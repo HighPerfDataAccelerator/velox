@@ -430,8 +430,9 @@ RowVectorPtr JoinFuzzer::execute(
 
   TestScopedSpillInjection scopedSpillInjection(spillPct);
   RowVectorPtr result;
+  TaskStats stats;
   try {
-    result = builder.maxDrivers(2).copyResults(pool_.get());
+    std::tie(result, stats) = builder.maxDrivers(2).copyResultsWithStats(pool_.get());
   } catch (VeloxRuntimeError& e) {
     if (FLAGS_enable_oom_injection &&
         e.errorCode() == facebook::velox::error_code::kMemCapExceeded &&
@@ -451,6 +452,8 @@ RowVectorPtr JoinFuzzer::execute(
   // avoid the potential interference of the background activities across query
   // executions.
   test::waitForAllTasksToBeDeleted();
+  std::cout << exec::printPlanWithStats(*plan.plan, stats, true)
+          << std::endl;
   return result;
 }
 
