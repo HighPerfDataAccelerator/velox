@@ -25,6 +25,7 @@
 #include <cudf/copying.hpp>
 #include <cudf/join/join.hpp>
 #include <cudf/join/mixed_join.hpp>
+#include <cudf/stream_compaction.hpp>
 
 #include <nvtx3/nvtx3.hpp>
 
@@ -99,6 +100,7 @@ void CudfHashJoinBuild::addInput(RowVectorPtr input) {
     std::cout << "Calling CudfHashJoinBuild::addInput" << std::endl;
   }
   // Queue inputs, process all at once.
+  // std::cout << "CHB: AddInput input->size() = " << input->size() << std::endl;
   if (input->size() > 0) {
     auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input);
     VELOX_CHECK_NOT_NULL(cudfInput);
@@ -148,6 +150,7 @@ void CudfHashJoinBuild::noMoreInput() {
   };
 
   auto stream = cudfGlobalStreamPool().get_stream();
+  // std::cout << "CHB: NoMoreInput inputs_.size() = " << inputs_.size() << std::endl;
   std::unique_ptr<cudf::table> tbl;
   if (inputs_.size() == 0) {
     auto emptyRowVector = RowVector::createEmpty(joinNode_->sources()[1]->outputType(), operatorCtx_->pool());
@@ -204,7 +207,7 @@ void CudfHashJoinBuild::noMoreInput() {
   auto cudfHashJoinBridge =
       std::dynamic_pointer_cast<CudfHashJoinBridge>(joinBridge);
   cudfHashJoinBridge->setHashTable(std::make_optional(
-      std::make_pair(std::shared_ptr(std::move(tbl)), std::move(hashObject))));
+      std::make_tuple(std::shared_ptr(std::move(tbl)), std::move(hashObject), std::make_shared<std::atomic<bool>>(false))));
 }
 
 exec::BlockingReason CudfHashJoinBuild::isBlocked(ContinueFuture* future) {
@@ -378,15 +381,29 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
     return nullptr;
   }
   if (!input_) {
+    // right join should be designed to output only matching left table rows immediately, and 
+    // wait for unmatched right table rows until end.
+    // After noMoreInput_ is set, only one probe driver should output all unmatched right table rows.
+    // following code is not correct. it was added as debug code.
+    if (!(joinNode_->isRightJoin() and !std::get<2>(hashObject_.value())->load(std::memory_order_relaxed) and noMoreInput_))
     return nullptr;
   }
   if (!hashObject_.has_value()) {
     return nullptr;
   }
   auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input_);
-  VELOX_CHECK_NOT_NULL(cudfInput);
-  auto stream = cudfInput->stream();
-  auto leftTable = cudfInput->release(); // probe table
+  rmm::cuda_stream_view stream;
+  std::unique_ptr<cudf::table> leftTable;
+  if (!cudfInput) {
+    auto emptyRowVector = RowVector::createEmpty(joinNode_->sources()[0]->outputType(), operatorCtx_->pool());
+    auto stream = cudfGlobalStreamPool().get_stream();
+    leftTable = facebook::velox::cudf_velox::with_arrow::toCudfTable(emptyRowVector, operatorCtx_->pool(), stream);
+  } else {
+    VELOX_CHECK_NOT_NULL(cudfInput);
+    stream = cudfInput->stream();
+    leftTable  = cudfInput->release(); // probe table
+  }
+
   if (cudfDebugEnabled()) {
     std::cout << "Probe table number of columns: " << leftTable->num_columns()
               << std::endl;
@@ -397,8 +414,9 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
   // TODO pass the input pool !!!
   // TODO: We should probably subset columns before calling to_cudf_table?
   // Maybe that isn't a problem if we fuse operators together.
-  auto& rightTable = hashObject_.value().first;
-  auto& hb = hashObject_.value().second;
+  auto& rightTable = std::get<0>(hashObject_.value());
+  auto& hb = std::get<1>(hashObject_.value());
+  auto& isRightProbed = std::get<2>(hashObject_.value());
   VELOX_CHECK_NOT_NULL(rightTable);
   if (cudfDebugEnabled()) {
     if (rightTable != nullptr)
@@ -475,7 +493,10 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
           leftTableView.select(leftKeyIndices_), std::nullopt, stream);
     }
   } else if (joinNode_->isRightJoin()) {
+    std::cout << "Right join" << "," << noMoreInput_ << "," << input_ << std::endl;
+    isRightProbed->store(true, std::memory_order_relaxed);
     if (joinNode_->filter()) {
+      // TODO check if tree needs to be flipped.
       std::tie(rightJoinIndices, leftJoinIndices) = cudf::mixed_left_join(
           rightTableView.select(rightKeyIndices_),
           leftTableView.select(leftKeyIndices_),
@@ -544,27 +565,6 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
           cudf::get_current_device_resource_ref());
     } else {
       rightJoinIndices = cudf::left_semi_join(
-
-  // print the left indices
-  if (std::getenv("PRINT_TABLES") != nullptr && std::string(std::getenv("PRINT_TABLES")) == "1") {
-    std::lock_guard<std::mutex> lock(probePrintMutex_);
-    // move the table with toVeloxColumn and print it
-    auto veloxTable = with_arrow::toVeloxColumn(cudf::table_view{{leftIndicesCol}}, pool(), "left_indices", stream);
-    std::cout << "Left  indices: " << veloxTable->toString() << std::endl;
-    // print each row in the velox table
-    for (int i = 0; i < veloxTable->size(); i++) {
-      std::cout << "Row " << std::setw(3) << i << ": " << veloxTable->toString(i) << std::endl;
-    }
-    // do it for right table
-    auto veloxTable2 = with_arrow::toVeloxColumn(cudf::table_view{{rightIndicesCol}}, pool(), "right_indices", stream);
-    std::cout << "Right indices: " << veloxTable2->toString() << std::endl;
-    // print each row in the velox table
-    for (int i = 0; i < veloxTable2->size(); i++) {
-      std::cout << "Row " << std::setw(3) << i << ": " << veloxTable2->toString(i) << std::endl;
-    }
-    std::cout << std::flush;
-  }
-
           rightTableView.select(rightKeyIndices_),
           leftTableView.select(leftKeyIndices_),
           cudf::null_equality::UNEQUAL,
@@ -608,6 +608,17 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
     std::cout << std::flush;
   }
 
+  // if(!noMoreInput_ and joinNode_->isRightJoin()) {
+  //   // drop out of bounds indices
+  //   // auto nullified_indices = cudf::gather(cudf::table_view{{rightIndicesCol}}, rightIndicesCol, oobPolicy, stream);
+  //   // nullified_indices = cudf::drop_nulls(nullified_indices->view(), {0}, stream);
+  //   // rightTable = cudf::gather(rightTableView, nullified_indices->get_column(0), oobPolicy, stream);
+  //   rightTable = cudf::gather(rightTableView, rightIndicesCol, oobPolicy, stream);
+  //   // generate output for left table immediately, but update the right table.
+
+  //   input_.reset();
+  //   return nullptr;
+  // }
   auto leftResult = cudf::gather(leftInput, leftIndicesCol, oobPolicy, stream);
   auto rightResult =
       cudf::gather(rightInput, rightIndicesCol, oobPolicy, stream);
