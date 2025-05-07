@@ -409,6 +409,28 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
   auto leftTableView = leftTable->view();
   auto rightTableView = rightTable->view();
 
+  // print the tables
+  auto probeType = joinNode_->sources()[0]->outputType();
+  auto buildType = joinNode_->sources()[1]->outputType();
+  if (std::getenv("PRINT_TABLES") != nullptr && std::string(std::getenv("PRINT_TABLES")) == "1") {
+    std::lock_guard<std::mutex> lock(probePrintMutex_);
+    // move the table with toVeloxColumn and print it
+    auto veloxTable = with_arrow::toVeloxColumn(leftTable->view(), pool(), probeType->asRow().names(), stream);
+    std::cout << "Left  table: " << veloxTable->toString() << std::endl;
+    // print each row in the velox table
+    for (int i = 0; i < veloxTable->size(); i++) {
+    std::cout << "Row " << std::setw(3) << i << ": " << veloxTable->toString(i) << std::endl;
+  }
+  // do it for right table
+  auto veloxTable2 = with_arrow::toVeloxColumn(rightTable->view(), pool(), buildType->asRow().names(), stream);
+  std::cout << "Right table: " << veloxTable2->toString() << std::endl;
+  // print each row in the velox table
+  for (int i = 0; i < veloxTable2->size(); i++) {
+      std::cout << "Row " << std::setw(3) << i << ": " << veloxTable2->toString(i) << std::endl;
+    }
+    std::cout << std::flush;
+  }
+
   if (joinNode_->isInnerJoin()) {
     // left = probe, right = build
     if (joinNode_->filter()) {
@@ -512,6 +534,27 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
           cudf::get_current_device_resource_ref());
     } else {
       rightJoinIndices = cudf::left_semi_join(
+
+  // print the left indices
+  if (std::getenv("PRINT_TABLES") != nullptr && std::string(std::getenv("PRINT_TABLES")) == "1") {
+    std::lock_guard<std::mutex> lock(probePrintMutex_);
+    // move the table with toVeloxColumn and print it
+    auto veloxTable = with_arrow::toVeloxColumn(cudf::table_view{{leftIndicesCol}}, pool(), "left_indices", stream);
+    std::cout << "Left  indices: " << veloxTable->toString() << std::endl;
+    // print each row in the velox table
+    for (int i = 0; i < veloxTable->size(); i++) {
+      std::cout << "Row " << std::setw(3) << i << ": " << veloxTable->toString(i) << std::endl;
+    }
+    // do it for right table
+    auto veloxTable2 = with_arrow::toVeloxColumn(cudf::table_view{{rightIndicesCol}}, pool(), "right_indices", stream);
+    std::cout << "Right indices: " << veloxTable2->toString() << std::endl;
+    // print each row in the velox table
+    for (int i = 0; i < veloxTable2->size(); i++) {
+      std::cout << "Row " << std::setw(3) << i << ": " << veloxTable2->toString(i) << std::endl;
+    }
+    std::cout << std::flush;
+  }
+
           rightTableView.select(rightKeyIndices_),
           leftTableView.select(leftKeyIndices_),
           cudf::null_equality::EQUAL,
@@ -534,6 +577,27 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
   auto leftIndicesCol = cudf::column_view{leftIndicesSpan};
   auto rightIndicesCol = cudf::column_view{rightIndicesSpan};
   auto constexpr oobPolicy = cudf::out_of_bounds_policy::NULLIFY;
+
+  // print the left indices
+  if (std::getenv("PRINT_TABLES") != nullptr && std::string(std::getenv("PRINT_TABLES")) == "1") {
+    std::lock_guard<std::mutex> lock(probePrintMutex_);
+    // move the table with toVeloxColumn and print it
+    auto veloxTable = with_arrow::toVeloxColumn(cudf::table_view{{leftIndicesCol}}, pool(), "left_indices", stream);
+    std::cout << "Left  indices: " << veloxTable->toString() << std::endl;
+    // print each row in the velox table
+    for (int i = 0; i < veloxTable->size(); i++) {
+      std::cout << "Row " << std::setw(3) << i << ": " << veloxTable->toString(i) << std::endl;
+    }
+    // do it for right table
+    auto veloxTable2 = with_arrow::toVeloxColumn(cudf::table_view{{rightIndicesCol}}, pool(), "right_indices", stream);
+    std::cout << "Right indices: " << veloxTable2->toString() << std::endl;
+    // print each row in the velox table
+    for (int i = 0; i < veloxTable2->size(); i++) {
+      std::cout << "Row " << std::setw(3) << i << ": " << veloxTable2->toString(i) << std::endl;
+    }
+    std::cout << std::flush;
+  }
+
   auto leftResult = cudf::gather(leftInput, leftIndicesCol, oobPolicy, stream);
   auto rightResult =
       cudf::gather(rightInput, rightIndicesCol, oobPolicy, stream);
@@ -557,6 +621,18 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
   }
   auto cudfOutput = std::make_unique<cudf::table>(std::move(joinedCols));
   stream.synchronize();
+
+  // print the output
+  if (std::getenv("PRINT_TABLES") != nullptr && std::string(std::getenv("PRINT_TABLES")) == "1") {
+    std::lock_guard<std::mutex> lock(probePrintMutex_);
+    auto veloxTable = with_arrow::toVeloxColumn(cudfOutput->view(), pool(), outputType_->asRow().names(), stream);
+    std::cout << "Output table: " << veloxTable->toString() << std::endl;
+    // print each row in the velox table
+    for (int i = 0; i < veloxTable->size(); i++) {
+      std::cout << "Row " << std::setw(3) << i << ": " << veloxTable->toString(i) << std::endl;
+    }
+    std::cout << std::flush;
+  }
 
   input_.reset();
   finished_ = noMoreInput_;

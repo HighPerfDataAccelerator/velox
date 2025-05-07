@@ -113,6 +113,7 @@ class CudfHashJoinProbe : public exec::Operator, public NvtxHelper {
   std::vector<cudf::size_type> rightColumnIndicesToGather_;
   std::vector<size_t> leftColumnOutputIndices_;
   std::vector<size_t> rightColumnOutputIndices_;
+  std::mutex probePrintMutex_;
   bool finished_{false};
 };
 
