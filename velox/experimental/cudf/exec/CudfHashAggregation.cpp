@@ -30,6 +30,8 @@
 #include <cudf/stream_compaction.hpp>
 #include <cudf/unary.hpp>
 
+#include <mutex>
+
 namespace {
 
 using namespace facebook::velox;
@@ -386,32 +388,6 @@ struct MeanAggregator : cudf_velox::CudfHashAggregation::Aggregator {
   uint32_t countIdx_;
 };
 
-std::unique_ptr<cudf_velox::CudfHashAggregation::Aggregator> createAggregator(
-    core::AggregationNode::Step step,
-    std::string const& kind,
-    uint32_t inputIndex,
-    VectorPtr constant,
-    bool isGlobal) {
-  if (kind.rfind("sum", 0) == 0) {
-    return std::make_unique<SumAggregator>(
-        step, inputIndex, constant, isGlobal);
-  } else if (kind.rfind("count", 0) == 0) {
-    return std::make_unique<CountAggregator>(
-        step, inputIndex, constant, isGlobal);
-  } else if (kind.rfind("min", 0) == 0) {
-    return std::make_unique<MinAggregator>(
-        step, inputIndex, constant, isGlobal);
-  } else if (kind.rfind("max", 0) == 0) {
-    return std::make_unique<MaxAggregator>(
-        step, inputIndex, constant, isGlobal);
-  } else if (kind.rfind("avg", 0) == 0) {
-    return std::make_unique<MeanAggregator>(
-        step, inputIndex, constant, isGlobal);
-  } else {
-    VELOX_NYI("Aggregation not yet supported");
-  }
-}
-
 static const std::unordered_map<std::string, core::AggregationNode::Step>
     companionStep = {
         {"_partial", core::AggregationNode::Step::kPartial},
@@ -485,8 +461,8 @@ auto toAggregators(
     auto const inputIndex = aggInputs[0];
     auto const constant = aggConstants.empty() ? nullptr : aggConstants[0];
     auto const companionStep = getCompanionStep(kind, step);
-    aggregators.push_back(
-        createAggregator(companionStep, kind, inputIndex, constant, isGlobal));
+    aggregators.push_back(facebook::velox::cudf_velox::createAggregator(
+        kind, companionStep, inputIndex, constant, isGlobal));
   }
   return aggregators;
 }
@@ -507,8 +483,8 @@ auto toIntermediateAggregators(
     auto const inputIndex = aggregationNode.groupingKeys().size() + i;
     auto const kind = aggregate.call->name();
     auto const constant = nullptr;
-    aggregators.push_back(
-        createAggregator(step, kind, inputIndex, constant, isGlobal));
+    aggregators.push_back(facebook::velox::cudf_velox::createAggregator(
+        kind, step, inputIndex, constant, isGlobal));
   }
   return aggregators;
 }
@@ -887,6 +863,120 @@ void CudfHashAggregation::noMoreInput() {
 
 bool CudfHashAggregation::isFinished() {
   return finished_;
+}
+
+std::unique_ptr<cudf_velox::CudfHashAggregation::Aggregator> createAggregator(
+    const std::string& kind,
+    core::AggregationNode::Step step,
+    uint32_t inputIndex,
+    VectorPtr constant,
+    bool isGlobal) {
+  // Ensure aggregators are registered
+  static std::once_flag registrationFlag;
+  std::call_once(registrationFlag, []() {
+    facebook::velox::cudf_velox::registerCudfAggregators(false /* overwrite */);
+  });
+
+  // Extract the base function name by removing companion suffixes
+  // TODO (dm): Maybe I can remove this logic here and instead enforce that
+  // companion functions be registered separately
+  std::string baseName = kind;
+  // Inline companionStep logic instead of referring to the map
+  static const std::unordered_map<std::string, core::AggregationNode::Step>
+      kCompanionSuffixes = {
+          {"_partial", core::AggregationNode::Step::kPartial},
+          {"_merge", core::AggregationNode::Step::kIntermediate},
+          {"_merge_extract", core::AggregationNode::Step::kFinal}};
+
+  for (const auto& [suffix, _] : kCompanionSuffixes) {
+    if (folly::StringPiece(kind).endsWith(suffix)) {
+      baseName = kind.substr(0, kind.length() - suffix.length());
+      break;
+    }
+  }
+
+  if (auto entry = facebook::velox::cudf_velox::getAggregatorEntry(baseName)) {
+    return entry->factory(step, inputIndex, constant, isGlobal);
+  }
+
+  VELOX_NYI("Aggregation not yet supported: {}", kind);
+}
+
+AggregatorMap& aggregators() {
+  static AggregatorMap aggregators;
+  return aggregators;
+}
+
+const AggregatorEntry* FOLLY_NULLABLE
+getAggregatorEntry(const std::string& name) {
+  return aggregators().withRLock(
+      [&](const auto& aggregatorsMap) -> const AggregatorEntry* {
+        auto it = aggregatorsMap.find(name);
+        if (it != aggregatorsMap.end()) {
+          return &it->second;
+        }
+        return nullptr;
+      });
+}
+
+bool registerAggregator(
+    const std::string& name,
+    const AggregatorFactory& factory,
+    bool overwrite) {
+  if (overwrite) {
+    aggregators().withWLock(
+        [&](auto& aggregatorsMap) { aggregatorsMap[name] = {factory}; });
+    return true;
+  } else {
+    return aggregators().withWLock([&](auto& aggregatorsMap) {
+      auto [_, inserted] = aggregatorsMap.insert({name, {factory}});
+      return inserted;
+    });
+  }
+}
+
+// Registration functions for CUDF aggregators
+template <typename AggregatorType>
+void registerAggregatorImpl(const std::string& name, bool overwrite) {
+  registerAggregator(
+      name,
+      [](core::AggregationNode::Step step,
+         uint32_t inputIndex,
+         VectorPtr constant,
+         bool isGlobal) -> std::unique_ptr<CudfHashAggregation::Aggregator> {
+        return std::make_unique<AggregatorType>(
+            step, inputIndex, constant, isGlobal);
+      },
+      overwrite);
+}
+
+void registerSumAggregator(bool overwrite) {
+  registerAggregatorImpl<SumAggregator>("sum", overwrite);
+}
+
+void registerCountAggregator(bool overwrite) {
+  registerAggregatorImpl<CountAggregator>("count", overwrite);
+}
+
+void registerMinAggregator(bool overwrite) {
+  registerAggregatorImpl<MinAggregator>("min", overwrite);
+}
+
+void registerMaxAggregator(bool overwrite) {
+  registerAggregatorImpl<MaxAggregator>("max", overwrite);
+}
+
+void registerAvgAggregator(bool overwrite) {
+  registerAggregatorImpl<MeanAggregator>("avg", overwrite);
+}
+
+// Register all CUDF aggregators
+void registerCudfAggregators(bool overwrite) {
+  registerSumAggregator(overwrite);
+  registerCountAggregator(overwrite);
+  registerMinAggregator(overwrite);
+  registerMaxAggregator(overwrite);
+  registerAvgAggregator(overwrite);
 }
 
 } // namespace facebook::velox::cudf_velox
