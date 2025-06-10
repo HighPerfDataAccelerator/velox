@@ -184,13 +184,17 @@ std::unique_ptr<CudfHashAggregation::Aggregator> createAggregator(
     bool isGlobal);
 
 /// Registration functions for CUDF aggregators
-void registerSumAggregator(bool overwrite = false);
-void registerCountAggregator(bool overwrite = false);
-void registerMinAggregator(bool overwrite = false);
-void registerMaxAggregator(bool overwrite = false);
-void registerAvgAggregator(bool overwrite = false);
+void registerSumAggregator(bool withCompanionFunctions, bool overwrite = false);
+void registerCountAggregator(
+    bool withCompanionFunctions,
+    bool overwrite = false);
+void registerMinAggregator(bool withCompanionFunctions, bool overwrite = false);
+void registerMaxAggregator(bool withCompanionFunctions, bool overwrite = false);
+void registerAvgAggregator(bool withCompanionFunctions, bool overwrite = false);
 
 /// Register all CUDF aggregators
-void registerCudfAggregators(bool overwrite = false);
+void registerCudfAggregators(
+    bool withCompanionFunctions,
+    bool overwrite = false);
 
 } // namespace facebook::velox::cudf_velox

@@ -871,31 +871,14 @@ std::unique_ptr<cudf_velox::CudfHashAggregation::Aggregator> createAggregator(
     uint32_t inputIndex,
     VectorPtr constant,
     bool isGlobal) {
-  // Ensure aggregators are registered
+  // Ensure basic cudf aggregators are registered
   static std::once_flag registrationFlag;
   std::call_once(registrationFlag, []() {
-    facebook::velox::cudf_velox::registerCudfAggregators(false /* overwrite */);
+    facebook::velox::cudf_velox::registerCudfAggregators(
+        false /* withCompanionFunctions */, false /* overwrite */);
   });
 
-  // Extract the base function name by removing companion suffixes
-  // TODO (dm): Maybe I can remove this logic here and instead enforce that
-  // companion functions be registered separately
-  std::string baseName = kind;
-  // Inline companionStep logic instead of referring to the map
-  static const std::unordered_map<std::string, core::AggregationNode::Step>
-      kCompanionSuffixes = {
-          {"_partial", core::AggregationNode::Step::kPartial},
-          {"_merge", core::AggregationNode::Step::kIntermediate},
-          {"_merge_extract", core::AggregationNode::Step::kFinal}};
-
-  for (const auto& [suffix, _] : kCompanionSuffixes) {
-    if (folly::StringPiece(kind).endsWith(suffix)) {
-      baseName = kind.substr(0, kind.length() - suffix.length());
-      break;
-    }
-  }
-
-  if (auto entry = facebook::velox::cudf_velox::getAggregatorEntry(baseName)) {
+  if (auto entry = facebook::velox::cudf_velox::getAggregatorEntry(kind)) {
     return entry->factory(step, inputIndex, constant, isGlobal);
   }
 
@@ -937,7 +920,10 @@ bool registerAggregator(
 
 // Registration functions for CUDF aggregators
 template <typename AggregatorType>
-void registerAggregatorImpl(const std::string& name, bool overwrite) {
+void registerAggregatorImpl(
+    const std::string& name,
+    bool withCompanionFunctions,
+    bool overwrite) {
   registerAggregator(
       name,
       [](core::AggregationNode::Step step,
@@ -948,35 +934,81 @@ void registerAggregatorImpl(const std::string& name, bool overwrite) {
             step, inputIndex, constant, isGlobal);
       },
       overwrite);
+  if (withCompanionFunctions) {
+    registerAggregator(
+        name + "_partial",
+        [](core::AggregationNode::Step,
+           uint32_t inputIndex,
+           VectorPtr constant,
+           bool isGlobal) -> std::unique_ptr<CudfHashAggregation::Aggregator> {
+          return std::make_unique<AggregatorType>(
+              core::AggregationNode::Step::kPartial,
+              inputIndex,
+              constant,
+              isGlobal);
+        },
+        overwrite);
+    registerAggregator(
+        name + "_merge",
+        [](core::AggregationNode::Step,
+           uint32_t inputIndex,
+           VectorPtr constant,
+           bool isGlobal) -> std::unique_ptr<CudfHashAggregation::Aggregator> {
+          return std::make_unique<AggregatorType>(
+              core::AggregationNode::Step::kIntermediate,
+              inputIndex,
+              constant,
+              isGlobal);
+        },
+        overwrite);
+    registerAggregator(
+        name + "_merge_extract",
+        [](core::AggregationNode::Step,
+           uint32_t inputIndex,
+           VectorPtr constant,
+           bool isGlobal) -> std::unique_ptr<CudfHashAggregation::Aggregator> {
+          return std::make_unique<AggregatorType>(
+              core::AggregationNode::Step::kFinal,
+              inputIndex,
+              constant,
+              isGlobal);
+        },
+        overwrite);
+  }
 }
 
-void registerSumAggregator(bool overwrite) {
-  registerAggregatorImpl<SumAggregator>("sum", overwrite);
+void registerSumAggregator(bool withCompanionFunctions, bool overwrite) {
+  registerAggregatorImpl<SumAggregator>(
+      "sum", withCompanionFunctions, overwrite);
 }
 
-void registerCountAggregator(bool overwrite) {
-  registerAggregatorImpl<CountAggregator>("count", overwrite);
+void registerCountAggregator(bool withCompanionFunctions, bool overwrite) {
+  registerAggregatorImpl<CountAggregator>(
+      "count", withCompanionFunctions, overwrite);
 }
 
-void registerMinAggregator(bool overwrite) {
-  registerAggregatorImpl<MinAggregator>("min", overwrite);
+void registerMinAggregator(bool withCompanionFunctions, bool overwrite) {
+  registerAggregatorImpl<MinAggregator>(
+      "min", withCompanionFunctions, overwrite);
 }
 
-void registerMaxAggregator(bool overwrite) {
-  registerAggregatorImpl<MaxAggregator>("max", overwrite);
+void registerMaxAggregator(bool withCompanionFunctions, bool overwrite) {
+  registerAggregatorImpl<MaxAggregator>(
+      "max", withCompanionFunctions, overwrite);
 }
 
-void registerAvgAggregator(bool overwrite) {
-  registerAggregatorImpl<MeanAggregator>("avg", overwrite);
+void registerAvgAggregator(bool withCompanionFunctions, bool overwrite) {
+  registerAggregatorImpl<MeanAggregator>(
+      "avg", withCompanionFunctions, overwrite);
 }
 
 // Register all CUDF aggregators
-void registerCudfAggregators(bool overwrite) {
-  registerSumAggregator(overwrite);
-  registerCountAggregator(overwrite);
-  registerMinAggregator(overwrite);
-  registerMaxAggregator(overwrite);
-  registerAvgAggregator(overwrite);
+void registerCudfAggregators(bool withCompanionFunctions, bool overwrite) {
+  registerSumAggregator(withCompanionFunctions, overwrite);
+  registerCountAggregator(withCompanionFunctions, overwrite);
+  registerMinAggregator(withCompanionFunctions, overwrite);
+  registerMaxAggregator(withCompanionFunctions, overwrite);
+  registerAvgAggregator(withCompanionFunctions, overwrite);
 }
 
 } // namespace facebook::velox::cudf_velox
