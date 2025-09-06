@@ -328,14 +328,27 @@ TEST_F(TableScanTest, filterPushdown) {
   createDuckDbTable(vectors);
 
   // c1 >= 0 or null and c3 is true
-  common::SubfieldFilters subfieldFilters =
-      common::test::SubfieldFiltersBuilder()
-          .add(
-              "c1",
-              std::make_unique<common::BigintRange>(
-                  int64_t(0), std::numeric_limits<int64_t>::max(), true))
-          .add("c3", std::make_unique<common::BoolValue>(true, false))
-          .build();
+  // common::SubfieldFilters subfieldFilters =
+  //     SubfieldFiltersBuilder()
+  //         .add("c1", greaterThanOrEqual(0, true))
+  //         .add("c3", std::make_unique<common::BoolValue>(true, false))
+  //         .build();
+  // convert subfieldFilters to a typed expression
+  // c1 >= 0 or null and c3 is true
+  auto c1Expr = std::make_shared<core::CallTypedExpr>(
+      BOOLEAN(),
+      "gte",
+      std::make_shared<core::FieldAccessTypedExpr>(BIGINT(), "c1"),
+      std::make_shared<core::ConstantTypedExpr>(BIGINT(), int64_t(0)));
+
+  auto c3Expr = std::make_shared<core::CallTypedExpr>(
+      BOOLEAN(),
+      "eq",
+      std::make_shared<core::FieldAccessTypedExpr>(BOOLEAN(), "c3"),
+      std::make_shared<core::ConstantTypedExpr>(BOOLEAN(), true));
+
+  auto subfieldFilterExpr =
+      std::make_shared<core::CallTypedExpr>(BOOLEAN(), "and", c1Expr, c3Expr);
   auto tableHandle = makeTableHandle(
       "parquet_table", rowType, true, std::move(subfieldFilters), nullptr);
 

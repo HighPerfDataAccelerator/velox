@@ -1324,7 +1324,7 @@ cudf::ast::expression const& createAstFromSubfieldFilter(
   // First, create column reference from subfield
   // For now, only support simple field references
   if (subfield.path().empty() ||
-      subfield.path()[0]->kind() != common::kNestedField) {
+      subfield.path()[0]->kind() != common::SubfieldKind::kNestedField) {
     VELOX_FAIL(
         "Only simple field references are supported in subfield filters");
   }
