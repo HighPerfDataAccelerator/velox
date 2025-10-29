@@ -34,6 +34,7 @@ output_batch_rows=${BATCH_SIZE_ROWS:-100000}
 cudf_chunk_read_limit=$((1024 * 1024 * 1024 * 1))
 cudf_pass_read_limit=0
 VELOX_CUDF_MEMORY_RESOURCE="async"
+VELOX_CUDF_MEMORY_PERCENT=0
 
 for query_number in ${queries}; do
   printf -v query_number '%02d' "${query_number}"
@@ -48,7 +49,7 @@ for query_number in ${queries}; do
     "gpu")
       num_drivers=${NUM_DRIVERS:-4}
       BENCHMARK_EXECUTABLE=./_build/release/velox/experimental/cudf/benchmarks/velox_cudf_tpch_benchmark
-      CUDF_FLAGS="--cudf_chunk_read_limit=${cudf_chunk_read_limit} --cudf_pass_read_limit=${cudf_pass_read_limit}"
+      CUDF_FLAGS="--cudf_chunk_read_limit=${cudf_chunk_read_limit} --cudf_pass_read_limit=${cudf_pass_read_limit} --cudf_memory_resource=${VELOX_CUDF_MEMORY_RESOURCE} --cudf_memory_percent=${VELOX_CUDF_MEMORY_PERCENT}"
       VELOX_CUDF_ENABLED=true
       ;;
     esac
@@ -71,8 +72,6 @@ for query_number in ${queries}; do
       --data_format=parquet \
       --run_query_verbose=${query_number} \
       --num_repeats=1 \
-      --velox_cudf_enabled=${VELOX_CUDF_ENABLED} \
-      --velox_cudf_memory_resource=${VELOX_CUDF_MEMORY_RESOURCE} \
       --num_drivers=${num_drivers} \
       --preferred_output_batch_rows=${output_batch_rows} \
       --max_output_batch_rows=${output_batch_rows} \
