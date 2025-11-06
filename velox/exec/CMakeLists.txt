@@ -247,6 +247,10 @@ velox_link_libraries(
   velox_vector
 )
 
+if(${VELOX_ENABLE_CUDF})
+  velox_link_libraries(velox_exec cudf::cudf)
+endif()
+
 velox_add_library(velox_cursor Cursor.cpp HEADERS Cursor.h)
 
 velox_link_libraries(velox_cursor velox_core velox_exception velox_expression)
