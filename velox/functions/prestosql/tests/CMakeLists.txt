@@ -53,6 +53,7 @@ add_executable(
   ArgTypesGeneratorTest.cpp
   BinaryFunctionsTest.cpp
   BingTileCastTest.cpp
+  BingTileFunctionsTest.cpp
   BitwiseTest.cpp
   CardinalityTest.cpp
   CeilFloorTest.cpp
@@ -69,7 +70,9 @@ add_executable(
   GreatestLeastTest.cpp
   HyperLogLogCastTest.cpp
   HyperLogLogFunctionsTest.cpp
+  KHyperLogLogCastTest.cpp
   P4HyperLogLogCastTest.cpp
+  SetDigestCastTest.cpp
   InPredicateTest.cpp
   IntegerFunctionsTest.cpp
   IPAddressCastTest.cpp
@@ -110,6 +113,7 @@ add_executable(
   SplitToMultiMapTest.cpp
   StringFunctionsTest.cpp
   TimestampWithTimeZoneCastTest.cpp
+  TimeWithTimezoneCastTest.cpp
   TransformKeysTest.cpp
   TransformTest.cpp
   TransformValuesTest.cpp

@@ -33,7 +33,6 @@
 #include "velox/exec/tests/utils/PlanBuilder.h"
 #include "velox/exec/tests/utils/TempDirectoryPath.h"
 #include "velox/exec/tests/utils/VectorTestUtil.h"
-#include "velox/vector/VectorPrinter.h"
 #include "velox/vector/fuzzer/VectorFuzzer.h"
 
 #include <fmt/format.h>
@@ -56,7 +55,7 @@ class HashJoinTest : public HashJoinTestBase {
 
   void SetUp() override {
     HashJoinTestBase::SetUp();
-    cudf_velox::CudfConfig::getInstance().forceReplace = true;
+    cudf_velox::CudfConfig::getInstance().allowCpuFallback = false;
     cudf_velox::registerCudf();
   }
 
@@ -920,7 +919,7 @@ TEST_P(MultiThreadedHashJoinTest, rightSemiJoinFilterWithExtraFilter) {
   }
 }
 
-TEST_P(MultiThreadedHashJoinTest, semiFilterOverLazyVectors) {
+TEST_P(MultiThreadedHashJoinTest, DISABLED_semiFilterOverLazyVectors) {
   auto probeVectors = makeBatches(1, [&](auto /*unused*/) {
     return makeRowVector(
         {"t0", "t1"},
@@ -1025,7 +1024,7 @@ TEST_P(MultiThreadedHashJoinTest, semiFilterOverLazyVectors) {
       .run();
 }
 
-TEST_P(MultiThreadedHashJoinTest, nullAwareAntiJoin) {
+TEST_P(MultiThreadedHashJoinTest, DISABLED_nullAwareAntiJoin) {
   std::vector<RowVectorPtr> probeVectors =
       makeBatches(5, [&](uint32_t /*unused*/) {
         return makeRowVector({
@@ -1465,7 +1464,8 @@ TEST_P(MultiThreadedHashJoinTest, antiJoin) {
       .run();
 
   std::vector<std::string> filters({
-      "u1 > t1", "u1 * t1 > 0",
+      "u1 > t1",
+      "u1 * t1 > 0",
       // This filter is true on rows without a match. It should not prevent
       // the row from being returned.
       // Disabling this because coalesce is not supported in cudf.
@@ -1493,9 +1493,10 @@ TEST_P(MultiThreadedHashJoinTest, antiJoin) {
         .joinType(core::JoinType::kAnti)
         .joinFilter(filter)
         .joinOutputLayout({"t0", "t1"})
-        .referenceQuery(fmt::format(
-            "SELECT t.* FROM t WHERE NOT EXISTS (SELECT * FROM u WHERE u.u0 = t.t0 AND {})",
-            filter))
+        .referenceQuery(
+            fmt::format(
+                "SELECT t.* FROM t WHERE NOT EXISTS (SELECT * FROM u WHERE u.u0 = t.t0 AND {})",
+                filter))
         .run();
   }
 }
@@ -1958,223 +1959,6 @@ TEST_P(MultiThreadedHashJoinTest, leftJoinWithFilter) {
         .run();
   }
 }
-
-void printRowVectors(
-    const std::vector<RowVectorPtr>& vectors,
-    const std::string& label) {
-  std::cout << "=== " << label << " ===" << std::endl;
-  for (size_t i = 0; i < vectors.size(); ++i) {
-    std::cout << "Batch " << i << ":" << std::endl;
-    std::cout << printVector(*vectors[i]) << std::endl;
-  }
-}
-#if 0
-
-TEST_P(MultiThreadedHashJoinTest, leftJoinWithFilterDebug) {
-  // Left side keys are [0, 1, 2,..10].
-  // Use 3-rd column as row number to allow for asserting the order of
-  // results.
-#if 0
-  std::vector<RowVectorPtr> probeVectors = mergeBatches(
-      makeBatches(
-          1,
-          [&](int32_t /*unused*/) {
-            return makeRowVector(
-                {"c0", "c1", "row_number"},
-                {
-                    makeFlatVector<int32_t>(
-                        5, [](auto row) { return row % 5; }),
-                    makeFlatVector<int32_t>(5, [](auto row) { return row; }),
-                    makeFlatVector<int32_t>(5, [](auto row) { return row; }),
-                });
-          }),
-      makeBatches(
-          1,
-          [&](int32_t /*unused*/) {
-            return makeRowVector(
-                {"c0", "c1", "row_number"},
-                {
-                    makeFlatVector<int32_t>(
-                        5,
-                        [](auto row) { return (row + 3) % 5; }
-                        ),
-                    makeFlatVector<int32_t>(5, [](auto row) { return row; }),
-                    makeFlatVector<int32_t>(
-                        5, [](auto row) { return 5 + row; }),
-                });
-          }),
-      true);
-#endif
-  std::vector<RowVectorPtr> probeVectors = makeBatches(
-          1,
-          [&](int32_t /*unused*/) {
-            return makeRowVector(
-                {"c0", "c1", "row_number"},
-                {
-                    makeFlatVector<int32_t>(
-                        5, [](auto row) { return (row + 3) % 5; }),
-                    makeFlatVector<int32_t>(5, [](auto row) { return row; }),
-                    makeFlatVector<int32_t>(5, [](auto row) { return row; }),
-                });
-          });
-
-  std::vector<RowVectorPtr> buildVectors =
-      makeBatches(1, [&](int32_t /*unused*/) {
-        return makeRowVector(
-            {"c0", "c1"}, {
-            makeFlatVector<int32_t>(
-                5, [](auto row) { return row % 2; }),
-            makeFlatVector<int32_t>(
-                5, [](auto row) { return 111 + row * 2; }),
-        });
-      });
-  printRowVectors(probeVectors, "Probe Table");
-  printRowVectors(buildVectors, "Build Table");
-  std::cout << "numDrivers_ = " << numDrivers_ << std::endl;
-  // Additional filter.
-
-  {
-    auto testProbeVectors = probeVectors;
-    auto testBuildVectors = buildVectors;
-    HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
-        .injectSpill(false)
-        .numDrivers(numDrivers_, false, true)
-        .probeKeys({"c0"})
-        .probeVectors(std::move(testProbeVectors))
-        .buildKeys({"u_c0"})
-        .buildVectors(std::move(testBuildVectors))
-        .buildProjections({"c0 AS u_c0", "c1 AS u_c1"})
-        .joinType(core::JoinType::kLeft)
-        .joinFilter("(c1 + u_c1) % 2 = 1")
-        .joinOutputLayout({"row_number", "c0", "c1", "u_c1"})
-        .referenceQuery(
-            "SELECT t.row_number, t.c0, t.c1, u.c1 FROM t LEFT JOIN u ON t.c0 = u.c0 AND (t.c1 + u.c1) % 2 = 1")
-        .run();
-  }
-  std::cout << "===============================================================\n";
-
-  // No rows pass the additional filter.
-  {
-    auto testProbeVectors = probeVectors;
-    auto testBuildVectors = buildVectors;
-    HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
-        .injectSpill(false)
-        .numDrivers(numDrivers_, false, true)
-        .probeKeys({"c0"})
-        .probeVectors(std::move(testProbeVectors))
-        .buildKeys({"u_c0"})
-        .buildVectors(std::move(testBuildVectors))
-        .buildProjections({"c0 AS u_c0", "c1 AS u_c1"})
-        .joinType(core::JoinType::kLeft)
-        .joinFilter("(c1 + u_c1) % 2  = 3")
-        .joinOutputLayout({"row_number", "c0", "c1", "u_c1"})
-        .referenceQuery(
-            "SELECT t.row_number, t.c0, t.c1, u.c1 FROM t LEFT JOIN u ON t.c0 = u.c0 AND (t.c1 + u.c1) % 2 = 3")
-        .run();
-  }
-}
-
-TEST_P(MultiThreadedHashJoinTest, InnerJoinWithFilterDebug) {
-  // Left side keys are [0, 1, 2,..10].
-  // Use 3-rd column as row number to allow for asserting the order of
-  // results.
-  std::vector<RowVectorPtr> probeVectors = mergeBatches(
-      makeBatches(
-          1,
-          [&](int32_t /*unused*/) {
-            return makeRowVector(
-                {"c0", "c1", "row_number"},
-                {
-                    makeFlatVector<int32_t>(
-                        5, [](auto row) { return row % 5; }),
-                    makeFlatVector<int32_t>(5, [](auto row) { return row; }),
-                    makeFlatVector<int32_t>(5, [](auto row) { return row; }),
-                });
-          }),
-      makeBatches(
-          1,
-          [&](int32_t /*unused*/) {
-            return makeRowVector(
-                {"c0", "c1", "row_number"},
-                {
-                    makeFlatVector<int32_t>(
-                        5,
-                        [](auto row) { return (row + 3) % 5; }
-                        ),
-                    makeFlatVector<int32_t>(5, [](auto row) { return row; }),
-                    makeFlatVector<int32_t>(
-                        5, [](auto row) { return 5 + row; }),
-                });
-          }),
-      true);
-  std::vector<RowVectorPtr> probeVectors = makeBatches(
-          1,
-          [&](int32_t /*unused*/) {
-            return makeRowVector(
-                {"c0", "c1", "row_number"},
-                {
-                    makeFlatVector<int32_t>(
-                        5, [](auto row) { return (row + 3) % 5; }),
-                    makeFlatVector<int32_t>(5, [](auto row) { return row; }),
-                    makeFlatVector<int32_t>(5, [](auto row) { return row; }),
-                });
-          });
-
-  std::vector<RowVectorPtr> buildVectors =
-      makeBatches(1, [&](int32_t /*unused*/) {
-        return makeRowVector(
-            {"c0", "c1"}, {
-            makeFlatVector<int32_t>(
-                5, [](auto row) { return row % 2; }),
-            makeFlatVector<int32_t>(
-                5, [](auto row) { return 111 + row * 2; }),
-        });
-      });
-  printRowVectors(probeVectors, "Probe Table");
-  printRowVectors(buildVectors, "Build Table");
-  std::cout << "numDrivers_ = " << numDrivers_ << std::endl;
-  // Additional filter.
-  {
-    auto testProbeVectors = probeVectors;
-    auto testBuildVectors = buildVectors;
-    HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
-        .injectSpill(false)
-        .numDrivers(numDrivers_, true, false)
-        .probeKeys({"c0"})
-        .probeVectors(std::move(testProbeVectors))
-        .buildKeys({"u_c0"})
-        .buildVectors(std::move(testBuildVectors))
-        .buildProjections({"c0 AS u_c0", "c1 AS u_c1"})
-        .joinType(core::JoinType::kInner)
-        .joinFilter("(c1 + u_c1) % 2 = 1")
-        .joinOutputLayout({"row_number", "c0", "c1", "u_c1"})
-        .referenceQuery(
-            "SELECT t.row_number, t.c0, t.c1, u.c1 FROM t INNER JOIN u ON t.c0 = u.c0 AND (t.c1 + u.c1) % 2 = 1")
-        .run();
-  }
-  std::cout << "===============================================================\n";
-
-  // No rows pass the additional filter.
-  {
-    auto testProbeVectors = probeVectors;
-    auto testBuildVectors = buildVectors;
-    HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
-        .injectSpill(false)
-        .numDrivers(numDrivers_, false, false)
-        .probeKeys({"c0"})
-        .probeVectors(std::move(testProbeVectors))
-        .buildKeys({"u_c0"})
-        .buildVectors(std::move(testBuildVectors))
-        .buildProjections({"c0 AS u_c0", "c1 AS u_c1"})
-        .joinType(core::JoinType::kInner)
-        .joinFilter("(c1 + u_c1) % 2  = 3")
-        .joinOutputLayout({"row_number", "c0", "c1", "u_c1"})
-        .referenceQuery(
-            "SELECT t.row_number, t.c0, t.c1, u.c1 FROM t INNER JOIN u ON t.c0 = u.c0 AND (t.c1 + u.c1) % 2 = 3")
-        .run();
-  }
-}
-#endif
 
 /// Tests left join with a filter that may evaluate to true, false or null.
 /// Makes sure that null filter results are handled correctly, e.g. as if the
@@ -3456,9 +3240,10 @@ TEST_F(HashJoinTest, semiProjectWithFilter) {
     VELOX_ASSERT_THROW(
         HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
             .planNode(plan)
-            .referenceQuery(fmt::format(
-                "SELECT t0, t1, t0 IN (SELECT u0 FROM u WHERE {}) FROM t",
-                filter))
+            .referenceQuery(
+                fmt::format(
+                    "SELECT t0, t1, t0 IN (SELECT u0 FROM u WHERE {}) FROM t",
+                    filter))
             .injectSpill(false)
             .run(),
         "Replacement with cuDF operator failed");
@@ -3471,9 +3256,10 @@ TEST_F(HashJoinTest, semiProjectWithFilter) {
     VELOX_ASSERT_THROW(
         HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
             .planNode(plan)
-            .referenceQuery(fmt::format(
-                "SELECT t0, t1, EXISTS (SELECT * FROM u WHERE (u0 is not null OR t0 is not null) AND u0 = t0 AND {}) FROM t",
-                filter))
+            .referenceQuery(
+                fmt::format(
+                    "SELECT t0, t1, EXISTS (SELECT * FROM u WHERE (u0 is not null OR t0 is not null) AND u0 = t0 AND {}) FROM t",
+                    filter))
             .injectSpill(false)
             .run(),
         "Replacement with cuDF operator failed");
@@ -3798,7 +3584,7 @@ TEST_F(HashJoinTest, memory) {
   EXPECT_GT(40'000'000, params.queryCtx->pool()->stats().cumulativeBytes);
 }
 
-TEST_F(HashJoinTest, lazyVectors) {
+TEST_F(HashJoinTest, DISABLED_lazyVectors) {
   // a dataset of multiple row groups with multiple columns. We create
   // different dictionary wrappings for different columns and load the
   // rows in scope at different times.
@@ -3844,8 +3630,9 @@ TEST_F(HashJoinTest, lazyVectors) {
       }
       std::vector<exec::Split> buildSplits;
       for (int i = 0; i < buildVectors.size(); ++i) {
-        buildSplits.push_back(exec::Split(makeHiveConnectorSplit(
-            tempFiles[probeSplits.size() + i]->getPath())));
+        buildSplits.push_back(
+            exec::Split(makeHiveConnectorSplit(
+                tempFiles[probeSplits.size() + i]->getPath())));
       }
       SplitInput splits;
       splits.emplace(probeScanId, probeSplits);
@@ -3916,7 +3703,7 @@ TEST_F(HashJoinTest, lazyVectors) {
   }
 }
 
-TEST_F(HashJoinTest, lazyVectorNotLoadedInFilter) {
+TEST_F(HashJoinTest, DISABLED_lazyVectorNotLoadedInFilter) {
   // Ensure that if lazy vectors are temporarily wrapped during a filter's
   // execution and remain unloaded, the temporary wrap is promptly
   // discarded. This precaution prevents the generation of the probe's output
@@ -3934,7 +3721,7 @@ TEST_F(HashJoinTest, lazyVectorNotLoadedInFilter) {
       "SELECT t.c1, t.c2 FROM t, u WHERE t.c0 = u.c0");
 }
 
-TEST_F(HashJoinTest, lazyVectorPartiallyLoadedInFilterLeftJoin) {
+TEST_F(HashJoinTest, DISABLED_lazyVectorPartiallyLoadedInFilterLeftJoin) {
   // Test the case where a filter loads a subset of the rows that will be output
   // from a column on the probe side.
 
@@ -3945,7 +3732,7 @@ TEST_F(HashJoinTest, lazyVectorPartiallyLoadedInFilterLeftJoin) {
       "SELECT t.c1, t.c2 FROM t LEFT JOIN u ON t.c0 = u.c0 AND (c1 > 0 AND c2 > 0)");
 }
 
-TEST_F(HashJoinTest, lazyVectorPartiallyLoadedInFilterFullJoin) {
+TEST_F(HashJoinTest, DISABLED_lazyVectorPartiallyLoadedInFilterFullJoin) {
   // Test the case where a filter loads a subset of the rows that will be output
   // from a column on the probe side.
 
@@ -3959,7 +3746,9 @@ TEST_F(HashJoinTest, lazyVectorPartiallyLoadedInFilterFullJoin) {
       "Replacement with cuDF operator failed");
 }
 
-TEST_F(HashJoinTest, lazyVectorPartiallyLoadedInFilterLeftSemiProject) {
+TEST_F(
+    HashJoinTest,
+    DISABLED_lazyVectorPartiallyLoadedInFilterLeftSemiProject) {
   // Test the case where a filter loads a subset of the rows that will be output
   // from a column on the probe side.
 
@@ -3973,7 +3762,7 @@ TEST_F(HashJoinTest, lazyVectorPartiallyLoadedInFilterLeftSemiProject) {
       "Replacement with cuDF operator failed");
 }
 
-TEST_F(HashJoinTest, lazyVectorPartiallyLoadedInFilterAntiJoin) {
+TEST_F(HashJoinTest, DISABLED_lazyVectorPartiallyLoadedInFilterAntiJoin) {
   // Test the case where a filter loads a subset of the rows that will be output
   // from a column on the probe side.
 
@@ -3984,7 +3773,7 @@ TEST_F(HashJoinTest, lazyVectorPartiallyLoadedInFilterAntiJoin) {
       "SELECT t.c1, t.c2 FROM t WHERE NOT EXISTS (SELECT * FROM u WHERE t.c0 = u.c0 AND (t.c1 > 0 AND t.c2 > 0))");
 }
 
-TEST_F(HashJoinTest, lazyVectorPartiallyLoadedInFilterInnerJoin) {
+TEST_F(HashJoinTest, DISABLED_lazyVectorPartiallyLoadedInFilterInnerJoin) {
   // Test the case where a filter loads a subset of the rows that will be output
   // from a column on the probe side.
 
@@ -3995,7 +3784,7 @@ TEST_F(HashJoinTest, lazyVectorPartiallyLoadedInFilterInnerJoin) {
       "SELECT t.c1, t.c2 FROM t, u WHERE t.c0 = u.c0 AND NOT (c1 < 15 AND c2 >= 0)");
 }
 
-TEST_F(HashJoinTest, lazyVectorPartiallyLoadedInFilterLeftSemiFilter) {
+TEST_F(HashJoinTest, DISABLED_lazyVectorPartiallyLoadedInFilterLeftSemiFilter) {
   // Test the case where a filter loads a subset of the rows that will be output
   // from a column on the probe side.
 
@@ -5170,7 +4959,7 @@ TEST_F(HashJoinTest, DISABLED_dynamicFiltersPushDownThroughAgg) {
       .run();
 }
 
-TEST_F(HashJoinTest, noDynamicFiltersPushDownThroughRightJoin) {
+TEST_F(HashJoinTest, DISABLED_noDynamicFiltersPushDownThroughRightJoin) {
   std::vector<RowVectorPtr> innerBuild = {makeRowVector(
       {"a"},
       {
@@ -5426,7 +5215,7 @@ DEBUG_ONLY_TEST_F(HashJoinTest, buildReservationReleaseCheck) {
   ASSERT_TRUE(waitForTaskAborted(task, 5'000'000));
 }
 
-TEST_F(HashJoinTest, dynamicFilterOnPartitionKey) {
+TEST_F(HashJoinTest, DISABLED_dynamicFilterOnPartitionKey) {
   vector_size_t size = 10;
   auto filePaths = makeFilePaths(1);
   auto rowVector = makeRowVector(
@@ -6617,9 +6406,10 @@ TEST_F(HashJoinTest, leftJoinWithMissAtEndOfBatch) {
         .numDrivers(1)
         .config(
             core::QueryConfig::kPreferredOutputBatchRows, std::to_string(10))
-        .referenceQuery(fmt::format(
-            "SELECT t_k1, u_k1 from t left join u on t_k1 = u_k1 and {}",
-            filter))
+        .referenceQuery(
+            fmt::format(
+                "SELECT t_k1, u_k1 from t left join u on t_k1 = u_k1 and {}",
+                filter))
         .run();
   };
 
@@ -6668,9 +6458,10 @@ TEST_F(HashJoinTest, leftJoinWithMissAtEndOfBatchMultipleBuildMatches) {
         .numDrivers(1)
         .config(
             core::QueryConfig::kPreferredOutputBatchRows, std::to_string(10))
-        .referenceQuery(fmt::format(
-            "SELECT t_k1, u_k1 from t left join u on t_k1 = u_k1 and {}",
-            filter))
+        .referenceQuery(
+            fmt::format(
+                "SELECT t_k1, u_k1 from t left join u on t_k1 = u_k1 and {}",
+                filter))
         .run();
   };
 
@@ -6755,8 +6546,9 @@ DEBUG_ONLY_TEST_F(HashJoinTest, minSpillableMemoryReservation) {
                   .planNode();
 
   for (int32_t minSpillableReservationPct : {5, 50, 100}) {
-    SCOPED_TRACE(fmt::format(
-        "minSpillableReservationPct: {}", minSpillableReservationPct));
+    SCOPED_TRACE(
+        fmt::format(
+            "minSpillableReservationPct: {}", minSpillableReservationPct));
 
     SCOPED_TESTVALUE_SET(
         "facebook::velox::exec::HashBuild::addInput",

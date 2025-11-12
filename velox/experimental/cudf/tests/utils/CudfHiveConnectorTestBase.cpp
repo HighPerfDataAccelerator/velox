@@ -18,12 +18,12 @@
 #include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/tests/utils/CudfHiveConnectorTestBase.h"
-#include "velox/experimental/cudf/vector/CudfVector.h"
 
 #include "velox/common/base/Exceptions.h"
 #include "velox/common/file/FileSystems.h"
 #include "velox/common/file/tests/FaultyFileSystem.h"
 #include "velox/connectors/hive/HiveConnector.h"
+#include "velox/connectors/hive/storage_adapters/s3fs/RegisterS3FileSystem.h"
 #include "velox/dwio/common/FileSink.h"
 #include "velox/dwio/common/tests/utils/BatchMaker.h"
 #include "velox/exec/Driver.h"
@@ -40,8 +40,6 @@
 namespace facebook::velox::cudf_velox::exec::test {
 
 namespace {
-
-using namespace facebook::velox::cudf_velox;
 
 void fillColumnNames(
     cudf::io::table_input_metadata& tableMeta,
@@ -69,6 +67,7 @@ using facebook::velox::connector::hive::HiveConnectorFactory;
 
 CudfHiveConnectorTestBase::CudfHiveConnectorTestBase() {
   filesystems::registerLocalFileSystem();
+  filesystems::registerS3FileSystem();
   tests::utils::registerFaultyFileSystem();
 }
 

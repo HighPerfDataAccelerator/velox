@@ -490,6 +490,12 @@ class QueryConfig {
   static constexpr const char* kDriverCpuTimeSliceLimitMs =
       "driver_cpu_time_slice_limit_ms";
 
+  /// Window operator can be configured to sub-divide window partitions on each
+  /// thread of execution into groups of partitions for sequential processing.
+  /// This setting specifies how many sub-partitions to create for each thread.
+  static constexpr const char* kWindowNumSubPartitions =
+      "window_num_sub_partitions";
+
   /// Maximum number of bytes to use for the normalized key in prefix-sort. Use
   /// 0 to disable prefix-sort.
   static constexpr const char* kPrefixSortNormalizedKeyMaxBytes =
@@ -723,13 +729,6 @@ class QueryConfig {
   /// username.
   static constexpr const char* kClientTags = "client_tags";
 
-#ifdef VELOX_ENABLE_BACKWARD_COMPATIBILITY
-  /// Enable (reader) row size tracker as a fallback to file level row size
-  /// estimates.
-  static constexpr const char* kRowSizeTrackingEnabled =
-      "row_size_tracking_enabled";
-#endif
-
   /// Enable (reader) row size tracker as a fallback to file level row size
   /// estimates.
   static constexpr const char* kRowSizeTrackingMode = "row_size_tracking_mode";
@@ -743,12 +742,6 @@ class QueryConfig {
   bool selectiveNimbleReaderEnabled() const {
     return get<bool>(kSelectiveNimbleReaderEnabled, false);
   }
-
-#ifdef VELOX_ENABLE_BACKWARD_COMPATIBILITY
-  bool rowSizeTrackingEnabled() const {
-    return get<bool>(kRowSizeTrackingEnabled, true);
-  }
-#endif
 
   RowSizeTrackingMode rowSizeTrackingMode() const {
     return get<RowSizeTrackingMode>(
@@ -791,7 +784,7 @@ class QueryConfig {
   }
 
   uint8_t debugBingTileChildrenMaxZoomShift() const {
-    return get<uint8_t>(kDebugBingTileChildrenMaxZoomShift, 5);
+    return get<uint8_t>(kDebugBingTileChildrenMaxZoomShift, 6);
   }
 
   uint64_t queryMaxMemoryPerNode() const {
@@ -1224,6 +1217,10 @@ class QueryConfig {
 
   uint32_t driverCpuTimeSliceLimitMs() const {
     return get<uint32_t>(kDriverCpuTimeSliceLimitMs, 0);
+  }
+
+  uint32_t windowNumSubPartitions() const {
+    return get<uint32_t>(kWindowNumSubPartitions, 1);
   }
 
   uint32_t prefixSortNormalizedKeyMaxBytes() const {
