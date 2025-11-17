@@ -33,7 +33,8 @@ profile=${3:-"false"}
 output_batch_rows=${BATCH_SIZE_ROWS:-100000}
 cudf_chunk_read_limit=$((1024 * 1024 * 1024 * 1))
 cudf_pass_read_limit=0
-# VELOX_CUDF_MEMORY_RESOURCE="async"
+VELOX_CUDF_MEMORY_RESOURCE="async"
+VELOX_CUDF_MEMORY_PERCENT=0
 
 for query_number in ${queries}; do
   printf -v query_number '%02d' "${query_number}"
@@ -47,7 +48,7 @@ for query_number in ${queries}; do
     "gpu")
       num_drivers=${NUM_DRIVERS:-4}
       BENCHMARK_EXECUTABLE=./_build/release/velox/experimental/cudf/benchmarks/velox_cudf_tpch_benchmark
-      CUDF_FLAGS="--cudf_chunk_read_limit=${cudf_chunk_read_limit} --cudf_pass_read_limit=${cudf_pass_read_limit}"
+      CUDF_FLAGS="--cudf_chunk_read_limit=${cudf_chunk_read_limit} --cudf_pass_read_limit=${cudf_pass_read_limit} --cudf_memory_resource=${VELOX_CUDF_MEMORY_RESOURCE} --cudf_memory_percent=${VELOX_CUDF_MEMORY_PERCENT}"
       ;;
     esac
     echo "Running query ${query_number} on ${device} with ${num_drivers} drivers."
