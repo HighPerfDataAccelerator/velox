@@ -14,11 +14,11 @@
  * limitations under the License.
  */
 
-#include "velox/experimental/cudf-exchange/CombinedCudfHttpExchange.h"
 #include "velox/experimental/cudf-exchange/CudfExchange.h"
 #include "velox/experimental/cudf-exchange/CudfExchangeClient.h"
 #include "velox/experimental/cudf-exchange/CudfPartitionedOutput.h"
 #include "velox/experimental/cudf-exchange/ExchangeClientFacade.h"
+#include "velox/experimental/cudf-exchange/HybridExchange.h"
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConnector.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveDataSource.h"
@@ -353,6 +353,10 @@ bool CompileState::compile(bool allowCpuFallback) {
           getPlanNode(oper->planNodeId()));
       VELOX_CHECK(planNode != nullptr);
       keepOperator = 1;
+      // We don't make a new type of table scan operator but use the existing
+      // type. But we need to update the connector so we'll make a new plan node
+      // from the old one and use that to construct the new operator of the same
+      // type but with the updated connector
     } else if (isJoinSupported(oper)) {
       if (auto joinBuildOp = dynamic_cast<exec::HashBuild*>(oper)) {
         auto planNode = std::dynamic_pointer_cast<const core::HashJoinNode>(
@@ -460,7 +464,7 @@ bool CompileState::compile(bool allowCpuFallback) {
           // The following std::move transfers the ownership of the
           // HttpExchangeClient to the facade, preventing that it is closed when
           // the ExchangeOperator is destructed after being replace by the
-          // CombinedCudfHttpExchange.
+          // HybridExchange.
           auto veloxExchangeClient = exchangeOp->releaseExchangeClient();
           VELOX_CHECK_NOT_NULL(
               veloxExchangeClient, "Velox exchange client can't be null.");
@@ -468,8 +472,7 @@ bool CompileState::compile(bool allowCpuFallback) {
           auto cudfClient = std::make_shared<CudfExchangeClient>(
               oper->taskId(),
               veloxExchangeClient->getDestination(),
-              veloxExchangeClient->getNumberOfConsumers(),
-              veloxExchangeClient->getExecutor());
+              veloxExchangeClient->getNumberOfConsumers());
           client = std::make_shared<ExchangeClientFacade>(
               std::move(cudfClient), std::move(veloxExchangeClient));
           TaskPlanNodeKey key(oper->taskId(), oper->planNodeId());
@@ -481,8 +484,7 @@ bool CompileState::compile(bool allowCpuFallback) {
           exchangeOp->resetExchangeClient();
         }
         replaceOp.push_back(
-            std::make_unique<CombinedCudfHttpExchange>(
-                id, ctx, planNode, client));
+            std::make_unique<HybridExchange>(id, ctx, planNode, client));
       }
     } else if (
         auto localExchangeOp = dynamic_cast<exec::LocalExchange*>(oper)) {
@@ -496,12 +498,11 @@ bool CompileState::compile(bool allowCpuFallback) {
             std::dynamic_pointer_cast<const core::MergeExchangeNode>(
                 getPlanNode(oper->planNodeId()));
         VELOX_CHECK(planNode != nullptr);
-        // create a CombinedCudfHttpExchange operator for the merge exchange.
-        // Pass a nullptr to force the CombinedCudfHttpExchange op to create its
+        // create a HybridExchange operator for the merge exchange.
+        // Pass a nullptr to force the HybridExchange op to create its
         // own, private CudfExchangeClient.
         replaceOp.push_back(
-            std::make_unique<CombinedCudfHttpExchange>(
-                id, ctx, planNode, nullptr));
+            std::make_unique<HybridExchange>(id, ctx, planNode, nullptr));
         // Add an order-by node. SortingKeys and SortOrders will be taken from
         // the MergeExchangeNode.
         replaceOp.push_back(std::make_unique<CudfOrderBy>(id, ctx, planNode));
@@ -531,7 +532,6 @@ bool CompileState::compile(bool allowCpuFallback) {
           exec::StreamingAggregation,
           exec::Limit,
           exec::LocalPartition,
-          exec::LocalExchange,
           exec::FilterProject,
           exec::AssignUniqueId,
           CudfOperator>(op);
@@ -556,7 +556,10 @@ bool CompileState::compile(bool allowCpuFallback) {
                 << ", GPU operator condition = " << condition;
     }
     if (!allowCpuFallback) {
-      VELOX_CHECK(condition, "Replacement with cuDF operator failed");
+      VELOX_CHECK(
+          condition,
+          "Replacement with cuDF operator failed. Falling back to CPU execution for operator: {}",
+          oper->toString());
     } else if (!condition) {
       LOG(WARNING)
           << "Replacement with cuDF operator failed. Falling back to CPU execution";
