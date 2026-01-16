@@ -287,7 +287,6 @@ bool CompileState::compile(bool allowCpuFallback) {
       isSupportedGpuOperator);
   auto acceptsGpuInput =
       [isFilterProjectSupported,
-       isJoinSupported,
        isAggregationSupported,
        isJoinSupported,
        isPartitionedOutputSupported](const exec::Operator* op) {
@@ -541,7 +540,7 @@ bool CompileState::compile(bool allowCpuFallback) {
                 << oper->toString() << ", keepOperator = " << keepOperator
                 << ", replaceOp.size() = " << replaceOp.size();
     }
-    auto GpuReplacedOperator = [](const exec::Operator* op) {
+    auto isGpuReplaceableOperator = [](const exec::Operator* op) {
       return isAnyOf<
           exec::OrderBy,
           exec::TopN,
@@ -552,27 +551,29 @@ bool CompileState::compile(bool allowCpuFallback) {
           exec::Limit,
           exec::LocalPartition,
           exec::FilterProject,
-          exec::AssignUniqueId,
-          CudfOperator>(op);
+          exec::AssignUniqueId>(op);
     };
-    auto GpuRetainedOperator =
+    auto isGpuAgnosticOperator =
         [isTableScanSupported](const exec::Operator* op) {
-          return isAnyOf<exec::Values, exec::LocalExchange, exec::CallbackSink>(
-                     op) ||
+          return isAnyOf<
+                     exec::Values,
+                     exec::LocalPartition,
+                     exec::LocalExchange,
+                     exec::CallbackSink>(op) ||
               (isAnyOf<exec::TableScan>(op) && isTableScanSupported(op));
         };
     // If GPU operator is supported, then replaceOp should be non-empty and
     // the operator should not be retained Else the velox operator is retained
     // as-is
-    auto condition = (GpuReplacedOperator(oper) && !replaceOp.empty() &&
+    auto condition = (isGpuReplaceableOperator(oper) && !replaceOp.empty() &&
                       keepOperator == 0) ||
-        (GpuRetainedOperator(oper) && replaceOp.empty() && keepOperator == 1);
+        (isGpuAgnosticOperator(oper) && replaceOp.empty() && keepOperator == 1);
     if (CudfConfig::getInstance().debugEnabled) {
-      LOG(INFO) << "Operator: ID " << oper->operatorId() << ": "
-                << oper->toString() << " Replacement condition: "
-                << "GpuReplacedOperator = " << GpuReplacedOperator(oper)
-                << ", GpuRetainedOperator = " << GpuRetainedOperator(oper)
-                << ", GPU operator condition = " << condition;
+      LOG(INFO) << "isGpuReplaceableOperator = "
+                << isGpuReplaceableOperator(oper)
+                << ", isGpuAgnosticOperator = " << isGpuAgnosticOperator(oper)
+                << std::endl;
+      LOG(INFO) << "GPU operator condition = " << condition << std::endl;
     }
     if (!allowCpuFallback) {
       VELOX_CHECK(
@@ -581,11 +582,25 @@ bool CompileState::compile(bool allowCpuFallback) {
           oper->toString());
     } else if (!condition) {
       LOG(WARNING)
-          << "Replacement with cuDF operator failed. Falling back to CPU execution";
-      LOG(WARNING) << "Replacement Failed Operator: " << oper->toString();
-      auto planNode = getPlanNode(oper->planNodeId());
-      LOG(WARNING) << "Replacement Failed PlanNode: "
-                   << planNode->toString(true, false);
+          << "Replacement with cuDF operator failed. Falling back to CPU execution for operator:"
+          << oper->toString();
+      // DNB: There's no plan node for the CallbackSink operator
+      // that reports "N/A" as the planNodeId.
+      if (CudfConfig::getInstance().debugEnabled &&
+          oper->planNodeId() != "N/A") {
+        // print input types, output types
+        auto planNode = getPlanNode(oper->planNodeId());
+        LOG(INFO) << "Output type: " << planNode->outputType()->toString();
+        if (!planNode->sources().empty()) {
+          std::vector<std::string> inputTypes;
+          for (auto& source : planNode->sources()) {
+            inputTypes.push_back(source->outputType()->toString());
+          }
+          LOG(INFO) << "Input types: " << folly::join(", ", inputTypes);
+        } else {
+          LOG(INFO) << "Input types: <none - source operator>";
+        }
+      }
     }
 
     if (not replaceOp.empty()) {
@@ -731,7 +746,6 @@ void CudfConfig::initialize(
   if (config.find(kUcxxBlockingPolling) != config.end()) {
     ucxxBlockingPolling = folly::to<bool>(config[kUcxxBlockingPolling]);
   }
-
 }
 
 } // namespace facebook::velox::cudf_velox
