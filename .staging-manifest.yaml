@@ -1,0 +1,36 @@
+# Staging Branch Manifest
+# This file describes how this staging branch was created
+
+metadata:
+  generated_at: "2026-01-28T18:06:39Z"
+  target_repository: "rapidsai/velox"
+  target_branch: "staging"
+  dated_branch: "staging_01-28-2026"
+
+base:
+  repository: "facebookincubator/velox"
+  branch: "main"
+  commit: "6280634669da3b164534677a4b5db621e1f26876"
+  url: "https://github.com/facebookincubator/velox/tree/6280634669da3b164534677a4b5db621e1f26876"
+
+merged_prs:
+  - number: 16037
+    commit: "74416393f34a2fd3a1b4805704e9c0dbcbd8c30d"
+    author: "dan13bauer"
+    title: "feat(Cudf): Upgrade cudf-exchange to version 2026-01-09"
+    url: "https://github.com/facebookincubator/velox/pull/16037"
+  - number: 15831
+    commit: "32e9e9bdb56c747e366a531b4ec5924dbbb4128f"
+    author: "karthikeyann"
+    title: "refactor(cudf): Improve debug printing for cudf "
+    url: "https://github.com/facebookincubator/velox/pull/15831"
+  - number: 15529
+    commit: "4a62d196d44b1c81d32c2d446e5508310ea2a82c"
+    author: "mattgara"
+    title: "feat(cudf): Check signatures of aggregate functions before replacing with `cudf` variants"
+    url: "https://github.com/facebookincubator/velox/pull/15529"
+  - number: 15404
+    commit: "9ebda67da66ede0944d410fd8505e9ddbbdf76b5"
+    author: "zoltan"
+    title: "feat: PartitionedOutputNode must distinguish the root of a plan"
+    url: "https://github.com/facebookincubator/velox/pull/15404"
