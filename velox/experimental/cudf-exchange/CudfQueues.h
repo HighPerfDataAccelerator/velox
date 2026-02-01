@@ -16,9 +16,11 @@
 #pragma once
 
 #include <cudf/contiguous_split.hpp>
+#include <rmm/cuda_stream_view.hpp>
 #include <deque>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <vector>
 #include "velox/core/PlanNode.h"
 #include "velox/exec/OutputBuffer.h" // for the Stats structure
@@ -26,17 +28,84 @@
 
 namespace facebook::velox::cudf_exchange {
 
+/// @brief RAII wrapper for CUDA events with reference counting.
+/// Multiple PackedColumnsWithEvent objects can share the same event when they
+/// are produced by the same GPU operation (e.g., partitions from one split).
+struct CudaEventRef {
+  cudaEvent_t event{nullptr};
+
+  CudaEventRef() = default;
+  explicit CudaEventRef(cudaEvent_t e) : event(e) {}
+
+  ~CudaEventRef() {
+    if (event != nullptr) {
+      cudaEventDestroy(event);
+    }
+  }
+
+  // Non-copyable
+  CudaEventRef(const CudaEventRef&) = delete;
+  CudaEventRef& operator=(const CudaEventRef&) = delete;
+};
+
+/// @brief Wrapper for packed_columns with an optional CUDA event for
+/// synchronization. The event is recorded after GPU operations complete,
+/// allowing consumers to wait on it instead of blocking stream synchronization.
+struct PackedColumnsWithEvent {
+  std::unique_ptr<cudf::packed_columns> data;
+  /// Optional CUDA event recorded after the data was produced.
+  /// If set, consumers should wait on this event before using the data.
+  /// Using shared_ptr for reference counting when multiple partitions share
+  /// the same event (e.g., from a single contiguous_split operation).
+  std::shared_ptr<CudaEventRef> readyEvent;
+
+  PackedColumnsWithEvent() = default;
+  explicit PackedColumnsWithEvent(std::unique_ptr<cudf::packed_columns> d)
+      : data(std::move(d)), readyEvent(nullptr) {}
+  PackedColumnsWithEvent(
+      std::unique_ptr<cudf::packed_columns> d,
+      cudaEvent_t event)
+      : data(std::move(d)),
+        readyEvent(event ? std::make_shared<CudaEventRef>(event) : nullptr) {}
+  PackedColumnsWithEvent(
+      std::unique_ptr<cudf::packed_columns> d,
+      std::shared_ptr<CudaEventRef> eventRef)
+      : data(std::move(d)), readyEvent(std::move(eventRef)) {}
+
+  // Move-only
+  PackedColumnsWithEvent(PackedColumnsWithEvent&&) = default;
+  PackedColumnsWithEvent& operator=(PackedColumnsWithEvent&&) = default;
+  PackedColumnsWithEvent(const PackedColumnsWithEvent&) = delete;
+  PackedColumnsWithEvent& operator=(const PackedColumnsWithEvent&) = delete;
+
+  /// Wait for the event to complete (if one exists).
+  /// Should be called before reading the data.
+  void waitForReady() const {
+    if (readyEvent && readyEvent->event != nullptr) {
+      cudaEventSynchronize(readyEvent->event);
+    }
+  }
+
+  /// Check if the event has completed without blocking.
+  /// Returns true if no event or if event has completed.
+  [[nodiscard]] bool isReady() const {
+    if (!readyEvent || readyEvent->event == nullptr) {
+      return true;
+    }
+    return cudaEventQuery(readyEvent->event) == cudaSuccess;
+  }
+};
+
 /// @brief  Callback function for getting data from the queues.
-/// A nullptr indicates that there is no more data.
+/// A nullptr data indicates that there is no more data.
 /// The remainingBytes vector contains the sizes for the
 /// packed_columns elements remaining in the queue.
-using CudfDataAvailableCallback = std::function<void(
-    std::unique_ptr<cudf::packed_columns> data,
-    std::vector<int64_t> remainingBytes)>;
+using CudfDataAvailableCallback = std::function<
+    void(PackedColumnsWithEvent data, std::vector<int64_t> remainingBytes)>;
 
 struct CudfDataAvailable {
   CudfDataAvailableCallback callback{nullptr};
-  std::unique_ptr<cudf::packed_columns> data;
+  PackedColumnsWithEvent data;
   std::vector<int64_t> remainingBytes;
 
   void notify() {
@@ -69,16 +138,16 @@ class CudfDestinationQueue {
   };
 
   /// @brief Enqueues the data to the back of the queue.
-  /// @param data Corresponds to a RowVector
-  void enqueueBack(std::unique_ptr<cudf::packed_columns> data);
+  /// @param data Corresponds to a RowVector, with optional CUDA event.
+  void enqueueBack(PackedColumnsWithEvent data);
 
   /// @brief Enqueues the data to the front of the queue. This is needed when
   /// a transfer fails.
   /// @param data
-  void enqueueFront(std::unique_ptr<cudf::packed_columns> data);
+  void enqueueFront(PackedColumnsWithEvent data);
 
   struct Data {
-    std::unique_ptr<cudf::packed_columns> data;
+    PackedColumnsWithEvent data;
     std::vector<int64_t> remainingBytes;
     /// Whether the result is returned immediately without invoking the `notify'
     /// callback.
@@ -109,7 +178,7 @@ class CudfDestinationQueue {
  private:
   void clearNotify();
 
-  std::deque<std::unique_ptr<cudf::packed_columns>> queue_;
+  std::deque<PackedColumnsWithEvent> queue_;
   CudfDataAvailableCallback notify_{nullptr};
   Stats stats_;
 };
@@ -162,12 +231,9 @@ class CudfOutputQueue {
   /// > numDestinations, then this will be dynamically adapted like it is done
   /// in OutputQueue.
   /// @param destination The destination, must be < numDestinations.
-  /// @param data The data.
+  /// @param data The data with optional CUDA event.
   /// @param numRows The number of rows in the data.
-  void enqueue(
-      int destination,
-      std::unique_ptr<cudf::packed_columns> data,
-      int32_t numRows);
+  void enqueue(int destination, PackedColumnsWithEvent data, int32_t numRows);
 
   /// @brief Checks if the queue is over capacity and returns a future if so.
   /// This should be called after enqueueing all partitions for a batch.
@@ -238,7 +304,7 @@ class CudfOutputQueue {
 
   bool enqueuePartitionedOutputLocked(
       int destination,
-      std::unique_ptr<cudf::packed_columns> data,
+      PackedColumnsWithEvent data,
       std::vector<CudfDataAvailable>& dataAvailableCbs);
 
   // Reference to the task that owns this CudfQueue.

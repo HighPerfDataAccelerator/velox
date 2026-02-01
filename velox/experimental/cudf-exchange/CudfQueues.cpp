@@ -41,23 +41,22 @@ void CudfDestinationQueue::Stats::recordDequeue(
   }
 }
 
-void CudfDestinationQueue::enqueueBack(
-    std::unique_ptr<cudf::packed_columns> data) {
+void CudfDestinationQueue::enqueueBack(PackedColumnsWithEvent data) {
   // drop duplicate end markers.
-  if (data == nullptr && !queue_.empty() && queue_.back() == nullptr) {
+  if (data.data == nullptr && !queue_.empty() &&
+      queue_.back().data == nullptr) {
     return;
   }
 
-  if (data != nullptr) {
-    stats_.recordEnqueue(data.get());
+  if (data.data != nullptr) {
+    stats_.recordEnqueue(data.data.get());
   }
   queue_.push_back(std::move(data));
 }
 
-void CudfDestinationQueue::enqueueFront(
-    std::unique_ptr<cudf::packed_columns> data) {
+void CudfDestinationQueue::enqueueFront(PackedColumnsWithEvent data) {
   // ignore nullptr.
-  if (data == nullptr) {
+  if (data.data == nullptr) {
     return;
   }
 
@@ -76,24 +75,24 @@ CudfDestinationQueue::Data CudfDestinationQueue::getData(
   // queue is not empty.
   auto data = std::move(queue_.front());
   queue_.pop_front();
-  stats_.recordDequeue(data.get());
+  stats_.recordDequeue(data.data.get());
 
   std::vector<int64_t> remainingBytes;
   remainingBytes.reserve(queue_.size());
   // fill in the remainingbytes vector.
   for (std::size_t i = 0; i < queue_.size(); ++i) {
-    if (queue_[i] == nullptr) {
+    if (queue_[i].data == nullptr) {
       VELOX_CHECK_EQ(i, queue_.size() - 1, "null marker found in the middle");
       break;
     }
-    remainingBytes.push_back(queue_[i]->gpu_data->size());
+    remainingBytes.push_back(queue_[i].data->gpu_data->size());
   }
   return {std::move(data), std::move(remainingBytes), true};
 }
 
 void CudfDestinationQueue::deleteResults() {
   for (auto i = 0; i < queue_.size(); ++i) {
-    if (queue_[i] == nullptr) {
+    if (queue_[i].data == nullptr) {
       VELOX_CHECK_EQ(i, queue_.size() - 1, "null marker found in the middle");
       break;
     }
@@ -192,9 +191,9 @@ void CudfOutputQueue::updateNumDrivers(uint32_t newNumDrivers) {
 
 void CudfOutputQueue::enqueue(
     int destination,
-    std::unique_ptr<cudf::packed_columns> data,
+    PackedColumnsWithEvent data,
     int32_t numRows) {
-  VELOX_CHECK_NOT_NULL(data);
+  VELOX_CHECK_NOT_NULL(data.data);
   VELOX_CHECK_NOT_NULL(task_);
   VELOX_CHECK(
       task_->isRunning(), "Task is terminated, cannot add data to output.");
@@ -204,7 +203,7 @@ void CudfOutputQueue::enqueue(
     VELOX_CHECK_LT(destination, queues_.size());
 
     // TODO: Support other output modes as well. This is only for partitioned.
-    auto numBytes = data->gpu_data->size();
+    auto numBytes = data.data->gpu_data->size();
     if (enqueuePartitionedOutputLocked(
             destination, std::move(data), dataAvailableCallbacks)) {
       // enqueueing was successful - update the stats.
@@ -246,10 +245,10 @@ void CudfOutputQueue::getData(
     // have been removed. In this case, no data is returned.
     if (queue) {
       data = queue->getData([notify, this](
-                                std::unique_ptr<cudf::packed_columns> data,
+                                PackedColumnsWithEvent data,
                                 std::vector<int64_t> remainingBytes) {
         std::vector<ContinuePromise> promises;
-        int64_t bytes = data ? data->gpu_data->size() : -1L;
+        int64_t bytes = data.data ? data.data->gpu_data->size() : -1L;
         notify(std::move(data), std::move(remainingBytes));
         if (bytes >= 0L) {
           std::lock_guard<std::mutex> l(mutex_);
@@ -266,13 +265,14 @@ void CudfOutputQueue::getData(
           promise.setValue();
         }
       });
-      if (data.data) {
+      if (data.data.data) {
         // This implies data.immediate and no notify upcall will be done.
         // Need to update the stats here.
-        updateStatsWithFreedLocked(data.data->gpu_data->size(), 1L, promises);
+        updateStatsWithFreedLocked(
+            data.data.data->gpu_data->size(), 1L, promises);
       }
     } else {
-      data = CudfDestinationQueue::Data{nullptr, {}, true};
+      data = CudfDestinationQueue::Data{{}, {}, true};
     }
   }
   // outside lock: If we have data, then return it immediately.
@@ -312,7 +312,8 @@ void CudfOutputQueue::checkIfDone(bool oneDriverFinished) {
     }
     for (auto& queue : queues_) {
       if (queue != nullptr) {
-        queue->enqueueBack(nullptr);
+        // Enqueue end-of-stream marker (empty PackedColumnsWithEvent)
+        queue->enqueueBack(PackedColumnsWithEvent{});
         finished.push_back(queue->getAndClearNotify());
       }
     }
@@ -325,7 +326,7 @@ void CudfOutputQueue::checkIfDone(bool oneDriverFinished) {
 
 bool CudfOutputQueue::enqueuePartitionedOutputLocked(
     int destination,
-    std::unique_ptr<cudf::packed_columns> data,
+    PackedColumnsWithEvent data,
     std::vector<CudfDataAvailable>& dataAvailableCbs) {
   VELOX_DCHECK(dataAvailableCbs.empty());
   VELOX_CHECK_LT(destination, queues_.size());

@@ -135,8 +135,11 @@ class CudfExchangeServer
   bool isIntraNodeTransfer_{false};
 
   std::atomic<ServerState> state_;
-  std::unique_ptr<cudf::packed_columns> dataPtr_{nullptr};
-  std::recursive_mutex dataMutex_; // mutex for above ptr.
+  /// Data received from the output queue, including optional CUDA event for
+  /// synchronization. The event (if present) must be waited on before using
+  /// the data.
+  PackedColumnsWithEvent dataHolder_;
+  std::recursive_mutex dataMutex_; // mutex for above data holder.
   std::atomic<bool> closed_{false};
 
   /// Future for intra-node transfer - signaled when source retrieves data.

@@ -50,12 +50,12 @@ class CudfOutputQueueManager {
   /// @param taskId The unique task Id.
   /// @param destination The destination (partition, queue number) into which
   /// the data is queued.
-  /// @param txData The data to enqueue.
+  /// @param txData The data to enqueue with optional CUDA event.
   /// @param numRows The number of rows in the data.
   void enqueue(
       const std::string& taskId,
       int destination,
-      std::unique_ptr<cudf::packed_columns> txData,
+      PackedColumnsWithEvent txData,
       int32_t numRows);
 
   /// @brief Checks if the queue for a task is over capacity.

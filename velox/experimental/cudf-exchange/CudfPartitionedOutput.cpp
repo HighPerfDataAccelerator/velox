@@ -115,19 +115,34 @@ void CudfPartitionedOutput::addInput(RowVectorPtr input) {
     } else {
       // Single partition case. No need to hash, assume queue zero
       auto packedCols = cudf::pack(tableView, stream);
-      // Sync the stream since UCXX/UCX is not stream oriented and without
-      // syncing, data could get lost. Syncing here is  easy but notthe most
-      // efficient. A better approach is to create an event and pass it along
-      // the data through the queue and synchronize on the event before calling
-      // into UCXX.
-      // TODO: change stream sync and move to event sync
-      // Thanks to Lawrence Mitchel for pointing this out!
-      stream.synchronize();
+
+      // Create a CUDA event and record it on the stream after GPU operations.
+      // The consumer will wait on this event before using the data, avoiding
+      // the need for a blocking stream synchronization here.
+      cudaEvent_t readyEvent;
+      cudaError_t createErr =
+          cudaEventCreateWithFlags(&readyEvent, cudaEventDisableTiming);
+      VELOX_CHECK_EQ(
+          createErr,
+          cudaSuccess,
+          "cudaEventCreateWithFlags failed: {}",
+          cudaGetErrorString(createErr));
+      cudaError_t recordErr = cudaEventRecord(readyEvent, stream.value());
+      VELOX_CHECK_EQ(
+          recordErr,
+          cudaSuccess,
+          "cudaEventRecord failed: {}",
+          cudaGetErrorString(recordErr));
+
       std::unique_ptr<cudf::packed_columns> packedColsPtr =
           std::make_unique<cudf::packed_columns>(
               std::move(packedCols.metadata), std::move(packedCols.gpu_data));
+
+      // Enqueue data with the event for async synchronization
+      PackedColumnsWithEvent dataWithEvent(
+          std::move(packedColsPtr), readyEvent);
       queueManager->enqueue(
-          this->taskId(), 0, std::move(packedColsPtr), tableView.num_rows());
+          this->taskId(), 0, std::move(dataWithEvent), tableView.num_rows());
     }
     // Check once after all enqueues if we're blocked
     blocked = queueManager->checkBlocked(this->taskId(), &future_);
@@ -288,6 +303,28 @@ void CudfPartitionedOutput::splitAndEnqueue(
     rmm::cuda_stream_view stream) {
   auto contiguousTables = cudf::contiguous_split(tableView, offsets, stream);
 
+  // Create a CUDA event and record it on the stream after GPU operations.
+  // The consumer will wait on this event before using the data, avoiding
+  // the need for a blocking stream synchronization here.
+  // We use a shared_ptr to the event so multiple partitions can share
+  // ownership - the event will be destroyed when all partitions have been
+  // consumed.
+  cudaEvent_t rawEvent;
+  cudaError_t createErr =
+      cudaEventCreateWithFlags(&rawEvent, cudaEventDisableTiming);
+  VELOX_CHECK_EQ(
+      createErr,
+      cudaSuccess,
+      "cudaEventCreateWithFlags failed: {}",
+      cudaGetErrorString(createErr));
+  cudaError_t recordErr = cudaEventRecord(rawEvent, stream.value());
+  VELOX_CHECK_EQ(
+      recordErr,
+      cudaSuccess,
+      "cudaEventRecord failed: {}",
+      cudaGetErrorString(recordErr));
+  auto sharedEvent = std::make_shared<CudaEventRef>(rawEvent);
+
   VELOX_CHECK_EQ(
       offsets.size() + 1, numPartitions_, "mismatch in numPartitions_");
   auto queueManager = sharedQueueManager();
@@ -302,11 +339,14 @@ void CudfPartitionedOutput::splitAndEnqueue(
         std::move(contiguousTables[i].data.metadata),
         std::move(contiguousTables[i].data.gpu_data));
 
-    // enqueue partition data on Cudf Output Buffer
+    // Enqueue data with the shared event for async synchronization.
+    // All partitions from this split share the same event since they were
+    // all produced by the same contiguous_split operation on the same stream.
+    PackedColumnsWithEvent dataWithEvent(std::move(packedColsPtr), sharedEvent);
     queueManager->enqueue(
         this->taskId(),
         i,
-        std::move(packedColsPtr),
+        std::move(dataWithEvent),
         partitionTable.table.num_rows());
   }
 }

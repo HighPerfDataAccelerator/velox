@@ -56,7 +56,7 @@ void CudfOutputQueueManager::initializeTask(
 void CudfOutputQueueManager::enqueue(
     const std::string& taskId,
     int destination,
-    std::unique_ptr<cudf::packed_columns> txData,
+    PackedColumnsWithEvent txData,
     int numRows) {
   getQueue(taskId)->enqueue(destination, std::move(txData), numRows);
 }

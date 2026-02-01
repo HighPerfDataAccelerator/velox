@@ -15,6 +15,7 @@
  */
 #include "velox/experimental/cudf-exchange/CudfExchangeServer.h"
 #include <glog/logging.h>
+#include <rmm/cuda_stream_view.hpp>
 #include "cuda_runtime.h"
 #include "velox/experimental/cudf-exchange/Communicator.h"
 #include "velox/experimental/cudf-exchange/CudfExchangeProtocol.h"
@@ -73,7 +74,7 @@ void CudfExchangeServer::process() {
       communicator_->addToWorkQueue(getSelfPtr());
       break;
     case ServerState::ReadyToTransfer: {
-      // Fetch the data from CudfQueueManager and store it in the dataPtr_;
+      // Fetch the data from CudfQueueManager and store it in dataHolder_;
       setState(ServerState::WaitingForDataFromQueue);
       // Register the callback with the destination queue to get data.
       // If the queue doesn't exist yet, getData will create an empty
@@ -86,7 +87,7 @@ void CudfExchangeServer::process() {
           partitionKey_.taskId,
           partitionKey_.destination,
           [weakQueue](
-              std::unique_ptr<cudf::packed_columns> data,
+              PackedColumnsWithEvent data,
               std::vector<int64_t> remainingBytes) {
             auto self = weakQueue.lock();
             if (!self) {
@@ -107,9 +108,9 @@ void CudfExchangeServer::process() {
                     << self->partitionKey_.toString();
             std::lock_guard<std::recursive_mutex> lock(self->dataMutex_);
             VELOX_CHECK(
-                self->dataPtr_ == nullptr,
+                self->dataHolder_.data == nullptr,
                 "Data pointer exists: Illegal state!");
-            self->dataPtr_ = std::move(data);
+            self->dataHolder_ = std::move(data);
             self->setState(ServerState::DataReady);
             self->communicator_->addToWorkQueue(self);
           });
@@ -190,13 +191,18 @@ std::shared_ptr<CudfExchangeServer> CudfExchangeServer::getSelfPtr() {
 void CudfExchangeServer::sendData() {
   std::lock_guard<std::recursive_mutex> lock(dataMutex_);
 
+  // Wait for the CUDA event to ensure GPU operations have completed before
+  // sending data. This replaces blocking stream synchronization with
+  // event-based synchronization for better CPU/GPU overlap.
+  dataHolder_.waitForReady();
+
   if (isIntraNodeTransfer_) {
     // INTRA-NODE TRANSFER PATH: Use registry for all communication, no UCXX
     // needed
     sendStart_ = std::chrono::high_resolution_clock::now();
 
-    if (dataPtr_) {
-      bytes_ = dataPtr_->gpu_data->size();
+    if (dataHolder_.data) {
+      bytes_ = dataHolder_.data->gpu_data->size();
 
       VLOG(3) << "@" << partitionKey_.taskId
               << " Intra-node transfer: publishing data for sequence "
@@ -204,14 +210,18 @@ void CudfExchangeServer::sendData() {
 
       // Convert the data to shared_ptr for sharing with the source
       auto sharedData = std::make_shared<cudf::packed_columns>(
-          std::move(dataPtr_->metadata), std::move(dataPtr_->gpu_data));
-      dataPtr_.reset();
+          std::move(dataHolder_.data->metadata),
+          std::move(dataHolder_.data->gpu_data));
+      dataHolder_.data.reset();
 
       IntraNodeTransferKey key{
           partitionKey_.taskId, partitionKey_.destination, sequenceNumber_};
+      // The call to dataHolder_.waitForReady() above ensures the data is
+      // synchronized and ready for transfer. We pass default stream since no
+      // further GPU-side synchronization is needed.
       intraNodeRetrieveFuture_ =
           IntraNodeTransferRegistry::getInstance()->publish(
-              key, sharedData, /*atEnd=*/false);
+              key, sharedData, rmm::cuda_stream_default, /*atEnd=*/false);
       intraNodeAtEndPublished_ = false;
 
       // Transition to WaitingForIntraNodeRetrieve state
@@ -228,7 +238,7 @@ void CudfExchangeServer::sendData() {
           partitionKey_.taskId, partitionKey_.destination, sequenceNumber_};
       intraNodeRetrieveFuture_ =
           IntraNodeTransferRegistry::getInstance()->publish(
-              key, nullptr, /*atEnd=*/true);
+              key, nullptr, rmm::cuda_stream_default, /*atEnd=*/true);
       intraNodeAtEndPublished_ = true;
 
       queueMgr_->deleteResults(partitionKey_.taskId, partitionKey_.destination);
@@ -241,9 +251,9 @@ void CudfExchangeServer::sendData() {
     // REMOTE EXCHANGE PATH: Use UCXX for metadata and data transfer
     std::shared_ptr<MetadataMsg> metadataMsg = std::make_shared<MetadataMsg>();
 
-    if (dataPtr_) {
-      metadataMsg->cudfMetadata = std::move(dataPtr_->metadata);
-      metadataMsg->dataSizeBytes = dataPtr_->gpu_data->size();
+    if (dataHolder_.data) {
+      metadataMsg->cudfMetadata = std::move(dataHolder_.data->metadata);
+      metadataMsg->dataSizeBytes = dataHolder_.data->gpu_data->size();
       metadataMsg->remainingBytes = {};
       metadataMsg->atEnd = false;
     } else {
@@ -295,15 +305,15 @@ void CudfExchangeServer::sendData() {
         serializedMetadata);
 
     // send the data chunk (if any)
-    if (dataPtr_) {
+    if (dataHolder_.data) {
       sendStart_ = std::chrono::high_resolution_clock::now();
-      bytes_ = dataPtr_->gpu_data->size();
+      bytes_ = dataHolder_.data->gpu_data->size();
 
       VLOG(3) << "@" << partitionKey_.taskId
               << " Sending rmm::buffer: " << std::hex
-              << dataPtr_->gpu_data.get()
+              << dataHolder_.data->gpu_data.get()
               << " pointing to device memory: " << std::hex
-              << dataPtr_->gpu_data->data() << std::dec << " to task "
+              << dataHolder_.data->gpu_data->data() << std::dec << " to task "
               << partitionKey_.toString() << ":" << this->sequenceNumber_
               << std::dec << " of size " << bytes_;
 
@@ -314,8 +324,8 @@ void CudfExchangeServer::sendData() {
       // callback
       std::weak_ptr<CudfExchangeServer> weakData = weak_from_this();
       dataRequest_ = endpointRef_->endpoint_->tagSend(
-          dataPtr_->gpu_data->data(),
-          dataPtr_->gpu_data->size(),
+          dataHolder_.data->gpu_data->data(),
+          dataHolder_.data->gpu_data->size(),
           ucxx::Tag{dataTag},
           false,
           [weakData](ucs_status_t status, std::shared_ptr<void> arg) {
@@ -346,7 +356,7 @@ void CudfExchangeServer::sendComplete(
   }
   if (status == UCS_OK) {
     std::lock_guard<std::recursive_mutex> lock(dataMutex_);
-    VELOX_CHECK(dataPtr_ != nullptr, "dataPtr_ is null");
+    VELOX_CHECK(dataHolder_.data != nullptr, "dataHolder_.data is null");
 
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = end - sendStart_;
@@ -362,9 +372,9 @@ void CudfExchangeServer::sendComplete(
             << " MByte/s";
 
     this->sequenceNumber_++;
-    dataPtr_.reset(); // release memory.
+    dataHolder_.data.reset(); // release memory.
     VLOG(3) << "@" << partitionKey_.taskId
-            << " Releasing dataPtr_ in sendComplete.";
+            << " Releasing dataHolder_ in sendComplete.";
     setState(ServerState::ReadyToTransfer);
   } else {
     VLOG(3) << "@" << partitionKey_.taskId

@@ -72,7 +72,9 @@ std::shared_ptr<Communicator> Communicator::getInstance() {
 
 Communicator::~Communicator() {
   listener_.reset();
-  auto req = worker_->flush();
+  // Note: worker_->flush() was removed - it only applies to RMA (Remote Memory
+  // Access) operations like ucp_put/ucp_get, which this code doesn't use.
+  // This code only uses tag send/recv and active messages.
   worker_->progressWorkerEvent(100);
   worker_.reset();
   context_.reset();
@@ -124,6 +126,16 @@ void Communicator::run() {
         worker_->progressWorkerEvent(0);
       } else {
         worker_->progress();
+      }
+
+      // Process deferred endpoint cleanups from callbacks.
+      // UCX callbacks cannot call closeBlocking() (which progresses the
+      // worker), so they defer cleanup to this main loop via
+      // deferEndpointCleanup().
+      while (!deferredEndpointCleanup_.empty()) {
+        auto ep = deferredEndpointCleanup_.pop();
+        VLOG(3) << "Processing deferred endpoint cleanup";
+        removeEndpointRef(ep);
       }
 
       // process the work queue. Make sure that communication is progressed
@@ -209,10 +221,11 @@ std::shared_ptr<EndpointRef> Communicator::assocEndpointRef(
 void Communicator::removeEndpointRef(std::shared_ptr<EndpointRef> ep) {
   VLOG(3) << "In Communicator::removeEndpointRef for Communicator with port = "
           << Communicator::getInstance()->port_;
-  std::string worker_info = ep->endpoint_->getWorker()->getInfo();
-  // VLOG(3) << "Remote end point has closed associated with worker " <<
-  // worker_info;
 
+  // Close the endpoint if it's still alive.
+  // NOTE: This calls closeBlocking() which progresses the worker internally.
+  // Therefore, this method must NOT be called from within a UCX callback.
+  // Use deferEndpointCleanup() from callbacks instead.
   if (ep->endpoint_ && ep->endpoint_->isAlive()) {
     VLOG(3) << "In Communicator::removeEndpointRef call closeBlocking";
     ep->endpoint_->closeBlocking();
@@ -225,6 +238,14 @@ void Communicator::removeEndpointRef(std::shared_ptr<EndpointRef> ep) {
     }
   }
   VLOG(3) << "- Communicator::removeEndpointRef";
+}
+
+void Communicator::deferEndpointCleanup(std::shared_ptr<EndpointRef> ep) {
+  // This method is safe to call from UCX callbacks because it doesn't
+  // call any blocking/progress functions. The actual cleanup happens
+  // in the main run() loop.
+  VLOG(3) << "Deferring endpoint cleanup to main loop";
+  deferredEndpointCleanup_.push(ep);
 }
 
 const std::string& Communicator::getCoordinatorUrl() {

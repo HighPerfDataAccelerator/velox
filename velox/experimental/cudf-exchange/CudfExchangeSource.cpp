@@ -244,10 +244,13 @@ void CudfExchangeSource::setEndpoint(std::shared_ptr<EndpointRef> endpointRef) {
 void CudfExchangeSource::sendHandshake() {
   std::shared_ptr<HandshakeMsg> handshakeReq = std::make_shared<HandshakeMsg>();
   handshakeReq->destination = partitionKey_.destination;
+  // Use sizeof(...) - 1 and explicitly null-terminate to prevent buffer
+  // overread if taskId is longer than the destination buffer.
   strncpy(
       handshakeReq->taskId,
       partitionKey_.taskId.c_str(),
-      sizeof(handshakeReq->taskId));
+      sizeof(handshakeReq->taskId) - 1);
+  handshakeReq->taskId[sizeof(handshakeReq->taskId) - 1] = '\0';
 
   // Include our Communicator's listener address for same-node detection.
   // The server will compare this with its own listener address.
@@ -271,7 +274,7 @@ void CudfExchangeSource::sendHandshake() {
   std::weak_ptr<CudfExchangeSource> weak = weak_from_this();
   request_ = endpointRef_->endpoint_->amSend(
       handshakeReq.get(),
-      sizeof(HandshakeMsg),
+      sizeof(*handshakeReq),
       UCS_MEMORY_TYPE_HOST,
       info,
       false,
@@ -313,8 +316,9 @@ void CudfExchangeSource::onHandshake(
 }
 
 void CudfExchangeSource::getMetadata() {
-  uint32_t sizeMetadata = 4096; // shouldn't be a fixed size.
-  auto metadataReq = std::make_shared<std::vector<uint8_t>>(sizeMetadata);
+  // Use kMaxMetaBufSize to support tables with many columns.
+  // The sender allocates exact size needed; receiver pre-allocates max.
+  auto metadataReq = std::make_shared<std::vector<uint8_t>>(kMaxMetaBufSize);
   uint64_t metadataTag = getMetadataTag(partitionKeyHash_, sequenceNumber_);
 
   VLOG(3) << toString()
@@ -325,7 +329,7 @@ void CudfExchangeSource::getMetadata() {
   std::weak_ptr<CudfExchangeSource> weak = weak_from_this();
   request_ = endpointRef_->endpoint_->tagRecv(
       reinterpret_cast<void*>(metadataReq->data()),
-      sizeMetadata,
+      kMaxMetaBufSize,
       ucxx::Tag{metadataTag},
       ucxx::TagMaskFull,
       false,
@@ -389,6 +393,9 @@ void CudfExchangeSource::onMetadata(
     // Get a stream from the global stream pool
     auto stream =
         facebook::velox::cudf_velox::cudfGlobalStreamPool().get_stream();
+    // Store the stream in the DataAndMetadata struct so it can be used later
+    // in onData() when creating the PackedTableWithStream.
+    ptr->stream = stream;
     try {
       ptr->dataBuf = std::make_unique<rmm::device_buffer>(
           ptr->metadata.dataSizeBytes, stream);
@@ -499,7 +506,7 @@ void CudfExchangeSource::receiveHandshakeResponse() {
   std::weak_ptr<CudfExchangeSource> weak = weak_from_this();
   request_ = endpointRef_->endpoint_->tagRecv(
       responseBuffer.get(),
-      sizeof(HandshakeResponse),
+      sizeof(*responseBuffer),
       ucxx::Tag{responseTag},
       ucxx::TagMaskFull,
       false,
@@ -571,12 +578,14 @@ void CudfExchangeSource::waitForIntraNodeData() {
     return;
   }
 
-  auto [data, atEnd] = result.value();
-  onIntraNodeData(std::move(data), atEnd);
+  // Pass the stream along with the data so the consumer can synchronize if
+  // needed
+  onIntraNodeData(std::move(result->data), result->stream, result->atEnd);
 }
 
 void CudfExchangeSource::onIntraNodeData(
     std::shared_ptr<cudf::packed_columns> data,
+    rmm::cuda_stream_view producerStream,
     bool atEnd) {
   // Check if close() was called
   if (closed_.load(std::memory_order_acquire)) {
@@ -628,14 +637,12 @@ void CudfExchangeSource::onIntraNodeData(
   auto packedTable = std::make_unique<cudf::packed_table>(
       cudf::packed_table{tableView, std::move(packedCols)});
 
-  // Get a stream from the global stream pool for the PackedTableWithStream.
-  // For intra-node transfer, the data was allocated on the server side.
-  auto stream =
-      facebook::velox::cudf_velox::cudfGlobalStreamPool().get_stream();
-
-  // Bundle the packed_table with the stream
-  auto tableWithStream =
-      std::make_unique<PackedTableWithStream>(std::move(packedTable), stream);
+  // Use the producer's stream for proper stream ordering.
+  // Since the producer (CudfPartitionedOutput) synchronizes before publishing,
+  // the data is already ready, but we pass the stream for consistency.
+  // If future optimizations remove the sync, this ensures correctness.
+  auto tableWithStream = std::make_unique<PackedTableWithStream>(
+      std::move(packedTable), producerStream);
 
   enqueue(std::move(tableWithStream));
 
