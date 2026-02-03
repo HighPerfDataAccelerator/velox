@@ -31,6 +31,7 @@
 #include "velox/experimental/cudf/exec/CudfOperator.h"
 #include "velox/experimental/cudf/exec/CudfOrderBy.h"
 #include "velox/experimental/cudf/exec/CudfTopN.h"
+#include "velox/experimental/cudf/exec/CudfTopNRowNumber.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/expression/AstExpression.h"
@@ -54,6 +55,7 @@
 #include "velox/exec/TableScan.h"
 #include "velox/exec/Task.h"
 #include "velox/exec/TopN.h"
+#include "velox/exec/TopNRowNumber.h"
 #include "velox/exec/Values.h"
 
 #include <cudf/detail/nvtx/ranges.hpp>
@@ -268,6 +270,7 @@ bool CompileState::compile(bool allowCpuFallback) {
         return isAnyOf<
                    exec::OrderBy,
                    exec::TopN,
+                   exec::TopNRowNumber,
                    exec::Limit,
                    exec::LocalPartition,
                    exec::LocalExchange,
@@ -293,6 +296,7 @@ bool CompileState::compile(bool allowCpuFallback) {
         return isAnyOf<
                    exec::OrderBy,
                    exec::TopN,
+                   exec::TopNRowNumber,
                    exec::Limit,
                    exec::LocalPartition,
                    exec::AssignUniqueId,
@@ -310,6 +314,7 @@ bool CompileState::compile(bool allowCpuFallback) {
         return isAnyOf<
                    exec::OrderBy,
                    exec::TopN,
+                   exec::TopNRowNumber,
                    exec::Limit,
                    exec::LocalExchange,
                    exec::AssignUniqueId,
@@ -396,6 +401,16 @@ bool CompileState::compile(bool allowCpuFallback) {
           getPlanNode(topNOp->planNodeId()));
       VELOX_CHECK(planNode != nullptr);
       replaceOp.push_back(std::make_unique<CudfTopN>(id, ctx, planNode));
+    } else if (
+        auto topNRowNumberOp = dynamic_cast<exec::TopNRowNumber*>(oper)) {
+      auto planNode = std::dynamic_pointer_cast<const core::TopNRowNumberNode>(
+          getPlanNode(topNRowNumberOp->planNodeId()));
+      VELOX_CHECK(planNode != nullptr);
+      VELOX_CHECK(
+          CudfTopNRowNumber::shouldReplace(planNode),
+          "CudfTopNRowNumber only supports limit=1 with row_number function");
+      replaceOp.push_back(
+          std::make_unique<CudfTopNRowNumber>(id, ctx, planNode));
     } else if (isAggregationSupported(oper)) {
       auto planNode = std::dynamic_pointer_cast<const core::AggregationNode>(
           getPlanNode(oper->planNodeId()));
@@ -544,6 +559,7 @@ bool CompileState::compile(bool allowCpuFallback) {
       return isAnyOf<
           exec::OrderBy,
           exec::TopN,
+          exec::TopNRowNumber,
           exec::HashAggregation,
           exec::HashProbe,
           exec::HashBuild,
