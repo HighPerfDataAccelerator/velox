@@ -36,6 +36,7 @@
 #include <cudf/io/types.hpp>
 
 #include <mutex>
+#include <unordered_set>
 
 namespace facebook::velox::cudf_velox::connector::hive {
 
@@ -89,8 +90,8 @@ class CudfHiveDataSource : public DataSource, public NvtxHelper {
 
  private:
   // Create a CudfParquetReader with the given split.
-  CudfParquetReaderPtr createSplitReader();
-  CudfHybridScanReaderPtr createExperimentalSplitReader();
+  CudfParquetReaderPtr createOldSplitReader();
+  CudfHybridScanReaderPtr createSplitReader();
 
   // Clear split_ and splitReader after split has been fully processed.  Keep
   // readers around to hold adaptation.
@@ -125,9 +126,9 @@ class CudfHiveDataSource : public DataSource, public NvtxHelper {
   cudf::io::parquet_reader_options readerOptions_;
   std::shared_ptr<cudf::io::datasource> dataSource_;
   std::unique_ptr<std::once_flag> tableMaterialized_;
-  CudfParquetReaderPtr splitReader_;
-  CudfHybridScanReaderPtr exptSplitReader_;
-  bool useExperimentalSplitReader_;
+  CudfParquetReaderPtr oldSplitReader_;
+  CudfHybridScanReaderPtr splitReader_;
+  bool useOldSplitReader_;
   rmm::cuda_stream_view stream_;
 
   // Output type from file reader.  This is different from outputType_ that it
@@ -136,6 +137,7 @@ class CudfHiveDataSource : public DataSource, public NvtxHelper {
   RowTypePtr readerOutputType_;
 
   // Columns to read.
+  std::unordered_set<std::string> readColumnSet_;
   std::vector<std::string> readColumnNames_;
 
   std::shared_ptr<io::IoStatistics> ioStats_;
