@@ -584,24 +584,24 @@ bool CompileState::compile(bool allowCpuFallback) {
       LOG(WARNING)
           << "Replacement with cuDF operator failed. Falling back to CPU execution";
       LOG(WARNING) << "Replacement Failed Operator: " << oper->toString();
-      auto planNode = getPlanNode(oper->planNodeId());
-      LOG(WARNING) << "Replacement Failed PlanNode: "
-                   << planNode->toString(true, false);
-      // DNB: There's no plan node for the CallbackSink operator
+      // Note: There's no plan node for the CallbackSink operator
       // that reports "N/A" as the planNodeId.
-      if (CudfConfig::getInstance().debugEnabled &&
-          oper->planNodeId() != "N/A") {
-        // print input types, output types
+      if (oper->planNodeId() != "N/A") {
         auto planNode = getPlanNode(oper->planNodeId());
-        LOG(INFO) << "Output type: " << planNode->outputType()->toString();
-        if (!planNode->sources().empty()) {
-          std::vector<std::string> inputTypes;
-          for (auto& source : planNode->sources()) {
-            inputTypes.push_back(source->outputType()->toString());
+        LOG(WARNING) << "Replacement Failed PlanNode: "
+                     << planNode->toString(true, false);
+        if (CudfConfig::getInstance().debugEnabled) {
+          // print input types, output types
+          LOG(INFO) << "Output type: " << planNode->outputType()->toString();
+          if (!planNode->sources().empty()) {
+            std::vector<std::string> inputTypes;
+            for (auto& source : planNode->sources()) {
+              inputTypes.push_back(source->outputType()->toString());
+            }
+            LOG(INFO) << "Input types: " << folly::join(", ", inputTypes);
+          } else {
+            LOG(INFO) << "Input types: <none - source operator>";
           }
-          LOG(INFO) << "Input types: " << folly::join(", ", inputTypes);
-        } else {
-          LOG(INFO) << "Input types: <none - source operator>";
         }
       }
     }
