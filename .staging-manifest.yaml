@@ -1,0 +1,26 @@
+# Staging Branch Manifest
+# This file describes how this staging branch was created
+
+metadata:
+  generated_at: "2026-02-05T13:47:30Z"
+  target_repository: "rapidsai/velox"
+  target_branch: "staging_pr_16226"
+  dated_branch: "staging_pr_16226_02-05-2026"
+
+base:
+  repository: "facebookincubator/velox"
+  branch: "main"
+  commit: "2f4d9dc7bc3dc05aa8ccb7fdd68d5dbc649e5540"
+  url: "https://github.com/facebookincubator/velox/tree/2f4d9dc7bc3dc05aa8ccb7fdd68d5dbc649e5540"
+
+additional_merge:
+  repository: "paul-aiyedun/velox"
+  branch: "paul/rebase_feb04/ibm-research-preview"
+  commit: "d26664bc5a7b8a35fc2ca14242e1f6c8e92681a8"
+  url: "https://github.com/paul-aiyedun/velox/tree/d26664bc5a7b8a35fc2ca14242e1f6c8e92681a8"
+merged_prs:
+  - number: 16226
+    commit: "0a58c605fb8abb000795c02ba1180d6874330af6"
+    author: "mhaseeb123"
+    title: "feat(cudf): Update hybrid scan usage and cuDF dependency tree"
+    url: "https://github.com/facebookincubator/velox/pull/16226"
