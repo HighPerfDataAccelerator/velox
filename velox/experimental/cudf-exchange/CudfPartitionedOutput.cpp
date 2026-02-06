@@ -122,15 +122,13 @@ void CudfPartitionedOutput::addInput(RowVectorPtr input) {
       cudaEvent_t readyEvent;
       cudaError_t createErr =
           cudaEventCreateWithFlags(&readyEvent, cudaEventDisableTiming);
-      VELOX_CHECK_EQ(
-          createErr,
-          cudaSuccess,
+      VELOX_CHECK(
+          createErr == cudaSuccess,
           "cudaEventCreateWithFlags failed: {}",
           cudaGetErrorString(createErr));
       cudaError_t recordErr = cudaEventRecord(readyEvent, stream.value());
-      VELOX_CHECK_EQ(
-          recordErr,
-          cudaSuccess,
+      VELOX_CHECK(
+          recordErr == cudaSuccess,
           "cudaEventRecord failed: {}",
           cudaGetErrorString(recordErr));
 
@@ -312,15 +310,13 @@ void CudfPartitionedOutput::splitAndEnqueue(
   cudaEvent_t rawEvent;
   cudaError_t createErr =
       cudaEventCreateWithFlags(&rawEvent, cudaEventDisableTiming);
-  VELOX_CHECK_EQ(
-      createErr,
-      cudaSuccess,
+  VELOX_CHECK(
+      createErr == cudaSuccess,
       "cudaEventCreateWithFlags failed: {}",
       cudaGetErrorString(createErr));
   cudaError_t recordErr = cudaEventRecord(rawEvent, stream.value());
-  VELOX_CHECK_EQ(
-      recordErr,
-      cudaSuccess,
+  VELOX_CHECK(
+      recordErr == cudaSuccess,
       "cudaEventRecord failed: {}",
       cudaGetErrorString(recordErr));
   auto sharedEvent = std::make_shared<CudaEventRef>(rawEvent);

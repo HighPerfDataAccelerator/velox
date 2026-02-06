@@ -567,9 +567,6 @@ void CudfExchangeSource::waitForIntraNodeData() {
   IntraNodeTransferKey key{
       partitionKey_.taskId, partitionKey_.destination, sequenceNumber_};
 
-  VLOG(3) << toString()
-          << " polling for intra-node transfer data, seq=" << sequenceNumber_;
-
   auto result = IntraNodeTransferRegistry::getInstance()->poll(key);
 
   if (!result.has_value()) {

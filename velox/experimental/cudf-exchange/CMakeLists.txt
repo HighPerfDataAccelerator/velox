@@ -33,11 +33,9 @@ add_library(
 
 find_package(ucx REQUIRED)
 
-# Note: ucx::ucs was removed - it has no ABI stability guarantee and
-# any required symbols are transitively available via ucxx::ucxx.
 target_link_libraries(
   velox_cudf_exchange
-  PUBLIC ucxx::ucxx ucx::ucp
+  PUBLIC ucxx::ucxx ucx::ucp ucx::ucs
   PRIVATE cudf::cudf CUDA::cudart CUDA::cuda_driver Folly::folly velox_core
 )
 
