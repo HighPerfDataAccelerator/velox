@@ -58,21 +58,31 @@ void CudfOutputQueueManager::enqueue(
     int destination,
     PackedColumnsWithEvent txData,
     int numRows) {
-  getQueue(taskId)->enqueue(destination, std::move(txData), numRows);
+  if (auto queue = getQueueIfExists(taskId)) {
+    queue->enqueue(destination, std::move(txData), numRows);
+  }
 }
 
 bool CudfOutputQueueManager::checkBlocked(
     const std::string& taskId,
     ContinueFuture* future) {
-  return getQueue(taskId)->checkBlocked(future);
+  if (auto queue = getQueueIfExists(taskId)) {
+    return queue->checkBlocked(future);
+  }
+  return false;
 }
 
 void CudfOutputQueueManager::noMoreData(const std::string& taskId) {
-  getQueue(taskId)->noMoreData();
+  if (auto queue = getQueueIfExists(taskId)) {
+    queue->noMoreData();
+  }
 }
 
 bool CudfOutputQueueManager::isFinished(const std::string& taskId) {
-  return getQueue(taskId)->isFinished();
+  if (auto queue = getQueueIfExists(taskId)) {
+    return queue->isFinished();
+  }
+  return true;
 }
 
 void CudfOutputQueueManager::deleteResults(
