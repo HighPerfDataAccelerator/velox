@@ -475,6 +475,79 @@ class SubstrFunction : public CudfFunction {
   std::unique_ptr<cudf::numeric_scalar<cudf::size_type>> stepScalar_;
 };
 
+// Constructs a struct column from input columns with null propagation.
+// NullMode 0: struct is never null (row_constructor)
+// NullMode 1: struct is null if ANY input is null
+//   (row_constructor_with_null)
+// NullMode 2: struct is null only if ALL inputs are null
+//   (row_constructor_with_all_null)
+template <int NullMode>
+class RowConstructorFunction : public CudfFunction {
+ public:
+  RowConstructorFunction(
+      const std::shared_ptr<velox::exec::Expr>& /*expr*/) {}
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    VELOX_CHECK(
+        !inputColumns.empty(),
+        "row_constructor requires at least one input");
+
+    auto const numRows = asView(inputColumns[0]).size();
+
+    std::vector<std::unique_ptr<cudf::column>> children;
+    children.reserve(inputColumns.size());
+    for (auto& col : inputColumns) {
+      children.push_back(
+          std::make_unique<cudf::column>(
+              asView(col), stream, mr));
+    }
+
+    rmm::device_buffer null_mask{};
+    cudf::size_type null_count = 0;
+
+    if constexpr (NullMode == 1) {
+      // ANY child null -> struct null
+      auto tbl_view = cudf::table_view(
+          [&]() {
+            std::vector<cudf::column_view> views;
+            for (auto& c : children)
+              views.push_back(c->view());
+            return views;
+          }());
+      auto [mask, nc] =
+          cudf::bitmask_and(tbl_view, stream, mr);
+      null_mask = std::move(mask);
+      null_count = nc;
+    } else if constexpr (NullMode == 2) {
+      // ALL children null -> struct null
+      auto tbl_view = cudf::table_view(
+          [&]() {
+            std::vector<cudf::column_view> views;
+            for (auto& c : children)
+              views.push_back(c->view());
+            return views;
+          }());
+      auto [mask, nc] =
+          cudf::bitmask_or(tbl_view, stream, mr);
+      null_mask = std::move(mask);
+      null_count = nc;
+    }
+    // NullMode 0: no null mask, struct is never null
+
+    return std::make_unique<cudf::column>(
+        cudf::data_type{cudf::type_id::STRUCT},
+        numRows,
+        rmm::device_buffer{},
+        std::move(null_mask),
+        null_count,
+        std::move(children));
+  }
+};
+
+
 class CoalesceFunction : public CudfFunction {
  public:
   CoalesceFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
@@ -1043,6 +1116,37 @@ bool registerBuiltinFunctions(const std::string& prefix) {
            .constantArgumentType("integer")
            .build()});
 
+  // row_constructor variants: registered with empty signatures
+  // because the return type (struct) is dynamically determined
+  // by input types, which cannot be expressed with static
+  // FunctionSignature. The canEvaluate check handles validation.
+  registerCudfFunction(
+      "row_constructor_with_null",
+      [](const std::string&,
+         const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<
+            RowConstructorFunction<1>>(expr);
+      },
+      {});
+
+  registerCudfFunction(
+      "row_constructor",
+      [](const std::string&,
+         const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<
+            RowConstructorFunction<0>>(expr);
+      },
+      {});
+
+  registerCudfFunction(
+      "row_constructor_with_all_null",
+      [](const std::string&,
+         const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<
+            RowConstructorFunction<2>>(expr);
+      },
+      {});
+
   return true;
 }
 
@@ -1128,6 +1232,15 @@ bool FunctionExpression::canEvaluate(std::shared_ptr<velox::exec::Expr> expr) {
     auto src = cudf::data_type(cudf_velox::veloxToCudfTypeId(srcType));
     auto dst = cudf::data_type(cudf_velox::veloxToCudfTypeId(dstType));
     return cudf::is_supported_cast(src, dst);
+  }
+  // row_constructor variants always accepted: the return type is a
+  // struct dynamically derived from input types, so static signature
+  // matching cannot express this. The actual GPU implementation
+  // (RowConstructorFunction) handles any input combination.
+  if (opName == "row_constructor_with_null" ||
+      opName == "row_constructor" ||
+      opName == "row_constructor_with_all_null") {
+    return true;
   }
 
   auto& registry = getCudfFunctionRegistry();
