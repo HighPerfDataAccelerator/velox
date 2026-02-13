@@ -18,6 +18,7 @@
 
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConfig.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConnectorSplit.h"
+#include "velox/experimental/cudf/connectors/hive/CudfHiveDataSourceHelpers.hpp"
 #include "velox/experimental/cudf/exec/NvtxHelper.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
 
@@ -38,6 +39,7 @@
 
 #include <future>
 #include <mutex>
+#include <unordered_set>
 #include <vector>
 
 namespace facebook::velox::cudf_velox {
@@ -99,8 +101,7 @@ class CudfHiveDataSource : public DataSource, public NvtxHelper {
   CudfParquetReaderPtr createSplitReader();
   CudfHybridScanReaderPtr createExperimentalSplitReader();
 
-  // Clear split_ and splitReader after split has been fully processed.  Keep
-  // readers around to hold adaptation.
+  // Clear split_ and splitReaders after split has been fully processed.
   void resetSplit();
   // Clear cudfTable_ and currentCudfTableView_ once we have successfully
   // converted it to `RowVectorPtr` and returned.
@@ -131,9 +132,9 @@ class CudfHiveDataSource : public DataSource, public NvtxHelper {
   // cuDF split reader stuff.
   cudf::io::parquet_reader_options readerOptions_;
   std::shared_ptr<cudf::io::datasource> dataSource_;
-  std::unique_ptr<std::once_flag> tableMaterialized_;
   CudfParquetReaderPtr splitReader_;
   CudfHybridScanReaderPtr exptSplitReader_;
+  std::unique_ptr<HybridScanState> hybridScanState_;
   bool useExperimentalSplitReader_;
   rmm::cuda_stream_view stream_;
 
@@ -143,6 +144,7 @@ class CudfHiveDataSource : public DataSource, public NvtxHelper {
   RowTypePtr readerOutputType_;
 
   // Columns to read.
+  std::unordered_set<std::string> readColumnSet_;
   std::vector<std::string> readColumnNames_;
 
   std::shared_ptr<io::IoStatistics> ioStatistics_;
