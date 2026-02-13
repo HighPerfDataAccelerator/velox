@@ -14,6 +14,10 @@
  * limitations under the License.
  */
 
+#include "velox/experimental/cudf-exchange/CudfExchangeClient.h"
+#include "velox/experimental/cudf-exchange/CudfPartitionedOutput.h"
+#include "velox/experimental/cudf-exchange/ExchangeClientFacade.h"
+#include "velox/experimental/cudf-exchange/HybridExchange.h"
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConnector.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveDataSource.h"
@@ -28,6 +32,7 @@
 #include "velox/experimental/cudf/exec/CudfOrderBy.h"
 #include "velox/experimental/cudf/exec/CudfTopN.h"
 #include "velox/experimental/cudf/exec/OperatorAdapters.h"
+#include "velox/experimental/cudf/exec/CudfTopNRowNumber.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/expression/AstExpression.h"
@@ -38,17 +43,21 @@
 #include "velox/exec/AssignUniqueId.h"
 #include "velox/exec/CallbackSink.h"
 #include "velox/exec/Driver.h"
+#include "velox/exec/Exchange.h"
 #include "velox/exec/FilterProject.h"
 #include "velox/exec/HashAggregation.h"
 #include "velox/exec/HashBuild.h"
 #include "velox/exec/HashProbe.h"
 #include "velox/exec/Limit.h"
+#include "velox/exec/Merge.h"
 #include "velox/exec/Operator.h"
 #include "velox/exec/OrderBy.h"
+#include "velox/exec/PartitionedOutput.h"
 #include "velox/exec/StreamingAggregation.h"
 #include "velox/exec/TableScan.h"
 #include "velox/exec/Task.h"
 #include "velox/exec/TopN.h"
+#include "velox/exec/TopNRowNumber.h"
 #include "velox/exec/Values.h"
 
 #include <cudf/detail/nvtx/ranges.hpp>
@@ -58,8 +67,28 @@
 #include <iostream>
 
 static const std::string kCudfAdapterName = "cuDF";
+DEFINE_bool(velox_cudf_enabled, true, "Enable cuDF-Velox acceleration");
+DEFINE_string(velox_cudf_memory_resource, "async", "Memory resource for cuDF");
+DEFINE_bool(velox_cudf_debug, false, "Enable debug printing");
+DEFINE_bool(velox_cudf_exchange, true, "Enable cuDF exchange");
+
+using namespace facebook::velox::cudf_exchange;
 
 namespace facebook::velox::cudf_velox {
+
+// Single instance of the map to store ExchangeClientFacade instances.
+// Using a function with a static local ensures thread-safe initialization
+// and a single instance across all translation units.
+ExchangeClientFacadeMap& getExchangeClientFacadeMap() {
+  static ExchangeClientFacadeMap instance;
+  return instance;
+}
+
+// Mutex to protect concurrent access to the ExchangeClientFacadeMap.
+std::mutex& getExchangeClientFacadeMapMutex() {
+  static std::mutex instance;
+  return instance;
+}
 
 namespace {
 
@@ -128,6 +157,38 @@ bool CompileState::compile(bool allowCpuFallback) {
           props.canRunOnGPU = true;
           props.acceptsGpuInput = true;
           props.producesGpuOutput = true;
+        }
+        if (!adapter && isValidPlanNodeId(op->planNodeId())) {
+          if (auto topNRowNumberOp =
+                  dynamic_cast<const exec::TopNRowNumber*>(op)) {
+            auto topNRowNumberNode =
+                std::dynamic_pointer_cast<const core::TopNRowNumberNode>(
+                    getPlanNode(topNRowNumberOp->planNodeId()));
+            if (topNRowNumberNode &&
+                CudfTopNRowNumber::shouldReplace(topNRowNumberNode)) {
+              props.canRunOnGPU = true;
+              props.acceptsGpuInput = true;
+              props.producesGpuOutput = true;
+            }
+          } else if (
+              CudfConfig::getInstance().exchange &&
+              isAnyOf<exec::Exchange, exec::MergeExchange>(op)) {
+            props.canRunOnGPU = true;
+            props.acceptsGpuInput = false;
+            props.producesGpuOutput = true;
+          } else if (
+              CudfConfig::getInstance().exchange &&
+              isAnyOf<exec::PartitionedOutput>(op)) {
+            auto partitionedOutputNode =
+                std::dynamic_pointer_cast<const core::PartitionedOutputNode>(
+                    getPlanNode(op->planNodeId()));
+            if (partitionedOutputNode &&
+                !partitionedOutputNode->isRootFragment()) {
+              props.canRunOnGPU = true;
+              props.acceptsGpuInput = true;
+              props.producesGpuOutput = false;
+            }
+          }
         }
         return props;
       };
@@ -209,6 +270,85 @@ bool CompileState::compile(bool allowCpuFallback) {
         // disabled.
         isPureCpuOperator = false;
       }
+    } else if (
+        auto topNRowNumberOp = dynamic_cast<exec::TopNRowNumber*>(oper)) {
+      auto topNRowNumberNode =
+          std::dynamic_pointer_cast<const core::TopNRowNumberNode>(
+              getPlanNode(topNRowNumberOp->planNodeId()));
+      if (topNRowNumberNode &&
+          CudfTopNRowNumber::shouldReplace(topNRowNumberNode)) {
+        replaceOp.push_back(
+            std::make_unique<CudfTopNRowNumber>(id, ctx, topNRowNumberNode));
+        keepOperator = 0;
+        isPureCpuOperator = false;
+      } else {
+        isPureCpuOperator = true;
+      }
+    } else if (
+        auto partitionOp = dynamic_cast<exec::PartitionedOutput*>(oper)) {
+      auto partitionedOutputNode =
+          std::dynamic_pointer_cast<const core::PartitionedOutputNode>(
+              getPlanNode(partitionOp->planNodeId()));
+      if (CudfConfig::getInstance().exchange && partitionedOutputNode &&
+          !partitionedOutputNode->isRootFragment()) {
+        replaceOp.push_back(std::make_unique<CudfPartitionedOutput>(
+            id, ctx, partitionedOutputNode, partitionOp->getEagerFlush()));
+        keepOperator = 0;
+        isPureCpuOperator = false;
+      } else {
+        isPureCpuOperator = true;
+      }
+    } else if (auto exchangeOp = dynamic_cast<exec::Exchange*>(oper)) {
+      auto exchangeNode = std::dynamic_pointer_cast<const core::ExchangeNode>(
+          getPlanNode(exchangeOp->planNodeId()));
+      if (CudfConfig::getInstance().exchange && exchangeNode) {
+        auto key = TaskPipelineKey(oper->taskId(), ctx->pipelineId);
+        std::shared_ptr<ExchangeClientFacade> client = nullptr;
+        {
+          std::lock_guard<std::mutex> lock(getExchangeClientFacadeMapMutex());
+          auto& facadeMap = getExchangeClientFacadeMap();
+          auto clientIter = facadeMap.find(key);
+          if (clientIter == facadeMap.end()) {
+            auto veloxExchangeClient = exchangeOp->releaseExchangeClient();
+            VELOX_CHECK_NOT_NULL(
+                veloxExchangeClient, "Velox exchange client can't be null.");
+            auto cudfClient = std::make_shared<CudfExchangeClient>(
+                oper->taskId(),
+                veloxExchangeClient->getDestination(),
+                veloxExchangeClient->getNumberOfConsumers());
+            client = std::make_shared<ExchangeClientFacade>(
+                oper->taskId(),
+                ctx->pipelineId,
+                std::move(cudfClient),
+                std::move(veloxExchangeClient));
+            facadeMap.emplace(key, client);
+          } else {
+            client = clientIter->second;
+            exchangeOp->resetExchangeClient();
+          }
+        }
+        replaceOp.push_back(
+            std::make_unique<HybridExchange>(id, ctx, exchangeNode, client));
+        keepOperator = 0;
+        isPureCpuOperator = false;
+      } else {
+        isPureCpuOperator = true;
+      }
+    } else if (
+        auto mergeExchangeOp = dynamic_cast<exec::MergeExchange*>(oper)) {
+      auto mergeExchangeNode =
+          std::dynamic_pointer_cast<const core::MergeExchangeNode>(
+              getPlanNode(mergeExchangeOp->planNodeId()));
+      if (CudfConfig::getInstance().exchange && mergeExchangeNode) {
+        replaceOp.push_back(std::make_unique<HybridExchange>(
+            id, ctx, mergeExchangeNode, nullptr));
+        replaceOp.push_back(
+            std::make_unique<CudfOrderBy>(id, ctx, mergeExchangeNode));
+        keepOperator = 0;
+        isPureCpuOperator = false;
+      } else {
+        isPureCpuOperator = true;
+      }
     } else {
       // special case for CudfOperator
       if (isAnyOf<CudfOperator>(oper)) {
@@ -247,11 +387,25 @@ bool CompileState::compile(bool allowCpuFallback) {
       VELOX_CHECK(!isPureCpuOperator, "Replacement with cuDF operator failed");
     } else if (isPureCpuOperator) {
       LOG(WARNING)
-          << "Replacement with cuDF operator failed. Falling back to CPU execution";
-      LOG(WARNING) << "Replacement Failed Operator: " << oper->toString();
-      auto planNode = getPlanNode(oper->planNodeId());
-      LOG(WARNING) << "Replacement Failed PlanNode: "
-                   << planNode->toString(true, false);
+          << "Replacement with cuDF operator failed. Falling back to CPU execution for operator:"
+          << oper->toString();
+      // DNB: There's no plan node for the CallbackSink operator
+      // that reports "N/A" as the planNodeId.
+      if (CudfConfig::getInstance().debugEnabled &&
+          oper->planNodeId() != "N/A") {
+        // print input types, output types
+        auto planNode = getPlanNode(oper->planNodeId());
+        LOG(INFO) << "Output type: " << planNode->outputType()->toString();
+        if (!planNode->sources().empty()) {
+          std::vector<std::string> inputTypes;
+          for (auto& source : planNode->sources()) {
+            inputTypes.push_back(source->outputType()->toString());
+          }
+          LOG(INFO) << "Input types: " << folly::join(", ", inputTypes);
+        } else {
+          LOG(INFO) << "Input types: <none - source operator>";
+        }
+      }
     }
 
     if (not replaceOp.empty()) {
@@ -284,6 +438,7 @@ bool CompileState::compile(bool allowCpuFallback) {
     }
   }
 
+  VLOG(3) << "- CompileState::compile";
   return replacementsMade;
 }
 
@@ -404,6 +559,15 @@ void CudfConfig::initialize(
   }
   if (config.find(kCudfLogFallback) != config.end()) {
     logFallback = folly::to<bool>(config[kCudfLogFallback]);
+  }
+  if (config.find(kCudfExchange) != config.end()) {
+    exchange = folly::to<bool>(config[kCudfExchange]);
+  }
+  if (config.find(kUcxxErrorHandling) != config.end()) {
+    ucxxErrorHandling = folly::to<bool>(config[kUcxxErrorHandling]);
+  }
+  if (config.find(kUcxxBlockingPolling) != config.end()) {
+    ucxxBlockingPolling = folly::to<bool>(config[kUcxxBlockingPolling]);
   }
 }
 

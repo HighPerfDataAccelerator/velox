@@ -31,6 +31,232 @@
 #include "velox/type/Type.h"
 
 #include <cudf/ast/expressions.hpp>
+/*
+ * Copyright (c) Facebook, Inc. and its affiliates.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+#include "velox/experimental/cudf/connectors/hive/CudfHiveConfig.h"
+#include "velox/experimental/cudf/connectors/hive/CudfHiveConnectorSplit.h"
+#include "velox/experimental/cudf/exec/NvtxHelper.h"
+#include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
+
+#include "velox/common/base/RandomUtil.h"
+#include "velox/common/io/IoStatistics.h"
+#include "velox/common/io/Options.h"
+#include "velox/connectors/Connector.h"
+#include "velox/connectors/hive/FileHandle.h"
+#include "velox/connectors/hive/TableHandle.h"
+#include "velox/dwio/common/Statistics.h"
+#include "velox/type/Type.h"
+
+#include <cudf/io/datasource.hpp>
+#include <cudf/io/experimental/hybrid_scan.hpp>
+#include <cudf/io/parquet.hpp>
+#include <cudf/io/types.hpp>
+
+#include <mutex>
+#include <unordered_map>
+/*
+ * Copyright (c) Facebook, Inc. and its affiliates.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+#include "velox/experimental/cudf/connectors/hive/CudfHiveConfig.h"
+#include "velox/experimental/cudf/connectors/hive/CudfHiveConnectorSplit.h"
+#include "velox/experimental/cudf/exec/NvtxHelper.h"
+#include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
+
+#include "velox/common/base/RandomUtil.h"
+#include "velox/common/io/IoStatistics.h"
+#include "velox/common/io/Options.h"
+#include "velox/connectors/Connector.h"
+#include "velox/connectors/hive/FileHandle.h"
+#include "velox/connectors/hive/TableHandle.h"
+#include "velox/dwio/common/Statistics.h"
+#include "velox/type/Type.h"
+
+#include <cudf/io/datasource.hpp>
+#include <cudf/io/experimental/hybrid_scan.hpp>
+#include <cudf/io/parquet.hpp>
+#include <cudf/io/types.hpp>
+
+#include <mutex>
+
+namespace facebook::velox::cudf_velox::connector::hive {
+
+using namespace facebook::velox::connector;
+
+using CudfParquetReader = cudf::io::chunked_parquet_reader;
+using CudfParquetReaderPtr = std::unique_ptr<CudfParquetReader>;
+
+using CudfHybridScanReader =
+    cudf::io::parquet::experimental::hybrid_scan_reader;
+using CudfHybridScanReaderPtr = std::unique_ptr<CudfHybridScanReader>;
+
+class CudfHiveDataSource : public DataSource, public NvtxHelper {
+ public:
+  CudfHiveDataSource(
+      const RowTypePtr& outputType,
+      const ConnectorTableHandlePtr& tableHandle,
+      const ColumnHandleMap& columnHandles,
+      facebook::velox::FileHandleFactory* fileHandleFactory,
+      folly::Executor* executor,
+      const ConnectorQueryCtx* connectorQueryCtx,
+      const std::shared_ptr<CudfHiveConfig>& CudfHiveConfig);
+
+  void addSplit(std::shared_ptr<ConnectorSplit> split) override;
+
+  void addDynamicFilter(
+      column_index_t /*outputChannel*/,
+      const std::shared_ptr<facebook::velox::common::Filter>& /*filter*/)
+      override {
+    VELOX_NYI(
+        "Dynamic filters not yet implemented by cudf::CudfHiveConnector.");
+  }
+
+  std::optional<RowVectorPtr> next(
+      uint64_t size,
+      velox::ContinueFuture& /* future */) override;
+
+  uint64_t getCompletedRows() override {
+    return completedRows_;
+  }
+
+  const common::SubfieldFilters* getFilters() const override {
+    return &subfieldFilters_;
+  }
+
+  uint64_t getCompletedBytes() override {
+    return completedBytes_;
+  }
+
+  std::unordered_map<std::string, RuntimeMetric> getRuntimeStats() override;
+
+ private:
+  // Create a CudfParquetReader with the given split.
+  CudfParquetReaderPtr createSplitReader();
+  CudfHybridScanReaderPtr createExperimentalSplitReader();
+
+  // Clear split_ and splitReader after split has been fully processed.  Keep
+  // readers around to hold adaptation.
+  void resetSplit();
+  // Clear cudfTable_ and currentCudfTableView_ once we have successfully
+  // converted it to `RowVectorPtr` and returned.
+  void resetCudfTableAndView();
+  const RowVectorPtr& getEmptyOutput() {
+    if (!emptyOutput_) {
+      emptyOutput_ = RowVector::createEmpty(outputType_, pool_);
+    }
+    return emptyOutput_;
+  }
+
+  // Setup the cuDF data source and options
+  void setupCudfDataSourceAndOptions();
+
+  RowVectorPtr emptyOutput_;
+
+  std::shared_ptr<CudfHiveConnectorSplit> split_;
+  std::shared_ptr<const ::facebook::velox::connector::hive::HiveTableHandle>
+      tableHandle_;
+
+  const std::shared_ptr<CudfHiveConfig> cudfHiveConfig_;
+  facebook::velox::FileHandleFactory* const fileHandleFactory_;
+  folly::Executor* const executor_;
+  const ConnectorQueryCtx* const connectorQueryCtx_;
+
+  memory::MemoryPool* const pool_;
+
+  // cuDF split reader stuff.
+  cudf::io::parquet_reader_options readerOptions_;
+  std::shared_ptr<cudf::io::datasource> dataSource_;
+  std::unique_ptr<std::once_flag> tableMaterialized_;
+  CudfParquetReaderPtr splitReader_;
+  CudfHybridScanReaderPtr exptSplitReader_;
+  bool useExperimentalSplitReader_;
+  rmm::cuda_stream_view stream_;
+
+  // Output type from file reader.  This is different from outputType_ that it
+  // contains column names before assignment, and columns that only used in
+  // remaining filter.
+  RowTypePtr readerOutputType_;
+
+  // Columns to read.
+  std::vector<std::string> readColumnNames_;
+
+  // Mapping from logical column names (from DDL/Hive schema) to physical
+  // column names (in parquet file). This handles cases where DDL has different
+  // column names than the parquet file (e.g., case differences or completely
+  // different names). The mapping is done by positional index.
+  std::unordered_map<std::string, std::string> logicalToPhysicalColumnMap_;
+
+  // Build the logical-to-physical column name mapping by reading parquet
+  // metadata and matching columns by index position.
+  void buildColumnNameMapping(const cudf::io::source_info& sourceInfo);
+
+  // Map a vector of logical column names to their physical parquet column
+  // names. If a column is not found in the mapping, the original name is used.
+  std::vector<std::string> mapToPhysicalColumnNames(
+      const std::vector<std::string>& logicalNames) const;
+
+/*
+ * Copyright (c) Facebook, Inc. and its affiliates.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+#include "velox/experimental/cudf/connectors/hive/CudfHiveConfig.h"
+#include "velox/experimental/cudf/connectors/hive/CudfHiveConnectorSplit.h"
+#include "velox/experimental/cudf/exec/NvtxHelper.h"
+#include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
+
+#include "velox/common/base/RandomUtil.h"
+#include "velox/common/io/IoStatistics.h"
+#include "velox/common/io/Options.h"
+#include "velox/connectors/Connector.h"
+#include "velox/connectors/hive/FileHandle.h"
+#include "velox/connectors/hive/TableHandle.h"
+#include "velox/dwio/common/Statistics.h"
+#include "velox/type/Type.h"
+
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/experimental/hybrid_scan.hpp>
 #include <cudf/io/parquet.hpp>
@@ -161,6 +387,24 @@ class CudfHiveDataSource : public DataSource, public NvtxHelper {
   common::SubfieldFilters subfieldFilters_;
   // Cached combined subfield filter expression owned by 'subfieldTree_'.
   cudf::ast::expression const* subfieldFilterExpr_{nullptr};
+
+  dwio::common::ReaderOptions baseReaderOpts_;
+
+  size_t completedRows_{0};
+  size_t completedBytes_{0};
+
+  // The row type for the data source output, not including filter-only columns
+  const RowTypePtr outputType_;
+
+  // Expression evaluator for remaining filter.
+  core::ExpressionEvaluator* const expressionEvaluator_;
+  std::unique_ptr<exec::ExprSet> remainingFilterExprSet_;
+  std::shared_ptr<velox::cudf_velox::CudfExpression> cudfExpressionEvaluator_;
+
+  // Expression evaluator for subfield filter.
+  std::vector<std::unique_ptr<cudf::scalar>> subfieldScalars_;
+  cudf::ast::tree subfieldTree_;
+  common::SubfieldFilters subfieldFilters_;
 
   dwio::common::RuntimeStatistics runtimeStats_;
   std::atomic<uint64_t> totalRemainingFilterTime_{0};
