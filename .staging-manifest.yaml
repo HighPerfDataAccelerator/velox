@@ -1,0 +1,47 @@
+# Staging Branch Manifest
+# This file describes how this staging branch was created
+
+metadata:
+  generated_at: "2026-02-13T08:14:33Z"
+  target_repository: "rapidsai/velox"
+  target_branch: "staging"
+  dated_branch: "staging_02-13-2026"
+
+base:
+  repository: "facebookincubator/velox"
+  branch: "main"
+  commit: "ab65d89b1f14f24f12964a42a4bd9ccfc60f9547"
+  url: "https://github.com/facebookincubator/velox/tree/ab65d89b1f14f24f12964a42a4bd9ccfc60f9547"
+
+additional_merge:
+  repository: "rapidsai/velox"
+  branch: "cudf_exchange/rebase_latest/ibm-research-preview"
+  commit: "c430c1ab044c18efe10c20de2ea66c099cdf87f4"
+  url: "https://github.com/rapidsai/velox/tree/c430c1ab044c18efe10c20de2ea66c099cdf87f4"
+
+merged_prs:
+  - number: 16266
+    commit: "cd824e5e185ec6fa46396a78cbcdeb29fda406e3"
+    author: "karthikeyann"
+    title: "docs: Documentation of \"Cudf Hive Connector Configuration (Experimental)\""
+    url: "https://github.com/facebookincubator/velox/pull/16266"
+  - number: 16226
+    commit: "d886f5b74431aed6177fdce58745942763f87165"
+    author: "mhaseeb123"
+    title: "feat(cudf): Update hybrid scan usage"
+    url: "https://github.com/facebookincubator/velox/pull/16226"
+  - number: 15700
+    commit: "ba2203fe59476459f24a4264617c850510768950"
+    author: "majetideepak"
+    title: "feat(cudf): Run tests in CI"
+    url: "https://github.com/facebookincubator/velox/pull/15700"
+  - number: 15404
+    commit: "9ebda67da66ede0944d410fd8505e9ddbbdf76b5"
+    author: "zoltan"
+    title: "feat: PartitionedOutputNode must distinguish the root of a plan"
+    url: "https://github.com/facebookincubator/velox/pull/15404"
+  - number: 15825
+    commit: "16a2c7ed2960647ca4731ea01dabc12bdf3a8f2d"
+    author: "simoneves"
+    title: "feat(cudf): Support decimal types in CUDF GPU operators"
+    url: "https://github.com/facebookincubator/velox/pull/15825"
