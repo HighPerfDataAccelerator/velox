@@ -18,12 +18,91 @@ add_library(
   CudfConversion.cpp
   CudfFilterProject.cpp
   CudfHashAggregation.cpp
+  DecimalAggregationKernels.cu
+# Copyright (c) Facebook, Inc. and its affiliates.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+add_library(
+  velox_cudf_exec
+  CudfAssignUniqueId.cpp
+  CudfConversion.cpp
+  CudfFilterProject.cpp
+  CudfHashAggregation.cpp
   CudfHashJoin.cpp
   CudfLimit.cpp
   CudfLocalPartition.cpp
   CudfOrderBy.cpp
   CudfTopN.cpp
   CudfTopNRowNumber.cpp
+# Copyright (c) Facebook, Inc. and its affiliates.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+add_library(
+  velox_cudf_exec
+  CudfAssignUniqueId.cpp
+  CudfConversion.cpp
+  CudfFilterProject.cpp
+  CudfHashAggregation.cpp
+  CudfHashJoin.cpp
+  CudfLimit.cpp
+  CudfLocalPartition.cpp
+  CudfOrderBy.cpp
+  CudfTopN.cpp
+  DebugUtil.cpp
+  OperatorAdapters.cpp
+  ToCudf.cpp
+  Utilities.cpp
+  VeloxCudfInterop.cpp
+)
+
+set_target_properties(velox_cudf_exec PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
+# Copyright (c) Facebook, Inc. and its affiliates.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+add_library(
+  velox_cudf_exec
+  CudfAssignUniqueId.cpp
+  CudfConversion.cpp
+  CudfFilterProject.cpp
+  CudfHashAggregation.cpp
+  CudfHashJoin.cpp
+  CudfLimit.cpp
+  CudfLocalPartition.cpp
+  CudfOrderBy.cpp
+  CudfTopN.cpp
   DebugUtil.cpp
   OperatorAdapters.cpp
   ToCudf.cpp
@@ -32,6 +111,38 @@ add_library(
 )
 
 find_package(ucx REQUIRED)
+
+# Copyright (c) Facebook, Inc. and its affiliates.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+add_library(
+  velox_cudf_exec
+  CudfAssignUniqueId.cpp
+  CudfConversion.cpp
+  CudfFilterProject.cpp
+  CudfHashAggregation.cpp
+  CudfHashJoin.cpp
+  CudfLimit.cpp
+  CudfLocalPartition.cpp
+  CudfOrderBy.cpp
+  CudfTopN.cpp
+  DebugUtil.cpp
+  OperatorAdapters.cpp
+  ToCudf.cpp
+  Utilities.cpp
+  VeloxCudfInterop.cpp
+)
 
 target_link_libraries(
   velox_cudf_exec
