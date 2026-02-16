@@ -1639,14 +1639,20 @@ bool canAggregationBeEvaluatedByCudf(
     core::AggregationNode::Step step,
     const std::vector<TypePtr>& rawInputTypes,
     core::QueryCtx* queryCtx) {
-  // Check against step-aware aggregation registry
+  // Check against step-aware aggregation registry.
+  // Strip companion suffix (e.g. avg_partial -> avg) and adjust the step
+  // accordingly, so that companion function names from Spark/Gluten plans
+  // are validated against the base function's step-specific signatures.
   auto& stepAwareRegistry = getStepAwareAggregationRegistry();
-  auto funcIt = stepAwareRegistry.find(call.name());
+  auto originalName = getOriginalName(call.name());
+  auto companionStep = getCompanionStep(call.name(), step);
+
+  auto funcIt = stepAwareRegistry.find(originalName);
   if (funcIt == stepAwareRegistry.end()) {
     return false;
   }
 
-  auto stepIt = funcIt->second.find(step);
+  auto stepIt = funcIt->second.find(companionStep);
   if (stepIt == funcIt->second.end()) {
     return false;
   }
