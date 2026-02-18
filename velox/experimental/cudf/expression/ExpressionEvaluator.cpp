@@ -970,6 +970,39 @@ bool registerBuiltinFunctions(const std::string& prefix) {
            .constantArgumentType("varchar")
            .build()});
 
+  registerCudfFunction(
+      prefix + "startswith",
+      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<StartswithFunction>(expr);
+      },
+      {FunctionSignatureBuilder()
+           .returnType("boolean")
+           .argumentType("varchar")
+           .constantArgumentType("varchar")
+           .build()});
+
+  registerCudfFunction(
+      prefix + "endswith",
+      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<EndswithFunction>(expr);
+      },
+      {FunctionSignatureBuilder()
+           .returnType("boolean")
+           .argumentType("varchar")
+           .constantArgumentType("varchar")
+           .build()});
+
+  registerCudfFunction(
+      prefix + "contains",
+      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<ContainsFunction>(expr);
+      },
+      {FunctionSignatureBuilder()
+           .returnType("boolean")
+           .argumentType("varchar")
+           .constantArgumentType("varchar")
+           .build()});
+
   // Our cudf binary ops can take all numeric types but instead of listing them
   // all, we're testing if input types can be casted to double. Coersion will
   // pass because all numerics can be casted to double.
