@@ -717,12 +717,22 @@ class LikeFunction : public CudfFunction {
  public:
   explicit LikeFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
     using velox::exec::ConstantExpr;
-    VELOX_CHECK_EQ(expr->inputs().size(), 2, "like expects 2 inputs");
+    VELOX_CHECK(
+        expr->inputs().size() == 2 || expr->inputs().size() == 3,
+        "like expects 2 or 3 inputs, got {}",
+        expr->inputs().size());
 
     auto patternExpr =
         std::dynamic_pointer_cast<ConstantExpr>(expr->inputs()[1]);
     VELOX_CHECK_NOT_NULL(patternExpr, "like pattern must be a constant");
     pattern_ = patternExpr->value()->toString(0);
+
+    if (expr->inputs().size() == 3) {
+      auto escapeExpr =
+          std::dynamic_pointer_cast<ConstantExpr>(expr->inputs()[2]);
+      VELOX_CHECK_NOT_NULL(escapeExpr, "like escape char must be a constant");
+      escape_ = escapeExpr->value()->toString(0);
+    }
   }
 
   ColumnOrView eval(
@@ -730,12 +740,12 @@ class LikeFunction : public CudfFunction {
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr) const override {
     auto inputCol = asView(inputColumns[0]);
-    return cudf::strings::like(
-        inputCol, pattern_, std::string_view(""), stream, mr);
+    return cudf::strings::like(inputCol, pattern_, escape_, stream, mr);
   }
 
  private:
   std::string pattern_;
+  std::string escape_;
 };
 
 class StartswithFunction : public CudfFunction {
@@ -1040,6 +1050,12 @@ bool registerBuiltinFunctions(const std::string& prefix) {
       {FunctionSignatureBuilder()
            .returnType("boolean")
            .argumentType("varchar")
+           .constantArgumentType("varchar")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("boolean")
+           .argumentType("varchar")
+           .constantArgumentType("varchar")
            .constantArgumentType("varchar")
            .build()});
 
