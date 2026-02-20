@@ -408,6 +408,21 @@ class SwitchFunction : public CudfFunction {
   std::unique_ptr<cudf::scalar> right_;
 };
 
+int64_t getIntConstant(
+    const std::shared_ptr<velox::exec::ConstantExpr>& constExpr) {
+  auto value = constExpr->value();
+  switch (value->typeKind()) {
+    case TypeKind::INTEGER:
+      return value->as<SimpleVector<int32_t>>()->valueAt(0);
+    case TypeKind::BIGINT:
+      return value->as<SimpleVector<int64_t>>()->valueAt(0);
+    default:
+      VELOX_FAIL(
+          "Expected integer or bigint constant, got {}",
+          value->type()->toString());
+  }
+}
+
 class SubstrFunction : public CudfFunction {
  public:
   SubstrFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
@@ -423,8 +438,7 @@ class SubstrFunction : public CudfFunction {
     auto startExpr = std::dynamic_pointer_cast<ConstantExpr>(expr->inputs()[1]);
     VELOX_CHECK_NOT_NULL(startExpr, "substr start must be a constant");
 
-    auto startValue =
-        startExpr->value()->as<SimpleVector<int64_t>>()->valueAt(0);
+    auto startValue = getIntConstant(startExpr);
     cudf::size_type adjustedStart = static_cast<cudf::size_type>(startValue);
     if (startValue >= 1) {
       // cuDF indexing starts at 0.
@@ -441,8 +455,7 @@ class SubstrFunction : public CudfFunction {
           std::dynamic_pointer_cast<ConstantExpr>(expr->inputs()[2]);
       VELOX_CHECK_NOT_NULL(lengthExpr, "substr length must be a constant");
 
-      auto lengthValue =
-          lengthExpr->value()->as<SimpleVector<int64_t>>()->valueAt(0);
+      auto lengthValue = getIntConstant(lengthExpr);
       // cuDF uses indices [begin, end).
       // Presto uses length as the length of the substring.
       // We compute the end as start + length.
@@ -842,6 +855,17 @@ bool registerBuiltinFunctions(const std::string& prefix) {
            .argumentType("varchar")
            .constantArgumentType("bigint")
            .constantArgumentType("bigint")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("varchar")
+           .argumentType("varchar")
+           .constantArgumentType("integer")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("varchar")
+           .argumentType("varchar")
+           .constantArgumentType("integer")
+           .constantArgumentType("integer")
            .build()});
 
   // Coalesce is special form and doesn't have a prefix in its name.
