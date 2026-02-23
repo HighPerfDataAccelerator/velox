@@ -43,6 +43,7 @@
 #include <cudf/table/table.hpp>
 #include <cudf/transform.hpp>
 #include <cudf/strings/convert/convert_datetime.hpp>
+#include <cudf/strings/convert/convert_integers.hpp>
 #include <cudf/unary.hpp>
 
 namespace facebook::velox::cudf_velox {
@@ -228,6 +229,7 @@ class CastFunction : public CudfFunction {
   enum class CastMode {
     kFixedWidth, // cudf::cast() for fixed-width <-> fixed-width
     kDateToString, // cudf::strings::from_timestamps() with "%Y-%m-%d"
+    kIntToString, // cudf::strings::from_integers()
   };
 
   CastFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
@@ -244,6 +246,13 @@ class CastFunction : public CudfFunction {
     if (srcVeloxType->isDate() &&
         dstVeloxType->kind() == TypeKind::VARCHAR) {
       castMode_ = CastMode::kDateToString;
+    } else if (
+        (srcVeloxType->kind() == TypeKind::TINYINT ||
+         srcVeloxType->kind() == TypeKind::SMALLINT ||
+         srcVeloxType->kind() == TypeKind::INTEGER ||
+         srcVeloxType->kind() == TypeKind::BIGINT) &&
+        dstVeloxType->kind() == TypeKind::VARCHAR) {
+      castMode_ = CastMode::kIntToString;
     } else {
       castMode_ = CastMode::kFixedWidth;
       VELOX_CHECK(
@@ -274,6 +283,8 @@ class CastFunction : public CudfFunction {
                 0}),
             stream,
             mr);
+      case CastMode::kIntToString:
+        return cudf::strings::from_integers(inputCol, stream, mr);
       default:
         return cudf::cast(inputCol, targetCudfType_, stream, mr);
     }
@@ -1373,6 +1384,13 @@ bool FunctionExpression::canEvaluate(std::shared_ptr<velox::exec::Expr> expr) {
     // Both cast and try_cast are safe (from_timestamps always succeeds on
     // valid timestamp data, and propagates NULLs).
     if (srcType->isDate() && dstType->kind() == TypeKind::VARCHAR) {
+      return true;
+    }
+    // Integer types -> VARCHAR via cudf::strings::from_integers.
+    auto srcKind = srcType->kind();
+    if ((srcKind == TypeKind::TINYINT || srcKind == TypeKind::SMALLINT ||
+         srcKind == TypeKind::INTEGER || srcKind == TypeKind::BIGINT) &&
+        dstType->kind() == TypeKind::VARCHAR) {
       return true;
     }
     return false;
