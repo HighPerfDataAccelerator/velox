@@ -38,6 +38,7 @@
 #include <string>
 
 namespace facebook::velox::cudf_velox::exec::test {
+using namespace facebook::velox::common::testutil;
 
 namespace {
 
@@ -128,8 +129,7 @@ std::vector<RowVectorPtr> CudfHiveConnectorTestBase::makeVectors(
 std::shared_ptr<facebook::velox::exec::Task>
 CudfHiveConnectorTestBase::assertQuery(
     const core::PlanNodePtr& plan,
-    const std::vector<
-        std::shared_ptr<facebook::velox::exec::test::TempFilePath>>& filePaths,
+    const std::vector<std::shared_ptr<TempFilePath>>& filePaths,
     const std::string& duckDbSql) {
   return OperatorTestBase::assertQuery(
       plan, makeCudfHiveConnectorSplits(filePaths), duckDbSql);
@@ -151,13 +151,12 @@ CudfHiveConnectorTestBase::assertQuery(
       .assertResults(duckDbSql);
 }
 
-std::vector<std::shared_ptr<facebook::velox::exec::test::TempFilePath>>
+std::vector<std::shared_ptr<TempFilePath>>
 CudfHiveConnectorTestBase::makeFilePaths(int count) {
-  std::vector<std::shared_ptr<facebook::velox::exec::test::TempFilePath>>
-      filePaths;
+  std::vector<std::shared_ptr<TempFilePath>> filePaths;
   filePaths.reserve(count);
   for (auto i = 0; i < count; ++i) {
-    filePaths.emplace_back(facebook::velox::exec::test::TempFilePath::create());
+    filePaths.emplace_back(TempFilePath::create());
   }
   return filePaths;
 }
@@ -221,9 +220,7 @@ void CudfHiveConnectorTestBase::writeToFile(
 
 std::vector<std::shared_ptr<facebook::velox::connector::ConnectorSplit>>
 CudfHiveConnectorTestBase::makeCudfHiveConnectorSplits(
-    const std::vector<
-        std::shared_ptr<facebook::velox::exec::test::TempFilePath>>&
-        filePaths) {
+    const std::vector<std::shared_ptr<TempFilePath>>& filePaths) {
   std::vector<std::shared_ptr<facebook::velox::connector::ConnectorSplit>>
       splits;
   for (const auto& filePath : filePaths) {
