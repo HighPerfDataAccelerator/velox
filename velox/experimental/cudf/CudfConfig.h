@@ -39,6 +39,8 @@ struct CudfConfig {
       "cudf.jit_expression_priority"};
   static constexpr const char* kCudfAllowCpuFallback{"cudf.allow_cpu_fallback"};
   static constexpr const char* kCudfLogFallback{"cudf.log_fallback"};
+  static constexpr const char* kCudfGpuTargetBatchRows{
+      "cudf.gpu_target_batch_rows"};
 
   /// Singleton CudfConfig instance.
   /// Clients must set the configs below before invoking registerCudf().
@@ -88,6 +90,14 @@ struct CudfConfig {
 
   /// Whether to log a reason for falling back to Velox CPU execution.
   bool logFallback{true};
+
+  /// Target minimum number of rows for a GPU batch.  Operators that may
+  /// produce or receive tiny batches (e.g. hash-probe after many small
+  /// shuffled partitions, filter with high selectivity, or partial
+  /// aggregation fed by scan with small row-groups) accumulate rows
+  /// until this threshold is reached before launching GPU kernels.
+  /// Set to 0 to disable accumulation (process each batch individually).
+  int32_t gpuTargetBatchRows{1'000'000};
 };
 
 } // namespace facebook::velox::cudf_velox

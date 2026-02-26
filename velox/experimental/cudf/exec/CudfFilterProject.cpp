@@ -25,6 +25,7 @@
 #include "velox/expression/FieldReference.h"
 
 #include <cudf/aggregation.hpp>
+#include <cudf/concatenate.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/stream_compaction.hpp>
 #include <cudf/unary.hpp>
@@ -226,6 +227,16 @@ void CudfFilterProject::initialize() {
   project_.reset();
 }
 
+bool CudfFilterProject::needsInput() const {
+  if (!hasFilter_) {
+    return !input_;
+  }
+  auto minRows = CudfConfig::getInstance().gpuTargetBatchRows;
+  bool belowThreshold = accumulatedOutputs_.empty() ||
+      (minRows > 0 && accumulatedOutputRows_ < minRows);
+  return !noMoreInput_ && input_ == nullptr && belowThreshold;
+}
+
 void CudfFilterProject::addInput(RowVectorPtr input) {
   input_ = std::move(input);
 }
@@ -234,10 +245,19 @@ RowVectorPtr CudfFilterProject::getOutput() {
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
 
   if (allInputProcessed()) {
+    if (!hasFilter_) {
+      return nullptr;
+    }
+    if (!accumulatedOutputs_.empty() && noMoreInput_) {
+      return flushAccumulatedOutputs();
+    }
     return nullptr;
   }
   if (input_->size() == 0) {
     input_.reset();
+    if (!accumulatedOutputs_.empty() && noMoreInput_) {
+      return flushAccumulatedOutputs();
+    }
     return nullptr;
   }
 
@@ -260,13 +280,71 @@ RowVectorPtr CudfFilterProject::getOutput() {
             << " columns";
   }
 
-  auto cudfOutput = std::make_shared<CudfVector>(
-      input_->pool(), outputType_, size, std::move(outputTable), stream);
+  auto pool = input_->pool();
   input_.reset();
-  if (numColumns == 0 or size == 0) {
+
+  if (numColumns == 0 || size == 0) {
+    if (!accumulatedOutputs_.empty() && noMoreInput_) {
+      return flushAccumulatedOutputs();
+    }
     return nullptr;
   }
-  return cudfOutput;
+
+  auto cudfOutput = std::make_shared<CudfVector>(
+      pool, outputType_, size, std::move(outputTable), stream);
+
+  if (!hasFilter_) {
+    return cudfOutput;
+  }
+
+  auto minRows = CudfConfig::getInstance().gpuTargetBatchRows;
+  if (minRows <= 0) {
+    return cudfOutput;
+  }
+
+  accumulatedOutputRows_ += size;
+  accumulatedOutputs_.push_back(std::move(cudfOutput));
+
+  if (accumulatedOutputRows_ >= minRows) {
+    return flushAccumulatedOutputs();
+  }
+  return nullptr;
+}
+
+RowVectorPtr CudfFilterProject::flushAccumulatedOutputs() {
+  if (accumulatedOutputs_.empty()) {
+    return nullptr;
+  }
+  VLOG(1) << "CudfFilterProject::flush: " << accumulatedOutputs_.size()
+          << " batches, " << accumulatedOutputRows_ << " rows";
+  {
+    auto lockedStats = stats_.wlock();
+    lockedStats->addRuntimeStat(
+        "numCoalescedBatches", RuntimeCounter(1));
+  }
+  if (accumulatedOutputs_.size() == 1) {
+    auto result = std::move(accumulatedOutputs_[0]);
+    accumulatedOutputs_.clear();
+    accumulatedOutputRows_ = 0;
+    return result;
+  }
+
+  std::vector<cudf::table_view> tableViews;
+  tableViews.reserve(accumulatedOutputs_.size());
+  rmm::cuda_stream_view stream;
+  for (auto& out : accumulatedOutputs_) {
+    tableViews.push_back(out->getTableView());
+    stream = out->stream();
+  }
+  auto concatenated = cudf::concatenate(tableViews, stream);
+  stream.synchronize();
+
+  auto pool = accumulatedOutputs_[0]->pool();
+  auto totalRows = accumulatedOutputRows_;
+  accumulatedOutputs_.clear();
+  accumulatedOutputRows_ = 0;
+  return std::make_shared<CudfVector>(
+      pool, outputType_, totalRows, std::move(concatenated), stream);
 }
 
 void CudfFilterProject::filter(
@@ -371,7 +449,7 @@ bool CudfFilterProject::allInputProcessed() {
 }
 
 bool CudfFilterProject::isFinished() {
-  return noMoreInput_ && allInputProcessed();
+  return noMoreInput_ && allInputProcessed() && accumulatedOutputs_.empty();
 }
 
 } // namespace facebook::velox::cudf_velox

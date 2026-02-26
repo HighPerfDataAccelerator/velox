@@ -81,6 +81,8 @@ void CudfHashJoinProbe::close() {
   filterEvaluator_.reset();
   scalars_.clear();
   tree_ = {};
+  accumulatedProbeInputs_.clear();
+  accumulatedProbeRows_ = 0;
 }
 
 void CudfHashJoinBridge::setHashTable(
@@ -460,7 +462,11 @@ bool CudfHashJoinProbe::needsInput() const {
   if (joinNode_->isRightSemiFilterJoin()) {
     return !noMoreInput_;
   }
-  return !noMoreInput_ && !finished_ && input_ == nullptr;
+  auto minRows = CudfConfig::getInstance().gpuTargetBatchRows;
+  bool belowThreshold =
+      accumulatedProbeInputs_.empty() ||
+      (minRows > 0 && accumulatedProbeRows_ < minRows);
+  return !noMoreInput_ && !finished_ && input_ == nullptr && belowThreshold;
 }
 
 void CudfHashJoinProbe::addInput(RowVectorPtr input) {
@@ -489,7 +495,8 @@ void CudfHashJoinProbe::addInput(RowVectorPtr input) {
   }
 
   if (input->size() > 0) {
-    input_ = std::move(input);
+    accumulatedProbeRows_ += input->size();
+    accumulatedProbeInputs_.push_back(std::move(cudfInput));
   }
 }
 
@@ -1307,6 +1314,39 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
   if (finished_ or !hashObject_.has_value()) {
     return nullptr;
   }
+
+  // Materialize accumulated probe inputs into input_ when the row threshold
+  // is reached or no more input is expected. This coalesces many small GPU
+  // batches into one large batch, dramatically reducing kernel-launch and
+  // stream-synchronize overhead.
+  if (!joinNode_->isRightSemiFilterJoin() &&
+      !accumulatedProbeInputs_.empty() && input_ == nullptr) {
+    auto minRows = CudfConfig::getInstance().gpuTargetBatchRows;
+    if (accumulatedProbeRows_ >= minRows || noMoreInput_) {
+      if (accumulatedProbeInputs_.size() == 1) {
+        input_ = std::move(accumulatedProbeInputs_[0]);
+      } else {
+        auto stream = accumulatedProbeInputs_[0]->stream();
+        auto probeType = joinNode_->sources()[0]->outputType();
+        auto tbl =
+            getConcatenatedTable(accumulatedProbeInputs_, probeType, stream);
+        input_ = std::make_shared<CudfVector>(
+            operatorCtx_->pool(),
+            probeType,
+            tbl->num_rows(),
+            std::move(tbl),
+            stream);
+      }
+      accumulatedProbeInputs_.clear();
+      accumulatedProbeRows_ = 0;
+      {
+        auto lockedStats = stats_.wlock();
+        lockedStats->addRuntimeStat(
+            "numCoalescedBatches", RuntimeCounter(1));
+      }
+    }
+  }
+
   if (!input_) {
     // If no more input, emit unmatched-right rows if needed.
     if ((joinNode_->isRightJoin() || joinNode_->isFullJoin()) && noMoreInput_ &&
@@ -1566,7 +1606,8 @@ exec::BlockingReason CudfHashJoinProbe::isBlocked(ContinueFuture* future) {
 }
 
 bool CudfHashJoinProbe::isFinished() {
-  auto const isFinished = finished_ || (noMoreInput_ && input_ == nullptr);
+  auto const isFinished = finished_ ||
+      (noMoreInput_ && input_ == nullptr && accumulatedProbeInputs_.empty());
 
   // Release hashObject_ if finished
   if (isFinished) {

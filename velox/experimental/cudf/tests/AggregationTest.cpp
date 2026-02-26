@@ -875,4 +875,104 @@ TEST_F(AggregationTest, globalApproxDistinctWithNaN) {
   EXPECT_LE(cudfEstimate, 5);
 }
 
+TEST_F(AggregationTest, partialAggInputAccumulation) {
+  auto& config = cudf_velox::CudfConfig::getInstance();
+  auto savedTarget = config.gpuTargetBatchRows;
+  config.gpuTargetBatchRows = 500;
+
+  constexpr int kBatchSize = 100;
+  constexpr int kNumBatches = 20;
+
+  std::vector<RowVectorPtr> batches;
+  for (int b = 0; b < kNumBatches; ++b) {
+    std::vector<int32_t> keys(kBatchSize);
+    std::vector<int64_t> vals(kBatchSize);
+    for (int i = 0; i < kBatchSize; ++i) {
+      keys[i] = (b * kBatchSize + i) % 10;
+      vals[i] = 1;
+    }
+    batches.push_back(makeRowVector(
+        {makeFlatVector<int32_t>(keys), makeFlatVector<int64_t>(vals)}));
+  }
+
+  auto plan = PlanBuilder()
+                  .values(batches)
+                  .partialAggregation({"c0"}, {"sum(c1)", "count(c1)"})
+                  .finalAggregation()
+                  .planNode();
+
+  createDuckDbTable(batches);
+  assertQuery(plan, "SELECT c0, sum(c1), count(c1) FROM tmp GROUP BY c0");
+
+  config.gpuTargetBatchRows = savedTarget;
+}
+
+TEST_F(AggregationTest, partialAggInputAccumulationDisabled) {
+  auto& config = cudf_velox::CudfConfig::getInstance();
+  auto savedTarget = config.gpuTargetBatchRows;
+  config.gpuTargetBatchRows = 0;
+
+  constexpr int kBatchSize = 50;
+  constexpr int kNumBatches = 10;
+
+  std::vector<RowVectorPtr> batches;
+  for (int b = 0; b < kNumBatches; ++b) {
+    std::vector<int32_t> keys(kBatchSize);
+    std::vector<int64_t> vals(kBatchSize);
+    for (int i = 0; i < kBatchSize; ++i) {
+      keys[i] = i % 5;
+      vals[i] = b + 1;
+    }
+    batches.push_back(makeRowVector(
+        {makeFlatVector<int32_t>(keys), makeFlatVector<int64_t>(vals)}));
+  }
+
+  auto plan = PlanBuilder()
+                  .values(batches)
+                  .partialAggregation({"c0"}, {"sum(c1)"})
+                  .finalAggregation()
+                  .planNode();
+
+  createDuckDbTable(batches);
+  assertQuery(plan, "SELECT c0, sum(c1) FROM tmp GROUP BY c0");
+
+  config.gpuTargetBatchRows = savedTarget;
+}
+
+TEST_F(AggregationTest, partialDistinctInputAccumulation) {
+  auto& config = cudf_velox::CudfConfig::getInstance();
+  auto savedTarget = config.gpuTargetBatchRows;
+  config.gpuTargetBatchRows = 300;
+
+  constexpr int kBatchSize = 80;
+  constexpr int kNumBatches = 15;
+
+  std::vector<RowVectorPtr> batches;
+  for (int b = 0; b < kNumBatches; ++b) {
+    std::vector<int32_t> keys(kBatchSize);
+    for (int i = 0; i < kBatchSize; ++i) {
+      keys[i] = (b * kBatchSize + i) % 20;
+    }
+    batches.push_back(makeRowVector({makeFlatVector<int32_t>(keys)}));
+  }
+
+  auto plan =
+      PlanBuilder()
+          .values(batches)
+          .aggregation(
+              {"c0"},
+              {},
+              {},
+              core::AggregationNode::Step::kPartial,
+              false)
+          .aggregation(
+              {"c0"}, {}, {}, core::AggregationNode::Step::kFinal, false)
+          .planNode();
+
+  createDuckDbTable(batches);
+  assertQuery(plan, "SELECT DISTINCT c0 FROM tmp");
+
+  config.gpuTargetBatchRows = savedTarget;
+}
+
 } // namespace facebook::velox::exec::test

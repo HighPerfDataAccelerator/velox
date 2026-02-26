@@ -38,4 +38,25 @@ TEST(ConfigTest, CudfConfig) {
   ASSERT_EQ(config.functionNamePrefix, "presto");
   ASSERT_EQ(config.allowCpuFallback, false);
 }
+
+TEST(ConfigTest, GpuTargetBatchRows) {
+  {
+    CudfConfig config;
+    ASSERT_EQ(config.gpuTargetBatchRows, 1'000'000);
+  }
+  {
+    CudfConfig config;
+    std::unordered_map<std::string, std::string> options = {
+        {CudfConfig::kCudfGpuTargetBatchRows, "500000"}};
+    config.initialize(std::move(options));
+    ASSERT_EQ(config.gpuTargetBatchRows, 500000);
+  }
+  {
+    CudfConfig config;
+    std::unordered_map<std::string, std::string> options = {
+        {CudfConfig::kCudfGpuTargetBatchRows, "0"}};
+    config.initialize(std::move(options));
+    ASSERT_EQ(config.gpuTargetBatchRows, 0);
+  }
+}
 } // namespace facebook::velox::cudf_velox::test

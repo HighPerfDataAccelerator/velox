@@ -18,6 +18,7 @@
 
 #include "velox/experimental/cudf/exec/NvtxHelper.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
+#include "velox/experimental/cudf/vector/CudfVector.h"
 
 #include "velox/core/Expressions.h"
 #include "velox/core/PlanNode.h"
@@ -39,9 +40,7 @@ class CudfFilterProject : public exec::Operator, public NvtxHelper {
   // Some is copied from operator FilterProject.
   void initialize() override;
 
-  bool needsInput() const override {
-    return !input_;
-  }
+  bool needsInput() const override;
 
   void addInput(RowVectorPtr input) override;
 
@@ -65,16 +64,18 @@ class CudfFilterProject : public exec::Operator, public NvtxHelper {
     Operator::close();
     projectEvaluators_.clear();
     filterEvaluator_.reset();
+    accumulatedOutputs_.clear();
+    accumulatedOutputRows_ = 0;
   }
 
  private:
   bool allInputProcessed();
 
-  // If true exprs_[0] is a filter and the other expressions are projections
+  /// Concatenate all accumulated output batches into a single CudfVector.
+  RowVectorPtr flushAccumulatedOutputs();
+
   const bool hasFilter_{false};
 
-  // Cached filter and project node for lazy initialization. After
-  // initialization, they will be reset, and initialized_ will be set to true.
   std::shared_ptr<const core::ProjectNode> project_;
   std::shared_ptr<const core::FilterNode> filter_;
 
@@ -83,6 +84,10 @@ class CudfFilterProject : public exec::Operator, public NvtxHelper {
 
   std::vector<velox::exec::IdentityProjection> resultProjections_;
   std::vector<velox::exec::IdentityProjection> identityProjections_;
+
+  /// Post-filter output batches waiting to be concatenated and emitted.
+  std::vector<CudfVectorPtr> accumulatedOutputs_;
+  int64_t accumulatedOutputRows_{0};
 };
 
 bool canBeEvaluatedByCudf(

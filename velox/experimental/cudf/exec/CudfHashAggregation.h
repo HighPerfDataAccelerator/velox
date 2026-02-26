@@ -155,6 +155,14 @@ class CudfHashAggregation : public exec::Operator, public NvtxHelper {
 
   void computeIntermediateDistinctPartial(CudfVectorPtr tbl);
 
+  // Accumulates input batches for partial aggregation so that many small
+  // batches (e.g. ~4K rows from scan) are concatenated into a single large
+  // batch before running the GPU groupby kernel.
+  void processAccumulatedPartialInputs();
+
+  std::vector<CudfVectorPtr> accumulatedPartialInputs_;
+  int64_t accumulatedPartialRows_{0};
+
   CudfVectorPtr partialOutput_;
 };
 

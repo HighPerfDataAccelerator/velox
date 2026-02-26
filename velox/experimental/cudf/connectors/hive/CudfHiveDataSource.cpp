@@ -323,15 +323,17 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
     cudfTable = std::make_unique<cudf::table>(std::move(originalColumns));
   }
 
-  // TODO (dm): Should we only enable table scan if cudf is registered?
-  // Earlier we could enable cudf table scans without using other cudf operators
-  // We still can, but I'm wondering if this is the right thing to do
+  // Synchronize the stream before accessing GPU data on the host side.
+  // CudfVector constructor calls getTableSize() which may trigger GPU kernels
+  // (e.g., null_count()) on the default stream. Without synchronization, this
+  // races with async operations still in flight on stream_.
+  stream_.synchronize();
+
   auto output = cudfIsRegistered()
       ? std::make_shared<CudfVector>(
             pool_, outputType_, nRows, std::move(cudfTable), stream_)
       : with_arrow::toVeloxColumn(
             cudfTable->view(), pool_, outputType_->names(), stream_);
-  stream_.synchronize();
 
   // Check if conversion yielded a nullptr
   VELOX_CHECK_NOT_NULL(output, "Cudf to Velox conversion yielded a nullptr");
