@@ -8494,4 +8494,255 @@ DEBUG_ONLY_TEST_F(HashJoinTest, hashTableCleanupAfterProbeFinish) {
   ASSERT_TRUE(tableEmpty);
 }
 
+// Verify that inner join produces correct results when probe side consists of
+// many tiny batches (simulating the shuffle-read small-batch scenario). The
+// probe batch accumulation logic should coalesce them automatically.
+TEST_F(HashJoinTest, innerJoinManySmallProbeBatches) {
+  constexpr int32_t kNumProbeBatches = 200;
+  constexpr int32_t kRowsPerBatch = 50;
+  constexpr int32_t kBuildRows = 500;
+
+  auto& config = cudf_velox::CudfConfig::getInstance();
+  auto savedThreshold = config.gpuTargetBatchRows;
+  config.gpuTargetBatchRows = 2000;
+
+  auto probeType = ROW({"t_k0", "t_v0"}, {INTEGER(), INTEGER()});
+  auto buildType = ROW({"u_k0", "u_v0"}, {INTEGER(), INTEGER()});
+
+  std::vector<RowVectorPtr> probeVectors =
+      makeBatches(kNumProbeBatches, [&](int32_t /*batch*/) {
+        return makeRowVector(
+            probeType->names(),
+            {
+                makeFlatVector<int32_t>(
+                    kRowsPerBatch, [](auto row) { return row % 500; }),
+                makeFlatVector<int32_t>(
+                    kRowsPerBatch, [](auto row) { return row * 10; }),
+            });
+      });
+  std::vector<RowVectorPtr> buildVectors =
+      makeBatches(1, [&](int32_t /*batch*/) {
+        return makeRowVector(
+            buildType->names(),
+            {
+                makeFlatVector<int32_t>(
+                    kBuildRows, [](auto row) { return row; }),
+                makeFlatVector<int32_t>(
+                    kBuildRows, [](auto row) { return row * 100; }),
+            });
+      });
+
+  HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
+      .numDrivers(1)
+      .injectSpill(false)
+      .probeKeys({"t_k0"})
+      .probeVectors(std::move(probeVectors))
+      .buildKeys({"u_k0"})
+      .buildVectors(std::move(buildVectors))
+      .joinOutputLayout({"t_k0", "t_v0", "u_v0"})
+      .referenceQuery(
+          "SELECT t.t_k0, t.t_v0, u.u_v0 FROM t, u WHERE t.t_k0 = u.u_k0")
+      .run();
+
+  config.gpuTargetBatchRows = savedThreshold;
+}
+
+// Same as above but with accumulation disabled (threshold = 0), exercising
+// the fallback per-batch code path.
+TEST_F(HashJoinTest, innerJoinSmallBatchesNoAccumulation) {
+  constexpr int32_t kNumProbeBatches = 30;
+  constexpr int32_t kRowsPerBatch = 100;
+  constexpr int32_t kBuildRows = 200;
+
+  auto& config = cudf_velox::CudfConfig::getInstance();
+  auto savedThreshold = config.gpuTargetBatchRows;
+  config.gpuTargetBatchRows = 0;
+
+  auto probeType = ROW({"t_k0", "t_v0"}, {INTEGER(), INTEGER()});
+  auto buildType = ROW({"u_k0", "u_v0"}, {INTEGER(), INTEGER()});
+
+  std::vector<RowVectorPtr> probeVectors =
+      makeBatches(kNumProbeBatches, [&](int32_t /*batch*/) {
+        return makeRowVector(
+            probeType->names(),
+            {
+                makeFlatVector<int32_t>(
+                    kRowsPerBatch, [](auto row) { return row % 200; }),
+                makeFlatVector<int32_t>(
+                    kRowsPerBatch, [](auto row) { return row; }),
+            });
+      });
+  std::vector<RowVectorPtr> buildVectors =
+      makeBatches(1, [&](int32_t /*batch*/) {
+        return makeRowVector(
+            buildType->names(),
+            {
+                makeFlatVector<int32_t>(
+                    kBuildRows, [](auto row) { return row; }),
+                makeFlatVector<int32_t>(
+                    kBuildRows, [](auto row) { return row * 7; }),
+            });
+      });
+
+  HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
+      .numDrivers(1)
+      .injectSpill(false)
+      .probeKeys({"t_k0"})
+      .probeVectors(std::move(probeVectors))
+      .buildKeys({"u_k0"})
+      .buildVectors(std::move(buildVectors))
+      .joinOutputLayout({"t_k0", "t_v0", "u_v0"})
+      .referenceQuery(
+          "SELECT t.t_k0, t.t_v0, u.u_v0 FROM t, u WHERE t.t_k0 = u.u_k0")
+      .run();
+
+  config.gpuTargetBatchRows = savedThreshold;
+}
+
+// Verify left join correctness with many small probe batches.
+TEST_F(HashJoinTest, leftJoinManySmallProbeBatches) {
+  constexpr int32_t kNumProbeBatches = 100;
+  constexpr int32_t kRowsPerBatch = 80;
+  constexpr int32_t kBuildRows = 300;
+
+  auto& config = cudf_velox::CudfConfig::getInstance();
+  auto savedThreshold = config.gpuTargetBatchRows;
+  config.gpuTargetBatchRows = 5000;
+
+  auto probeType = ROW({"t_k0", "t_v0"}, {INTEGER(), INTEGER()});
+  auto buildType = ROW({"u_k0", "u_v0"}, {INTEGER(), INTEGER()});
+
+  std::vector<RowVectorPtr> probeVectors =
+      makeBatches(kNumProbeBatches, [&](int32_t /*batch*/) {
+        return makeRowVector(
+            probeType->names(),
+            {
+                makeFlatVector<int32_t>(
+                    kRowsPerBatch, [](auto row) { return row; }),
+                makeFlatVector<int32_t>(
+                    kRowsPerBatch, [](auto row) { return row * 3; }),
+            });
+      });
+  std::vector<RowVectorPtr> buildVectors =
+      makeBatches(1, [&](int32_t /*batch*/) {
+        return makeRowVector(
+            buildType->names(),
+            {
+                makeFlatVector<int32_t>(
+                    kBuildRows, [](auto row) { return row * 2; }),
+                makeFlatVector<int32_t>(
+                    kBuildRows, [](auto row) { return row; }),
+            });
+      });
+
+  HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
+      .numDrivers(1)
+      .injectSpill(false)
+      .joinType(core::JoinType::kLeft)
+      .probeKeys({"t_k0"})
+      .probeVectors(std::move(probeVectors))
+      .buildKeys({"u_k0"})
+      .buildVectors(std::move(buildVectors))
+      .joinOutputLayout({"t_k0", "t_v0", "u_v0"})
+      .referenceQuery(
+          "SELECT t.t_k0, t.t_v0, u.u_v0 FROM t LEFT JOIN u ON t.t_k0 = u.u_k0")
+      .run();
+
+  config.gpuTargetBatchRows = savedThreshold;
+}
+
+// Verify leftSemiFilter join with many small probe batches and accumulation.
+TEST_F(HashJoinTest, leftSemiFilterJoinManySmallProbeBatches) {
+  constexpr int32_t kNumProbeBatches = 80;
+  constexpr int32_t kRowsPerBatch = 60;
+  constexpr int32_t kBuildRows = 400;
+
+  auto& config = cudf_velox::CudfConfig::getInstance();
+  auto savedThreshold = config.gpuTargetBatchRows;
+  config.gpuTargetBatchRows = 3000;
+
+  std::vector<RowVectorPtr> probeVectors =
+      makeBatches(kNumProbeBatches, [&](int32_t /*batch*/) {
+        return makeRowVector(
+            {"t_k0", "t_v0"},
+            {
+                makeFlatVector<int32_t>(
+                    kRowsPerBatch, [](auto row) { return row % 400; }),
+                makeFlatVector<int32_t>(
+                    kRowsPerBatch, [](auto row) { return row; }),
+            });
+      });
+  std::vector<RowVectorPtr> buildVectors =
+      makeBatches(1, [&](int32_t /*batch*/) {
+        return makeRowVector(
+            {"u_k0"},
+            {
+                makeFlatVector<int32_t>(
+                    kBuildRows, [](auto row) { return row; }),
+            });
+      });
+
+  HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
+      .numDrivers(1)
+      .injectSpill(false)
+      .joinType(core::JoinType::kLeftSemiFilter)
+      .probeKeys({"t_k0"})
+      .probeVectors(std::move(probeVectors))
+      .buildKeys({"u_k0"})
+      .buildVectors(std::move(buildVectors))
+      .joinOutputLayout({"t_k0", "t_v0"})
+      .referenceQuery(
+          "SELECT t.t_k0, t.t_v0 FROM t WHERE t.t_k0 IN (SELECT u_k0 FROM u)")
+      .run();
+
+  config.gpuTargetBatchRows = savedThreshold;
+}
+
+// Verify anti join with many small probe batches and accumulation.
+TEST_F(HashJoinTest, antiJoinManySmallProbeBatches) {
+  constexpr int32_t kNumProbeBatches = 60;
+  constexpr int32_t kRowsPerBatch = 70;
+  constexpr int32_t kBuildRows = 200;
+
+  auto& config = cudf_velox::CudfConfig::getInstance();
+  auto savedThreshold = config.gpuTargetBatchRows;
+  config.gpuTargetBatchRows = 2500;
+
+  std::vector<RowVectorPtr> probeVectors =
+      makeBatches(kNumProbeBatches, [&](int32_t /*batch*/) {
+        return makeRowVector(
+            {"t_k0", "t_v0"},
+            {
+                makeFlatVector<int32_t>(
+                    kRowsPerBatch, [](auto row) { return row; }),
+                makeFlatVector<int32_t>(
+                    kRowsPerBatch, [](auto row) { return row * 5; }),
+            });
+      });
+  std::vector<RowVectorPtr> buildVectors =
+      makeBatches(1, [&](int32_t /*batch*/) {
+        return makeRowVector(
+            {"u_k0"},
+            {
+                makeFlatVector<int32_t>(
+                    kBuildRows, [](auto row) { return row * 3; }),
+            });
+      });
+
+  HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
+      .numDrivers(1)
+      .injectSpill(false)
+      .joinType(core::JoinType::kAnti)
+      .probeKeys({"t_k0"})
+      .probeVectors(std::move(probeVectors))
+      .buildKeys({"u_k0"})
+      .buildVectors(std::move(buildVectors))
+      .joinOutputLayout({"t_k0", "t_v0"})
+      .referenceQuery(
+          "SELECT t.t_k0, t.t_v0 FROM t WHERE t.t_k0 NOT IN (SELECT u_k0 FROM u WHERE u_k0 IS NOT NULL) AND t.t_k0 IS NOT NULL")
+      .run();
+
+  config.gpuTargetBatchRows = savedThreshold;
+}
+
 } // namespace

@@ -173,9 +173,16 @@ class CudfHashJoinProbe : public exec::Operator, public NvtxHelper {
 
   bool rightPrecomputed_{false};
 
-  // Batched probe inputs needed for right join
+  // Batched probe inputs needed for right semi-filter join
   std::vector<CudfVectorPtr> inputs_;
   ContinueFuture future_{ContinueFuture::makeEmpty()};
+
+  // Accumulated probe inputs for batch-coalescing before GPU hash probe.
+  // Small probe batches severely underutilize the GPU; we buffer them here
+  // until we reach the configured row threshold, then concatenate and probe
+  // as a single large batch.
+  std::vector<CudfVectorPtr> accumulatedProbeInputs_;
+  int64_t accumulatedProbeRows_{0};
 
   /** @brief Column indices for join keys in left (probe) table */
   std::vector<cudf::size_type> leftKeyIndices_;

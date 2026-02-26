@@ -985,6 +985,36 @@ void CudfHashAggregation::computeIntermediateDistinctPartial(
   }
 }
 
+void CudfHashAggregation::processAccumulatedPartialInputs() {
+  if (accumulatedPartialInputs_.empty()) {
+    return;
+  }
+
+  auto stream = cudfGlobalStreamPool().get_stream();
+  auto tbl =
+      getConcatenatedTable(accumulatedPartialInputs_, inputType_, stream);
+  stream.synchronize();
+
+  auto numRows = static_cast<int64_t>(tbl->num_rows());
+  auto cudfBatch = std::make_shared<CudfVector>(
+      pool(), inputType_, numRows, std::move(tbl), stream);
+
+  accumulatedPartialInputs_.clear();
+  accumulatedPartialRows_ = 0;
+
+  if (isDistinct_) {
+    computeIntermediateDistinctPartial(cudfBatch);
+  } else {
+    computeIntermediateGroupbyPartial(cudfBatch);
+  }
+
+  {
+    auto lockedStats = stats_.wlock();
+    lockedStats->addRuntimeStat(
+        "numCoalescedBatches", RuntimeCounter(1));
+  }
+}
+
 void CudfHashAggregation::addInput(RowVectorPtr input) {
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
   if (input->size() == 0) {
@@ -996,11 +1026,18 @@ void CudfHashAggregation::addInput(RowVectorPtr input) {
   VELOX_CHECK_NOT_NULL(cudfInput);
 
   if (isPartialOutput_ && !isGlobal_) {
+    const auto targetRows = CudfConfig::getInstance().gpuTargetBatchRows;
+    if (targetRows > 0) {
+      accumulatedPartialInputs_.push_back(std::move(cudfInput));
+      accumulatedPartialRows_ += input->size();
+      if (accumulatedPartialRows_ >= targetRows) {
+        processAccumulatedPartialInputs();
+      }
+      return;
+    }
     if (isDistinct_) {
-      // Handle partial distinct aggregation.
       computeIntermediateDistinctPartial(cudfInput);
     } else {
-      // Handle partial groupby aggregation.
       computeIntermediateGroupbyPartial(cudfInput);
     }
     return;
@@ -1186,13 +1223,17 @@ RowVectorPtr CudfHashAggregation::getOutput() {
 
 void CudfHashAggregation::noMoreInput() {
   Operator::noMoreInput();
-  if (isPartialOutput_ && inputs_.empty()) {
+  if (isPartialOutput_ && !isGlobal_) {
+    processAccumulatedPartialInputs();
+  }
+  if (isPartialOutput_ && inputs_.empty() &&
+      accumulatedPartialInputs_.empty()) {
     finished_ = true;
   }
 }
 
 bool CudfHashAggregation::isFinished() {
-  return finished_;
+  return finished_ && accumulatedPartialInputs_.empty();
 }
 
 // Step-aware aggregation registry implementation

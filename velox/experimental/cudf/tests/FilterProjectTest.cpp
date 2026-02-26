@@ -1200,4 +1200,129 @@ TEST_F(CudfSimpleFilterProjectTest, castToSmallInt) {
   EXPECT_EQ(tryCast, -214);
 }
 
+TEST_F(CudfFilterProjectTest, filterOutputAccumulationManySmallBatches) {
+  constexpr int32_t kNumBatches = 100;
+  constexpr int32_t kRowsPerBatch = 200;
+
+  auto& config = cudf_velox::CudfConfig::getInstance();
+  auto saved = config.gpuTargetBatchRows;
+  config.gpuTargetBatchRows = 500;
+
+  auto rowType = ROW({{"c0", INTEGER()}, {"c1", DOUBLE()}});
+  std::vector<RowVectorPtr> vectors;
+  for (int32_t b = 0; b < kNumBatches; ++b) {
+    vectors.push_back(makeRowVector(
+        rowType->names(),
+        {
+            makeFlatVector<int32_t>(
+                kRowsPerBatch, [&](auto row) { return b * kRowsPerBatch + row; }),
+            makeFlatVector<double>(
+                kRowsPerBatch, [](auto row) { return row * 1.1; }),
+        }));
+  }
+  createDuckDbTable(vectors);
+
+  auto plan = PlanBuilder()
+                  .values(vectors)
+                  .filter("c0 % 100 = 0")
+                  .project({"c0", "c1"})
+                  .planNode();
+
+  assertQuery(plan, "SELECT c0, c1 FROM tmp WHERE c0 % 100 = 0");
+  config.gpuTargetBatchRows = saved;
+}
+
+TEST_F(CudfFilterProjectTest, filterOutputAccumulationDisabled) {
+  constexpr int32_t kNumBatches = 20;
+  constexpr int32_t kRowsPerBatch = 100;
+
+  auto& config = cudf_velox::CudfConfig::getInstance();
+  auto saved = config.gpuTargetBatchRows;
+  config.gpuTargetBatchRows = 0;
+
+  auto rowType = ROW({{"c0", INTEGER()}, {"c1", DOUBLE()}});
+  std::vector<RowVectorPtr> vectors;
+  for (int32_t b = 0; b < kNumBatches; ++b) {
+    vectors.push_back(makeRowVector(
+        rowType->names(),
+        {
+            makeFlatVector<int32_t>(
+                kRowsPerBatch, [&](auto row) { return b * kRowsPerBatch + row; }),
+            makeFlatVector<double>(
+                kRowsPerBatch, [](auto row) { return row * 0.5; }),
+        }));
+  }
+  createDuckDbTable(vectors);
+
+  auto plan = PlanBuilder()
+                  .values(vectors)
+                  .filter("c0 % 50 = 0")
+                  .project({"c0", "c1"})
+                  .planNode();
+
+  assertQuery(plan, "SELECT c0, c1 FROM tmp WHERE c0 % 50 = 0");
+  config.gpuTargetBatchRows = saved;
+}
+
+TEST_F(CudfFilterProjectTest, filterOutputAccumulationHighSelectivity) {
+  constexpr int32_t kNumBatches = 50;
+  constexpr int32_t kRowsPerBatch = 500;
+
+  auto& config = cudf_velox::CudfConfig::getInstance();
+  auto saved = config.gpuTargetBatchRows;
+  config.gpuTargetBatchRows = 2000;
+
+  auto rowType = ROW({{"c0", INTEGER()}, {"c1", DOUBLE()}});
+  std::vector<RowVectorPtr> vectors;
+  for (int32_t b = 0; b < kNumBatches; ++b) {
+    vectors.push_back(makeRowVector(
+        rowType->names(),
+        {
+            makeFlatVector<int32_t>(
+                kRowsPerBatch, [&](auto row) { return b * kRowsPerBatch + row; }),
+            makeFlatVector<double>(
+                kRowsPerBatch, [](auto row) { return row * 2.0; }),
+        }));
+  }
+  createDuckDbTable(vectors);
+
+  auto plan = PlanBuilder()
+                  .values(vectors)
+                  .filter("c0 >= 0")
+                  .project({"c0", "c1"})
+                  .planNode();
+
+  assertQuery(plan, "SELECT c0, c1 FROM tmp WHERE c0 >= 0");
+  config.gpuTargetBatchRows = saved;
+}
+
+TEST_F(CudfFilterProjectTest, projectOnlyNoAccumulation) {
+  constexpr int32_t kNumBatches = 20;
+  constexpr int32_t kRowsPerBatch = 100;
+
+  auto& config = cudf_velox::CudfConfig::getInstance();
+  auto saved = config.gpuTargetBatchRows;
+  config.gpuTargetBatchRows = 5000;
+
+  auto rowType = ROW({{"c0", INTEGER()}, {"c1", DOUBLE()}});
+  std::vector<RowVectorPtr> vectors;
+  for (int32_t b = 0; b < kNumBatches; ++b) {
+    vectors.push_back(makeRowVector(
+        rowType->names(),
+        {
+            makeFlatVector<int32_t>(kRowsPerBatch, [](auto row) { return row; }),
+            makeFlatVector<double>(kRowsPerBatch, [](auto row) { return row * 3.0; }),
+        }));
+  }
+  createDuckDbTable(vectors);
+
+  auto plan = PlanBuilder()
+                  .values(vectors)
+                  .project({"c0 + 1 AS c0_inc", "c1 * 2.0 AS c1_dbl"})
+                  .planNode();
+
+  assertQuery(plan, "SELECT c0 + 1 AS c0_inc, c1 * 2.0 AS c1_dbl FROM tmp");
+  config.gpuTargetBatchRows = saved;
+}
+
 } // namespace

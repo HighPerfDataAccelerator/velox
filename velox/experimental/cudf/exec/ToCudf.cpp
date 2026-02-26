@@ -405,6 +405,12 @@ void CudfConfig::initialize(
   if (config.find(kCudfLogFallback) != config.end()) {
     logFallback = folly::to<bool>(config[kCudfLogFallback]);
   }
+  if (config.find(kCudfGpuTargetBatchRows) != config.end()) {
+    gpuTargetBatchRows =
+        folly::to<int32_t>(config[kCudfGpuTargetBatchRows]);
+  }
+  LOG(WARNING) << "CudfConfig initialized: gpuTargetBatchRows="
+               << gpuTargetBatchRows;
 }
 
 } // namespace facebook::velox::cudf_velox

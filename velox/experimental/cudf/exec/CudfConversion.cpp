@@ -252,7 +252,7 @@ RowVectorPtr CudfToVelox::getOutput() {
       auto cudfTableView = input->getTableView();
       auto partitions = std::vector<cudf::size_type>{
           static_cast<cudf::size_type>(targetBatchSize - totalSize)};
-      auto tableSplits = cudf::split(cudfTableView, partitions);
+      auto tableSplits = cudf::split(cudfTableView, partitions, stream);
 
       // Create new CudfVector from the first part
       auto firstPart = std::make_unique<cudf::table>(tableSplits[0], stream);
