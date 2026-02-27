@@ -25,6 +25,7 @@ add_library(
   CudfTopN.cpp
   DebugUtil.cpp
   OperatorAdapters.cpp
+  PinnedArrowInterop.cpp
   ToCudf.cpp
   Utilities.cpp
   VeloxCudfInterop.cpp
@@ -43,5 +44,15 @@ target_link_libraries(
     velox_cudf_hive_connector
     velox_cudf_expression
 )
+
+# PinnedArrowInterop.cpp uses nanoarrow headers directly (cudf's private dep).
+# nanoarrow is already linked into libcudf.so; we only need the headers + namespace define.
+if(DEFINED nanoarrow_SOURCE_DIR)
+  target_include_directories(velox_cudf_exec PRIVATE
+    "${nanoarrow_SOURCE_DIR}/src"
+    "${nanoarrow_BINARY_DIR}/src"
+  )
+endif()
+target_compile_definitions(velox_cudf_exec PRIVATE NANOARROW_NAMESPACE=cudf)
 
 target_compile_options(velox_cudf_exec PRIVATE -Wno-missing-field-initializers)
