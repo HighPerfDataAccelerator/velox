@@ -36,7 +36,7 @@ class PinnedHostBuffer {
     }
     try {
       mr_ = cudf::get_pinned_memory_resource();
-      data_ = static_cast<uint8_t*>(mr_.allocate(size));
+      data_ = static_cast<uint8_t*>(mr_.allocate_sync(size));
       pinned_ = true;
     } catch (...) {
       fallback_.resize(size);
@@ -47,7 +47,7 @@ class PinnedHostBuffer {
 
   ~PinnedHostBuffer() {
     if (pinned_ && data_) {
-      mr_.deallocate(data_, size_);
+      mr_.deallocate_sync(data_, size_);
     }
   }
 
