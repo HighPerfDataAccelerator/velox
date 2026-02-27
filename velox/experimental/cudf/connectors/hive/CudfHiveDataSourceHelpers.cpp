@@ -17,6 +17,7 @@
 #include "velox/experimental/cudf/connectors/hive/CudfHiveDataSourceHelpers.hpp"
 
 #include "velox/dwio/common/BufferedInput.h"
+#include "velox/experimental/cudf/exec/PinnedHostMemory.h"
 
 #include <cudf/ast/detail/expression_transformer.hpp>
 #include <cudf/ast/detail/operators.hpp>
@@ -32,6 +33,9 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+using facebook::velox::cudf_velox::PinnedDataSourceBuffer;
+using facebook::velox::cudf_velox::PinnedHostBuffer;
 
 namespace {
 template <typename T>
@@ -69,10 +73,14 @@ void BufferedInputDataSource::enqueueForDevice(
   std::shared_ptr sharedStream(std::move(inputStream));
   pendingDeviceLoads_.push_back(
       [dst, size, sharedStream](rmm::cuda_stream_view stream) {
-        std::vector<uint8_t> buffer(size);
-        sharedStream->readFully(reinterpret_cast<char*>(buffer.data()), size);
+        auto buffer = std::make_shared<PinnedHostBuffer>(size);
+        sharedStream->readFully(reinterpret_cast<char*>(buffer->data()), size);
         CUDF_CUDA_TRY(cudaMemcpyAsync(
-            dst, buffer.data(), size, cudaMemcpyHostToDevice, stream.value()));
+            dst,
+            buffer->data(),
+            size,
+            cudaMemcpyHostToDevice,
+            stream.value()));
       });
 }
 
@@ -89,9 +97,9 @@ BufferedInputDataSource::host_read(size_t offset, size_t size) {
     return cudf::io::datasource::buffer::create(std::vector<uint8_t>{});
   }
   const size_t readSize = std::min(size, fileSize_ - offset);
-  std::vector<uint8_t> data(readSize);
-  readContiguous(offset, readSize, data.data());
-  return cudf::io::datasource::buffer::create(std::move(data));
+  auto buf = std::make_shared<PinnedHostBuffer>(readSize);
+  readContiguous(offset, readSize, buf->data());
+  return std::make_unique<PinnedDataSourceBuffer>(std::move(buf));
 }
 
 size_t
