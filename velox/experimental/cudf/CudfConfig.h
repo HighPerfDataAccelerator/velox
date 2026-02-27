@@ -41,6 +41,10 @@ struct CudfConfig {
   static constexpr const char* kCudfLogFallback{"cudf.log_fallback"};
   static constexpr const char* kCudfGpuTargetBatchRows{
       "cudf.gpu_target_batch_rows"};
+  static constexpr const char* kCudfPinnedPoolSize{
+      "cudf.pinned_pool_size"};
+  static constexpr const char* kCudfHostAsPinnedThreshold{
+      "cudf.host_as_pinned_threshold"};
 
   /// Singleton CudfConfig instance.
   /// Clients must set the configs below before invoking registerCudf().
@@ -90,6 +94,16 @@ struct CudfConfig {
 
   /// Whether to log a reason for falling back to Velox CPU execution.
   bool logFallback{true};
+
+  /// Size of the pinned host memory pool in bytes.
+  /// Used for HtoD/DtoH transfers to achieve full PCIe bandwidth.
+  /// 0 means use cudf default (0.5% of device memory, capped at 64 MB).
+  size_t pinnedPoolSize{0};
+
+  /// Threshold in bytes for allocating host memory as pinned.
+  /// Host allocations <= this size use the pinned pool; larger ones use
+  /// pageable. 0 disables (cudf default). Use SIZE_MAX to pin everything.
+  size_t hostAsPinnedThreshold{0};
 
   /// Target minimum number of rows for a GPU batch.  Operators that may
   /// produce or receive tiny batches (e.g. hash-probe after many small

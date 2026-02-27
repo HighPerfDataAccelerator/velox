@@ -52,6 +52,8 @@
 #include "velox/exec/Values.h"
 
 #include <cudf/detail/nvtx/ranges.hpp>
+#include <cudf/logger.hpp>
+#include <cudf/utilities/pinned_memory.hpp>
 
 #include <cuda.h>
 
@@ -336,6 +338,30 @@ void registerCudf() {
   cudf::set_current_device_resource(mr.get());
   mr_ = mr;
 
+  // Temporarily lower cudf logger level so pinned pool init is visible.
+  cudf::default_logger().set_level(rapids_logger::level_enum::info);
+
+  // Configure pinned host memory pool for fast HtoD/DtoH transfers.
+  const auto& config = CudfConfig::getInstance();
+  if (config.pinnedPoolSize > 0) {
+    cudf::config_default_pinned_memory_resource(
+        cudf::pinned_mr_options{config.pinnedPoolSize});
+  }
+  if (config.hostAsPinnedThreshold > 0) {
+    cudf::set_allocate_host_as_pinned_threshold(
+        config.hostAsPinnedThreshold);
+  }
+
+  // Force pinned pool initialization and log the result.
+  // This triggers the lazy-init inside cudf that reads LIBCUDF_PINNED_POOL_SIZE.
+  auto pinnedMr = cudf::get_pinned_memory_resource();
+  auto pinnedThreshold = cudf::get_allocate_host_as_pinned_threshold();
+  LOG(WARNING) << "cudf pinned memory: pool initialized (resource="
+               << &pinnedMr << "), hostAsPinnedThreshold="
+               << pinnedThreshold;
+
+  cudf::default_logger().set_level(rapids_logger::level_enum::warn);
+
   exec::Operator::registerOperator(
       std::make_unique<CudfHashJoinBridgeTranslator>());
   CudfDriverAdapter cda{CudfConfig::getInstance().allowCpuFallback};
@@ -409,8 +435,17 @@ void CudfConfig::initialize(
     gpuTargetBatchRows =
         folly::to<int32_t>(config[kCudfGpuTargetBatchRows]);
   }
+  if (config.find(kCudfPinnedPoolSize) != config.end()) {
+    pinnedPoolSize = folly::to<size_t>(config[kCudfPinnedPoolSize]);
+  }
+  if (config.find(kCudfHostAsPinnedThreshold) != config.end()) {
+    hostAsPinnedThreshold =
+        folly::to<size_t>(config[kCudfHostAsPinnedThreshold]);
+  }
   LOG(WARNING) << "CudfConfig initialized: gpuTargetBatchRows="
-               << gpuTargetBatchRows;
+               << gpuTargetBatchRows
+               << " pinnedPoolSize=" << pinnedPoolSize
+               << " hostAsPinnedThreshold=" << hostAsPinnedThreshold;
 }
 
 } // namespace facebook::velox::cudf_velox
