@@ -32,28 +32,6 @@
 namespace facebook::velox::cudf_velox {
 
 namespace {
-// Concatenate multiple RowVectors into a single RowVector.
-// Copied from AggregationFuzzer.cpp.
-RowVectorPtr mergeRowVectors(
-    const std::vector<RowVectorPtr>& results,
-    velox::memory::MemoryPool* pool) {
-  VELOX_NVTX_FUNC_RANGE();
-  if (results.size() == 1) {
-    return results[0];
-  }
-  vector_size_t totalCount = 0;
-  for (const auto& result : results) {
-    totalCount += result->size();
-  }
-  auto copy =
-      BaseVector::create<RowVector>(results[0]->type(), totalCount, pool);
-  auto copyCount = 0;
-  for (const auto& result : results) {
-    copy->copy(result.get(), copyCount, 0, result->size());
-    copyCount += result->size();
-  }
-  return copy;
-}
 
 cudf::size_type preferredGpuBatchSizeRows(
     const facebook::velox::core::QueryConfig& queryConfig) {
@@ -127,32 +105,27 @@ RowVectorPtr CudfFromVelox::getOutput() {
     }
   }
 
-  // Combine selected RowVectors into a single RowVector
-  auto input = mergeRowVectors(selectedInputs, inputs_[0]->pool());
-
   // Remove processed inputs
   inputs_.erase(inputs_.begin(), inputs_.begin() + selectedInputs.size());
   currentOutputSize_ -= totalSize;
 
   // Early return if no input
-  if (input->size() == 0) {
+  if (totalSize == 0) {
     return nullptr;
   }
 
-  // Get a stream from the global stream pool
   auto stream = cudfGlobalStreamPool().get_stream();
 
-  // Convert RowVector to cudf table
-  auto tbl = with_arrow::toCudfTable(input, input->pool(), stream);
-
-  stream.synchronize();
+  // Batched HtoD: issues N async from_arrow calls, ONE sync, then GPU concat.
+  // Avoids the CPU-side mergeRowVectors copy and N separate sync round-trips.
+  auto tbl =
+      with_arrow::toCudfTableBatched(selectedInputs, selectedInputs[0]->pool(), stream);
 
   VELOX_CHECK_NOT_NULL(tbl);
 
-  // Return a CudfVector that owns the cudf table
   const auto size = tbl->num_rows();
   return std::make_shared<CudfVector>(
-      input->pool(), outputType_, size, std::move(tbl), stream);
+      selectedInputs[0]->pool(), outputType_, size, std::move(tbl), stream);
 }
 
 void CudfFromVelox::close() {
@@ -228,7 +201,6 @@ RowVectorPtr CudfToVelox::getOutput() {
     }
     RowVectorPtr output =
         with_arrow::toVeloxColumn(tableView, pool(), "", stream);
-    stream.synchronize();
     finished_ = noMoreInput_ && inputs_.empty();
     output->setType(outputType_);
     // cudfVector goes out of scope here, freeing the GPU memory
@@ -295,7 +267,6 @@ RowVectorPtr CudfToVelox::getOutput() {
 
   RowVectorPtr output =
       with_arrow::toVeloxColumn(resultTable->view(), pool(), "", stream);
-  stream.synchronize();
   finished_ = noMoreInput_ && inputs_.empty();
   output->setType(outputType_);
   return output;

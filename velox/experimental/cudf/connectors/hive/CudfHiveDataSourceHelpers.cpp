@@ -72,8 +72,13 @@ void BufferedInputDataSource::enqueueForDevice(
   auto inputStream = input_->enqueue({offset, size});
   std::shared_ptr sharedStream(std::move(inputStream));
   pendingDeviceLoads_.push_back(
-      [dst, size, sharedStream](rmm::cuda_stream_view stream) {
+      [this, dst, size, sharedStream](rmm::cuda_stream_view stream) {
         auto buffer = std::make_shared<PinnedHostBuffer>(size);
+        if (buffer->isPinned()) {
+          pinnedAllocBytes_.fetch_add(size, std::memory_order_relaxed);
+        } else {
+          pageableAllocBytes_.fetch_add(size, std::memory_order_relaxed);
+        }
         sharedStream->readFully(reinterpret_cast<char*>(buffer->data()), size);
         CUDF_CUDA_TRY(cudaMemcpyAsync(
             dst,
@@ -98,6 +103,11 @@ BufferedInputDataSource::host_read(size_t offset, size_t size) {
   }
   const size_t readSize = std::min(size, fileSize_ - offset);
   auto buf = std::make_shared<PinnedHostBuffer>(readSize);
+  if (buf->isPinned()) {
+    pinnedAllocBytes_.fetch_add(readSize, std::memory_order_relaxed);
+  } else {
+    pageableAllocBytes_.fetch_add(readSize, std::memory_order_relaxed);
+  }
   readContiguous(offset, readSize, buf->data());
   return std::make_unique<PinnedDataSourceBuffer>(std::move(buf));
 }

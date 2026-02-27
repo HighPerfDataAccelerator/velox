@@ -18,6 +18,7 @@
 
 #include "velox/dwio/common/BufferedInput.h"
 
+#include <atomic>
 #include <cudf/ast/detail/expression_transformer.hpp>
 #include <cudf/ast/detail/operators.hpp>
 #include <cudf/ast/expressions.hpp>
@@ -72,6 +73,13 @@ class BufferedInputDataSource : public cudf::io::datasource {
   // loads and copies to device.
   void load(rmm::cuda_stream_view stream);
 
+  uint64_t pinnedAllocBytes() const {
+    return pinnedAllocBytes_.load(std::memory_order_relaxed);
+  }
+  uint64_t pageableAllocBytes() const {
+    return pageableAllocBytes_.load(std::memory_order_relaxed);
+  }
+
  private:
   void readContiguous(size_t offset, size_t size, uint8_t* dst);
 
@@ -79,6 +87,8 @@ class BufferedInputDataSource : public cudf::io::datasource {
   const size_t fileSize_;
   std::vector<std::function<void(rmm::cuda_stream_view stream)>>
       pendingDeviceLoads_;
+  std::atomic<uint64_t> pinnedAllocBytes_{0};
+  std::atomic<uint64_t> pageableAllocBytes_{0};
 };
 
 /**
