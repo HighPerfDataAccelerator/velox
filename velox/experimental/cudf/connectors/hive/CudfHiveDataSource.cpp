@@ -686,6 +686,17 @@ CudfHiveDataSource::getRuntimeStats() {
   for (const auto& storageStats : ioStats) {
     res.emplace(storageStats.first, storageStats.second);
   }
+
+  if (auto* bids = dynamic_cast<BufferedInputDataSource*>(dataSource_.get())) {
+    res.emplace(
+        "pinnedAllocBytes",
+        RuntimeMetric(bids->pinnedAllocBytes(), RuntimeCounter::Unit::kBytes));
+    res.emplace(
+        "pageableAllocBytes",
+        RuntimeMetric(
+            bids->pageableAllocBytes(), RuntimeCounter::Unit::kBytes));
+  }
+
   return res;
 }
 

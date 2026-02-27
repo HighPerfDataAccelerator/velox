@@ -35,6 +35,14 @@ std::unique_ptr<cudf::table> toCudfTable(
     facebook::velox::memory::MemoryPool* pool,
     rmm::cuda_stream_view stream);
 
+/// Converts multiple RowVectors to a single cudf::table with ONE stream sync.
+/// Issues N async from_arrow transfers on the same stream, then a single
+/// synchronize, then concatenates on GPU. Avoids N separate sync round-trips.
+std::unique_ptr<cudf::table> toCudfTableBatched(
+    const std::vector<facebook::velox::RowVectorPtr>& batches,
+    facebook::velox::memory::MemoryPool* pool,
+    rmm::cuda_stream_view stream);
+
 facebook::velox::RowVectorPtr toVeloxColumn(
     const cudf::table_view& table,
     facebook::velox::memory::MemoryPool* pool,

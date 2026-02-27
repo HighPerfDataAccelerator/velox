@@ -19,12 +19,71 @@
 #include <cudf/io/datasource.hpp>
 #include <cudf/utilities/pinned_memory.hpp>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <memory>
 #include <vector>
 
 namespace facebook::velox::cudf_velox {
+
+struct PinnedAllocStats {
+  std::atomic<uint64_t> pinnedCount{0};
+  std::atomic<uint64_t> pinnedBytes{0};
+  std::atomic<uint64_t> fallbackCount{0};
+  std::atomic<uint64_t> fallbackBytes{0};
+  std::atomic<uint64_t> peakInFlight{0};
+  std::atomic<uint64_t> curInFlight{0};
+
+  static PinnedAllocStats& instance() {
+    static PinnedAllocStats s;
+    return s;
+  }
+
+  void recordPinned(size_t bytes) {
+    auto pc = pinnedCount.fetch_add(1, std::memory_order_relaxed) + 1;
+    pinnedBytes.fetch_add(bytes, std::memory_order_relaxed);
+    auto cur = curInFlight.fetch_add(bytes, std::memory_order_relaxed) + bytes;
+    auto peak = peakInFlight.load(std::memory_order_relaxed);
+    while (cur > peak &&
+           !peakInFlight.compare_exchange_weak(
+               peak, cur, std::memory_order_relaxed)) {
+    }
+    auto total = pc + fallbackCount.load(std::memory_order_relaxed);
+    if ((total & (total - 1)) == 0 || (total % 100000) == 0) {
+      dump("alloc");
+    }
+  }
+
+  void recordFallback(size_t bytes) {
+    fallbackCount.fetch_add(1, std::memory_order_relaxed);
+    fallbackBytes.fetch_add(bytes, std::memory_order_relaxed);
+    auto total = pinnedCount.load(std::memory_order_relaxed) +
+        fallbackCount.load(std::memory_order_relaxed);
+    if ((total & (total - 1)) == 0 || (total % 100000) == 0) {
+      dump("fallback");
+    }
+  }
+
+  void recordFree(size_t bytes) {
+    curInFlight.fetch_sub(bytes, std::memory_order_relaxed);
+  }
+
+  void dump(const char* event) {
+    fprintf(
+        stderr,
+        "[PinnedAlloc] %s: pinned=%lu/%luMB fallback=%lu/%luMB "
+        "inFlight=%luMB peak=%luMB\n",
+        event,
+        (unsigned long)pinnedCount.load(std::memory_order_relaxed),
+        (unsigned long)(pinnedBytes.load(std::memory_order_relaxed) >> 20),
+        (unsigned long)fallbackCount.load(std::memory_order_relaxed),
+        (unsigned long)(fallbackBytes.load(std::memory_order_relaxed) >> 20),
+        (unsigned long)(curInFlight.load(std::memory_order_relaxed) >> 20),
+        (unsigned long)(peakInFlight.load(std::memory_order_relaxed) >> 20));
+  }
+};
 
 /// RAII host buffer that prefers pinned memory for fast PCIe DMA transfers.
 /// Allocates from cudf's pinned pool; falls back to pageable heap on failure.
@@ -38,15 +97,18 @@ class PinnedHostBuffer {
       mr_ = cudf::get_pinned_memory_resource();
       data_ = static_cast<uint8_t*>(mr_.allocate_sync(size));
       pinned_ = true;
+      PinnedAllocStats::instance().recordPinned(size);
     } catch (...) {
       fallback_.resize(size);
       data_ = fallback_.data();
       pinned_ = false;
+      PinnedAllocStats::instance().recordFallback(size);
     }
   }
 
   ~PinnedHostBuffer() {
     if (pinned_ && data_) {
+      PinnedAllocStats::instance().recordFree(size_);
       mr_.deallocate_sync(data_, size_);
     }
   }

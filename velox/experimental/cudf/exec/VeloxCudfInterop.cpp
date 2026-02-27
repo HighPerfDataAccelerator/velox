@@ -25,6 +25,8 @@
 #include "velox/vector/ComplexVector.h"
 #include "velox/vector/arrow/Bridge.h"
 
+#include <cudf/concatenate.hpp>
+#include <cudf/copying.hpp>
 #include <cudf/interop.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
@@ -38,7 +40,22 @@
 
 #include <cstring>
 
+#include <atomic>
+
 namespace facebook::velox::cudf_velox {
+
+namespace {
+struct PinnedTransferStats {
+  std::atomic<uint64_t> htodCalls{0};
+  std::atomic<uint64_t> htodBytes{0};
+  std::atomic<uint64_t> dtohCalls{0};
+  std::atomic<uint64_t> dtohBytes{0};
+};
+PinnedTransferStats& pinnedStats() {
+  static PinnedTransferStats stats;
+  return stats;
+}
+} // namespace
 
 cudf::type_id veloxToCudfTypeId(const TypePtr& type) {
   switch (type->kind()) {
@@ -215,43 +232,135 @@ void pinArrowBuffersRecursive(
   }
 }
 
+/// Result of an async HtoD transfer. The caller must call sync() or let the
+/// owning batch function handle synchronization before the pinned buffers and
+/// Arrow resources are released.
+struct AsyncHtoD {
+  std::unique_ptr<cudf::table> table;
+  std::vector<std::shared_ptr<PinnedHostBuffer>> pinnedBufs;
+  ArrowArray arrowArray{};
+  ArrowSchema arrowSchema{};
+
+  AsyncHtoD() = default;
+  AsyncHtoD(const AsyncHtoD&) = delete;
+  AsyncHtoD& operator=(const AsyncHtoD&) = delete;
+  AsyncHtoD(AsyncHtoD&& o) noexcept
+      : table(std::move(o.table)),
+        pinnedBufs(std::move(o.pinnedBufs)),
+        arrowArray(o.arrowArray),
+        arrowSchema(o.arrowSchema) {
+    o.arrowArray.release = nullptr;
+    o.arrowSchema.release = nullptr;
+  }
+
+  void releaseArrow() {
+    pinnedBufs.clear();
+    if (arrowArray.release) {
+      arrowArray.release(&arrowArray);
+    }
+    if (arrowSchema.release) {
+      arrowSchema.release(&arrowSchema);
+    }
+  }
+};
+
+/// Issues the from_arrow transfer on `stream` but does NOT synchronize.
+/// The returned AsyncHtoD keeps pinned buffers alive; caller must sync
+/// the stream before destroying it.
+AsyncHtoD toCudfTableNoSync(
+    const facebook::velox::RowVectorPtr& veloxTable,
+    facebook::velox::memory::MemoryPool* pool,
+    rmm::cuda_stream_view stream) {
+  // Flatten nested encodings (e.g. dictionary-of-dictionary) that the Arrow
+  // bridge cannot export.  BaseVector::copy always produces flat output.
+  auto flat = facebook::velox::BaseVector::create<facebook::velox::RowVector>(
+      veloxTable->type(), veloxTable->size(), pool);
+  flat->copy(veloxTable.get(), 0, 0, veloxTable->size());
+
+  AsyncHtoD result;
+  ArrowOptions arrowOptions{true, true};
+  exportToArrow(
+      std::dynamic_pointer_cast<facebook::velox::BaseVector>(flat),
+      result.arrowArray,
+      pool,
+      arrowOptions);
+  exportToArrow(
+      std::dynamic_pointer_cast<facebook::velox::BaseVector>(flat),
+      result.arrowSchema,
+      arrowOptions);
+
+  pinArrowBuffersRecursive(
+      &result.arrowArray, &result.arrowSchema, result.pinnedBufs);
+
+  uint64_t pinnedBytes = 0;
+  for (const auto& b : result.pinnedBufs) {
+    pinnedBytes += b->size();
+  }
+  auto& stats = pinnedStats();
+  auto callNum = stats.htodCalls.fetch_add(1, std::memory_order_relaxed) + 1;
+  stats.htodBytes.fetch_add(pinnedBytes, std::memory_order_relaxed);
+  if ((callNum & (callNum - 1)) == 0) {
+    fprintf(
+        stderr,
+        "[PinnedDMA] HtoD: calls=%lu thisBytes=%lu totalBytes=%lu\n",
+        (unsigned long)callNum,
+        (unsigned long)pinnedBytes,
+        (unsigned long)stats.htodBytes.load(std::memory_order_relaxed));
+  }
+
+  result.table =
+      cudf::from_arrow(&result.arrowSchema, &result.arrowArray, stream);
+  return result;
+}
+
 } // anonymous namespace
 
 std::unique_ptr<cudf::table> toCudfTable(
     const facebook::velox::RowVectorPtr& veloxTable,
     facebook::velox::memory::MemoryPool* pool,
     rmm::cuda_stream_view stream) {
-  ArrowOptions arrowOptions{true, true};
-  ArrowArray arrowArray;
-  exportToArrow(
-      std::dynamic_pointer_cast<facebook::velox::BaseVector>(veloxTable),
-      arrowArray,
-      pool,
-      arrowOptions);
-  ArrowSchema arrowSchema;
-  exportToArrow(
-      std::dynamic_pointer_cast<facebook::velox::BaseVector>(veloxTable),
-      arrowSchema,
-      arrowOptions);
-
-  // Copy pageable Arrow buffers to pinned host memory so that
-  // cudf::from_arrow's cudaMemcpyDefault uses DMA instead of staging.
-  std::vector<std::shared_ptr<PinnedHostBuffer>> pinnedBufs;
-  pinArrowBuffersRecursive(&arrowArray, &arrowSchema, pinnedBufs);
-
-  auto tbl = cudf::from_arrow(&arrowSchema, &arrowArray, stream);
-
-  // Wait for HtoD copies to complete before freeing pinned buffers.
+  auto async = toCudfTableNoSync(veloxTable, pool, stream);
   stream.synchronize();
-  pinnedBufs.clear();
+  async.releaseArrow();
+  return std::move(async.table);
+}
 
-  if (arrowArray.release) {
-    arrowArray.release(&arrowArray);
+std::unique_ptr<cudf::table> toCudfTableBatched(
+    const std::vector<facebook::velox::RowVectorPtr>& batches,
+    facebook::velox::memory::MemoryPool* pool,
+    rmm::cuda_stream_view stream) {
+  if (batches.empty()) {
+    return nullptr;
   }
-  if (arrowSchema.release) {
-    arrowSchema.release(&arrowSchema);
+  if (batches.size() == 1) {
+    return toCudfTable(batches[0], pool, stream);
   }
-  return tbl;
+
+  // Issue all from_arrow calls on the same stream without syncing.
+  std::vector<AsyncHtoD> pending;
+  pending.reserve(batches.size());
+  for (const auto& batch : batches) {
+    pending.push_back(toCudfTableNoSync(batch, pool, stream));
+  }
+
+  // ONE sync for all transfers.
+  stream.synchronize();
+
+  // Build table views for GPU-side concatenation.
+  std::vector<cudf::table_view> views;
+  views.reserve(pending.size());
+  for (auto& p : pending) {
+    views.push_back(p.table->view());
+  }
+
+  auto concatenated = cudf::concatenate(views, stream);
+
+  // Release Arrow / pinned resources after concatenation is issued.
+  for (auto& p : pending) {
+    p.releaseArrow();
+  }
+
+  return concatenated;
 }
 
 namespace {
@@ -261,9 +370,15 @@ RowVectorPtr toVeloxColumn(
     memory::MemoryPool* pool,
     const std::vector<cudf::column_metadata>& metadata,
     rmm::cuda_stream_view stream) {
-  // Use pinned host memory for DtoH instead of cudf::to_arrow_host (pageable).
   auto arrowDeviceArray = pinnedToArrowHost(table, stream);
   auto& arrowArray = arrowDeviceArray->array;
+
+  auto& stats = pinnedStats();
+  auto callNum = stats.dtohCalls.fetch_add(1, std::memory_order_relaxed) + 1;
+  int64_t rows = arrowArray.length;
+  if ((callNum & (callNum - 1)) == 0) {
+    LOG(WARNING) << "Pinned DtoH: calls=" << callNum << " rows=" << rows;
+  }
 
   auto arrowSchema = cudf::to_arrow_schema(table, metadata);
   auto veloxTable = importFromArrowAsOwner(*arrowSchema, arrowArray, pool);

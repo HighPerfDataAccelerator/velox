@@ -174,7 +174,6 @@ void CudfHiveConnectorTestBase::writeToFile(
     if (vector->size()) {
       auto stream = cudf::get_default_stream();
       auto cudfTable = with_arrow::toCudfTable(vector, vector->pool(), stream);
-      stream.synchronize();
       cudfTables.emplace_back(std::move(cudfTable));
     }
   }
@@ -211,7 +210,6 @@ void CudfHiveConnectorTestBase::writeToFile(
   VELOX_CHECK_NOT_NULL(vector);
   auto stream = cudf::get_default_stream();
   auto cudfTable = with_arrow::toCudfTable(vector, vector->pool(), stream);
-  stream.synchronize();
   auto tableInputMetadata = cudf::io::table_input_metadata(cudfTable->view());
   fillColumnNames(tableInputMetadata, prefix);
   auto options =
@@ -295,6 +293,7 @@ CudfHiveConnectorTestBase::makeCudfHiveConnectorSplit(
     uint64_t start,
     uint64_t length) {
   return facebook::velox::connector::hive::HiveConnectorSplitBuilder(filePath)
+      .connectorId(kCudfHiveConnectorId)
       .infoColumn("$file_size", fmt::format("{}", fileSize))
       .infoColumn("$file_modified_time", fmt::format("{}", fileModifiedTime))
       .start(start)
