@@ -45,6 +45,7 @@ struct CudfConfig {
       "cudf.pinned_pool_size"};
   static constexpr const char* kCudfHostAsPinnedThreshold{
       "cudf.host_as_pinned_threshold"};
+  static constexpr const char* kCudfPackedDtoH{"cudf.packed_dtoh"};
 
   /// Singleton CudfConfig instance.
   /// Clients must set the configs below before invoking registerCudf().
@@ -104,6 +105,10 @@ struct CudfConfig {
   /// Host allocations <= this size use the pinned pool; larger ones use
   /// pageable. 0 disables (cudf default). Use SIZE_MAX to pin everything.
   size_t hostAsPinnedThreshold{0};
+
+  /// Use cudf::pack for D2H transfers (single contiguous copy instead of
+  /// per-buffer).  Disable to revert to legacy per-buffer path for A/B testing.
+  bool packedDtoH{true};
 
   /// Target minimum number of rows for a GPU batch.  Operators that may
   /// produce or receive tiny batches (e.g. hash-probe after many small

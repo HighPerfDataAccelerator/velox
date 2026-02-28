@@ -20,18 +20,22 @@
 
 #include "velox/experimental/cudf/exec/PinnedArrowInterop.h"
 #include "velox/experimental/cudf/exec/PinnedHostMemory.h"
+#include "velox/experimental/cudf/CudfConfig.h"
 
 #include <cudf/contiguous_split.hpp>
 #include <cudf/interop.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/utilities/error.hpp>
 
 #include <nanoarrow/nanoarrow.h>
+#include <nanoarrow/hpp/exception.hpp>
 #include <nanoarrow/nanoarrow_device.h>
 
 #include <cuda_runtime.h>
 
 #include <atomic>
 #include <cstdio>
+#include <cstring>
 
 namespace facebook::velox::cudf_velox {
 
@@ -175,6 +179,262 @@ bool rebaseArrowBuffersToHost(
   return true;
 }
 
+// ---------------------------------------------------------------------------
+// Pack metadata layout (mirrors cudf internal serialized_column).
+// ---------------------------------------------------------------------------
+struct SerializedColumn {
+  cudf::data_type type;
+  cudf::size_type size;
+  cudf::size_type null_count;
+  int64_t data_offset;
+  int64_t null_mask_offset;
+  cudf::size_type num_children;
+  int pad;
+};
+
+/// Attach a shared_ptr<PinnedHostBuffer> ref to a nanoarrow ArrowBuffer so the
+/// host buffer stays alive as long as any consumer holds a reference.
+void attachHostBufToArrowBuffer(
+    ArrowBuffer* buf,
+    const std::shared_ptr<PinnedHostBuffer>& hostBuf,
+    uint8_t* ptr,
+    int64_t sizeBytes) {
+  buf->data = ptr;
+  buf->size_bytes = sizeBytes;
+  auto* ref = new std::shared_ptr<PinnedHostBuffer>(hostBuf);
+  buf->allocator.reallocate = nullptr;
+  buf->allocator.free = [](ArrowBufferAllocator* alloc,
+                           uint8_t* /*ptr*/,
+                           int64_t /*size*/) {
+    delete static_cast<std::shared_ptr<PinnedHostBuffer>*>(
+        alloc->private_data);
+  };
+  buf->allocator.private_data = ref;
+}
+
+/// Recursively build a nanoarrow ArrowArray from packed host buffer + metadata.
+/// `idx` is advanced past the current column and all its children.
+void buildArrowColumnFromPacked(
+    const SerializedColumn* meta,
+    size_t& idx,
+    uint8_t* hostBase,
+    const std::shared_ptr<PinnedHostBuffer>& hostBuf,
+    ArrowArray* out) {
+  auto& col = meta[idx++];
+
+  auto typeId = col.type.id();
+  bool isString = (typeId == cudf::type_id::STRING);
+
+  if (isString) {
+    // String column: cudf stores offsets child + chars data.
+    // Arrow layout: buf[0]=validity, buf[1]=offsets, buf[2]=chars
+
+    // Peek at the offsets child to determine offset width.
+    CUDF_EXPECTS(
+        col.num_children >= 1, "String column must have offsets child");
+    auto& offsetsCol = meta[idx]; // peek, don't advance yet
+    bool largeOffsets = (offsetsCol.type.id() == cudf::type_id::INT64);
+
+    auto arrowStringType =
+        largeOffsets ? NANOARROW_TYPE_LARGE_STRING : NANOARROW_TYPE_STRING;
+    NANOARROW_THROW_NOT_OK(ArrowArrayInitFromType(out, arrowStringType));
+    out->length = col.size;
+    out->null_count = col.null_count;
+
+    // validity
+    if (col.null_mask_offset != -1) {
+      auto* buf = ArrowArrayBuffer(out, 0);
+      auto maskBytes =
+          static_cast<int64_t>(cudf::bitmask_allocation_size_bytes(col.size));
+      attachHostBufToArrowBuffer(
+          buf, hostBuf, hostBase + col.null_mask_offset, maskBytes);
+      out->buffers[0] = buf->data;
+    }
+
+    // Consume the offsets child in metadata.
+    idx++; // advance past offsetsCol
+    for (int c = 0; c < offsetsCol.num_children; ++c) {
+      idx++;
+    }
+
+    auto offsetElemSize =
+        largeOffsets ? sizeof(int64_t) : sizeof(int32_t);
+    auto offsetsBytes =
+        static_cast<int64_t>(col.size + 1) * offsetElemSize;
+    auto* offsetsBuf = ArrowArrayBuffer(out, 1);
+    if (offsetsCol.data_offset != -1) {
+      attachHostBufToArrowBuffer(
+          offsetsBuf,
+          hostBuf,
+          hostBase + offsetsCol.data_offset,
+          offsetsBytes);
+    }
+    out->buffers[1] = offsetsBuf->data;
+
+    // chars data: read chars_size from host-side offsets (last element).
+    // This avoids the D2H that cudf::strings_column_view::chars_size() does.
+    int64_t charsSize = 0;
+    if (col.size > 0 && offsetsCol.data_offset != -1) {
+      auto* offsetsPtr = hostBase + offsetsCol.data_offset;
+      if (largeOffsets) {
+        charsSize = reinterpret_cast<const int64_t*>(offsetsPtr)[col.size];
+      } else {
+        charsSize = reinterpret_cast<const int32_t*>(offsetsPtr)[col.size];
+      }
+    }
+
+    auto* charsBuf = ArrowArrayBuffer(out, 2);
+    if (col.data_offset != -1 && charsSize > 0) {
+      attachHostBufToArrowBuffer(
+          charsBuf, hostBuf, hostBase + col.data_offset, charsSize);
+    }
+    out->buffers[2] = charsBuf->data;
+
+    // Skip remaining children beyond offsets (chars is stored as parent data).
+    for (int c = 1; c < col.num_children; ++c) {
+      auto& childCol = meta[idx++];
+      for (int gc = 0; gc < childCol.num_children; ++gc) {
+        idx++;
+      }
+    }
+  } else {
+    // Fixed-width or other column
+    auto arrowType = NANOARROW_TYPE_UNINITIALIZED;
+    int64_t elemSize = 0;
+    switch (typeId) {
+      case cudf::type_id::INT8:
+        arrowType = NANOARROW_TYPE_INT8;
+        elemSize = 1;
+        break;
+      case cudf::type_id::INT16:
+        arrowType = NANOARROW_TYPE_INT16;
+        elemSize = 2;
+        break;
+      case cudf::type_id::INT32:
+        arrowType = NANOARROW_TYPE_INT32;
+        elemSize = 4;
+        break;
+      case cudf::type_id::INT64:
+        arrowType = NANOARROW_TYPE_INT64;
+        elemSize = 8;
+        break;
+      case cudf::type_id::UINT8:
+        arrowType = NANOARROW_TYPE_UINT8;
+        elemSize = 1;
+        break;
+      case cudf::type_id::UINT16:
+        arrowType = NANOARROW_TYPE_UINT16;
+        elemSize = 2;
+        break;
+      case cudf::type_id::UINT32:
+        arrowType = NANOARROW_TYPE_UINT32;
+        elemSize = 4;
+        break;
+      case cudf::type_id::UINT64:
+        arrowType = NANOARROW_TYPE_UINT64;
+        elemSize = 8;
+        break;
+      case cudf::type_id::FLOAT32:
+        arrowType = NANOARROW_TYPE_FLOAT;
+        elemSize = 4;
+        break;
+      case cudf::type_id::FLOAT64:
+        arrowType = NANOARROW_TYPE_DOUBLE;
+        elemSize = 8;
+        break;
+      case cudf::type_id::BOOL8:
+        arrowType = NANOARROW_TYPE_BOOL;
+        elemSize = 0;
+        break;
+      case cudf::type_id::TIMESTAMP_DAYS:
+        arrowType = NANOARROW_TYPE_INT32;
+        elemSize = 4;
+        break;
+      case cudf::type_id::TIMESTAMP_SECONDS:
+      case cudf::type_id::TIMESTAMP_MILLISECONDS:
+      case cudf::type_id::TIMESTAMP_MICROSECONDS:
+      case cudf::type_id::TIMESTAMP_NANOSECONDS:
+      case cudf::type_id::DURATION_SECONDS:
+      case cudf::type_id::DURATION_MILLISECONDS:
+      case cudf::type_id::DURATION_MICROSECONDS:
+      case cudf::type_id::DURATION_NANOSECONDS:
+        arrowType = NANOARROW_TYPE_INT64;
+        elemSize = 8;
+        break;
+      default:
+        arrowType = NANOARROW_TYPE_BINARY;
+        elemSize = 0;
+        break;
+    }
+
+    NANOARROW_THROW_NOT_OK(ArrowArrayInitFromType(out, arrowType));
+    out->length = col.size;
+    out->null_count = col.null_count;
+
+    // validity
+    if (col.null_mask_offset != -1) {
+      auto* buf = ArrowArrayBuffer(out, 0);
+      auto maskBytes =
+          static_cast<int64_t>(cudf::bitmask_allocation_size_bytes(col.size));
+      attachHostBufToArrowBuffer(
+          buf, hostBuf, hostBase + col.null_mask_offset, maskBytes);
+      out->buffers[0] = buf->data;
+    }
+
+    // data
+    if (col.data_offset != -1 && elemSize > 0) {
+      auto* buf = ArrowArrayBuffer(out, 1);
+      auto dataBytes = static_cast<int64_t>(col.size) * elemSize;
+      attachHostBufToArrowBuffer(
+          buf, hostBuf, hostBase + col.data_offset, dataBytes);
+      out->buffers[1] = buf->data;
+    } else if (col.data_offset != -1 && arrowType == NANOARROW_TYPE_BOOL) {
+      auto* buf = ArrowArrayBuffer(out, 1);
+      auto dataBytes =
+          static_cast<int64_t>(cudf::bitmask_allocation_size_bytes(col.size));
+      attachHostBufToArrowBuffer(
+          buf, hostBuf, hostBase + col.data_offset, dataBytes);
+      out->buffers[1] = buf->data;
+    }
+
+    // Recurse into children (e.g. for STRUCT or LIST types)
+    if (col.num_children > 0) {
+      NANOARROW_THROW_NOT_OK(
+          ArrowArrayAllocateChildren(out, col.num_children));
+      for (int c = 0; c < col.num_children; ++c) {
+        buildArrowColumnFromPacked(
+            meta, idx, hostBase, hostBuf, out->children[c]);
+      }
+    }
+  }
+}
+
+/// Build a complete ArrowArray (struct-of-columns) from packed host buffer.
+void buildArrowFromPackedHost(
+    const std::vector<uint8_t>& metadata,
+    const std::shared_ptr<PinnedHostBuffer>& hostBuf,
+    int numColumns,
+    int64_t numRows,
+    ArrowArray* out) {
+  auto* meta = reinterpret_cast<const SerializedColumn*>(metadata.data());
+  // First entry is a stub: size == number of top-level columns
+  size_t idx = 1;
+
+  NANOARROW_THROW_NOT_OK(
+      ArrowArrayInitFromType(out, NANOARROW_TYPE_STRUCT));
+  NANOARROW_THROW_NOT_OK(ArrowArrayAllocateChildren(out, numColumns));
+  out->length = numRows;
+  out->null_count = 0;
+
+  for (int c = 0; c < numColumns; ++c) {
+    buildArrowColumnFromPacked(
+        meta, idx, hostBuf->data(), hostBuf, out->children[c]);
+  }
+
+  NANOARROW_THROW_NOT_OK(ArrowArrayFinishBuilding(
+      out, NANOARROW_VALIDATION_LEVEL_MINIMAL, nullptr));
+}
+
 } // namespace
 
 cudf::unique_device_array_t pinnedToArrowHost(
@@ -187,27 +447,32 @@ cudf::unique_device_array_t pinnedToArrowHost(
     return devArray;
   }
 
-  // --- Packed path: single D2H instead of per-buffer copies ---
-  //
-  // 1. cudf::pack  — GPU kernel copies all column buffers into one
-  //                   contiguous device buffer (D2D).
-  // 2. cudf::unpack — zero-copy: creates table_view into packed buffer.
-  // 3. to_arrow_device on the packed view — ArrowArray whose buffer
-  //                   pointers all fall inside the packed range.
-  // 4. Single cudaMemcpyAsync D2H of the whole packed buffer.
-  // 5. Pointer rebase — swap device pointers for host offsets.
-  //
-  // If to_arrow_device allocates buffers outside the packed range
-  // (e.g. offset-type conversion for large strings), the rebase
-  // detects this and we fall back to the legacy per-buffer path.
+  const bool usePacked = CudfConfig::getInstance().packedDtoH;
+
+  if (!usePacked) {
+    auto devArray = cudf::to_arrow_device(table, stream);
+    int bufs = countBuffersRecursive(&devArray->array);
+    auto& stats = DtoHStats::instance();
+    stats.fallbackCalls.fetch_add(1, std::memory_order_relaxed);
+    stats.fallbackBuffers.fetch_add(bufs, std::memory_order_relaxed);
+    copyDeviceBuffersToPinnedHost(&devArray->array, stream);
+    stream.synchronize();
+    auto calls = stats.fallbackCalls.load(std::memory_order_relaxed);
+    if ((calls & (calls - 1)) == 0 || (calls % 500) == 0) {
+      stats.dump("legacy");
+    }
+    devArray->device_type = ARROW_DEVICE_CPU;
+    return devArray;
+  }
+
+  // --- Packed path: cudf::pack + 1 big D2H + build Arrow on host ---
 
   auto packed = cudf::pack(table, stream);
-  auto packedView = cudf::unpack(packed);
-  auto devArray = cudf::to_arrow_device(packedView, stream);
 
   auto* devBase = static_cast<const uint8_t*>(packed.gpu_data->data());
   size_t devSize = packed.gpu_data->size();
 
+  // Single D2H transfer of the entire packed buffer.
   auto hostBuf = std::make_shared<PinnedHostBuffer>(devSize);
   CUDF_CUDA_TRY(cudaMemcpyAsync(
       hostBuf->data(),
@@ -215,38 +480,41 @@ cudf::unique_device_array_t pinnedToArrowHost(
       devSize,
       cudaMemcpyDeviceToHost,
       stream.value()));
-
   stream.synchronize();
 
-  if (rebaseArrowBuffersToHost(
-          &devArray->array, devBase, devSize, hostBuf)) {
-    auto& stats = DtoHStats::instance();
-    auto calls =
-        stats.packedCalls.fetch_add(1, std::memory_order_relaxed) + 1;
-    stats.packedBytes.fetch_add(devSize, std::memory_order_relaxed);
-    stats.packedCols.fetch_add(
-        table.num_columns(), std::memory_order_relaxed);
-    stats.packedRows.fetch_add(table.num_rows(), std::memory_order_relaxed);
-    if ((calls & (calls - 1)) == 0 || (calls % 500) == 0) {
-      stats.dump("packed");
-    }
-    devArray->device_type = ARROW_DEVICE_CPU;
-    return devArray;
+  // Build Arrow arrays from host-side packed buffer + metadata.
+  // No to_arrow_device call, no chars_size D2H, no cudaEvent overhead.
+  auto* raw = new ArrowDeviceArray;
+  std::memset(raw, 0, sizeof(ArrowDeviceArray));
+  cudf::unique_device_array_t result(
+      raw, [](ArrowDeviceArray* arr) {
+        if (arr->array.release != nullptr) {
+          ArrowArrayRelease(&arr->array);
+        }
+        delete arr;
+      });
+  result->device_id = 0;
+  result->device_type = ARROW_DEVICE_CPU;
+  result->sync_event = nullptr;
+
+  buildArrowFromPackedHost(
+      *packed.metadata,
+      hostBuf,
+      table.num_columns(),
+      table.num_rows(),
+      &result->array);
+
+  auto& stats = DtoHStats::instance();
+  auto calls =
+      stats.packedCalls.fetch_add(1, std::memory_order_relaxed) + 1;
+  stats.packedBytes.fetch_add(devSize, std::memory_order_relaxed);
+  stats.packedCols.fetch_add(table.num_columns(), std::memory_order_relaxed);
+  stats.packedRows.fetch_add(table.num_rows(), std::memory_order_relaxed);
+  if ((calls & (calls - 1)) == 0 || (calls % 500) == 0) {
+    stats.dump("packed-v2");
   }
 
-  // Fallback: some buffer was outside the packed range.
-  {
-    auto devArrayFallback = cudf::to_arrow_device(table, stream);
-    int bufs = countBuffersRecursive(&devArrayFallback->array);
-    auto& stats = DtoHStats::instance();
-    stats.fallbackCalls.fetch_add(1, std::memory_order_relaxed);
-    stats.fallbackBuffers.fetch_add(bufs, std::memory_order_relaxed);
-    copyDeviceBuffersToPinnedHost(&devArrayFallback->array, stream);
-    stream.synchronize();
-    stats.dump("fallback!");
-    devArrayFallback->device_type = ARROW_DEVICE_CPU;
-    return devArrayFallback;
-  }
+  return result;
 }
 
 } // namespace facebook::velox::cudf_velox

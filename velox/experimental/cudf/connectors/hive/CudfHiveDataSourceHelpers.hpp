@@ -83,10 +83,15 @@ class BufferedInputDataSource : public cudf::io::datasource {
  private:
   void readContiguous(size_t offset, size_t size, uint8_t* dst);
 
+  struct PendingChunk {
+    std::shared_ptr<facebook::velox::dwio::common::SeekableInputStream> stream;
+    uint64_t size;
+    uint8_t* deviceDst;
+  };
+
   std::shared_ptr<facebook::velox::dwio::common::BufferedInput> input_;
   const size_t fileSize_;
-  std::vector<std::function<void(rmm::cuda_stream_view stream)>>
-      pendingDeviceLoads_;
+  std::vector<PendingChunk> pendingChunks_;
   std::atomic<uint64_t> pinnedAllocBytes_{0};
   std::atomic<uint64_t> pageableAllocBytes_{0};
 };

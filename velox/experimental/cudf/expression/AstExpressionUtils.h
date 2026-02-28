@@ -536,14 +536,18 @@ cudf::ast::expression const& AstContext::pushExprToTree(
     return *result;
   } else if (name == "cast" || name == "try_cast") {
     VELOX_CHECK_EQ(len, 1);
-    auto const& op1 = pushExprToTree(expr->inputs()[0]);
-    if (expr->type()->kind() == TypeKind::INTEGER) {
-      // No int32 cast in cudf ast
+    auto outputKind = expr->type()->kind();
+    if (outputKind == TypeKind::INTEGER || outputKind == TypeKind::BIGINT ||
+        outputKind == TypeKind::DOUBLE) {
+      auto const& op1 = pushExprToTree(expr->inputs()[0]);
+      if (outputKind == TypeKind::DOUBLE) {
+        return tree.push(Operation{Op::CAST_TO_FLOAT64, op1});
+      }
       return tree.push(Operation{Op::CAST_TO_INT64, op1});
-    } else if (expr->type()->kind() == TypeKind::BIGINT) {
-      return tree.push(Operation{Op::CAST_TO_INT64, op1});
-    } else if (expr->type()->kind() == TypeKind::DOUBLE) {
-      return tree.push(Operation{Op::CAST_TO_FLOAT64, op1});
+    } else if (!allowPureAstOnly && canBeEvaluatedByCudf(expr, /*deep=*/false)) {
+      auto node =
+          createCudfExpression(expr, inputRowSchema[0], kAstEvaluatorName);
+      return addPrecomputeInstructionOnSide(0, 0, name, "", node);
     } else {
       VELOX_FAIL("Unsupported type for cast operation");
     }
