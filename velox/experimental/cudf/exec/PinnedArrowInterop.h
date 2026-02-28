@@ -25,15 +25,17 @@ namespace facebook::velox::cudf_velox {
 
 /// DtoH: Convert cudf table_view to host ArrowDeviceArray using pinned memory.
 ///
-/// Replacement for cudf::to_arrow_host() that allocates destination buffers
-/// from cudf's pinned host memory pool instead of pageable malloc. This
-/// enables CUDA DMA (cudaMemcpyDefault detects pinned → direct PCIe transfer)
-/// instead of the slower staged-copy path used for pageable memory.
+/// Uses cudf::pack() to consolidate all column buffers into a single
+/// contiguous device buffer, then transfers the entire buffer to pinned
+/// host memory in one cudaMemcpyAsync call.  This eliminates the CPU
+/// overhead of issuing per-buffer D2H copies (~47µs each).
 ///
-/// Internally calls cudf::to_arrow_device(table_view) to get device-side
-/// ArrowArray, then copies every buffer to pinned host via cudaMemcpyAsync.
+/// Falls back to per-buffer D2H if to_arrow_device produces pointers
+/// outside the packed range (e.g. offset-type conversion for large strings).
+///
 /// The returned ArrowDeviceArray has device_type=CPU and owns the pinned
-/// buffers through nanoarrow's ArrowBuffer deallocator mechanism.
+/// buffer through shared_ptr ref-counting in nanoarrow's ArrowBuffer
+/// deallocator.
 cudf::unique_device_array_t pinnedToArrowHost(
     cudf::table_view const& table,
     rmm::cuda_stream_view stream);

@@ -38,6 +38,7 @@ add_executable(
 # add_executable(velox_cudf_table_write_test Main.cpp TableWriteTest.cpp)
 add_executable(velox_cudf_topn_test Main.cpp TopNTest.cpp)
 add_executable(velox_cudf_htod_perf_test Main.cpp HtoDPerfTest.cpp)
+add_executable(velox_cudf_dtoh_packed_test Main.cpp DtoHPackedTest.cpp)
 
 add_test(
   NAME velox_cudf_aggregation_test
@@ -359,6 +360,16 @@ target_link_libraries(
 
 target_link_libraries(
   velox_cudf_htod_perf_test
+  velox_cudf_exec
+  velox_exec
+  velox_exec_test_lib
+  velox_test_util
+  gtest
+  gtest_main
+)
+
+target_link_libraries(
+  velox_cudf_dtoh_packed_test
   velox_cudf_exec
   velox_exec
   velox_exec_test_lib
