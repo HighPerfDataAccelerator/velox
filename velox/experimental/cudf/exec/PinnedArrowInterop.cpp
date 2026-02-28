@@ -30,9 +30,58 @@
 
 #include <cuda_runtime.h>
 
+#include <atomic>
+#include <cstdio>
+
 namespace facebook::velox::cudf_velox {
 
 namespace {
+
+struct DtoHStats {
+  std::atomic<uint64_t> packedCalls{0};
+  std::atomic<uint64_t> packedBytes{0};
+  std::atomic<uint64_t> packedCols{0};
+  std::atomic<uint64_t> packedRows{0};
+  std::atomic<uint64_t> fallbackCalls{0};
+  std::atomic<uint64_t> fallbackBuffers{0};
+  std::atomic<uint64_t> fallbackBytes{0};
+  std::atomic<uint64_t> emptyCalls{0};
+
+  static DtoHStats& instance() {
+    static DtoHStats s;
+    return s;
+  }
+
+  void dump(const char* event) {
+    fprintf(
+        stderr,
+        "[DtoH] %s: packed=%lu/%luMB (%lu cols, %lu rows) "
+        "fallback=%lu/%lu bufs/%luMB empty=%lu\n",
+        event,
+        (unsigned long)packedCalls.load(std::memory_order_relaxed),
+        (unsigned long)(packedBytes.load(std::memory_order_relaxed) >> 20),
+        (unsigned long)packedCols.load(std::memory_order_relaxed),
+        (unsigned long)packedRows.load(std::memory_order_relaxed),
+        (unsigned long)fallbackCalls.load(std::memory_order_relaxed),
+        (unsigned long)fallbackBuffers.load(std::memory_order_relaxed),
+        (unsigned long)(fallbackBytes.load(std::memory_order_relaxed) >> 20),
+        (unsigned long)emptyCalls.load(std::memory_order_relaxed));
+  }
+};
+
+int countBuffersRecursive(ArrowArray* array) {
+  int cnt = 0;
+  for (int64_t i = 0; i < array->n_buffers; ++i) {
+    auto* buf = ArrowArrayBuffer(array, i);
+    if (buf->data != nullptr && buf->size_bytes > 0)
+      ++cnt;
+  }
+  for (int64_t i = 0; i < array->n_children; ++i)
+    cnt += countBuffersRecursive(array->children[i]);
+  if (array->dictionary)
+    cnt += countBuffersRecursive(array->dictionary);
+  return cnt;
+}
 
 /// Recursively copy device buffers in a nanoarrow ArrowArray to pinned host.
 /// (Legacy per-buffer path — kept as fallback.)
@@ -132,6 +181,7 @@ cudf::unique_device_array_t pinnedToArrowHost(
     cudf::table_view const& table,
     rmm::cuda_stream_view stream) {
   if (table.num_rows() == 0 || table.num_columns() == 0) {
+    DtoHStats::instance().emptyCalls.fetch_add(1, std::memory_order_relaxed);
     auto devArray = cudf::to_arrow_device(table, stream);
     devArray->device_type = ARROW_DEVICE_CPU;
     return devArray;
@@ -170,17 +220,33 @@ cudf::unique_device_array_t pinnedToArrowHost(
 
   if (rebaseArrowBuffersToHost(
           &devArray->array, devBase, devSize, hostBuf)) {
+    auto& stats = DtoHStats::instance();
+    auto calls =
+        stats.packedCalls.fetch_add(1, std::memory_order_relaxed) + 1;
+    stats.packedBytes.fetch_add(devSize, std::memory_order_relaxed);
+    stats.packedCols.fetch_add(
+        table.num_columns(), std::memory_order_relaxed);
+    stats.packedRows.fetch_add(table.num_rows(), std::memory_order_relaxed);
+    if ((calls & (calls - 1)) == 0 || (calls % 500) == 0) {
+      stats.dump("packed");
+    }
     devArray->device_type = ARROW_DEVICE_CPU;
     return devArray;
   }
 
   // Fallback: some buffer was outside the packed range.
-  // Re-create from scratch using the original per-buffer D2H path.
-  auto devArrayFallback = cudf::to_arrow_device(table, stream);
-  copyDeviceBuffersToPinnedHost(&devArrayFallback->array, stream);
-  stream.synchronize();
-  devArrayFallback->device_type = ARROW_DEVICE_CPU;
-  return devArrayFallback;
+  {
+    auto devArrayFallback = cudf::to_arrow_device(table, stream);
+    int bufs = countBuffersRecursive(&devArrayFallback->array);
+    auto& stats = DtoHStats::instance();
+    stats.fallbackCalls.fetch_add(1, std::memory_order_relaxed);
+    stats.fallbackBuffers.fetch_add(bufs, std::memory_order_relaxed);
+    copyDeviceBuffersToPinnedHost(&devArrayFallback->array, stream);
+    stream.synchronize();
+    stats.dump("fallback!");
+    devArrayFallback->device_type = ARROW_DEVICE_CPU;
+    return devArrayFallback;
+  }
 }
 
 } // namespace facebook::velox::cudf_velox
