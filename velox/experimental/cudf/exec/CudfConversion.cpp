@@ -24,10 +24,80 @@
 #include "velox/exec/Driver.h"
 #include "velox/exec/Operator.h"
 #include "velox/vector/ComplexVector.h"
+#include "velox/vector/FlatVector.h"
 
 #include <cudf/copying.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/utilities/default_stream.hpp>
+
+namespace {
+
+// cuDF has no VARBINARY type — all string-like columns come back as VARCHAR.
+// kindEquals(VARCHAR, VARBINARY) returns false, so setType() crashes even
+// though they share FlatVector<StringView> layout.  This function rebuilds
+// vectors bottom-up with the target type while sharing data buffers, so
+// setType() can succeed (or be skipped entirely).
+void fixStringBinaryMismatch(
+    facebook::velox::VectorPtr& vec,
+    const facebook::velox::TypePtr& target) {
+  using namespace facebook::velox;
+  if (!vec || !target || vec->type()->kindEquals(target)) {
+    return;
+  }
+  auto actualKind = vec->type()->kind();
+  auto targetKind = target->kind();
+
+  if (is_string_kind(actualKind) && is_string_kind(targetKind)) {
+    auto* flat = vec->asFlatVector<StringView>();
+    vec = std::make_shared<FlatVector<StringView>>(
+        flat->pool(), target, flat->nulls(), flat->size(),
+        flat->values(),
+        std::vector<BufferPtr>(flat->stringBuffers()));
+    return;
+  }
+
+  if (actualKind == TypeKind::ROW && targetKind == TypeKind::ROW) {
+    auto* row = vec->as<RowVector>();
+    for (column_index_t i = 0;
+         i < row->childrenSize() && i < target->size();
+         ++i) {
+      fixStringBinaryMismatch(row->childAt(i), target->childAt(i));
+    }
+    if (!vec->type()->kindEquals(target)) {
+      std::vector<VectorPtr> children;
+      children.reserve(row->childrenSize());
+      for (column_index_t i = 0; i < row->childrenSize(); ++i) {
+        children.push_back(row->childAt(i));
+      }
+      vec = std::make_shared<RowVector>(
+          row->pool(), target, row->nulls(), row->size(),
+          std::move(children));
+    }
+  } else if (actualKind == TypeKind::ARRAY && targetKind == TypeKind::ARRAY) {
+    auto* arr = vec->as<ArrayVector>();
+    VectorPtr elems = arr->elements();
+    fixStringBinaryMismatch(elems, target->childAt(0));
+    if (elems != arr->elements()) {
+      vec = std::make_shared<ArrayVector>(
+          arr->pool(), target, arr->nulls(), arr->size(),
+          arr->offsets(), arr->sizes(), std::move(elems));
+    }
+  } else if (actualKind == TypeKind::MAP && targetKind == TypeKind::MAP) {
+    auto* map = vec->as<MapVector>();
+    VectorPtr keys = map->mapKeys();
+    VectorPtr vals = map->mapValues();
+    fixStringBinaryMismatch(keys, target->childAt(0));
+    fixStringBinaryMismatch(vals, target->childAt(1));
+    if (keys != map->mapKeys() || vals != map->mapValues()) {
+      vec = std::make_shared<MapVector>(
+          map->pool(), target, map->nulls(), map->size(),
+          map->offsets(), map->sizes(),
+          std::move(keys), std::move(vals));
+    }
+  }
+}
+
+} // namespace
 
 namespace facebook::velox::cudf_velox {
 
@@ -202,8 +272,24 @@ RowVectorPtr CudfToVelox::getOutput() {
     RowVectorPtr output =
         with_arrow::toVeloxColumn(tableView, pool(), "", stream);
     finished_ = noMoreInput_ && inputs_.empty();
-    output->setType(outputType_);
-    // cudfVector goes out of scope here, freeing the GPU memory
+    if (output->type()->kindEquals(outputType_)) {
+      output->setType(outputType_);
+    } else {
+      for (column_index_t i = 0; i < output->childrenSize(); ++i) {
+        if (i < outputType_->size()) {
+          fixStringBinaryMismatch(
+              output->childAt(i), outputType_->childAt(i));
+        }
+      }
+      std::vector<VectorPtr> children;
+      children.reserve(output->childrenSize());
+      for (column_index_t i = 0; i < output->childrenSize(); ++i) {
+        children.push_back(output->childAt(i));
+      }
+      output = std::make_shared<RowVector>(
+          pool(), outputType_, output->nulls(), output->size(),
+          std::move(children));
+    }
     return output;
   }
 
@@ -268,7 +354,24 @@ RowVectorPtr CudfToVelox::getOutput() {
   RowVectorPtr output =
       with_arrow::toVeloxColumn(resultTable->view(), pool(), "", stream);
   finished_ = noMoreInput_ && inputs_.empty();
-  output->setType(outputType_);
+  if (output->type()->kindEquals(outputType_)) {
+    output->setType(outputType_);
+  } else {
+    for (column_index_t i = 0; i < output->childrenSize(); ++i) {
+      if (i < outputType_->size()) {
+        fixStringBinaryMismatch(
+            output->childAt(i), outputType_->childAt(i));
+      }
+    }
+    std::vector<VectorPtr> children;
+    children.reserve(output->childrenSize());
+    for (column_index_t i = 0; i < output->childrenSize(); ++i) {
+      children.push_back(output->childAt(i));
+    }
+    output = std::make_shared<RowVector>(
+        pool(), outputType_, output->nulls(), output->size(),
+        std::move(children));
+  }
   return output;
 }
 

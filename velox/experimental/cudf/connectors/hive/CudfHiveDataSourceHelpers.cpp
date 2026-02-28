@@ -27,6 +27,8 @@
 #include <cudf/io/parquet.hpp>
 #include <cudf/io/types.hpp>
 
+#include <rmm/device_buffer.hpp>
+
 #include <folly/futures/Future.h>
 
 #include <list>
@@ -70,30 +72,58 @@ void BufferedInputDataSource::enqueueForDevice(
     uint64_t size,
     uint8_t* dst) {
   auto inputStream = input_->enqueue({offset, size});
-  std::shared_ptr sharedStream(std::move(inputStream));
-  pendingDeviceLoads_.push_back(
-      [this, dst, size, sharedStream](rmm::cuda_stream_view stream) {
-        auto buffer = std::make_shared<PinnedHostBuffer>(size);
-        if (buffer->isPinned()) {
-          pinnedAllocBytes_.fetch_add(size, std::memory_order_relaxed);
-        } else {
-          pageableAllocBytes_.fetch_add(size, std::memory_order_relaxed);
-        }
-        sharedStream->readFully(reinterpret_cast<char*>(buffer->data()), size);
-        CUDF_CUDA_TRY(cudaMemcpyAsync(
-            dst,
-            buffer->data(),
-            size,
-            cudaMemcpyHostToDevice,
-            stream.value()));
-      });
+  pendingChunks_.push_back(
+      {std::shared_ptr(std::move(inputStream)), size, dst});
 }
 
 void BufferedInputDataSource::load(rmm::cuda_stream_view stream) {
   input_->load(velox::dwio::common::LogType::FILE);
-  for (auto& deviceLoad : pendingDeviceLoads_) {
-    deviceLoad(stream);
+
+  if (pendingChunks_.empty()) {
+    return;
   }
+
+  // Phase 1 (no GPU needed): read all chunks into one contiguous pinned buffer.
+  uint64_t totalBytes = 0;
+  for (const auto& chunk : pendingChunks_) {
+    totalBytes += chunk.size;
+  }
+
+  auto pinnedBuf = std::make_shared<PinnedHostBuffer>(totalBytes);
+  if (pinnedBuf->isPinned()) {
+    pinnedAllocBytes_.fetch_add(totalBytes, std::memory_order_relaxed);
+  } else {
+    pageableAllocBytes_.fetch_add(totalBytes, std::memory_order_relaxed);
+  }
+
+  uint64_t hostOffset = 0;
+  for (auto& chunk : pendingChunks_) {
+    chunk.stream->readFully(
+        reinterpret_cast<char*>(pinnedBuf->data() + hostOffset), chunk.size);
+    hostOffset += chunk.size;
+  }
+
+  // Phase 2 (GPU): one bulk H2D into a staging device buffer, then D2D scatter.
+  rmm::device_buffer staging(totalBytes, stream);
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+      staging.data(),
+      pinnedBuf->data(),
+      totalBytes,
+      cudaMemcpyHostToDevice,
+      stream.value()));
+
+  hostOffset = 0;
+  for (const auto& chunk : pendingChunks_) {
+    CUDF_CUDA_TRY(cudaMemcpyAsync(
+        chunk.deviceDst,
+        static_cast<uint8_t*>(staging.data()) + hostOffset,
+        chunk.size,
+        cudaMemcpyDeviceToDevice,
+        stream.value()));
+    hostOffset += chunk.size;
+  }
+
+  pendingChunks_.clear();
 }
 
 std::unique_ptr<cudf::io::datasource::buffer>
