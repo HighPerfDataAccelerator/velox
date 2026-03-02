@@ -46,6 +46,8 @@ struct CudfConfig {
   static constexpr const char* kCudfHostAsPinnedThreshold{
       "cudf.host_as_pinned_threshold"};
   static constexpr const char* kCudfPackedDtoH{"cudf.packed_dtoh"};
+  static constexpr const char* kCudfGpuTargetBatchBytes{
+      "cudf.gpu_target_batch_bytes"};
 
   /// Singleton CudfConfig instance.
   /// Clients must set the configs below before invoking registerCudf().
@@ -117,6 +119,13 @@ struct CudfConfig {
   /// until this threshold is reached before launching GPU kernels.
   /// Set to 0 to disable accumulation (process each batch individually).
   int32_t gpuTargetBatchRows{1'000'000};
+
+  /// Target minimum byte size for a GPU batch.  When non-zero, operators
+  /// use this as the primary coalescing threshold instead of row counts.
+  /// This produces better GPU utilization for wide tables where a small
+  /// number of rows already consumes significant memory.
+  /// Default 2 GiB.  Set to 0 to fall back to row-based accumulation.
+  int64_t gpuTargetBatchBytes{2LL * 1024 * 1024 * 1024};
 };
 
 } // namespace facebook::velox::cudf_velox

@@ -435,6 +435,10 @@ void CudfConfig::initialize(
     gpuTargetBatchRows =
         folly::to<int32_t>(config[kCudfGpuTargetBatchRows]);
   }
+  if (config.find(kCudfGpuTargetBatchBytes) != config.end()) {
+    gpuTargetBatchBytes =
+        folly::to<int64_t>(config[kCudfGpuTargetBatchBytes]);
+  }
   if (config.find(kCudfPinnedPoolSize) != config.end()) {
     pinnedPoolSize = folly::to<size_t>(config[kCudfPinnedPoolSize]);
   }
@@ -447,6 +451,7 @@ void CudfConfig::initialize(
   }
   LOG(WARNING) << "CudfConfig initialized: gpuTargetBatchRows="
                << gpuTargetBatchRows
+               << " gpuTargetBatchBytes=" << gpuTargetBatchBytes
                << " pinnedPoolSize=" << pinnedPoolSize
                << " hostAsPinnedThreshold=" << hostAsPinnedThreshold
                << " packedDtoH=" << packedDtoH;

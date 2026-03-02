@@ -17,8 +17,12 @@
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 
+#include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
+#include <cudf/column/column_view.hpp>
 #include <cudf/concatenate.hpp>
+#include <cudf/utilities/bit.hpp>
+#include <cudf/utilities/traits.hpp>
 #include <cudf/detail/utilities/stream_pool.hpp>
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/error.hpp>
@@ -146,6 +150,34 @@ std::shared_ptr<rmm::mr::device_memory_resource> createMemoryResource(
 cudf::detail::cuda_stream_pool& cudfGlobalStreamPool() {
   return cudf::detail::global_cuda_stream_pool();
 };
+
+namespace {
+uint64_t estimateColumnViewBytes(cudf::column_view const& col) {
+  uint64_t bytes = 0;
+  if (col.size() > 0 && cudf::is_fixed_width(col.type())) {
+    bytes += static_cast<uint64_t>(cudf::size_of(col.type())) * col.size();
+  }
+  if (col.nullable()) {
+    bytes += cudf::bitmask_allocation_size_bytes(col.size());
+  }
+  for (int i = 0; i < col.num_children(); ++i) {
+    bytes += estimateColumnViewBytes(col.child(i));
+  }
+  return bytes;
+}
+} // namespace
+
+uint64_t estimateTableBytes(std::unique_ptr<cudf::table>& table) {
+  if (!table || table->num_columns() == 0 || table->num_rows() == 0) {
+    return 0;
+  }
+  uint64_t totalBytes = 0;
+  auto view = table->view();
+  for (int i = 0; i < view.num_columns(); ++i) {
+    totalBytes += estimateColumnViewBytes(view.column(i));
+  }
+  return totalBytes;
+}
 
 std::unique_ptr<cudf::table> concatenateTables(
     std::vector<std::unique_ptr<cudf::table>> tables,
