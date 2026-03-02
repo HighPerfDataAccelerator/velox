@@ -22,6 +22,7 @@ add_library(
   CudfLimit.cpp
   CudfLocalPartition.cpp
   CudfOrderBy.cpp
+  CudfShufflePartition.cpp
   CudfTopN.cpp
   DebugUtil.cpp
   OperatorAdapters.cpp

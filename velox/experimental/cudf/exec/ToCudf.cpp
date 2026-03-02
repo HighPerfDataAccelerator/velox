@@ -25,6 +25,7 @@
 #include "velox/experimental/cudf/exec/CudfLimit.h"
 #include "velox/experimental/cudf/exec/CudfLocalPartition.h"
 #include "velox/experimental/cudf/exec/CudfOperator.h"
+#include "velox/experimental/cudf/exec/CudfShufflePartition.h"
 #include "velox/experimental/cudf/exec/CudfOrderBy.h"
 #include "velox/experimental/cudf/exec/CudfTopN.h"
 #include "velox/experimental/cudf/exec/OperatorAdapters.h"
@@ -222,6 +223,18 @@ bool CompileState::compile(bool allowCpuFallback) {
     }
     if (thisOpProps.producesGpuOutput and
         (nextOperatorIsNotGpu or isLastOperatorOfTask) and planNode) {
+      if (isLastOperatorOfTask) {
+        auto numParts = ctx->queryConfig().get<int32_t>(
+            CudfShufflePartition::kShuffleNumPartitions, 0);
+        if (numParts > 0) {
+          replaceOp.push_back(std::make_unique<CudfShufflePartition>(
+              id,
+              planNode->outputType(),
+              ctx,
+              planNode->id() + "-shuffle-partition",
+              numParts));
+        }
+      }
       replaceOp.push_back(
           std::make_unique<CudfToVelox>(
               id, planNode->outputType(), ctx, planNode->id() + "-to-velox"));
