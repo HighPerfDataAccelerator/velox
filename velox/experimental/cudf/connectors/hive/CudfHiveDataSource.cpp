@@ -14,10 +14,12 @@
  * limitations under the License.
  */
 
+#include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConfig.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConnectorSplit.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveDataSource.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveDataSourceHelpers.hpp"
+#include "velox/experimental/cudf/exec/PinnedHostMemory.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveTableHandle.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
@@ -51,6 +53,9 @@
 #include <nvtx3/nvtx3.hpp>
 
 #include <filesystem>
+#include <fstream>
+#include <future>
+#include <limits>
 #include <memory>
 #include <string>
 
@@ -188,8 +193,9 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
   // Basic sanity checks
   VELOX_CHECK_NOT_NULL(split_, "No split to process. Call addSplit first.");
-  VELOX_CHECK_NOT_NULL(
-      splitReader_ or exptSplitReader_, "No split reader present");
+  VELOX_CHECK(
+      splitReader_ or exptSplitReader_ or coalescedMultiSourcePending_,
+      "No split reader present");
 
   std::unique_ptr<cudf::table> cudfTable;
   cudf::io::table_metadata metadata;
@@ -197,14 +203,77 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
   // Record start time before reading chunk
   auto startTimeUs = getCurrentTimeMicro();
 
-  if (not useExperimentalSplitReader_) {
-    // Read table using the regular cudf parquet reader
-    VELOX_CHECK_NOT_NULL(splitReader_, "cudf parquet reader not present");
+  const bool hasCoalescedFiles = !pendingFiles_.empty();
+  const auto targetBytes = CudfConfig::getInstance().gpuTargetBatchBytes;
 
+  if (not useExperimentalSplitReader_) {
+    // Lazily create the multi-source reader on first next() call.
+    if (coalescedMultiSourcePending_) {
+      createCoalescedMultiSourceReader();
+    }
+
+    VELOX_CHECK_NOT_NULL(splitReader_, "Regular cudf split reader not present");
+
+    if (hasCoalescedFiles) {
+      // Multi-source coalesced read: a single chunked_parquet_reader sees
+      // all files as multiple sources, reading row groups across them.
+      const auto effectiveTarget = (targetBytes > 0)
+          ? targetBytes
+          : std::numeric_limits<int64_t>::max();
+      auto coalesceLoopStartUs = getCurrentTimeMicro();
+      while (splitReader_->has_next()) {
+        auto tableWithMetadata = splitReader_->read_chunk();
+        if (tableWithMetadata.tbl && tableWithMetadata.tbl->num_rows() > 0) {
+          auto& tbl = tableWithMetadata.tbl;
+          if (remainingFilterExprSet_) {
+            auto cols = tbl->release();
+            const auto originalNumColumns = cols.size();
+            auto filterResult = cudfExpressionEvaluator_->eval(
+                cols, stream_, cudf::get_current_device_resource_ref());
+            std::vector<std::unique_ptr<cudf::column>> origCols;
+            origCols.reserve(originalNumColumns);
+            std::move(
+                cols.begin(),
+                cols.begin() + originalNumColumns,
+                std::back_inserter(origCols));
+            auto origTable =
+                std::make_unique<cudf::table>(std::move(origCols));
+            tbl = cudf::apply_boolean_mask(
+                *origTable,
+                asView(filterResult),
+                stream_,
+                cudf::get_current_device_resource_ref());
+          }
+          if (tbl->num_rows() > 0) {
+            auto tableBytes = estimateTableBytes(tbl);
+            accumulatedTables_.push_back(std::move(tbl));
+            accumulatedBytes_ += tableBytes;
+            if (accumulatedBytes_ >= effectiveTarget) {
+              break;
+            }
+          }
+        }
+      }
+      totalCoalesceBufferTimeNs_.fetch_add(
+          (getCurrentTimeMicro() - coalesceLoopStartUs) * 1000,
+          std::memory_order_relaxed);
+      auto result = flushAccumulated();
+      if (result == nullptr) {
+        return nullptr;
+      }
+      TotalScanTimeCallbackData* callbackData =
+          new TotalScanTimeCallbackData{startTimeUs, ioStatistics_};
+      cudaLaunchHostFunc(
+          stream_.value(),
+          &CudfHiveDataSource::totalScanTimeCalculator,
+          callbackData);
+      return result;
+    }
+
+    // Single-file path (no coalesced files).
     if (not splitReader_->has_next()) {
       return nullptr;
     }
-
     auto tableWithMetadata = splitReader_->read_chunk();
     cudfTable = std::move(tableWithMetadata.tbl);
     metadata = std::move(tableWithMetadata.metadata);
@@ -403,6 +472,72 @@ void CudfHiveDataSource::addSplit(std::shared_ptr<ConnectorSplit> split) {
 
   VLOG(1) << "Adding split " << split_->toString();
 
+  // Reset cross-split accumulation state.
+  pendingFiles_.clear();
+  nextFileIndex_ = 0;
+  accumulatedTables_.clear();
+  accumulatedBytes_ = 0;
+
+  // Launch async reads into PinnedHostBuffers for coalesced files.
+  // Each file is read in full so the cuDF Parquet reader can parse
+  // the header/footer; skip_bytes/num_bytes handle row-group filtering.
+  asyncFileReads_.clear();
+  coalescedPinnedBuffers_.clear();
+  coalescedMultiSourcePending_ = false;
+
+  if (!split_->coalescedFiles.empty()) {
+    pendingFiles_ = split_->coalescedFiles;
+    for (const auto& fileRange : pendingFiles_) {
+      completedBytes_ += fileRange.length;
+    }
+
+    auto launchAsyncRead = [](const std::string& path, uint64_t start,
+                              uint64_t length)
+        -> AsyncFileRead {
+      auto future = std::async(
+          std::launch::async,
+          [path]() -> std::shared_ptr<cudf_velox::PinnedHostBuffer> {
+            const auto fsize = std::filesystem::file_size(path);
+            auto buf = std::make_shared<cudf_velox::PinnedHostBuffer>(fsize);
+            std::ifstream file(path, std::ios::binary);
+            VELOX_CHECK(file.good(), "Failed to open file: {}", path);
+            file.read(reinterpret_cast<char*>(buf->data()), fsize);
+            return buf;
+          });
+      const auto fsize = std::filesystem::file_size(path);
+      return {future.share(), fsize, start, length};
+    };
+
+    auto preReadStartUs = getCurrentTimeMicro();
+
+    if (!useExperimentalSplitReader_) {
+      // Multi-source approach (like spark-rapids): async-read ALL files
+      // (primary + coalesced) into individual pinned buffers, then create
+      // ONE chunked_parquet_reader with all buffers as multiple sources.
+      const size_t totalFiles = 1 + pendingFiles_.size();
+      asyncFileReads_.reserve(totalFiles);
+      asyncFileReads_.push_back(launchAsyncRead(
+          split_->filePath, split_->start, split_->length));
+      for (const auto& fileRange : pendingFiles_) {
+        asyncFileReads_.push_back(launchAsyncRead(
+            fileRange.filePath, fileRange.start, fileRange.length));
+      }
+      coalescedMultiSourcePending_ = true;
+    } else {
+      // Experimental reader: per-file approach. Only async-read coalesced
+      // files; the primary file's reader is created synchronously below.
+      asyncFileReads_.reserve(pendingFiles_.size());
+      for (const auto& fileRange : pendingFiles_) {
+        asyncFileReads_.push_back(launchAsyncRead(
+            fileRange.filePath, fileRange.start, fileRange.length));
+      }
+    }
+
+    totalPreReadTimeNs_.fetch_add(
+        (getCurrentTimeMicro() - preReadStartUs) * 1000,
+        std::memory_order_relaxed);
+  }
+
   // Split reader already exists, reset
   if (splitReader_ or exptSplitReader_) {
     splitReader_.reset();
@@ -410,7 +545,17 @@ void CudfHiveDataSource::addSplit(std::shared_ptr<ConnectorSplit> split) {
     hybridScanState_.reset();
   }
 
-  // Create a cudf split reader
+  if (coalescedMultiSourcePending_) {
+    // Multi-source path: defer reader creation to first next() call,
+    // after all async reads have completed.
+    stream_ = cudfGlobalStreamPool().get_stream();
+    tableMaterialized_ = std::make_unique<std::once_flag>();
+    completedBytes_ += split_->length;
+    numFilesCoalesced_ = static_cast<int64_t>(asyncFileReads_.size());
+    return;
+  }
+
+  // Create a cudf split reader (single-file or experimental coalesced)
   if (useExperimentalSplitReader_) {
     exptSplitReader_ = createExperimentalSplitReader();
     hybridScanState_ = std::make_unique<
@@ -419,8 +564,9 @@ void CudfHiveDataSource::addSplit(std::shared_ptr<ConnectorSplit> split) {
     splitReader_ = createSplitReader();
   }
 
-  // TODO: `completedBytes_` should be updated in `next()` as we read more and
-  // more table bytes
+  tableMaterialized_ = std::make_unique<std::once_flag>();
+
+
   try {
     const auto fileHandleKey = FileHandleKey{
         .filename = split_->filePath,
@@ -432,7 +578,6 @@ void CudfHiveDataSource::addSplit(std::shared_ptr<ConnectorSplit> split) {
       completedBytes_ += fileHandleCachePtr->file->size();
     }
   } catch (const std::exception& e) {
-    // Unable to get the file size, log a warning and continue
     LOG(WARNING) << "Failed to get file size for " << split_->filePath << ": "
                  << e.what();
   }
@@ -566,6 +711,9 @@ void CudfHiveDataSource::resetSplit() {
   exptSplitReader_.reset();
   hybridScanState_.reset();
   dataSource_.reset();
+  coalescedPinnedBuffers_.clear();
+  currentFilePinnedBuffer_.reset();
+  coalescedMultiSourcePending_ = false;
 }
 
 std::unordered_map<std::string, RuntimeMetric>
@@ -580,6 +728,49 @@ CudfHiveDataSource::getRuntimeStats() {
            totalRemainingFilterTime_.load(std::memory_order_relaxed),
            RuntimeCounter::Unit::kNanos)},
   });
+  if (numCoalescedBatches_ > 0) {
+    res.emplace(
+        "numCoalescedBatches", RuntimeMetric(numCoalescedBatches_));
+    res.emplace(
+        "totalCoalesceBufferTime",
+        RuntimeMetric(
+            totalCoalesceBufferTimeNs_.load(std::memory_order_relaxed),
+            RuntimeCounter::Unit::kNanos));
+    res.emplace(
+        "totalFileAdvanceTime",
+        RuntimeMetric(
+            totalFileAdvanceTimeNs_.load(std::memory_order_relaxed),
+            RuntimeCounter::Unit::kNanos));
+    res.emplace("numFilesCoalesced", RuntimeMetric(numFilesCoalesced_));
+    auto preReadNs = totalPreReadTimeNs_.load(std::memory_order_relaxed);
+    if (preReadNs > 0) {
+      res.emplace(
+          "totalPreReadTime",
+          RuntimeMetric(preReadNs, RuntimeCounter::Unit::kNanos));
+    }
+    if (!asyncFileReads_.empty()) {
+      res.emplace(
+          "asyncFileReadsLaunched",
+          RuntimeMetric(static_cast<int64_t>(asyncFileReads_.size())));
+    }
+    if (!coalescedPinnedBuffers_.empty()) {
+      size_t totalPinnedBytes = 0;
+      for (const auto& buf : coalescedPinnedBuffers_) {
+        if (buf) {
+          totalPinnedBytes += buf->size();
+        }
+      }
+      res.emplace(
+          "multiSourcePinnedBuffers",
+          RuntimeMetric(
+              static_cast<int64_t>(coalescedPinnedBuffers_.size())));
+      res.emplace(
+          "multiSourcePinnedBytes",
+          RuntimeMetric(
+              static_cast<int64_t>(totalPinnedBytes),
+              RuntimeCounter::Unit::kBytes));
+    }
+  }
   const auto& ioStats = ioStats_->stats();
   for (const auto& storageStats : ioStats) {
     res.emplace(storageStats.first, storageStats.second);
@@ -596,6 +787,244 @@ CudfHiveDataSource::getRuntimeStats() {
   }
 
   return res;
+}
+
+void CudfHiveDataSource::createCoalescedMultiSourceReader() {
+  VELOX_CHECK(
+      coalescedMultiSourcePending_,
+      "createCoalescedMultiSourceReader called without pending multi-source");
+  VELOX_CHECK(
+      !asyncFileReads_.empty(),
+      "No async file reads for multi-source reader");
+
+  auto waitStartUs = getCurrentTimeMicro();
+
+  // Wait for all async reads and collect pinned buffers.
+  coalescedPinnedBuffers_.reserve(asyncFileReads_.size());
+  std::vector<cudf::host_span<const std::byte>> bufferSpans;
+  bufferSpans.reserve(asyncFileReads_.size());
+
+  for (auto& asyncRead : asyncFileReads_) {
+    auto pinnedBuf = asyncRead.future.get();
+    VELOX_CHECK_NOT_NULL(pinnedBuf, "Async file read returned null");
+    bufferSpans.push_back(cudf::host_span<const std::byte>(
+        reinterpret_cast<const std::byte*>(pinnedBuf->data()),
+        pinnedBuf->size()));
+    coalescedPinnedBuffers_.push_back(std::move(pinnedBuf));
+  }
+
+  totalPreReadTimeNs_.fetch_add(
+      (getCurrentTimeMicro() - waitStartUs) * 1000,
+      std::memory_order_relaxed);
+
+  // Build multi-source source_info: cuDF treats each buffer as a separate
+  // Parquet file and merges their row groups into a single reader pipeline.
+  auto sourceInfo = cudf::io::source_info(
+      cudf::host_span<cudf::host_span<const std::byte>>(
+          bufferSpans.data(), bufferSpans.size()));
+
+  readerOptions_ =
+      cudf::io::parquet_reader_options::builder(std::move(sourceInfo))
+          .use_pandas_metadata(cudfHiveConfig_->isUsePandasMetadata())
+          .use_arrow_schema(cudfHiveConfig_->isUseArrowSchema())
+          .allow_mismatched_pq_schemas(
+              cudfHiveConfig_->isAllowMismatchedCudfHiveSchemas())
+          .timestamp_type(cudfHiveConfig_->timestampType())
+          .build();
+
+  if (subfieldFilterExpr_ != nullptr) {
+    readerOptions_.set_filter(*subfieldFilterExpr_);
+  }
+  if (!readColumnNames_.empty()) {
+    readerOptions_.set_column_names(readColumnNames_);
+  }
+
+  splitReader_ = std::make_unique<cudf::io::chunked_parquet_reader>(
+      cudfHiveConfig_->maxChunkReadLimit(),
+      cudfHiveConfig_->maxPassReadLimit(),
+      readerOptions_,
+      stream_,
+      cudf::get_current_device_resource_ref());
+
+  coalescedMultiSourcePending_ = false;
+
+  LOG(INFO) << "Created multi-source parquet reader with "
+            << asyncFileReads_.size() << " files ("
+            << coalescedPinnedBuffers_.size() << " pinned buffers)";
+}
+
+bool CudfHiveDataSource::advanceToNextCoalescedFile() {
+  if (nextFileIndex_ >= pendingFiles_.size()) {
+    return false;
+  }
+
+  const auto& fileRange = pendingFiles_[nextFileIndex_];
+  const size_t fileIdx = nextFileIndex_;
+  ++nextFileIndex_;
+
+  splitReader_.reset();
+  exptSplitReader_.reset();
+  dataSource_.reset();
+  tableMaterialized_ = std::make_unique<std::once_flag>();
+
+  // Build a temporary CudfHiveConnectorSplit for this file.
+  split_ = std::make_shared<CudfHiveConnectorSplit>(
+      split_->connectorId,
+      fileRange.filePath,
+      fileRange.start,
+      fileRange.length,
+      0,
+      fileRange.infoColumns);
+
+  // Try to use the async pre-read pinned buffer (pipelined IO).
+  // The future blocks only until THIS file's IO completes — other files'
+  // reads continue in the background, overlapping with GPU processing.
+  const bool hasAsyncRead = fileIdx < asyncFileReads_.size();
+  if (hasAsyncRead) {
+    auto& asyncRead = asyncFileReads_[fileIdx];
+    // Wait for this file's IO to complete (likely already done while
+    // GPU was processing the previous file).
+    currentFilePinnedBuffer_ = asyncRead.future.get();
+    VELOX_CHECK_NOT_NULL(
+        currentFilePinnedBuffer_, "Async file read returned null");
+
+    // Build source_info from the full-file pinned buffer.
+    auto sourceInfo = cudf::io::source_info(
+        cudf::host_span<const std::byte>(
+            reinterpret_cast<const std::byte*>(
+                currentFilePinnedBuffer_->data()),
+            currentFilePinnedBuffer_->size()));
+
+    // Use skip_bytes/num_bytes for row-group filtering when the split
+    // covers a sub-range of the file (e.g., Spark split a large file).
+    auto builder =
+        cudf::io::parquet_reader_options::builder(std::move(sourceInfo))
+            .skip_bytes(asyncRead.start)
+            .use_pandas_metadata(cudfHiveConfig_->isUsePandasMetadata())
+            .use_arrow_schema(cudfHiveConfig_->isUseArrowSchema())
+            .allow_mismatched_pq_schemas(
+                cudfHiveConfig_->isAllowMismatchedCudfHiveSchemas())
+            .timestamp_type(cudfHiveConfig_->timestampType());
+    readerOptions_ = builder.build();
+    if (asyncRead.length < asyncRead.fileSize) {
+      readerOptions_.set_num_bytes(asyncRead.length);
+    }
+    if (subfieldFilterExpr_ != nullptr) {
+      readerOptions_.set_filter(*subfieldFilterExpr_);
+    }
+    if (readColumnNames_.size()) {
+      readerOptions_.set_column_names(readColumnNames_);
+    }
+
+    if (useExperimentalSplitReader_) {
+      dataSource_ =
+          std::move(makeDataSourcesFromSourceInfo(
+                        cudf::io::source_info(
+                            cudf::host_span<const std::byte>(
+                                reinterpret_cast<const std::byte*>(
+                                    currentFilePinnedBuffer_->data()),
+                                currentFilePinnedBuffer_->size())))
+                        .front());
+      auto const footerBytes = fetchFooterBytes(dataSource_);
+      exptSplitReader_ = std::make_unique<CudfHybridScanReader>(
+          cudf::host_span<uint8_t const>{
+              footerBytes->data(), footerBytes->size()},
+          readerOptions_);
+      auto const pageIndexByteRange =
+          exptSplitReader_->page_index_byte_range();
+      if (not pageIndexByteRange.is_empty()) {
+        auto const pageIndexBytes = dataSource_->host_read(
+            pageIndexByteRange.offset(), pageIndexByteRange.size());
+        exptSplitReader_->setup_page_index(
+            cudf::host_span<uint8_t const>{
+                pageIndexBytes->data(), pageIndexBytes->size()});
+      }
+    } else {
+      splitReader_ = std::make_unique<cudf::io::chunked_parquet_reader>(
+          cudfHiveConfig_->maxChunkReadLimit(),
+          cudfHiveConfig_->maxPassReadLimit(),
+          readerOptions_,
+          stream_,
+          cudf::get_current_device_resource_ref());
+    }
+  } else {
+    // No async pre-read available; read from disk synchronously.
+    if (useExperimentalSplitReader_) {
+      setupCudfDataSourceAndOptions();
+      auto const footerBytes = fetchFooterBytes(dataSource_);
+      exptSplitReader_ = std::make_unique<CudfHybridScanReader>(
+          cudf::host_span<uint8_t const>{
+              footerBytes->data(), footerBytes->size()},
+          readerOptions_);
+      auto const pageIndexByteRange =
+          exptSplitReader_->page_index_byte_range();
+      if (not pageIndexByteRange.is_empty()) {
+        auto const pageIndexBytes = dataSource_->host_read(
+            pageIndexByteRange.offset(), pageIndexByteRange.size());
+        exptSplitReader_->setup_page_index(
+            cudf::host_span<uint8_t const>{
+                pageIndexBytes->data(), pageIndexBytes->size()});
+      }
+    } else {
+      setupCudfDataSourceAndOptions();
+      splitReader_ = std::make_unique<cudf::io::chunked_parquet_reader>(
+          cudfHiveConfig_->maxChunkReadLimit(),
+          cudfHiveConfig_->maxPassReadLimit(),
+          readerOptions_,
+          stream_,
+          cudf::get_current_device_resource_ref());
+    }
+  }
+
+  ++numFilesCoalesced_;
+  VLOG(1) << "Advanced to coalesced file " << fileRange.filePath
+           << " (" << nextFileIndex_ << "/" << pendingFiles_.size() << ")";
+  return true;
+}
+
+RowVectorPtr CudfHiveDataSource::flushAccumulated() {
+  if (accumulatedTables_.empty()) {
+    return nullptr;
+  }
+  ++numCoalescedBatches_;
+
+  std::unique_ptr<cudf::table> cudfTable;
+  if (accumulatedTables_.size() == 1) {
+    cudfTable = std::move(accumulatedTables_[0]);
+  } else {
+    cudfTable = concatenateTables(std::move(accumulatedTables_), stream_);
+  }
+  accumulatedTables_.clear();
+  accumulatedBytes_ = 0;
+
+  const auto nRows = cudfTable->num_rows();
+  if (nRows == 0) {
+    return nullptr;
+  }
+
+  // Keep only outputType_.size() columns
+  if (outputType_->size() < cudfTable->num_columns()) {
+    auto cudfTableColumns = cudfTable->release();
+    std::vector<std::unique_ptr<cudf::column>> originalColumns;
+    originalColumns.reserve(outputType_->size());
+    std::move(
+        cudfTableColumns.begin(),
+        cudfTableColumns.begin() + outputType_->size(),
+        std::back_inserter(originalColumns));
+    cudfTable = std::make_unique<cudf::table>(std::move(originalColumns));
+  }
+
+  stream_.synchronize();
+
+  auto output = cudfIsRegistered()
+      ? std::make_shared<CudfVector>(
+            pool_, outputType_, nRows, std::move(cudfTable), stream_)
+      : with_arrow::toVeloxColumn(
+            cudfTable->view(), pool_, outputType_->names(), stream_);
+
+  VELOX_CHECK_NOT_NULL(output, "Cudf to Velox conversion yielded a nullptr");
+  completedRows_ += output->size();
+  return output;
 }
 
 } // namespace facebook::velox::cudf_velox::connector::hive

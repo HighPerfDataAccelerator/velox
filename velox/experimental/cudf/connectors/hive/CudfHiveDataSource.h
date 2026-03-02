@@ -37,8 +37,14 @@
 #include <cudf/io/parquet.hpp>
 #include <cudf/io/types.hpp>
 
+#include <future>
 #include <mutex>
 #include <unordered_set>
+#include <vector>
+
+namespace facebook::velox::cudf_velox {
+class PinnedHostBuffer;
+} // namespace facebook::velox::cudf_velox
 
 namespace facebook::velox::cudf_velox::connector::hive {
 
@@ -175,6 +181,55 @@ class CudfHiveDataSource : public DataSource, public NvtxHelper {
 
   // Host callback function to calculate total scan time
   static void totalScanTimeCalculator(void* userData);
+
+  // --- Cross-split accumulation for coalesced multi-file reads ---
+  // Pending file ranges from a coalesced split, processed one at a time.
+  std::vector<CoalescedFileRange> pendingFiles_;
+  size_t nextFileIndex_{0};
+  // Accumulated cudf tables from multiple files, flushed when target reached.
+  std::vector<std::unique_ptr<cudf::table>> accumulatedTables_;
+  int64_t accumulatedBytes_{0};
+  int64_t numCoalescedBatches_{0};
+
+  // Coalesced scan timing metrics.
+  std::atomic<uint64_t> totalCoalesceBufferTimeNs_{0};
+  std::atomic<uint64_t> totalFileAdvanceTimeNs_{0};
+  std::atomic<uint64_t> totalPreReadTimeNs_{0};
+  int64_t numFilesCoalesced_{0};
+
+  // Max number of I/O threads active concurrently during pre-read.
+  int32_t maxActiveIoThreads_{0};
+
+  // Per-file async read futures launched in addSplit().
+  struct AsyncFileRead {
+    std::shared_future<std::shared_ptr<cudf_velox::PinnedHostBuffer>> future;
+    size_t fileSize;
+    uint64_t start;
+    uint64_t length;
+  };
+  std::vector<AsyncFileRead> asyncFileReads_;
+
+  // Multi-source reader: all pinned buffers kept alive while the single
+  // chunked_parquet_reader references them via host_span in source_info.
+  std::vector<std::shared_ptr<cudf_velox::PinnedHostBuffer>>
+      coalescedPinnedBuffers_;
+  // True when addSplit() prepared async reads for multi-source; the reader
+  // will be created lazily on the first next() call.
+  bool coalescedMultiSourcePending_{false};
+
+  // Create a single multi-source chunked_parquet_reader from all async-read
+  // pinned buffers (regular reader path only).
+  void createCoalescedMultiSourceReader();
+
+  // Keeps the current file's pinned buffer alive for the experimental
+  // reader per-file path (advanceToNextCoalescedFile only).
+  std::shared_ptr<cudf_velox::PinnedHostBuffer> currentFilePinnedBuffer_;
+
+  // Advance to the next file in the coalesced split (experimental reader
+  // path only). Returns false if no more files.
+  bool advanceToNextCoalescedFile();
+  // Flush accumulated tables into one CudfVector output.
+  RowVectorPtr flushAccumulated();
 };
 
 } // namespace facebook::velox::cudf_velox::connector::hive

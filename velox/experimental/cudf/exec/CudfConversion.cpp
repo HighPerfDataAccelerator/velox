@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/CudfConversion.h"
 #include "velox/experimental/cudf/exec/NvtxHelper.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
@@ -143,6 +144,7 @@ void CudfFromVelox::addInput(RowVectorPtr input) {
     input->loadedVector();
 
     // Accumulate inputs
+    currentOutputBytes_ += input->estimateFlatSize();
     inputs_.push_back(input);
     currentOutputSize_ += input->size();
   }
@@ -150,26 +152,32 @@ void CudfFromVelox::addInput(RowVectorPtr input) {
 
 RowVectorPtr CudfFromVelox::getOutput() {
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
-  const auto targetOutputSize =
+
+  const auto targetBytes = CudfConfig::getInstance().gpuTargetBatchBytes;
+  const auto targetRows =
       preferredGpuBatchSizeRows(operatorCtx_->driverCtx()->queryConfig());
 
   finished_ = noMoreInput_ && inputs_.empty();
 
-  if (finished_ or
-      (currentOutputSize_ < targetOutputSize and not noMoreInput_) or
-      inputs_.empty()) {
+  bool belowThreshold = (targetBytes > 0)
+      ? (currentOutputBytes_ < targetBytes)
+      : (currentOutputSize_ < static_cast<std::size_t>(targetRows));
+
+  if (finished_ or (belowThreshold and not noMoreInput_) or inputs_.empty()) {
     return nullptr;
   }
 
   // Select inputs that don't exceed the max vector size limit
   std::vector<RowVectorPtr> selectedInputs;
   vector_size_t totalSize = 0;
+  int64_t totalBytes = 0;
   auto const maxVectorSize = std::numeric_limits<vector_size_t>::max();
 
   for (const auto& input : inputs_) {
     if (totalSize + input->size() <= maxVectorSize) {
       selectedInputs.push_back(input);
       totalSize += input->size();
+      totalBytes += input->estimateFlatSize();
     } else {
       break;
     }
@@ -178,6 +186,7 @@ RowVectorPtr CudfFromVelox::getOutput() {
   // Remove processed inputs
   inputs_.erase(inputs_.begin(), inputs_.begin() + selectedInputs.size());
   currentOutputSize_ -= totalSize;
+  currentOutputBytes_ -= totalBytes;
 
   // Early return if no input
   if (totalSize == 0) {
@@ -192,6 +201,12 @@ RowVectorPtr CudfFromVelox::getOutput() {
       with_arrow::toCudfTableBatched(selectedInputs, selectedInputs[0]->pool(), stream);
 
   VELOX_CHECK_NOT_NULL(tbl);
+
+  if (selectedInputs.size() > 1) {
+    auto lockedStats = stats_.wlock();
+    lockedStats->addRuntimeStat(
+        "numCoalescedBatches", RuntimeCounter(1));
+  }
 
   const auto size = tbl->num_rows();
   return std::make_shared<CudfVector>(
@@ -236,6 +251,9 @@ void CudfToVelox::addInput(RowVectorPtr input) {
 
 std::optional<uint64_t> CudfToVelox::averageRowSize() {
   if (!averageRowSize_) {
+    if (inputs_.empty() || inputs_.front()->size() == 0) {
+      return std::nullopt;
+    }
     averageRowSize_ =
         inputs_.front()->estimateFlatSize() / inputs_.front()->size();
   }

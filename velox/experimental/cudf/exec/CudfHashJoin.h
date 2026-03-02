@@ -190,10 +190,11 @@ class CudfHashJoinProbe : public exec::Operator, public NvtxHelper {
 
   // Accumulated probe inputs for batch-coalescing before GPU hash probe.
   // Small probe batches severely underutilize the GPU; we buffer them here
-  // until we reach the configured row threshold, then concatenate and probe
+  // until we reach the configured byte threshold, then concatenate and probe
   // as a single large batch.
   std::vector<CudfVectorPtr> accumulatedProbeInputs_;
   int64_t accumulatedProbeRows_{0};
+  int64_t accumulatedProbeBytes_{0};
 
   /** @brief Column indices for join keys in left (probe) table */
   std::vector<cudf::size_type> leftKeyIndices_;

@@ -88,6 +88,14 @@ getConcatenatedTableBatched(
     const TypePtr& tableType,
     rmm::cuda_stream_view stream);
 
+/// Estimates the total memory size of a cudf table by summing per-column
+/// data + null-mask buffer sizes.  This is a fast host-side estimate that
+/// does not require releasing or copying the table.  It may slightly
+/// undercount for nested types (LIST, STRUCT with children) but is
+/// accurate enough for coalescing decisions.
+[[nodiscard]] uint64_t estimateTableBytes(
+    std::unique_ptr<cudf::table>& table);
+
 /**
  * @brief Wrapper for CUDA events used for stream synchronization.
  *

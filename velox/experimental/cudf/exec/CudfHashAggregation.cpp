@@ -1002,6 +1002,7 @@ void CudfHashAggregation::processAccumulatedPartialInputs() {
 
   accumulatedPartialInputs_.clear();
   accumulatedPartialRows_ = 0;
+  accumulatedPartialBytes_ = 0;
 
   if (isDistinct_) {
     computeIntermediateDistinctPartial(cudfBatch);
@@ -1027,11 +1028,16 @@ void CudfHashAggregation::addInput(RowVectorPtr input) {
   VELOX_CHECK_NOT_NULL(cudfInput);
 
   if (isPartialOutput_ && !isGlobal_) {
+    const auto targetBytes = CudfConfig::getInstance().gpuTargetBatchBytes;
     const auto targetRows = CudfConfig::getInstance().gpuTargetBatchRows;
-    if (targetRows > 0) {
-      accumulatedPartialInputs_.push_back(std::move(cudfInput));
+    if (targetBytes > 0 || targetRows > 0) {
       accumulatedPartialRows_ += input->size();
-      if (accumulatedPartialRows_ >= targetRows) {
+      accumulatedPartialBytes_ += cudfInput->estimateFlatSize();
+      accumulatedPartialInputs_.push_back(std::move(cudfInput));
+      bool thresholdReached = (targetBytes > 0)
+          ? (accumulatedPartialBytes_ >= targetBytes)
+          : (accumulatedPartialRows_ >= targetRows);
+      if (thresholdReached) {
         processAccumulatedPartialInputs();
       }
       return;

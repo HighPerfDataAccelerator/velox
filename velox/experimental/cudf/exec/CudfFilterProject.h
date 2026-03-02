@@ -66,6 +66,7 @@ class CudfFilterProject : public exec::Operator, public NvtxHelper {
     filterEvaluator_.reset();
     accumulatedOutputs_.clear();
     accumulatedOutputRows_ = 0;
+    accumulatedOutputBytes_ = 0;
   }
 
  private:
@@ -88,6 +89,7 @@ class CudfFilterProject : public exec::Operator, public NvtxHelper {
   /// Post-filter output batches waiting to be concatenated and emitted.
   std::vector<CudfVectorPtr> accumulatedOutputs_;
   int64_t accumulatedOutputRows_{0};
+  int64_t accumulatedOutputBytes_{0};
 };
 
 bool canBeEvaluatedByCudf(

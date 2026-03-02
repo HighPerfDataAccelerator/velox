@@ -162,6 +162,7 @@ class CudfHashAggregation : public exec::Operator, public NvtxHelper {
 
   std::vector<CudfVectorPtr> accumulatedPartialInputs_;
   int64_t accumulatedPartialRows_{0};
+  int64_t accumulatedPartialBytes_{0};
 
   CudfVectorPtr partialOutput_;
 };

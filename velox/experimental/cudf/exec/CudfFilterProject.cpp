@@ -231,9 +231,18 @@ bool CudfFilterProject::needsInput() const {
   if (!hasFilter_) {
     return !input_;
   }
+  auto targetBytes = CudfConfig::getInstance().gpuTargetBatchBytes;
   auto minRows = CudfConfig::getInstance().gpuTargetBatchRows;
-  bool belowThreshold = accumulatedOutputs_.empty() ||
-      (minRows > 0 && accumulatedOutputRows_ < minRows);
+  bool belowThreshold;
+  if (targetBytes > 0) {
+    belowThreshold = accumulatedOutputs_.empty() ||
+        accumulatedOutputBytes_ < targetBytes;
+  } else if (minRows > 0) {
+    belowThreshold = accumulatedOutputs_.empty() ||
+        accumulatedOutputRows_ < minRows;
+  } else {
+    belowThreshold = accumulatedOutputs_.empty();
+  }
   return !noMoreInput_ && input_ == nullptr && belowThreshold;
 }
 
@@ -297,15 +306,20 @@ RowVectorPtr CudfFilterProject::getOutput() {
     return cudfOutput;
   }
 
+  auto targetBytes = CudfConfig::getInstance().gpuTargetBatchBytes;
   auto minRows = CudfConfig::getInstance().gpuTargetBatchRows;
-  if (minRows <= 0) {
+  if (targetBytes <= 0 && minRows <= 0) {
     return cudfOutput;
   }
 
   accumulatedOutputRows_ += size;
+  accumulatedOutputBytes_ += cudfOutput->estimateFlatSize();
   accumulatedOutputs_.push_back(std::move(cudfOutput));
 
-  if (accumulatedOutputRows_ >= minRows) {
+  bool thresholdReached = (targetBytes > 0)
+      ? (accumulatedOutputBytes_ >= targetBytes)
+      : (accumulatedOutputRows_ >= minRows);
+  if (thresholdReached) {
     return flushAccumulatedOutputs();
   }
   return nullptr;
@@ -326,15 +340,18 @@ RowVectorPtr CudfFilterProject::flushAccumulatedOutputs() {
     auto result = std::move(accumulatedOutputs_[0]);
     accumulatedOutputs_.clear();
     accumulatedOutputRows_ = 0;
+    accumulatedOutputBytes_ = 0;
     return result;
   }
 
   std::vector<cudf::table_view> tableViews;
   tableViews.reserve(accumulatedOutputs_.size());
-  rmm::cuda_stream_view stream;
+  rmm::cuda_stream_view stream = accumulatedOutputs_.back()->stream();
   for (auto& out : accumulatedOutputs_) {
     tableViews.push_back(out->getTableView());
-    stream = out->stream();
+    if (out->stream() != stream) {
+      out->stream().synchronize();
+    }
   }
   auto concatenated = cudf::concatenate(tableViews, stream);
   stream.synchronize();
@@ -343,6 +360,7 @@ RowVectorPtr CudfFilterProject::flushAccumulatedOutputs() {
   auto totalRows = accumulatedOutputRows_;
   accumulatedOutputs_.clear();
   accumulatedOutputRows_ = 0;
+  accumulatedOutputBytes_ = 0;
   return std::make_shared<CudfVector>(
       pool, outputType_, totalRows, std::move(concatenated), stream);
 }

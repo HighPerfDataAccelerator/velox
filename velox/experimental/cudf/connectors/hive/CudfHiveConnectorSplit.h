@@ -28,8 +28,17 @@ struct source_info;
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace facebook::velox::cudf_velox::connector::hive {
+
+/// Describes a single file range within a coalesced split.
+struct CoalescedFileRange {
+  std::string filePath;
+  uint64_t start;
+  uint64_t length;
+  std::unordered_map<std::string, std::string> infoColumns;
+};
 
 struct CudfHiveConnectorSplit
     : public facebook::velox::connector::ConnectorSplit {
@@ -44,19 +53,30 @@ struct CudfHiveConnectorSplit
   /// associated with the CudfHiveConnectorSplit.
   std::unordered_map<std::string, std::string> infoColumns = {};
 
+  /// Additional file ranges coalesced into this split.
+  /// When non-empty, the DataSource should process all files sequentially
+  /// and accumulate data until the target batch byte size is reached.
+  std::vector<CoalescedFileRange> coalescedFiles;
+
   CudfHiveConnectorSplit(
       const std::string& connectorId,
       const std::string& _filePath,
       uint64_t _start = 0,
       uint64_t _length = std::numeric_limits<uint64_t>::max(),
       int64_t _splitWeight = 0,
-      const std::unordered_map<std::string, std::string>& _infoColumns = {});
+      const std::unordered_map<std::string, std::string>& _infoColumns = {},
+      std::vector<CoalescedFileRange> _coalescedFiles = {});
 
   std::string toString() const override;
   std::string getFileName() const;
 
   const cudf::io::source_info& getCudfSourceInfo() const {
     return *cudfSourceInfo;
+  }
+
+  /// Total number of files in this split (primary + coalesced).
+  size_t totalFileCount() const {
+    return 1 + coalescedFiles.size();
   }
 
   uint64_t size() const override;
@@ -99,9 +119,20 @@ class CudfHiveConnectorSplitBuilder {
     return *this;
   }
 
+  CudfHiveConnectorSplitBuilder& addCoalescedFile(CoalescedFileRange file) {
+    coalescedFiles_.push_back(std::move(file));
+    return *this;
+  }
+
   std::shared_ptr<CudfHiveConnectorSplit> build() const {
     return std::make_shared<CudfHiveConnectorSplit>(
-        connectorId_, filePath_, start_, length_, splitWeight_, infoColumns_);
+        connectorId_,
+        filePath_,
+        start_,
+        length_,
+        splitWeight_,
+        infoColumns_,
+        coalescedFiles_);
   }
 
  private:
@@ -111,6 +142,7 @@ class CudfHiveConnectorSplitBuilder {
   std::string connectorId_;
   int64_t splitWeight_{0};
   std::unordered_map<std::string, std::string> infoColumns_ = {};
+  std::vector<CoalescedFileRange> coalescedFiles_;
 };
 
 } // namespace facebook::velox::cudf_velox::connector::hive

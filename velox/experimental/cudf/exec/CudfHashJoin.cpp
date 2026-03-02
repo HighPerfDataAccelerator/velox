@@ -83,6 +83,7 @@ void CudfHashJoinProbe::close() {
   tree_ = {};
   accumulatedProbeInputs_.clear();
   accumulatedProbeRows_ = 0;
+  accumulatedProbeBytes_ = 0;
 }
 
 void CudfHashJoinBridge::setHashTable(
@@ -462,10 +463,19 @@ bool CudfHashJoinProbe::needsInput() const {
   if (joinNode_->isRightSemiFilterJoin()) {
     return !noMoreInput_;
   }
+  auto targetBytes = CudfConfig::getInstance().gpuTargetBatchBytes;
   auto minRows = CudfConfig::getInstance().gpuTargetBatchRows;
-  bool belowThreshold =
-      accumulatedProbeInputs_.empty() ||
-      (minRows > 0 && accumulatedProbeRows_ < minRows);
+  bool belowThreshold;
+  if (targetBytes > 0) {
+    belowThreshold = accumulatedProbeInputs_.empty() ||
+        accumulatedProbeBytes_ < targetBytes;
+  } else if (minRows > 0) {
+    belowThreshold = accumulatedProbeInputs_.empty() ||
+        accumulatedProbeRows_ < minRows;
+  } else {
+    // Both thresholds disabled: pass through without coalescing.
+    belowThreshold = accumulatedProbeInputs_.empty();
+  }
   return !noMoreInput_ && !finished_ && input_ == nullptr && belowThreshold;
 }
 
@@ -496,6 +506,7 @@ void CudfHashJoinProbe::addInput(RowVectorPtr input) {
 
   if (input->size() > 0) {
     accumulatedProbeRows_ += input->size();
+    accumulatedProbeBytes_ += cudfInput->estimateFlatSize();
     accumulatedProbeInputs_.push_back(std::move(cudfInput));
   }
 }
@@ -1315,14 +1326,20 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
     return nullptr;
   }
 
-  // Materialize accumulated probe inputs into input_ when the row threshold
-  // is reached or no more input is expected. This coalesces many small GPU
-  // batches into one large batch, dramatically reducing kernel-launch and
-  // stream-synchronize overhead.
+  // Materialize accumulated probe inputs into input_ when the byte/row
+  // threshold is reached or no more input is expected. This coalesces many
+  // small GPU batches into one large batch, dramatically reducing
+  // kernel-launch and stream-synchronize overhead.
   if (!joinNode_->isRightSemiFilterJoin() &&
       !accumulatedProbeInputs_.empty() && input_ == nullptr) {
+    auto targetBytes = CudfConfig::getInstance().gpuTargetBatchBytes;
     auto minRows = CudfConfig::getInstance().gpuTargetBatchRows;
-    if (accumulatedProbeRows_ >= minRows || noMoreInput_) {
+    bool thresholdReached = (targetBytes > 0)
+        ? (accumulatedProbeBytes_ >= targetBytes)
+        : (minRows > 0)
+            ? (accumulatedProbeRows_ >= minRows)
+            : !accumulatedProbeInputs_.empty();
+    if (thresholdReached || noMoreInput_) {
       if (accumulatedProbeInputs_.size() == 1) {
         input_ = std::move(accumulatedProbeInputs_[0]);
       } else {
@@ -1339,6 +1356,7 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
       }
       accumulatedProbeInputs_.clear();
       accumulatedProbeRows_ = 0;
+      accumulatedProbeBytes_ = 0;
       {
         auto lockedStats = stats_.wlock();
         lockedStats->addRuntimeStat(
