@@ -57,6 +57,20 @@
 #include <memory>
 #include <string>
 
+namespace gluten {
+void lockGpu();
+void unlockGpu();
+} // namespace gluten
+
+namespace {
+struct GpuGuard {
+  GpuGuard() { gluten::lockGpu(); }
+  ~GpuGuard() { gluten::unlockGpu(); }
+  GpuGuard(const GpuGuard&) = delete;
+  GpuGuard& operator=(const GpuGuard&) = delete;
+};
+} // namespace
+
 namespace facebook::velox::cudf_velox::connector::hive {
 
 using namespace facebook::velox::connector;
@@ -207,6 +221,10 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
   const bool hasCoalescedFiles = !pendingFiles_.empty();
   const auto targetBytes = CudfConfig::getInstance().gpuTargetBatchBytes;
 
+  // GPU guard for single-file and experimental paths; emplaced before first
+  // GPU operation and held through common post-processing.
+  std::optional<GpuGuard> gpuGuard;
+
   if (not useExperimentalSplitReader_) {
     // Lazily create the multi-source reader on first next() call.
     if (coalescedMultiSourcePending_) {
@@ -221,6 +239,7 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
       const auto effectiveTarget = (targetBytes > 0)
           ? targetBytes
           : std::numeric_limits<int64_t>::max();
+      GpuGuard coalescedGpuGuard;
       auto coalesceLoopStartUs = getCurrentTimeMicro();
       while (splitReader_->has_next()) {
         auto tableWithMetadata = splitReader_->read_chunk();
@@ -275,6 +294,7 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
     if (not splitReader_->has_next()) {
       return nullptr;
     }
+    gpuGuard.emplace();
     auto tableWithMetadata = splitReader_->read_chunk();
     cudfTable = std::move(tableWithMetadata.tbl);
     metadata = std::move(tableWithMetadata.metadata);
@@ -322,6 +342,9 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
             cudf::ast::operation(cudf::ast::ast_operator::IDENTITY, literal);
         tmpOptions.set_filter(filter);
       }
+
+      // Acquire GPU after CPU metadata work, before device buffer allocation
+      gpuGuard.emplace();
 
       // Get column chunk byte ranges to fetch
       const auto columnChunkByteRanges =
