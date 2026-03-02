@@ -73,9 +73,13 @@ CudfVectorPtr CudfTopN::mergeTopK(
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr) {
   std::vector<cudf::table_view> tableViews;
+  std::vector<rmm::cuda_stream_view> inputStreams;
   for (const auto& batch : topNBatches) {
     tableViews.push_back(batch->getTableView());
+    inputStreams.push_back(batch->stream());
   }
+  cudf::detail::join_streams(inputStreams, stream);
+
   auto mergedTable =
       cudf::merge(tableViews, sortKeys_, columnOrder_, nullOrder_, stream, mr);
   // slice it
