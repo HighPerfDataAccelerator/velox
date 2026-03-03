@@ -226,7 +226,7 @@ bool CompileState::compile(bool allowCpuFallback) {
       if (driverFactory_.outputDriver) {
         skipD2H = ctx->queryConfig().get<bool>(
             "cudf.gpu_shuffle_output", false);
-        LOG(INFO) << "ToCudf: outputDriver GPU->nonGPU boundary, op="
+        LOG(WARNING) << "ToCudf: outputDriver GPU->nonGPU boundary, op="
                   << oper->toString()
                   << " gpu_shuffle_output=" << skipD2H;
       }
