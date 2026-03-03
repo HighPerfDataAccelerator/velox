@@ -15,6 +15,7 @@
  */
 
 #include "velox/experimental/cudf/exec/CudfLimit.h"
+#include "velox/experimental/cudf/exec/GpuGuard.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
 #include <cudf/copying.hpp>
@@ -57,6 +58,7 @@ void CudfLimit::addInput(RowVectorPtr input) {
 
 RowVectorPtr CudfLimit::getOutput() {
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
+  GpuGuard gpuGuard;
   if (input_ == nullptr || (remainingOffset_ == 0 && remainingLimit_ == 0)) {
     return nullptr;
   }

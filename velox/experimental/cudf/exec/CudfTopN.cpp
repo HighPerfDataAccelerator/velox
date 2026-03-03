@@ -15,10 +15,12 @@
  */
 #include "velox/experimental/cudf/CudfQueryConfig.h"
 #include "velox/experimental/cudf/exec/CudfTopN.h"
+#include "velox/experimental/cudf/exec/GpuGuard.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 
 #include <cudf/detail/copy.hpp>
 #include <cudf/detail/gather.hpp>
+#include <cudf/detail/utilities/stream_pool.hpp>
 #include <cudf/merge.hpp>
 #include <cudf/sorting.hpp>
 
@@ -73,9 +75,12 @@ CudfVectorPtr CudfTopN::mergeTopK(
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr) {
   std::vector<cudf::table_view> tableViews;
+  std::vector<rmm::cuda_stream_view> inputStreams;
   for (const auto& batch : topNBatches) {
     tableViews.push_back(batch->getTableView());
+    inputStreams.push_back(batch->stream());
   }
+  cudf::detail::join_streams(inputStreams, stream);
   auto mergedTable =
       cudf::merge(tableViews, sortKeys_, columnOrder_, nullOrder_, stream, mr);
   // slice it
@@ -128,6 +133,7 @@ CudfVectorPtr CudfTopN::getTopKBatch(CudfVectorPtr cudfInput, int32_t k) {
 
 void CudfTopN::addInput(RowVectorPtr input) {
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
+  GpuGuard gpuGuard;
   if (count_ == 0 || input->size() == 0) {
     return;
   }
@@ -158,6 +164,7 @@ void CudfTopN::addInput(RowVectorPtr input) {
 
 RowVectorPtr CudfTopN::getOutput() {
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
+  GpuGuard gpuGuard;
   if (finished_ || !noMoreInput_) {
     return nullptr;
   }

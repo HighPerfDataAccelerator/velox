@@ -16,6 +16,7 @@
 
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/CudfHashJoin.h"
+#include "velox/experimental/cudf/exec/GpuGuard.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
@@ -169,6 +170,7 @@ void CudfHashJoinBuild::noMoreInput() {
     VLOG(2) << "Calling CudfHashJoinBuild::noMoreInput";
   }
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
+  GpuGuard gpuGuard;
   Operator::noMoreInput();
   std::vector<ContinuePromise> promises;
   std::vector<std::shared_ptr<exec::Driver>> peers;
@@ -499,6 +501,7 @@ void CudfHashJoinProbe::noMoreInput() {
     VLOG(2) << "Calling CudfHashJoinProbe::noMoreInput";
   }
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
+  GpuGuard gpuGuard;
   Operator::noMoreInput();
   if (!joinNode_->isRightJoin() && !joinNode_->isRightSemiFilterJoin()) {
     return;
@@ -1107,6 +1110,7 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
     VLOG(2) << "Calling CudfHashJoinProbe::getOutput";
   }
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
+  GpuGuard gpuGuard;
 
   if (finished_ or !hashObject_.has_value()) {
     return nullptr;

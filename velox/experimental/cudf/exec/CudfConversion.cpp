@@ -16,6 +16,7 @@
 
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/CudfConversion.h"
+#include "velox/experimental/cudf/exec/GpuGuard.h"
 #include "velox/experimental/cudf/exec/NvtxHelper.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
@@ -152,6 +153,7 @@ void CudfFromVelox::addInput(RowVectorPtr input) {
 
 RowVectorPtr CudfFromVelox::getOutput() {
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
+  GpuGuard gpuGuard;
 
   const auto targetBytes = CudfConfig::getInstance().gpuTargetBatchBytes;
   const auto targetRows =
@@ -262,6 +264,7 @@ std::optional<uint64_t> CudfToVelox::averageRowSize() {
 
 RowVectorPtr CudfToVelox::getOutput() {
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
+  GpuGuard gpuGuard;
   if (finished_ || inputs_.empty()) {
     finished_ = noMoreInput_ && inputs_.empty();
     return nullptr;

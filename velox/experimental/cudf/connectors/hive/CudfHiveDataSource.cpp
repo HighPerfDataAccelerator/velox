@@ -19,6 +19,7 @@
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConnectorSplit.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveDataSource.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveDataSourceHelpers.hpp"
+#include "velox/experimental/cudf/exec/GpuGuard.h"
 #include "velox/experimental/cudf/exec/PinnedHostMemory.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveTableHandle.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
@@ -57,21 +58,9 @@
 #include <memory>
 #include <string>
 
-namespace gluten {
-void lockGpu();
-void unlockGpu();
-} // namespace gluten
-
-namespace {
-struct GpuGuard {
-  GpuGuard() { gluten::lockGpu(); }
-  ~GpuGuard() { gluten::unlockGpu(); }
-  GpuGuard(const GpuGuard&) = delete;
-  GpuGuard& operator=(const GpuGuard&) = delete;
-};
-} // namespace
-
 namespace facebook::velox::cudf_velox::connector::hive {
+
+using cudf_velox::GpuGuard;
 
 using namespace facebook::velox::connector;
 using namespace facebook::velox::connector::hive;

@@ -16,6 +16,7 @@
 
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/CudfFilterProject.h"
+#include "velox/experimental/cudf/exec/GpuGuard.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
@@ -252,6 +253,7 @@ void CudfFilterProject::addInput(RowVectorPtr input) {
 
 RowVectorPtr CudfFilterProject::getOutput() {
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
+  GpuGuard gpuGuard;
 
   if (allInputProcessed()) {
     if (!hasFilter_) {

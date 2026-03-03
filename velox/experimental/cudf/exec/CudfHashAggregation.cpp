@@ -17,6 +17,7 @@
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/CudfFilterProject.h"
 #include "velox/experimental/cudf/exec/CudfHashAggregation.h"
+#include "velox/experimental/cudf/exec/GpuGuard.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 
@@ -1018,6 +1019,7 @@ void CudfHashAggregation::processAccumulatedPartialInputs() {
 
 void CudfHashAggregation::addInput(RowVectorPtr input) {
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
+  GpuGuard gpuGuard;
   if (input->size() == 0) {
     return;
   }
@@ -1167,6 +1169,7 @@ CudfVectorPtr CudfHashAggregation::releaseAndResetPartialOutput() {
 
 RowVectorPtr CudfHashAggregation::getOutput() {
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
+  GpuGuard gpuGuard;
 
   // Handle partial groupby and distinct.
   if (isPartialOutput_ && !isGlobal_) {

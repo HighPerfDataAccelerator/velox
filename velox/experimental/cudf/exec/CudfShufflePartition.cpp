@@ -15,6 +15,7 @@
  */
 
 #include "velox/experimental/cudf/exec/CudfShufflePartition.h"
+#include "velox/experimental/cudf/exec/GpuGuard.h"
 
 #include <cudf/binaryop.hpp>
 #include <cudf/partitioning.hpp>
@@ -44,6 +45,7 @@ CudfShufflePartition::CudfShufflePartition(
 
 void CudfShufflePartition::addInput(RowVectorPtr input) {
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
+  GpuGuard gpuGuard;
   VELOX_CHECK_NULL(output_, "Previous output not consumed");
 
   auto cudfVec = std::dynamic_pointer_cast<CudfVector>(input);

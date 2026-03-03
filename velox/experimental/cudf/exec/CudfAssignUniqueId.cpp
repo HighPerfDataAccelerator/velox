@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #include "velox/experimental/cudf/exec/CudfAssignUniqueId.h"
+#include "velox/experimental/cudf/exec/GpuGuard.h"
 
 #include <cudf/lists/filling.hpp>
 
@@ -58,6 +59,7 @@ void CudfAssignUniqueId::addInput(RowVectorPtr input) {
 
 RowVectorPtr CudfAssignUniqueId::getOutput() {
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
+  GpuGuard gpuGuard;
 
   if (input_ == nullptr) {
     return nullptr;

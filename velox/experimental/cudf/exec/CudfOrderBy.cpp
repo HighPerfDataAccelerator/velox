@@ -15,6 +15,7 @@
  */
 
 #include "velox/experimental/cudf/exec/CudfOrderBy.h"
+#include "velox/experimental/cudf/exec/GpuGuard.h"
 #include "velox/experimental/cudf/exec/NvtxHelper.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 
@@ -71,6 +72,7 @@ void CudfOrderBy::noMoreInput() {
   exec::Operator::noMoreInput();
 
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
+  GpuGuard gpuGuard;
 
   if (inputs_.empty()) {
     return;
