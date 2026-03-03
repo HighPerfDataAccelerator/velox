@@ -29,6 +29,7 @@
 #include "velox/vector/FlatVector.h"
 
 #include <cudf/copying.hpp>
+#include <cudf/detail/utilities/stream_pool.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/utilities/default_stream.hpp>
 
@@ -327,7 +328,13 @@ RowVectorPtr CudfToVelox::getOutput() {
       inputs_.pop_front();
     } else {
       // If the next input would exceed targetBatchSize,
-      // we need to split it and only take what we need
+      // we need to split it and only take what we need.
+      // The input may have been produced on a different stream than the
+      // first input's stream; ensure ordering before using its data.
+      if (input->stream() != stream) {
+        cudf::detail::join_streams(
+            std::vector<rmm::cuda_stream_view>{input->stream()}, stream);
+      }
       auto cudfTableView = input->getTableView();
       auto partitions = std::vector<cudf::size_type>{
           static_cast<cudf::size_type>(targetBatchSize - totalSize)};
