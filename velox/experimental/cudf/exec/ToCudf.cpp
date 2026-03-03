@@ -222,18 +222,16 @@ bool CompileState::compile(bool allowCpuFallback) {
     }
     if (thisOpProps.producesGpuOutput and
         (nextOperatorIsNotGpu or isLastOperatorOfTask) and planNode) {
-      bool skipD2H = false;
-      if (driverFactory_.outputDriver) {
-        skipD2H = ctx->queryConfig().get<bool>(
-            "cudf.gpu_shuffle_output", false);
-        LOG(WARNING) << "ToCudf: outputDriver GPU->nonGPU boundary, op="
-                  << oper->toString()
-                  << " gpu_shuffle_output=" << skipD2H;
-      }
-      if (!skipD2H) {
+      const bool skipForExternalGpu = isLastOperatorOfTask &&
+          ctx->queryConfig().get<bool>(
+              CudfConfig::kCudfSkipOutputToVelox, false);
+      if (!skipForExternalGpu) {
         replaceOp.push_back(
             std::make_unique<CudfToVelox>(
-                id, planNode->outputType(), ctx, planNode->id() + "-to-velox"));
+                id,
+                planNode->outputType(),
+                ctx,
+                planNode->id() + "-to-velox"));
       }
     }
 

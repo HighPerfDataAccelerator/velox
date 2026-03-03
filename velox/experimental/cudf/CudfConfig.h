@@ -46,6 +46,8 @@ struct CudfConfig {
   static constexpr const char* kCudfHostAsPinnedThreshold{
       "cudf.host_as_pinned_threshold"};
   static constexpr const char* kCudfPackedDtoH{"cudf.packed_dtoh"};
+  static constexpr const char* kCudfSkipOutputToVelox{
+      "velox.cudf.skip_output_to_velox"};
   static constexpr const char* kCudfGpuTargetBatchBytes{
       "cudf.gpu_target_batch_bytes"};
 
