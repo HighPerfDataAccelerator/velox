@@ -223,9 +223,12 @@ bool CompileState::compile(bool allowCpuFallback) {
     if (thisOpProps.producesGpuOutput and
         (nextOperatorIsNotGpu or isLastOperatorOfTask) and planNode) {
       bool skipD2H = false;
-      if (isLastOperatorOfTask) {
+      if (driverFactory_.outputDriver) {
         skipD2H = ctx->queryConfig().get<bool>(
             "cudf.gpu_shuffle_output", false);
+        LOG(INFO) << "ToCudf: outputDriver GPU->nonGPU boundary, op="
+                  << oper->toString()
+                  << " gpu_shuffle_output=" << skipD2H;
       }
       if (!skipD2H) {
         replaceOp.push_back(
