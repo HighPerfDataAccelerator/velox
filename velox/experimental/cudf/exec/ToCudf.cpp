@@ -224,14 +224,8 @@ bool CompileState::compile(bool allowCpuFallback) {
         (nextOperatorIsNotGpu or isLastOperatorOfTask) and planNode) {
       bool skipD2H = false;
       if (isLastOperatorOfTask) {
-        auto gpuPartition =
-            ctx->queryConfig().get<bool>("cudf.gpu_partition", false);
-        if (gpuPartition) {
-          skipD2H = true;
-          LOG(INFO) << "GPU shuffle: skipping CudfToVelox for operator "
-                    << oper->toString()
-                    << ", CudfVector will flow to shuffle writer";
-        }
+        skipD2H = ctx->queryConfig().get<bool>(
+            "cudf.gpu_shuffle_output", false);
       }
       if (!skipD2H) {
         replaceOp.push_back(
