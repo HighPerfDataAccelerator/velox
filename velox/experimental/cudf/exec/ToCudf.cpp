@@ -223,21 +223,27 @@ bool CompileState::compile(bool allowCpuFallback) {
     }
     if (thisOpProps.producesGpuOutput and
         (nextOperatorIsNotGpu or isLastOperatorOfTask) and planNode) {
+      bool skipD2H = false;
       if (isLastOperatorOfTask) {
         auto numParts = ctx->queryConfig().get<int32_t>(
             CudfShufflePartition::kShuffleNumPartitions, 0);
         if (numParts > 0) {
-          replaceOp.push_back(std::make_unique<CudfShufflePartition>(
-              id,
-              planNode->outputType(),
-              ctx,
-              planNode->id() + "-shuffle-partition",
-              numParts));
+          // GPU shuffle partition enabled: skip CudfToVelox so CudfVector
+          // flows directly to VeloxGpuHashShuffleWriter::gpuPartitionAndEvict,
+          // which performs cudf::partition() + D2H + buffer extraction on GPU.
+          // CudfShufflePartition is also skipped (gpuPartitionAndEvict is the
+          // single place that handles GPU partition + D2H).
+          skipD2H = true;
+          LOG(INFO) << "GPU shuffle: skipping CudfToVelox for operator "
+                    << oper->toString() << " (numPartitions=" << numParts
+                    << "), CudfVector will flow to shuffle writer";
         }
       }
-      replaceOp.push_back(
-          std::make_unique<CudfToVelox>(
-              id, planNode->outputType(), ctx, planNode->id() + "-to-velox"));
+      if (!skipD2H) {
+        replaceOp.push_back(
+            std::make_unique<CudfToVelox>(
+                id, planNode->outputType(), ctx, planNode->id() + "-to-velox"));
+      }
     }
 
     if (debugEnabled) {
