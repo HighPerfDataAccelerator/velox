@@ -972,10 +972,11 @@ void CudfHashAggregation::computeIntermediateDistinctPartial(
 
     // Do a distinct on the concatenated results.
     // Keep concatenatedTable alive while we use its view.
+    // Must use partialOutputStream since concatenatedTable was produced on it.
     auto distinctOutput = getDistinctKeys(
         concatenatedTable->view(),
         groupingKeyOutputChannels_,
-        inputTableStream);
+        partialOutputStream);
     partialOutput_ = distinctOutput;
   } else {
     // First time processing, just store the result of the input batch's
