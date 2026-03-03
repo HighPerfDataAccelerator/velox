@@ -25,7 +25,6 @@
 #include "velox/experimental/cudf/exec/CudfLimit.h"
 #include "velox/experimental/cudf/exec/CudfLocalPartition.h"
 #include "velox/experimental/cudf/exec/CudfOperator.h"
-#include "velox/experimental/cudf/exec/CudfShufflePartition.h"
 #include "velox/experimental/cudf/exec/CudfOrderBy.h"
 #include "velox/experimental/cudf/exec/CudfTopN.h"
 #include "velox/experimental/cudf/exec/OperatorAdapters.h"
@@ -225,18 +224,13 @@ bool CompileState::compile(bool allowCpuFallback) {
         (nextOperatorIsNotGpu or isLastOperatorOfTask) and planNode) {
       bool skipD2H = false;
       if (isLastOperatorOfTask) {
-        auto numParts = ctx->queryConfig().get<int32_t>(
-            CudfShufflePartition::kShuffleNumPartitions, 0);
-        if (numParts > 0) {
-          // GPU shuffle partition enabled: skip CudfToVelox so CudfVector
-          // flows directly to VeloxGpuHashShuffleWriter::gpuPartitionAndEvict,
-          // which performs cudf::partition() + D2H + buffer extraction on GPU.
-          // CudfShufflePartition is also skipped (gpuPartitionAndEvict is the
-          // single place that handles GPU partition + D2H).
+        auto gpuPartition =
+            ctx->queryConfig().get<bool>("cudf.gpu_partition", false);
+        if (gpuPartition) {
           skipD2H = true;
           LOG(INFO) << "GPU shuffle: skipping CudfToVelox for operator "
-                    << oper->toString() << " (numPartitions=" << numParts
-                    << "), CudfVector will flow to shuffle writer";
+                    << oper->toString()
+                    << ", CudfVector will flow to shuffle writer";
         }
       }
       if (!skipD2H) {
