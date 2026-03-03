@@ -132,6 +132,7 @@ class CudfHiveDataSource : public DataSource, public NvtxHelper {
   // cuDF split reader stuff.
   cudf::io::parquet_reader_options readerOptions_;
   std::shared_ptr<cudf::io::datasource> dataSource_;
+  std::unique_ptr<std::once_flag> tableMaterialized_;
   CudfParquetReaderPtr splitReader_;
   CudfHybridScanReaderPtr exptSplitReader_;
   std::unique_ptr<HybridScanState> hybridScanState_;

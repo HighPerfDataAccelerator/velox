@@ -152,4 +152,10 @@ fetchByteRangesAsync(
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr);
 
+std::vector<std::unique_ptr<cudf::io::datasource>>
+makeDataSourcesFromSourceInfo(
+    const cudf::io::source_info& info,
+    size_t offset = 0,
+    size_t maxSizeEstimate = 0);
+
 } // namespace facebook::velox::cudf_velox::connector::hive
