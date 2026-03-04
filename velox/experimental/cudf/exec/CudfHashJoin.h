@@ -133,6 +133,8 @@ class CudfHashJoinProbe : public exec::Operator, public NvtxHelper {
       exec::DriverCtx* driverCtx,
       std::shared_ptr<const core::HashJoinNode> joinNode);
 
+  void initialize() override;
+
   bool needsInput() const override;
 
   void addInput(RowVectorPtr input) override;
