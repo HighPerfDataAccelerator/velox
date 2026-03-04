@@ -608,18 +608,15 @@ void CudfHiveDataSource::addSplit(std::shared_ptr<ConnectorSplit> split) {
       completedBytes_ += fileRange.length;
     }
 
-    auto launchAsyncRead = [](const std::string& path, uint64_t start,
+    auto launchAsyncRead = [this](const std::string& path, uint64_t start,
                               uint64_t length)
         -> AsyncFileRead {
+      auto colNames = readColumnNames_;
       auto future = std::async(
           std::launch::async,
-          [path]() -> std::shared_ptr<cudf_velox::PinnedHostBuffer> {
-            const auto fsize = std::filesystem::file_size(path);
-            auto buf = std::make_shared<cudf_velox::PinnedHostBuffer>(fsize);
-            std::ifstream file(path, std::ios::binary);
-            VELOX_CHECK(file.good(), "Failed to open file: {}", path);
-            file.read(reinterpret_cast<char*>(buf->data()), fsize);
-            return buf;
+          [path, colNames, start]()
+              -> std::shared_ptr<cudf_velox::PinnedHostBuffer> {
+            return selectiveParquetRead(path, colNames, start);
           });
       const auto fsize = std::filesystem::file_size(path);
       return {future.share(), fsize, start, length};
@@ -999,25 +996,28 @@ bool CudfHiveDataSource::advanceToNextCoalescedFile() {
     VELOX_CHECK_NOT_NULL(
         currentFilePinnedBuffer_, "Async file read returned null");
 
-    // Build source_info from the full-file pinned buffer.
+    // Build source_info from the pinned buffer.
     auto sourceInfo = cudf::io::source_info(
         cudf::host_span<const std::byte>(
             reinterpret_cast<const std::byte*>(
                 currentFilePinnedBuffer_->data()),
             currentFilePinnedBuffer_->size()));
 
-    // Use skip_bytes/num_bytes for row-group filtering when the split
-    // covers a sub-range of the file (e.g., Spark split a large file).
+    // If selectiveParquetRead produced a compact buffer (smaller than the
+    // original file), the internal offsets are already self-contained.
+    // skip_bytes/num_bytes must not be applied to reconstructed buffers.
+    const bool isSelectiveBuffer =
+        currentFilePinnedBuffer_->size() != asyncRead.fileSize;
     auto builder =
         cudf::io::parquet_reader_options::builder(std::move(sourceInfo))
-            .skip_bytes(asyncRead.start)
+            .skip_bytes(isSelectiveBuffer ? 0 : asyncRead.start)
             .use_pandas_metadata(cudfHiveConfig_->isUsePandasMetadata())
             .use_arrow_schema(cudfHiveConfig_->isUseArrowSchema())
             .allow_mismatched_pq_schemas(
                 cudfHiveConfig_->isAllowMismatchedCudfHiveSchemas())
             .timestamp_type(cudfHiveConfig_->timestampType());
     readerOptions_ = builder.build();
-    if (asyncRead.length < asyncRead.fileSize) {
+    if (!isSelectiveBuffer && asyncRead.length < asyncRead.fileSize) {
       readerOptions_.set_num_bytes(asyncRead.length);
     }
     if (subfieldFilterExpr_ != nullptr) {

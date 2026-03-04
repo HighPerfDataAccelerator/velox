@@ -33,6 +33,10 @@
 #include <unordered_map>
 #include <vector>
 
+namespace facebook::velox::cudf_velox {
+class PinnedHostBuffer;
+} // namespace facebook::velox::cudf_velox
+
 namespace facebook::velox::cudf_velox::connector::hive {
 
 // ---------------- Internal helper ----------------
@@ -143,5 +147,16 @@ makeDataSourcesFromSourceInfo(
     const cudf::io::source_info& info,
     size_t offset = 0,
     size_t maxSizeEstimate = 0);
+
+/// Read a Parquet file selectively: parse footer, identify needed column
+/// chunks based on readColumnNames, read only those byte ranges, and
+/// reconstruct a compact valid Parquet buffer in pinned host memory.
+/// Falls back to reading the full file if readColumnNames is empty,
+/// splitStart > 0 (sub-file splits), or selective read would not save IO.
+std::shared_ptr<facebook::velox::cudf_velox::PinnedHostBuffer>
+selectiveParquetRead(
+    const std::string& filePath,
+    const std::vector<std::string>& readColumnNames,
+    uint64_t splitStart = 0);
 
 } // namespace facebook::velox::cudf_velox::connector::hive

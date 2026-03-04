@@ -361,6 +361,18 @@ void buildArrowColumnFromPacked(
         arrowType = NANOARROW_TYPE_INT64;
         elemSize = 8;
         break;
+      case cudf::type_id::DECIMAL32:
+        arrowType = NANOARROW_TYPE_INT32;
+        elemSize = 4;
+        break;
+      case cudf::type_id::DECIMAL64:
+        arrowType = NANOARROW_TYPE_INT64;
+        elemSize = 8;
+        break;
+      case cudf::type_id::DECIMAL128:
+        arrowType = NANOARROW_TYPE_DECIMAL128;
+        elemSize = 16;
+        break;
       default:
         arrowType = NANOARROW_TYPE_BINARY;
         elemSize = 0;
