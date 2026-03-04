@@ -228,6 +228,16 @@ class CudfHiveDataSource : public DataSource, public NvtxHelper {
   bool advanceToNextCoalescedFile();
   // Flush accumulated tables into one CudfVector output.
   RowVectorPtr flushAccumulated();
+
+  // --- Chunked experimental reader state ---
+  void initExperimentalReaderMetadata();
+  std::unique_ptr<cudf::table> readNextExperimentalBatch(
+      cudf::io::table_metadata& metadata);
+
+  bool exptMetadataInitialized_{false};
+  std::vector<cudf::size_type> exptFilteredRowGroups_;
+  size_t exptNextRGIndex_{0};
+  cudf::io::parquet_reader_options exptResolvedOptions_;
 };
 
 } // namespace facebook::velox::cudf_velox::connector::hive

@@ -288,171 +288,27 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
     cudfTable = std::move(tableWithMetadata.tbl);
     metadata = std::move(tableWithMetadata.metadata);
   } else {
-    // Read a table chunk using the experimental parquet reader
+    // Chunked experimental reader: process row groups in batches.
+    // Loops across coalesced files when the current file is exhausted.
     VELOX_CHECK_NOT_NULL(
         exptSplitReader_, "Experimental cudf split reader not present");
 
-    // TODO(mh): Replace this with chunked hybrid scan APIs when available in
-    // the pinned cuDF version
-    std::call_once(*tableMaterialized_, [&]() {
-      auto rowGroupIndices = exptSplitReader_->all_row_groups(readerOptions_);
-
-      // Temporary options used for filtering row groups. TODO(mh): Remove this
-      // once PR https://github.com/rapidsai/cudf/pull/20604 is merged
-      auto tmpOptions = readerOptions_;
-
-      if (readerOptions_.get_filter().has_value()) {
-        // Filter expression converter
-        auto exprConverter = referenceToNameConverter(
-            readerOptions_.get_filter(),
-            exptSplitReader_->parquet_metadata().schema,
-            readColumnNames_);
-        tmpOptions.set_filter(exprConverter.convertedExpression());
-
-        // Create a temporary split reader for filtering row groups. TODO(mh):
-        // Remove this once PR https://github.com/rapidsai/cudf/pull/20604 is
-        // merged or the pinned cuDF version is updated
-        auto footerBytes = fetchFooterBytes(dataSource_);
-        auto tmpExptSplitReader = std::make_unique<CudfHybridScanReader>(
-            cudf::host_span<uint8_t const>{
-                footerBytes->data(), footerBytes->size()},
-            tmpOptions);
-        rowGroupIndices = tmpExptSplitReader->filter_row_groups_with_stats(
-            rowGroupIndices, tmpOptions, stream_);
+    gpuGuard.emplace();
+    while (true) {
+      if (!exptMetadataInitialized_) {
+        initExperimentalReaderMetadata();
       }
 
-      // Workaround: Set a dummy filter expression to avoid erroneous assertion
-      // in `payload_column_chunks_byte_ranges`. TODO(mh): Remove this once PR
-      // https://github.com/rapidsai/cudf/pull/20604 is merged
-      if (not tmpOptions.get_filter().has_value()) {
-        auto scalar = cudf::numeric_scalar<int32_t>(0, false, stream_);
-        auto literal = cudf::ast::literal(scalar);
-        auto filter =
-            cudf::ast::operation(cudf::ast::ast_operator::IDENTITY, literal);
-        tmpOptions.set_filter(filter);
+      if (exptNextRGIndex_ < exptFilteredRowGroups_.size()) {
+        cudfTable = readNextExperimentalBatch(metadata);
+        if (cudfTable && cudfTable->num_rows() > 0) {
+          break;
+        }
       }
 
-      // Acquire GPU after CPU metadata work, before device buffer allocation
-      gpuGuard.emplace();
-
-      // Get column chunk byte ranges to fetch
-      const auto columnChunkByteRanges =
-          exptSplitReader_->payload_column_chunks_byte_ranges(
-              rowGroupIndices, tmpOptions);
-      // Fetch row group data device buffers
-      std::vector<rmm::device_buffer> columnChunkBuffers(
-          columnChunkByteRanges.size());
-      std::vector<std::future<size_t>> ioFutures{};
-      ioFutures.reserve(columnChunkByteRanges.size());
-      std::for_each(
-          thrust::counting_iterator<size_t>(0),
-          thrust::counting_iterator(columnChunkByteRanges.size()),
-          [&](auto idx) {
-            const auto& byteRange = columnChunkByteRanges[idx];
-            auto& buffer = columnChunkBuffers[idx];
-
-            // Pad the buffer size to be a multiple of 8 bytes
-            constexpr size_t bufferPaddingMultiple = 8;
-            buffer = rmm::device_buffer(
-                cudf::util::round_up_safe<size_t>(
-                    byteRange.size(), bufferPaddingMultiple),
-                stream_,
-                cudf::get_current_device_resource_ref());
-            // Directly read the column chunk data to the device buffer if
-            // supported
-            if (auto bufferedInput =
-                    dynamic_cast<BufferedInputDataSource*>(dataSource_.get())) {
-              bufferedInput->enqueueForDevice(
-                  static_cast<uint64_t>(byteRange.offset()),
-                  static_cast<uint64_t>(byteRange.size()),
-                  static_cast<uint8_t*>(buffer.data()));
-            } else if (
-                dataSource_->supports_device_read() and
-                dataSource_->is_device_read_preferred(byteRange.size())) {
-              ioFutures.emplace_back(dataSource_->device_read_async(
-                  byteRange.offset(),
-                  byteRange.size(),
-                  static_cast<uint8_t*>(buffer.data()),
-                  stream_));
-            } else {
-              // Read the column chunk data to the host buffer and copy it to
-              // the device buffer
-              auto hostBuffer =
-                  dataSource_->host_read(byteRange.offset(), byteRange.size());
-              CUDF_CUDA_TRY(cudaMemcpyAsync(
-                  buffer.data(),
-                  hostBuffer->data(),
-                  byteRange.size(),
-                  cudaMemcpyHostToDevice,
-                  stream_.value()));
-            }
-          });
-
-      if (auto bufferedInput =
-              dynamic_cast<BufferedInputDataSource*>(dataSource_.get())) {
-        bufferedInput->load(stream_);
+      if (!hasCoalescedFiles || !advanceToNextCoalescedFile()) {
+        return nullptr;
       }
-
-      // Wait for all IO futures to complete
-      std::for_each(ioFutures.begin(), ioFutures.end(), [](auto& future) {
-        future.get();
-      });
-
-      // Convert device buffers to device spans
-      auto columnChunkData = [&]() {
-        std::vector<cudf::device_span<uint8_t const>> columnChunkData;
-        columnChunkData.reserve(columnChunkBuffers.size());
-        std::transform(
-            columnChunkBuffers.begin(),
-            columnChunkBuffers.end(),
-            std::back_inserter(columnChunkData),
-            [](auto& buffer) {
-              return cudf::device_span<uint8_t const>{
-                  static_cast<uint8_t*>(buffer.data()), buffer.size()};
-            });
-        return columnChunkData;
-      }();
-
-      // Create an all true row mask to read the table in one go without output
-      // filtering. TODO(mh): Remove this once PR
-      // https://github.com/rapidsai/cudf/pull/20604 is merged
-      const auto totalRows =
-          exptSplitReader_->total_rows_in_row_groups(rowGroupIndices);
-
-      auto const scalarTrue = cudf::numeric_scalar<bool>(true, true, stream_);
-      auto allTrueRowMask =
-          cudf::make_column_from_scalar(scalarTrue, totalRows, stream_);
-
-      // Read the table in one go
-      auto tableWithMetadata = exptSplitReader_->materialize_payload_columns(
-          rowGroupIndices,
-          columnChunkData,
-          allTrueRowMask->view(),
-          cudf::io::parquet::experimental::use_data_page_mask::NO,
-          readerOptions_,
-          stream_,
-          cudf::get_current_device_resource_ref());
-
-      // Store the read metadata
-      metadata = std::move(tableWithMetadata.metadata);
-
-      // Apply the subfield filter manually since we passed an all true row mask
-      if (readerOptions_.get_filter().has_value()) {
-        std::unique_ptr<cudf::table> table = std::move(tableWithMetadata.tbl);
-        auto filterMask = cudf::compute_column(
-            *table, readerOptions_.get_filter().value(), stream_);
-        cudfTable = cudf::apply_boolean_mask(
-            table->view(),
-            filterMask->view(),
-            stream_,
-            cudf::get_current_device_resource_ref());
-      } else {
-        cudfTable = std::move(tableWithMetadata.tbl);
-      }
-    });
-
-    if (cudfTable == nullptr) {
-      return nullptr;
     }
   }
 
@@ -508,12 +364,6 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
         std::back_inserter(originalColumns));
     cudfTable = std::make_unique<cudf::table>(std::move(originalColumns));
   }
-
-  // Synchronize the stream before accessing GPU data on the host side.
-  // CudfVector constructor calls getTableSize() which may trigger GPU kernels
-  // (e.g., null_count()) on the default stream. Without synchronization, this
-  // races with async operations still in flight on stream_.
-  stream_.synchronize();
 
   auto output = cudfIsRegistered()
       ? std::make_shared<CudfVector>(
@@ -822,6 +672,9 @@ void CudfHiveDataSource::resetSplit() {
   coalescedPinnedBuffers_.clear();
   currentFilePinnedBuffer_.reset();
   coalescedMultiSourcePending_ = false;
+  exptMetadataInitialized_ = false;
+  exptFilteredRowGroups_.clear();
+  exptNextRGIndex_ = 0;
 }
 
 std::unordered_map<std::string, RuntimeMetric>
@@ -974,6 +827,9 @@ bool CudfHiveDataSource::advanceToNextCoalescedFile() {
   exptSplitReader_.reset();
   dataSource_.reset();
   tableMaterialized_ = std::make_unique<std::once_flag>();
+  exptMetadataInitialized_ = false;
+  exptFilteredRowGroups_.clear();
+  exptNextRGIndex_ = 0;
 
   // Build a temporary CudfHiveConnectorSplit for this file.
   split_ = std::make_shared<CudfHiveConnectorSplit>(
@@ -1125,8 +981,6 @@ RowVectorPtr CudfHiveDataSource::flushAccumulated() {
     cudfTable = std::make_unique<cudf::table>(std::move(originalColumns));
   }
 
-  stream_.synchronize();
-
   auto output = cudfIsRegistered()
       ? std::make_shared<CudfVector>(
             pool_, outputType_, nRows, std::move(cudfTable), stream_)
@@ -1136,6 +990,170 @@ RowVectorPtr CudfHiveDataSource::flushAccumulated() {
   VELOX_CHECK_NOT_NULL(output, "Cudf to Velox conversion yielded a nullptr");
   completedRows_ += output->size();
   return output;
+}
+
+void CudfHiveDataSource::initExperimentalReaderMetadata() {
+  VELOX_CHECK(!exptMetadataInitialized_);
+  exptFilteredRowGroups_ = exptSplitReader_->all_row_groups(readerOptions_);
+
+  exptResolvedOptions_ = readerOptions_;
+
+  if (readerOptions_.get_filter().has_value()) {
+    auto exprConverter = referenceToNameConverter(
+        readerOptions_.get_filter(),
+        exptSplitReader_->parquet_metadata().schema,
+        readColumnNames_);
+    exptResolvedOptions_.set_filter(exprConverter.convertedExpression());
+
+    auto footerBytes = fetchFooterBytes(dataSource_);
+    auto tmpExptSplitReader = std::make_unique<CudfHybridScanReader>(
+        cudf::host_span<uint8_t const>{
+            footerBytes->data(), footerBytes->size()},
+        exptResolvedOptions_);
+    exptFilteredRowGroups_ =
+        tmpExptSplitReader->filter_row_groups_with_stats(
+            exptFilteredRowGroups_, exptResolvedOptions_, stream_);
+  }
+
+  if (not exptResolvedOptions_.get_filter().has_value()) {
+    auto scalar = cudf::numeric_scalar<int32_t>(0, false, stream_);
+    auto literal = cudf::ast::literal(scalar);
+    auto filter =
+        cudf::ast::operation(cudf::ast::ast_operator::IDENTITY, literal);
+    exptResolvedOptions_.set_filter(filter);
+  }
+
+  exptNextRGIndex_ = 0;
+  exptMetadataInitialized_ = true;
+}
+
+std::unique_ptr<cudf::table> CudfHiveDataSource::readNextExperimentalBatch(
+    cudf::io::table_metadata& metadata) {
+  VELOX_CHECK(exptMetadataInitialized_);
+  if (exptNextRGIndex_ >= exptFilteredRowGroups_.size()) {
+    return nullptr;
+  }
+
+  const auto targetBytes = CudfConfig::getInstance().gpuTargetBatchBytes;
+
+  size_t batchEnd = exptNextRGIndex_;
+  int64_t batchCompressedBytes = 0;
+  while (batchEnd < exptFilteredRowGroups_.size()) {
+    auto singleRG = cudf::host_span<cudf::size_type const>(
+        &exptFilteredRowGroups_[batchEnd], 1);
+    auto byteRanges =
+        exptSplitReader_->payload_column_chunks_byte_ranges(
+            singleRG, exptResolvedOptions_);
+    int64_t rgBytes = 0;
+    for (auto const& br : byteRanges) {
+      rgBytes += br.size();
+    }
+    batchCompressedBytes += rgBytes;
+    ++batchEnd;
+    if (targetBytes > 0 && batchCompressedBytes >= targetBytes) {
+      break;
+    }
+  }
+
+  auto batchSpan = cudf::host_span<cudf::size_type const>(
+      exptFilteredRowGroups_.data() + exptNextRGIndex_,
+      batchEnd - exptNextRGIndex_);
+  exptNextRGIndex_ = batchEnd;
+
+  const auto columnChunkByteRanges =
+      exptSplitReader_->payload_column_chunks_byte_ranges(
+          batchSpan, exptResolvedOptions_);
+
+  std::vector<rmm::device_buffer> columnChunkBuffers(
+      columnChunkByteRanges.size());
+  std::vector<std::future<size_t>> ioFutures{};
+  ioFutures.reserve(columnChunkByteRanges.size());
+  std::for_each(
+      thrust::counting_iterator<size_t>(0),
+      thrust::counting_iterator(columnChunkByteRanges.size()),
+      [&](auto idx) {
+        const auto& byteRange = columnChunkByteRanges[idx];
+        auto& buffer = columnChunkBuffers[idx];
+
+        constexpr size_t bufferPaddingMultiple = 8;
+        buffer = rmm::device_buffer(
+            cudf::util::round_up_safe<size_t>(
+                byteRange.size(), bufferPaddingMultiple),
+            stream_,
+            cudf::get_current_device_resource_ref());
+        if (auto bufferedInput =
+                dynamic_cast<BufferedInputDataSource*>(dataSource_.get())) {
+          bufferedInput->enqueueForDevice(
+              static_cast<uint64_t>(byteRange.offset()),
+              static_cast<uint64_t>(byteRange.size()),
+              static_cast<uint8_t*>(buffer.data()));
+        } else if (
+            dataSource_->supports_device_read() and
+            dataSource_->is_device_read_preferred(byteRange.size())) {
+          ioFutures.emplace_back(dataSource_->device_read_async(
+              byteRange.offset(),
+              byteRange.size(),
+              static_cast<uint8_t*>(buffer.data()),
+              stream_));
+        } else {
+          auto hostBuffer =
+              dataSource_->host_read(byteRange.offset(), byteRange.size());
+          CUDF_CUDA_TRY(cudaMemcpyAsync(
+              buffer.data(),
+              hostBuffer->data(),
+              byteRange.size(),
+              cudaMemcpyHostToDevice,
+              stream_.value()));
+        }
+      });
+
+  if (auto bufferedInput =
+          dynamic_cast<BufferedInputDataSource*>(dataSource_.get())) {
+    bufferedInput->load(stream_);
+  }
+  std::for_each(ioFutures.begin(), ioFutures.end(), [](auto& future) {
+    future.get();
+  });
+
+  std::vector<cudf::device_span<uint8_t const>> columnChunkData;
+  columnChunkData.reserve(columnChunkBuffers.size());
+  std::transform(
+      columnChunkBuffers.begin(),
+      columnChunkBuffers.end(),
+      std::back_inserter(columnChunkData),
+      [](auto& buffer) {
+        return cudf::device_span<uint8_t const>{
+            static_cast<uint8_t*>(buffer.data()), buffer.size()};
+      });
+
+  const auto totalRows =
+      exptSplitReader_->total_rows_in_row_groups(batchSpan);
+  auto const scalarTrue = cudf::numeric_scalar<bool>(true, true, stream_);
+  auto allTrueRowMask =
+      cudf::make_column_from_scalar(scalarTrue, totalRows, stream_);
+
+  auto tableWithMetadata = exptSplitReader_->materialize_payload_columns(
+      batchSpan,
+      columnChunkData,
+      allTrueRowMask->view(),
+      cudf::io::parquet::experimental::use_data_page_mask::NO,
+      readerOptions_,
+      stream_,
+      cudf::get_current_device_resource_ref());
+
+  metadata = std::move(tableWithMetadata.metadata);
+
+  if (readerOptions_.get_filter().has_value()) {
+    std::unique_ptr<cudf::table> table = std::move(tableWithMetadata.tbl);
+    auto filterMask = cudf::compute_column(
+        *table, readerOptions_.get_filter().value(), stream_);
+    return cudf::apply_boolean_mask(
+        table->view(),
+        filterMask->view(),
+        stream_,
+        cudf::get_current_device_resource_ref());
+  }
+  return std::move(tableWithMetadata.tbl);
 }
 
 } // namespace facebook::velox::cudf_velox::connector::hive
