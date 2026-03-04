@@ -415,46 +415,54 @@ CudfHashJoinProbe::CudfHashJoinProbe(
     }
   }
 
-  // Setup filter in case it exists
-  if (joinNode_->filter()) {
-    // simplify expression
-    exec::ExprSet exprs({joinNode_->filter()}, operatorCtx_->execCtx());
-    VELOX_CHECK_EQ(exprs.exprs().size(), 1);
+}
 
-    // Create a reusable evaluator for the filter column. This is expensive to
-    // build, and the expression + input schema are stable for the lifetime of
-    // the operator instance.
-    std::vector<velox::RowTypePtr> filterRowTypes{probeType_, buildType_};
-    filterEvaluator_ = createCudfExpression(
+void CudfHashJoinProbe::initialize() {
+  Operator::initialize();
+
+  if (!joinNode_->filter()) {
+    return;
+  }
+
+  auto probeType = joinNode_->sources()[0]->outputType();
+  auto buildType = joinNode_->sources()[1]->outputType();
+
+  exec::ExprSet exprs({joinNode_->filter()}, operatorCtx_->execCtx());
+  VELOX_CHECK_EQ(exprs.exprs().size(), 1);
+
+  // Create a reusable evaluator for the filter column. This is expensive to
+  // build, and the expression + input schema are stable for the lifetime of
+  // the operator instance.
+  std::vector<velox::RowTypePtr> filterRowTypes{probeType, buildType};
+  filterEvaluator_ = createCudfExpression(
+      exprs.exprs()[0],
+      facebook::velox::type::concatRowTypes(filterRowTypes));
+
+  // We don't need to get tables that contain conditional comparison columns
+  // We'll pass the entire table. The ast will handle finding the required
+  // columns. This is required because we build the ast with whole row schema
+  // and the column locations in that schema translate to column locations
+  // in whole tables
+
+  // create ast tree
+  if (joinNode_->isRightJoin() || joinNode_->isRightSemiFilterJoin()) {
+    createAstTree(
         exprs.exprs()[0],
-        facebook::velox::type::concatRowTypes(filterRowTypes));
-
-    // We don't need to get tables that contain conditional comparison columns
-    // We'll pass the entire table. The ast will handle finding the required
-    // columns. This is required because we build the ast with whole row schema
-    // and the column locations in that schema translate to column locations
-    // in whole tables
-
-    // create ast tree
-    if (joinNode_->isRightJoin() || joinNode_->isRightSemiFilterJoin()) {
-      createAstTree(
-          exprs.exprs()[0],
-          tree_,
-          scalars_,
-          buildType_,
-          probeType_,
-          rightPrecomputeInstructions_,
-          leftPrecomputeInstructions_);
-    } else {
-      createAstTree(
-          exprs.exprs()[0],
-          tree_,
-          scalars_,
-          probeType_,
-          buildType_,
-          leftPrecomputeInstructions_,
-          rightPrecomputeInstructions_);
-    }
+        tree_,
+        scalars_,
+        buildType,
+        probeType,
+        rightPrecomputeInstructions_,
+        leftPrecomputeInstructions_);
+  } else {
+    createAstTree(
+        exprs.exprs()[0],
+        tree_,
+        scalars_,
+        probeType,
+        buildType,
+        leftPrecomputeInstructions_,
+        rightPrecomputeInstructions_);
   }
 }
 
