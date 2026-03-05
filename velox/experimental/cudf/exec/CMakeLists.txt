@@ -53,6 +53,29 @@ if(DEFINED nanoarrow_SOURCE_DIR)
     "${nanoarrow_SOURCE_DIR}/src"
     "${nanoarrow_BINARY_DIR}/src"
   )
+else()
+  # Fallback: find nanoarrow headers from the system or cudf install.
+  find_path(NANOARROW_INCLUDE_DIR nanoarrow/nanoarrow.h
+    HINTS ${CUDAToolkit_LIBRARY_DIR}/../include
+          ${CMAKE_INSTALL_PREFIX}/include)
+  if(NANOARROW_INCLUDE_DIR)
+    target_include_directories(velox_cudf_exec PRIVATE "${NANOARROW_INCLUDE_DIR}")
+  else()
+    # Last resort: fetch nanoarrow headers (header-only, not linked).
+    include(FetchContent)
+    FetchContent_Declare(
+      nanoarrow
+      GIT_REPOSITORY https://github.com/apache/arrow-nanoarrow.git
+      GIT_TAG apache-arrow-nanoarrow-0.7.0
+      GIT_SHALLOW TRUE)
+    FetchContent_GetProperties(nanoarrow)
+    if(NOT nanoarrow_POPULATED)
+      FetchContent_MakeAvailable(nanoarrow)
+    endif()
+    target_include_directories(velox_cudf_exec PRIVATE
+      "${nanoarrow_SOURCE_DIR}/src"
+      "${nanoarrow_BINARY_DIR}/src")
+  endif()
 endif()
 target_compile_definitions(velox_cudf_exec PRIVATE NANOARROW_NAMESPACE=cudf)
 

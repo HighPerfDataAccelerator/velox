@@ -236,8 +236,13 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
           if (remainingFilterExprSet_) {
             auto cols = tbl->release();
             const auto originalNumColumns = cols.size();
+            std::vector<cudf::column_view> colViews;
+            colViews.reserve(cols.size());
+            for (auto& c : cols) {
+              colViews.push_back(c->view());
+            }
             auto filterResult = cudfExpressionEvaluator_->eval(
-                cols, stream_, cudf::get_current_device_resource_ref());
+                colViews, stream_, cudf::get_current_device_resource_ref());
             std::vector<std::unique_ptr<cudf::column>> origCols;
             origCols.reserve(originalNumColumns);
             std::move(
@@ -558,7 +563,6 @@ void CudfHiveDataSource::addSplit(std::shared_ptr<ConnectorSplit> split) {
     // Multi-source path: defer reader creation to first next() call,
     // after all async reads have completed.
     stream_ = cudfGlobalStreamPool().get_stream();
-    tableMaterialized_ = std::make_unique<std::once_flag>();
     completedBytes_ += split_->length;
     numFilesCoalesced_ = static_cast<int64_t>(asyncFileReads_.size());
     return;
@@ -572,8 +576,6 @@ void CudfHiveDataSource::addSplit(std::shared_ptr<ConnectorSplit> split) {
   } else {
     splitReader_ = createSplitReader();
   }
-
-  tableMaterialized_ = std::make_unique<std::once_flag>();
 
   // TODO: `completedBytes_` should be updated in `next()` as we read more and
   // more table bytes
@@ -875,7 +877,8 @@ bool CudfHiveDataSource::advanceToNextCoalescedFile() {
   splitReader_.reset();
   exptSplitReader_.reset();
   dataSource_.reset();
-  tableMaterialized_ = std::make_unique<std::once_flag>();
+  hybridScanState_ = std::make_unique<
+      facebook::velox::cudf_velox::connector::hive::HybridScanState>();
 
   // Build a temporary CudfHiveConnectorSplit for this file.
   split_ = std::make_shared<CudfHiveConnectorSplit>(
@@ -931,7 +934,7 @@ bool CudfHiveDataSource::advanceToNextCoalescedFile() {
 
     if (useExperimentalSplitReader_) {
       dataSource_ =
-          std::move(makeDataSourcesFromSourceInfo(
+          std::move(cudf::io::make_datasources(
                         cudf::io::source_info(
                             cudf::host_span<const std::byte>(
                                 reinterpret_cast<const std::byte*>(
