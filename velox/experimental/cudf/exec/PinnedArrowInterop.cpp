@@ -401,11 +401,21 @@ void buildArrowColumnFromPacked(
           buf, hostBuf, hostBase + col.data_offset, dataBytes);
       out->buffers[1] = buf->data;
     } else if (col.data_offset != -1 && arrowType == NANOARROW_TYPE_BOOL) {
-      auto* buf = ArrowArrayBuffer(out, 1);
-      auto dataBytes =
+      // cudf BOOL8 stores 1 byte per bool; Arrow boolean is bit-packed.
+      // Convert byte-per-bool → bit-packed before attaching to Arrow buffer.
+      auto bitBytes =
           static_cast<int64_t>(cudf::bitmask_allocation_size_bytes(col.size));
-      attachHostBufToArrowBuffer(
-          buf, hostBuf, hostBase + col.data_offset, dataBytes);
+      auto bitBuf = std::make_shared<PinnedHostBuffer>(bitBytes);
+      auto* src = hostBase + col.data_offset;
+      auto* dst = bitBuf->data();
+      std::memset(dst, 0, bitBytes);
+      for (cudf::size_type i = 0; i < col.size; ++i) {
+        if (src[i]) {
+          dst[i >> 3] |= static_cast<uint8_t>(1u << (i & 7));
+        }
+      }
+      auto* buf = ArrowArrayBuffer(out, 1);
+      attachHostBufToArrowBuffer(buf, bitBuf, bitBuf->data(), bitBytes);
       out->buffers[1] = buf->data;
     }
 
