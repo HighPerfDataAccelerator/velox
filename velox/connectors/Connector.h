@@ -300,6 +300,14 @@ class DataSource {
     VELOX_UNSUPPORTED("setFromDataSource");
   }
 
+  /// Returns true if the DataSource wants additional splits to be coalesced
+  /// into the current batch before next() is called. The driver will
+  /// non-blocking fetch available splits and call setFromDataSource() for
+  /// each one while this returns true.
+  virtual bool wantsMoreSplits() const {
+    return false;
+  }
+
   /// Returns a connector dependent row size if available. This can be
   /// called after addSplit().  This estimates uncompressed data
   /// sizes. This is better than getCompletedBytes()/getCompletedRows()

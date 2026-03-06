@@ -92,6 +92,9 @@ class TableScan : public SourceOperator {
   static constexpr std::string_view kDataSourceAddSplitWallNanos =
       "dataSourceAddSplitWallNanos";
 
+  /// Number of additional splits coalesced into the current batch.
+  static constexpr std::string_view kCoalescedSplits = "coalescedSplits";
+
   std::shared_ptr<ScaledScanController> testingScaledController() const {
     return scaledController_;
   }
@@ -131,6 +134,10 @@ class TableScan : public SourceOperator {
   // the scan driver memory usage and check to see if we need to scale up scan
   // processing or not.
   void tryScaleUp();
+
+  // After the first split is loaded, non-blocking fetches additional splits
+  // while the DataSource requests coalescing (wantsMoreSplits()).
+  void coalesceAvailableSplits();
 
   // Calculates the batch size to read based on available row size information.
   // Returns the number of rows to read in the next batch.

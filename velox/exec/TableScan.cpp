@@ -390,7 +390,65 @@ bool TableScan::getSplit() {
         RuntimeCounter(addSplitTimeUs * 1'000, RuntimeCounter::Unit::kNanos));
   }
   ++stats_.wlock()->numSplits;
+
+  coalesceAvailableSplits();
+
   return true;
+}
+
+void TableScan::coalesceAvailableSplits() {
+  int32_t numCoalesced = 0;
+  while (dataSource_->wantsMoreSplits()) {
+    exec::Split coalesceSplit;
+    ContinueFuture coalesceFuture{ContinueFuture::makeEmpty()};
+    auto reason = driverCtx_->task->getSplitOrFuture(
+        driverCtx_->driverId,
+        driverCtx_->splitGroupId,
+        planNodeId(),
+        maxPreloadedSplits_,
+        splitPreloader_,
+        coalesceSplit,
+        coalesceFuture);
+    if (reason != BlockingReason::kNotBlocked) {
+      break;
+    }
+    if (!coalesceSplit.hasConnectorSplit()) {
+      break;
+    }
+
+    const auto& connSplit = coalesceSplit.connectorSplit;
+    if (connSplit->dataSource) {
+      ++numPreloadedSplits_;
+      numReadyPreloadedSplits_ += connSplit->dataSource->hasValue();
+      auto prepared = connSplit->dataSource->move();
+      if (!prepared) {
+        break;
+      }
+      dataSource_->setFromDataSource(std::move(prepared));
+    } else {
+      auto tempSource = createDataSource(
+          driverCtx_->driver->pushdownFilters()->at(0),
+          *connector_,
+          outputType_,
+          tableHandle_,
+          columnHandles_,
+          connectorQueryCtx_.get());
+      {
+        auto lk = driverCtx_->driver->pushdownFilters()->at(0).rlock();
+        tempSource->addSplit(connSplit);
+      }
+      dataSource_->setFromDataSource(std::move(tempSource));
+    }
+
+    driverCtx_->task->splitFinished(true, connSplit->splitWeight);
+    ++numCoalesced;
+    ++stats_.wlock()->numSplits;
+  }
+
+  if (numCoalesced > 0) {
+    stats_.wlock()->addRuntimeStat(
+        std::string(kCoalescedSplits), RuntimeCounter(numCoalesced));
+  }
 }
 
 bool TableScan::shouldWaitForScaleUp() {

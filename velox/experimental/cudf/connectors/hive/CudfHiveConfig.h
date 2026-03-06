@@ -88,6 +88,23 @@ class CudfHiveConfig {
   static constexpr const char* kUseExperimentalCudfReaderSession =
       "cudf.hive.use_experimental_reader";
 
+  // Whether to use the metadata pre-filter path (CudfHiveDataSource2).
+  // When enabled: one file per split, footer pre-parsing on IO executor,
+  // selective byte-range I/O, self-contained Parquet buffer assembly.
+  static constexpr const char* kUseMetadataPrefilter =
+      "cudf.hive.use-metadata-prefilter";
+  static constexpr const char* kUseMetadataPrefilterSession =
+      "cudf.hive.use_metadata_prefilter";
+
+  // Target accumulated buffer size (bytes) for split coalescing in DS2.
+  // When the total preloaded buffer bytes is below this threshold, the
+  // driver will non-blocking fetch additional available splits before
+  // calling next(). Set to 0 to disable coalescing. Default: 256 MiB.
+  static constexpr const char* kCoalesceAccBufferSizeInBytes =
+      "cudf.hive.coalesce-acc-buffer-size-in-bytes";
+  static constexpr const char* kCoalesceAccBufferSizeInBytesSession =
+      "cudf.hive.coalesce_acc_buffer_size_in_bytes";
+
   // Writer config options
 
   /// Whether new data can be inserted into a CudfHive file
@@ -157,6 +174,13 @@ class CudfHiveConfig {
 
   bool useExperimentalCudfReader() const;
   bool useExperimentalCudfReaderSession(
+      const config::ConfigBase* session) const;
+
+  bool useMetadataPrefilter() const;
+  bool useMetadataPrefilterSession(const config::ConfigBase* session) const;
+
+  int64_t coalesceAccBufferSizeInBytes() const;
+  int64_t coalesceAccBufferSizeInBytesSession(
       const config::ConfigBase* session) const;
 
   bool immutableFiles() const;

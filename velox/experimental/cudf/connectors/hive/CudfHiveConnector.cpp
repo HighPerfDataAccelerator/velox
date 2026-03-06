@@ -16,6 +16,7 @@
 
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConnector.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveDataSource.h"
+#include "velox/experimental/cudf/connectors/hive/CudfHiveDataSource2.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 
 #include "velox/connectors/hive/HiveDataSource.h"
@@ -44,6 +45,17 @@ std::unique_ptr<DataSource> CudfHiveConnector::createDataSource(
   // Problem: this information is in split, not table handle
 
   if (cudfIsRegistered()) {
+    if (cudfHiveConfig_->useMetadataPrefilterSession(
+            connectorQueryCtx->sessionProperties())) {
+      return std::make_unique<CudfHiveDataSource2>(
+          outputType,
+          tableHandle,
+          columnHandles,
+          &fileHandleFactory_,
+          ioExecutor_,
+          connectorQueryCtx,
+          cudfHiveConfig_);
+    }
     return std::make_unique<CudfHiveDataSource>(
         outputType,
         tableHandle,

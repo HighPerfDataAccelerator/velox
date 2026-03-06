@@ -18,6 +18,7 @@ add_library(
   CudfHiveConnector.cpp
   CudfHiveConnectorSplit.cpp
   CudfHiveDataSource.cpp
+  CudfHiveDataSource2.cpp
   CudfHiveDataSourceHelpers.cpp
   CudfHiveDataSink.cpp
   CudfHiveTableHandle.cpp
@@ -27,6 +28,6 @@ set_target_properties(velox_cudf_hive_connector PROPERTIES CUDA_ARCHITECTURES na
 
 target_link_libraries(
   velox_cudf_hive_connector
-  PRIVATE velox_hive_connector
+  PRIVATE velox_hive_connector velox_dwio_native_parquet_reader
   PUBLIC cudf::cudf velox_cudf_expression
 )

@@ -31,6 +31,8 @@ add_library(
   VeloxCudfInterop.cpp
 )
 
+find_package(CURL REQUIRED)
+
 target_link_libraries(
   velox_cudf_exec
   PUBLIC cudf::cudf
@@ -43,6 +45,7 @@ target_link_libraries(
     velox_exec
     velox_cudf_hive_connector
     velox_cudf_expression
+    CURL::libcurl
 )
 
 # PinnedArrowInterop.cpp uses nanoarrow headers directly (cudf's private dep).

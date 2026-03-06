@@ -231,4 +231,12 @@ fetchByteRangesAsync(
       *dataSource, byteRanges, stream, mr);
 }
 
+std::vector<std::unique_ptr<cudf::io::datasource>>
+makeDataSourcesFromSourceInfo(
+    const cudf::io::source_info& info,
+    size_t offset,
+    size_t maxSizeEstimate) {
+  return cudf::io::make_datasources(info, offset, maxSizeEstimate);
+}
+
 } // namespace facebook::velox::cudf_velox::connector::hive

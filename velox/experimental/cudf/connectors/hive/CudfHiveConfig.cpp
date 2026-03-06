@@ -143,6 +143,30 @@ bool CudfHiveConfig::useExperimentalCudfReaderSession(
       config_->get<bool>(kUseExperimentalCudfReader, false));
 }
 
+bool CudfHiveConfig::useMetadataPrefilter() const {
+  return config_->get<bool>(kUseMetadataPrefilter, false);
+}
+
+bool CudfHiveConfig::useMetadataPrefilterSession(
+    const config::ConfigBase* session) const {
+  return session->get<bool>(
+      kUseMetadataPrefilterSession,
+      config_->get<bool>(kUseMetadataPrefilter, false));
+}
+
+int64_t CudfHiveConfig::coalesceAccBufferSizeInBytes() const {
+  constexpr int64_t kDefault256MiB = 256LL * 1024 * 1024;
+  return config_->get<int64_t>(kCoalesceAccBufferSizeInBytes, kDefault256MiB);
+}
+
+int64_t CudfHiveConfig::coalesceAccBufferSizeInBytesSession(
+    const config::ConfigBase* session) const {
+  constexpr int64_t kDefault256MiB = 256LL * 1024 * 1024;
+  return session->get<int64_t>(
+      kCoalesceAccBufferSizeInBytesSession,
+      config_->get<int64_t>(kCoalesceAccBufferSizeInBytes, kDefault256MiB));
+}
+
 bool CudfHiveConfig::immutableFiles() const {
   return config_->get<bool>(kImmutableFiles, false);
 }

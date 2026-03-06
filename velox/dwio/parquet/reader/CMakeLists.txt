@@ -16,6 +16,7 @@ velox_add_library(
   velox_dwio_native_parquet_reader
   Metadata.cpp
   NestedStructureDecoder.cpp
+  ParquetMetadataUtil.cpp
   ParquetReader.cpp
   ParquetTypeWithId.cpp
   PageReader.cpp
