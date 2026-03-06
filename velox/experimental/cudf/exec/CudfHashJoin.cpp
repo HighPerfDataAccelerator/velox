@@ -42,6 +42,7 @@
 #include <cudf/scalar/scalar_factories.hpp>
 #include <cudf/search.hpp>
 #include <cudf/stream_compaction.hpp>
+#include <cudf/table/table.hpp>
 #include <cudf/unary.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
@@ -916,6 +917,14 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::rightJoin(
     if (buildStream_.has_value()) {
       cudaEvent_->recordFrom(buildStream_.value()).waitOn(stream);
     }
+    // cudf::scatter is async: it enqueues a device memcpy of the old flags
+    // (the target) plus a thrust::scatter kernel onto `stream`, then returns
+    // immediately. The old rightMatchedFlags_[i] column must stay alive until
+    // that work completes. We defer the assignment to rightMatchedFlags_[i]
+    // until after unfilteredOutput/filteredOutput (which call
+    // stream.synchronize()), so the old column is not destroyed while the
+    // scatter kernel is still reading from it.
+    std::unique_ptr<cudf::column> updated_flag_col;
     if (!joinNode_->filter()) {
       // Mark matched build rows by checking which row indices appear in
       // rightJoinIndices. Use contains to avoid scatter with duplicate indices.
@@ -942,7 +951,7 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::rightJoin(
           cudf::data_type{cudf::type_id::BOOL8},
           stream,
           cudf::get_current_device_resource_ref());
-      rightMatchedFlags_[i] = std::move(updatedFlags);
+      updated_flag_col = std::move(updatedFlags->release()[0]);    
     }
 
     auto leftIndicesSpan =
@@ -957,7 +966,7 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::rightJoin(
       auto& rightMatchedFlags = rightMatchedFlags_[i];
       auto numBuildRows = rightTableView.num_rows();
       auto filterFunc =
-          [&rightMatchedFlags, rightIndicesSpan, numBuildRows, stream](
+          [&rightMatchedFlags, &updated_flag_col, rightIndicesSpan, numBuildRows, stream](
               std::vector<std::unique_ptr<cudf::column>>&& joinedCols,
               cudf::column_view filterColumn) {
             // apply the filter
@@ -997,7 +1006,7 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::rightJoin(
                 cudf::data_type{cudf::type_id::BOOL8},
                 stream,
                 cudf::get_current_device_resource_ref());
-            rightMatchedFlags = std::move(updatedFlags);
+            updated_flag_col = std::move(updatedFlags->release()[0]);
             return std::move(joinedCols);
           };
       cudfOutputs.push_back(filteredOutput(
@@ -1015,6 +1024,8 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::rightJoin(
           rightIndicesCol,
           stream));
     }
+    // Safe to assign now: stream has been synchronized by the output call above.
+    rightMatchedFlags_[i] = std::move(updated_flag_col);
   }
   return cudfOutputs;
 }
