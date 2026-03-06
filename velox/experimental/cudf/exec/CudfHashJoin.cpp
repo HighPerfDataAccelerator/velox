@@ -465,8 +465,11 @@ bool CudfHashJoinProbe::needsInput() const {
     belowThreshold = accumulatedProbeInputs_.empty() ||
         accumulatedProbeRows_ < minRows;
   } else {
-    // Both thresholds disabled: pass through without coalescing.
-    belowThreshold = accumulatedProbeInputs_.empty();
+    // Both thresholds disabled: pass through without coalescing. Keep accepting
+    // input until we have a batch to process (materialized into input_ in
+    // getOutput). Otherwise we would stop after the first batch and drop
+    // subsequent stream-side batches.
+    belowThreshold = (input_ == nullptr);
   }
   return !noMoreInput_ && !finished_ && input_ == nullptr && belowThreshold;
 }
@@ -842,6 +845,12 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::rightJoin(
     if (buildStream_.has_value()) {
       cudaEvent_->recordFrom(buildStream_.value()).waitOn(stream);
     }
+    // Keep old flags alive until after stream.synchronize() in the output path
+    // below. The scatter reads old flags asynchronously on 'stream', but the
+    // old column's device_buffer would be freed on the stream it was originally
+    // allocated on. Destroying it before the scatter kernel finishes reading
+    // is a use-after-free.
+    std::unique_ptr<cudf::column> oldFlags;
     if (!joinNode_->filter()) {
       // Mark matched rights using scatter of true into flags at matching
       // indices
@@ -853,7 +862,8 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::rightJoin(
           rightJoinIndices->size(),
           stream,
           cudf::get_current_device_resource_ref());
-      auto flags_table = cudf::table_view({rightMatchedFlags_[i]->view()});
+      oldFlags = std::move(rightMatchedFlags_[i]);
+      auto flags_table = cudf::table_view({oldFlags->view()});
       auto rightIdxCol = cudf::column_view{
           cudf::device_span<cudf::size_type const>{*rightJoinIndices}};
       auto updated_flags_tbl = cudf::scatter(
@@ -875,8 +885,9 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::rightJoin(
 
     if (joinNode_->filter()) {
       auto& rightMatchedFlags = rightMatchedFlags_[i];
+      oldFlags = std::move(rightMatchedFlags);
       auto filterFunc =
-          [&rightMatchedFlags, rightIndicesSpan, stream](
+          [&rightMatchedFlags, &oldFlags, rightIndicesSpan, stream](
               std::vector<std::unique_ptr<cudf::column>>&& joinedCols,
               cudf::column_view filterColumn) {
             // apply the filter
@@ -905,7 +916,7 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::rightJoin(
                 filteredRightIdxCol->size(),
                 stream,
                 cudf::get_current_device_resource_ref());
-            auto flags_table = cudf::table_view({rightMatchedFlags->view()});
+            auto flags_table = cudf::table_view({oldFlags->view()});
             auto updated_flags_tbl = cudf::scatter(
                 cudf::table_view({true_col->view()}),
                 filteredRightIdxCol->view(),
