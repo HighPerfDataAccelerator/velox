@@ -352,6 +352,12 @@ RowVectorPtr CudfToVelox::getOutput() {
       auto secondPartVector = std::make_shared<CudfVector>(
           pool(), input->type(), secondPartSize, std::move(secondPart), stream);
 
+      // Sync before releasing the original input: the table copies above are
+      // async on `stream` and read from the original input's device buffers.
+      // Without this, the original's GPU memory may be freed (when `input` is
+      // reassigned below) while the copy kernels are still reading from it.
+      stream.synchronize();
+
       // Replace the original input with the second part
       input = std::move(secondPartVector);
 

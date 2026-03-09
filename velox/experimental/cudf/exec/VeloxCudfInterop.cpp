@@ -355,7 +355,12 @@ std::unique_ptr<cudf::table> toCudfTableBatched(
 
   auto concatenated = cudf::concatenate(views, stream);
 
-  // Release Arrow / pinned resources after concatenation is issued.
+  // Synchronize before releasing source tables: cudf::concatenate is async
+  // and reads from the source table device buffers. Without this sync, the
+  // source tables' GPU memory could be freed (when `pending` goes out of
+  // scope) while the concatenation kernel is still reading from them.
+  stream.synchronize();
+
   for (auto& p : pending) {
     p.releaseArrow();
   }

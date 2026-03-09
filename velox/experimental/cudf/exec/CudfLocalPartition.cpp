@@ -233,25 +233,35 @@ void CudfLocalPartition::addInput(RowVectorPtr input) {
     auto partitionedTables =
         cudf::split(partitionedTable->view(), partitionOffsets, stream);
 
-    // DM: We should investigate if keeping partitionedTables alive and using
-    // the table view in partitionData is more efficient than creating a new
-    // table each time. Currently out of scope because it would need a new
-    // type of RowVector that can hold a table view and shared_ptr to the
-    // table.
+    std::vector<std::pair<int, std::shared_ptr<CudfVector>>> partitionVectors;
     for (int i = 0; i < numPartitions_; ++i) {
       auto partitionData = partitionedTables[i];
       if (partitionData.num_rows() == 0) {
         continue;
       }
 
-      auto partitionCudfVector = std::make_shared<CudfVector>(
-          pool(),
-          outputType_,
-          partitionData.num_rows(),
-          std::make_unique<cudf::table>(
-              partitionData, stream, cudf::get_current_device_resource_ref()),
-          stream);
-      enqueuePartition(i, partitionCudfVector);
+      partitionVectors.emplace_back(
+          i,
+          std::make_shared<CudfVector>(
+              pool(),
+              outputType_,
+              partitionData.num_rows(),
+              std::make_unique<cudf::table>(
+                  partitionData,
+                  stream,
+                  cudf::get_current_device_resource_ref()),
+              stream));
+    }
+
+    // Synchronize before enqueuing to consumer threads: the table copies
+    // above are async on `stream` and read from partitionedTable. Without
+    // this sync, partitionedTable could be freed (end of scope) while the
+    // copies are still in flight, causing illegal memory access when using
+    // non-stream-ordered memory resources (pool, arena).
+    stream.synchronize();
+
+    for (auto& [pid, vec] : partitionVectors) {
+      enqueuePartition(pid, vec);
     }
   } else {
     // Single partition case.

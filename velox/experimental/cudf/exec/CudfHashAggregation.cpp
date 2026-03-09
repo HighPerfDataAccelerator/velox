@@ -939,6 +939,16 @@ void CudfHashAggregation::computeIntermediateGroupbyPartial(CudfVectorPtr tbl) {
         intermediateAggregators_,
         partialOutputStream);
     partialOutput_ = compactedOutput;
+
+    // The concatenation (and groupby) on partialOutputStream asynchronously
+    // reads from groupbyOnInput's device buffers, which were allocated on
+    // inputTableStream.  When groupbyOnInput goes out of scope the buffers
+    // are freed via cudaFreeAsync on inputTableStream.  Without this reverse
+    // join the free can race ahead of the read on partialOutputStream.
+    if (inputTableStream != partialOutputStream) {
+      cudf::detail::join_streams(
+          std::vector<rmm::cuda_stream_view>{partialOutputStream}, inputTableStream);
+    }
   } else {
     // First time processing, just store the result of the input batch's groupby
     // This means we're storing the stream from the first batch.
@@ -978,6 +988,16 @@ void CudfHashAggregation::computeIntermediateDistinctPartial(
         groupingKeyOutputChannels_,
         partialOutputStream);
     partialOutput_ = distinctOutput;
+
+    // The concatenation (and distinct) on partialOutputStream asynchronously
+    // reads from tbl's device buffers, which were allocated on
+    // inputTableStream.  When tbl goes out of scope the buffers are freed
+    // via cudaFreeAsync on inputTableStream.  Without this reverse join the
+    // free can race ahead of the read on partialOutputStream.
+    if (inputTableStream != partialOutputStream) {
+      cudf::detail::join_streams(
+          std::vector<rmm::cuda_stream_view>{partialOutputStream}, inputTableStream);
+    }
   } else {
     // First time processing, just store the result of the input batch's
     // distinct. Use getTableView() to avoid expensive materialization for

@@ -245,10 +245,17 @@ std::unique_ptr<cudf::table> getConcatenatedTable(
 
   cudf::detail::join_streams(inputStreams, stream);
 
-  if (tables.size() == 1) {
+  if (tables.size() == 1 && inputStreams[0] == stream) {
+    // Zero-copy: safe because buffers are on `stream`, so any later
+    // cudaFreeAsync is ordered with work on the same stream.
     return tables[0]->release();
   }
 
+  // For multiple tables, or a single table whose buffers live on a different
+  // stream, materialize on `stream`.  This ensures the returned table's
+  // device_buffers are allocated (and later freed) on `stream`, avoiding
+  // cross-stream free-vs-read races when the caller uses the table on
+  // `stream` and the buffers would otherwise be freed on the original stream.
   auto output = cudf::concatenate(
       tableViews, stream, cudf::get_current_device_resource_ref());
   stream.synchronize();
@@ -280,7 +287,8 @@ std::vector<std::unique_ptr<cudf::table>> getConcatenatedTableBatched(
 
   cudf::detail::join_streams(inputStreams, stream);
 
-  if (tables.size() == 1) {
+  if (tables.size() == 1 && inputStreams[0] == stream) {
+    // Zero-copy: safe because buffers are on `stream`.
     concatTables.push_back(tables[0]->release());
     return concatTables;
   }
