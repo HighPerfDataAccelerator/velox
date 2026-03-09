@@ -343,10 +343,10 @@ std::unique_ptr<cudf::table> toCudfTableBatched(
     pending.push_back(toCudfTableNoSync(batch, pool, stream));
   }
 
-  // ONE sync for all transfers.
-  stream.synchronize();
-
   // Build table views for GPU-side concatenation.
+  // No sync needed here: concatenation is enqueued on the same stream as
+  // from_arrow transfers, so CUDA stream ordering guarantees the data is
+  // available. Pinned host buffers stay alive until releaseArrow() below.
   std::vector<cudf::table_view> views;
   views.reserve(pending.size());
   for (auto& p : pending) {

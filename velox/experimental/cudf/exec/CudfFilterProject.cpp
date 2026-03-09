@@ -235,14 +235,18 @@ bool CudfFilterProject::needsInput() const {
   auto targetBytes = CudfConfig::getInstance().gpuTargetBatchBytes;
   auto minRows = CudfConfig::getInstance().gpuTargetBatchRows;
   bool belowThreshold;
-  if (targetBytes > 0) {
-    belowThreshold = accumulatedOutputs_.empty() ||
-        accumulatedOutputBytes_ < targetBytes;
-  } else if (minRows > 0) {
-    belowThreshold = accumulatedOutputs_.empty() ||
+  if (accumulatedOutputs_.empty()) {
+    belowThreshold = true;
+  } else if (targetBytes > 0 && minRows > 0) {
+    belowThreshold =
+        accumulatedOutputBytes_ < targetBytes &&
         accumulatedOutputRows_ < minRows;
+  } else if (targetBytes > 0) {
+    belowThreshold = accumulatedOutputBytes_ < targetBytes;
+  } else if (minRows > 0) {
+    belowThreshold = accumulatedOutputRows_ < minRows;
   } else {
-    belowThreshold = accumulatedOutputs_.empty();
+    belowThreshold = false;
   }
   return !noMoreInput_ && input_ == nullptr && belowThreshold;
 }
@@ -317,9 +321,16 @@ RowVectorPtr CudfFilterProject::getOutput() {
   accumulatedOutputBytes_ += cudfOutput->estimateFlatSize();
   accumulatedOutputs_.push_back(std::move(cudfOutput));
 
-  bool thresholdReached = (targetBytes > 0)
-      ? (accumulatedOutputBytes_ >= targetBytes)
-      : (accumulatedOutputRows_ >= minRows);
+  bool thresholdReached;
+  if (targetBytes > 0 && minRows > 0) {
+    thresholdReached =
+        accumulatedOutputBytes_ >= targetBytes ||
+        accumulatedOutputRows_ >= minRows;
+  } else if (targetBytes > 0) {
+    thresholdReached = accumulatedOutputBytes_ >= targetBytes;
+  } else {
+    thresholdReached = accumulatedOutputRows_ >= minRows;
+  }
   if (thresholdReached) {
     return flushAccumulatedOutputs();
   }

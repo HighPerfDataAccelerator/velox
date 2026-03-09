@@ -167,16 +167,6 @@ void CudfHashJoinBuild::addInput(RowVectorPtr input) {
   if (input->size() > 0) {
     auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input);
     VELOX_CHECK_NOT_NULL(cudfInput);
-    // Count nulls in join key columns
-    auto [_, null_count] = cudf::bitmask_and(
-        cudfInput->getTableView(),
-        cudfInput->stream(),
-        cudf::get_current_device_resource_ref());
-    {
-      // Update statistics for null keys in join operator.
-      auto lockedStats = stats_.wlock();
-      lockedStats->numNullKeys += null_count;
-    }
     inputs_.push_back(std::move(cudfInput));
   }
 }
@@ -236,9 +226,6 @@ void CudfHashJoinBuild::noMoreInput() {
   auto stream = cudfGlobalStreamPool().get_stream();
   auto tbls = getConcatenatedTableBatched(
       inputs_, joinNode_->sources()[1]->outputType(), stream);
-
-  // Release input data after synchronizing
-  stream.synchronize();
   inputs_.clear();
 
   for (auto const& tbl : tbls) {
@@ -477,15 +464,18 @@ bool CudfHashJoinProbe::needsInput() const {
   auto targetBytes = CudfConfig::getInstance().gpuTargetBatchBytes;
   auto minRows = CudfConfig::getInstance().gpuTargetBatchRows;
   bool belowThreshold;
-  if (targetBytes > 0) {
-    belowThreshold = accumulatedProbeInputs_.empty() ||
-        accumulatedProbeBytes_ < targetBytes;
-  } else if (minRows > 0) {
-    belowThreshold = accumulatedProbeInputs_.empty() ||
+  if (accumulatedProbeInputs_.empty()) {
+    belowThreshold = true;
+  } else if (targetBytes > 0 && minRows > 0) {
+    belowThreshold =
+        accumulatedProbeBytes_ < targetBytes &&
         accumulatedProbeRows_ < minRows;
+  } else if (targetBytes > 0) {
+    belowThreshold = accumulatedProbeBytes_ < targetBytes;
+  } else if (minRows > 0) {
+    belowThreshold = accumulatedProbeRows_ < minRows;
   } else {
-    // Both thresholds disabled: pass through without coalescing.
-    belowThreshold = accumulatedProbeInputs_.empty();
+    belowThreshold = false;
   }
   return !noMoreInput_ && !finished_ && input_ == nullptr && belowThreshold;
 }
@@ -497,18 +487,7 @@ void CudfHashJoinProbe::addInput(RowVectorPtr input) {
   }
   auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input);
   VELOX_CHECK_NOT_NULL(cudfInput);
-  // Count nulls in join key columns
-  auto [_, null_count] = cudf::bitmask_and(
-      cudfInput->getTableView(),
-      cudfInput->stream(),
-      cudf::get_current_device_resource_ref());
-  {
-    // Update statistics for null keys in join operator.
-    auto lockedStats = stats_.wlock();
-    lockedStats->numNullKeys += null_count;
-  }
   if (joinNode_->isRightSemiFilterJoin()) {
-    // Queue inputs and process all at once
     if (input->size() > 0) {
       inputs_.push_back(std::move(cudfInput));
     }
@@ -595,9 +574,6 @@ void CudfHashJoinProbe::noMoreInput() {
   auto stream = cudfGlobalStreamPool().get_stream();
   auto tbl = getConcatenatedTable(
       inputs_, joinNode_->sources()[1]->outputType(), stream);
-
-  // Release input data after synchronizing
-  stream.synchronize();
 
   VELOX_CHECK_NOT_NULL(tbl);
 
@@ -1357,11 +1333,18 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
       !accumulatedProbeInputs_.empty() && input_ == nullptr) {
     auto targetBytes = CudfConfig::getInstance().gpuTargetBatchBytes;
     auto minRows = CudfConfig::getInstance().gpuTargetBatchRows;
-    bool thresholdReached = (targetBytes > 0)
-        ? (accumulatedProbeBytes_ >= targetBytes)
-        : (minRows > 0)
-            ? (accumulatedProbeRows_ >= minRows)
-            : !accumulatedProbeInputs_.empty();
+    bool thresholdReached;
+    if (targetBytes > 0 && minRows > 0) {
+      thresholdReached =
+          accumulatedProbeBytes_ >= targetBytes ||
+          accumulatedProbeRows_ >= minRows;
+    } else if (targetBytes > 0) {
+      thresholdReached = accumulatedProbeBytes_ >= targetBytes;
+    } else if (minRows > 0) {
+      thresholdReached = accumulatedProbeRows_ >= minRows;
+    } else {
+      thresholdReached = !accumulatedProbeInputs_.empty();
+    }
     if (thresholdReached || noMoreInput_) {
       if (accumulatedProbeInputs_.size() == 1) {
         input_ = std::move(accumulatedProbeInputs_[0]);
