@@ -1015,7 +1015,6 @@ void CudfHashAggregation::processAccumulatedPartialInputs() {
   auto stream = cudfGlobalStreamPool().get_stream();
   auto tbl =
       getConcatenatedTable(accumulatedPartialInputs_, inputType_, stream);
-  stream.synchronize();
 
   auto numRows = static_cast<int64_t>(tbl->num_rows());
   auto cudfBatch = std::make_shared<CudfVector>(
@@ -1040,7 +1039,6 @@ void CudfHashAggregation::processAccumulatedPartialInputs() {
 
 void CudfHashAggregation::addInput(RowVectorPtr input) {
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
-  GpuGuard gpuGuard;
   if (input->size() == 0) {
     return;
   }
@@ -1056,18 +1054,29 @@ void CudfHashAggregation::addInput(RowVectorPtr input) {
       accumulatedPartialRows_ += input->size();
       accumulatedPartialBytes_ += cudfInput->estimateFlatSize();
       accumulatedPartialInputs_.push_back(std::move(cudfInput));
-      bool thresholdReached = (targetBytes > 0)
-          ? (accumulatedPartialBytes_ >= targetBytes)
-          : (accumulatedPartialRows_ >= targetRows);
+      bool thresholdReached;
+      if (targetBytes > 0 && targetRows > 0) {
+        thresholdReached =
+            accumulatedPartialBytes_ >= targetBytes ||
+            accumulatedPartialRows_ >= targetRows;
+      } else if (targetBytes > 0) {
+        thresholdReached = accumulatedPartialBytes_ >= targetBytes;
+      } else {
+        thresholdReached = accumulatedPartialRows_ >= targetRows;
+      }
       if (thresholdReached) {
+        GpuGuard gpuGuard;
         processAccumulatedPartialInputs();
       }
       return;
     }
-    if (isDistinct_) {
-      computeIntermediateDistinctPartial(cudfInput);
-    } else {
-      computeIntermediateGroupbyPartial(cudfInput);
+    {
+      GpuGuard gpuGuard;
+      if (isDistinct_) {
+        computeIntermediateDistinctPartial(cudfInput);
+      } else {
+        computeIntermediateGroupbyPartial(cudfInput);
+      }
     }
     return;
   }
@@ -1228,9 +1237,6 @@ RowVectorPtr CudfHashAggregation::getOutput() {
   auto stream = cudfGlobalStreamPool().get_stream();
 
   auto tbl = getConcatenatedTable(inputs_, inputType_, stream);
-
-  // Release input data after synchronizing.
-  stream.synchronize();
   inputs_.clear();
 
   if (noMoreInput_) {

@@ -162,9 +162,11 @@ RowVectorPtr CudfFromVelox::getOutput() {
 
   finished_ = noMoreInput_ && inputs_.empty();
 
-  bool belowThreshold = (targetBytes > 0)
-      ? (currentOutputBytes_ < targetBytes)
-      : (currentOutputSize_ < static_cast<std::size_t>(targetRows));
+  bool belowRowThreshold =
+      currentOutputSize_ < static_cast<std::size_t>(targetRows);
+  bool belowByteThreshold =
+      (targetBytes > 0) ? (currentOutputBytes_ < targetBytes) : true;
+  bool belowThreshold = belowRowThreshold && belowByteThreshold;
 
   if (finished_ or (belowThreshold and not noMoreInput_) or inputs_.empty()) {
     return nullptr;
