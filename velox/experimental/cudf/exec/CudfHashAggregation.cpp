@@ -1234,6 +1234,7 @@ RowVectorPtr CudfHashAggregation::getOutput() {
 void CudfHashAggregation::noMoreInput() {
   Operator::noMoreInput();
   if (isPartialOutput_ && !isGlobal_) {
+    GpuGuard gpuGuard;
     processAccumulatedPartialInputs();
   }
   if (isPartialOutput_ && inputs_.empty() &&

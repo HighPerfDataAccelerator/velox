@@ -141,6 +141,7 @@ void CudfHashJoinBuild::addInput(RowVectorPtr input) {
   if (input->size() > 0) {
     auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input);
     VELOX_CHECK_NOT_NULL(cudfInput);
+    GpuGuard gpuGuard;
     // Count nulls in join key columns
     auto [_, null_count] = cudf::bitmask_and(
         cudfInput->getTableView(),
@@ -479,6 +480,7 @@ void CudfHashJoinProbe::addInput(RowVectorPtr input) {
   }
   auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input);
   VELOX_CHECK_NOT_NULL(cudfInput);
+  GpuGuard gpuGuard;
   // Count nulls in join key columns
   auto [_, null_count] = cudf::bitmask_and(
       cudfInput->getTableView(),
