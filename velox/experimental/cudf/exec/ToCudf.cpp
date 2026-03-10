@@ -350,18 +350,20 @@ void registerCudf() {
   cudf::default_logger().set_level(rapids_logger::level_enum::info);
 
   // Configure pinned host memory pool for fast HtoD/DtoH transfers.
-  // When pinnedPoolSize is explicitly set, use that value as the initial pool
-  // size (cudf sets max = initial * 16).  When unset (0), auto-size based on
-  // gpuTargetBatchBytes so the pool can hold concurrent D2H transfers without
-  // falling back to direct cudaHostAlloc (which can exhaust system pinned
-  // memory under heavy concurrency and cause fatal CUDA errors).
+  // When pinnedPoolSize is explicitly set (via Spark config
+  // spark.gluten.sql.columnar.backend.velox.cudf.pinnedPoolSize), use that
+  // value as the initial pool size (cudf sets max = initial * 16).
+  // When unset (0), auto-size with a minimum of 8 GB so that multiple
+  // concurrent GPU shuffle D2H transfers don't exhaust the pool and trigger
+  // fatal CUDA errors (cudaErrorIllegalAddress).
   const auto& config = CudfConfig::getInstance();
   {
     size_t poolInitial = config.pinnedPoolSize;
     if (poolInitial == 0) {
+      constexpr size_t kMinPinnedPool = size_t{8} << 30; // 8 GB
       auto batchBytes = static_cast<size_t>(
           std::max(config.gpuTargetBatchBytes, int64_t{1}));
-      poolInitial = std::max(size_t{64} << 20, batchBytes / 2);
+      poolInitial = std::max(kMinPinnedPool, batchBytes * 8);
     }
     cudf::config_default_pinned_memory_resource(
         cudf::pinned_mr_options{poolInitial});
