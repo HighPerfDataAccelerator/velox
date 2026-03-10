@@ -478,55 +478,78 @@ cudf::unique_device_array_t pinnedToArrowHost(
   }
 
   // --- Packed path: cudf::pack + 1 big D2H + build Arrow on host ---
+  // Falls back to the legacy per-buffer path on any failure (e.g. pinned pool
+  // exhaustion, CUDA errors) to avoid poisoning the CUDA context.
+  try {
+    auto packed = cudf::pack(table, stream);
 
-  auto packed = cudf::pack(table, stream);
+    auto* devBase = static_cast<const uint8_t*>(packed.gpu_data->data());
+    size_t devSize = packed.gpu_data->size();
 
-  auto* devBase = static_cast<const uint8_t*>(packed.gpu_data->data());
-  size_t devSize = packed.gpu_data->size();
+    auto hostBuf = std::make_shared<PinnedHostBuffer>(devSize);
+    CUDF_CUDA_TRY(cudaMemcpyAsync(
+        hostBuf->data(),
+        devBase,
+        devSize,
+        cudaMemcpyDeviceToHost,
+        stream.value()));
+    stream.synchronize();
 
-  // Single D2H transfer of the entire packed buffer.
-  auto hostBuf = std::make_shared<PinnedHostBuffer>(devSize);
-  CUDF_CUDA_TRY(cudaMemcpyAsync(
-      hostBuf->data(),
-      devBase,
-      devSize,
-      cudaMemcpyDeviceToHost,
-      stream.value()));
-  stream.synchronize();
+    auto* raw = new ArrowDeviceArray;
+    std::memset(raw, 0, sizeof(ArrowDeviceArray));
+    cudf::unique_device_array_t result(
+        raw, [](ArrowDeviceArray* arr) {
+          if (arr->array.release != nullptr) {
+            ArrowArrayRelease(&arr->array);
+          }
+          delete arr;
+        });
+    result->device_id = 0;
+    result->device_type = ARROW_DEVICE_CPU;
+    result->sync_event = nullptr;
 
-  // Build Arrow arrays from host-side packed buffer + metadata.
-  // No to_arrow_device call, no chars_size D2H, no cudaEvent overhead.
-  auto* raw = new ArrowDeviceArray;
-  std::memset(raw, 0, sizeof(ArrowDeviceArray));
-  cudf::unique_device_array_t result(
-      raw, [](ArrowDeviceArray* arr) {
-        if (arr->array.release != nullptr) {
-          ArrowArrayRelease(&arr->array);
-        }
-        delete arr;
-      });
-  result->device_id = 0;
-  result->device_type = ARROW_DEVICE_CPU;
-  result->sync_event = nullptr;
+    buildArrowFromPackedHost(
+        *packed.metadata,
+        hostBuf,
+        table.num_columns(),
+        table.num_rows(),
+        &result->array);
 
-  buildArrowFromPackedHost(
-      *packed.metadata,
-      hostBuf,
-      table.num_columns(),
-      table.num_rows(),
-      &result->array);
+    auto& stats = DtoHStats::instance();
+    auto calls =
+        stats.packedCalls.fetch_add(1, std::memory_order_relaxed) + 1;
+    stats.packedBytes.fetch_add(devSize, std::memory_order_relaxed);
+    stats.packedCols.fetch_add(
+        table.num_columns(), std::memory_order_relaxed);
+    stats.packedRows.fetch_add(table.num_rows(), std::memory_order_relaxed);
+    if ((calls & (calls - 1)) == 0 || (calls % 500) == 0) {
+      stats.dump("packed-v2");
+    }
 
-  auto& stats = DtoHStats::instance();
-  auto calls =
-      stats.packedCalls.fetch_add(1, std::memory_order_relaxed) + 1;
-  stats.packedBytes.fetch_add(devSize, std::memory_order_relaxed);
-  stats.packedCols.fetch_add(table.num_columns(), std::memory_order_relaxed);
-  stats.packedRows.fetch_add(table.num_rows(), std::memory_order_relaxed);
-  if ((calls & (calls - 1)) == 0 || (calls % 500) == 0) {
-    stats.dump("packed-v2");
+    return result;
+  } catch (const std::exception& e) {
+    LOG(WARNING) << "Packed D2H failed (" << e.what()
+                 << "), falling back to legacy per-buffer D2H. "
+                 << "Consider increasing "
+                 << "spark.gluten.sql.columnar.backend.velox.cudf.pinnedPoolSize";
+    // Clear any sticky CUDA error so the legacy path has a chance to succeed.
+    cudaGetLastError();
   }
 
-  return result;
+  // Legacy per-buffer fallback (smaller individual allocations).
+  auto devArray = cudf::to_arrow_device(table, stream);
+  int bufs = countBuffersRecursive(&devArray->array);
+  auto& stats = DtoHStats::instance();
+  stats.fallbackCalls.fetch_add(1, std::memory_order_relaxed);
+  stats.fallbackBuffers.fetch_add(bufs, std::memory_order_relaxed);
+  copyDeviceBuffersToPinnedHost(&devArray->array, stream);
+  stream.synchronize();
+  auto calls = stats.fallbackCalls.load(std::memory_order_relaxed);
+  if ((calls & (calls - 1)) == 0 || (calls % 500) == 0) {
+    stats.dump("packed-fallback-to-legacy");
+  }
+  devArray->device_type = ARROW_DEVICE_CPU;
+  return devArray;
 }
 
 } // namespace facebook::velox::cudf_velox

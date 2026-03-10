@@ -19,12 +19,17 @@
 #include <cudf/io/datasource.hpp>
 #include <cudf/utilities/pinned_memory.hpp>
 
+#include <cuda_runtime.h>
+
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <memory>
-#include <vector>
+#include <mutex>
+#include <new>
+#include <unordered_set>
 
 namespace facebook::velox::cudf_velox {
 
@@ -57,10 +62,9 @@ struct PinnedAllocStats {
   }
 
   void recordFallback(size_t bytes) {
-    fallbackCount.fetch_add(1, std::memory_order_relaxed);
+    auto fc = fallbackCount.fetch_add(1, std::memory_order_relaxed) + 1;
     fallbackBytes.fetch_add(bytes, std::memory_order_relaxed);
-    auto total = pinnedCount.load(std::memory_order_relaxed) +
-        fallbackCount.load(std::memory_order_relaxed);
+    auto total = pinnedCount.load(std::memory_order_relaxed) + fc;
     if ((total & (total - 1)) == 0 || (total % 100000) == 0) {
       dump("fallback");
     }
@@ -85,31 +89,113 @@ struct PinnedAllocStats {
   }
 };
 
+/// Unified "preferred-pinned" allocator.  Every host allocation that wants
+/// DMA-friendly pinned memory goes through this single layer:
+///
+///   1. Try cudf's pinned pool  (fast, pool-backed cudaHostAlloc)
+///   2. On ANY failure → clear sticky CUDA error, fall back to pageable malloc
+///
+/// By going straight to malloc on failure we avoid the thundering-herd of
+/// direct cudaHostAlloc calls that cudf's own fallback would issue, which
+/// under heavy concurrency can exhaust OS pinned-memory limits and poison
+/// the CUDA context with cudaErrorIllegalAddress.
+///
+/// Thread-safe.  The pageable-pointer set is protected by a mutex so that
+/// allocate / deallocate can safely happen on different threads.
+class PreferredPinnedPool {
+ public:
+  static PreferredPinnedPool& instance() {
+    static PreferredPinnedPool pool;
+    return pool;
+  }
+
+  /// Allocate `bytes` of host memory, preferring pinned.
+  /// Returns {pointer, true} for pinned, {pointer, false} for pageable.
+  /// Throws std::bad_alloc only if pageable malloc also fails.
+  std::pair<void*, bool> allocate(size_t bytes) {
+    if (bytes == 0) {
+      return {nullptr, false};
+    }
+
+    // Fast path: try pinned pool.
+    try {
+      auto mr = cudf::get_pinned_memory_resource();
+      void* ptr = mr.allocate_sync(bytes);
+      PinnedAllocStats::instance().recordPinned(bytes);
+      return {ptr, true};
+    } catch (...) {
+      // Pinned allocation failed (pool exhausted, cudaHostAlloc failed, or
+      // CUDA context error).  Clear any sticky CUDA error so that later GPU
+      // operations on other streams are not affected.
+      cudaGetLastError();
+    }
+
+    // Slow path: pageable heap.
+    void* ptr = std::malloc(bytes);
+    if (!ptr) {
+      throw std::bad_alloc();
+    }
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      pageablePtrs_.insert(ptr);
+    }
+    PinnedAllocStats::instance().recordFallback(bytes);
+    return {ptr, false};
+  }
+
+  /// Deallocate a pointer previously returned by allocate().
+  void deallocate(void* ptr, size_t bytes, bool pinned) {
+    if (!ptr) {
+      return;
+    }
+    if (pinned) {
+      PinnedAllocStats::instance().recordFree(bytes);
+      try {
+        auto mr = cudf::get_pinned_memory_resource();
+        mr.deallocate_sync(ptr, bytes);
+      } catch (...) {
+        // If deallocation fails (poisoned context), just leak rather than
+        // crash.  This is a last-resort safety net.
+        cudaGetLastError();
+      }
+    } else {
+      {
+        std::lock_guard<std::mutex> lock(mu_);
+        pageablePtrs_.erase(ptr);
+      }
+      std::free(ptr);
+    }
+  }
+
+  /// Check whether a pointer was allocated as pageable fallback.
+  /// Useful when callers only have the pointer and not the pinned flag.
+  bool isPageable(void* ptr) const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return pageablePtrs_.count(ptr) > 0;
+  }
+
+ private:
+  PreferredPinnedPool() = default;
+  mutable std::mutex mu_;
+  std::unordered_set<void*> pageablePtrs_;
+};
+
 /// RAII host buffer that prefers pinned memory for fast PCIe DMA transfers.
-/// Allocates from cudf's pinned pool; falls back to pageable heap on failure.
+/// Allocates through PreferredPinnedPool: pinned pool → pageable malloc.
 class PinnedHostBuffer {
  public:
   explicit PinnedHostBuffer(size_t size) : size_(size) {
     if (size == 0) {
       return;
     }
-    try {
-      mr_ = cudf::get_pinned_memory_resource();
-      data_ = static_cast<uint8_t*>(mr_.allocate_sync(size));
-      pinned_ = true;
-      PinnedAllocStats::instance().recordPinned(size);
-    } catch (...) {
-      fallback_.resize(size);
-      data_ = fallback_.data();
-      pinned_ = false;
-      PinnedAllocStats::instance().recordFallback(size);
-    }
+    auto [ptr, isPinned] = PreferredPinnedPool::instance().allocate(size);
+    data_ = static_cast<uint8_t*>(ptr);
+    pinned_ = isPinned;
   }
 
   ~PinnedHostBuffer() {
-    if (pinned_ && data_) {
-      PinnedAllocStats::instance().recordFree(size_);
-      mr_.deallocate_sync(data_, size_);
+    if (data_) {
+      PreferredPinnedPool::instance().deallocate(data_, size_, pinned_);
     }
   }
 
@@ -124,11 +210,9 @@ class PinnedHostBuffer {
   bool isPinned() const { return pinned_; }
 
  private:
-  rmm::host_device_async_resource_ref mr_{cudf::get_pinned_memory_resource()};
   uint8_t* data_{nullptr};
   size_t size_{0};
   bool pinned_{false};
-  std::vector<uint8_t> fallback_;
 };
 
 /// cudf::io::datasource::buffer backed by PinnedHostBuffer.
