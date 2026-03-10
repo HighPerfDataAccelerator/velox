@@ -89,11 +89,20 @@ CudfVectorPtr CudfTopN::mergeTopK(
           mergedTable->view(), {std::min(k, mergedTable->num_rows())}, stream)
           .front();
   auto const size = topk.num_rows();
+  auto resultTable = std::make_unique<cudf::table>(topk, stream, mr);
+
+  // cudf::merge and the table copy above are async on `stream` and read from
+  // the input batches' device buffers, which live on their original streams.
+  // The caller destroys the input batches after we return, freeing those
+  // buffers via cudaFreeAsync on the original streams.  Without this sync the
+  // frees can race ahead of the reads on `stream`.
+  stream.synchronize();
+
   return std::make_shared<CudfVector>(
       topNBatches[0]->pool(),
       outputType_,
       size,
-      std::make_unique<cudf::table>(topk, stream, mr),
+      std::move(resultTable),
       stream);
 }
 

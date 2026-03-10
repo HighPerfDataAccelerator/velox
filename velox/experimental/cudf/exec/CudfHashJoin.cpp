@@ -533,6 +533,12 @@ void CudfHashJoinProbe::noMoreInput() {
     isLastDriver_ = true;
     if (hashObject_.has_value()) {
       auto stream = cudfGlobalStreamPool().get_stream();
+      // Keep old flag columns alive until after sync: the binary_operation
+      // on `stream` reads from them asynchronously, but their memory lives
+      // on a different stream. Destroying them before the sync would free
+      // the buffers via cudaFreeAsync on the old stream, racing with the
+      // reads on `stream`.
+      std::vector<std::unique_ptr<cudf::column>> oldFlags;
       for (auto& peer : peers) {
         if (peer.get() == operatorCtx_->driver()) {
           continue;
@@ -542,10 +548,6 @@ void CudfHashJoinProbe::noMoreInput() {
         if (probe == nullptr) {
           continue;
         }
-        // Combine flags per partition using cuDF bitwise OR
-        // DM: This needs a relook. This is for when build side exceeds cudf
-        // size_type limits. In case of multiple right side chunks, I'm not sure
-        // if partitions to combine are in the same place p
         for (size_t p = 0; p < rightMatchedFlags_.size(); ++p) {
           auto or_result = cudf::binary_operation(
               rightMatchedFlags_[p]->view(),
@@ -554,6 +556,7 @@ void CudfHashJoinProbe::noMoreInput() {
               cudf::data_type{cudf::type_id::BOOL8},
               stream,
               cudf::get_current_device_resource_ref());
+          oldFlags.push_back(std::move(rightMatchedFlags_[p]));
           rightMatchedFlags_[p] = std::move(or_result);
         }
       }
