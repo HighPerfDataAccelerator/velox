@@ -22,6 +22,8 @@
 #include "velox/experimental/cudf/exec/PinnedHostMemory.h"
 #include "velox/experimental/cudf/CudfConfig.h"
 
+#include <glog/logging.h>
+
 #include <cudf/contiguous_split.hpp>
 #include <cudf/interop.hpp>
 #include <cudf/null_mask.hpp>
