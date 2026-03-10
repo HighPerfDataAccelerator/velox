@@ -283,7 +283,6 @@ RowVectorPtr CudfFilterProject::getOutput() {
   auto outputColumns = project(inputTableColumns, stream);
 
   auto outputTable = std::make_unique<cudf::table>(std::move(outputColumns));
-  stream.synchronize();
   auto const numColumns = outputTable->num_columns();
   auto const size = outputTable->num_rows();
   if (CudfConfig::getInstance().debugEnabled) {
@@ -370,7 +369,6 @@ RowVectorPtr CudfFilterProject::flushAccumulatedOutputs() {
 void CudfFilterProject::filter(
     std::vector<std::unique_ptr<cudf::column>>& inputTableColumns,
     rmm::cuda_stream_view stream) {
-  // Evaluate the Filter
   std::vector<cudf::column_view> inputViews;
   inputViews.reserve(inputTableColumns.size());
   for (auto& col : inputTableColumns) {
@@ -383,7 +381,6 @@ void CudfFilterProject::filter(
     if (filterColumnView.has_nulls()) {
       return true;
     }
-    // check if all values in filterColumnView are true
     auto isAllTrue = cudf::reduce(
         filterColumnView,
         *cudf::make_all_aggregation<cudf::reduce_aggregation>(),
@@ -392,7 +389,6 @@ void CudfFilterProject::filter(
         cudf::get_current_device_resource_ref());
     using ScalarType = cudf::scalar_type_t<bool>;
     auto result = static_cast<ScalarType*>(isAllTrue.get());
-    // If filter is not all true, apply the filter
     return !(result->is_valid(stream) && result->value(stream));
   }();
   if (shouldApplyFilter) {
