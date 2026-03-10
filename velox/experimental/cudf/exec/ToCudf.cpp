@@ -350,10 +350,25 @@ void registerCudf() {
   cudf::default_logger().set_level(rapids_logger::level_enum::info);
 
   // Configure pinned host memory pool for fast HtoD/DtoH transfers.
+  // When pinnedPoolSize is explicitly set, use that value as the initial pool
+  // size (cudf sets max = initial * 16).  When unset (0), auto-size based on
+  // gpuTargetBatchBytes so the pool can hold concurrent D2H transfers without
+  // falling back to direct cudaHostAlloc (which can exhaust system pinned
+  // memory under heavy concurrency and cause fatal CUDA errors).
   const auto& config = CudfConfig::getInstance();
-  if (config.pinnedPoolSize > 0) {
+  {
+    size_t poolInitial = config.pinnedPoolSize;
+    if (poolInitial == 0) {
+      auto batchBytes = static_cast<size_t>(
+          std::max(config.gpuTargetBatchBytes, int64_t{1}));
+      poolInitial = std::max(size_t{64} << 20, batchBytes / 2);
+    }
     cudf::config_default_pinned_memory_resource(
-        cudf::pinned_mr_options{config.pinnedPoolSize});
+        cudf::pinned_mr_options{poolInitial});
+    LOG(WARNING) << "cudf pinned pool configured: initial="
+                 << (poolInitial >> 20) << "MB, max="
+                 << ((poolInitial * 16) >> 20) << "MB"
+                 << (config.pinnedPoolSize == 0 ? " (auto-sized)" : "");
   }
   if (config.hostAsPinnedThreshold > 0) {
     cudf::set_allocate_host_as_pinned_threshold(
