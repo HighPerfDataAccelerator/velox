@@ -923,14 +923,13 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::rightJoin(
       auto matchedInBatch = cudf::contains(rightIdxCol, rowIndices->view());
 
       // OR with existing flags to accumulate matches across batches
-      auto updatedFlags = cudf::binary_operation(
+      updated_flag_col = cudf::binary_operation(
           rightMatchedFlags_[i]->view(),
           matchedInBatch->view(),
           cudf::binary_operator::BITWISE_OR,
           cudf::data_type{cudf::type_id::BOOL8},
           stream,
           cudf::get_current_device_resource_ref());
-      updated_flag_col = std::move(updatedFlags->release()[0]);    
     }
 
     auto leftIndicesSpan =
@@ -978,14 +977,13 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::rightJoin(
                 cudf::contains(filteredRightIdxCol->view(), rowIndices->view());
 
             // OR with existing flags to accumulate matches across batches
-            auto updatedFlags = cudf::binary_operation(
+            updated_flag_col = cudf::binary_operation(
                 rightMatchedFlags->view(),
                 matchedInBatch->view(),
                 cudf::binary_operator::BITWISE_OR,
                 cudf::data_type{cudf::type_id::BOOL8},
                 stream,
                 cudf::get_current_device_resource_ref());
-            updated_flag_col = std::move(updatedFlags->release()[0]);
             return std::move(joinedCols);
           };
       cudfOutputs.push_back(filteredOutput(
