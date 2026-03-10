@@ -167,4 +167,39 @@ selectiveParquetRead(
     const std::vector<std::string>& readColumnNames,
     uint64_t splitStart = 0);
 
+/// Converts column_reference nodes (index-based) in an AST expression to
+/// column_name_reference nodes (name-based) so the hybrid scan reader can
+/// resolve filter columns by name.
+class referenceToNameConverter
+    : public cudf::ast::detail::expression_transformer {
+ public:
+  explicit referenceToNameConverter(
+      std::optional<std::reference_wrapper<const cudf::ast::expression>> expr,
+      const std::vector<cudf::io::parquet::SchemaElement>& schemaTree,
+      cudf::host_span<const std::string> readColumnNames);
+
+  std::reference_wrapper<const cudf::ast::expression> visit(
+      const cudf::ast::literal& expr) override;
+
+  std::reference_wrapper<const cudf::ast::expression> visit(
+      const cudf::ast::column_reference& expr) override;
+
+  std::reference_wrapper<const cudf::ast::expression> visit(
+      const cudf::ast::column_name_reference& expr) override;
+
+  std::reference_wrapper<const cudf::ast::expression> visit(
+      const cudf::ast::operation& expr) override;
+
+  [[nodiscard]] std::reference_wrapper<const cudf::ast::expression>
+  convertedExpression() const;
+
+ private:
+  std::vector<std::reference_wrapper<const cudf::ast::expression>>
+  visitOperands(
+      cudf::host_span<const std::reference_wrapper<const cudf::ast::expression>>
+          operands);
+  cudf::ast::tree convertedExpr_;
+  std::unordered_map<cudf::size_type, std::string> indicesToColumnNames_;
+};
+
 } // namespace facebook::velox::cudf_velox::connector::hive

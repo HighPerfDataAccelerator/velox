@@ -36,6 +36,8 @@
 
 #include <folly/futures/Future.h>
 
+#include <thrust/iterator/counting_iterator.h>
+
 #include <filesystem>
 #include <fstream>
 #include <list>
@@ -568,6 +570,89 @@ std::shared_ptr<PinnedHostBuffer> selectiveParquetRead(
             << " (" << (100 - totalBufSize * 100 / fileSize) << "%)";
 
   return buf;
+}
+
+referenceToNameConverter::referenceToNameConverter(
+    std::optional<std::reference_wrapper<const cudf::ast::expression>> expr,
+    const std::vector<cudf::io::parquet::SchemaElement>& schemaTree,
+    cudf::host_span<const std::string> readColumnNames) {
+  if (not expr.has_value()) {
+    return;
+  }
+  if (not readColumnNames.empty()) {
+    std::transform(
+        readColumnNames.begin(),
+        readColumnNames.end(),
+        thrust::counting_iterator<cudf::size_type>(0),
+        std::inserter(indicesToColumnNames_, indicesToColumnNames_.end()),
+        [](const auto& columnName, const auto colIndex) {
+          return std::make_pair(colIndex, columnName);
+        });
+  } else {
+    const auto& root = schemaTree.front();
+    std::for_each(
+        thrust::counting_iterator(0),
+        thrust::counting_iterator<cudf::size_type>(root.children_idx.size()),
+        [&](int32_t colIndex) {
+          const auto schemaIdx = root.children_idx[colIndex];
+          indicesToColumnNames_.insert({colIndex, schemaTree[schemaIdx].name});
+        });
+  }
+  expr.value().get().accept(*this);
+}
+
+std::reference_wrapper<const cudf::ast::expression>
+referenceToNameConverter::visit(const cudf::ast::literal& expr) {
+  return expr;
+}
+
+std::reference_wrapper<const cudf::ast::expression>
+referenceToNameConverter::visit(const cudf::ast::column_reference& expr) {
+  const auto columnIdx = expr.get_column_index();
+  const auto columnName = indicesToColumnNames_.find(columnIdx);
+  VELOX_CHECK(
+      columnName != indicesToColumnNames_.end(), "Column index not found");
+  convertedExpr_.push(cudf::ast::column_name_reference{columnName->second});
+  return std::reference_wrapper<const cudf::ast::expression>(
+      convertedExpr_.back());
+}
+
+std::reference_wrapper<const cudf::ast::expression>
+referenceToNameConverter::visit(const cudf::ast::column_name_reference& expr) {
+  return expr;
+}
+
+std::reference_wrapper<const cudf::ast::expression>
+referenceToNameConverter::visit(const cudf::ast::operation& expr) {
+  const auto operands = expr.get_operands();
+  auto op = expr.get_operator();
+  auto newOperands = visitOperands(operands);
+  const auto operatorArity = cudf::ast::detail::ast_operator_arity(op);
+  if (operatorArity == 2) {
+    convertedExpr_.push(
+        cudf::ast::operation{op, newOperands.front(), newOperands.back()});
+  } else if (operatorArity == 1) {
+    convertedExpr_.push(cudf::ast::operation{op, newOperands.front()});
+  }
+  return convertedExpr_.back();
+}
+
+std::reference_wrapper<const cudf::ast::expression>
+referenceToNameConverter::convertedExpression() const {
+  return convertedExpr_.back();
+}
+
+std::vector<std::reference_wrapper<const cudf::ast::expression>>
+referenceToNameConverter::visitOperands(
+    cudf::host_span<const std::reference_wrapper<const cudf::ast::expression>>
+        operands) {
+  std::vector<std::reference_wrapper<const cudf::ast::expression>>
+      transformedOperands;
+  for (const auto& operand : operands) {
+    const auto newOperand = operand.get().accept(*this);
+    transformedOperands.push_back(newOperand);
+  }
+  return transformedOperands;
 }
 
 } // namespace facebook::velox::cudf_velox::connector::hive
