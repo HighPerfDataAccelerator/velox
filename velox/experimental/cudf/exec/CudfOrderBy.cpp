@@ -78,11 +78,8 @@ void CudfOrderBy::noMoreInput() {
     return;
   }
 
-  auto stream = cudfGlobalStreamPool().get_stream();
+  auto stream = cudfPipelineStream();
   auto tbl = getConcatenatedTable(inputs_, outputType_, stream);
-
-  // Release input data after synchronizing
-  stream.synchronize();
   inputs_.clear();
 
   VELOX_CHECK_NOT_NULL(tbl);

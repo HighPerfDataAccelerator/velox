@@ -44,6 +44,20 @@ createMemoryResource(std::string_view mode, int percent);
  */
 [[nodiscard]] cudf::detail::cuda_stream_pool& cudfGlobalStreamPool();
 
+/**
+ * @brief Returns a fixed CUDA stream for the current thread (pipeline).
+ *
+ * Each Velox pipeline driver runs on a single thread. This function returns
+ * a thread_local stream from the global pool, so all GPU operators within
+ * the same pipeline share one CUDA stream. Same-stream operations are
+ * FIFO-ordered by the GPU, eliminating the need for explicit host-side
+ * synchronization between operators in the same pipeline.
+ *
+ * Cross-pipeline synchronization (e.g. hash join build/probe) is handled
+ * separately via CudaEvent.
+ */
+[[nodiscard]] rmm::cuda_stream_view cudfPipelineStream();
+
 // Concatenate a vector of cuDF tables into a single table
 [[nodiscard]] std::unique_ptr<cudf::table> concatenateTables(
     std::vector<std::unique_ptr<cudf::table>> tables,
@@ -68,10 +82,11 @@ createMemoryResource(std::string_view mode, int percent);
  * number of rows would exceeds ~2.1 billion, the maximum value representable by
  * cudf::size_type
  *
- * The function is stream-safe and handles proper stream synchronization. All
- * input streams from individual tables are collected and joined on the provided
- * output stream. Tables that may have been created on different CUDA streams
- * are also properly synchronized.
+ * The function joins input streams from individual tables on the provided
+ * output stream via cudf::detail::join_streams. When all tables share the
+ * same pipeline stream, the join is a no-op and no host synchronization is
+ * needed. The caller is responsible for any host-side synchronization if
+ * the result must be immediately accessible on the host.
  *
  * @param tables Input vector of CUDF tables to concatenate (consumed during
  * operation)

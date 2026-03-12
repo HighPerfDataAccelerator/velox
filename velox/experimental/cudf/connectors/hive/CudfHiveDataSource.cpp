@@ -512,7 +512,7 @@ void CudfHiveDataSource::addSplit(std::shared_ptr<ConnectorSplit> split) {
   if (coalescedMultiSourcePending_) {
     // Multi-source path: defer reader creation to first next() call,
     // after all async reads have completed.
-    stream_ = cudfGlobalStreamPool().get_stream();
+    stream_ = cudfPipelineStream();
     tableMaterialized_ = std::make_unique<std::once_flag>();
     completedBytes_ += split_->length;
     numFilesCoalesced_ = static_cast<int64_t>(asyncFileReads_.size());
@@ -629,7 +629,7 @@ void CudfHiveDataSource::setupCudfDataSourceAndOptions() {
 
 CudfParquetReaderPtr CudfHiveDataSource::createSplitReader() {
   setupCudfDataSourceAndOptions();
-  stream_ = cudfGlobalStreamPool().get_stream();
+  stream_ = cudfPipelineStream();
 
   // Create a parquet reader
   return std::make_unique<cudf::io::chunked_parquet_reader>(
@@ -642,7 +642,7 @@ CudfParquetReaderPtr CudfHiveDataSource::createSplitReader() {
 
 CudfHybridScanReaderPtr CudfHiveDataSource::createExperimentalSplitReader() {
   setupCudfDataSourceAndOptions();
-  stream_ = cudfGlobalStreamPool().get_stream();
+  stream_ = cudfPipelineStream();
 
   // Create a hybrid scan reader
   auto const footerBytes = fetchFooterBytes(dataSource_);

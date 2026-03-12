@@ -1012,7 +1012,7 @@ void CudfHashAggregation::processAccumulatedPartialInputs() {
     return;
   }
 
-  auto stream = cudfGlobalStreamPool().get_stream();
+  auto stream = cudfPipelineStream();
   auto tbl =
       getConcatenatedTable(accumulatedPartialInputs_, inputType_, stream);
 
@@ -1234,7 +1234,7 @@ RowVectorPtr CudfHashAggregation::getOutput() {
     return nullptr;
   }
 
-  auto stream = cudfGlobalStreamPool().get_stream();
+  auto stream = cudfPipelineStream();
 
   auto tbl = getConcatenatedTable(inputs_, inputType_, stream);
   inputs_.clear();

@@ -197,7 +197,7 @@ void CudfHashJoinBuild::noMoreInput() {
     }
   }
 
-  auto stream = cudfGlobalStreamPool().get_stream();
+  auto stream = cudfPipelineStream();
   auto tbls = getConcatenatedTableBatched(
       inputs_, joinNode_->sources()[1]->outputType(), stream);
   inputs_.clear();
@@ -513,7 +513,7 @@ void CudfHashJoinProbe::noMoreInput() {
   if (joinNode_->isRightJoin()) {
     isLastDriver_ = true;
     if (hashObject_.has_value()) {
-      auto stream = cudfGlobalStreamPool().get_stream();
+      auto stream = cudfPipelineStream();
       // Keep old flag columns alive until after sync: the binary_operation
       // on `stream` reads from them asynchronously, but their memory lives
       // on a different stream. Destroying them before the sync would free
@@ -541,7 +541,9 @@ void CudfHashJoinProbe::noMoreInput() {
           rightMatchedFlags_[p] = std::move(or_result);
         }
       }
-      stream.synchronize();
+      if (!oldFlags.empty()) {
+        stream.synchronize();
+      }
     }
     return;
   }
@@ -555,7 +557,7 @@ void CudfHashJoinProbe::noMoreInput() {
     inputs_.insert(inputs_.end(), probe->inputs_.begin(), probe->inputs_.end());
   }
 
-  auto stream = cudfGlobalStreamPool().get_stream();
+  auto stream = cudfPipelineStream();
   auto tbl = getConcatenatedTable(
       inputs_, joinNode_->sources()[1]->outputType(), stream);
 
@@ -608,7 +610,6 @@ std::unique_ptr<cudf::table> CudfHashJoinProbe::unfilteredOutput(
     // Ensure deallocation of build table happens after probe gathers
     cudaEvent_->recordFrom(stream).waitOn(buildStream_.value());
   }
-  stream.synchronize();
   return std::make_unique<cudf::table>(std::move(joinedCols));
 }
 
@@ -659,7 +660,6 @@ std::unique_ptr<cudf::table> CudfHashJoinProbe::filteredOutput(
     // Ensure any deallocation of join indices is ordered wrt probe gathers
     cudaEvent_->recordFrom(stream).waitOn(buildStream_.value());
   }
-  stream.synchronize();
   return std::make_unique<cudf::table>(std::move(joinedCols));
 }
 
@@ -826,9 +826,9 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::rightJoin(
     // (the target) plus a thrust::scatter kernel onto `stream`, then returns
     // immediately. The old rightMatchedFlags_[i] column must stay alive until
     // that work completes. We defer the assignment to rightMatchedFlags_[i]
-    // until after unfilteredOutput/filteredOutput (which call
-    // stream.synchronize()), so the old column is not destroyed while the
-    // scatter kernel is still reading from it.
+    // until after unfilteredOutput/filteredOutput. All operations (scatter,
+    // gather, etc.) share the same pipeline stream, so cudaFreeAsync from
+    // destroying the old column is FIFO-ordered after the scatter reads.
     std::unique_ptr<cudf::column> updated_flag_col;
     if (!joinNode_->filter()) {
       // Mark matched rights using scatter of true into flags at matching
@@ -918,7 +918,8 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::rightJoin(
           rightIndicesCol,
           stream));
     }
-    // Safe to assign now: stream has been synchronized by the output call above.
+    // Safe to assign: all ops share the pipeline stream, so the free is
+    // FIFO-ordered after scatter/gather reads.
     rightMatchedFlags_[i] = std::move(updated_flag_col);
   }
   return cudfOutputs;
@@ -1164,7 +1165,7 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
     if (joinNode_->isRightJoin() && noMoreInput_ && !finished_ &&
         isLastDriver_) {
       auto& rightTables = hashObject_.value().first;
-      auto stream = cudfGlobalStreamPool().get_stream();
+      auto stream = cudfPipelineStream();
       std::vector<std::unique_ptr<cudf::table>> toConcat;
       for (size_t i = 0; i < rightTables.size(); ++i) {
         auto& rightTable = rightTables[i];
@@ -1342,7 +1343,7 @@ exec::BlockingReason CudfHashJoinProbe::isBlocked(ContinueFuture* future) {
     auto& rightTablesInit = hashObject_.value().first;
     rightMatchedFlags_.clear();
     rightMatchedFlags_.reserve(rightTablesInit.size());
-    auto initStream = cudfGlobalStreamPool().get_stream();
+    auto initStream = cudfPipelineStream();
     for (auto& rt : rightTablesInit) {
       auto n = rt->num_rows();
       auto false_scalar = cudf::numeric_scalar<bool>(false, true, initStream);
@@ -1350,7 +1351,6 @@ exec::BlockingReason CudfHashJoinProbe::isBlocked(ContinueFuture* future) {
           false_scalar, n, initStream, cudf::get_current_device_resource_ref());
       rightMatchedFlags_.push_back(std::move(flags_col));
     }
-    initStream.synchronize();
   }
   auto& rightTables = hashObject_.value().first;
   // should be rightTable->numDistinct() but it needs compute,

@@ -162,7 +162,7 @@ void CudfTopN::addInput(RowVectorPtr input) {
         return sum + (batch ? batch->size() : 0);
       });
   if (topNBatches_.size() >= kBatchSize_ and totalSize >= count_) {
-    auto stream = cudfGlobalStreamPool().get_stream();
+    auto stream = cudfPipelineStream();
     auto mr = cudf::get_current_device_resource_ref();
 
     auto result = mergeTopK(topNBatches_, count_, stream, mr);

@@ -151,6 +151,12 @@ cudf::detail::cuda_stream_pool& cudfGlobalStreamPool() {
   return cudf::detail::global_cuda_stream_pool();
 };
 
+rmm::cuda_stream_view cudfPipelineStream() {
+  static thread_local rmm::cuda_stream_view stream =
+      cudfGlobalStreamPool().get_stream();
+  return stream;
+}
+
 namespace {
 uint64_t estimateColumnViewBytes(cudf::column_view const& col) {
   uint64_t bytes = 0;
@@ -258,6 +264,11 @@ std::unique_ptr<cudf::table> getConcatenatedTable(
   // `stream` and the buffers would otherwise be freed on the original stream.
   auto output = cudf::concatenate(
       tableViews, stream, cudf::get_current_device_resource_ref());
+  // Input tables may have been allocated on a different pipeline stream
+  // (e.g. shuffle data from another task thread). The caller typically
+  // destroys the inputs after this call, which frees their device buffers
+  // via cudaFreeAsync on the *original* stream. Without this sync, those
+  // frees can race ahead of the concatenation reads on `stream`.
   stream.synchronize();
   return output;
 }
@@ -323,6 +334,8 @@ std::vector<std::unique_ptr<cudf::table>> getConcatenatedTableBatched(
             stream,
             cudf::get_current_device_resource_ref()));
   }
+  // Same reasoning as getConcatenatedTable: input tables may live on a
+  // different pipeline stream, so sync before the caller frees them.
   stream.synchronize();
   return outputTables;
 }

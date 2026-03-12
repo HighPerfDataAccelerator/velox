@@ -198,7 +198,7 @@ RowVectorPtr CudfFromVelox::getOutput() {
     return nullptr;
   }
 
-  auto stream = cudfGlobalStreamPool().get_stream();
+  auto stream = cudfPipelineStream();
 
   // Batched HtoD: issues N async from_arrow calls, ONE sync, then GPU concat.
   // Avoids the CPU-side mergeRowVectors copy and N separate sync round-trips.
@@ -219,7 +219,7 @@ RowVectorPtr CudfFromVelox::getOutput() {
 }
 
 void CudfFromVelox::close() {
-  cudf::get_default_stream().synchronize();
+  cudfPipelineStream().synchronize();
   exec::Operator::close();
   inputs_.clear();
 }
