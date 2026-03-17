@@ -19,6 +19,7 @@
 namespace gluten {
 void lockGpu();
 void unlockGpu();
+bool tryLockGpu();
 } // namespace gluten
 
 namespace facebook::velox::cudf_velox {
@@ -34,6 +35,24 @@ struct GpuGuard {
   }
   GpuGuard(const GpuGuard&) = delete;
   GpuGuard& operator=(const GpuGuard&) = delete;
+};
+
+/// Non-blocking RAII guard. Attempts to acquire GPU access without waiting.
+/// Check `acquired` (or use `operator bool()`) to see if the lock was obtained.
+/// If acquired, automatically releases on destruction.
+struct TryGpuGuard {
+  bool acquired;
+  TryGpuGuard() : acquired(gluten::tryLockGpu()) {}
+  ~TryGpuGuard() {
+    if (acquired) {
+      gluten::unlockGpu();
+    }
+  }
+  explicit operator bool() const {
+    return acquired;
+  }
+  TryGpuGuard(const TryGpuGuard&) = delete;
+  TryGpuGuard& operator=(const TryGpuGuard&) = delete;
 };
 
 } // namespace facebook::velox::cudf_velox

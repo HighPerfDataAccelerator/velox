@@ -50,6 +50,8 @@ struct CudfConfig {
       "velox.cudf.skip_output_to_velox"};
   static constexpr const char* kCudfGpuTargetBatchBytes{
       "cudf.gpu_target_batch_bytes"};
+  static constexpr const char* kCudfCpuDecodeFallback{
+      "cudf.cpu_decode_fallback"};
 
   /// Singleton CudfConfig instance.
   /// Clients must set the configs below before invoking registerCudf().
@@ -128,6 +130,12 @@ struct CudfConfig {
   /// number of rows already consumes significant memory.
   /// Default 2 GiB.  Set to 0 to fall back to row-based accumulation.
   int64_t gpuTargetBatchBytes{2LL * 1024 * 1024 * 1024};
+
+  /// When true, the coalesced multi-source Parquet scan path will fall back
+  /// to CPU-side decoding (Velox ParquetReader) if the GPU semaphore is full
+  /// and all output columns are fixed-width (INT, BIGINT, REAL, DOUBLE).
+  /// The decoded data is transferred to GPU via direct cudaMemcpyAsync.
+  bool cpuDecodeFallback{false};
 };
 
 } // namespace facebook::velox::cudf_velox

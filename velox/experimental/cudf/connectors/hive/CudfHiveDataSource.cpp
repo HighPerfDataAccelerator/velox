@@ -198,7 +198,8 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
   // Basic sanity checks
   VELOX_CHECK_NOT_NULL(split_, "No split to process. Call addSplit first.");
   VELOX_CHECK(
-      splitReader_ or exptSplitReader_ or coalescedMultiSourcePending_,
+      splitReader_ or exptSplitReader_ or coalescedMultiSourcePending_ or
+          usingCpuDecoder_,
       "No split reader present");
 
   std::unique_ptr<cudf::table> cudfTable;
@@ -214,9 +215,52 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
   // GPU operation and held through common post-processing.
   std::optional<GpuGuard> gpuGuard;
 
+  // CPU fallback decoder: if already active, continue draining it.
+  if (usingCpuDecoder_) {
+    auto result = cpuDecoder_->decodeNext();
+    if (!result) {
+      cpuDecoder_.reset();
+      usingCpuDecoder_ = false;
+      return nullptr;
+    }
+    completedRows_ += result.value()->size();
+    return result;
+  }
+
   if (not useExperimentalSplitReader_) {
     // Lazily create the multi-source reader on first next() call.
     if (coalescedMultiSourcePending_) {
+      // CPU fallback: if config enabled, all columns fixed-width, and GPU busy.
+      if (CudfConfig::getInstance().cpuDecodeFallback &&
+          allFieldsFixedWidth(readerOutputType_)) {
+        TryGpuGuard probe;
+        if (!probe) {
+          cpuDecoder_ = std::make_unique<CpuCoalescedDecoder>(
+              asyncFileReads_,
+              readerOutputType_,
+              outputType_,
+              readColumnNames_,
+              subfieldFilters_,
+              remainingFilterExprSet_.get(),
+              expressionEvaluator_,
+              pool_,
+              stream_,
+              targetBytes);
+          usingCpuDecoder_ = true;
+          coalescedMultiSourcePending_ = false;
+          LOG(INFO) << "CPU decode fallback activated: "
+                    << asyncFileReads_.size() << " files, GPU semaphore full";
+          auto result = cpuDecoder_->decodeNext();
+          if (!result) {
+            cpuDecoder_.reset();
+            usingCpuDecoder_ = false;
+            return nullptr;
+          }
+          completedRows_ += result.value()->size();
+          return result;
+        }
+        // probe acquired GPU -> release via destructor, fall through to GPU path
+      }
       createCoalescedMultiSourceReader();
     }
 
@@ -672,6 +716,8 @@ void CudfHiveDataSource::resetSplit() {
   coalescedPinnedBuffers_.clear();
   currentFilePinnedBuffer_.reset();
   coalescedMultiSourcePending_ = false;
+  cpuDecoder_.reset();
+  usingCpuDecoder_ = false;
   exptMetadataInitialized_ = false;
   exptFilteredRowGroups_.clear();
   exptNextRGIndex_ = 0;
@@ -745,6 +791,19 @@ CudfHiveDataSource::getRuntimeStats() {
         "pageableAllocBytes",
         RuntimeMetric(
             bids->pageableAllocBytes(), RuntimeCounter::Unit::kBytes));
+  }
+
+  if (cpuDecoder_) {
+    res.emplace(
+        "cpuDecodeTime",
+        RuntimeMetric(
+            cpuDecoder_->cpuDecodeTimeNs(), RuntimeCounter::Unit::kNanos));
+    res.emplace(
+        "cpuDecodedFiles",
+        RuntimeMetric(cpuDecoder_->cpuDecodedFiles()));
+    res.emplace(
+        "cpuDecodedRows",
+        RuntimeMetric(cpuDecoder_->cpuDecodedRows()));
   }
 
   return res;

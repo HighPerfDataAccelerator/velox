@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "velox/experimental/cudf/connectors/hive/CpuCoalescedDecoder.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConfig.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConnectorSplit.h"
 #include "velox/experimental/cudf/exec/NvtxHelper.h"
@@ -199,12 +200,6 @@ class CudfHiveDataSource : public DataSource, public NvtxHelper {
   int32_t maxActiveIoThreads_{0};
 
   // Per-file async read futures launched in addSplit().
-  struct AsyncFileRead {
-    std::shared_future<std::shared_ptr<cudf_velox::PinnedHostBuffer>> future;
-    size_t fileSize;
-    uint64_t start;
-    uint64_t length;
-  };
   std::vector<AsyncFileRead> asyncFileReads_;
 
   // Multi-source reader: all pinned buffers kept alive while the single
@@ -228,6 +223,10 @@ class CudfHiveDataSource : public DataSource, public NvtxHelper {
   bool advanceToNextCoalescedFile();
   // Flush accumulated tables into one CudfVector output.
   RowVectorPtr flushAccumulated();
+
+  // --- CPU coalesced fallback decoder ---
+  std::unique_ptr<CpuCoalescedDecoder> cpuDecoder_;
+  bool usingCpuDecoder_{false};
 
   // --- Chunked experimental reader state ---
   void initExperimentalReaderMetadata();
