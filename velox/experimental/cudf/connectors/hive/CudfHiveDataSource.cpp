@@ -51,8 +51,6 @@
 
 #include <cuda_runtime.h>
 
-#include <filesystem>
-#include <fstream>
 #include <future>
 #include <limits>
 #include <memory>
@@ -462,14 +460,47 @@ void CudfHiveDataSource::addSplit(std::shared_ptr<ConnectorSplit> split) {
                               uint64_t length)
         -> AsyncFileRead {
       auto colNames = readColumnNames_;
-      auto future = std::async(
-          std::launch::async,
-          [path, colNames, start]()
-              -> std::shared_ptr<cudf_velox::PinnedHostBuffer> {
-            return selectiveParquetRead(path, colNames, start);
-          });
-      const auto fsize = std::filesystem::file_size(path);
-      return {future.share(), fsize, start, length};
+      const auto fileHandleKey = FileHandleKey{
+          .filename = path,
+          .tokenProvider = connectorQueryCtx_->fsTokenProvider()};
+      auto fileProperties = FileProperties{};
+      auto fileHandleCachePtr = fileHandleFactory_->generate(
+          fileHandleKey, &fileProperties,
+          ioStats_ ? ioStats_.get() : nullptr);
+      auto readFile = fileHandleCachePtr->file;
+      const auto fsize = readFile->size();
+
+      if (executor_) {
+        // Dispatch onto the IO executor whose threads are JVM-attached,
+        // so HDFS (libhdfs JNI) pread operations work correctly —
+        // unlike std::async threads which are not attached to the JVM.
+        auto promise = std::make_shared<
+            std::promise<std::shared_ptr<cudf_velox::PinnedHostBuffer>>>();
+        auto future = promise->get_future().share();
+
+        // Capture readFile by value (shared_ptr copy) to keep the file
+        // handle alive for the duration of the async read.
+        executor_->add(
+            [promise, readFile, colNames = std::move(colNames), start]() {
+              try {
+                auto buf =
+                    selectiveParquetRead(readFile.get(), colNames, start);
+                promise->set_value(std::move(buf));
+              } catch (...) {
+                promise->set_exception(std::current_exception());
+              }
+            });
+
+        return {std::move(future), fsize, start, length,
+                std::move(readFile)};
+      }
+
+      // Fallback: no executor — run synchronously.
+      auto buf = selectiveParquetRead(readFile.get(), colNames, start);
+      std::promise<std::shared_ptr<cudf_velox::PinnedHostBuffer>> promise;
+      promise.set_value(std::move(buf));
+      return {promise.get_future().share(), fsize, start, length,
+              std::move(readFile)};
     };
 
     auto preReadStartUs = getCurrentTimeMicro();

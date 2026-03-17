@@ -204,6 +204,11 @@ class CudfHiveDataSource : public DataSource, public NvtxHelper {
     size_t fileSize;
     uint64_t start;
     uint64_t length;
+    // Prevents the ReadFile from being destroyed on the IO executor
+    // thread.  HDFS files close via JNI; keeping the shared_ptr here
+    // ensures the file handle outlives the async read and is destroyed
+    // on the calling thread (when asyncFileReads_ is cleared).
+    std::shared_ptr<ReadFile> readFile;
   };
   std::vector<AsyncFileRead> asyncFileReads_;
 

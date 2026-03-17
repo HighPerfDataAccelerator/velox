@@ -35,8 +35,8 @@
 
 #include <folly/futures/Future.h>
 
-#include <filesystem>
-#include <fstream>
+#include "velox/common/file/File.h"
+
 #include <list>
 #include <stack>
 #include <string>
@@ -412,16 +412,15 @@ std::string getTopLevelColumnName(
 } // anonymous namespace
 
 std::shared_ptr<PinnedHostBuffer> selectiveParquetRead(
-    const std::string& filePath,
+    ReadFile* readFile,
     const std::vector<std::string>& readColumnNames,
     uint64_t splitStart) {
-  const auto fileSize = std::filesystem::file_size(filePath);
+  const auto filePath = readFile->getName();
+  const auto fileSize = readFile->size();
 
   auto fullRead = [&]() {
     auto buf = std::make_shared<PinnedHostBuffer>(fileSize);
-    std::ifstream f(filePath, std::ios::binary);
-    VELOX_CHECK(f.good(), "Failed to open file: {}", filePath);
-    f.read(reinterpret_cast<char*>(buf->data()), fileSize);
+    readFile->pread(0, fileSize, buf->data());
     return buf;
   };
 
@@ -444,15 +443,12 @@ std::shared_ptr<PinnedHostBuffer> selectiveParquetRead(
   // avoiding any dependency on cuDF internal APIs.
   pqthrift::FileMetaData metadata;
   {
-    std::ifstream file(filePath, std::ios::binary);
-    VELOX_CHECK(file.good(), "Failed to open file: {}", filePath);
-
-    file.seekg(
-        static_cast<std::streamoff>(fileSize) -
-        static_cast<std::streamoff>(kEnderLen));
+    // Read the ender (footer_len + magic) from the end of the file.
+    uint8_t enderBuf[kEnderLen];
+    readFile->pread(fileSize - kEnderLen, kEnderLen, enderBuf);
     uint32_t footerLen = 0, magic = 0;
-    file.read(reinterpret_cast<char*>(&footerLen), sizeof(footerLen));
-    file.read(reinterpret_cast<char*>(&magic), sizeof(magic));
+    std::memcpy(&footerLen, enderBuf, sizeof(footerLen));
+    std::memcpy(&magic, enderBuf + sizeof(footerLen), sizeof(magic));
     VELOX_CHECK(
         magic == kParquetMagic, "Invalid Parquet magic in: {}", filePath);
     VELOX_CHECK(
@@ -461,11 +457,8 @@ std::shared_ptr<PinnedHostBuffer> selectiveParquetRead(
         filePath);
 
     std::vector<uint8_t> footerBytes(footerLen);
-    file.seekg(
-        static_cast<std::streamoff>(fileSize) -
-        static_cast<std::streamoff>(kEnderLen) -
-        static_cast<std::streamoff>(footerLen));
-    file.read(reinterpret_cast<char*>(footerBytes.data()), footerLen);
+    readFile->pread(
+        fileSize - kEnderLen - footerLen, footerLen, footerBytes.data());
 
     auto transport =
         std::make_shared<apache::thrift::transport::TMemoryBuffer>(
@@ -655,11 +648,8 @@ std::shared_ptr<PinnedHostBuffer> selectiveParquetRead(
   size_t dstOffset = kHeaderLen;
 
   // Step 7: Read needed column chunks from file and write to buffer
-  std::ifstream file(filePath, std::ios::binary);
-  VELOX_CHECK(file.good(), "Failed to open file: {}", filePath);
   for (const auto& chunk : chunksToRead) {
-    file.seekg(chunk.srcOffset);
-    file.read(reinterpret_cast<char*>(dst + dstOffset), chunk.size);
+    readFile->pread(chunk.srcOffset, chunk.size, dst + dstOffset);
     dstOffset += chunk.size;
   }
 
