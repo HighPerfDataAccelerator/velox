@@ -65,7 +65,21 @@ void CudfHashJoinProbe::close() {
 void CudfHashJoinBridge::setHashTable(
     std::optional<CudfHashJoinBridge::hash_type> hashObject) {
   if (CudfConfig::getInstance().debugEnabled) {
-    VLOG(2) << "Calling CudfHashJoinBridge::setHashTable";
+    if (hashObject.has_value()) {
+      const auto& [tables, joins] = hashObject.value();
+      VLOG(1) << "Calling CudfHashJoinBridge::setHashTable with tables="
+              << tables.size() << ", hashObjects=" << joins.size();
+      for (size_t i = 0; i < tables.size(); ++i) {
+        VLOG(2) << "  setHashTable table[" << i
+                << "]=" << static_cast<const void*>(tables[i].get());
+      }
+      for (size_t i = 0; i < joins.size(); ++i) {
+        VLOG(2) << "  setHashTable hashObject[" << i
+                << "]=" << static_cast<const void*>(joins[i].get());
+      }
+    } else {
+      VLOG(1) << "Calling CudfHashJoinBridge::setHashTable with nullopt";
+    }
   }
   std::vector<ContinuePromise> promises;
   {
@@ -75,8 +89,18 @@ void CudfHashJoinBridge::setHashTable(
         "CudfHashJoinBridge already has a hash table");
     hashObject_ = std::move(hashObject);
     promises = std::move(promises_);
+    if (CudfConfig::getInstance().debugEnabled) {
+      VLOG(1) << "CudfHashJoinBridge::setHashTable stored hash table; waiters="
+              << promises.size();
+    }
+  }
+  if (CudfConfig::getInstance().debugEnabled) {
+    VLOG(1) << "CudfHashJoinBridge::setHashTable notifying waiters";
   }
   notify(std::move(promises));
+  if (CudfConfig::getInstance().debugEnabled) {
+    VLOG(1) << "CudfHashJoinBridge::setHashTable completed";
+  }
 }
 
 std::optional<CudfHashJoinBridge::hash_type> CudfHashJoinBridge::hashOrFuture(
@@ -189,9 +213,16 @@ void CudfHashJoinBuild::noMoreInput() {
 
   if (CudfConfig::getInstance().debugEnabled) {
     VLOG(1) << "CudfHashJoinBuild: build batches";
-    VLOG(1) << "Build batches number of columns: "
-            << inputs_[0]->getTableView().num_columns();
-    for (auto i = 0; i < inputs_.size(); i++) {
+    VLOG(1) << "Build batches count: " << inputs_.size();
+    if (inputs_.empty()) {
+      VLOG(1) << "Build input batches are empty; continuing with empty build table";
+    } else {
+      VELOX_CHECK_NOT_NULL(inputs_[0]);
+      VLOG(1) << "Build batches number of columns: "
+              << inputs_[0]->getTableView().num_columns();
+    }
+    for (size_t i = 0; i < inputs_.size(); i++) {
+      VELOX_CHECK_NOT_NULL(inputs_[i]);
       VLOG(1) << "Build batch " << i
               << ": number of rows: " << inputs_[i]->getTableView().num_rows();
     }
@@ -205,9 +236,14 @@ void CudfHashJoinBuild::noMoreInput() {
   for (auto const& tbl : tbls) {
     VELOX_CHECK_NOT_NULL(tbl);
   }
+  VELOX_CHECK(
+      !tbls.empty(),
+      "Expected at least one build table after concatenation. planNodeId: {}",
+      planNodeId());
   if (CudfConfig::getInstance().debugEnabled) {
+    VLOG(1) << "Build table batches count: " << tbls.size();
     VLOG(1) << "Build table number of columns: " << tbls[0]->num_columns();
-    for (auto i = 0; i < tbls.size(); i++) {
+    for (size_t i = 0; i < tbls.size(); i++) {
       VLOG(1) << "Build table " << i
               << ": number of rows: " << tbls[i]->num_rows();
     }
@@ -254,16 +290,67 @@ void CudfHashJoinBuild::noMoreInput() {
   for (auto& tbl : tbls) {
     shared_tbls.push_back(std::move(tbl));
   }
+  VELOX_CHECK_EQ(
+      shared_tbls.size(),
+      hashObjects.size(),
+      "Mismatched build table/hash object counts. planNodeId: {}, splitGroupId: {}",
+      planNodeId(),
+      operatorCtx_->driverCtx()->splitGroupId);
+  if (CudfConfig::getInstance().debugEnabled) {
+    VLOG(1) << "Prepared hash join payload: shared_tbls=" << shared_tbls.size()
+            << ", hashObjects=" << hashObjects.size();
+    for (size_t i = 0; i < shared_tbls.size(); ++i) {
+      VLOG(2) << "  shared_tbls[" << i
+              << "]=" << static_cast<const void*>(shared_tbls[i].get());
+    }
+    for (size_t i = 0; i < hashObjects.size(); ++i) {
+      VLOG(2) << "  hashObjects[" << i
+              << "]=" << static_cast<const void*>(hashObjects[i].get());
+    }
+  }
   // set hash table to CudfHashJoinBridge
+  const auto splitGroupId = operatorCtx_->driverCtx()->splitGroupId;
   auto joinBridge = operatorCtx_->task()->getCustomJoinBridge(
-      operatorCtx_->driverCtx()->splitGroupId, planNodeId());
+      splitGroupId, planNodeId());
   auto cudfHashJoinBridge =
       std::dynamic_pointer_cast<CudfHashJoinBridge>(joinBridge);
+  if (CudfConfig::getInstance().debugEnabled) {
+    VLOG(1) << "CudfHashJoinBuild bridge lookup: planNodeId=" << planNodeId()
+            << ", splitGroupId=" << splitGroupId
+            << ", joinBridge=" << static_cast<const void*>(joinBridge.get())
+            << ", cudfHashJoinBridge="
+            << static_cast<const void*>(cudfHashJoinBridge.get());
+  }
+  VELOX_CHECK_NOT_NULL(
+      joinBridge,
+      "Expected JoinBridge for CudfHashJoinBuild. planNodeId: {}, splitGroupId: {}",
+      planNodeId(),
+      splitGroupId);
+  VELOX_CHECK_NOT_NULL(
+      cudfHashJoinBridge,
+      "Expected CudfHashJoinBridge for CudfHashJoinBuild. planNodeId: {}, splitGroupId: {}, joinBridge: {}",
+      planNodeId(),
+      splitGroupId,
+      static_cast<const void*>(joinBridge.get()));
 
+  if (CudfConfig::getInstance().debugEnabled) {
+    VLOG(1) << "CudfHashJoinBuild setting build stream: planNodeId="
+            << planNodeId() << ", splitGroupId=" << splitGroupId;
+  }
   cudfHashJoinBridge->setBuildStream(stream);
+  if (CudfConfig::getInstance().debugEnabled) {
+    VLOG(1) << "CudfHashJoinBuild setBuildStream completed: planNodeId="
+            << planNodeId() << ", splitGroupId=" << splitGroupId;
+    VLOG(1) << "CudfHashJoinBuild setting hash table: planNodeId="
+            << planNodeId() << ", splitGroupId=" << splitGroupId;
+  }
   cudfHashJoinBridge->setHashTable(
       std::make_optional(
           std::make_pair(std::move(shared_tbls), std::move(hashObjects))));
+  if (CudfConfig::getInstance().debugEnabled) {
+    VLOG(1) << "CudfHashJoinBuild setHashTable completed: planNodeId="
+            << planNodeId() << ", splitGroupId=" << splitGroupId;
+  }
 }
 
 exec::BlockingReason CudfHashJoinBuild::isBlocked(ContinueFuture* future) {
@@ -1320,11 +1407,29 @@ exec::BlockingReason CudfHashJoinProbe::isBlocked(ContinueFuture* future) {
     return exec::BlockingReason::kNotBlocked;
   }
 
+  const auto splitGroupId = operatorCtx_->driverCtx()->splitGroupId;
   auto joinBridge = operatorCtx_->task()->getCustomJoinBridge(
-      operatorCtx_->driverCtx()->splitGroupId, planNodeId());
+      splitGroupId, planNodeId());
   auto cudfJoinBridge =
       std::dynamic_pointer_cast<CudfHashJoinBridge>(joinBridge);
-  VELOX_CHECK_NOT_NULL(cudfJoinBridge);
+  if (CudfConfig::getInstance().debugEnabled) {
+    VLOG(1) << "CudfHashJoinProbe bridge lookup: planNodeId=" << planNodeId()
+            << ", splitGroupId=" << splitGroupId
+            << ", joinBridge=" << static_cast<const void*>(joinBridge.get())
+            << ", cudfJoinBridge="
+            << static_cast<const void*>(cudfJoinBridge.get());
+  }
+  VELOX_CHECK_NOT_NULL(
+      joinBridge,
+      "Expected JoinBridge for CudfHashJoinProbe. planNodeId: {}, splitGroupId: {}",
+      planNodeId(),
+      splitGroupId);
+  VELOX_CHECK_NOT_NULL(
+      cudfJoinBridge,
+      "Expected CudfHashJoinBridge for CudfHashJoinProbe. planNodeId: {}, splitGroupId: {}, joinBridge: {}",
+      planNodeId(),
+      splitGroupId,
+      static_cast<const void*>(joinBridge.get()));
   VELOX_CHECK_NOT_NULL(future);
   auto hashObject = cudfJoinBridge->hashOrFuture(future);
 
