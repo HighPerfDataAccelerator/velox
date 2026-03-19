@@ -403,12 +403,21 @@ void buildArrowColumnFromPacked(
           buf, hostBuf, hostBase + col.data_offset, dataBytes);
       out->buffers[1] = buf->data;
     } else if (col.data_offset != -1 && arrowType == NANOARROW_TYPE_BOOL) {
+      // cudf BOOL8 stores 1 byte per element; Arrow BOOL stores 1 bit
+      // per element. Convert byte-per-value to bit-packed bitmask.
+      auto numElements = static_cast<int64_t>(col.size);
+      auto bitmaskBytes = (numElements + 7) / 8;
+      auto* srcBytes = hostBase + col.data_offset;
+
       auto* buf = ArrowArrayBuffer(out, 1);
-      auto dataBytes =
-          static_cast<int64_t>(cudf::bitmask_allocation_size_bytes(col.size));
-      attachHostBufToArrowBuffer(
-          buf, hostBuf, hostBase + col.data_offset, dataBytes);
-      out->buffers[1] = buf->data;
+      NANOARROW_THROW_NOT_OK(ArrowBufferResize(buf, bitmaskBytes, 0));
+      auto* dst = reinterpret_cast<uint8_t*>(buf->data);
+      memset(dst, 0, bitmaskBytes);
+      for (int64_t i = 0; i < numElements; ++i) {
+        if (srcBytes[i]) {
+          dst[i / 8] |= static_cast<uint8_t>(1 << (i % 8));
+        }
+      }
     }
 
     // Recurse into children (e.g. for STRUCT or LIST types)

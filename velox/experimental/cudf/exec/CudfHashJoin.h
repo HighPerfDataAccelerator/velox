@@ -156,6 +156,7 @@ class CudfHashJoinProbe : public exec::Operator, public NvtxHelper {
         joinType == core::JoinType::kLeft ||
         joinType == core::JoinType::kAnti ||
         joinType == core::JoinType::kLeftSemiFilter ||
+        joinType == core::JoinType::kLeftSemiProject ||
         joinType == core::JoinType::kRight ||
         joinType == core::JoinType::kRightSemiFilter ||
         joinType == core::JoinType::kFull;
@@ -211,6 +212,10 @@ class CudfHashJoinProbe : public exec::Operator, public NvtxHelper {
   /** @brief Output column positions for right table columns */
   std::vector<size_t> rightColumnOutputIndices_;
   bool finished_{false};
+
+  // For LeftSemiProject: output index of the boolean "match" column.
+  // -1 when the join is not a LeftSemiProject.
+  int32_t matchColumnOutputIndex_{-1};
 
   // Copied from HashProbe.h
   // Indicates whether to skip probe input data processing or not. It only
@@ -306,6 +311,14 @@ class CudfHashJoinProbe : public exec::Operator, public NvtxHelper {
    * @return Vector of result tables (multiple if build data was batched)
    */
   std::vector<std::unique_ptr<cudf::table>> antiJoin(
+      cudf::table_view leftTableView,
+      rmm::cuda_stream_view stream);
+  std::vector<std::unique_ptr<cudf::table>>
+  nullAwareAntiJoinWithFilter(
+      cudf::table_view leftTableView,
+      cudf::table_view rightTableView,
+      rmm::cuda_stream_view stream);
+  std::vector<std::unique_ptr<cudf::table>> leftSemiProjectJoin(
       cudf::table_view leftTableView,
       rmm::cuda_stream_view stream);
   /**

@@ -248,6 +248,21 @@ void CudfHashJoinBuild::noMoreInput() {
         buildType->getChildIdx(rightKeys[i]->name()));
   }
 
+  {
+    int64_t totalNullKeyRows = 0;
+    for (const auto& tbl : tbls) {
+      auto n = tbl->num_rows();
+      if (n == 0) {
+        continue;
+      }
+      auto nonNull =
+          cudf::drop_nulls(*tbl, buildKeyIndices, stream);
+      totalNullKeyRows += n - nonNull->num_rows();
+    }
+    auto lockedStats = stats_.wlock();
+    lockedStats->numNullKeys += totalNullKeyRows;
+  }
+
   // Only need to construct hash_join object if it's an inner join, left join,
   // right join, or full join.
   // All other cases use a standalone function in cudf
@@ -364,11 +379,22 @@ CudfHashJoinProbe::CudfHashJoinProbe(
   }
 
   auto outputType = joinNode_->outputType();
+  auto numOutputColumns = outputType->names().size();
+  if (joinNode_->isLeftSemiProjectJoin()) {
+    VELOX_CHECK_GE(numOutputColumns, 1);
+    matchColumnOutputIndex_ =
+        static_cast<int32_t>(numOutputColumns - 1);
+    VELOX_CHECK_EQ(
+        outputType->childAt(matchColumnOutputIndex_),
+        BOOLEAN());
+    --numOutputColumns;
+  }
+
   leftColumnIndicesToGather_ = std::vector<cudf::size_type>();
   rightColumnIndicesToGather_ = std::vector<cudf::size_type>();
   leftColumnOutputIndices_ = std::vector<size_t>();
   rightColumnOutputIndices_ = std::vector<size_t>();
-  for (int i = 0; i < outputType->names().size(); i++) {
+  for (size_t i = 0; i < numOutputColumns; i++) {
     auto const outputName = outputType->names()[i];
     if (CudfConfig::getInstance().debugEnabled) {
       VLOG(1) << "Output column " << i << ": " << outputName;
@@ -388,7 +414,8 @@ CudfHashJoinProbe::CudfHashJoinProbe(
       continue;
     }
     VELOX_FAIL(
-        "Join field {} not in probe or build input", outputType->children()[i]);
+        "Join field {} not in probe or build input",
+        outputType->children()[i]);
   }
 
   if (CudfConfig::getInstance().debugEnabled) {
@@ -1178,6 +1205,154 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::leftSemiFilterJoin(
 }
 
 std::vector<std::unique_ptr<cudf::table>>
+CudfHashJoinProbe::leftSemiProjectJoin(
+    cudf::table_view leftTableView,
+    rmm::cuda_stream_view stream) {
+  std::vector<std::unique_ptr<cudf::table>> cudfOutputs;
+  auto& rightTables = hashObject_.value().first;
+  auto leftNumRows = leftTableView.num_rows();
+
+  auto falseScalar =
+      cudf::numeric_scalar<bool>(false, true, stream);
+  auto matchFlags = cudf::make_column_from_scalar(
+      falseScalar,
+      leftNumRows,
+      stream,
+      cudf::get_current_device_resource_ref());
+
+  auto rowIndices = cudf::sequence(
+      leftNumRows,
+      cudf::numeric_scalar<cudf::size_type>(0, true, stream),
+      cudf::numeric_scalar<cudf::size_type>(1, true, stream),
+      stream,
+      cudf::get_current_device_resource_ref());
+
+  for (auto i = 0; i < rightTables.size(); i++) {
+    auto rightTableView = rightTables[i]->view();
+    std::unique_ptr<rmm::device_uvector<cudf::size_type>>
+        leftJoinIndices;
+
+    if (joinNode_->filter()) {
+      leftJoinIndices = cudf::mixed_left_semi_join(
+          leftTableView.select(leftKeyIndices_),
+          rightTableView.select(rightKeyIndices_),
+          leftTableView,
+          rightTableView,
+          tree_.back(),
+          cudf::null_equality::UNEQUAL,
+          stream,
+          cudf::get_current_device_resource_ref());
+    } else {
+      cudf::filtered_join filter_join(
+          rightTableView.select(rightKeyIndices_),
+          cudf::null_equality::UNEQUAL,
+          cudf::set_as_build_table::RIGHT,
+          stream);
+      leftJoinIndices = filter_join.semi_join(
+          leftTableView.select(leftKeyIndices_),
+          stream,
+          cudf::get_current_device_resource_ref());
+    }
+
+    if (leftJoinIndices->size() > 0) {
+      auto leftIdxCol = cudf::column_view{
+          cudf::device_span<cudf::size_type const>{
+              *leftJoinIndices}};
+      auto matchedInBatch =
+          cudf::contains(leftIdxCol, rowIndices->view());
+      auto updated = cudf::binary_operation(
+          matchFlags->view(),
+          matchedInBatch->view(),
+          cudf::binary_operator::BITWISE_OR,
+          cudf::data_type{cudf::type_id::BOOL8},
+          stream,
+          cudf::get_current_device_resource_ref());
+      matchFlags = std::move(updated);
+    }
+  }
+
+  if (joinNode_->isNullAware()) {
+    auto mr = cudf::get_current_device_resource_ref();
+    bool buildIsEmpty = true;
+    bool buildHasNullKeys = false;
+    for (const auto& rt : rightTables) {
+      if (rt->view().num_rows() > 0) {
+        buildIsEmpty = false;
+        if (cudf::has_nulls(
+                rt->view().select(rightKeyIndices_))) {
+          buildHasNullKeys = true;
+        }
+      }
+    }
+
+    // x IN (empty set) = false for any x, including null.
+    if (!buildIsEmpty) {
+      auto trueScalar =
+          cudf::numeric_scalar<bool>(true, true, stream);
+      auto probeKeyNotNull = cudf::make_column_from_scalar(
+          trueScalar, leftNumRows, stream, mr);
+      for (auto ki : leftKeyIndices_) {
+        auto keyCol = leftTableView.column(ki);
+        if (keyCol.has_nulls()) {
+          auto isValid =
+              cudf::is_valid(keyCol, stream, mr);
+          probeKeyNotNull = cudf::binary_operation(
+              probeKeyNotNull->view(),
+              isValid->view(),
+              cudf::binary_operator::BITWISE_AND,
+              cudf::data_type{cudf::type_id::BOOL8},
+              stream,
+              mr);
+        }
+      }
+
+      std::unique_ptr<cudf::column> validMask;
+      if (buildHasNullKeys) {
+        validMask = cudf::binary_operation(
+            probeKeyNotNull->view(),
+            matchFlags->view(),
+            cudf::binary_operator::BITWISE_AND,
+            cudf::data_type{cudf::type_id::BOOL8},
+            stream,
+            mr);
+      } else {
+        validMask = std::move(probeKeyNotNull);
+      }
+
+      auto nullScalar =
+          cudf::numeric_scalar<bool>(false, false, stream);
+      matchFlags = cudf::copy_if_else(
+          matchFlags->view(),
+          nullScalar,
+          validMask->view(),
+          stream,
+          mr);
+    }
+  }
+
+  auto leftInput =
+      leftTableView.select(leftColumnIndicesToGather_);
+  std::vector<std::unique_ptr<cudf::column>> outCols(
+      outputType_->size());
+  for (size_t j = 0; j < leftColumnOutputIndices_.size(); ++j) {
+    auto outIdx = leftColumnOutputIndices_[j];
+    outCols[outIdx] = std::make_unique<cudf::column>(
+        leftInput.column(j),
+        stream,
+        cudf::get_current_device_resource_ref());
+  }
+  outCols[matchColumnOutputIndex_] = std::move(matchFlags);
+
+  if (buildStream_.has_value()) {
+    cudaEvent_->recordFrom(stream).waitOn(buildStream_.value());
+  }
+  stream.synchronize();
+  cudfOutputs.push_back(
+      std::make_unique<cudf::table>(std::move(outCols)));
+  return cudfOutputs;
+}
+
+std::vector<std::unique_ptr<cudf::table>>
 CudfHashJoinProbe::rightSemiFilterJoin(
     cudf::table_view leftTableView,
     rmm::cuda_stream_view stream) {
@@ -1233,6 +1408,7 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::antiJoin(
     rmm::cuda_stream_view stream) {
   std::vector<std::unique_ptr<cudf::table>> cudfOutputs;
   auto& rightTables = hashObject_.value().first;
+  auto mr = cudf::get_current_device_resource_ref();
 
   VELOX_CHECK_EQ(
       rightTables.size(),
@@ -1241,28 +1417,31 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::antiJoin(
 
   auto rightTableView = rightTables[0]->view();
 
-  // For the special case where we need to drop nulls, we create a local table.
-  // Otherwise, we use the input view directly.
+  if (joinNode_->isNullAware() && joinNode_->filter()) {
+    return nullAwareAntiJoinWithFilter(
+        leftTableViewParam, rightTableView, stream);
+  }
+
   std::unique_ptr<cudf::table> modifiedLeftTable;
   cudf::table_view leftTableView = leftTableViewParam;
 
-  // Special case for null-aware anti join where
-  // build table is not empty, no nulls, and probe table has nulls
-  if (joinNode_->isNullAware() and !joinNode_->filter()) {
+  if (joinNode_->isNullAware() && !joinNode_->filter()) {
     auto const leftTableHasNulls =
-        cudf::has_nulls(leftTableViewParam.select(leftKeyIndices_));
+        cudf::has_nulls(
+            leftTableViewParam.select(leftKeyIndices_));
     auto const rightTableHasNulls =
-        cudf::has_nulls(rightTableView.select(rightKeyIndices_));
-    if (rightTables[0]->num_rows() > 0 and !rightTableHasNulls and
-        leftTableHasNulls) {
-      // drop nulls on probe table - creates a new table
-      modifiedLeftTable =
-          cudf::drop_nulls(leftTableViewParam, leftKeyIndices_, stream);
+        cudf::has_nulls(
+            rightTableView.select(rightKeyIndices_));
+    if (rightTables[0]->num_rows() > 0 &&
+        !rightTableHasNulls && leftTableHasNulls) {
+      modifiedLeftTable = cudf::drop_nulls(
+          leftTableViewParam, leftKeyIndices_, stream);
       leftTableView = modifiedLeftTable->view();
     }
   }
 
-  std::unique_ptr<rmm::device_uvector<cudf::size_type>> leftJoinIndices;
+  std::unique_ptr<rmm::device_uvector<cudf::size_type>>
+      leftJoinIndices;
   if (joinNode_->filter()) {
     leftJoinIndices = cudf::mixed_left_anti_join(
         leftTableView.select(leftKeyIndices_),
@@ -1272,14 +1451,15 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::antiJoin(
         tree_.back(),
         cudf::null_equality::UNEQUAL,
         stream,
-        cudf::get_current_device_resource_ref());
+        mr);
   } else {
     auto const rightTableHasNulls =
-        cudf::has_nulls(rightTableView.select(rightKeyIndices_));
-    if (joinNode_->isNullAware() and rightTableHasNulls) {
-      // empty result
-      leftJoinIndices = std::make_unique<rmm::device_uvector<cudf::size_type>>(
-          0, stream, cudf::get_current_device_resource_ref());
+        cudf::has_nulls(
+            rightTableView.select(rightKeyIndices_));
+    if (joinNode_->isNullAware() && rightTableHasNulls) {
+      leftJoinIndices =
+          std::make_unique<rmm::device_uvector<cudf::size_type>>(
+              0, stream, mr);
     } else {
       cudf::filtered_join filter_join(
           rightTableView.select(rightKeyIndices_),
@@ -1289,7 +1469,7 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::antiJoin(
       leftJoinIndices = filter_join.anti_join(
           leftTableView.select(leftKeyIndices_),
           stream,
-          cudf::get_current_device_resource_ref());
+          mr);
     }
   }
 
@@ -1304,6 +1484,318 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::antiJoin(
       rightIndicesCol->view(),
       stream));
 
+  return cudfOutputs;
+}
+
+std::vector<std::unique_ptr<cudf::table>>
+CudfHashJoinProbe::nullAwareAntiJoinWithFilter(
+    cudf::table_view leftTableViewParam,
+    cudf::table_view rightTableView,
+    rmm::cuda_stream_view stream) {
+  std::vector<std::unique_ptr<cudf::table>> cudfOutputs;
+  auto mr = cudf::get_current_device_resource_ref();
+
+  auto leftNonNullTable =
+      cudf::drop_nulls(leftTableViewParam, leftKeyIndices_, stream);
+  auto leftNonNull = leftNonNullTable->view();
+  auto leftN = leftNonNull.num_rows();
+
+  auto buildHasNullKeys =
+      cudf::has_nulls(rightTableView.select(rightKeyIndices_));
+
+  std::unique_ptr<cudf::column> rowIndices;
+  std::unique_ptr<cudf::column> candidateMask;
+  if (leftN > 0) {
+    rowIndices = cudf::sequence(
+        leftN,
+        cudf::numeric_scalar<cudf::size_type>(0, true, stream),
+        cudf::numeric_scalar<cudf::size_type>(1, true, stream),
+        stream,
+        mr);
+
+    candidateMask = cudf::make_column_from_scalar(
+        cudf::numeric_scalar<bool>(true, true, stream),
+        leftN,
+        stream,
+        mr);
+  }
+
+  // Exclude left rows matching non-null-key build rows via
+  // key equality + filter. With UNEQUAL null equality, null
+  // build keys are invisible.
+  if (leftN > 0 && rightTableView.num_rows() > 0) {
+    std::unique_ptr<rmm::device_uvector<cudf::size_type>>
+        antiIndices;
+    if (buildHasNullKeys) {
+      // Extract non-null-key build rows
+      auto rightNonNull = cudf::drop_nulls(
+          rightTableView, rightKeyIndices_, stream);
+      if (rightNonNull->num_rows() > 0) {
+        antiIndices = cudf::mixed_left_anti_join(
+            leftNonNull.select(leftKeyIndices_),
+            rightNonNull->view().select(rightKeyIndices_),
+            leftNonNull,
+            rightNonNull->view(),
+            tree_.back(),
+            cudf::null_equality::UNEQUAL,
+            stream,
+            mr);
+      }
+    } else {
+      antiIndices = cudf::mixed_left_anti_join(
+          leftNonNull.select(leftKeyIndices_),
+          rightTableView.select(rightKeyIndices_),
+          leftNonNull,
+          rightTableView,
+          tree_.back(),
+          cudf::null_equality::UNEQUAL,
+          stream,
+          mr);
+    }
+    if (antiIndices && antiIndices->size() > 0) {
+      auto antiCol = cudf::column_view{
+          cudf::device_span<cudf::size_type const>{
+              *antiIndices}};
+      auto inAnti =
+          cudf::contains(antiCol, rowIndices->view());
+      candidateMask = cudf::binary_operation(
+          candidateMask->view(),
+          inAnti->view(),
+          cudf::binary_operator::BITWISE_AND,
+          cudf::data_type{cudf::type_id::BOOL8},
+          stream,
+          mr);
+    } else if (!antiIndices || antiIndices->size() == 0) {
+      if (!buildHasNullKeys ||
+          cudf::drop_nulls(
+              rightTableView, rightKeyIndices_, stream)
+                  ->num_rows() > 0) {
+        // Anti-join returned nothing: all left rows matched.
+        // Unless no non-null build rows existed.
+        auto falseScalar =
+            cudf::numeric_scalar<bool>(false, true, stream);
+        candidateMask = cudf::make_column_from_scalar(
+            falseScalar, leftN, stream, mr);
+      }
+    }
+  }
+
+  // Exclude left rows matching any null-key build row via
+  // filter. Use dummy constant keys so every pair passes key
+  // equality, letting the filter decide.
+  if (leftN > 0 && buildHasNullKeys &&
+      rightTableView.num_rows() > 0) {
+    // Build per-row "any key is null" mask for right table
+    auto rightN = rightTableView.num_rows();
+    auto anyKeyNull = cudf::make_column_from_scalar(
+        cudf::numeric_scalar<bool>(false, true, stream),
+        rightN,
+        stream,
+        mr);
+    for (auto keyIdx : rightKeyIndices_) {
+      auto col = rightTableView.column(keyIdx);
+      if (!col.has_nulls()) {
+        continue;
+      }
+      auto nullScalar =
+          cudf::make_default_constructed_scalar(
+              col.type(), stream, mr);
+      auto isNull = cudf::binary_operation(
+          col,
+          *nullScalar,
+          cudf::binary_operator::NULL_EQUALS,
+          cudf::data_type{cudf::type_id::BOOL8},
+          stream,
+          mr);
+      anyKeyNull = cudf::binary_operation(
+          anyKeyNull->view(),
+          isNull->view(),
+          cudf::binary_operator::BITWISE_OR,
+          cudf::data_type{cudf::type_id::BOOL8},
+          stream,
+          mr);
+    }
+
+    auto rightNullKeys = cudf::apply_boolean_mask(
+        rightTableView, anyKeyNull->view(), stream);
+    auto nullKeyN = rightNullKeys->num_rows();
+
+    if (nullKeyN > 0) {
+      // Dummy constant keys: every (left, rightNull) pair
+      // passes key equality so the filter is evaluated on all
+      // cross-product pairs.
+      auto zeroScalar = cudf::numeric_scalar<cudf::size_type>(
+          0, true, stream);
+      auto leftDummyKey = cudf::make_column_from_scalar(
+          zeroScalar, leftN, stream, mr);
+      auto rightDummyKey = cudf::make_column_from_scalar(
+          zeroScalar, nullKeyN, stream, mr);
+
+      auto semiIndices = cudf::mixed_left_semi_join(
+          cudf::table_view({leftDummyKey->view()}),
+          cudf::table_view({rightDummyKey->view()}),
+          leftNonNull,
+          rightNullKeys->view(),
+          tree_.back(),
+          cudf::null_equality::UNEQUAL,
+          stream,
+          mr);
+
+      if (semiIndices->size() > 0) {
+        auto semiCol = cudf::column_view{
+            cudf::device_span<cudf::size_type const>{
+                *semiIndices}};
+        auto inSemi =
+            cudf::contains(semiCol, rowIndices->view());
+        auto notInSemi = cudf::unary_operation(
+            inSemi->view(),
+            cudf::unary_operator::NOT,
+            stream);
+        candidateMask = cudf::binary_operation(
+            candidateMask->view(),
+            notInSemi->view(),
+            cudf::binary_operator::BITWISE_AND,
+            cudf::data_type{cudf::type_id::BOOL8},
+            stream,
+            mr);
+      }
+    }
+  }
+
+  // Collect surviving non-null-keyed rows
+  std::unique_ptr<cudf::table> nonNullResult;
+  if (leftN > 0) {
+    auto leftInput =
+        leftNonNull.select(leftColumnIndicesToGather_);
+    nonNullResult = cudf::apply_boolean_mask(
+        leftInput, candidateMask->view(), stream);
+  }
+
+  // Handle null-keyed probe rows.
+  // null NOT IN (empty) = true  -> keep
+  // null NOT IN (non-empty where filter passes) = null -> exclude
+  // null NOT IN (non-empty where NO filter passes) = true -> keep
+  std::unique_ptr<cudf::table> nullKeyResult;
+  auto totalLeft = leftTableViewParam.num_rows();
+  if (totalLeft > leftN) {
+    // Extract rows where any key column is null
+    auto trueScalar =
+        cudf::numeric_scalar<bool>(true, true, stream);
+    auto hasNullKey = cudf::make_column_from_scalar(
+        cudf::numeric_scalar<bool>(false, true, stream),
+        totalLeft, stream, mr);
+    for (auto ki : leftKeyIndices_) {
+      auto col = leftTableViewParam.column(ki);
+      if (col.has_nulls()) {
+        auto isNull = cudf::is_null(col, stream, mr);
+        hasNullKey = cudf::binary_operation(
+            hasNullKey->view(),
+            isNull->view(),
+            cudf::binary_operator::BITWISE_OR,
+            cudf::data_type{cudf::type_id::BOOL8},
+            stream, mr);
+      }
+    }
+    auto leftNullKeyTable = cudf::apply_boolean_mask(
+        leftTableViewParam, hasNullKey->view(), stream);
+    auto nullN = leftNullKeyTable->num_rows();
+
+    if (nullN > 0 && rightTableView.num_rows() == 0) {
+      // Build is empty: all null-keyed rows survive
+      nullKeyResult = std::make_unique<cudf::table>(
+          leftNullKeyTable->view().select(
+              leftColumnIndicesToGather_),
+          stream, mr);
+    } else if (nullN > 0 && rightTableView.num_rows() > 0) {
+      // Cross-join anti: for each null-keyed probe row,
+      // check if ANY build row passes the filter.
+      auto buildN = rightTableView.num_rows();
+      auto zeroScalar = cudf::numeric_scalar<cudf::size_type>(
+          0, true, stream);
+      auto dummyL = cudf::make_column_from_scalar(
+          zeroScalar, nullN, stream, mr);
+      auto dummyR = cudf::make_column_from_scalar(
+          zeroScalar, buildN, stream, mr);
+
+      auto antiIdx = cudf::mixed_left_anti_join(
+          cudf::table_view({dummyL->view()}),
+          cudf::table_view({dummyR->view()}),
+          leftNullKeyTable->view(),
+          rightTableView,
+          tree_.back(),
+          cudf::null_equality::UNEQUAL,
+          stream, mr);
+
+      if (antiIdx->size() > 0) {
+        auto idxCol = cudf::column_view{
+            cudf::device_span<cudf::size_type const>{
+                *antiIdx}};
+        nullKeyResult = cudf::gather(
+            leftNullKeyTable->view().select(
+                leftColumnIndicesToGather_),
+            idxCol, cudf::out_of_bounds_policy::DONT_CHECK,
+            stream, mr);
+      }
+    }
+  }
+
+  // Concatenate non-null and null-key results
+  std::vector<cudf::table_view> toConcat;
+  if (nonNullResult && nonNullResult->num_rows() > 0) {
+    toConcat.push_back(nonNullResult->view());
+  }
+  if (nullKeyResult && nullKeyResult->num_rows() > 0) {
+    toConcat.push_back(nullKeyResult->view());
+  }
+
+  if (toConcat.empty()) {
+    // Return an empty table with correct schema
+    std::vector<std::unique_ptr<cudf::column>> emptyCols;
+    for (size_t j = 0; j < leftColumnOutputIndices_.size(); ++j) {
+      auto srcIdx = leftColumnIndicesToGather_[j];
+      auto type = leftTableViewParam.column(srcIdx).type();
+      emptyCols.push_back(
+          cudf::make_empty_column(type));
+    }
+    std::vector<std::unique_ptr<cudf::column>> outCols(
+        outputType_->size());
+    for (size_t j = 0; j < leftColumnOutputIndices_.size(); ++j) {
+      outCols[leftColumnOutputIndices_[j]] =
+          std::move(emptyCols[j]);
+    }
+    if (buildStream_.has_value()) {
+      cudaEvent_->recordFrom(stream).waitOn(
+          buildStream_.value());
+    }
+    stream.synchronize();
+    cudfOutputs.push_back(
+        std::make_unique<cudf::table>(std::move(outCols)));
+    return cudfOutputs;
+  }
+
+  std::unique_ptr<cudf::table> finalResult;
+  if (toConcat.size() == 1) {
+    finalResult = std::make_unique<cudf::table>(
+        toConcat[0], stream, mr);
+  } else {
+    finalResult =
+        cudf::concatenate(toConcat, stream, mr);
+  }
+
+  auto resultCols = finalResult->release();
+  std::vector<std::unique_ptr<cudf::column>> outCols(
+      outputType_->size());
+  for (size_t j = 0; j < leftColumnOutputIndices_.size(); ++j) {
+    outCols[leftColumnOutputIndices_[j]] =
+        std::move(resultCols[j]);
+  }
+
+  if (buildStream_.has_value()) {
+    cudaEvent_->recordFrom(stream).waitOn(buildStream_.value());
+  }
+  stream.synchronize();
+  cudfOutputs.push_back(
+      std::make_unique<cudf::table>(std::move(outCols)));
   return cudfOutputs;
 }
 
@@ -1469,6 +1961,20 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
     }
   }
 
+  {
+    auto n = leftTableView.num_rows();
+    if (n > 0) {
+      auto nonNull =
+          cudf::drop_nulls(leftTableView, leftKeyIndices_, stream);
+      auto nullKeyRows =
+          static_cast<int64_t>(n - nonNull->num_rows());
+      if (nullKeyRows > 0) {
+        auto lockedStats = stats_.wlock();
+        lockedStats->numNullKeys += nullKeyRows;
+      }
+    }
+  }
+
   std::vector<std::unique_ptr<cudf::table>> cudfOutputs;
   switch (joinNode_->joinType()) {
     case core::JoinType::kInner:
@@ -1482,6 +1988,9 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
       break;
     case core::JoinType::kLeftSemiFilter:
       cudfOutputs = leftSemiFilterJoin(leftTableView, stream);
+      break;
+    case core::JoinType::kLeftSemiProject:
+      cudfOutputs = leftSemiProjectJoin(leftTableView, stream);
       break;
     case core::JoinType::kRightSemiFilter:
       cudfOutputs = rightSemiFilterJoin(leftTableView, stream);
@@ -1623,10 +2132,18 @@ exec::BlockingReason CudfHashJoinProbe::isBlocked(ContinueFuture* future) {
 }
 
 bool CudfHashJoinProbe::isFinished() {
-  auto const isFinished = finished_ ||
-      (noMoreInput_ && input_ == nullptr && accumulatedProbeInputs_.empty());
+  bool isFinished;
+  if ((joinNode_->isRightJoin() || joinNode_->isFullJoin()) &&
+      isLastDriver_) {
+    // The last driver must wait until finished_ is set after emitting
+    // unmatched build rows.
+    isFinished = finished_;
+  } else {
+    isFinished = finished_ ||
+        (noMoreInput_ && input_ == nullptr &&
+         accumulatedProbeInputs_.empty());
+  }
 
-  // Release hashObject_ if finished
   if (isFinished) {
     hashObject_.reset();
   }

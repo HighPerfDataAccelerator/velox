@@ -235,8 +235,15 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
           if (remainingFilterExprSet_) {
             auto cols = tbl->release();
             const auto originalNumColumns = cols.size();
+            std::vector<cudf::column_view> colViews;
+            colViews.reserve(cols.size());
+            for (auto& c : cols) {
+              colViews.push_back(c->view());
+            }
             auto filterResult = cudfExpressionEvaluator_->eval(
-                cols, stream_, cudf::get_current_device_resource_ref());
+                colViews,
+                stream_,
+                cudf::get_current_device_resource_ref());
             std::vector<std::unique_ptr<cudf::column>> origCols;
             origCols.reserve(originalNumColumns);
             std::move(
