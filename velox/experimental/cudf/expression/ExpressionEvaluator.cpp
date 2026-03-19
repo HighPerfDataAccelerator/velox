@@ -1262,9 +1262,8 @@ ColumnOrView FunctionExpression::eval(
     std::vector<ColumnOrView> subexprResults;
     subexprResults.reserve(subexpressions_.size());
 
-    for (auto& sub : subexpressions_) {
-      subexprResults.push_back(
-          sub->eval(inputColumnViews, stream, mr));
+    for (const auto& subexpr : subexpressions_) {
+      subexprResults.push_back(subexpr->eval(inputColumnViews, stream, mr));
     }
 
     auto result = function_->eval(subexprResults, stream, mr);
