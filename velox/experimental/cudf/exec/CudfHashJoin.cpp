@@ -40,6 +40,7 @@
 #include <cudf/null_mask.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
+#include <cudf/search.hpp>
 #include <cudf/stream_compaction.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/unary.hpp>
@@ -51,6 +52,31 @@
 #include <nvtx3/nvtx3.hpp>
 
 namespace facebook::velox::cudf_velox {
+
+namespace {
+
+/// Creates extended table view by appending precomputed columns
+cudf::table_view createExtendedTableView(
+    cudf::table_view originalView,
+    std::vector<ColumnOrView>& precomputedColumns) {
+  if (precomputedColumns.empty()) {
+    return originalView;
+  }
+
+  std::vector<cudf::column_view> allViews;
+  allViews.reserve(originalView.num_columns() + precomputedColumns.size());
+
+  for (cudf::size_type i = 0; i < originalView.num_columns(); ++i) {
+    allViews.push_back(originalView.column(i));
+  }
+  for (auto& col : precomputedColumns) {
+    allViews.push_back(asView(col));
+  }
+
+  return cudf::table_view(allViews);
+}
+
+} // namespace
 
 void CudfHashJoinProbe::close() {
   Operator::close();
@@ -249,21 +275,36 @@ void CudfHashJoinBuild::noMoreInput() {
     }
   }
 
-  auto buildType = joinNode_->sources()[1]->outputType();
   auto rightKeys = joinNode_->rightKeys();
 
   auto buildKeyIndices = std::vector<cudf::size_type>(rightKeys.size());
+  auto buildType = joinNode_->sources()[1]->outputType();
   for (size_t i = 0; i < buildKeyIndices.size(); i++) {
     buildKeyIndices[i] = static_cast<cudf::size_type>(
         buildType->getChildIdx(rightKeys[i]->name()));
   }
 
-  // Only need to construct hash_join object if it's an inner join, left join or
-  // right join.
+  {
+    int64_t totalNullKeyRows = 0;
+    for (const auto& tbl : tbls) {
+      auto n = tbl->num_rows();
+      if (n == 0) {
+        continue;
+      }
+      auto nonNull =
+          cudf::drop_nulls(*tbl, buildKeyIndices, stream);
+      totalNullKeyRows += n - nonNull->num_rows();
+    }
+    auto lockedStats = stats_.wlock();
+    lockedStats->numNullKeys += totalNullKeyRows;
+  }
+
+  // Only need to construct hash_join object if it's an inner join, left join,
+  // right join, or full join.
   // All other cases use a standalone function in cudf
   bool buildHashJoin =
       (joinNode_->isInnerJoin() || joinNode_->isLeftJoin() ||
-       joinNode_->isRightJoin());
+       joinNode_->isRightJoin() || joinNode_->isFullJoin());
 
   std::vector<std::shared_ptr<cudf::hash_join>> hashObjects;
   for (auto i = 0; i < tbls.size(); i++) {
@@ -380,22 +421,22 @@ CudfHashJoinProbe::CudfHashJoinProbe(
           operatorId,
           fmt::format("[{}]", joinNode->id())),
       joinNode_(joinNode),
+      probeType_(joinNode_->sources()[0]->outputType()),
+      buildType_(joinNode_->sources()[1]->outputType()),
       cudaEvent_(std::make_unique<CudaEvent>(cudaEventDisableTiming)) {
   if (CudfConfig::getInstance().debugEnabled) {
     VLOG(2) << "CudfHashJoinProbe constructor";
   }
-  auto probeType = joinNode_->sources()[0]->outputType();
-  auto buildType = joinNode_->sources()[1]->outputType();
   auto const& leftKeys = joinNode_->leftKeys(); // probe keys
   auto const& rightKeys = joinNode_->rightKeys(); // build keys
 
   if (CudfConfig::getInstance().debugEnabled) {
-    for (int i = 0; i < probeType->names().size(); i++) {
-      VLOG(1) << "Left column " << i << ": " << probeType->names()[i];
+    for (int i = 0; i < probeType_->names().size(); i++) {
+      VLOG(1) << "Left column " << i << ": " << probeType_->names()[i];
     }
 
-    for (int i = 0; i < buildType->names().size(); i++) {
-      VLOG(1) << "Right column " << i << ": " << buildType->names()[i];
+    for (int i = 0; i < buildType_->names().size(); i++) {
+      VLOG(1) << "Right column " << i << ": " << buildType_->names()[i];
     }
 
     for (int i = 0; i < leftKeys.size(); i++) {
@@ -409,39 +450,50 @@ CudfHashJoinProbe::CudfHashJoinProbe(
     }
   }
 
-  auto const probeTableNumColumns = probeType->size();
+  auto const probeTableNumColumns = probeType_->size();
   leftKeyIndices_ = std::vector<cudf::size_type>(leftKeys.size());
   for (size_t i = 0; i < leftKeyIndices_.size(); i++) {
     leftKeyIndices_[i] = static_cast<cudf::size_type>(
-        probeType->getChildIdx(leftKeys[i]->name()));
+        probeType_->getChildIdx(leftKeys[i]->name()));
     VELOX_CHECK_LT(leftKeyIndices_[i], probeTableNumColumns);
   }
-  auto const buildTableNumColumns = buildType->size();
+  auto const buildTableNumColumns = buildType_->size();
   rightKeyIndices_ = std::vector<cudf::size_type>(rightKeys.size());
   for (size_t i = 0; i < rightKeyIndices_.size(); i++) {
     rightKeyIndices_[i] = static_cast<cudf::size_type>(
-        buildType->getChildIdx(rightKeys[i]->name()));
+        buildType_->getChildIdx(rightKeys[i]->name()));
     VELOX_CHECK_LT(rightKeyIndices_[i], buildTableNumColumns);
   }
 
   auto outputType = joinNode_->outputType();
+  auto numOutputColumns = outputType->names().size();
+  if (joinNode_->isLeftSemiProjectJoin()) {
+    VELOX_CHECK_GE(numOutputColumns, 1);
+    matchColumnOutputIndex_ =
+        static_cast<int32_t>(numOutputColumns - 1);
+    VELOX_CHECK_EQ(
+        outputType->childAt(matchColumnOutputIndex_),
+        BOOLEAN());
+    --numOutputColumns;
+  }
+
   leftColumnIndicesToGather_ = std::vector<cudf::size_type>();
   rightColumnIndicesToGather_ = std::vector<cudf::size_type>();
   leftColumnOutputIndices_ = std::vector<size_t>();
   rightColumnOutputIndices_ = std::vector<size_t>();
-  for (int i = 0; i < outputType->names().size(); i++) {
+  for (size_t i = 0; i < numOutputColumns; i++) {
     auto const outputName = outputType->names()[i];
     if (CudfConfig::getInstance().debugEnabled) {
       VLOG(1) << "Output column " << i << ": " << outputName;
     }
-    auto channel = probeType->getChildIdxIfExists(outputName);
+    auto channel = probeType_->getChildIdxIfExists(outputName);
     if (channel.has_value()) {
       leftColumnIndicesToGather_.push_back(
           static_cast<cudf::size_type>(channel.value()));
       leftColumnOutputIndices_.push_back(i);
       continue;
     }
-    channel = buildType->getChildIdxIfExists(outputName);
+    channel = buildType_->getChildIdxIfExists(outputName);
     if (channel.has_value()) {
       rightColumnIndicesToGather_.push_back(
           static_cast<cudf::size_type>(channel.value()));
@@ -449,7 +501,8 @@ CudfHashJoinProbe::CudfHashJoinProbe(
       continue;
     }
     VELOX_FAIL(
-        "Join field {} not in probe or build input", outputType->children()[i]);
+        "Join field {} not in probe or build input",
+        outputType->children()[i]);
   }
 
   if (CudfConfig::getInstance().debugEnabled) {
@@ -473,16 +526,13 @@ void CudfHashJoinProbe::initialize() {
     return;
   }
 
-  auto probeType = joinNode_->sources()[0]->outputType();
-  auto buildType = joinNode_->sources()[1]->outputType();
-
   exec::ExprSet exprs({joinNode_->filter()}, operatorCtx_->execCtx());
   VELOX_CHECK_EQ(exprs.exprs().size(), 1);
 
   // Create a reusable evaluator for the filter column. This is expensive to
   // build, and the expression + input schema are stable for the lifetime of
   // the operator instance.
-  std::vector<velox::RowTypePtr> filterRowTypes{probeType, buildType};
+  std::vector<velox::RowTypePtr> filterRowTypes{probeType_, buildType_};
   filterEvaluator_ = createCudfExpression(
       exprs.exprs()[0],
       facebook::velox::type::concatRowTypes(filterRowTypes));
@@ -493,33 +543,25 @@ void CudfHashJoinProbe::initialize() {
   // and the column locations in that schema translate to column locations
   // in whole tables
 
-  std::vector<PrecomputeInstruction> rightPrecomputeInstructions;
-  std::vector<PrecomputeInstruction> leftPrecomputeInstructions;
-  static constexpr bool kAllowPureAstOnly = true;
+  // create ast tree
   if (joinNode_->isRightJoin() || joinNode_->isRightSemiFilterJoin()) {
     createAstTree(
         exprs.exprs()[0],
         tree_,
         scalars_,
-        buildType,
-        probeType,
-        rightPrecomputeInstructions,
-        leftPrecomputeInstructions,
-        kAllowPureAstOnly);
+        buildType_,
+        probeType_,
+        rightPrecomputeInstructions_,
+        leftPrecomputeInstructions_);
   } else {
     createAstTree(
         exprs.exprs()[0],
         tree_,
         scalars_,
-        probeType,
-        buildType,
-        leftPrecomputeInstructions,
-        rightPrecomputeInstructions,
-        kAllowPureAstOnly);
-  }
-  if (leftPrecomputeInstructions.size() > 0 ||
-      rightPrecomputeInstructions.size() > 0) {
-    VELOX_NYI("Filters that require precomputation are not yet supported");
+        probeType_,
+        buildType_,
+        leftPrecomputeInstructions_,
+        rightPrecomputeInstructions_);
   }
 }
 
@@ -577,7 +619,8 @@ void CudfHashJoinProbe::noMoreInput() {
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
   GpuGuard gpuGuard;
   Operator::noMoreInput();
-  if (!joinNode_->isRightJoin() && !joinNode_->isRightSemiFilterJoin()) {
+  if (!joinNode_->isRightJoin() && !joinNode_->isRightSemiFilterJoin() &&
+      !joinNode_->isFullJoin()) {
     return;
   }
   std::vector<ContinuePromise> promises;
@@ -597,7 +640,7 @@ void CudfHashJoinProbe::noMoreInput() {
     }
   };
 
-  if (joinNode_->isRightJoin()) {
+  if (joinNode_->isRightJoin() || joinNode_->isFullJoin()) {
     isLastDriver_ = true;
     if (hashObject_.has_value()) {
       auto stream = cudfGlobalStreamPool().get_stream();
@@ -725,8 +768,13 @@ std::unique_ptr<cudf::table> CudfHashJoinProbe::filteredOutput(
   VELOX_CHECK_NOT_NULL(
       filterEvaluator_,
       "Join filter evaluator must be initialized before filteredOutput()");
+  std::vector<cudf::column_view> joinedColViews;
+  joinedColViews.reserve(joinedCols.size());
+  for (const auto& col : joinedCols) {
+    joinedColViews.push_back(col->view());
+  }
   auto filterColumns = filterEvaluator_->eval(
-      joinedCols, stream, cudf::get_current_device_resource_ref());
+      joinedColViews, stream, cudf::get_current_device_resource_ref());
   auto filterColumn = asView(filterColumns);
 
   joinedCols = func(std::move(joinedCols), filterColumn);
@@ -755,12 +803,15 @@ std::unique_ptr<cudf::table> CudfHashJoinProbe::filteredOutputIndices(
     cudf::column_view leftIndicesCol,
     cudf::table_view rightTableView,
     cudf::column_view rightIndicesCol,
+    cudf::table_view extendedLeftView,
+    cudf::table_view extendedRightView,
     cudf::join_kind joinKind,
     rmm::cuda_stream_view stream) {
+  // Use extended views (with precomputed columns) for filter evaluation
   auto [filteredLeftJoinIndices, filteredRightJoinIndices] =
       cudf::filter_join_indices(
-          leftTableView,
-          rightTableView,
+          extendedLeftView,
+          extendedRightView,
           leftIndicesCol,
           rightIndicesCol,
           tree_.back(),
@@ -773,6 +824,7 @@ std::unique_ptr<cudf::table> CudfHashJoinProbe::filteredOutputIndices(
       cudf::device_span<cudf::size_type const>{*filteredRightJoinIndices};
   auto filteredLeftIndicesCol = cudf::column_view{filteredLeftIndicesSpan};
   auto filteredRightIndicesCol = cudf::column_view{filteredRightIndicesSpan};
+  // Use original views (without precomputed columns) for gathering output
   return unfilteredOutput(
       leftTableView,
       filteredLeftIndicesCol,
@@ -788,9 +840,30 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::innerJoin(
 
   auto& rightTables = hashObject_.value().first;
   auto& hbs = hashObject_.value().second;
+
+  // Precompute left (probe) table columns if needed (once, outside loop)
+  std::vector<ColumnOrView> leftPrecomputed;
+  cudf::table_view extendedLeftView = leftTableView;
+  if (joinNode_->filter() && !leftPrecomputeInstructions_.empty()) {
+    auto leftColumnViews = tableViewToColumnViews(leftTableView);
+    leftPrecomputed = precomputeSubexpressions(
+        leftColumnViews,
+        leftPrecomputeInstructions_,
+        scalars_,
+        probeType_,
+        stream);
+    extendedLeftView = createExtendedTableView(leftTableView, leftPrecomputed);
+  }
+
   for (auto i = 0; i < rightTables.size(); i++) {
     auto rightTableView = rightTables[i]->view();
     auto& hb = hbs[i];
+
+    // Use cached precomputed columns for right (build) table
+    cudf::table_view extendedRightView =
+        (joinNode_->filter() && !rightPrecomputeInstructions_.empty())
+        ? cachedExtendedRightViews_[i]
+        : rightTableView;
 
     // left = probe, right = build
     VELOX_CHECK_NOT_NULL(hb);
@@ -821,6 +894,8 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::innerJoin(
           leftIndicesCol,
           rightTableView,
           rightIndicesCol,
+          extendedLeftView,
+          extendedRightView,
           cudf::join_kind::INNER_JOIN,
           stream));
     } else {
@@ -842,9 +917,30 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::leftJoin(
 
   auto& rightTables = hashObject_.value().first;
   auto& hbs = hashObject_.value().second;
+
+  // Precompute left (probe) table columns if needed (once, outside loop)
+  std::vector<ColumnOrView> leftPrecomputed;
+  cudf::table_view extendedLeftView = leftTableView;
+  if (joinNode_->filter() && !leftPrecomputeInstructions_.empty()) {
+    auto leftColumnViews = tableViewToColumnViews(leftTableView);
+    leftPrecomputed = precomputeSubexpressions(
+        leftColumnViews,
+        leftPrecomputeInstructions_,
+        scalars_,
+        probeType_,
+        stream);
+    extendedLeftView = createExtendedTableView(leftTableView, leftPrecomputed);
+  }
+
   for (auto i = 0; i < rightTables.size(); i++) {
     auto rightTableView = rightTables[i]->view();
     auto& hb = hbs[i];
+
+    // Use cached precomputed columns for right (build) table
+    cudf::table_view extendedRightView =
+        (joinNode_->filter() && !rightPrecomputeInstructions_.empty())
+        ? cachedExtendedRightViews_[i]
+        : rightTableView;
 
     VELOX_CHECK_NOT_NULL(hb);
     if (buildStream_.has_value()) {
@@ -872,6 +968,8 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::leftJoin(
           leftIndicesCol,
           rightTableView,
           rightIndicesCol,
+          extendedLeftView,
+          extendedRightView,
           cudf::join_kind::LEFT_JOIN,
           stream));
     } else {
@@ -912,32 +1010,33 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::rightJoin(
     // cudf::scatter is async: it enqueues a device memcpy of the old flags
     // (the target) plus a thrust::scatter kernel onto `stream`, then returns
     // immediately. The old rightMatchedFlags_[i] column must stay alive until
-    // that work completes. We defer the assignment to rightMatchedFlags_[i]
-    // until after unfilteredOutput/filteredOutput (which call
-    // stream.synchronize()), so the old column is not destroyed while the
-    // scatter kernel is still reading from it.
-    std::unique_ptr<cudf::column> updated_flag_col;
     if (!joinNode_->filter()) {
-      // Mark matched rights using scatter of true into flags at matching
-      // indices
-      // TODO (dm): Use a better implementation that doesn't require making a
-      // scalar and broadcasting. My cuDF foo is rusty
-      auto true_scalar = cudf::numeric_scalar<bool>(true, true, stream);
-      auto true_col = cudf::make_column_from_scalar(
-          true_scalar,
-          rightJoinIndices->size(),
-          stream,
-          cudf::get_current_device_resource_ref());
-      auto flags_table = cudf::table_view({rightMatchedFlags_[i]->view()});
+      // Mark matched build rows by checking which row indices appear in
+      // rightJoinIndices. Use contains to avoid scatter with duplicate indices.
       auto rightIdxCol = cudf::column_view{
           cudf::device_span<cudf::size_type const>{*rightJoinIndices}};
-      auto updated_flags_tbl = cudf::scatter(
-          cudf::table_view({true_col->view()}),
-          rightIdxCol,
-          flags_table,
+
+      // Create sequence [0, 1, ..., n-1] for build table row indices
+      auto n = rightTableView.num_rows();
+      auto rowIndices = cudf::sequence(
+          n,
+          cudf::numeric_scalar<cudf::size_type>(0, true, stream),
+          cudf::numeric_scalar<cudf::size_type>(1, true, stream),
           stream,
           cudf::get_current_device_resource_ref());
-      updated_flag_col = std::move(updated_flags_tbl->release()[0]);    
+
+      // Check which build row indices are present in the join result
+      auto matchedInBatch = cudf::contains(rightIdxCol, rowIndices->view());
+
+      // OR with existing flags to accumulate matches across batches
+      auto updatedFlags = cudf::binary_operation(
+          rightMatchedFlags_[i]->view(),
+          matchedInBatch->view(),
+          cudf::binary_operator::BITWISE_OR,
+          cudf::data_type{cudf::type_id::BOOL8},
+          stream,
+          cudf::get_current_device_resource_ref());
+      rightMatchedFlags_[i] = std::move(updatedFlags);
     }
 
     auto leftIndicesSpan =
@@ -950,8 +1049,9 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::rightJoin(
 
     if (joinNode_->filter()) {
       auto& rightMatchedFlags = rightMatchedFlags_[i];
+      auto numBuildRows = rightTableView.num_rows();
       auto filterFunc =
-          [&rightMatchedFlags, &updated_flag_col, rightIndicesSpan, stream](
+          [&rightMatchedFlags, rightIndicesSpan, numBuildRows, stream](
               std::vector<std::unique_ptr<cudf::column>>&& joinedCols,
               cudf::column_view filterColumn) {
             // apply the filter
@@ -972,22 +1072,26 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::rightJoin(
             auto filteredCols = filteredIdxTable->release();
             auto filteredRightIdxCol = std::move(filteredCols[0]);
 
-            // TODO (dm): The below code is repeated from non-filter case. Find
-            // a way to consolidate in future
-            auto true_scalar = cudf::numeric_scalar<bool>(true, true, stream);
-            auto true_col = cudf::make_column_from_scalar(
-                true_scalar,
-                filteredRightIdxCol->size(),
+            // Use contains to check which build row indices passed the filter
+            auto rowIndices = cudf::sequence(
+                numBuildRows,
+                cudf::numeric_scalar<cudf::size_type>(0, true, stream),
+                cudf::numeric_scalar<cudf::size_type>(1, true, stream),
                 stream,
                 cudf::get_current_device_resource_ref());
-            auto flags_table = cudf::table_view({rightMatchedFlags->view()});
-            auto updated_flags_tbl = cudf::scatter(
-                cudf::table_view({true_col->view()}),
-                filteredRightIdxCol->view(),
-                flags_table,
+
+            auto matchedInBatch =
+                cudf::contains(filteredRightIdxCol->view(), rowIndices->view());
+
+            // OR with existing flags to accumulate matches across batches
+            auto updatedFlags = cudf::binary_operation(
+                rightMatchedFlags->view(),
+                matchedInBatch->view(),
+                cudf::binary_operator::BITWISE_OR,
+                cudf::data_type{cudf::type_id::BOOL8},
                 stream,
                 cudf::get_current_device_resource_ref());
-            updated_flag_col = std::move(updated_flags_tbl->release()[0]);
+            rightMatchedFlags = std::move(updatedFlags);
             return std::move(joinedCols);
           };
       cudfOutputs.push_back(filteredOutput(
@@ -1005,8 +1109,136 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::rightJoin(
           rightIndicesCol,
           stream));
     }
-    // Safe to assign now: stream has been synchronized by the output call above.
-    rightMatchedFlags_[i] = std::move(updated_flag_col);
+  }
+  return cudfOutputs;
+}
+
+std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::fullJoin(
+    cudf::table_view leftTableView,
+    rmm::cuda_stream_view stream) {
+  std::vector<std::unique_ptr<cudf::table>> cudfOutputs;
+
+  auto& rightTables = hashObject_.value().first;
+  auto& hbs = hashObject_.value().second;
+
+  for (auto i = 0; i < rightTables.size(); i++) {
+    auto rightTableView = rightTables[i]->view();
+    auto& hb = hbs[i];
+
+    VELOX_CHECK_NOT_NULL(hb);
+    if (buildStream_.has_value()) {
+      cudaEvent_->recordFrom(stream).waitOn(buildStream_.value());
+    }
+    // Use left_join to get all probe rows (matched + unmatched).
+    // Track matched build rows in rightMatchedFlags_ for last driver to emit
+    // unmatched build rows at the end.
+    auto [leftJoinIndices, rightJoinIndices] = hb->left_join(
+        leftTableView.select(leftKeyIndices_),
+        std::nullopt,
+        buildStream_.has_value() ? buildStream_.value() : stream);
+    if (buildStream_.has_value()) {
+      cudaEvent_->recordFrom(buildStream_.value()).waitOn(stream);
+    }
+    if (!joinNode_->filter()) {
+      // Mark matched build rows by checking which row indices appear in
+      // rightJoinIndices. Use contains to avoid scatter with duplicate indices.
+      auto rightIdxCol = cudf::column_view{
+          cudf::device_span<cudf::size_type const>{*rightJoinIndices}};
+
+      // Create sequence [0, 1, ..., n-1] for build table row indices
+      auto n = rightTableView.num_rows();
+      auto rowIndices = cudf::sequence(
+          n,
+          cudf::numeric_scalar<cudf::size_type>(0, true, stream),
+          cudf::numeric_scalar<cudf::size_type>(1, true, stream),
+          stream,
+          cudf::get_current_device_resource_ref());
+
+      // Check which build row indices are present in the join result
+      auto matchedInBatch = cudf::contains(rightIdxCol, rowIndices->view());
+
+      // OR with existing flags to accumulate matches across batches
+      auto updatedFlags = cudf::binary_operation(
+          rightMatchedFlags_[i]->view(),
+          matchedInBatch->view(),
+          cudf::binary_operator::BITWISE_OR,
+          cudf::data_type{cudf::type_id::BOOL8},
+          stream,
+          cudf::get_current_device_resource_ref());
+      rightMatchedFlags_[i] = std::move(updatedFlags);
+    }
+
+    auto leftIndicesSpan =
+        cudf::device_span<cudf::size_type const>{*leftJoinIndices};
+    auto rightIndicesSpan =
+        cudf::device_span<cudf::size_type const>{*rightJoinIndices};
+    auto leftIndicesCol = cudf::column_view{leftIndicesSpan};
+    auto rightIndicesCol = cudf::column_view{rightIndicesSpan};
+
+    if (joinNode_->filter()) {
+      // Use filter_join_indices with LEFT_JOIN to get proper full join probe
+      // semantics: all probe rows are kept, build columns are NULL when filter
+      // fails or no match.
+      auto [filteredLeftJoinIndices, filteredRightJoinIndices] =
+          cudf::filter_join_indices(
+              leftTableView,
+              rightTableView,
+              leftIndicesCol,
+              rightIndicesCol,
+              tree_.back(),
+              cudf::join_kind::LEFT_JOIN,
+              stream);
+
+      // Track matched build rows for unmatched row emission at end.
+      // Use contains to check which build row indices passed the filter.
+      auto& rightMatchedFlags = rightMatchedFlags_[i];
+      auto filteredRightIndicesSpan =
+          cudf::device_span<cudf::size_type const>{*filteredRightJoinIndices};
+      auto filteredRightIdxCol = cudf::column_view{filteredRightIndicesSpan};
+
+      // Create sequence [0, 1, ..., n-1] for build table row indices
+      auto n = rightTableView.num_rows();
+      auto rowIndices = cudf::sequence(
+          n,
+          cudf::numeric_scalar<cudf::size_type>(0, true, stream),
+          cudf::numeric_scalar<cudf::size_type>(1, true, stream),
+          stream,
+          cudf::get_current_device_resource_ref());
+
+      // Check which build row indices are present in the filtered join result
+      auto matchedInBatch =
+          cudf::contains(filteredRightIdxCol, rowIndices->view());
+
+      // OR with existing flags to accumulate matches across batches
+      auto updatedFlags = cudf::binary_operation(
+          rightMatchedFlags->view(),
+          matchedInBatch->view(),
+          cudf::binary_operator::BITWISE_OR,
+          cudf::data_type{cudf::type_id::BOOL8},
+          stream,
+          cudf::get_current_device_resource_ref());
+      rightMatchedFlags = std::move(updatedFlags);
+
+      // Build output using filtered indices
+      auto filteredLeftIndicesSpan =
+          cudf::device_span<cudf::size_type const>{*filteredLeftJoinIndices};
+      auto filteredLeftIndicesCol = cudf::column_view{filteredLeftIndicesSpan};
+      auto filteredRightIndicesCol =
+          cudf::column_view{filteredRightIndicesSpan};
+      cudfOutputs.push_back(unfilteredOutput(
+          leftTableView,
+          filteredLeftIndicesCol,
+          rightTableView,
+          filteredRightIndicesCol,
+          stream));
+    } else {
+      cudfOutputs.push_back(unfilteredOutput(
+          leftTableView,
+          leftIndicesCol,
+          rightTableView,
+          rightIndicesCol,
+          stream));
+    }
   }
   return cudfOutputs;
 }
@@ -1056,6 +1288,154 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::leftSemiFilterJoin(
         rightIndicesCol->view(),
         stream));
   }
+  return cudfOutputs;
+}
+
+std::vector<std::unique_ptr<cudf::table>>
+CudfHashJoinProbe::leftSemiProjectJoin(
+    cudf::table_view leftTableView,
+    rmm::cuda_stream_view stream) {
+  std::vector<std::unique_ptr<cudf::table>> cudfOutputs;
+  auto& rightTables = hashObject_.value().first;
+  auto leftNumRows = leftTableView.num_rows();
+
+  auto falseScalar =
+      cudf::numeric_scalar<bool>(false, true, stream);
+  auto matchFlags = cudf::make_column_from_scalar(
+      falseScalar,
+      leftNumRows,
+      stream,
+      cudf::get_current_device_resource_ref());
+
+  auto rowIndices = cudf::sequence(
+      leftNumRows,
+      cudf::numeric_scalar<cudf::size_type>(0, true, stream),
+      cudf::numeric_scalar<cudf::size_type>(1, true, stream),
+      stream,
+      cudf::get_current_device_resource_ref());
+
+  for (auto i = 0; i < rightTables.size(); i++) {
+    auto rightTableView = rightTables[i]->view();
+    std::unique_ptr<rmm::device_uvector<cudf::size_type>>
+        leftJoinIndices;
+
+    if (joinNode_->filter()) {
+      leftJoinIndices = cudf::mixed_left_semi_join(
+          leftTableView.select(leftKeyIndices_),
+          rightTableView.select(rightKeyIndices_),
+          leftTableView,
+          rightTableView,
+          tree_.back(),
+          cudf::null_equality::UNEQUAL,
+          stream,
+          cudf::get_current_device_resource_ref());
+    } else {
+      cudf::filtered_join filter_join(
+          rightTableView.select(rightKeyIndices_),
+          cudf::null_equality::UNEQUAL,
+          cudf::set_as_build_table::RIGHT,
+          stream);
+      leftJoinIndices = filter_join.semi_join(
+          leftTableView.select(leftKeyIndices_),
+          stream,
+          cudf::get_current_device_resource_ref());
+    }
+
+    if (leftJoinIndices->size() > 0) {
+      auto leftIdxCol = cudf::column_view{
+          cudf::device_span<cudf::size_type const>{
+              *leftJoinIndices}};
+      auto matchedInBatch =
+          cudf::contains(leftIdxCol, rowIndices->view());
+      auto updated = cudf::binary_operation(
+          matchFlags->view(),
+          matchedInBatch->view(),
+          cudf::binary_operator::BITWISE_OR,
+          cudf::data_type{cudf::type_id::BOOL8},
+          stream,
+          cudf::get_current_device_resource_ref());
+      matchFlags = std::move(updated);
+    }
+  }
+
+  if (joinNode_->isNullAware()) {
+    auto mr = cudf::get_current_device_resource_ref();
+    bool buildIsEmpty = true;
+    bool buildHasNullKeys = false;
+    for (const auto& rt : rightTables) {
+      if (rt->view().num_rows() > 0) {
+        buildIsEmpty = false;
+        if (cudf::has_nulls(
+                rt->view().select(rightKeyIndices_))) {
+          buildHasNullKeys = true;
+        }
+      }
+    }
+
+    // x IN (empty set) = false for any x, including null.
+    if (!buildIsEmpty) {
+      auto trueScalar =
+          cudf::numeric_scalar<bool>(true, true, stream);
+      auto probeKeyNotNull = cudf::make_column_from_scalar(
+          trueScalar, leftNumRows, stream, mr);
+      for (auto ki : leftKeyIndices_) {
+        auto keyCol = leftTableView.column(ki);
+        if (keyCol.has_nulls()) {
+          auto isValid =
+              cudf::is_valid(keyCol, stream, mr);
+          probeKeyNotNull = cudf::binary_operation(
+              probeKeyNotNull->view(),
+              isValid->view(),
+              cudf::binary_operator::BITWISE_AND,
+              cudf::data_type{cudf::type_id::BOOL8},
+              stream,
+              mr);
+        }
+      }
+
+      std::unique_ptr<cudf::column> validMask;
+      if (buildHasNullKeys) {
+        validMask = cudf::binary_operation(
+            probeKeyNotNull->view(),
+            matchFlags->view(),
+            cudf::binary_operator::BITWISE_AND,
+            cudf::data_type{cudf::type_id::BOOL8},
+            stream,
+            mr);
+      } else {
+        validMask = std::move(probeKeyNotNull);
+      }
+
+      auto nullScalar =
+          cudf::numeric_scalar<bool>(false, false, stream);
+      matchFlags = cudf::copy_if_else(
+          matchFlags->view(),
+          nullScalar,
+          validMask->view(),
+          stream,
+          mr);
+    }
+  }
+
+  auto leftInput =
+      leftTableView.select(leftColumnIndicesToGather_);
+  std::vector<std::unique_ptr<cudf::column>> outCols(
+      outputType_->size());
+  for (size_t j = 0; j < leftColumnOutputIndices_.size(); ++j) {
+    auto outIdx = leftColumnOutputIndices_[j];
+    outCols[outIdx] = std::make_unique<cudf::column>(
+        leftInput.column(j),
+        stream,
+        cudf::get_current_device_resource_ref());
+  }
+  outCols[matchColumnOutputIndex_] = std::move(matchFlags);
+
+  if (buildStream_.has_value()) {
+    cudaEvent_->recordFrom(stream).waitOn(buildStream_.value());
+  }
+  stream.synchronize();
+  cudfOutputs.push_back(
+      std::make_unique<cudf::table>(std::move(outCols)));
   return cudfOutputs;
 }
 
@@ -1115,6 +1495,7 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::antiJoin(
     rmm::cuda_stream_view stream) {
   std::vector<std::unique_ptr<cudf::table>> cudfOutputs;
   auto& rightTables = hashObject_.value().first;
+  auto mr = cudf::get_current_device_resource_ref();
 
   VELOX_CHECK_EQ(
       rightTables.size(),
@@ -1123,28 +1504,31 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::antiJoin(
 
   auto rightTableView = rightTables[0]->view();
 
-  // For the special case where we need to drop nulls, we create a local table.
-  // Otherwise, we use the input view directly.
+  if (joinNode_->isNullAware() && joinNode_->filter()) {
+    return nullAwareAntiJoinWithFilter(
+        leftTableViewParam, rightTableView, stream);
+  }
+
   std::unique_ptr<cudf::table> modifiedLeftTable;
   cudf::table_view leftTableView = leftTableViewParam;
 
-  // Special case for null-aware anti join where
-  // build table is not empty, no nulls, and probe table has nulls
-  if (joinNode_->isNullAware() and !joinNode_->filter()) {
+  if (joinNode_->isNullAware() && !joinNode_->filter()) {
     auto const leftTableHasNulls =
-        cudf::has_nulls(leftTableViewParam.select(leftKeyIndices_));
+        cudf::has_nulls(
+            leftTableViewParam.select(leftKeyIndices_));
     auto const rightTableHasNulls =
-        cudf::has_nulls(rightTableView.select(rightKeyIndices_));
-    if (rightTables[0]->num_rows() > 0 and !rightTableHasNulls and
-        leftTableHasNulls) {
-      // drop nulls on probe table - creates a new table
-      modifiedLeftTable =
-          cudf::drop_nulls(leftTableViewParam, leftKeyIndices_, stream);
+        cudf::has_nulls(
+            rightTableView.select(rightKeyIndices_));
+    if (rightTables[0]->num_rows() > 0 &&
+        !rightTableHasNulls && leftTableHasNulls) {
+      modifiedLeftTable = cudf::drop_nulls(
+          leftTableViewParam, leftKeyIndices_, stream);
       leftTableView = modifiedLeftTable->view();
     }
   }
 
-  std::unique_ptr<rmm::device_uvector<cudf::size_type>> leftJoinIndices;
+  std::unique_ptr<rmm::device_uvector<cudf::size_type>>
+      leftJoinIndices;
   if (joinNode_->filter()) {
     leftJoinIndices = cudf::mixed_left_anti_join(
         leftTableView.select(leftKeyIndices_),
@@ -1154,14 +1538,15 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::antiJoin(
         tree_.back(),
         cudf::null_equality::UNEQUAL,
         stream,
-        cudf::get_current_device_resource_ref());
+        mr);
   } else {
     auto const rightTableHasNulls =
-        cudf::has_nulls(rightTableView.select(rightKeyIndices_));
-    if (joinNode_->isNullAware() and rightTableHasNulls) {
-      // empty result
-      leftJoinIndices = std::make_unique<rmm::device_uvector<cudf::size_type>>(
-          0, stream, cudf::get_current_device_resource_ref());
+        cudf::has_nulls(
+            rightTableView.select(rightKeyIndices_));
+    if (joinNode_->isNullAware() && rightTableHasNulls) {
+      leftJoinIndices =
+          std::make_unique<rmm::device_uvector<cudf::size_type>>(
+              0, stream, mr);
     } else {
       cudf::filtered_join filter_join(
           rightTableView.select(rightKeyIndices_),
@@ -1171,7 +1556,7 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::antiJoin(
       leftJoinIndices = filter_join.anti_join(
           leftTableView.select(leftKeyIndices_),
           stream,
-          cudf::get_current_device_resource_ref());
+          mr);
     }
   }
 
@@ -1186,6 +1571,318 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::antiJoin(
       rightIndicesCol->view(),
       stream));
 
+  return cudfOutputs;
+}
+
+std::vector<std::unique_ptr<cudf::table>>
+CudfHashJoinProbe::nullAwareAntiJoinWithFilter(
+    cudf::table_view leftTableViewParam,
+    cudf::table_view rightTableView,
+    rmm::cuda_stream_view stream) {
+  std::vector<std::unique_ptr<cudf::table>> cudfOutputs;
+  auto mr = cudf::get_current_device_resource_ref();
+
+  auto leftNonNullTable =
+      cudf::drop_nulls(leftTableViewParam, leftKeyIndices_, stream);
+  auto leftNonNull = leftNonNullTable->view();
+  auto leftN = leftNonNull.num_rows();
+
+  auto buildHasNullKeys =
+      cudf::has_nulls(rightTableView.select(rightKeyIndices_));
+
+  std::unique_ptr<cudf::column> rowIndices;
+  std::unique_ptr<cudf::column> candidateMask;
+  if (leftN > 0) {
+    rowIndices = cudf::sequence(
+        leftN,
+        cudf::numeric_scalar<cudf::size_type>(0, true, stream),
+        cudf::numeric_scalar<cudf::size_type>(1, true, stream),
+        stream,
+        mr);
+
+    candidateMask = cudf::make_column_from_scalar(
+        cudf::numeric_scalar<bool>(true, true, stream),
+        leftN,
+        stream,
+        mr);
+  }
+
+  // Exclude left rows matching non-null-key build rows via
+  // key equality + filter. With UNEQUAL null equality, null
+  // build keys are invisible.
+  if (leftN > 0 && rightTableView.num_rows() > 0) {
+    std::unique_ptr<rmm::device_uvector<cudf::size_type>>
+        antiIndices;
+    if (buildHasNullKeys) {
+      // Extract non-null-key build rows
+      auto rightNonNull = cudf::drop_nulls(
+          rightTableView, rightKeyIndices_, stream);
+      if (rightNonNull->num_rows() > 0) {
+        antiIndices = cudf::mixed_left_anti_join(
+            leftNonNull.select(leftKeyIndices_),
+            rightNonNull->view().select(rightKeyIndices_),
+            leftNonNull,
+            rightNonNull->view(),
+            tree_.back(),
+            cudf::null_equality::UNEQUAL,
+            stream,
+            mr);
+      }
+    } else {
+      antiIndices = cudf::mixed_left_anti_join(
+          leftNonNull.select(leftKeyIndices_),
+          rightTableView.select(rightKeyIndices_),
+          leftNonNull,
+          rightTableView,
+          tree_.back(),
+          cudf::null_equality::UNEQUAL,
+          stream,
+          mr);
+    }
+    if (antiIndices && antiIndices->size() > 0) {
+      auto antiCol = cudf::column_view{
+          cudf::device_span<cudf::size_type const>{
+              *antiIndices}};
+      auto inAnti =
+          cudf::contains(antiCol, rowIndices->view());
+      candidateMask = cudf::binary_operation(
+          candidateMask->view(),
+          inAnti->view(),
+          cudf::binary_operator::BITWISE_AND,
+          cudf::data_type{cudf::type_id::BOOL8},
+          stream,
+          mr);
+    } else if (!antiIndices || antiIndices->size() == 0) {
+      if (!buildHasNullKeys ||
+          cudf::drop_nulls(
+              rightTableView, rightKeyIndices_, stream)
+                  ->num_rows() > 0) {
+        // Anti-join returned nothing: all left rows matched.
+        // Unless no non-null build rows existed.
+        auto falseScalar =
+            cudf::numeric_scalar<bool>(false, true, stream);
+        candidateMask = cudf::make_column_from_scalar(
+            falseScalar, leftN, stream, mr);
+      }
+    }
+  }
+
+  // Exclude left rows matching any null-key build row via
+  // filter. Use dummy constant keys so every pair passes key
+  // equality, letting the filter decide.
+  if (leftN > 0 && buildHasNullKeys &&
+      rightTableView.num_rows() > 0) {
+    // Build per-row "any key is null" mask for right table
+    auto rightN = rightTableView.num_rows();
+    auto anyKeyNull = cudf::make_column_from_scalar(
+        cudf::numeric_scalar<bool>(false, true, stream),
+        rightN,
+        stream,
+        mr);
+    for (auto keyIdx : rightKeyIndices_) {
+      auto col = rightTableView.column(keyIdx);
+      if (!col.has_nulls()) {
+        continue;
+      }
+      auto nullScalar =
+          cudf::make_default_constructed_scalar(
+              col.type(), stream, mr);
+      auto isNull = cudf::binary_operation(
+          col,
+          *nullScalar,
+          cudf::binary_operator::NULL_EQUALS,
+          cudf::data_type{cudf::type_id::BOOL8},
+          stream,
+          mr);
+      anyKeyNull = cudf::binary_operation(
+          anyKeyNull->view(),
+          isNull->view(),
+          cudf::binary_operator::BITWISE_OR,
+          cudf::data_type{cudf::type_id::BOOL8},
+          stream,
+          mr);
+    }
+
+    auto rightNullKeys = cudf::apply_boolean_mask(
+        rightTableView, anyKeyNull->view(), stream);
+    auto nullKeyN = rightNullKeys->num_rows();
+
+    if (nullKeyN > 0) {
+      // Dummy constant keys: every (left, rightNull) pair
+      // passes key equality so the filter is evaluated on all
+      // cross-product pairs.
+      auto zeroScalar = cudf::numeric_scalar<cudf::size_type>(
+          0, true, stream);
+      auto leftDummyKey = cudf::make_column_from_scalar(
+          zeroScalar, leftN, stream, mr);
+      auto rightDummyKey = cudf::make_column_from_scalar(
+          zeroScalar, nullKeyN, stream, mr);
+
+      auto semiIndices = cudf::mixed_left_semi_join(
+          cudf::table_view({leftDummyKey->view()}),
+          cudf::table_view({rightDummyKey->view()}),
+          leftNonNull,
+          rightNullKeys->view(),
+          tree_.back(),
+          cudf::null_equality::UNEQUAL,
+          stream,
+          mr);
+
+      if (semiIndices->size() > 0) {
+        auto semiCol = cudf::column_view{
+            cudf::device_span<cudf::size_type const>{
+                *semiIndices}};
+        auto inSemi =
+            cudf::contains(semiCol, rowIndices->view());
+        auto notInSemi = cudf::unary_operation(
+            inSemi->view(),
+            cudf::unary_operator::NOT,
+            stream);
+        candidateMask = cudf::binary_operation(
+            candidateMask->view(),
+            notInSemi->view(),
+            cudf::binary_operator::BITWISE_AND,
+            cudf::data_type{cudf::type_id::BOOL8},
+            stream,
+            mr);
+      }
+    }
+  }
+
+  // Collect surviving non-null-keyed rows
+  std::unique_ptr<cudf::table> nonNullResult;
+  if (leftN > 0) {
+    auto leftInput =
+        leftNonNull.select(leftColumnIndicesToGather_);
+    nonNullResult = cudf::apply_boolean_mask(
+        leftInput, candidateMask->view(), stream);
+  }
+
+  // Handle null-keyed probe rows.
+  // null NOT IN (empty) = true  -> keep
+  // null NOT IN (non-empty where filter passes) = null -> exclude
+  // null NOT IN (non-empty where NO filter passes) = true -> keep
+  std::unique_ptr<cudf::table> nullKeyResult;
+  auto totalLeft = leftTableViewParam.num_rows();
+  if (totalLeft > leftN) {
+    // Extract rows where any key column is null
+    auto trueScalar =
+        cudf::numeric_scalar<bool>(true, true, stream);
+    auto hasNullKey = cudf::make_column_from_scalar(
+        cudf::numeric_scalar<bool>(false, true, stream),
+        totalLeft, stream, mr);
+    for (auto ki : leftKeyIndices_) {
+      auto col = leftTableViewParam.column(ki);
+      if (col.has_nulls()) {
+        auto isNull = cudf::is_null(col, stream, mr);
+        hasNullKey = cudf::binary_operation(
+            hasNullKey->view(),
+            isNull->view(),
+            cudf::binary_operator::BITWISE_OR,
+            cudf::data_type{cudf::type_id::BOOL8},
+            stream, mr);
+      }
+    }
+    auto leftNullKeyTable = cudf::apply_boolean_mask(
+        leftTableViewParam, hasNullKey->view(), stream);
+    auto nullN = leftNullKeyTable->num_rows();
+
+    if (nullN > 0 && rightTableView.num_rows() == 0) {
+      // Build is empty: all null-keyed rows survive
+      nullKeyResult = std::make_unique<cudf::table>(
+          leftNullKeyTable->view().select(
+              leftColumnIndicesToGather_),
+          stream, mr);
+    } else if (nullN > 0 && rightTableView.num_rows() > 0) {
+      // Cross-join anti: for each null-keyed probe row,
+      // check if ANY build row passes the filter.
+      auto buildN = rightTableView.num_rows();
+      auto zeroScalar = cudf::numeric_scalar<cudf::size_type>(
+          0, true, stream);
+      auto dummyL = cudf::make_column_from_scalar(
+          zeroScalar, nullN, stream, mr);
+      auto dummyR = cudf::make_column_from_scalar(
+          zeroScalar, buildN, stream, mr);
+
+      auto antiIdx = cudf::mixed_left_anti_join(
+          cudf::table_view({dummyL->view()}),
+          cudf::table_view({dummyR->view()}),
+          leftNullKeyTable->view(),
+          rightTableView,
+          tree_.back(),
+          cudf::null_equality::UNEQUAL,
+          stream, mr);
+
+      if (antiIdx->size() > 0) {
+        auto idxCol = cudf::column_view{
+            cudf::device_span<cudf::size_type const>{
+                *antiIdx}};
+        nullKeyResult = cudf::gather(
+            leftNullKeyTable->view().select(
+                leftColumnIndicesToGather_),
+            idxCol, cudf::out_of_bounds_policy::DONT_CHECK,
+            stream, mr);
+      }
+    }
+  }
+
+  // Concatenate non-null and null-key results
+  std::vector<cudf::table_view> toConcat;
+  if (nonNullResult && nonNullResult->num_rows() > 0) {
+    toConcat.push_back(nonNullResult->view());
+  }
+  if (nullKeyResult && nullKeyResult->num_rows() > 0) {
+    toConcat.push_back(nullKeyResult->view());
+  }
+
+  if (toConcat.empty()) {
+    // Return an empty table with correct schema
+    std::vector<std::unique_ptr<cudf::column>> emptyCols;
+    for (size_t j = 0; j < leftColumnOutputIndices_.size(); ++j) {
+      auto srcIdx = leftColumnIndicesToGather_[j];
+      auto type = leftTableViewParam.column(srcIdx).type();
+      emptyCols.push_back(
+          cudf::make_empty_column(type));
+    }
+    std::vector<std::unique_ptr<cudf::column>> outCols(
+        outputType_->size());
+    for (size_t j = 0; j < leftColumnOutputIndices_.size(); ++j) {
+      outCols[leftColumnOutputIndices_[j]] =
+          std::move(emptyCols[j]);
+    }
+    if (buildStream_.has_value()) {
+      cudaEvent_->recordFrom(stream).waitOn(
+          buildStream_.value());
+    }
+    stream.synchronize();
+    cudfOutputs.push_back(
+        std::make_unique<cudf::table>(std::move(outCols)));
+    return cudfOutputs;
+  }
+
+  std::unique_ptr<cudf::table> finalResult;
+  if (toConcat.size() == 1) {
+    finalResult = std::make_unique<cudf::table>(
+        toConcat[0], stream, mr);
+  } else {
+    finalResult =
+        cudf::concatenate(toConcat, stream, mr);
+  }
+
+  auto resultCols = finalResult->release();
+  std::vector<std::unique_ptr<cudf::column>> outCols(
+      outputType_->size());
+  for (size_t j = 0; j < leftColumnOutputIndices_.size(); ++j) {
+    outCols[leftColumnOutputIndices_[j]] =
+        std::move(resultCols[j]);
+  }
+
+  if (buildStream_.has_value()) {
+    cudaEvent_->recordFrom(stream).waitOn(buildStream_.value());
+  }
+  stream.synchronize();
+  cudfOutputs.push_back(
+      std::make_unique<cudf::table>(std::move(outCols)));
   return cudfOutputs;
 }
 
@@ -1248,8 +1945,8 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
 
   if (!input_) {
     // If no more input, emit unmatched-right rows if needed.
-    if (joinNode_->isRightJoin() && noMoreInput_ && !finished_ &&
-        isLastDriver_) {
+    if ((joinNode_->isRightJoin() || joinNode_->isFullJoin()) && noMoreInput_ &&
+        !finished_ && isLastDriver_) {
       auto& rightTables = hashObject_.value().first;
       auto stream = cudfGlobalStreamPool().get_stream();
       std::vector<std::unique_ptr<cudf::table>> toConcat;
@@ -1264,34 +1961,44 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
         auto boolMask = cudf::unary_operation(
             flags->view(), cudf::unary_operator::NOT, stream);
 
-        auto rightInput =
-            rightTable->view().select(rightColumnIndicesToGather_);
-        auto unmatchedRight =
-            cudf::apply_boolean_mask(rightInput, boolMask->view(), stream);
-        auto m = unmatchedRight->num_rows();
+        // Count unmatched rows by summing the boolean mask
+        auto unmatchedCountScalar = cudf::reduce(
+            boolMask->view(),
+            *cudf::make_sum_aggregation<cudf::reduce_aggregation>(),
+            cudf::data_type{cudf::type_id::INT32},
+            stream);
+        auto m = static_cast<cudf::numeric_scalar<int32_t>*>(
+                     unmatchedCountScalar.get())
+                     ->value(stream);
         if (m == 0) {
           continue;
         }
+
         // Build left null columns
         std::vector<std::unique_ptr<cudf::column>> outCols(outputType_->size());
         // Left side nulls (types derive from probe schema at the matching
         // channel indices)
-        auto probeType = joinNode_->sources()[0]->outputType();
-        for (int li = 0; li < leftColumnOutputIndices_.size(); ++li) {
+        for (size_t li = 0; li < leftColumnOutputIndices_.size(); ++li) {
           auto outIdx = leftColumnOutputIndices_[li];
           auto probeChannel = leftColumnIndicesToGather_[li];
           auto leftCudfType =
-              veloxToCudfTypeId(probeType->childAt(probeChannel));
+              veloxToCudfTypeId(probeType_->childAt(probeChannel));
           auto nullScalar = cudf::make_default_constructed_scalar(
               cudf::data_type{leftCudfType});
           outCols[outIdx] = cudf::make_column_from_scalar(
               *nullScalar, m, stream, cudf::get_current_device_resource_ref());
         }
-        // Right side
-        auto rightCols = unmatchedRight->release();
-        for (int ri = 0; ri < rightColumnOutputIndices_.size(); ++ri) {
-          auto outIdx = rightColumnOutputIndices_[ri];
-          outCols[outIdx] = std::move(rightCols[ri]);
+        // Right side - gather unmatched build columns if any
+        if (!rightColumnIndicesToGather_.empty()) {
+          auto rightInput =
+              rightTable->view().select(rightColumnIndicesToGather_);
+          auto unmatchedRight =
+              cudf::apply_boolean_mask(rightInput, boolMask->view(), stream);
+          auto rightCols = unmatchedRight->release();
+          for (size_t ri = 0; ri < rightColumnOutputIndices_.size(); ++ri) {
+            auto outIdx = rightColumnOutputIndices_[ri];
+            outCols[outIdx] = std::move(rightCols[ri]);
+          }
         }
         toConcat.push_back(std::make_unique<cudf::table>(std::move(outCols)));
       }
@@ -1341,6 +2048,20 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
     }
   }
 
+  {
+    auto n = leftTableView.num_rows();
+    if (n > 0) {
+      auto nonNull =
+          cudf::drop_nulls(leftTableView, leftKeyIndices_, stream);
+      auto nullKeyRows =
+          static_cast<int64_t>(n - nonNull->num_rows());
+      if (nullKeyRows > 0) {
+        auto lockedStats = stats_.wlock();
+        lockedStats->numNullKeys += nullKeyRows;
+      }
+    }
+  }
+
   std::vector<std::unique_ptr<cudf::table>> cudfOutputs;
   switch (joinNode_->joinType()) {
     case core::JoinType::kInner:
@@ -1355,11 +2076,17 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
     case core::JoinType::kLeftSemiFilter:
       cudfOutputs = leftSemiFilterJoin(leftTableView, stream);
       break;
+    case core::JoinType::kLeftSemiProject:
+      cudfOutputs = leftSemiProjectJoin(leftTableView, stream);
+      break;
     case core::JoinType::kRightSemiFilter:
       cudfOutputs = rightSemiFilterJoin(leftTableView, stream);
       break;
     case core::JoinType::kAnti:
       cudfOutputs = antiJoin(leftTableView, stream);
+      break;
+    case core::JoinType::kFull:
+      cudfOutputs = fullJoin(leftTableView, stream);
       break;
     default:
       VELOX_FAIL("Unsupported join type: ", joinNode_->joinType());
@@ -1371,7 +2098,8 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
   // the refcount while cudfInput still holds a reference.
   cudfInput.reset();
   input_.reset();
-  finished_ = noMoreInput_ && !joinNode_->isRightJoin();
+  finished_ =
+      noMoreInput_ && !joinNode_->isRightJoin() && !joinNode_->isFullJoin();
 
   auto cudfOutput = concatenateTables(std::move(cudfOutputs), stream);
   auto const size = cudfOutput->num_rows();
@@ -1394,7 +2122,8 @@ bool CudfHashJoinProbe::skipProbeOnEmptyBuild() const {
 }
 
 exec::BlockingReason CudfHashJoinProbe::isBlocked(ContinueFuture* future) {
-  if ((joinNode_->isRightJoin() || joinNode_->isRightSemiFilterJoin()) &&
+  if ((joinNode_->isRightJoin() || joinNode_->isRightSemiFilterJoin() ||
+       joinNode_->isFullJoin()) &&
       hashObject_.has_value()) {
     if (!future_.valid()) {
       return exec::BlockingReason::kNotBlocked;
@@ -1443,7 +2172,7 @@ exec::BlockingReason CudfHashJoinProbe::isBlocked(ContinueFuture* future) {
   buildStream_ = cudfJoinBridge->getBuildStream();
 
   // Lazy initialize matched flags only when build side is done
-  if (joinNode_->isRightJoin()) {
+  if (joinNode_->isRightJoin() || joinNode_->isFullJoin()) {
     auto& rightTablesInit = hashObject_.value().first;
     rightMatchedFlags_.clear();
     rightMatchedFlags_.reserve(rightTablesInit.size());
@@ -1457,6 +2186,33 @@ exec::BlockingReason CudfHashJoinProbe::isBlocked(ContinueFuture* future) {
     }
     initStream.synchronize();
   }
+
+  // Precompute right table columns if filter exists (once when build is done)
+  if (joinNode_->filter() && !rightPrecomputeInstructions_.empty()) {
+    auto& rightTablesInit = hashObject_.value().first;
+    cachedRightPrecomputed_.clear();
+    cachedExtendedRightViews_.clear();
+    cachedRightPrecomputed_.reserve(rightTablesInit.size());
+    cachedExtendedRightViews_.reserve(rightTablesInit.size());
+
+    auto initStream = cudfGlobalStreamPool().get_stream();
+    for (auto& rt : rightTablesInit) {
+      auto rightTableView = rt->view();
+      auto rightColumnViews = tableViewToColumnViews(rightTableView);
+      auto rightPrecomputed = precomputeSubexpressions(
+          rightColumnViews,
+          rightPrecomputeInstructions_,
+          scalars_,
+          buildType_,
+          initStream);
+      auto extendedView =
+          createExtendedTableView(rightTableView, rightPrecomputed);
+      cachedRightPrecomputed_.push_back(std::move(rightPrecomputed));
+      cachedExtendedRightViews_.push_back(extendedView);
+    }
+    initStream.synchronize();
+  }
+
   auto& rightTables = hashObject_.value().first;
   // should be rightTable->numDistinct() but it needs compute,
   // so we use num_rows()
@@ -1471,7 +2227,8 @@ exec::BlockingReason CudfHashJoinProbe::isBlocked(ContinueFuture* future) {
       }
     }
   }
-  if ((joinNode_->isRightJoin() || joinNode_->isRightSemiFilterJoin()) &&
+  if ((joinNode_->isRightJoin() || joinNode_->isRightSemiFilterJoin() ||
+       joinNode_->isFullJoin()) &&
       future_.valid()) {
     *future = std::move(future_);
     return exec::BlockingReason::kWaitForJoinProbe;
@@ -1480,10 +2237,18 @@ exec::BlockingReason CudfHashJoinProbe::isBlocked(ContinueFuture* future) {
 }
 
 bool CudfHashJoinProbe::isFinished() {
-  auto const isFinished = finished_ ||
-      (noMoreInput_ && input_ == nullptr && accumulatedProbeInputs_.empty());
+  bool isFinished;
+  if ((joinNode_->isRightJoin() || joinNode_->isFullJoin()) &&
+      isLastDriver_) {
+    // The last driver must wait until finished_ is set after emitting
+    // unmatched build rows.
+    isFinished = finished_;
+  } else {
+    isFinished = finished_ ||
+        (noMoreInput_ && input_ == nullptr &&
+         accumulatedProbeInputs_.empty());
+  }
 
-  // Release hashObject_ if finished
   if (isFinished) {
     hashObject_.reset();
   }

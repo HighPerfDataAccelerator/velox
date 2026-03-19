@@ -17,6 +17,8 @@
 #pragma once
 
 #include "velox/experimental/cudf/exec/NvtxHelper.h"
+#include "velox/experimental/cudf/expression/AstExpression.h"
+#include "velox/experimental/cudf/expression/AstExpressionUtils.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
 #include "velox/core/PlanNode.h"
@@ -154,8 +156,10 @@ class CudfHashJoinProbe : public exec::Operator, public NvtxHelper {
         joinType == core::JoinType::kLeft ||
         joinType == core::JoinType::kAnti ||
         joinType == core::JoinType::kLeftSemiFilter ||
+        joinType == core::JoinType::kLeftSemiProject ||
         joinType == core::JoinType::kRight ||
-        joinType == core::JoinType::kRightSemiFilter;
+        joinType == core::JoinType::kRightSemiFilter ||
+        joinType == core::JoinType::kFull;
   }
 
   bool isFinished() override;
@@ -170,6 +174,14 @@ class CudfHashJoinProbe : public exec::Operator, public NvtxHelper {
   cudf::ast::tree tree_;
   /** @brief Scalar values used in filter expressions */
   std::vector<std::unique_ptr<cudf::scalar>> scalars_;
+  /** @brief Precompute instructions for left (probe) table columns */
+  std::vector<PrecomputeInstruction> leftPrecomputeInstructions_;
+  /** @brief Precompute instructions for right (build) table columns */
+  std::vector<PrecomputeInstruction> rightPrecomputeInstructions_;
+  /** @brief Row type for probe table (needed for precomputation) */
+  RowTypePtr probeType_;
+  /** @brief Row type for build table (needed for precomputation) */
+  RowTypePtr buildType_;
   /** @brief Cached evaluator for post-join filter column */
   std::shared_ptr<CudfExpression> filterEvaluator_;
 
@@ -201,6 +213,10 @@ class CudfHashJoinProbe : public exec::Operator, public NvtxHelper {
   std::vector<size_t> rightColumnOutputIndices_;
   bool finished_{false};
 
+  // For LeftSemiProject: output index of the boolean "match" column.
+  // -1 when the join is not a LeftSemiProject.
+  int32_t matchColumnOutputIndex_{-1};
+
   // Copied from HashProbe.h
   // Indicates whether to skip probe input data processing or not. It only
   // applies for a specific set of join types (see skipProbeOnEmptyBuild()), and
@@ -221,6 +237,11 @@ class CudfHashJoinProbe : public exec::Operator, public NvtxHelper {
   /** @brief Flags tracking which build rows have been matched (for right joins)
    */
   std::vector<std::unique_ptr<cudf::column>> rightMatchedFlags_;
+
+  /// Cached precomputed columns for right (build) tables
+  std::vector<std::vector<ColumnOrView>> cachedRightPrecomputed_;
+  /// Cached extended views for right tables (original + precomputed columns)
+  std::vector<cudf::table_view> cachedExtendedRightViews_;
 
   // For Right joins, only one driver collects the unmatched rows mask and
   // emits. This value is set true only for that driver. See noMoreInput
@@ -255,6 +276,15 @@ class CudfHashJoinProbe : public exec::Operator, public NvtxHelper {
       cudf::table_view leftTableView,
       rmm::cuda_stream_view stream);
   /**
+   * @brief Performs full outer join between probe table and all build tables.
+   * @param leftTableView Probe-side table view to join
+   * @param stream CUDA stream for operations
+   * @return Vector of result tables (multiple if build data was batched)
+   */
+  std::vector<std::unique_ptr<cudf::table>> fullJoin(
+      cudf::table_view leftTableView,
+      rmm::cuda_stream_view stream);
+  /**
    * @brief Performs left semi filter join between probe table and all build
    * tables.
    * @param leftTableView Probe-side table view to join
@@ -281,6 +311,14 @@ class CudfHashJoinProbe : public exec::Operator, public NvtxHelper {
    * @return Vector of result tables (multiple if build data was batched)
    */
   std::vector<std::unique_ptr<cudf::table>> antiJoin(
+      cudf::table_view leftTableView,
+      rmm::cuda_stream_view stream);
+  std::vector<std::unique_ptr<cudf::table>>
+  nullAwareAntiJoinWithFilter(
+      cudf::table_view leftTableView,
+      cudf::table_view rightTableView,
+      rmm::cuda_stream_view stream);
+  std::vector<std::unique_ptr<cudf::table>> leftSemiProjectJoin(
       cudf::table_view leftTableView,
       rmm::cuda_stream_view stream);
   /**
@@ -323,6 +361,8 @@ class CudfHashJoinProbe : public exec::Operator, public NvtxHelper {
       cudf::column_view leftIndicesCol,
       cudf::table_view rightTableView,
       cudf::column_view rightIndicesCol,
+      cudf::table_view extendedLeftView,
+      cudf::table_view extendedRightView,
       cudf::join_kind joinKind,
       rmm::cuda_stream_view stream);
 };
