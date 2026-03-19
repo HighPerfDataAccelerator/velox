@@ -513,9 +513,9 @@ class RowConstructorFunction : public CudfFunction {
     std::vector<std::unique_ptr<cudf::column>> children;
     children.reserve(inputColumns.size());
     for (auto& col : inputColumns) {
+      auto view = asView(col);
       children.push_back(
-          std::make_unique<cudf::column>(
-              asView(col), stream, mr));
+          std::make_unique<cudf::column>(view, stream, mr));
     }
 
     rmm::device_buffer null_mask{};
@@ -1262,8 +1262,9 @@ ColumnOrView FunctionExpression::eval(
     std::vector<ColumnOrView> subexprResults;
     subexprResults.reserve(subexpressions_.size());
 
-    for (const auto& subexpr : subexpressions_) {
-      subexprResults.push_back(subexpr->eval(inputColumnViews, stream, mr));
+    for (auto& sub : subexpressions_) {
+      subexprResults.push_back(
+          sub->eval(inputColumnViews, stream, mr));
     }
 
     auto result = function_->eval(subexprResults, stream, mr);
