@@ -16,6 +16,8 @@
 #include "velox/experimental/cudf/expression/AstExpressionUtils.h"
 #include "velox/experimental/cudf/expression/JitExpression.h"
 
+#include <cudf/column/column_factories.hpp>
+
 namespace facebook::velox::cudf_velox {
 
 JitExpression::JitExpression(
@@ -55,11 +57,25 @@ ColumnOrView JitExpression::eval(
       if (columnIndex < inputColumnViews.size()) {
         return inputColumnViews[columnIndex];
       } else {
-        // Referencing a precomputed column return as it is (view or owned)
         return std::move(
             precomputedColumns[columnIndex - inputColumnViews.size()]);
       }
+    } else if (
+        auto litPtr = dynamic_cast<cudf::ast::literal const*>(
+            &expr_.cudfTree_.back())) {
+      auto numRows = inputColumnViews.empty()
+          ? 0
+          : inputColumnViews[0].size();
+      if (CudfConfig::getInstance().debugEnabled) {
+        LOG(WARNING) << "JitExpr: literal shortcut, rows="
+                     << numRows;
+      }
+      return cudf::make_column_from_scalar(
+          litPtr->get_scalar(), numRows, stream, mr);
     } else {
+      if (CudfConfig::getInstance().debugEnabled) {
+        LOG(WARNING) << "JitExpr: compute_column_jit path";
+      }
       return cudf::compute_column_jit(
           astInputTableView, expr_.cudfTree_.back(), stream, mr);
     }

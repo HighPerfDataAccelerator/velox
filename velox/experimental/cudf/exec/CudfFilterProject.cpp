@@ -200,8 +200,9 @@ void CudfFilterProject::initialize() {
   if (CudfConfig::getInstance().debugEnabled) {
     int i = 0;
     for (const auto& expr : expr->exprs()) {
-      LOG(INFO) << "expr[" << i++ << "] " << expr->toString();
-      debugPrintTree(expr, 0, LOG(INFO));
+      LOG(WARNING) << "CudfFP-init[" << planNodeId()
+                   << "] expr[" << i++ << "] "
+                   << expr->toString();
     }
   }
   if (hasFilter_) {
@@ -302,6 +303,18 @@ RowVectorPtr CudfFilterProject::getOutput() {
       return flushAccumulatedOutputs();
     }
     return nullptr;
+  }
+
+  if (CudfConfig::getInstance().debugEnabled) {
+    for (int c = 0; c < numColumns; ++c) {
+      auto col = outputTable->get_column(c).view();
+      if (col.has_nulls()) {
+        LOG(WARNING) << "CudfFilterProject[" << planNodeId()
+                     << "] output col " << c
+                     << " null_count=" << col.null_count()
+                     << "/" << col.size();
+      }
+    }
   }
 
   auto cudfOutput = std::make_shared<CudfVector>(
@@ -420,9 +433,38 @@ std::vector<std::unique_ptr<cudf::column>> CudfFilterProject::project(
     inputViews.push_back(col->view());
   }
   std::vector<ColumnOrView> columns;
-  for (auto& projectEvaluator : projectEvaluators_) {
-    columns.push_back(projectEvaluator->eval(
-        inputViews, stream, cudf::get_current_device_resource_ref(), true));
+  if (CudfConfig::getInstance().debugEnabled) {
+    stream.synchronize();
+    std::string nullInfo;
+    for (size_t i = 0; i < inputViews.size(); ++i) {
+      if (inputViews[i].has_nulls()) {
+        nullInfo += " in[" + std::to_string(i) + "]="
+            + std::to_string(inputViews[i].null_count());
+      }
+    }
+    if (!nullInfo.empty()) {
+      LOG(WARNING) << "CudfFP[" << planNodeId()
+                   << "] input nulls:" << nullInfo
+                   << " rows=" << inputViews[0].size()
+                   << " nEvals=" << projectEvaluators_.size();
+    }
+  }
+  for (size_t ei = 0; ei < projectEvaluators_.size(); ++ei) {
+    columns.push_back(projectEvaluators_[ei]->eval(
+        inputViews, stream, cudf::get_current_device_resource_ref(),
+        true));
+    if (CudfConfig::getInstance().debugEnabled) {
+      stream.synchronize();
+      auto v = asView(columns.back());
+      if (v.has_nulls()) {
+        LOG(WARNING) << "CudfFP[" << planNodeId()
+                     << "] eval[" << ei << "]->outCol "
+                     << resultProjections_[ei].outputChannel
+                     << " null_count=" << v.null_count()
+                     << "/" << v.size()
+                     << " has_mask=" << (v.null_mask() != nullptr);
+      }
+    }
   }
 
   // Rearrange columns to match outputType_
@@ -454,11 +496,9 @@ std::vector<std::unique_ptr<cudf::column>> CudfFilterProject::project(
   for (auto const& identity : identityProjections_) {
     VELOX_CHECK_NOT_NULL(inputTableColumns[identity.inputChannel]);
     if (inputChannelCount[identity.inputChannel] == 1) {
-      // Move the column if it occurs only once
       outputColumns[identity.outputChannel] =
           std::move(inputTableColumns[identity.inputChannel]);
     } else {
-      // Otherwise, copy the column and decrement the count
       outputColumns[identity.outputChannel] = std::make_unique<cudf::column>(
           *inputTableColumns[identity.inputChannel],
           stream,
@@ -466,6 +506,32 @@ std::vector<std::unique_ptr<cudf::column>> CudfFilterProject::project(
     }
     VELOX_CHECK_GT(inputChannelCount[identity.inputChannel], 0);
     inputChannelCount[identity.inputChannel]--;
+  }
+
+  if (CudfConfig::getInstance().debugEnabled) {
+    stream.synchronize();
+    bool anyComputed = false;
+    for (size_t i = 0; i < outputColumns.size(); ++i) {
+      if (!outputColumns[i]) continue;
+      auto v = outputColumns[i]->view();
+      if (v.has_nulls()) {
+        bool isIdentity = false;
+        for (auto const& id : identityProjections_) {
+          if (id.outputChannel == static_cast<column_index_t>(i)) {
+            isIdentity = true;
+            break;
+          }
+        }
+        if (!isIdentity) {
+          anyComputed = true;
+          LOG(WARNING) << "CudfFP[" << planNodeId()
+                       << "] COMPUTED outCol " << i
+                       << " null_count=" << v.null_count()
+                       << "/" << v.size()
+                       << " mask_ptr=" << v.null_mask();
+        }
+      }
+    }
   }
 
   return outputColumns;
