@@ -125,8 +125,8 @@ std::reference_wrapper<const cudf::ast::expression> buildBigintRangeExpr(
 
     auto addLiteral = [&](int64_t value) -> const cudf::ast::expression& {
       variant veloxVariant = static_cast<NativeT>(value);
-      const auto& literal =
-          makeScalarAndLiteral<Kind>(columnTypePtr, veloxVariant, scalars);
+      const auto& literal = makeScalarAndLiteral<Kind>(
+          columnTypePtr, veloxVariant, /*isNull=*/false, scalars);
       return tree.push(literal);
     };
 
@@ -277,8 +277,8 @@ std::reference_wrapper<const cudf::ast::expression> buildIntegerInListExpr(
       }
 
       variant veloxVariant = static_cast<NativeT>(value);
-      const auto& literal =
-          makeScalarAndLiteral<Kind>(columnTypePtr, veloxVariant, scalars);
+      const auto& literal = makeScalarAndLiteral<Kind>(
+          columnTypePtr, veloxVariant, /*isNull=*/false, scalars);
       auto const& cudfLiteral = tree.push(literal);
       auto const& equalExpr =
           tree.push(Operation{Op::EQUAL, columnRef, cudfLiteral});

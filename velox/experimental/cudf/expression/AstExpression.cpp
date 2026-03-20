@@ -26,6 +26,8 @@
 #include "velox/vector/ComplexVector.h"
 #include "velox/vector/ConstantVector.h"
 
+#include <cudf/column/column_factories.hpp>
+
 namespace facebook::velox::cudf_velox {
 
 // Create tree from Expr
@@ -100,14 +102,27 @@ ColumnOrView ASTExpression::eval(
       if (columnIndex < inputColumnViews.size()) {
         return inputColumnViews[columnIndex];
       } else {
-        // Referencing a precomputed column return as it is (view or owned)
         return std::move(
             precomputedColumns[columnIndex - inputColumnViews.size()]);
       }
+    } else if (
+        auto litPtr = dynamic_cast<cudf::ast::literal const*>(
+            &cudfTree_.back())) {
+      auto numRows = inputColumnViews.empty()
+          ? 0
+          : inputColumnViews[0].size();
+      if (CudfConfig::getInstance().debugEnabled) {
+        LOG(WARNING) << "AstExpr: literal shortcut, rows="
+                     << numRows;
+      }
+      return cudf::make_column_from_scalar(
+          litPtr->get_scalar(), numRows, stream, mr);
     } else {
       if (CudfConfig::getInstance().debugEnabled) {
-        LOG(INFO) << cudf::ast::expression_to_string(cudfTree_.back());
-        LOG(INFO) << cudf::table_schema_to_string(astInputTableView);
+        LOG(WARNING) << "AstExpr: compute_column path, expr="
+            << cudf::ast::expression_to_string(cudfTree_.back());
+        LOG(WARNING) << "AstExpr: table_schema="
+            << cudf::table_schema_to_string(astInputTableView);
       }
       return cudf::compute_column(
           astInputTableView, cudfTree_.back(), stream, mr);
