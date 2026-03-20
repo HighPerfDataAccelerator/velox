@@ -168,7 +168,8 @@ const std::unordered_map<std::string, Op> binaryOps = [] {
 
 const std::map<std::string, Op> unaryOps = {
     {"not", Op::NOT},
-    {"is_null", Op::IS_NULL}};
+    {"is_null", Op::IS_NULL},
+    {"isnull", Op::IS_NULL}};
 
 namespace detail {
 
