@@ -155,6 +155,7 @@ const std::unordered_map<std::string, Op> sparkBinaryOps = {
     {"and", Op::NULL_LOGICAL_AND},
     {"or", Op::NULL_LOGICAL_OR},
     {"mod", Op::MOD},
+    {"bitwise_and", Op::BITWISE_AND},
 };
 
 const std::unordered_map<std::string, Op> binaryOps = [] {
