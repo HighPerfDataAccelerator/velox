@@ -223,12 +223,6 @@ class AggregationAdapter : public OperatorAdapter {
       return false;
     }
 
-    if (aggregationPlanNode->sources()[0]->outputType()->size() == 0) {
-      // We cannot handle RowVectors with a length but no data.
-      // This is the case with count(*) global (without groupby)
-      return false;
-    }
-
     return canBeEvaluatedByCudf(
         *aggregationPlanNode, ctx->task->queryCtx().get());
   }

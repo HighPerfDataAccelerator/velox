@@ -28,6 +28,7 @@
 #include "velox/vector/ComplexVector.h"
 #include "velox/vector/FlatVector.h"
 
+#include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/detail/utilities/stream_pool.hpp>
 #include <cudf/table/table.hpp>
@@ -199,6 +200,31 @@ RowVectorPtr CudfFromVelox::getOutput() {
   }
 
   auto stream = cudfGlobalStreamPool().get_stream();
+
+  if (selectedInputs[0]->type()->size() == 0) {
+    // Zero-column input (e.g. COUNT(*) without GROUP BY).
+    // Arrow/cudf tables cannot preserve row count with 0 columns,
+    // so create a dummy INT8 column to carry the row count through.
+    // Note: outputType_ may differ from actual input type because
+    // ToCudf uses the downstream operator's output type, not the
+    // upstream operator's output type.
+    auto mr = cudf::get_current_device_resource_ref();
+    auto dummy = cudf::make_numeric_column(
+        cudf::data_type(cudf::type_id::INT8),
+        totalSize,
+        cudf::mask_state::UNALLOCATED,
+        stream,
+        mr);
+    std::vector<std::unique_ptr<cudf::column>> cols;
+    cols.push_back(std::move(dummy));
+    auto tbl = std::make_unique<cudf::table>(std::move(cols));
+    return std::make_shared<CudfVector>(
+        selectedInputs[0]->pool(),
+        outputType_,
+        totalSize,
+        std::move(tbl),
+        stream);
+  }
 
   // Batched HtoD: issues N async from_arrow calls, ONE sync, then GPU concat.
   // Avoids the CPU-side mergeRowVectors copy and N separate sync round-trips.
