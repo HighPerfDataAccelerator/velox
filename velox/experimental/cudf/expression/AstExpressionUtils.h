@@ -43,10 +43,11 @@ cudf::ast::literal createLiteral(
     size_t atIndex = 0) {
   const auto kind = vector->typeKind();
   const auto& type = vector->type();
+  bool isNull = vector->isNullAt(atIndex);
   variant value =
       VELOX_DYNAMIC_TYPE_DISPATCH(getVariant, kind, vector, atIndex);
   return VELOX_DYNAMIC_TYPE_DISPATCH_ALL(
-      makeScalarAndLiteral, kind, type, value, scalars);
+      makeScalarAndLiteral, kind, type, value, isNull, scalars);
 }
 
 // Helper function to extract literals from array elements based on type
@@ -155,6 +156,7 @@ const std::unordered_map<std::string, Op> sparkBinaryOps = {
     {"and", Op::NULL_LOGICAL_AND},
     {"or", Op::NULL_LOGICAL_OR},
     {"mod", Op::MOD},
+    {"bitwise_and", Op::BITWISE_AND},
 };
 
 const std::unordered_map<std::string, Op> binaryOps = [] {
@@ -166,7 +168,8 @@ const std::unordered_map<std::string, Op> binaryOps = [] {
 
 const std::map<std::string, Op> unaryOps = {
     {"not", Op::NOT},
-    {"is_null", Op::IS_NULL}};
+    {"is_null", Op::IS_NULL},
+    {"isnull", Op::IS_NULL}};
 
 namespace detail {
 

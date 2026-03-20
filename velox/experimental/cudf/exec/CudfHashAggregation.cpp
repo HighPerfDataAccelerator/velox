@@ -1159,8 +1159,24 @@ CudfVectorPtr CudfHashAggregation::getDistinctKeys(
     cudf::table_view tableView,
     std::vector<column_index_t> const& groupByKeys,
     rmm::cuda_stream_view stream) {
+  auto selectedView =
+      tableView.select(groupByKeys.begin(), groupByKeys.end());
+
+  if (CudfConfig::getInstance().debugEnabled) {
+    stream.synchronize();
+    for (int c = 0; c < selectedView.num_columns(); ++c) {
+      auto col = selectedView.column(c);
+      if (col.has_nulls()) {
+        LOG(WARNING) << "getDistinctKeys[" << planNodeId()
+                     << "] input col " << c
+                     << " null_count=" << col.null_count()
+                     << "/" << col.size();
+      }
+    }
+  }
+
   auto result = cudf::distinct(
-      tableView.select(groupByKeys.begin(), groupByKeys.end()),
+      selectedView,
       {groupingKeyOutputChannels_.begin(), groupingKeyOutputChannels_.end()},
       cudf::duplicate_keep_option::KEEP_FIRST,
       cudf::null_equality::EQUAL,

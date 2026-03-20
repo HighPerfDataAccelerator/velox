@@ -37,6 +37,7 @@
 #include <cudf/strings/case.hpp>
 #include <cudf/strings/contains.hpp>
 #include <cudf/strings/find.hpp>
+#include <cudf/strings/combine.hpp>
 #include <cudf/strings/slice.hpp>
 #include <cudf/strings/split/split.hpp>
 #include <cudf/table/table.hpp>
@@ -283,13 +284,18 @@ class RoundFunction : public CudfFunction {
       std::vector<ColumnOrView>& inputColumns,
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr) const override {
+    auto inputView = asView(inputColumns[0]);
+    if (cudf::is_floating_point(inputView.type())) {
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+      return cudf::round(
+          inputView, scale_,
+          cudf::rounding_method::HALF_UP, stream, mr);
+#pragma GCC diagnostic pop
+    }
     return cudf::round_decimal(
-        asView(inputColumns[0]),
-        scale_,
-        cudf::rounding_method::HALF_UP,
-        stream,
-        mr);
-    ;
+        inputView, scale_,
+        cudf::rounding_method::HALF_UP, stream, mr);
   }
 
  private:
@@ -845,6 +851,99 @@ class ContainsFunction : public CudfFunction {
   std::unique_ptr<cudf::string_scalar> pattern_;
 };
 
+class AbsFunction : public CudfFunction {
+ public:
+  explicit AbsFunction(
+      const std::shared_ptr<velox::exec::Expr>& /*expr*/) {}
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    return cudf::unary_operation(
+        asView(inputColumns[0]),
+        cudf::unary_operator::ABS,
+        stream,
+        mr);
+  }
+};
+
+class ConcatFunction : public CudfFunction {
+ public:
+  explicit ConcatFunction(
+      const std::shared_ptr<velox::exec::Expr>& expr) {
+    numInputs_ = 0;
+    for (const auto& input : expr->inputs()) {
+      if (auto c =
+              std::dynamic_pointer_cast<exec::ConstantExpr>(input)) {
+        auto val = c->value();
+        VELOX_CHECK(val->isConstantEncoding());
+        auto sv =
+            val->as<SimpleVector<StringView>>()->valueAt(0);
+        literals_.push_back(std::string(sv.data(), sv.size()));
+        literalPositions_.push_back(numInputs_ + literals_.size() - 1);
+      } else {
+        columnPositions_.push_back(
+            numInputs_ + literals_.size());
+        numInputs_++;
+      }
+    }
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    if (inputColumns.empty() && literals_.empty()) {
+      VELOX_FAIL("concat requires at least one input");
+    }
+
+    cudf::size_type numRows = 0;
+    for (auto& col : inputColumns) {
+      numRows = std::max(numRows, asView(col).size());
+    }
+
+    std::vector<std::unique_ptr<cudf::column>> literalCols;
+    std::vector<cudf::column_view> allCols;
+    allCols.resize(
+        inputColumns.size() + literals_.size());
+
+    size_t colIdx = 0;
+    size_t litIdx = 0;
+    for (size_t i = 0;
+         i < inputColumns.size() + literals_.size();
+         ++i) {
+      bool isLit = litIdx < literalPositions_.size() &&
+          literalPositions_[litIdx] == i;
+      if (isLit) {
+        auto sc = cudf::string_scalar(
+            literals_[litIdx], true, stream, mr);
+        literalCols.push_back(
+            cudf::make_column_from_scalar(sc, numRows, stream, mr));
+        allCols[i] = literalCols.back()->view();
+        litIdx++;
+      } else {
+        allCols[i] = asView(inputColumns[colIdx]);
+        colIdx++;
+      }
+    }
+
+    auto tv = cudf::table_view(allCols);
+    auto emptySep = cudf::string_scalar("", true, stream, mr);
+    auto nullRep = cudf::string_scalar("", false, stream, mr);
+    return cudf::strings::concatenate(
+        tv, emptySep, nullRep,
+        cudf::strings::separator_on_nulls::YES,
+        stream, mr);
+  }
+
+ private:
+  size_t numInputs_{0};
+  std::vector<std::string> literals_;
+  std::vector<size_t> literalPositions_;
+  std::vector<size_t> columnPositions_;
+};
+
 bool registerCudfFunction(
     const std::string& name,
     CudfFunctionFactory factory,
@@ -960,7 +1059,7 @@ bool registerBuiltinFunctions(const std::string& prefix) {
         return std::make_shared<HashFunction>(expr);
       },
       {FunctionSignatureBuilder()
-           .returnType("bigint")
+           .returnType("integer")
            .constantArgumentType("integer")
            .argumentType("any")
            .variableArity()
@@ -1019,6 +1118,24 @@ bool registerBuiltinFunctions(const std::string& prefix) {
        FunctionSignatureBuilder()
            .returnType("bigint")
            .argumentType("bigint")
+           .constantArgumentType("integer")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("real")
+           .argumentType("real")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("real")
+           .argumentType("real")
+           .constantArgumentType("integer")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("double")
+           .argumentType("double")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("double")
+           .argumentType("double")
            .constantArgumentType("integer")
            .build()});
 
@@ -1120,17 +1237,21 @@ bool registerBuiltinFunctions(const std::string& prefix) {
   // all, we're testing if input types can be casted to double. Coersion will
   // pass because all numerics can be casted to double.
   // TODO (dm): This could break for decimal
+  auto cmpSigs = std::vector<exec::FunctionSignaturePtr>{
+      FunctionSignatureBuilder()
+          .returnType("boolean")
+          .argumentType("double")
+          .argumentType("double")
+          .build()};
+
   registerCudfFunctions(
       {prefix + "greaterthan", prefix + "gt"},
-      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+      [](const std::string&,
+         const std::shared_ptr<velox::exec::Expr>& expr) {
         return std::make_shared<BinaryFunction>(
             expr, cudf::binary_operator::GREATER);
       },
-      {FunctionSignatureBuilder()
-           .returnType("boolean")
-           .argumentType("double")
-           .argumentType("double")
-           .build()});
+      cmpSigs);
 
   registerCudfFunction(
       prefix + "divide",
@@ -1143,6 +1264,36 @@ bool registerBuiltinFunctions(const std::string& prefix) {
            .argumentType("double")
            .argumentType("double")
            .build()});
+
+  auto intShiftSigs = std::vector<exec::FunctionSignaturePtr>{
+      FunctionSignatureBuilder()
+          .returnType("integer")
+          .argumentType("integer")
+          .argumentType("integer")
+          .build(),
+      FunctionSignatureBuilder()
+          .returnType("bigint")
+          .argumentType("bigint")
+          .argumentType("integer")
+          .build()};
+
+  registerCudfFunction(
+      prefix + "shiftright",
+      [](const std::string&,
+         const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<BinaryFunction>(
+            expr, cudf::binary_operator::SHIFT_RIGHT);
+      },
+      intShiftSigs);
+
+  registerCudfFunction(
+      prefix + "shiftleft",
+      [](const std::string&,
+         const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<BinaryFunction>(
+            expr, cudf::binary_operator::SHIFT_LEFT);
+      },
+      intShiftSigs);
 
   // No prefix because switch and if are special form
   registerCudfFunctions(
@@ -1219,6 +1370,49 @@ bool registerBuiltinFunctions(const std::string& prefix) {
             RowConstructorFunction<2>>(expr);
       },
       {});
+
+  registerCudfFunction(
+      prefix + "abs",
+      [](const std::string&,
+         const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<AbsFunction>(expr);
+      },
+      {FunctionSignatureBuilder()
+           .returnType("tinyint")
+           .argumentType("tinyint")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("smallint")
+           .argumentType("smallint")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("integer")
+           .argumentType("integer")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("bigint")
+           .argumentType("bigint")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("real")
+           .argumentType("real")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("double")
+           .argumentType("double")
+           .build()});
+
+  registerCudfFunction(
+      prefix + "concat",
+      [](const std::string&,
+         const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<ConcatFunction>(expr);
+      },
+      {FunctionSignatureBuilder()
+           .returnType("varchar")
+           .argumentType("varchar")
+           .variableArity("varchar")
+           .build()});
 
   return true;
 }
