@@ -284,13 +284,18 @@ class RoundFunction : public CudfFunction {
       std::vector<ColumnOrView>& inputColumns,
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr) const override {
+    auto inputView = asView(inputColumns[0]);
+    if (cudf::is_floating_point(inputView.type())) {
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+      return cudf::round(
+          inputView, scale_,
+          cudf::rounding_method::HALF_UP, stream, mr);
+#pragma GCC diagnostic pop
+    }
     return cudf::round_decimal(
-        asView(inputColumns[0]),
-        scale_,
-        cudf::rounding_method::HALF_UP,
-        stream,
-        mr);
-    ;
+        inputView, scale_,
+        cudf::rounding_method::HALF_UP, stream, mr);
   }
 
  private:
