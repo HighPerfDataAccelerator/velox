@@ -19,6 +19,7 @@ add_library(
   CudfExpand.cpp
   CudfFilterProject.cpp
   CudfHashAggregation.cpp
+  DecimalAggregationKernels.cu
   CudfHashJoin.cpp
   CudfNestedLoopJoin.cpp
   CudfLimit.cpp
@@ -26,6 +27,7 @@ add_library(
   CudfOrderBy.cpp
   CudfShufflePartition.cpp
   CudfTopN.cpp
+  CudfTopNRowNumber.cpp
   DebugUtil.cpp
   OperatorAdapters.cpp
   PinnedArrowInterop.cpp
@@ -34,10 +36,13 @@ add_library(
   VeloxCudfInterop.cpp
 )
 
+set_target_properties(velox_cudf_exec PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
+
 target_link_libraries(
   velox_cudf_exec
   PUBLIC cudf::cudf
   PRIVATE
+    velox_cudf_kernels
     arrow
     velox_arrow_bridge
     velox_exception

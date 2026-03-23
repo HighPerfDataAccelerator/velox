@@ -86,15 +86,6 @@ ColumnOrView ASTExpression::eval(
       inputRowSchema_,
       stream);
 
-  // Make table_view from input columns and precomputed columns
-  std::vector<cudf::column_view> allColumnViews(inputColumnViews);
-  allColumnViews.reserve(inputColumnViews.size() + precomputedColumns.size());
-  for (auto& precomputedCol : precomputedColumns) {
-    allColumnViews.push_back(asView(precomputedCol));
-  }
-
-  cudf::table_view astInputTableView(allColumnViews);
-
   auto result = [&]() -> ColumnOrView {
     if (auto colRefPtr = dynamic_cast<cudf::ast::column_reference const*>(
             &cudfTree_.back())) {
@@ -118,19 +109,35 @@ ColumnOrView ASTExpression::eval(
       return cudf::make_column_from_scalar(
           litPtr->get_scalar(), numRows, stream, mr);
     } else {
+      // Build table_view lazily: only needed for compute_column.
+      // Precomputed columns referenced via column_reference may have a
+      // different row count (from a nested evaluator), so constructing
+      // the table_view eagerly would trigger a spurious size mismatch.
+      std::vector<cudf::column_view> allColumnViews(inputColumnViews);
+      allColumnViews.reserve(
+          inputColumnViews.size() + precomputedColumns.size());
+      for (auto& precomputedCol : precomputedColumns) {
+        allColumnViews.push_back(asView(precomputedCol));
+      }
+      cudf::table_view astInputTableView(allColumnViews);
       if (CudfConfig::getInstance().debugEnabled) {
         LOG(WARNING) << "AstExpr: compute_column path, expr="
             << cudf::ast::expression_to_string(cudfTree_.back());
         LOG(WARNING) << "AstExpr: table_schema="
             << cudf::table_schema_to_string(astInputTableView);
       }
-      return cudf::compute_column(
-          astInputTableView, cudfTree_.back(), stream, mr);
+      try {
+        return cudf::compute_column(
+            astInputTableView, cudfTree_.back(), stream, mr);
+      } catch (const std::exception& e) {
+        VELOX_FAIL(
+            "cudf::compute_column failed (possible operand type mismatch): {}",
+            e.what());
+      }
     }
   }();
   if (finalize) {
-    const auto requestedType =
-        cudf::data_type(cudf_velox::veloxToCudfTypeId(expr_->type()));
+    const auto requestedType = cudf_velox::veloxToCudfDataType(expr_->type());
     auto resultView = asView(result);
     if (resultView.type() != requestedType) {
       result = cudf::cast(resultView, requestedType, stream, mr);

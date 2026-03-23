@@ -320,7 +320,8 @@ RowVectorPtr CudfToVelox::getOutput() {
       return nullptr;
     }
     RowVectorPtr output =
-        with_arrow::toVeloxColumn(tableView, pool(), "", stream);
+        with_arrow::toVeloxColumn(tableView, pool(), outputType_, "", stream, cudf::get_current_device_resource_ref());
+    stream.synchronize();
     finished_ = noMoreInput_ && inputs_.empty();
     if (output->type()->kindEquals(outputType_)) {
       output->setType(outputType_);
@@ -413,8 +414,9 @@ RowVectorPtr CudfToVelox::getOutput() {
     return nullptr;
   }
 
-  RowVectorPtr output =
-      with_arrow::toVeloxColumn(resultTable->view(), pool(), "", stream);
+  RowVectorPtr output = with_arrow::toVeloxColumn(
+      resultTable->view(), pool(), outputType_, "", stream, cudf::get_current_device_resource_ref());
+  stream.synchronize();
   finished_ = noMoreInput_ && inputs_.empty();
   if (output->type()->kindEquals(outputType_)) {
     output->setType(outputType_);

@@ -101,7 +101,7 @@ CudfHiveDataSource::CudfHiveDataSource(
   VELOX_CHECK_NOT_NULL(
       tableHandle_, "TableHandle must be an instance of HiveTableHandle");
 
-  // Copy subfield filters
+  // Copy subfield filters.
   for (const auto& [k, v] : tableHandle_->subfieldFilters()) {
     subfieldFilters_.emplace(k.clone(), v->clone());
     // Add fields in the filter to the columns to read if not there
@@ -148,12 +148,13 @@ CudfHiveDataSource::CudfHiveDataSource(
 
     cudfExpressionEvaluator_ = velox::cudf_velox::createCudfExpression(
         remainingFilterExprSet_->exprs()[0], remainingFilterType_);
-    // TODO(kn): Get column names and subfields from remaining filter and add to
-    // readColumnNames_
   }
 
   // Build a combined AST for all subfield filters once. This is query-constant
   // and doesn't depend on split-specific state.
+  // STRING/Bytes filters are not supported by cudf AST/Jitify and will be
+  // skipped. If all filters are unsupported, subfieldFilterExpr_ stays null
+  // and the downstream FilterProject handles them on CPU.
   if (!subfieldFilters_.empty()) {
     const RowTypePtr readerFilterType = [&] {
       if (tableHandle_->dataColumns()) {
@@ -161,7 +162,6 @@ CudfHiveDataSource::CudfHiveDataSource(
         std::vector<TypePtr> newTypes;
 
         for (const auto& name : readColumnNames_) {
-          // Ensure all columns being read are available to the filter.
           auto parsedType = tableHandle_->dataColumns()->findChild(name);
           newNames.emplace_back(std::move(name));
           newTypes.push_back(parsedType);
@@ -173,8 +173,40 @@ CudfHiveDataSource::CudfHiveDataSource(
       }
     }();
 
-    subfieldFilterExpr_ = &createAstFromSubfieldFilters(
-        subfieldFilters_, subfieldTree_, subfieldScalars_, readerFilterType);
+    bool hasStringColumns = false;
+    for (const auto& [subfield, filterPtr] : subfieldFilters_) {
+      if (!filterPtr || subfield.path().empty()) {
+        continue;
+      }
+      auto* nestedField =
+          dynamic_cast<const common::Subfield::NestedField*>(
+              subfield.path()[0].get());
+      if (nestedField && readerFilterType->containsChild(nestedField->name())) {
+        auto colType =
+            readerFilterType->findChild(nestedField->name());
+        if (colType->isVarchar() || colType->isVarbinary()) {
+          hasStringColumns = true;
+          break;
+        }
+      }
+    }
+
+    if (hasStringColumns) {
+      LOG(WARNING)
+          << "Subfield filters involve STRING/VARBINARY columns; "
+          << "skipping GPU subfield filtering to avoid Jitify errors.";
+      subfieldFilterExpr_ = nullptr;
+    } else {
+      try {
+        subfieldFilterExpr_ = &createAstFromSubfieldFilters(
+            subfieldFilters_, subfieldTree_, subfieldScalars_, readerFilterType);
+      } catch (const VeloxException& e) {
+        LOG(WARNING) << "Could not build AST for subfield filters: "
+                     << e.message()
+                     << ". Skipping GPU subfield filtering.";
+        subfieldFilterExpr_ = nullptr;
+      }
+    }
   }
 
   VELOX_CHECK_NOT_NULL(fileHandleFactory_, "No FileHandleFactory present");
@@ -635,6 +667,40 @@ void CudfHiveDataSource::setupCudfDataSourceAndOptions() {
     dataSource_ = std::move(makeDataSourcesFromSourceInfo(sourceInfo).front());
   }
 
+  RowTypePtr readerFilterType = nullptr;
+  bool hasDecimalFilter = false;
+  if (subfieldFilters_.size()) {
+    readerFilterType = [&] {
+      if (tableHandle_->dataColumns()) {
+        std::vector<std::string> newNames;
+        std::vector<TypePtr> newTypes;
+
+        for (const auto& name : readColumnNames_) {
+          // Ensure all columns being read are available to the filter
+          auto parsedType = tableHandle_->dataColumns()->findChild(name);
+          newNames.emplace_back(std::move(name));
+          newTypes.push_back(parsedType);
+        }
+
+        return ROW(std::move(newNames), std::move(newTypes));
+      } else {
+        return outputType_;
+      }
+    }();
+
+    for (const auto& [field, _] : subfieldFilters_) {
+      if (!field.valid()) {
+        continue;
+      }
+      const auto& fieldName = field.baseName();
+      const auto fieldType = readerFilterType->findChild(fieldName);
+      if (fieldType && fieldType->isDecimal()) {
+        hasDecimalFilter = true;
+        break;
+      }
+    }
+  }
+
   // Reader options
   readerOptions_ =
       cudf::io::parquet_reader_options::builder(std::move(sourceInfo))
@@ -644,6 +710,7 @@ void CudfHiveDataSource::setupCudfDataSourceAndOptions() {
           .allow_mismatched_pq_schemas(
               cudfHiveConfig_->isAllowMismatchedCudfHiveSchemas())
           .timestamp_type(cudfHiveConfig_->timestampType())
+          .use_jit_filter(hasDecimalFilter)
           .build();
 
   // Set num_bytes only if available
@@ -651,6 +718,7 @@ void CudfHiveDataSource::setupCudfDataSourceAndOptions() {
     readerOptions_.set_num_bytes(split_->size());
   }
 
+  // Set filter expression created in constructor if any subfield filters
   if (subfieldFilterExpr_ != nullptr) {
     readerOptions_.set_filter(*subfieldFilterExpr_);
   }
@@ -1179,13 +1247,20 @@ std::unique_ptr<cudf::table> CudfHiveDataSource::readNextExperimentalBatch(
 
   if (readerOptions_.get_filter().has_value()) {
     std::unique_ptr<cudf::table> table = std::move(tableWithMetadata.tbl);
-    auto filterMask = cudf::compute_column(
-        *table, readerOptions_.get_filter().value(), stream_);
-    return cudf::apply_boolean_mask(
-        table->view(),
-        filterMask->view(),
-        stream_,
-        cudf::get_current_device_resource_ref());
+    try {
+      auto filterMask = cudf::compute_column(
+          *table, readerOptions_.get_filter().value(), stream_);
+      return cudf::apply_boolean_mask(
+          table->view(),
+          filterMask->view(),
+          stream_,
+          cudf::get_current_device_resource_ref());
+    } catch (const std::exception& e) {
+      LOG(WARNING)
+          << "Subfield filter compute_column failed (possibly Jitify): "
+          << e.what() << ". Returning unfiltered data for this chunk.";
+      return table;
+    }
   }
   return std::move(tableWithMetadata.tbl);
 }

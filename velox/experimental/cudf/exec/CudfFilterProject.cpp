@@ -113,21 +113,27 @@ bool canBeEvaluatedByCudf(
     return true;
   }
 
-  auto precompilePool =
-      memory::memoryManager()->addLeafPool("", /*threadSafe*/ false);
-  core::ExecCtx precompileCtx(precompilePool.get(), queryCtx);
+  try {
+    auto precompilePool =
+        memory::memoryManager()->addLeafPool("", /*threadSafe*/ false);
+    core::ExecCtx precompileCtx(precompilePool.get(), queryCtx);
 
-  bool lazyDereference = false;
-  std::vector<core::TypedExprPtr> exprsCopy = exprs;
-  std::unique_ptr<exec::ExprSet> exprSet = exec::makeExprSetFromFlag(
-      std::move(exprsCopy), &precompileCtx, lazyDereference);
+    bool lazyDereference = false;
+    std::vector<core::TypedExprPtr> exprsCopy = exprs;
+    std::unique_ptr<exec::ExprSet> exprSet = exec::makeExprSetFromFlag(
+        std::move(exprsCopy), &precompileCtx, lazyDereference);
 
-  for (const auto& e : exprSet->exprs()) {
-    if (!canBeEvaluatedByCudf(e)) {
-      return false;
+    for (const auto& e : exprSet->exprs()) {
+      if (!canBeEvaluatedByCudf(e)) {
+        return false;
+      }
     }
+    return true;
+  } catch (const VeloxException& e) {
+    LOG(WARNING) << "canBeEvaluatedByCudf: expression compilation failed, "
+                 << "falling back to CPU: " << e.message();
+    return false;
   }
-  return true;
 }
 
 CudfFilterProject::CudfFilterProject(
@@ -286,6 +292,13 @@ RowVectorPtr CudfFilterProject::getOutput() {
 
   if (hasFilter_) {
     filter(inputTableColumns, stream);
+    if (!inputTableColumns.empty() && inputTableColumns[0]->size() == 0) {
+      input_.reset();
+      if (!accumulatedOutputs_.empty() && noMoreInput_) {
+        return flushAccumulatedOutputs();
+      }
+      return nullptr;
+    }
   }
   auto outputColumns = project(inputTableColumns, stream);
 
@@ -304,6 +317,27 @@ RowVectorPtr CudfFilterProject::getOutput() {
           cudf::mask_state::UNALLOCATED,
           stream,
           mr));
+    }
+  }
+
+  // Validate all output columns have consistent row counts.
+  if (!outputColumns.empty()) {
+    cudf::size_type expectedRows = -1;
+    for (size_t i = 0; i < outputColumns.size(); ++i) {
+      if (outputColumns[i]) {
+        if (expectedRows < 0) {
+          expectedRows = outputColumns[i]->size();
+        } else {
+          VELOX_CHECK_EQ(
+              outputColumns[i]->size(),
+              expectedRows,
+              "CudfFilterProject output column {} has {} rows,"
+              " expected {}",
+              i,
+              outputColumns[i]->size(),
+              expectedRows);
+        }
+      }
     }
   }
 

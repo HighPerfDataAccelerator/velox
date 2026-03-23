@@ -212,6 +212,7 @@ class CudfHashJoinProbe : public exec::Operator, public NvtxHelper {
   /** @brief Output column positions for right table columns */
   std::vector<size_t> rightColumnOutputIndices_;
   bool finished_{false};
+  bool useAstFilter_{true};
 
   // For LeftSemiProject: output index of the boolean "match" column.
   // -1 when the join is not a LeftSemiProject.
@@ -242,6 +243,10 @@ class CudfHashJoinProbe : public exec::Operator, public NvtxHelper {
   std::vector<std::vector<ColumnOrView>> cachedRightPrecomputed_;
   /// Cached extended views for right tables (original + precomputed columns)
   std::vector<cudf::table_view> cachedExtendedRightViews_;
+
+  /// Pending join outputs from OOM probe splitting (returned one per
+  /// getOutput() call to avoid peak memory from concatenation).
+  std::vector<std::unique_ptr<cudf::table>> pendingJoinOutputs_;
 
   // For Right joins, only one driver collects the unmatched rows mask and
   // emits. This value is set true only for that driver. See noMoreInput
