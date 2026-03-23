@@ -44,7 +44,7 @@ std::unique_ptr<cudf::scalar> createScalarDispatch(
 
   if (isNull) {
     auto cudfType =
-        cudf::data_type{veloxToCudfTypeId(type)};
+        veloxToCudfDataType(type);
     return cudf::make_default_constructed_scalar(
         cudfType, stream, mr);
   }
