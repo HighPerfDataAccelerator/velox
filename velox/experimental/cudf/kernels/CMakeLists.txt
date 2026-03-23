@@ -12,22 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Shared GPU kernel library.
+# These kernels are designed to be reusable across projects (velox-cudf,
+# spark-rapids-jni) and may eventually be extracted into an independent repo.
+
 add_library(
-  velox_cudf_expression
-  AstExpression.cpp
-  DecimalExpressionKernels.cu
-  ExpressionEvaluator.cpp
-  JitExpression.cpp
-  SubfieldFiltersToAst.cpp
-  DecimalUtils.cpp
-)
+  velox_cudf_kernels
+  src/TopNRowNumber.cpp)
 
-target_link_libraries(
-  velox_cudf_expression
-  PUBLIC cudf::cudf
-  PRIVATE arrow velox_exception velox_common_base velox_cudf_vector
-)
+set_target_properties(
+  velox_cudf_kernels
+  PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
-target_compile_options(velox_cudf_expression PRIVATE -Wno-missing-field-initializers)
+target_include_directories(
+  velox_cudf_kernels
+  PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
-set_target_properties(velox_cudf_expression PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
+target_link_libraries(velox_cudf_kernels PUBLIC cudf::cudf)

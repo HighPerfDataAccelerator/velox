@@ -25,10 +25,12 @@
 #include "velox/experimental/cudf/exec/CudfLocalPartition.h"
 #include "velox/experimental/cudf/exec/CudfOrderBy.h"
 #include "velox/experimental/cudf/exec/CudfTopN.h"
+#include "velox/experimental/cudf/exec/CudfTopNRowNumber.h"
 #include "velox/experimental/cudf/exec/OperatorAdapters.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
 
+#include "velox/type/TypeUtil.h"
 #include "velox/exec/AssignUniqueId.h"
 #include "velox/exec/CallbackSink.h"
 #include "velox/exec/Expand.h"
@@ -45,9 +47,36 @@
 #include "velox/exec/TableScan.h"
 #include "velox/exec/Task.h"
 #include "velox/exec/TopN.h"
+#include "velox/exec/TopNRowNumber.h"
 #include "velox/exec/Values.h"
 
 namespace facebook::velox::cudf_velox {
+
+namespace {
+
+// Recursively check that all FieldAccessTypedExpr references in the
+// expression tree can be found in the given inputType.  Returns false
+// if any top-level field reference is missing from inputType.
+bool allFieldsResolvable(
+    const core::TypedExprPtr& expr,
+    const RowTypePtr& inputType) {
+  if (auto fieldAccess =
+          std::dynamic_pointer_cast<const core::FieldAccessTypedExpr>(expr)) {
+    if (fieldAccess->inputs().empty()) {
+      if (!inputType->containsChild(fieldAccess->name())) {
+        return false;
+      }
+    }
+  }
+  for (const auto& input : expr->inputs()) {
+    if (!allFieldsResolvable(input, inputType)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+} // namespace
 
 /// OperatorAdapterRegistry Implementation
 OperatorAdapterRegistry& OperatorAdapterRegistry::getInstance() {
@@ -171,6 +200,24 @@ class FilterProjectAdapter : public OperatorAdapter {
               projectPlanNode->projections(), ctx->task->queryCtx().get())) {
         return false;
       }
+      const auto& inputType = projectPlanNode->sources()[0]->outputType();
+      for (const auto& proj : projectPlanNode->projections()) {
+        if (!allFieldsResolvable(proj, inputType)) {
+          LOG(WARNING)
+              << "CudfFilterProject: unresolvable field reference in "
+              << proj->toString() << ", falling back to CPU";
+          return false;
+        }
+      }
+    }
+    if (filterNode) {
+      const auto& inputType = filterNode->sources()[0]->outputType();
+      if (!allFieldsResolvable(filterNode->filter(), inputType)) {
+        LOG(WARNING)
+            << "CudfFilterProject: unresolvable field reference in filter, "
+            << "falling back to CPU";
+        return false;
+      }
     }
     return true;
   }
@@ -288,6 +335,20 @@ class CudfHashJoinBaseAdapter : public OperatorAdapter {
     if (joinPlanNode->filter()) {
       if (!canBeEvaluatedByCudf(
               {joinPlanNode->filter()}, ctx->task->queryCtx().get())) {
+        return false;
+      }
+      // Verify that all field references in the filter exist in the
+      // combined left+right schema. Substrait plan conversion can produce
+      // expressions that reference fields from a different node ID than
+      // the join's actual probe/build output types.
+      auto combinedType = type::concatRowTypes(
+          {joinPlanNode->sources()[0]->outputType(),
+           joinPlanNode->sources()[1]->outputType()});
+      if (!allFieldsResolvable(joinPlanNode->filter(), combinedType)) {
+        LOG(WARNING)
+            << "CudfHashJoin: unresolvable field reference in filter '"
+            << joinPlanNode->filter()->toString()
+            << "', falling back to CPU";
         return false;
       }
     }
@@ -821,6 +882,50 @@ class CallbackSinkAdapter : public OperatorAdapter {
   }
 };
 
+/// TopNRowNumberAdapter - Replaces with CudfTopNRowNumber
+class TopNRowNumberAdapter : public OperatorAdapter {
+ public:
+  TopNRowNumberAdapter() : OperatorAdapter("TopNRowNumber") {}
+
+  bool canHandle(const exec::Operator* op) const override {
+    return dynamic_cast<const exec::TopNRowNumber*>(op) != nullptr;
+  }
+
+  bool canRunOnGPU(
+      const exec::Operator* op,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* /*ctx*/) const override {
+    if (!canHandle(op)) {
+      return false;
+    }
+    auto node =
+        std::dynamic_pointer_cast<const core::TopNRowNumberNode>(planNode);
+    return node != nullptr;
+  }
+
+  bool acceptsGpuInput() const override {
+    return true;
+  }
+
+  bool producesGpuOutput() const override {
+    return true;
+  }
+
+  std::vector<std::unique_ptr<exec::Operator>> createReplacements(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* ctx,
+      int32_t operatorId) const override {
+    auto node =
+        std::dynamic_pointer_cast<const core::TopNRowNumberNode>(planNode);
+
+    std::vector<std::unique_ptr<exec::Operator>> result;
+    result.push_back(
+        std::make_unique<CudfTopNRowNumber>(operatorId, ctx, node));
+    return result;
+  }
+};
+
 /// Registration Function
 void registerAllOperatorAdapters() {
   auto& registry = OperatorAdapterRegistry::getInstance();
@@ -844,6 +949,7 @@ void registerAllOperatorAdapters() {
   registry.registerAdapter(std::make_unique<LocalPartitionAdapter>());
   registry.registerAdapter(std::make_unique<LocalExchangeAdapter>());
   registry.registerAdapter(std::make_unique<AssignUniqueIdAdapter>());
+  registry.registerAdapter(std::make_unique<TopNRowNumberAdapter>());
   registry.registerAdapter(std::make_unique<ExpandAdapter>());
   registry.registerAdapter(std::make_unique<ValuesAdapter>());
   registry.registerAdapter(std::make_unique<CallbackSinkAdapter>());

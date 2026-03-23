@@ -19,6 +19,8 @@ add_executable(velox_cudf_aggregation_test Main.cpp AggregationTest.cpp)
 add_executable(velox_cudf_assign_unique_id_test Main.cpp AssignUniqueIdTest.cpp)
 add_executable(velox_cudf_config_test Main.cpp ConfigTest.cpp)
 add_executable(velox_cudf_expression_selection_test Main.cpp ExpressionEvaluatorSelectionTest.cpp)
+add_executable(velox_cudf_decimal_expression_test Main.cpp DecimalExpressionTest.cpp)
+add_executable(velox_cudf_decimal_aggregation_test Main.cpp DecimalAggregationTest.cpp)
 add_executable(velox_cudf_filter_project_test Main.cpp FilterProjectTest.cpp)
 add_executable(velox_cudf_hash_join_test HashJoinTest.cpp Main.cpp)
 add_executable(velox_cudf_nested_loop_join_test Main.cpp NestedLoopJoinTest.cpp)
@@ -65,6 +67,18 @@ add_test(
 add_test(
   NAME velox_cudf_expression_selection_test
   COMMAND velox_cudf_expression_selection_test
+  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+add_test(
+  NAME velox_cudf_decimal_expression_test
+  COMMAND velox_cudf_decimal_expression_test
+  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+add_test(
+  NAME velox_cudf_decimal_aggregation_test
+  COMMAND velox_cudf_decimal_aggregation_test
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
@@ -163,6 +177,8 @@ set_tests_properties(
   velox_cudf_expression_selection_test
   PROPERTIES LABELS cuda_driver TIMEOUT 3000
 )
+set_tests_properties(velox_cudf_decimal_expression_test PROPERTIES LABELS cuda_driver TIMEOUT 3000)
+set_tests_properties(velox_cudf_decimal_aggregation_test PROPERTIES LABELS cuda_driver TIMEOUT 3000)
 set_tests_properties(velox_cudf_filter_project_test PROPERTIES LABELS cuda_driver TIMEOUT 3000)
 set_tests_properties(velox_cudf_hash_join_test PROPERTIES LABELS cuda_driver TIMEOUT 3000)
 set_tests_properties(velox_cudf_nested_loop_join_test PROPERTIES LABELS cuda_driver TIMEOUT 3000)
@@ -189,6 +205,7 @@ set_tests_properties(
 target_link_libraries(
   velox_cudf_aggregation_test
   velox_cudf_exec
+  velox_cudf_gpu_guard_stub
   velox_exec
   velox_exec_test_lib
   velox_test_util
@@ -201,6 +218,7 @@ target_link_libraries(
 target_link_libraries(
   velox_cudf_assign_unique_id_test
   velox_cudf_exec
+  velox_cudf_gpu_guard_stub
   velox_exec
   velox_exec_test_lib
   velox_test_util
@@ -208,11 +226,12 @@ target_link_libraries(
   gtest_main
 )
 
-target_link_libraries(velox_cudf_config_test velox_cudf_exec Folly::folly gtest gtest_main)
+target_link_libraries(velox_cudf_config_test velox_cudf_exec velox_cudf_gpu_guard_stub Folly::folly gtest gtest_main)
 
 target_link_libraries(
   velox_cudf_expression_selection_test
   velox_cudf_exec
+  velox_cudf_gpu_guard_stub
   velox_exec
   velox_exec_test_lib
   velox_test_util
@@ -222,8 +241,33 @@ target_link_libraries(
 )
 
 target_link_libraries(
+  velox_cudf_decimal_expression_test
+  velox_cudf_exec
+  velox_cudf_gpu_guard_stub
+  velox_exec
+  velox_exec_test_lib
+  velox_functions_test_lib
+  velox_test_util
+  gtest
+  gtest_main
+)
+
+target_link_libraries(
+  velox_cudf_decimal_aggregation_test
+  velox_cudf_exec
+  velox_cudf_gpu_guard_stub
+  velox_exec
+  velox_exec_test_lib
+  velox_functions_test_lib
+  velox_test_util
+  gtest
+  gtest_main
+)
+
+target_link_libraries(
   velox_cudf_filter_project_test
   velox_cudf_exec
+  velox_cudf_gpu_guard_stub
   velox_exec
   velox_exec_test_lib
   velox_functions_test_lib
@@ -261,6 +305,7 @@ target_link_libraries(
 target_link_libraries(
   velox_cudf_limit_test
   velox_cudf_exec
+  velox_cudf_gpu_guard_stub
   velox_exec
   velox_exec_test_lib
   velox_test_util
@@ -271,6 +316,7 @@ target_link_libraries(
 target_link_libraries(
   velox_cudf_local_partition_test
   velox_cudf_exec
+  velox_cudf_gpu_guard_stub
   velox_exec
   velox_exec_test_lib
   velox_test_util
@@ -282,6 +328,7 @@ target_link_libraries(
 target_link_libraries(
   velox_cudf_order_by_test
   velox_cudf_exec
+  velox_cudf_gpu_guard_stub
   velox_exec
   velox_exec_test_lib
   velox_test_util
@@ -308,6 +355,7 @@ endif()
 target_link_libraries(
   velox_cudf_subfield_filter_ast_test
   velox_cudf_exec
+  velox_cudf_gpu_guard_stub
   velox_exec
   velox_exec_test_lib
   velox_test_util
@@ -342,6 +390,7 @@ target_link_libraries(
 target_link_libraries(
   velox_cudf_topn_test
   velox_cudf_exec
+  velox_cudf_gpu_guard_stub
   velox_exec
   velox_exec_test_lib
   velox_test_util
@@ -353,6 +402,7 @@ target_link_libraries(
 target_link_libraries(
   velox_cudf_aggregation_selection_test
   velox_cudf_exec
+  velox_cudf_gpu_guard_stub
   velox_exec
   velox_exec_test_lib
   velox_test_util
@@ -364,6 +414,7 @@ target_link_libraries(
 target_link_libraries(
   velox_cudf_tocudf_selection_test
   velox_cudf_exec
+  velox_cudf_gpu_guard_stub
   velox_exec
   velox_exec_test_lib
   velox_test_util
@@ -375,6 +426,7 @@ target_link_libraries(
 target_link_libraries(
   velox_cudf_step_aware_aggregation_registry_test
   velox_cudf_exec
+  velox_cudf_gpu_guard_stub
   velox_exec
   velox_exec_test_lib
   velox_test_util
@@ -385,6 +437,7 @@ target_link_libraries(
 target_link_libraries(
   velox_cudf_htod_perf_test
   velox_cudf_exec
+  velox_cudf_gpu_guard_stub
   velox_exec
   velox_exec_test_lib
   velox_test_util
@@ -395,6 +448,7 @@ target_link_libraries(
 target_link_libraries(
   velox_cudf_dtoh_packed_test
   velox_cudf_exec
+  velox_cudf_gpu_guard_stub
   velox_exec
   velox_exec_test_lib
   velox_test_util

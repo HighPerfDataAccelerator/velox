@@ -23,12 +23,18 @@
 
 #include "velox/expression/ConstantExpr.h"
 #include "velox/expression/FieldReference.h"
+#include "velox/type/TimestampConversion.h"
 #include "velox/vector/ComplexVector.h"
 #include "velox/vector/ConstantVector.h"
+
+#include <optional>
+#include <regex>
 
 #include <cudf/ast/detail/operators.hpp>
 #include <cudf/ast/expressions.hpp>
 #include <cudf/column/column_factories.hpp>
+#include <cudf/copying.hpp>
+#include <cudf/scalar/scalar_factories.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/transform.hpp>
 #include <cudf/unary.hpp>
@@ -186,6 +192,22 @@ std::optional<Op> opFromFunctionName(const std::string& funcName) {
 bool isOpAndInputsSupported(
     const cudf::ast::ast_operator op,
     const std::vector<cudf::data_type>& inputCudfDataTypes) {
+  // cudf::compute_column / Jitify cannot handle variable-width types (STRING)
+  // in AST operations. These must go through FunctionExpression instead.
+  for (const auto& dt : inputCudfDataTypes) {
+    if (!cudf::is_fixed_width(dt)) {
+      return false;
+    }
+  }
+  // cuDF AST expression parser requires all operands to have identical
+  // cudf::data_type (including decimal scale). Reject early if mismatched.
+  if (inputCudfDataTypes.size() >= 2 &&
+      std::adjacent_find(
+          inputCudfDataTypes.cbegin(),
+          inputCudfDataTypes.cend(),
+          std::not_equal_to<>()) != inputCudfDataTypes.cend()) {
+    return false;
+  }
   // check arity
   const auto arity = cudf::ast::detail::ast_operator_arity(op);
   if (arity != static_cast<int>(inputCudfDataTypes.size())) {
@@ -232,7 +254,7 @@ bool isAstExprSupported(const std::shared_ptr<velox::exec::Expr>& expr) {
   // Literals and field references are always supported
   auto isSupportedLiteral = [&](const TypePtr& type) {
     try {
-      auto cudfType = cudf::data_type(veloxToCudfTypeId(type));
+      auto cudfType = veloxToCudfDataType(type);
       return cudf::is_fixed_width(cudfType) ||
           cudfType.id() == cudf::type_id::STRING;
     } catch (...) {
@@ -261,7 +283,7 @@ bool isAstExprSupported(const std::shared_ptr<velox::exec::Expr>& expr) {
   for (const auto& input : expr->inputs()) {
     try {
       inputCudfDataTypes.push_back(
-          cudf::data_type(veloxToCudfTypeId(input->type())));
+          veloxToCudfDataType(input->type()));
     } catch (...) {
       return false;
     }
@@ -386,7 +408,7 @@ cudf::ast::expression const& AstContext::addPrecomputeInstructionOnSide(
     auto nestedIndices = getNestedColumnIndices(
         inputRowSchema[sideIdx].get()->childAt(columnIndex), fieldName);
     precomputeInstructions[sideIdx].get().emplace_back(
-        columnIndex, instruction, newColumnIndex, nestedIndices, node);
+        columnIndex, instruction, newColumnIndex, std::move(nestedIndices), node);
   }
   auto side = static_cast<cudf::ast::table_reference>(sideIdx);
   return tree.push(cudf::ast::column_reference(newColumnIndex, side));
@@ -402,6 +424,32 @@ cudf::ast::expression const& AstContext::addPrecomputeInstruction(
       auto columnIndex = inputRowSchema[sideIdx].get()->getChildIdx(name);
       return addPrecomputeInstructionOnSide(
           sideIdx, columnIndex, instruction, fieldName, node);
+    }
+  }
+  // Fallback: resolve n{nodeId}_{colIdx} by matching the colIdx suffix.
+  static const std::regex kNodeNamePattern("^n\\d+_(\\d+)$");
+  std::smatch reqMatch;
+  if (std::regex_match(name, reqMatch, kNodeNamePattern)) {
+    auto reqSuffix = reqMatch[1].str();
+    for (size_t sideIdx = 0; sideIdx < inputRowSchema.size(); ++sideIdx) {
+      auto& schema = inputRowSchema[sideIdx];
+      int matchCount = 0;
+      size_t matchedCol = 0;
+      for (size_t col = 0; col < schema->size(); ++col) {
+        const auto& colName = schema->nameOf(col);
+        std::smatch schMatch;
+        if (std::regex_match(colName, schMatch, kNodeNamePattern) &&
+            schMatch[1].str() == reqSuffix) {
+          matchedCol = col;
+          ++matchCount;
+        }
+      }
+      if (matchCount == 1) {
+        LOG(WARNING) << "Resolved precompute field '" << name
+                     << "' via colIdx fallback to column " << matchedCol;
+        return addPrecomputeInstructionOnSide(
+            sideIdx, matchedCol, instruction, fieldName, node);
+      }
     }
   }
   VELOX_FAIL("Field not found, " + name);
@@ -448,6 +496,48 @@ cudf::ast::expression const& AstContext::pushExprToTree(
   auto len = expr->inputs().size();
   auto& type = expr->type();
 
+  // Helper: check if any input expression produces a variable-width type
+  // (e.g., STRING). cudf::compute_column / Jitify cannot handle these in
+  // AST operations, so they must be evaluated as precompute instructions.
+  auto hasVariableWidthInput = [&]() {
+    for (const auto& input : expr->inputs()) {
+      try {
+        if (!cudf::is_fixed_width(veloxToCudfDataType(input->type()))) {
+          return true;
+        }
+      } catch (...) {
+      }
+    }
+    return false;
+  };
+
+  // Route a sub-expression with variable-width inputs to precompute
+  // via FunctionExpression, bypassing the JIT/AST compute_column path.
+  auto precomputeVarWidthOp =
+      [&]() -> const cudf::ast::expression* {
+    if (allowPureAstOnly || !hasVariableWidthInput()) {
+      return nullptr;
+    }
+    try {
+      int sideIdx = findExpressionSide(expr);
+      if (sideIdx < 0) {
+        return nullptr;
+      }
+      for (const auto* field : expr->distinctFields()) {
+        if (!inputRowSchema[sideIdx].get()->containsChild(field->field())) {
+          return nullptr;
+        }
+      }
+      auto node = createCudfExpression(
+          expr, inputRowSchema[sideIdx], kAstEvaluatorName);
+      if (node) {
+        return &addPrecomputeInstructionOnSide(sideIdx, 0, name, "", node);
+      }
+    } catch (...) {
+    }
+    return nullptr;
+  };
+
   if (name == "literal") {
     auto c = dynamic_cast<ConstantExpr*>(expr.get());
     VELOX_CHECK_NOT_NULL(c, "literal expression should be ConstantExpr");
@@ -473,6 +563,48 @@ cudf::ast::expression const& AstContext::pushExprToTree(
 
     return tree.push(createLiteral(value, scalars));
   } else if (binaryOps.find(name) != binaryOps.end()) {
+    if (name != "and" && name != "or") {
+      if (auto* result = precomputeVarWidthOp()) {
+        return *result;
+      }
+      // cuDF AST requires identical operand types for binary ops.
+      // If types mismatch, route through FunctionExpression precompute.
+      if (len == 2 && !allowPureAstOnly) {
+        bool mismatch = false;
+        try {
+          auto t0 = veloxToCudfDataType(expr->inputs()[0]->type());
+          auto t1 = veloxToCudfDataType(expr->inputs()[1]->type());
+          mismatch = (t0 != t1);
+        } catch (...) {
+        }
+        if (mismatch) {
+          try {
+            int sideIdx = findExpressionSide(expr);
+            if (sideIdx >= 0) {
+              bool fieldsOk = true;
+              for (const auto* field : expr->distinctFields()) {
+                if (!inputRowSchema[sideIdx].get()->containsChild(
+                        field->field())) {
+                  fieldsOk = false;
+                  break;
+                }
+              }
+              if (fieldsOk) {
+                auto node = createCudfExpression(
+                    expr, inputRowSchema[sideIdx], kAstEvaluatorName);
+                if (node) {
+                  return addPrecomputeInstructionOnSide(
+                      sideIdx, 0, name, "", node);
+                }
+              }
+            }
+          } catch (...) {
+          }
+          VELOX_FAIL(
+              "AST non-matching operand types for binary op '{}'", name);
+        }
+      }
+    }
     if (name == "and" or name == "or") {
       return multipleInputsToPairWise(expr);
     }
@@ -490,15 +622,57 @@ cudf::ast::expression const& AstContext::pushExprToTree(
     auto const& nullOp = tree.push(Operation{Op::IS_NULL, op1});
     return tree.push(Operation{Op::NOT, nullOp});
   } else if (name == "between") {
+    if (auto* result = precomputeVarWidthOp()) {
+      return *result;
+    }
     VELOX_CHECK_EQ(len, 3);
+    // cuDF AST requires matching operand types for gte/lte operations.
+    if (!allowPureAstOnly) {
+      bool mismatch = false;
+      try {
+        auto tVal = veloxToCudfDataType(expr->inputs()[0]->type());
+        auto tLo = veloxToCudfDataType(expr->inputs()[1]->type());
+        auto tHi = veloxToCudfDataType(expr->inputs()[2]->type());
+        mismatch = (tVal != tLo || tVal != tHi);
+      } catch (...) {
+      }
+      if (mismatch) {
+        try {
+          int sideIdx = findExpressionSide(expr);
+          if (sideIdx >= 0) {
+            bool fieldsOk = true;
+            for (const auto* field : expr->distinctFields()) {
+              if (!inputRowSchema[sideIdx].get()->containsChild(
+                      field->field())) {
+                fieldsOk = false;
+                break;
+              }
+            }
+            if (fieldsOk) {
+              auto node = createCudfExpression(
+                  expr, inputRowSchema[sideIdx], kAstEvaluatorName);
+              if (node) {
+                return addPrecomputeInstructionOnSide(
+                    sideIdx, 0, name, "", node);
+              }
+            }
+          }
+        } catch (...) {
+        }
+        VELOX_FAIL(
+            "AST non-matching operand types for between expression");
+      }
+    }
     auto const& value = pushExprToTree(expr->inputs()[0]);
     auto const& lower = pushExprToTree(expr->inputs()[1]);
     auto const& upper = pushExprToTree(expr->inputs()[2]);
-    // construct between(op2, op3) using >= and <=
     auto const& geLower = tree.push(Operation{Op::GREATER_EQUAL, value, lower});
     auto const& leUpper = tree.push(Operation{Op::LESS_EQUAL, value, upper});
     return tree.push(Operation{Op::NULL_LOGICAL_AND, geLower, leUpper});
   } else if (name == "in") {
+    if (auto* result = precomputeVarWidthOp()) {
+      return *result;
+    }
     // number of inputs is variable. >=2
     VELOX_CHECK_EQ(len, 2);
     // actually len is 2, second input is ARRAY
@@ -551,6 +725,42 @@ cudf::ast::expression const& AstContext::pushExprToTree(
       auto node =
           createCudfExpression(expr, inputRowSchema[0], kAstEvaluatorName);
       return addPrecomputeInstructionOnSide(0, 0, name, "", node);
+    } else if (
+        !allowPureAstOnly && expr->inputs().size() == 1 &&
+        expr->type()->isDate() &&
+        expr->inputs()[0]->type()->kind() == TypeKind::VARCHAR &&
+        expr->inputs()[0]->name() == "literal") {
+      // Constant-fold VARCHAR→DATE cast on a literal string input:
+      // parse the date on CPU and inject as a cuDF timestamp_D scalar.
+      auto constExpr = std::dynamic_pointer_cast<velox::exec::ConstantExpr>(
+          expr->inputs()[0]);
+      if (constExpr && constExpr->value() &&
+          !constExpr->value()->isNullAt(0)) {
+        auto strVal =
+            constExpr->value()->as<SimpleVector<StringView>>()->valueAt(0);
+        auto dateResult = velox::util::fromDateString(
+            strVal, velox::util::ParseMode::kPrestoCast);
+        if (dateResult.hasValue()) {
+          auto scalar = makeScalarFromValue(
+              DATE(), dateResult.value(), false);
+          scalars.push_back(std::move(scalar));
+          return tree.push(makeLiteralFromScalar<int32_t>(
+              *scalars.back(), DATE()));
+        }
+      }
+      VELOX_FAIL("Unsupported type for cast operation");
+    } else if (!allowPureAstOnly) {
+      // Fallback: try to evaluate the cast via cudf function as a precompute.
+      try {
+        auto node =
+            createCudfExpression(expr, inputRowSchema[0], kAstEvaluatorName);
+        if (node) {
+          return addPrecomputeInstructionOnSide(0, 0, name, "", node);
+        }
+      } catch (...) {
+        // If precompute creation fails, fall through to VELOX_FAIL.
+      }
+      VELOX_FAIL("Unsupported type for cast operation");
     } else {
       VELOX_FAIL("Unsupported type for cast operation");
     }
@@ -558,31 +768,105 @@ cudf::ast::expression const& AstContext::pushExprToTree(
     // Refer to the appropriate side
     const auto fieldName =
         fieldExpr->inputs().empty() ? name : fieldExpr->inputs()[0]->name();
-    for (size_t sideIdx = 0; sideIdx < inputRowSchema.size(); ++sideIdx) {
-      auto& schema = inputRowSchema[sideIdx];
-      if (schema.get()->containsChild(fieldName)) {
-        auto columnIndex = schema.get()->getChildIdx(fieldName);
-        // This column may be complex data type like ROW, we need to get the
-        // name from row. Push fieldName.name to the tree.
-        auto side = static_cast<cudf::ast::table_reference>(sideIdx);
-        if (fieldExpr->field() == fieldName) {
-          return tree.push(cudf::ast::column_reference(columnIndex, side));
+
+    auto resolveField = [&](const std::string& fname)
+        -> std::optional<cudf::ast::column_reference> {
+      for (size_t sideIdx = 0; sideIdx < inputRowSchema.size(); ++sideIdx) {
+        auto& schema = inputRowSchema[sideIdx];
+        if (schema.get()->containsChild(fname)) {
+          auto columnIndex = schema.get()->getChildIdx(fname);
+          auto side = static_cast<cudf::ast::table_reference>(sideIdx);
+          return cudf::ast::column_reference(columnIndex, side);
+        }
+      }
+      return std::nullopt;
+    };
+
+    auto tryPushField = [&](const std::string& fname,
+                            const std::string& origField)
+        -> std::optional<
+            std::reference_wrapper<cudf::ast::expression const>> {
+      if (auto ref = resolveField(fname)) {
+        if (origField == fname) {
+          return tree.push(*ref);
         } else if (!allowPureAstOnly) {
           return addPrecomputeInstruction(
-              fieldName, "nested_column", fieldExpr->field());
-        } else {
-          VELOX_FAIL("Unsupported type for nested column operation");
+              fname, "nested_column", fieldExpr->field());
+        }
+      }
+      return std::nullopt;
+    };
+
+    // First try exact match
+    if (auto result = tryPushField(fieldName, fieldExpr->field())) {
+      return result->get();
+    }
+
+    // For join filters the output schema may use disambiguated names
+    // (e.g. "col_0", "col_1") while probe/build schemas have "col".
+    // Strip trailing _N suffix and resolve against the hinted side.
+    if (inputRowSchema.size() == 2) {
+      auto pos = fieldName.rfind('_');
+      if (pos != std::string::npos && pos + 1 < fieldName.size()) {
+        auto suffix = fieldName.substr(pos + 1);
+        if (suffix == "0" || suffix == "1") {
+          auto baseName = fieldName.substr(0, pos);
+          if (auto ref = resolveField(baseName)) {
+            return tree.push(*ref);
+          }
         }
       }
     }
+
+    // Fallback for n{nodeId}_{colIdx} naming mismatches: the expression
+    // may reference a column by a different node ID than what the schema
+    // uses (e.g. n11_1 vs n10_1) when plan node IDs diverge.
+    // Extract colIdx and look for a schema column with the same suffix.
+    {
+      static const std::regex kNodeNamePattern("^n\\d+_(\\d+)$");
+      std::smatch reqMatch;
+      if (std::regex_match(fieldName, reqMatch, kNodeNamePattern)) {
+        auto reqSuffix = reqMatch[1].str();
+        std::optional<cudf::ast::column_reference> candidate;
+        int matchCount = 0;
+        for (size_t sideIdx = 0; sideIdx < inputRowSchema.size(); ++sideIdx) {
+          auto& schema = inputRowSchema[sideIdx];
+          for (size_t col = 0; col < schema->size(); ++col) {
+            const auto& colName = schema->nameOf(col);
+            std::smatch schMatch;
+            if (std::regex_match(colName, schMatch, kNodeNamePattern) &&
+                schMatch[1].str() == reqSuffix) {
+              auto side = static_cast<cudf::ast::table_reference>(sideIdx);
+              candidate = cudf::ast::column_reference(col, side);
+              ++matchCount;
+            }
+          }
+        }
+        if (matchCount == 1 && candidate.has_value()) {
+          LOG(WARNING) << "Resolved field '" << fieldName
+                       << "' via colIdx fallback";
+          return tree.push(*candidate);
+        }
+      }
+    }
+
     VELOX_FAIL("Field not found, " + name);
   } else if (!allowPureAstOnly && canBeEvaluatedByCudf(expr, /*deep=*/false)) {
-    // Shallow check: only verify this operation is supported
-    // Children will be recursively handled by createCudfExpression
-    // Determine which side this expression references
     int sideIdx = findExpressionSide(expr);
     if (sideIdx < 0) {
-      sideIdx = 0; // Default to left side if no fields found
+      VELOX_FAIL(
+          "Precompute: no matching side for expression '{}', "
+          "cannot create single-side precompute instruction",
+          name);
+    }
+    for (const auto* field : expr->distinctFields()) {
+      VELOX_CHECK(
+          inputRowSchema[sideIdx].get()->containsChild(field->field()),
+          "Precompute: field '{}' not in side {} schema for expression '{}'; "
+          "cannot create single-side precompute instruction",
+          field->field(),
+          sideIdx,
+          name);
     }
     auto node =
         createCudfExpression(expr, inputRowSchema[sideIdx], kAstEvaluatorName);
@@ -628,6 +912,28 @@ std::vector<ColumnOrView> precomputeSubexpressions(
           stream,
           cudf::get_current_device_resource_ref(),
           /*finalize=*/true);
+      // Constant/scalar sub-expressions may produce 0/1-row output when all
+      // inputs are literals. Expand to match input row count to prevent
+      // "Column size mismatch" in table_view construction.
+      if (!inputColumnViews.empty()) {
+        auto expectedRows = inputColumnViews[0].size();
+        auto actualRows = asView(result).size();
+        if (actualRows != expectedRows && expectedRows > 0) {
+          if (actualRows == 1) {
+            auto scl = cudf::get_element(asView(result), 0, stream);
+            result = cudf::make_column_from_scalar(
+                *scl, expectedRows, stream,
+                cudf::get_current_device_resource_ref());
+          } else if (actualRows == 0) {
+            auto scl = cudf::make_default_constructed_scalar(
+                asView(result).type(), stream,
+                cudf::get_current_device_resource_ref());
+            result = cudf::make_column_from_scalar(
+                *scl, expectedRows, stream,
+                cudf::get_current_device_resource_ref());
+          }
+        }
+      }
       precomputedColumns.push_back(std::move(result));
       continue;
     }

@@ -41,15 +41,6 @@ ColumnOrView JitExpression::eval(
       expr_.inputRowSchema_,
       stream);
 
-  // Make table_view from input columns and precomputed columns
-  std::vector<cudf::column_view> allColumnViews(inputColumnViews);
-  allColumnViews.reserve(inputColumnViews.size() + precomputedColumns.size());
-  for (auto& precomputedCol : precomputedColumns) {
-    allColumnViews.push_back(asView(precomputedCol));
-  }
-
-  cudf::table_view astInputTableView(allColumnViews);
-
   auto result = [&]() -> ColumnOrView {
     if (auto colRefPtr = dynamic_cast<cudf::ast::column_reference const*>(
             &expr_.cudfTree_.back())) {
@@ -76,13 +67,20 @@ ColumnOrView JitExpression::eval(
       if (CudfConfig::getInstance().debugEnabled) {
         LOG(WARNING) << "JitExpr: compute_column_jit path";
       }
+      std::vector<cudf::column_view> allColumnViews(inputColumnViews);
+      allColumnViews.reserve(
+          inputColumnViews.size() + precomputedColumns.size());
+      for (auto& precomputedCol : precomputedColumns) {
+        allColumnViews.push_back(asView(precomputedCol));
+      }
+      cudf::table_view astInputTableView(allColumnViews);
       return cudf::compute_column_jit(
           astInputTableView, expr_.cudfTree_.back(), stream, mr);
     }
   }();
   if (finalize) {
     const auto requestedType =
-        cudf::data_type(cudf_velox::veloxToCudfTypeId(expr_.expr_->type()));
+        cudf_velox::veloxToCudfDataType(expr_.expr_->type());
     auto resultView = asView(result);
     if (resultView.type() != requestedType) {
       result = cudf::cast(resultView, requestedType, stream, mr);
