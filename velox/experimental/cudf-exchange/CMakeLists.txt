@@ -16,7 +16,7 @@ set(
   CudfPartitionedOutput.cpp
   CudfOutputQueueManager.cpp
   CudfQueues.cpp
-  HybridExchange.cpp
+  UcxExchange.cpp
   CudfExchangeProtocol.cpp
   CudfExchangeSource.cpp
   CudfExchangeServer.cpp

@@ -32,16 +32,16 @@ using exec::SourceOperator;
 /// CudfExchangeClient. It is used as a replacement for the Velox Exchange
 /// operator when the plan node's transport type is UCX. The operator receives
 /// cudf::packed_columns from remote tasks and wraps them as CudfVectors.
-class HybridExchange : public SourceOperator, public cudf_velox::NvtxHelper {
+class UcxExchange : public SourceOperator, public cudf_velox::NvtxHelper {
  public:
-  HybridExchange(
+  UcxExchange(
       int32_t operatorId,
       DriverCtx* driverCtx,
       const std::shared_ptr<const core::PlanNode>& planNode,
       std::shared_ptr<CudfExchangeClient> cudfExchangeClient,
-      const std::string& operatorType = "HybridExchange");
+      const std::string& operatorType = "UcxExchange");
 
-  ~HybridExchange() override;
+  ~UcxExchange() override;
 
   BlockingReason isBlocked(ContinueFuture* future) override;
 

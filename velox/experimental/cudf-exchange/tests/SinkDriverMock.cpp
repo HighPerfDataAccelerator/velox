@@ -50,7 +50,7 @@ SinkDriverMock::SinkDriverMock(
         std::make_shared<DriverCtx>(
             task_, driverId, kPipelineId, kUngroupedGroupId, kPartitionId));
     hybridExchanges_.emplace_back(
-        std::make_unique<HybridExchange>(
+        std::make_unique<UcxExchange>(
             operatorId, driverCtxs_.back().get(), planNode, exchangeClient_));
   }
 }
@@ -81,7 +81,7 @@ void SinkDriverMock::run() {
   }
 }
 
-void SinkDriverMock::receiveAllData(HybridExchange* hybridExchange) {
+void SinkDriverMock::receiveAllData(UcxExchange* hybridExchange) {
   while (true) {
     ContinueFuture future;
     auto blocked = hybridExchange->isBlocked(&future);

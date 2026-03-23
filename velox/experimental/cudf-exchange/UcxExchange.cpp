@@ -13,7 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "velox/experimental/cudf-exchange/HybridExchange.h"
+#include "velox/experimental/cudf-exchange/UcxExchange.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
 using facebook::velox::exec::Operator;
@@ -24,9 +24,9 @@ using namespace facebook::velox::cudf_velox; // NOLINT
 
 namespace facebook::velox::cudf_exchange {
 
-// --- Implementation of the HybridExchange operator.
+// --- Implementation of the UcxExchange operator.
 
-HybridExchange::HybridExchange(
+UcxExchange::UcxExchange(
     int32_t operatorId,
     DriverCtx* driverCtx,
     const std::shared_ptr<const core::PlanNode>& planNode,
@@ -63,11 +63,11 @@ HybridExchange::HybridExchange(
   }
 }
 
-HybridExchange::~HybridExchange() {
+UcxExchange::~UcxExchange() {
   close();
 }
 
-void HybridExchange::addRemoteTaskIds(std::vector<std::string>& remoteTaskIds) {
+void UcxExchange::addRemoteTaskIds(std::vector<std::string>& remoteTaskIds) {
   std::shuffle(std::begin(remoteTaskIds), std::end(remoteTaskIds), rng_);
   for (const std::string& remoteTaskId : remoteTaskIds) {
     exchangeClient_->addRemoteTaskId(remoteTaskId);
@@ -75,7 +75,7 @@ void HybridExchange::addRemoteTaskIds(std::vector<std::string>& remoteTaskIds) {
   stats_.wlock()->numSplits += remoteTaskIds.size();
 }
 
-void HybridExchange::getSplits(ContinueFuture* future) {
+void UcxExchange::getSplits(ContinueFuture* future) {
   VLOG(3) << "@" << taskId() << "#" << pipelineId_ << "/" << driverId_
           << " getSplits called for task: " << taskId();
   if (!processSplits_) {
@@ -128,7 +128,7 @@ void HybridExchange::getSplits(ContinueFuture* future) {
   }
 }
 
-BlockingReason HybridExchange::isBlocked(ContinueFuture* future) {
+BlockingReason UcxExchange::isBlocked(ContinueFuture* future) {
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
   if (currentData_ || atEnd_) {
     return BlockingReason::kNotBlocked;
@@ -166,11 +166,11 @@ BlockingReason HybridExchange::isBlocked(ContinueFuture* future) {
   return BlockingReason::kWaitForProducer;
 }
 
-bool HybridExchange::isFinished() {
+bool UcxExchange::isFinished() {
   return atEnd_ && !currentData_;
 }
 
-RowVectorPtr HybridExchange::getOutputFromPackedTable() {
+RowVectorPtr UcxExchange::getOutputFromPackedTable() {
   if (!currentData_) {
     return nullptr;
   }
@@ -192,12 +192,12 @@ RowVectorPtr HybridExchange::getOutputFromPackedTable() {
   return result;
 }
 
-RowVectorPtr HybridExchange::getOutput() {
+RowVectorPtr UcxExchange::getOutput() {
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
   return getOutputFromPackedTable();
 }
 
-void HybridExchange::recordInputStats(
+void UcxExchange::recordInputStats(
     uint64_t rawInputBytes,
     const RowVectorPtr& result) {
   auto lockedStats = stats_.wlock();
@@ -206,7 +206,7 @@ void HybridExchange::recordInputStats(
   lockedStats->addInputVector(result->estimateFlatSize(), result->size());
 }
 
-void HybridExchange::close() {
+void UcxExchange::close() {
   if (closed_) {
     return;
   }
@@ -220,7 +220,7 @@ void HybridExchange::close() {
   exchangeClient_ = nullptr;
 }
 
-void HybridExchange::recordExchangeClientStats() {
+void UcxExchange::recordExchangeClientStats() {
   if (!processSplits_) {
     return;
   }

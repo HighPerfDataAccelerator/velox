@@ -16,7 +16,7 @@
 #pragma once
 
 #include "velox/exec/Driver.h"
-#include "velox/experimental/cudf-exchange/HybridExchange.h"
+#include "velox/experimental/cudf-exchange/UcxExchange.h"
 #include "velox/experimental/cudf-exchange/tests/CudfTestData.h"
 #include "velox/experimental/cudf-exchange/tests/CudfTestHelpers.h"
 
@@ -27,7 +27,7 @@ using exec::DriverCtx;
 /// @class SinkTaskMock
 /// @brief A mock class that receives data through an exchange from one or more
 /// upstream remote tasks. This class mocks the setup and execution of a plan
-/// fragment with a single HybridExchange operator.
+/// fragment with a single UcxExchange operator.
 
 class SinkDriverMock {
  public:
@@ -81,7 +81,7 @@ class SinkDriverMock {
 
  private:
   // Drives a single hybrid exchange operator until all data has been received.
-  void receiveAllData(HybridExchange* hybridExchange);
+  void receiveAllData(UcxExchange* hybridExchange);
 
   /// @brief checks if the received table corresponds to that sent, sets
   /// dataValidFlag_=false if not
@@ -93,7 +93,7 @@ class SinkDriverMock {
   std::shared_ptr<CudfExchangeClient> exchangeClient_;
 
   std::vector<std::shared_ptr<DriverCtx>> driverCtxs_;
-  std::vector<std::unique_ptr<HybridExchange>> hybridExchanges_;
+  std::vector<std::unique_ptr<UcxExchange>> hybridExchanges_;
   uint32_t numDrivers_;
   std::atomic<uint64_t> numRows_;
   std::atomic<uint64_t> numBytes_{0};
