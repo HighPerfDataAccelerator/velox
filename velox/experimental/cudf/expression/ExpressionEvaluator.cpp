@@ -2329,6 +2329,21 @@ bool registerBuiltinFunctions(const std::string& prefix) {
              .returnType("boolean")
              .argumentType("decimal(a_precision, a_scale)")
              .argumentType("decimal(b_precision, b_scale)")
+             .build(),
+         FunctionSignatureBuilder()
+             .returnType("boolean")
+             .argumentType("varchar")
+             .argumentType("varchar")
+             .build(),
+         FunctionSignatureBuilder()
+             .returnType("boolean")
+             .argumentType("date")
+             .argumentType("date")
+             .build(),
+         FunctionSignatureBuilder()
+             .returnType("boolean")
+             .argumentType("boolean")
+             .argumentType("boolean")
              .build()});
   };
 
@@ -2608,9 +2623,25 @@ ColumnOrView FunctionExpression::eval(
   using velox::exec::FieldReference;
 
   if (auto fieldExpr = std::dynamic_pointer_cast<FieldReference>(expr_)) {
-    auto name = fieldExpr->name();
-    auto columnIndex = inputRowSchema_->getChildIdx(name);
-    return inputColumnViews[columnIndex];
+    if (fieldExpr->inputs().empty()) {
+      auto columnIndex = inputRowSchema_->getChildIdx(fieldExpr->name());
+      return inputColumnViews[columnIndex];
+    }
+    // Struct field dereference: e.g. "n23_5"["col_0"] extracts a child
+    // column from a STRUCT/ROW column.  Walk the FieldReference chain to
+    // resolve the parent column and child index.
+    auto innerField =
+        std::dynamic_pointer_cast<FieldReference>(fieldExpr->inputs()[0]);
+    if (innerField && innerField->inputs().empty()) {
+      auto parentIdx = inputRowSchema_->getChildIdx(innerField->name());
+      auto parentType = inputRowSchema_->childAt(parentIdx);
+      VELOX_CHECK(
+          parentType->isRow(),
+          "Expected ROW type for struct dereference, got {}",
+          parentType->toString());
+      auto childIdx = parentType->asRow().getChildIdx(fieldExpr->name());
+      return inputColumnViews[parentIdx].child(childIdx);
+    }
   }
 
   if (function_) {
