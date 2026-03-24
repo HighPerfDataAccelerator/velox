@@ -208,7 +208,13 @@ bool isOpAndInputsSupported(
   }
   // Decimal DIV/MUL require custom rescaling logic in BinaryFunction.
   // The generic AST/Jitify path produces wrong output types/scales.
-  if (op == Op::DIV || op == Op::MUL) {
+  // Decimal comparisons (GREATER, LESS, etc.) also produce incorrect
+  // results through cudf::compute_column for DECIMAL128 types; route
+  // them through BinaryFunction which uses cudf::binary_operation.
+  if (op == Op::DIV || op == Op::MUL ||
+      op == Op::GREATER || op == Op::GREATER_EQUAL ||
+      op == Op::LESS || op == Op::LESS_EQUAL ||
+      op == Op::EQUAL || op == Op::NOT_EQUAL) {
     for (const auto& dt : inputCudfDataTypes) {
       if (cudf::is_fixed_point(dt)) {
         return false;

@@ -65,7 +65,9 @@ __global__ void decimalDivideKernel(
   __int128_t scaled = numerator * scale;
   __int128_t quotient = scaled / denom;
   __int128_t remainder = scaled % denom;
-  if (remainder * 2 >= denom) {
+  // HALF_UP rounding: round up when remainder >= denom/2.
+  // Use (denom - remainder) to avoid overflow from (remainder * 2).
+  if (remainder >= denom - remainder) {
     ++quotient;
   }
   if (sign < 0) {
