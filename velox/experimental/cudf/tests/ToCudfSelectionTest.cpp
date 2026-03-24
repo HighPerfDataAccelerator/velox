@@ -117,7 +117,7 @@ TEST_F(ToCudfSelectionTest, supportedAggregationUsesCudf) {
   ASSERT_FALSE(wasDefaultHashAggregationUsed(task));
 }
 
-// Test unsupported aggregation should fall back to CPU
+// Test unsupported aggregation should fall back to CPU (min on VARCHAR not in cudf registry)
 TEST_F(ToCudfSelectionTest, unsupportedAggregationFallsBack) {
   auto vectors = makeVectors(rowType_, 10, 100);
   createDuckDbTable(vectors);
@@ -126,7 +126,7 @@ TEST_F(ToCudfSelectionTest, unsupportedAggregationFallsBack) {
                   .values(vectors)
                   .aggregation(
                       {"c0"},
-                      {"stddev(c1)", "variance(c2)"},
+                      {"min(c6)"},
                       {},
                       core::AggregationNode::Step::kSingle,
                       false)
@@ -137,7 +137,7 @@ TEST_F(ToCudfSelectionTest, unsupportedAggregationFallsBack) {
           .config("cudf.enabled", true)
           .plan(plan)
           .assertResults(
-              "SELECT c0, stddev(c1), variance(c2) FROM tmp GROUP BY c0");
+              "SELECT c0, min(c6) FROM tmp GROUP BY c0");
 
   ASSERT_FALSE(wasCudfAggregationUsed(task));
   ASSERT_TRUE(wasDefaultHashAggregationUsed(task));
@@ -152,7 +152,7 @@ TEST_F(ToCudfSelectionTest, mixedSupportFallsBack) {
                   .values(vectors)
                   .aggregation(
                       {"c0"},
-                      {"sum(c1)", "stddev(c2)"},
+                      {"sum(c1)", "min(c6)"},
                       {},
                       core::AggregationNode::Step::kSingle,
                       false)
@@ -162,7 +162,7 @@ TEST_F(ToCudfSelectionTest, mixedSupportFallsBack) {
       AssertQueryBuilder(duckDbQueryRunner_)
           .config("cudf.enabled", true)
           .plan(plan)
-          .assertResults("SELECT c0, sum(c1), stddev(c2) FROM tmp GROUP BY c0");
+          .assertResults("SELECT c0, sum(c1), min(c6) FROM tmp GROUP BY c0");
 
   ASSERT_FALSE(wasCudfAggregationUsed(task));
   ASSERT_TRUE(wasDefaultHashAggregationUsed(task));
@@ -201,7 +201,7 @@ TEST_F(ToCudfSelectionTest, unsupportedGlobalAggregationFallsBack) {
                   .values(vectors)
                   .aggregation(
                       {},
-                      {"stddev(c1)"},
+                      {"min(c6)"},
                       {},
                       core::AggregationNode::Step::kSingle,
                       false)
@@ -210,7 +210,7 @@ TEST_F(ToCudfSelectionTest, unsupportedGlobalAggregationFallsBack) {
   auto task = AssertQueryBuilder(duckDbQueryRunner_)
                   .config("cudf.enabled", true)
                   .plan(plan)
-                  .assertResults("SELECT stddev(c1) FROM tmp");
+                  .assertResults("SELECT min(c6) FROM tmp");
 
   ASSERT_FALSE(wasCudfAggregationUsed(task));
   ASSERT_TRUE(wasDefaultHashAggregationUsed(task));
@@ -261,7 +261,7 @@ TEST_F(ToCudfSelectionTest, unsupportedAggregationFunctionsFallsBack) {
                   .values(vectors)
                   .aggregation(
                       {"c0"},
-                      {"sum(c1)", "stddev(c2)"},
+                      {"sum(c1)", "min(c6)"},
                       {},
                       core::AggregationNode::Step::kSingle,
                       false)
@@ -271,7 +271,7 @@ TEST_F(ToCudfSelectionTest, unsupportedAggregationFunctionsFallsBack) {
       AssertQueryBuilder(duckDbQueryRunner_)
           .config("cudf.enabled", true)
           .plan(plan)
-          .assertResults("SELECT c0, sum(c1), stddev(c2) FROM tmp GROUP BY c0");
+          .assertResults("SELECT c0, sum(c1), min(c6) FROM tmp GROUP BY c0");
 
   ASSERT_FALSE(wasCudfAggregationUsed(task));
   ASSERT_TRUE(wasDefaultHashAggregationUsed(task));
@@ -337,7 +337,7 @@ TEST_F(ToCudfSelectionTest, unsupportedAggregationInputExpressionsFallsBack) {
                   .values(vectors)
                   .aggregation(
                       {"c0"},
-                      {"sum(c1)", "variance(c2)"},
+                      {"sum(c1)", "min(c6)"},
                       {},
                       core::AggregationNode::Step::kSingle,
                       false)
@@ -347,7 +347,7 @@ TEST_F(ToCudfSelectionTest, unsupportedAggregationInputExpressionsFallsBack) {
                   .config("cudf.enabled", true)
                   .plan(plan)
                   .assertResults(
-                      "SELECT c0, sum(c1), variance(c2) FROM tmp GROUP BY c0");
+                      "SELECT c0, sum(c1), min(c6) FROM tmp GROUP BY c0");
 
   ASSERT_FALSE(wasCudfAggregationUsed(task));
   ASSERT_TRUE(wasDefaultHashAggregationUsed(task));
