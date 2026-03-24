@@ -155,10 +155,17 @@ const std::unordered_map<std::string, Op> sparkBinaryOps = {
     {"multiply", Op::MUL},
     {"divide", Op::DIV},
     {"equalto", Op::EQUAL},
+    {"decimal_equalto", Op::EQUAL},
     {"lessthan", Op::LESS},
+    {"decimal_lessthan", Op::LESS},
     {"greaterthan", Op::GREATER},
+    {"decimal_greaterthan", Op::GREATER},
     {"lessthanorequal", Op::LESS_EQUAL},
+    {"decimal_lessthanorequal", Op::LESS_EQUAL},
     {"greaterthanorequal", Op::GREATER_EQUAL},
+    {"decimal_greaterthanorequal", Op::GREATER_EQUAL},
+    {"notequalto", Op::NOT_EQUAL},
+    {"decimal_notequalto", Op::NOT_EQUAL},
     {"and", Op::NULL_LOGICAL_AND},
     {"or", Op::NULL_LOGICAL_OR},
     {"mod", Op::MOD},
@@ -197,6 +204,15 @@ bool isOpAndInputsSupported(
   for (const auto& dt : inputCudfDataTypes) {
     if (!cudf::is_fixed_width(dt)) {
       return false;
+    }
+  }
+  // Decimal DIV/MUL require custom rescaling logic in BinaryFunction.
+  // The generic AST/Jitify path produces wrong output types/scales.
+  if (op == Op::DIV || op == Op::MUL) {
+    for (const auto& dt : inputCudfDataTypes) {
+      if (cudf::is_fixed_point(dt)) {
+        return false;
+      }
     }
   }
   // cuDF AST expression parser requires all operands to have identical
