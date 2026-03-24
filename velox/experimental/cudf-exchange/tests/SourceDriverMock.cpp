@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #include "velox/experimental/cudf-exchange/tests/SourceDriverMock.h"
+#include <cudf/utilities/default_stream.hpp>
 #include "velox/experimental/cudf-exchange/tests/CudfTestHelpers.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 
@@ -72,7 +73,7 @@ void SourceDriverMock::run() {
 }
 
 void SourceDriverMock::sendAllData(CudfPartitionedOutput* partitionedOutput) {
-  auto stream = cudf_velox::cudfGlobalStreamPool().get_stream();
+  auto stream = cudf::get_default_stream();
   // Use tableGenerator's rowType if available, otherwise get from task
   auto rowType = tableGenerator_ ? tableGenerator_->getRowType()
                                  : task_->planFragment().planNode->outputType();
