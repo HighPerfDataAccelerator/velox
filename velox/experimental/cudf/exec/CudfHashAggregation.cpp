@@ -34,6 +34,7 @@
 #include <cudf/binaryop.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/concatenate.hpp>
+#include <cudf/copying.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/reduction/approx_distinct_count.hpp>
 #include <cudf/stream_compaction.hpp>
@@ -42,6 +43,7 @@
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/error.hpp>
 
+#include <cmath>
 #include <vector>
 
 namespace {
@@ -218,8 +220,24 @@ struct DecimalSumOrAvgAggregator : cudf_velox::CudfHashAggregation::Aggregator {
         count =
             cudf::cast(*count, cudf::data_type{cudf::type_id::INT64}, stream, cudf::get_current_device_resource_ref());
       }
-      return cudf_velox::serializeDecimalSumState(
-          col->view(), count->view(), stream, cudf::get_current_device_resource_ref());
+      auto const& outputType = asRowType(resultType);
+      auto const cudfSumType =
+          cudf_velox::veloxToCudfDataType(outputType->childAt(0));
+      if (col->type() != cudfSumType) {
+        col = cudf::cast(*col, cudfSumType, stream,
+                         cudf::get_current_device_resource_ref());
+      }
+      auto size = col->size();
+      std::vector<std::unique_ptr<cudf::column>> children;
+      children.push_back(std::move(col));
+      children.push_back(std::move(count));
+      return std::make_unique<cudf::column>(
+          cudf::data_type(cudf::type_id::STRUCT),
+          size,
+          rmm::device_buffer{},
+          rmm::device_buffer{},
+          0,
+          std::move(children));
     }
     if (step == core::AggregationNode::Step::kIntermediate) {
       auto count = std::move(results[countIdx_].results[0]);
@@ -227,8 +245,24 @@ struct DecimalSumOrAvgAggregator : cudf_velox::CudfHashAggregation::Aggregator {
         count =
             cudf::cast(*count, cudf::data_type{cudf::type_id::INT64}, stream, cudf::get_current_device_resource_ref());
       }
-      return cudf_velox::serializeDecimalSumState(
-          col->view(), count->view(), stream, cudf::get_current_device_resource_ref());
+      auto const& outputType = asRowType(resultType);
+      auto const cudfSumType =
+          cudf_velox::veloxToCudfDataType(outputType->childAt(0));
+      if (col->type() != cudfSumType) {
+        col = cudf::cast(*col, cudfSumType, stream,
+                         cudf::get_current_device_resource_ref());
+      }
+      auto size = col->size();
+      std::vector<std::unique_ptr<cudf::column>> children;
+      children.push_back(std::move(col));
+      children.push_back(std::move(count));
+      return std::make_unique<cudf::column>(
+          cudf::data_type(cudf::type_id::STRUCT),
+          size,
+          rmm::device_buffer{},
+          rmm::device_buffer{},
+          0,
+          std::move(children));
     }
     if (isAvg_ && step == core::AggregationNode::Step::kFinal) {
       auto count = std::move(results[countIdx_].results[0]);
@@ -270,8 +304,22 @@ struct DecimalSumOrAvgAggregator : cudf_velox::CudfHashAggregation::Aggregator {
           inputCol, *countAgg, cudf::data_type{cudf::type_id::INT64}, stream, cudf::get_current_device_resource_ref());
       auto sumCol = cudf::make_column_from_scalar(*sumScalar, 1, stream, cudf::get_current_device_resource_ref());
       auto countCol = cudf::make_column_from_scalar(*countScalar, 1, stream, cudf::get_current_device_resource_ref());
-      return cudf_velox::serializeDecimalSumState(
-          sumCol->view(), countCol->view(), stream, cudf::get_current_device_resource_ref());
+      auto const cudfSumType = cudf_velox::veloxToCudfDataType(
+          asRowType(outputType)->childAt(0));
+      if (sumCol->type() != cudfSumType) {
+        sumCol = cudf::cast(*sumCol, cudfSumType, stream,
+                            cudf::get_current_device_resource_ref());
+      }
+      std::vector<std::unique_ptr<cudf::column>> children;
+      children.push_back(std::move(sumCol));
+      children.push_back(std::move(countCol));
+      return std::make_unique<cudf::column>(
+          cudf::data_type(cudf::type_id::STRUCT),
+          1,
+          rmm::device_buffer{},
+          rmm::device_buffer{},
+          0,
+          std::move(children));
     }
     if (step == core::AggregationNode::Step::kIntermediate &&
         inputCol.type().id() == cudf::type_id::STRING) {
@@ -289,8 +337,22 @@ struct DecimalSumOrAvgAggregator : cudf_velox::CudfHashAggregation::Aggregator {
           stream, cudf::get_current_device_resource_ref());
       auto sumCol = cudf::make_column_from_scalar(*sumScalar, 1, stream, cudf::get_current_device_resource_ref());
       auto countCol = cudf::make_column_from_scalar(*countScalar, 1, stream, cudf::get_current_device_resource_ref());
-      return cudf_velox::serializeDecimalSumState(
-          sumCol->view(), countCol->view(), stream, cudf::get_current_device_resource_ref());
+      auto const cudfSumType = cudf_velox::veloxToCudfDataType(
+          asRowType(outputType)->childAt(0));
+      if (sumCol->type() != cudfSumType) {
+        sumCol = cudf::cast(*sumCol, cudfSumType, stream,
+                            cudf::get_current_device_resource_ref());
+      }
+      std::vector<std::unique_ptr<cudf::column>> children;
+      children.push_back(std::move(sumCol));
+      children.push_back(std::move(countCol));
+      return std::make_unique<cudf::column>(
+          cudf::data_type(cudf::type_id::STRUCT),
+          1,
+          rmm::device_buffer{},
+          rmm::device_buffer{},
+          0,
+          std::move(children));
     }
     if (step == core::AggregationNode::Step::kFinal &&
         inputCol.type().id() == cudf::type_id::STRING) {
@@ -1001,6 +1063,375 @@ struct BloomFilterAggregator : cudf_velox::CudfHashAggregation::Aggregator {
   int64_t numBits_;
 };
 
+// Aggregator for stddev_samp, stddev, variance, var_samp.
+// Uses cudf's direct STD/VARIANCE for kSingle, and M2-based aggregation
+// with Welford merge for partial/intermediate/final steps.
+struct VarianceAggregator : cudf_velox::CudfHashAggregation::Aggregator {
+  VarianceAggregator(
+      core::AggregationNode::Step step,
+      uint32_t inputIndex,
+      VectorPtr constant,
+      bool isGlobal,
+      const TypePtr& resultType,
+      bool isStdDev,
+      int ddof)
+      : Aggregator(
+            step,
+            isStdDev ? cudf::aggregation::STD : cudf::aggregation::VARIANCE,
+            inputIndex,
+            constant,
+            isGlobal,
+            resultType),
+        isStdDev_(isStdDev),
+        ddof_(ddof) {}
+
+  void addGroupbyRequest(
+      cudf::table_view const& tbl,
+      std::vector<cudf::groupby::aggregation_request>& requests,
+      rmm::cuda_stream_view stream) override {
+    switch (step) {
+      case core::AggregationNode::Step::kSingle: {
+        auto& request = requests.emplace_back();
+        singleIdx_ = requests.size() - 1;
+        request.values = tbl.column(inputIndex);
+        if (isStdDev_) {
+          request.aggregations.push_back(
+              cudf::make_std_aggregation<cudf::groupby_aggregation>(ddof_));
+        } else {
+          request.aggregations.push_back(
+              cudf::make_variance_aggregation<cudf::groupby_aggregation>(
+                  ddof_));
+        }
+        break;
+      }
+      case core::AggregationNode::Step::kPartial: {
+        auto& request = requests.emplace_back();
+        partialIdx_ = requests.size() - 1;
+        request.values = tbl.column(inputIndex);
+        request.aggregations.push_back(
+            cudf::make_count_aggregation<cudf::groupby_aggregation>(
+                cudf::null_policy::EXCLUDE));
+        request.aggregations.push_back(
+            cudf::make_mean_aggregation<cudf::groupby_aggregation>());
+        request.aggregations.push_back(
+            cudf::make_m2_aggregation<cudf::groupby_aggregation>());
+        break;
+      }
+      case core::AggregationNode::Step::kIntermediate:
+      case core::AggregationNode::Step::kFinal: {
+        // Input is struct(bigint, double, double) = (count, mean, m2).
+        // cudf MERGE_M2 accepts INT64 or FLOAT64 count directly.
+        auto& request = requests.emplace_back();
+        mergeIdx_ = requests.size() - 1;
+        request.values = tbl.column(inputIndex);
+        request.aggregations.push_back(
+            cudf::make_merge_m2_aggregation<cudf::groupby_aggregation>());
+        break;
+      }
+      default:
+        VELOX_NYI("Unsupported aggregation step for variance/stddev");
+    }
+  }
+
+  std::unique_ptr<cudf::column> makeOutputColumn(
+      std::vector<cudf::groupby::aggregation_result>& results,
+      rmm::cuda_stream_view stream) override {
+    auto mr = cudf::get_current_device_resource_ref();
+    switch (step) {
+      case core::AggregationNode::Step::kSingle: {
+        return std::move(results[singleIdx_].results[0]);
+      }
+      case core::AggregationNode::Step::kPartial: {
+        auto count = std::move(results[partialIdx_].results[0]);
+        auto mean = std::move(results[partialIdx_].results[1]);
+        auto m2 = std::move(results[partialIdx_].results[2]);
+
+        auto const& rowType = asRowType(resultType);
+        auto const cudfCountType =
+            cudf_velox::veloxToCudfDataType(rowType->childAt(0));
+        auto const cudfMeanType =
+            cudf_velox::veloxToCudfDataType(rowType->childAt(1));
+        auto const cudfM2Type =
+            cudf_velox::veloxToCudfDataType(rowType->childAt(2));
+        if (count->type() != cudfCountType) {
+          count = cudf::cast(*count, cudfCountType, stream, mr);
+        }
+        if (mean->type() != cudfMeanType) {
+          mean = cudf::cast(*mean, cudfMeanType, stream, mr);
+        }
+        if (m2->type() != cudfM2Type) {
+          m2 = cudf::cast(*m2, cudfM2Type, stream, mr);
+        }
+
+        auto const size = count->size();
+        auto children = std::vector<std::unique_ptr<cudf::column>>();
+        children.push_back(std::move(count));
+        children.push_back(std::move(mean));
+        children.push_back(std::move(m2));
+        return std::make_unique<cudf::column>(
+            cudf::data_type(cudf::type_id::STRUCT),
+            size,
+            rmm::device_buffer{},
+            rmm::device_buffer{},
+            0,
+            std::move(children));
+      }
+      case core::AggregationNode::Step::kIntermediate: {
+        // MERGE_M2 returns struct(count, mean, m2).
+        // The output count type matches the input count type (INT64).
+        auto mergedStruct = std::move(results[mergeIdx_].results[0]);
+        auto const& rowType = asRowType(resultType);
+        auto const cudfCountType =
+            cudf_velox::veloxToCudfDataType(rowType->childAt(0));
+
+        // If MERGE_M2 output count type differs from Velox's expected type,
+        // rebuild the struct with the correct types.
+        if (mergedStruct->child(0).type() != cudfCountType) {
+          auto const size = mergedStruct->size();
+          auto mergedCols = mergedStruct->release();
+          auto& childCols = mergedCols.children;
+          childCols[0] = cudf::cast(
+              childCols[0]->view(), cudfCountType, stream, mr);
+
+          auto children = std::vector<std::unique_ptr<cudf::column>>();
+          for (auto& c : childCols) {
+            children.push_back(std::move(c));
+          }
+          return std::make_unique<cudf::column>(
+              cudf::data_type(cudf::type_id::STRUCT),
+              size,
+              rmm::device_buffer{},
+              rmm::device_buffer{},
+              0,
+              std::move(children));
+        }
+        return mergedStruct;
+      }
+      case core::AggregationNode::Step::kFinal: {
+        // MERGE_M2 returns struct(count, mean, m2). Compute final result.
+        auto mergedStruct = std::move(results[mergeIdx_].results[0]);
+        auto const countCol = mergedStruct->view().child(0);
+        auto const m2Col = mergedStruct->view().child(2);
+
+        // Cast count to FLOAT64 for division.
+        auto countDouble =
+            cudf::cast(countCol, cudf::data_type{cudf::type_id::FLOAT64},
+                       stream, mr);
+
+        // divisor = count - ddof
+        auto ddofScalar =
+            cudf::numeric_scalar<double>(static_cast<double>(ddof_));
+        auto divisor = cudf::binary_operation(
+            *countDouble, ddofScalar, cudf::binary_operator::SUB,
+            cudf::data_type{cudf::type_id::FLOAT64}, stream, mr);
+
+        // variance = m2 / divisor
+        auto variance = cudf::binary_operation(
+            m2Col, *divisor, cudf::binary_operator::DIV,
+            cudf::data_type{cudf::type_id::FLOAT64}, stream, mr);
+
+        // Null out rows where count <= ddof (insufficient data for
+        // sample statistics). Spark returns NULL in this case.
+        auto ddofThreshold =
+            cudf::numeric_scalar<int64_t>(static_cast<int64_t>(ddof_));
+        auto validMask = cudf::binary_operation(
+            countCol, ddofThreshold, cudf::binary_operator::GREATER,
+            cudf::data_type{cudf::type_id::BOOL8}, stream, mr);
+        auto nullScalar =
+            cudf::numeric_scalar<double>(0.0, false, stream);
+
+        if (isStdDev_) {
+          auto stddev = cudf::unary_operation(
+              *variance, cudf::unary_operator::SQRT, stream, mr);
+          return cudf::copy_if_else(
+              *stddev, nullScalar, *validMask, stream, mr);
+        }
+        return cudf::copy_if_else(
+            *variance, nullScalar, *validMask, stream, mr);
+      }
+      default:
+        VELOX_NYI("Unsupported aggregation step for variance/stddev");
+    }
+  }
+
+  std::unique_ptr<cudf::column> doReduce(
+      cudf::table_view const& input,
+      TypePtr const& outputType,
+      rmm::cuda_stream_view stream) override {
+    auto mr = cudf::get_current_device_resource_ref();
+    switch (step) {
+      case core::AggregationNode::Step::kSingle: {
+        auto aggReq = isStdDev_
+            ? cudf::make_std_aggregation<cudf::reduce_aggregation>(ddof_)
+            : cudf::make_variance_aggregation<cudf::reduce_aggregation>(
+                  ddof_);
+        auto const cudfOutType = cudf::data_type{cudf::type_id::FLOAT64};
+        auto resultScalar = cudf::reduce(
+            input.column(inputIndex), *aggReq, cudfOutType, stream, mr);
+        return cudf::make_column_from_scalar(*resultScalar, 1, stream, mr);
+      }
+      case core::AggregationNode::Step::kPartial: {
+        VELOX_CHECK(outputType->isRow());
+        auto const inputCol = input.column(inputIndex);
+        int64_t n = inputCol.size() - inputCol.null_count();
+
+        auto countCol = cudf::make_column_from_scalar(
+            cudf::numeric_scalar<int64_t>(n), 1, stream, mr);
+
+        if (n == 0) {
+          auto meanCol = cudf::make_column_from_scalar(
+              cudf::numeric_scalar<double>(0.0, false, stream), 1,
+              stream, mr);
+          auto m2Col = cudf::make_column_from_scalar(
+              cudf::numeric_scalar<double>(0.0, false, stream), 1,
+              stream, mr);
+          auto children = std::vector<std::unique_ptr<cudf::column>>();
+          children.push_back(std::move(countCol));
+          children.push_back(std::move(meanCol));
+          children.push_back(std::move(m2Col));
+          return std::make_unique<cudf::column>(
+              cudf::data_type(cudf::type_id::STRUCT), 1,
+              rmm::device_buffer{}, rmm::device_buffer{}, 0,
+              std::move(children));
+        }
+
+        auto meanAgg =
+            cudf::make_mean_aggregation<cudf::reduce_aggregation>();
+        auto meanScalar = cudf::reduce(
+            inputCol, *meanAgg,
+            cudf::data_type{cudf::type_id::FLOAT64}, stream, mr);
+        auto meanCol =
+            cudf::make_column_from_scalar(*meanScalar, 1, stream, mr);
+
+        // m2 = variance_pop * n
+        auto varPopAgg =
+            cudf::make_variance_aggregation<cudf::reduce_aggregation>(0);
+        auto varPopScalar = cudf::reduce(
+            inputCol, *varPopAgg,
+            cudf::data_type{cudf::type_id::FLOAT64}, stream, mr);
+        auto varPopCol =
+            cudf::make_column_from_scalar(*varPopScalar, 1, stream, mr);
+        auto nScalar = cudf::numeric_scalar<double>(static_cast<double>(n));
+        auto m2Col = cudf::binary_operation(
+            *varPopCol, nScalar, cudf::binary_operator::MUL,
+            cudf::data_type{cudf::type_id::FLOAT64}, stream, mr);
+
+        auto children = std::vector<std::unique_ptr<cudf::column>>();
+        children.push_back(std::move(countCol));
+        children.push_back(std::move(meanCol));
+        children.push_back(std::move(m2Col));
+        return std::make_unique<cudf::column>(
+            cudf::data_type(cudf::type_id::STRUCT), 1,
+            rmm::device_buffer{}, rmm::device_buffer{}, 0,
+            std::move(children));
+      }
+      case core::AggregationNode::Step::kIntermediate:
+      case core::AggregationNode::Step::kFinal: {
+        // Input is struct column with (count, mean, m2) per row.
+        // Merge all rows using Welford's parallel algorithm on host.
+        auto const structCol = input.column(inputIndex);
+        auto const countView = structCol.child(0);
+        auto const meanView = structCol.child(1);
+        auto const m2View = structCol.child(2);
+
+        auto const numRows = structCol.size();
+
+        // Copy device columns to host memory for merge.
+        std::vector<int64_t> countData(numRows);
+        std::vector<double> meanData(numRows);
+        std::vector<double> m2Data(numRows);
+        CUDF_CUDA_TRY(cudaMemcpyAsync(
+            countData.data(),
+            countView.data<int64_t>(),
+            numRows * sizeof(int64_t),
+            cudaMemcpyDeviceToHost,
+            stream.value()));
+        CUDF_CUDA_TRY(cudaMemcpyAsync(
+            meanData.data(),
+            meanView.data<double>(),
+            numRows * sizeof(double),
+            cudaMemcpyDeviceToHost,
+            stream.value()));
+        CUDF_CUDA_TRY(cudaMemcpyAsync(
+            m2Data.data(),
+            m2View.data<double>(),
+            numRows * sizeof(double),
+            cudaMemcpyDeviceToHost,
+            stream.value()));
+        stream.synchronize();
+
+        int64_t mergedN = 0;
+        double mergedMean = 0.0;
+        double mergedM2 = 0.0;
+
+        for (int i = 0; i < numRows; i++) {
+          auto const pn = countData[i];
+          if (pn == 0) {
+            continue;
+          }
+          auto const pMean = meanData[i];
+          auto const pM2 = m2Data[i];
+          auto const newN = mergedN + pn;
+          auto const delta = pMean - mergedMean;
+          mergedM2 += pM2 + delta * delta *
+              static_cast<double>(mergedN) * static_cast<double>(pn) /
+              static_cast<double>(newN);
+          mergedMean = (mergedMean * static_cast<double>(mergedN) +
+                        pMean * static_cast<double>(pn)) /
+              static_cast<double>(newN);
+          mergedN = newN;
+        }
+
+        if (step == core::AggregationNode::Step::kIntermediate) {
+          VELOX_CHECK(outputType->isRow());
+          auto outCount = cudf::make_column_from_scalar(
+              cudf::numeric_scalar<int64_t>(mergedN), 1, stream, mr);
+          auto outMean = cudf::make_column_from_scalar(
+              cudf::numeric_scalar<double>(mergedMean), 1, stream, mr);
+          auto outM2 = cudf::make_column_from_scalar(
+              cudf::numeric_scalar<double>(mergedM2), 1, stream, mr);
+          auto children = std::vector<std::unique_ptr<cudf::column>>();
+          children.push_back(std::move(outCount));
+          children.push_back(std::move(outMean));
+          children.push_back(std::move(outM2));
+          return std::make_unique<cudf::column>(
+              cudf::data_type(cudf::type_id::STRUCT), 1,
+              rmm::device_buffer{}, rmm::device_buffer{}, 0,
+              std::move(children));
+        }
+
+        // kFinal: compute the scalar result.
+        if (mergedN == 0) {
+          auto nullScalar =
+              cudf::numeric_scalar<double>(0.0, false, stream);
+          return cudf::make_column_from_scalar(nullScalar, 1, stream, mr);
+        }
+        if (mergedN <= ddof_) {
+          // Return null for sample stats when n <= ddof.
+          auto nullScalar =
+              cudf::numeric_scalar<double>(0.0, false, stream);
+          return cudf::make_column_from_scalar(nullScalar, 1, stream, mr);
+        }
+        double result = mergedM2 / (static_cast<double>(mergedN) - ddof_);
+        if (isStdDev_) {
+          result = std::sqrt(result);
+        }
+        auto resultScalar = cudf::numeric_scalar<double>(result, true, stream);
+        return cudf::make_column_from_scalar(resultScalar, 1, stream, mr);
+      }
+      default:
+        VELOX_NYI("Unsupported aggregation step for variance/stddev");
+    }
+  }
+
+ private:
+  bool isStdDev_;
+  int ddof_;
+  uint32_t singleIdx_{0};
+  uint32_t partialIdx_{0};
+  uint32_t mergeIdx_{0};
+};
+
 std::unique_ptr<cudf_velox::CudfHashAggregation::Aggregator> createAggregator(
     core::AggregationNode::Step step,
     std::string const& kind,
@@ -1040,6 +1471,19 @@ std::unique_ptr<cudf_velox::CudfHashAggregation::Aggregator> createAggregator(
   } else if (kind.rfind(prefix + "approx_distinct", 0) == 0) {
     return std::make_unique<ApproxDistinctAggregator>(
         step, inputIndex, constant, isGlobal, resultType);
+  } else if (
+      kind.rfind(prefix + "stddev", 0) == 0) {
+    // Handles: stddev, stddev_samp (and their companion _partial/_merge etc.)
+    return std::make_unique<VarianceAggregator>(
+        step, inputIndex, constant, isGlobal, resultType,
+        /*isStdDev=*/true, /*ddof=*/1);
+  } else if (
+      kind.rfind(prefix + "variance", 0) == 0 ||
+      kind.rfind(prefix + "var_samp", 0) == 0) {
+    // Handles: variance, var_samp (and their companion _partial/_merge etc.)
+    return std::make_unique<VarianceAggregator>(
+        step, inputIndex, constant, isGlobal, resultType,
+        /*isStdDev=*/false, /*ddof=*/1);
   } else if (kind.rfind(prefix + "bloom_filter_agg", 0) == 0) {
     VELOX_UNREACHABLE(
         "bloom_filter_agg uses dedicated path in toAggregators");
@@ -2346,6 +2790,51 @@ bool registerStepAwareBuiltinAggregationFunctions(const std::string& prefix) {
       prefix + "bloom_filter_agg",
       core::AggregationNode::Step::kFinal,
       bloomMergeSignatures);
+
+  // Register stddev / stddev_samp / variance / var_samp
+  // Velox Spark intermediate type: row(bigint, double, double) = (count, mean, m2)
+  auto varianceSingleSignatures = std::vector<exec::FunctionSignaturePtr>{
+      FunctionSignatureBuilder()
+          .returnType("double")
+          .argumentType("double")
+          .build()};
+  auto variancePartialSignatures = std::vector<exec::FunctionSignaturePtr>{
+      FunctionSignatureBuilder()
+          .returnType("row(bigint,double,double)")
+          .argumentType("double")
+          .build()};
+  auto varianceFinalSignatures = std::vector<exec::FunctionSignaturePtr>{
+      FunctionSignatureBuilder()
+          .returnType("double")
+          .argumentType("row(bigint,double,double)")
+          .build()};
+  auto varianceIntermediateSignatures =
+      std::vector<exec::FunctionSignaturePtr>{
+          FunctionSignatureBuilder()
+              .returnType("row(bigint,double,double)")
+              .argumentType("row(bigint,double,double)")
+              .build()};
+
+  for (auto const& name :
+       {prefix + "stddev", prefix + "stddev_samp",
+        prefix + "variance", prefix + "var_samp"}) {
+    registerAggregationFunctionForStep(
+        name,
+        core::AggregationNode::Step::kSingle,
+        varianceSingleSignatures);
+    registerAggregationFunctionForStep(
+        name,
+        core::AggregationNode::Step::kPartial,
+        variancePartialSignatures);
+    registerAggregationFunctionForStep(
+        name,
+        core::AggregationNode::Step::kFinal,
+        varianceFinalSignatures);
+    registerAggregationFunctionForStep(
+        name,
+        core::AggregationNode::Step::kIntermediate,
+        varianceIntermediateSignatures);
+  }
 
   return true;
 }
