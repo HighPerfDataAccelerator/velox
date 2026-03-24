@@ -426,9 +426,6 @@ class BinaryFunction : public CudfFunction {
         };
         lhsView = ensureDecimal(lhsView, lhsCast);
         rhsView = ensureDecimal(rhsView, rhsCast);
-        if (hasDecimalZero(rhsView, stream, mr)) {
-          VELOX_USER_FAIL("Division by zero");
-        }
         auto lhsScale = -lhsView.type().scale();
         auto rhsScale = -rhsView.type().scale();
         auto outScale = -type_.scale();
@@ -631,9 +628,6 @@ class BinaryFunction : public CudfFunction {
       };
       lhsView = ensureDecimal(lhsView, lhsCast);
       rhsView = ensureDecimal(rhsView, rhsCast);
-      if (hasDecimalZero(rhsView, stream, mr)) {
-        VELOX_USER_FAIL("Division by zero");
-      }
       auto lhsScale = -lhsView.type().scale();
       auto rhsScale = -rhsView.type().scale();
       auto outScale = -type_.scale();
