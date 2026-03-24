@@ -131,10 +131,18 @@ TEST_F(CudfAggregationSelectionTest, supportedAggregationFunctions) {
   ASSERT_TRUE(canBeEvaluatedByCudf(*aggregationNode, queryCtx_.get()));
 }
 
+// Test stddev/variance are now supported
+TEST_F(CudfAggregationSelectionTest, supportedVarianceAggregationFunctions) {
+  auto aggregationNode =
+      createAggregationNode({"c0"}, {"stddev(c3)", "variance(c5)"});
+
+  ASSERT_TRUE(canBeEvaluatedByCudf(*aggregationNode, queryCtx_.get()));
+}
+
 // Test unsupported aggregation functions
 TEST_F(CudfAggregationSelectionTest, unsupportedAggregationFunctions) {
   auto aggregationNode =
-      createAggregationNode({"c0"}, {"stddev(c1)", "variance(c2)"});
+      createAggregationNode({"c0"}, {"arbitrary(c1)"});
 
   ASSERT_FALSE(canBeEvaluatedByCudf(*aggregationNode, queryCtx_.get()));
 }
@@ -143,7 +151,7 @@ TEST_F(CudfAggregationSelectionTest, unsupportedAggregationFunctions) {
 // function is unsupported
 TEST_F(CudfAggregationSelectionTest, mixedSupportedUnsupportedFunctions) {
   auto aggregationNode =
-      createAggregationNode({"c0"}, {"sum(c1)", "stddev(c2)"});
+      createAggregationNode({"c0"}, {"sum(c1)", "arbitrary(c2)"});
 
   ASSERT_FALSE(canBeEvaluatedByCudf(*aggregationNode, queryCtx_.get()));
 }
@@ -155,10 +163,10 @@ TEST_F(CudfAggregationSelectionTest, supportedGroupingKeyExpressions) {
   ASSERT_TRUE(canBeEvaluatedByCudf(*aggregationNode, queryCtx_.get()));
 }
 
-// Test unsupported aggregation functions (using stddev as example)
+// Test unsupported aggregation functions
 TEST_F(CudfAggregationSelectionTest, unsupportedGroupingKeyExpressions) {
   auto aggregationNode =
-      createAggregationNode({"c0"}, {"sum(c1)", "stddev(c2)"});
+      createAggregationNode({"c0"}, {"sum(c1)", "arbitrary(c2)"});
 
   ASSERT_FALSE(canBeEvaluatedByCudf(*aggregationNode, queryCtx_.get()));
 }
@@ -173,7 +181,7 @@ TEST_F(CudfAggregationSelectionTest, supportedAggregationInputExpressions) {
 
 // Test unsupported aggregation input expressions
 TEST_F(CudfAggregationSelectionTest, unsupportedAggregationInputExpressions) {
-  auto aggregationNode = createAggregationNode({"c0"}, {"variance(c1)"});
+  auto aggregationNode = createAggregationNode({"c0"}, {"arbitrary(c1)"});
 
   ASSERT_FALSE(canBeEvaluatedByCudf(*aggregationNode, queryCtx_.get()));
 }
@@ -186,9 +194,16 @@ TEST_F(CudfAggregationSelectionTest, globalAggregationSupported) {
   ASSERT_TRUE(canBeEvaluatedByCudf(*aggregationNode, queryCtx_.get()));
 }
 
+// Test global aggregation with supported stddev
+TEST_F(CudfAggregationSelectionTest, globalAggregationStddev) {
+  auto aggregationNode = createAggregationNode({}, {"stddev(c3)"});
+
+  ASSERT_TRUE(canBeEvaluatedByCudf(*aggregationNode, queryCtx_.get()));
+}
+
 // Test global aggregation with unsupported functions
 TEST_F(CudfAggregationSelectionTest, globalAggregationUnsupported) {
-  auto aggregationNode = createAggregationNode({}, {"stddev(c1)"});
+  auto aggregationNode = createAggregationNode({}, {"arbitrary(c1)"});
 
   ASSERT_FALSE(canBeEvaluatedByCudf(*aggregationNode, queryCtx_.get()));
 }
@@ -238,7 +253,7 @@ TEST_F(CudfAggregationSelectionTest, nestedAggregationAllowedToNotAllowed) {
                        })
                        .aggregation(
                            {},
-                           {"stddev(inner_sum) AS outer_stddev"},
+                           {"arbitrary(inner_sum) AS outer_arb"},
                            {},
                            core::AggregationNode::Step::kSingle,
                            false)
@@ -292,7 +307,7 @@ TEST_F(CudfAggregationSelectionTest, nestedAggregationNotAllowedToAllowed) {
                        })})
                        .aggregation(
                            {"c0"},
-                           {"stddev(c1) AS inner_stddev"},
+                           {"arbitrary(c1) AS inner_arb"},
                            {},
                            core::AggregationNode::Step::kSingle,
                            false)
@@ -304,7 +319,7 @@ TEST_F(CudfAggregationSelectionTest, nestedAggregationNotAllowedToAllowed) {
                        })
                        .aggregation(
                            {},
-                           {"sum(inner_stddev) AS outer_sum"},
+                           {"sum(inner_arb) AS outer_sum"},
                            {},
                            core::AggregationNode::Step::kSingle,
                            false)
@@ -326,7 +341,7 @@ TEST_F(CudfAggregationSelectionTest, nestedAggregationNotAllowedToNotAllowed) {
                        })})
                        .aggregation(
                            {"c0"},
-                           {"stddev(c1) AS inner_stddev"},
+                           {"arbitrary(c1) AS inner_arb"},
                            {},
                            core::AggregationNode::Step::kSingle,
                            false)
@@ -338,7 +353,7 @@ TEST_F(CudfAggregationSelectionTest, nestedAggregationNotAllowedToNotAllowed) {
                        })
                        .aggregation(
                            {},
-                           {"variance(inner_stddev) AS outer_variance"},
+                           {"arbitrary(inner_arb) AS outer_arb"},
                            {},
                            core::AggregationNode::Step::kSingle,
                            false)
@@ -350,22 +365,52 @@ TEST_F(CudfAggregationSelectionTest, nestedAggregationNotAllowedToNotAllowed) {
   ASSERT_FALSE(canBeEvaluatedByCudf(*outerAggregationNode, queryCtx_.get()));
 }
 
-// Test unsupported aggregation function signatures
-TEST_F(CudfAggregationSelectionTest, unsupportedAggregationFunctionSignatures) {
-  auto stddevExpr = std::make_shared<core::CallTypedExpr>(
+// Test stddev/variance aggregation function signatures
+TEST_F(CudfAggregationSelectionTest, varianceAggregationFunctionSignatures) {
+  // stddev(DOUBLE) is supported
+  auto stddevDoubleExpr = std::make_shared<core::CallTypedExpr>(
       DOUBLE(),
       std::vector<core::TypedExprPtr>{
-          std::make_shared<core::FieldAccessTypedExpr>(BIGINT(), "c0")},
+          std::make_shared<core::FieldAccessTypedExpr>(DOUBLE(), "c3")},
       "stddev");
+  ASSERT_TRUE(
+      canAggregationBeEvaluatedByCudf(*stddevDoubleExpr, queryCtx_.get()));
 
-  auto varianceExpr = std::make_shared<core::CallTypedExpr>(
+  // variance(DOUBLE) is supported
+  auto varianceDoubleExpr = std::make_shared<core::CallTypedExpr>(
       DOUBLE(),
       std::vector<core::TypedExprPtr>{
-          std::make_shared<core::FieldAccessTypedExpr>(BIGINT(), "c0")},
+          std::make_shared<core::FieldAccessTypedExpr>(DOUBLE(), "c3")},
       "variance");
+  ASSERT_TRUE(
+      canAggregationBeEvaluatedByCudf(*varianceDoubleExpr, queryCtx_.get()));
 
-  ASSERT_FALSE(canAggregationBeEvaluatedByCudf(*stddevExpr, queryCtx_.get()));
-  ASSERT_FALSE(canAggregationBeEvaluatedByCudf(*varianceExpr, queryCtx_.get()));
+  // stddev_samp(DOUBLE) is supported
+  auto stddevSampExpr = std::make_shared<core::CallTypedExpr>(
+      DOUBLE(),
+      std::vector<core::TypedExprPtr>{
+          std::make_shared<core::FieldAccessTypedExpr>(DOUBLE(), "c3")},
+      "stddev_samp");
+  ASSERT_TRUE(
+      canAggregationBeEvaluatedByCudf(*stddevSampExpr, queryCtx_.get()));
+
+  // var_samp(DOUBLE) is supported
+  auto varSampExpr = std::make_shared<core::CallTypedExpr>(
+      DOUBLE(),
+      std::vector<core::TypedExprPtr>{
+          std::make_shared<core::FieldAccessTypedExpr>(DOUBLE(), "c3")},
+      "var_samp");
+  ASSERT_TRUE(
+      canAggregationBeEvaluatedByCudf(*varSampExpr, queryCtx_.get()));
+
+  // arbitrary(BIGINT) is NOT supported by cudf
+  auto arbitraryExpr = std::make_shared<core::CallTypedExpr>(
+      BIGINT(),
+      std::vector<core::TypedExprPtr>{
+          std::make_shared<core::FieldAccessTypedExpr>(BIGINT(), "c0")},
+      "arbitrary");
+  ASSERT_FALSE(
+      canAggregationBeEvaluatedByCudf(*arbitraryExpr, queryCtx_.get()));
 }
 
 // Test comprehensive type support validation - all registered CUDF aggregation
