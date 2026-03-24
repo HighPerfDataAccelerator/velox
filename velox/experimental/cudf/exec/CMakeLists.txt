@@ -14,6 +14,7 @@
 
 add_library(
   velox_cudf_exec
+  BloomFilterKernels.cu
   CudfAssignUniqueId.cpp
   CudfConversion.cpp
   CudfExpand.cpp
@@ -28,6 +29,7 @@ add_library(
   CudfShufflePartition.cpp
   CudfTopN.cpp
   CudfTopNRowNumber.cpp
+  CudfWindow.cpp
   DebugUtil.cpp
   OperatorAdapters.cpp
   PinnedArrowInterop.cpp
@@ -99,3 +101,4 @@ endif()
 target_compile_definitions(velox_cudf_exec PRIVATE NANOARROW_NAMESPACE=cudf)
 
 target_compile_options(velox_cudf_exec PRIVATE -Wno-missing-field-initializers)
+target_compile_options(velox_cudf_exec PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda>)
