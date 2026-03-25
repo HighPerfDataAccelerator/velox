@@ -2094,11 +2094,13 @@ bool registerBuiltinFunctions(const std::string& prefix) {
            .variableArity()
            .build()});
 
-  registerCudfFunction(
-      prefix + "round",
-      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+  auto roundFactory =
+      [](const std::string&,
+         const std::shared_ptr<velox::exec::Expr>& expr) {
         return std::make_shared<RoundFunction>(expr);
-      },
+      };
+  registerCudfFunction(
+      prefix + "round", roundFactory,
       {FunctionSignatureBuilder()
            .integerVariable("p")
            .integerVariable("s")
@@ -2164,6 +2166,21 @@ bool registerBuiltinFunctions(const std::string& prefix) {
        FunctionSignatureBuilder()
            .returnType("double")
            .argumentType("double")
+           .constantArgumentType("integer")
+           .build()});
+  registerCudfFunction(
+      prefix + "decimal_round", roundFactory,
+      {FunctionSignatureBuilder()
+           .integerVariable("p")
+           .integerVariable("s")
+           .returnType("decimal(p,s)")
+           .argumentType("decimal(p,s)")
+           .build(),
+       FunctionSignatureBuilder()
+           .integerVariable("p")
+           .integerVariable("s")
+           .returnType("decimal(p,s)")
+           .argumentType("decimal(p,s)")
            .constantArgumentType("integer")
            .build()});
 
