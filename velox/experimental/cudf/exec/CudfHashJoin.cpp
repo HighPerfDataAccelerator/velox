@@ -2391,9 +2391,17 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
   // Build hash tables on-demand (transient). Construction is deferred from
   // the build phase to here so that at most GpuGuard-max hash table sets
   // exist at any instant, rather than one per Spark task.
+  //
+  // When the join has an AST filter and the join type supports mixed join
+  // (inner/left), cudf::mixed_*_join builds its own hash table internally,
+  // so we skip constructing cudf::hash_join to save GPU memory.
+  bool const useMixedJoin =
+      joinNode_->filter() && useAstFilter_ &&
+      (joinNode_->isInnerJoin() || joinNode_->isLeftJoin());
   bool const needHashJoin =
-      joinNode_->isInnerJoin() || joinNode_->isLeftJoin() ||
-      joinNode_->isRightJoin() || joinNode_->isFullJoin();
+      !useMixedJoin &&
+      (joinNode_->isInnerJoin() || joinNode_->isLeftJoin() ||
+       joinNode_->isRightJoin() || joinNode_->isFullJoin());
   if (needHashJoin) {
     auto& rightTables = hashObject_.value().first;
     auto& hbs = hashObject_.value().second;
