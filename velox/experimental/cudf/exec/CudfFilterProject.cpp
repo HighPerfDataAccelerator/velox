@@ -26,6 +26,7 @@
 #include "velox/expression/FieldReference.h"
 
 #include <cudf/aggregation.hpp>
+#include <cudf/column/column_factories.hpp>
 #include <cudf/concatenate.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/stream_compaction.hpp>
@@ -286,6 +287,7 @@ RowVectorPtr CudfFilterProject::getOutput() {
   auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input_);
   VELOX_CHECK_NOT_NULL(cudfInput);
   auto stream = cudfInput->stream();
+  auto const inputRows = input_->size();
 
   std::vector<std::unique_ptr<cudf::column>> inputTableColumns;
   try {
@@ -324,9 +326,25 @@ RowVectorPtr CudfFilterProject::getOutput() {
         "CudfFilterProject[{}]: GPU OOM in project: {}", planNodeId(), e.what());
   }
 
+  if (outputColumns.empty()) {
+    // Zero-column projection (e.g. COUNT(*)).  Downstream aggregation
+    // accesses column(0), so inject a lightweight dummy column to
+    // carry the row count, matching the CudfFromVelox convention.
+    auto rows = inputTableColumns.empty()
+        ? inputRows
+        : static_cast<cudf::size_type>(inputTableColumns[0]->size());
+    if (rows > 0) {
+      auto mr = cudf::get_current_device_resource_ref();
+      outputColumns.push_back(cudf::make_numeric_column(
+          cudf::data_type(cudf::type_id::INT8),
+          rows,
+          cudf::mask_state::UNALLOCATED,
+          stream,
+          mr));
+    }
+  }
+
   // Validate all output columns have consistent row counts.
-  // A mismatch indicates a project evaluator returned a column with the
-  // wrong size (e.g., pre-filter row count instead of post-filter).
   if (!outputColumns.empty()) {
     cudf::size_type expectedRows = -1;
     for (size_t i = 0; i < outputColumns.size(); ++i) {
@@ -337,7 +355,8 @@ RowVectorPtr CudfFilterProject::getOutput() {
           VELOX_CHECK_EQ(
               outputColumns[i]->size(),
               expectedRows,
-              "CudfFilterProject output column {} has {} rows, expected {}",
+              "CudfFilterProject output column {} has {} rows,"
+              " expected {}",
               i,
               outputColumns[i]->size(),
               expectedRows);
@@ -346,18 +365,19 @@ RowVectorPtr CudfFilterProject::getOutput() {
     }
   }
 
-  auto outputTable = std::make_unique<cudf::table>(std::move(outputColumns));
+  auto outputTable = std::make_unique<cudf::table>(
+      std::move(outputColumns));
   auto const numColumns = outputTable->num_columns();
   auto const size = outputTable->num_rows();
   if (CudfConfig::getInstance().debugEnabled) {
-    VLOG(1) << "cudfProject Output: " << size << " rows, " << numColumns
-            << " columns";
+    VLOG(1) << "cudfProject Output: " << size << " rows, "
+            << numColumns << " columns";
   }
 
   auto pool = input_->pool();
   input_.reset();
 
-  if (numColumns == 0 || size == 0) {
+  if (size == 0) {
     if (!accumulatedOutputs_.empty() && noMoreInput_) {
       return flushAccumulatedOutputs();
     }

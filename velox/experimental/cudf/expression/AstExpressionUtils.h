@@ -155,10 +155,17 @@ const std::unordered_map<std::string, Op> sparkBinaryOps = {
     {"multiply", Op::MUL},
     {"divide", Op::DIV},
     {"equalto", Op::EQUAL},
+    {"decimal_equalto", Op::EQUAL},
     {"lessthan", Op::LESS},
+    {"decimal_lessthan", Op::LESS},
     {"greaterthan", Op::GREATER},
+    {"decimal_greaterthan", Op::GREATER},
     {"lessthanorequal", Op::LESS_EQUAL},
+    {"decimal_lessthanorequal", Op::LESS_EQUAL},
     {"greaterthanorequal", Op::GREATER_EQUAL},
+    {"decimal_greaterthanorequal", Op::GREATER_EQUAL},
+    {"notequalto", Op::NOT_EQUAL},
+    {"decimal_notequalto", Op::NOT_EQUAL},
     {"and", Op::NULL_LOGICAL_AND},
     {"or", Op::NULL_LOGICAL_OR},
     {"mod", Op::MOD},
@@ -199,13 +206,20 @@ bool isOpAndInputsSupported(
       return false;
     }
   }
-  // cudf's AST decimal DIV uses result_scale = lhs_scale - rhs_scale, which
-  // gives scale 0 (integer division) when both operands share the same scale.
-  // The FunctionExpression path has a custom decimalDivide kernel with proper
-  // rescaling that preserves fractional precision.
-  if (op == cudf::ast::ast_operator::DIV && !inputCudfDataTypes.empty() &&
-      cudf::is_fixed_point(inputCudfDataTypes[0])) {
-    return false;
+  // Decimal DIV/MUL require custom rescaling logic in BinaryFunction.
+  // The generic AST/Jitify path produces wrong output types/scales.
+  // Decimal comparisons (GREATER, LESS, etc.) also produce incorrect
+  // results through cudf::compute_column for DECIMAL128 types; route
+  // them through BinaryFunction which uses cudf::binary_operation.
+  if (op == Op::DIV || op == Op::MUL ||
+      op == Op::GREATER || op == Op::GREATER_EQUAL ||
+      op == Op::LESS || op == Op::LESS_EQUAL ||
+      op == Op::EQUAL || op == Op::NOT_EQUAL) {
+    for (const auto& dt : inputCudfDataTypes) {
+      if (cudf::is_fixed_point(dt)) {
+        return false;
+      }
+    }
   }
   // cuDF AST expression parser requires all operands to have identical
   // cudf::data_type (including decimal scale). Reject early if mismatched.
