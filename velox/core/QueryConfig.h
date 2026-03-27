@@ -218,6 +218,13 @@ class QueryConfig {
   static constexpr const char* kMinExchangeOutputBatchBytes =
       "min_exchange_output_batch_bytes";
 
+  /// Minimum number of rows to accumulate in CudfPartitionedOutput before
+  /// flushing. Small inputs are buffered and concatenated into a single merged
+  /// table when this threshold is reached, avoiding pathologically small
+  /// exchange chunks. Set to 0 to disable accumulation.
+  static constexpr const char* kUcxPartitionedOutputBatchRows =
+      "cudf.partitioned_output_batch_rows";
+
   static constexpr const char* kMaxPartialAggregationMemory =
       "max_partial_aggregation_memory";
 
@@ -1092,6 +1099,10 @@ class QueryConfig {
   uint64_t minExchangeOutputBatchBytes() const {
     static constexpr uint64_t kDefault = 2UL << 20;
     return get<uint64_t>(kMinExchangeOutputBatchBytes, kDefault);
+  }
+
+  int64_t ucxPartitionedOutputBatchRows() const {
+    return get<int64_t>(kUcxPartitionedOutputBatchRows, 10'000);
   }
 
   uint64_t preferredOutputBatchBytes() const {

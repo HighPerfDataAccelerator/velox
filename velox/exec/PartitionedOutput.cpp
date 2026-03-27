@@ -203,6 +203,9 @@ PartitionedOutput::PartitionedOutput(
           operatorId,
           planNode->id(),
           OperatorType::kPartitionedOutput),
+      eagerFlush_(
+          eagerFlush ||
+          ctx->task->queryCtx()->queryConfig().partitionedOutputEagerFlush()),
       keyChannels_(toChannels(planNode->inputType(), planNode->keys())),
       numDestinations_(planNode->numPartitions()),
       replicateNullsAndAny_(planNode->isReplicateNullsAndAny()),
@@ -224,9 +227,6 @@ PartitionedOutput::PartitionedOutput(
       maxBufferedBytes_(ctx->task->queryCtx()
                             ->queryConfig()
                             .maxPartitionedOutputBufferSize()),
-      eagerFlush_(
-          eagerFlush ||
-          ctx->task->queryCtx()->queryConfig().partitionedOutputEagerFlush()),
       serde_(getNamedVectorSerde(planNode->serdeKind())),
       serdeOptions_(getVectorSerdeOptions(
           common::stringToCompressionKind(operatorCtx_->driverCtx()
