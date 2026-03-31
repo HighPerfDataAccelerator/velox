@@ -17,6 +17,7 @@
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/CudfFilterProject.h"
 #include "velox/experimental/cudf/exec/CudfHashAggregation.h"
+// #endregion
 #include "velox/experimental/cudf/exec/GpuGuard.h"
 #include "velox/experimental/cudf/exec/BloomFilterKernels.h"
 #include "velox/experimental/cudf/exec/DecimalAggregationKernels.h"
@@ -135,6 +136,40 @@ struct DecimalSumOrAvgAggregator : cudf_velox::CudfHashAggregation::Aggregator {
       cudf::table_view const& tbl,
       std::vector<cudf::groupby::aggregation_request>& requests,
       rmm::cuda_stream_view stream) override {
+    if ((step == core::AggregationNode::Step::kFinal ||
+         step == core::AggregationNode::Step::kIntermediate) &&
+        tbl.column(inputIndex).type().id() == cudf::type_id::STRUCT) {
+      auto const& structCol = tbl.column(inputIndex);
+      // Deep copy children to standalone columns for proper alignment
+      {
+        auto rawCopy = std::make_unique<cudf::column>(
+            structCol.child(0), stream, cudf::get_current_device_resource_ref());
+        origSumType_ = rawCopy->type();
+        if (rawCopy->type().id() == cudf::type_id::DECIMAL128) {
+          sumCopy_ = cudf::cast(
+              *rawCopy,
+              cudf::data_type{cudf::type_id::DECIMAL64, rawCopy->type().scale()},
+              stream, cudf::get_current_device_resource_ref());
+        } else {
+          sumCopy_ = std::move(rawCopy);
+        }
+      }
+      countCopy_ = std::make_unique<cudf::column>(
+          structCol.child(1), stream, cudf::get_current_device_resource_ref());
+      sumIdx_ = requests.size();
+      auto& sumRequest = requests.emplace_back();
+      sumRequest.values = sumCopy_->view();
+      sumRequest.aggregations.push_back(
+          cudf::make_sum_aggregation<cudf::groupby_aggregation>());
+      if (isAvg_ || step == core::AggregationNode::Step::kIntermediate) {
+        countIdx_ = requests.size();
+        auto& countRequest = requests.emplace_back();
+        countRequest.values = countCopy_->view();
+        countRequest.aggregations.push_back(
+            cudf::make_sum_aggregation<cudf::groupby_aggregation>());
+      }
+      return;
+    }
     if (step == core::AggregationNode::Step::kIntermediate &&
         tbl.column(inputIndex).type().id() == cudf::type_id::STRING) {
       auto scale = resultType->isDecimal()
@@ -220,13 +255,6 @@ struct DecimalSumOrAvgAggregator : cudf_velox::CudfHashAggregation::Aggregator {
         count =
             cudf::cast(*count, cudf::data_type{cudf::type_id::INT64}, stream, cudf::get_current_device_resource_ref());
       }
-      auto const& outputType = asRowType(resultType);
-      auto const cudfSumType =
-          cudf_velox::veloxToCudfDataType(outputType->childAt(0));
-      if (col->type() != cudfSumType) {
-        col = cudf::cast(*col, cudfSumType, stream,
-                         cudf::get_current_device_resource_ref());
-      }
       auto size = col->size();
       std::vector<std::unique_ptr<cudf::column>> children;
       children.push_back(std::move(col));
@@ -245,11 +273,9 @@ struct DecimalSumOrAvgAggregator : cudf_velox::CudfHashAggregation::Aggregator {
         count =
             cudf::cast(*count, cudf::data_type{cudf::type_id::INT64}, stream, cudf::get_current_device_resource_ref());
       }
-      auto const& outputType = asRowType(resultType);
-      auto const cudfSumType =
-          cudf_velox::veloxToCudfDataType(outputType->childAt(0));
-      if (col->type() != cudfSumType) {
-        col = cudf::cast(*col, cudfSumType, stream,
+      if (origSumType_.id() == cudf::type_id::DECIMAL128 &&
+          col->type().id() == cudf::type_id::DECIMAL64) {
+        col = cudf::cast(*col, origSumType_, stream,
                          cudf::get_current_device_resource_ref());
       }
       auto size = col->size();
@@ -265,6 +291,11 @@ struct DecimalSumOrAvgAggregator : cudf_velox::CudfHashAggregation::Aggregator {
           std::move(children));
     }
     if (isAvg_ && step == core::AggregationNode::Step::kFinal) {
+      if (origSumType_.id() == cudf::type_id::DECIMAL128 &&
+          col->type().id() == cudf::type_id::DECIMAL64) {
+        col = cudf::cast(*col, origSumType_, stream,
+                         cudf::get_current_device_resource_ref());
+      }
       auto count = std::move(results[countIdx_].results[0]);
       return computeAvgColumn(std::move(col), std::move(count), stream);
     }
@@ -354,6 +385,46 @@ struct DecimalSumOrAvgAggregator : cudf_velox::CudfHashAggregation::Aggregator {
           0,
           std::move(children));
     }
+    if ((step == core::AggregationNode::Step::kFinal ||
+         step == core::AggregationNode::Step::kIntermediate) &&
+        inputCol.type().id() == cudf::type_id::STRUCT) {
+      auto const sumChild = inputCol.child(0);
+      auto const countChild = inputCol.child(1);
+      auto sumScalar = cudf::reduce(
+          sumChild, *aggRequest, sumChild.type(), stream,
+          cudf::get_current_device_resource_ref());
+      auto sumCol = cudf::make_column_from_scalar(
+          *sumScalar, 1, stream, cudf::get_current_device_resource_ref());
+      if (isAvg_ && step == core::AggregationNode::Step::kFinal) {
+        auto countScalar = cudf::reduce(
+            countChild, *aggRequest,
+            cudf::data_type{cudf::type_id::INT64}, stream,
+            cudf::get_current_device_resource_ref());
+        auto countCol = cudf::make_column_from_scalar(
+            *countScalar, 1, stream, cudf::get_current_device_resource_ref());
+        return computeAvgColumn(
+            std::move(sumCol), std::move(countCol), stream);
+      }
+      auto countScalar = cudf::reduce(
+          countChild, *aggRequest,
+          cudf::data_type{cudf::type_id::INT64}, stream,
+          cudf::get_current_device_resource_ref());
+      auto countCol = cudf::make_column_from_scalar(
+          *countScalar, 1, stream, cudf::get_current_device_resource_ref());
+      auto const cudfSumType = cudf_velox::veloxToCudfDataType(
+          asRowType(outputType)->childAt(0));
+      if (sumCol->type() != cudfSumType) {
+        sumCol = cudf::cast(*sumCol, cudfSumType, stream,
+                            cudf::get_current_device_resource_ref());
+      }
+      std::vector<std::unique_ptr<cudf::column>> children;
+      children.push_back(std::move(sumCol));
+      children.push_back(std::move(countCol));
+      return std::make_unique<cudf::column>(
+          cudf::data_type(cudf::type_id::STRUCT), 1,
+          rmm::device_buffer{}, rmm::device_buffer{}, 0,
+          std::move(children));
+    }
     if (step == core::AggregationNode::Step::kFinal &&
         inputCol.type().id() == cudf::type_id::STRING) {
       auto scale = getDecimalPrecisionScale(*outputType).second;
@@ -423,6 +494,11 @@ struct DecimalSumOrAvgAggregator : cudf_velox::CudfHashAggregation::Aggregator {
   const bool isAvg_{false};
   std::unique_ptr<cudf::column> decodedSum_;
   std::unique_ptr<cudf::column> decodedCount_;
+  std::unique_ptr<cudf::column> alignedSum_;
+  std::unique_ptr<cudf::column> sumCopy_;
+  cudf::data_type origSumType_{cudf::type_id::DECIMAL128};
+  std::unique_ptr<cudf::column> countCopy_;
+  std::unique_ptr<cudf::column> alignedCount_;
 };
 
 struct CountAggregator : cudf_velox::CudfHashAggregation::Aggregator {
@@ -1462,7 +1538,10 @@ std::unique_ptr<cudf_velox::CudfHashAggregation::Aggregator> createAggregator(
   } else if (kind.rfind(prefix + "avg", 0) == 0) {
     bool isDecimalInput =
         rawInputTypes.size() == 1 && rawInputTypes[0]->isDecimal();
-    if (isDecimalInput) {
+    bool isDecimalRowInput =
+        rawInputTypes.size() == 1 && rawInputTypes[0]->isRow() &&
+        rawInputTypes[0]->asRow().childAt(0)->isDecimal();
+    if (isDecimalInput || isDecimalRowInput || resultType->isDecimal()) {
       return std::make_unique<DecimalSumOrAvgAggregator>(
           step, inputIndex, constant, isGlobal, resultType, true);
     }
@@ -1830,6 +1909,7 @@ void CudfHashAggregation::computeIntermediateGroupbyPartial(CudfVectorPtr tbl) {
       inputTableStream);
 
   // If we already have partial output, concatenate the new results with it.
+
   if (partialOutput_) {
     // Create a vector of tables to concatenate
     std::vector<cudf::table_view> tablesToConcat;
@@ -2028,6 +2108,7 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
   }
 
   auto [groupKeys, results] = groupByOwner.aggregate(requests, stream);
+
   // flatten the results
   std::vector<std::unique_ptr<cudf::column>> resultColumns;
 
@@ -2175,6 +2256,17 @@ RowVectorPtr CudfHashAggregation::getOutput() {
     if (isGlobal_) {
       auto stream = cudfGlobalStreamPool().get_stream();
       auto tbl = getConcatenatedTable(inputs_, inputType_, stream);
+      if (tbl->num_columns() == 0) {
+        auto mr = cudf::get_current_device_resource_ref();
+        std::vector<std::unique_ptr<cudf::column>> cols;
+        cols.push_back(cudf::make_numeric_column(
+            cudf::data_type(cudf::type_id::INT8),
+            0,
+            cudf::mask_state::UNALLOCATED,
+            stream,
+            mr));
+        tbl = std::make_unique<cudf::table>(std::move(cols));
+      }
       return doGlobalAggregation(tbl->view(), stream);
     }
     return nullptr;
@@ -2888,7 +2980,24 @@ bool canAggregationBeEvaluatedByCudf(
   }
 
   // Validate against step-specific signatures from registry
-  return matchTypedCallAgainstSignatures(call, stepIt->second);
+  if (matchTypedCallAgainstSignatures(call, stepIt->second)) {
+    return true;
+  }
+  // Allow decimal avg/sum kFinal/kIntermediate with ROW(DECIMAL, BIGINT)
+  // input even though no type-safe signature can be registered.
+  if ((companionStep == core::AggregationNode::Step::kFinal ||
+       companionStep == core::AggregationNode::Step::kIntermediate) &&
+      (originalName.size() >= 3 &&
+       (originalName.substr(originalName.size() - 3) == "avg" ||
+        originalName.substr(originalName.size() - 3) == "sum"))) {
+    if (!call.inputs().empty() && call.inputs()[0]->type()->isRow()) {
+      auto const& rowType = call.inputs()[0]->type()->asRow();
+      if (rowType.size() >= 1 && rowType.childAt(0)->isDecimal()) {
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 bool canBeEvaluatedByCudf(

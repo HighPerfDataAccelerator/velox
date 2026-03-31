@@ -1273,7 +1273,12 @@ void exportToArrowImpl(
 // Parses the velox decimal format from the given arrow format.
 // The input format string should be in the form "d:precision,scale<,bitWidth>".
 // bitWidth is not required and must be 128 if provided.
-TypePtr parseDecimalFormat(const char* format) {
+struct DecimalFormatInfo {
+  TypePtr type;
+  int bitWidth;
+};
+
+DecimalFormatInfo parseDecimalFormat(const char* format) {
   std::string invalidFormatMsg =
       "Unable to convert '{}' ArrowSchema decimal format to Velox decimal";
   try {
@@ -1290,19 +1295,18 @@ TypePtr parseDecimalFormat(const char* format) {
       VELOX_USER_FAIL(invalidFormatMsg, format);
     }
 
-    // Parse "d:".
     int precision = std::stoi(&format[2], &sz);
     int scale = std::stoi(&format[firstCommaIdx + 1], &sz);
-    // If bitwidth is provided, check if it is equal to 128.
+    int bitWidth = 128;
     if (secondCommaIdx != std::string::npos) {
-      int bitWidth = std::stoi(&format[secondCommaIdx + 1], &sz);
-      VELOX_USER_CHECK_EQ(
-          bitWidth,
-          128,
-          "Conversion failed for '{}'. Velox decimal does not support custom bitwidth.",
-          format);
+      bitWidth = std::stoi(&format[secondCommaIdx + 1], &sz);
+      VELOX_USER_CHECK(
+          bitWidth == 32 || bitWidth == 64 || bitWidth == 128,
+          "Conversion failed for '{}'. Unsupported decimal bitwidth {}.",
+          format,
+          bitWidth);
     }
-    return DECIMAL(precision, scale);
+    return {DECIMAL(precision, scale), bitWidth};
   } catch (std::invalid_argument&) {
     VELOX_USER_FAIL(invalidFormatMsg, format);
   }
@@ -1367,7 +1371,7 @@ TypePtr importFromArrowImpl(
 
     case 'd':
       // decimal types.
-      return parseDecimalFormat(format);
+      return parseDecimalFormat(format).type;
 
     // Complex types.
     case '+': {
@@ -2082,6 +2086,72 @@ VectorPtr createShortDecimalVector(
       pool, type, std::move(nulls), length, values, nullCount);
 }
 
+VectorPtr createShortDecimalFromNarrow(
+    memory::MemoryPool* pool,
+    const TypePtr& type,
+    BufferPtr nulls,
+    const void* rawData,
+    int arrowBitWidth,
+    vector_size_t length,
+    int64_t nullCount) {
+  auto values = AlignedBuffer::allocate<int64_t>(length, pool);
+  auto rawValues = values->asMutable<int64_t>();
+  if (arrowBitWidth == 64) {
+    memcpy(rawValues, rawData, length * sizeof(int64_t));
+  } else if (arrowBitWidth == 32) {
+    auto src = static_cast<const int32_t*>(rawData);
+    for (vector_size_t i = 0; i < length; ++i) {
+      rawValues[i] = static_cast<int64_t>(src[i]);
+    }
+  } else {
+    auto src = static_cast<const int128_t*>(rawData);
+    for (vector_size_t i = 0; i < length; ++i) {
+      memcpy(rawValues + i, src + i, sizeof(int64_t));
+    }
+  }
+  return createFlatVector<TypeKind::BIGINT>(
+      pool, type, std::move(nulls), length, values, nullCount);
+}
+
+VectorPtr createLongDecimalFromNarrow(
+    memory::MemoryPool* pool,
+    const TypePtr& type,
+    BufferPtr nulls,
+    const void* rawData,
+    int arrowBitWidth,
+    vector_size_t length,
+    int64_t nullCount,
+    WrapInBufferViewFunc wrapInBufferView) {
+  if (arrowBitWidth == 128) {
+    auto input128 = static_cast<const int128_t*>(rawData);
+    if ((reinterpret_cast<uintptr_t>(input128) & 0xf) == 0) {
+      return createFlatVector<TypeKind::HUGEINT>(
+          pool, type, nulls, length,
+          wrapInBufferView(input128, length * type->cppSizeInBytes()),
+          nullCount);
+    }
+    auto vals128 = AlignedBuffer::allocate<int128_t>(length, pool);
+    memcpy(vals128->asMutable<int128_t>(), input128, length * sizeof(int128_t));
+    return createFlatVector<TypeKind::HUGEINT>(
+        pool, type, std::move(nulls), length, vals128, nullCount);
+  }
+  auto values = AlignedBuffer::allocate<int128_t>(length, pool);
+  auto rawValues = values->asMutable<int128_t>();
+  if (arrowBitWidth == 64) {
+    auto src = static_cast<const int64_t*>(rawData);
+    for (vector_size_t i = 0; i < length; ++i) {
+      rawValues[i] = static_cast<int128_t>(src[i]);
+    }
+  } else {
+    auto src = static_cast<const int32_t*>(rawData);
+    for (vector_size_t i = 0; i < length; ++i) {
+      rawValues[i] = static_cast<int128_t>(src[i]);
+    }
+  }
+  return createFlatVector<TypeKind::HUGEINT>(
+      pool, type, std::move(nulls), length, values, nullCount);
+}
+
 // Arrow uses two uint64_t values to represent a 128-bit decimal value. The
 // memory allocated by Arrow might not be 16-byte aligned, so we need to copy
 // the values to a new buffer to ensure 16-byte alignment.
@@ -2222,23 +2292,21 @@ VectorPtr importFromArrowImpl(
         arrowArray.length,
         arrowArray.null_count,
         isTime32);
-  } else if (type->isShortDecimal()) {
-    return createShortDecimalVector(
-        pool,
-        type,
-        nulls,
-        static_cast<const int128_t*>(arrowArray.buffers[1]),
-        arrowArray.length,
-        arrowArray.null_count);
-  } else if (type->isLongDecimal()) {
-    return createLongDecimalVector(
-        pool,
-        type,
-        nulls,
-        static_cast<const int128_t*>(arrowArray.buffers[1]),
-        arrowArray.length,
-        arrowArray.null_count,
-        wrapInBufferView);
+  } else if (type->isShortDecimal() || type->isLongDecimal()) {
+    int decBitWidth = 128;
+    if (arrowSchema.format && arrowSchema.format[0] == 'd') {
+      auto info = parseDecimalFormat(arrowSchema.format);
+      decBitWidth = info.bitWidth;
+    }
+    if (type->isShortDecimal()) {
+      return createShortDecimalFromNarrow(
+          pool, type, nulls, arrowArray.buffers[1], decBitWidth,
+          arrowArray.length, arrowArray.null_count);
+    } else {
+      return createLongDecimalFromNarrow(
+          pool, type, nulls, arrowArray.buffers[1], decBitWidth,
+          arrowArray.length, arrowArray.null_count, wrapInBufferView);
+    }
   } else if (type->isRow()) {
     // Row/structs.
     return createRowVector(

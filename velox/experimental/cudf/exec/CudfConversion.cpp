@@ -384,6 +384,15 @@ RowVectorPtr CudfToVelox::getOutput() {
       finished_ = noMoreInput_ && inputs_.empty();
       return nullptr;
     }
+
+    finished_ = noMoreInput_ && inputs_.empty();
+
+    if (outputType_->size() == 0) {
+      return std::make_shared<RowVector>(
+          pool(), outputType_, nullptr, tableView.num_rows(),
+          std::vector<VectorPtr>{});
+    }
+
     RowVectorPtr output =
         with_arrow::toVeloxColumn(tableView, pool(), outputType_, "", stream, cudf::get_current_device_resource_ref());
     stream.synchronize();
@@ -477,6 +486,14 @@ RowVectorPtr CudfToVelox::getOutput() {
   VELOX_CHECK_NOT_NULL(resultTable);
   if (size == 0) {
     return nullptr;
+  }
+
+  finished_ = noMoreInput_ && inputs_.empty();
+
+  if (outputType_->size() == 0) {
+    return std::make_shared<RowVector>(
+        pool(), outputType_, nullptr, size,
+        std::vector<VectorPtr>{});
   }
 
   RowVectorPtr output = with_arrow::toVeloxColumn(
