@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConnector.h"
 #include "velox/experimental/cudf/exec/CudfAssignUniqueId.h"
 #include "velox/experimental/cudf/exec/CudfBatchConcat.h"
@@ -26,18 +27,24 @@
 #include "velox/experimental/cudf/exec/CudfTopN.h"
 #include "velox/experimental/cudf/exec/CudfTopNRowNumber.h"
 #include "velox/experimental/cudf/exec/OperatorAdapters.h"
+#include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
+#include "velox/experimental/ucx-exchange/UcxExchange.h"
+#include "velox/experimental/ucx-exchange/UcxPartitionedOutput.h"
 
 #include "velox/exec/AssignUniqueId.h"
 #include "velox/exec/CallbackSink.h"
+#include "velox/exec/Exchange.h"
 #include "velox/exec/FilterProject.h"
 #include "velox/exec/HashAggregation.h"
 #include "velox/exec/HashBuild.h"
 #include "velox/exec/HashProbe.h"
 #include "velox/exec/Limit.h"
 #include "velox/exec/LocalPartition.h"
+#include "velox/exec/Merge.h"
 #include "velox/exec/OrderBy.h"
+#include "velox/exec/PartitionedOutput.h"
 #include "velox/exec/StreamingAggregation.h"
 #include "velox/exec/TableScan.h"
 #include "velox/exec/Task.h"
@@ -286,14 +293,6 @@ class CudfHashJoinBaseAdapter : public OperatorAdapter {
 
     // Disabling null-aware anti join with filter until we implement it right
     if (joinPlanNode->joinType() == core::JoinType::kAnti &&
-        joinPlanNode->isNullAware() && joinPlanNode->filter()) {
-      return false;
-    }
-
-    // Null-aware LEFT SEMI PROJECT with filter requires tracking per-row
-    // NULL vs no-match state during filter evaluation, which is not yet
-    // implemented. The no-filter case is supported.
-    if (joinPlanNode->joinType() == core::JoinType::kLeftSemiProject &&
         joinPlanNode->isNullAware() && joinPlanNode->filter()) {
       return false;
     }
@@ -737,6 +736,228 @@ class TopNRowNumberAdapter : public OperatorAdapter {
   }
 };
 
+// Single instance of the map to store UcxExchangeClient instances.
+// Using a function with a static local ensures thread-safe initialization
+// and a single instance across all translation units.
+UcxExchangeClientMap& getUcxExchangeClientMap() {
+  static UcxExchangeClientMap instance;
+  return instance;
+}
+
+// Mutex to protect concurrent access to the UcxExchangeClientMap.
+std::mutex& getUcxExchangeClientMapMutex() {
+  static std::mutex instance;
+  return instance;
+}
+
+/// ExchangeAdapter - Replaces with UcxExchange for UCX transport.
+// Note: When exchange is enabled but transport is HTTP, canRunOnGPU()
+// returns false while keepOperator() returns false. In ToCudf.cpp's
+// compile(), this means replaceOp stays empty and the original Velox
+// Exchange operator is preserved (the replacement block is guarded by
+// "if (not replaceOp.empty())").
+class ExchangeAdapter : public OperatorAdapter {
+ public:
+  ExchangeAdapter() : OperatorAdapter("Exchange") {}
+
+  bool canHandle(const exec::Operator* op) const override {
+    return CudfConfig::getInstance().exchange &&
+        dynamic_cast<const exec::Exchange*>(op) != nullptr;
+  }
+
+  bool canRunOnGPU(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* /*ctx*/) const override {
+    auto exchangeNode =
+        std::dynamic_pointer_cast<const core::ExchangeNode>(planNode);
+    return CudfConfig::getInstance().exchange && exchangeNode &&
+        exchangeNode->transportType() ==
+        core::ExchangeNode::TransportType::kUcx;
+  }
+
+  bool acceptsGpuInput() const override {
+    return false;
+  }
+
+  bool producesGpuOutput() const override {
+    return true;
+  }
+
+  std::vector<std::unique_ptr<exec::Operator>> createReplacements(
+      const exec::Operator* op,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* ctx,
+      int32_t operatorId) const override {
+    std::vector<std::unique_ptr<exec::Operator>> result;
+    // const_cast is safe here: the original operator will be destroyed/replaced
+    // immediately after createReplacements() returns. We need non-const access
+    // to call releaseExchangeClient()/resetExchangeClient() on it.
+    auto exchangeOp =
+        const_cast<exec::Exchange*>(dynamic_cast<const exec::Exchange*>(op));
+    // Get or create the UcxExchangeClient, using parameters from the
+    // Velox exchange client.
+    auto key = TaskPipelineKey(op->taskId(), ctx->pipelineId);
+    std::shared_ptr<facebook::velox::ucx_exchange::UcxExchangeClient> client =
+        nullptr;
+    {
+      std::lock_guard<std::mutex> lock(getUcxExchangeClientMapMutex());
+      auto& clientMap = getUcxExchangeClientMap();
+      auto clientIter = clientMap.find(key);
+      if (clientIter != clientMap.end()) {
+        client = clientIter->second.lock();
+        if (!client) {
+          // Remove the expired weak_ptr entry to prevent unbounded growth
+          // of stale entries over thousands of queries.
+          clientMap.erase(clientIter);
+        }
+      }
+      if (!client) {
+        // Release the HTTP ExchangeClient to prevent double-close
+        // when the replaced Exchange operator is destroyed.
+        auto veloxExchangeClient = exchangeOp->releaseExchangeClient();
+        VELOX_CHECK_NOT_NULL(
+            veloxExchangeClient, "Velox exchange client can't be null.");
+        client =
+            std::make_shared<facebook::velox::ucx_exchange::UcxExchangeClient>(
+                op->taskId(),
+                veloxExchangeClient->getDestination(),
+                veloxExchangeClient->getNumberOfConsumers());
+        clientMap[key] = client;
+      } else {
+        // Prevent closing of the HTTP ExchangeClient when the replaced
+        // Exchange operator is destroyed.
+        exchangeOp->resetExchangeClient();
+      }
+    }
+    result.push_back(
+        std::make_unique<facebook::velox::ucx_exchange::UcxExchange>(
+            operatorId, ctx, planNode, client));
+    return result;
+  }
+
+  // Returns false when exchange is enabled. When transport is HTTP (not UCX),
+  // canRunOnGPU() also returns false, so createReplacements() is never called
+  // and the original Velox Exchange operator is preserved. See ToCudf.cpp's
+  // compile() which guards replacement on "not replaceOp.empty()".
+  bool keepOperator() const override {
+    return !CudfConfig::getInstance().exchange;
+  }
+};
+
+/// MergeExchangeAdapter - Replaces with UcxExchange+CudfOrderBy for UCX
+/// transport
+class MergeExchangeAdapter : public OperatorAdapter {
+ public:
+  MergeExchangeAdapter() : OperatorAdapter("MergeExchange") {}
+
+  bool canHandle(const exec::Operator* op) const override {
+    return CudfConfig::getInstance().exchange &&
+        dynamic_cast<const exec::MergeExchange*>(op) != nullptr;
+  }
+
+  bool canRunOnGPU(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* /*ctx*/) const override {
+    auto mergeExchangeNode =
+        std::dynamic_pointer_cast<const core::MergeExchangeNode>(planNode);
+    return CudfConfig::getInstance().exchange && mergeExchangeNode &&
+        mergeExchangeNode->transportType() ==
+        core::ExchangeNode::TransportType::kUcx;
+  }
+
+  bool acceptsGpuInput() const override {
+    return false;
+  }
+
+  bool producesGpuOutput() const override {
+    return true;
+  }
+
+  std::vector<std::unique_ptr<exec::Operator>> createReplacements(
+      const exec::Operator* op,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* ctx,
+      int32_t operatorId) const override {
+    std::vector<std::unique_ptr<exec::Operator>> result;
+    // create a UcxExchange operator for the merge exchange.
+    // Pass a nullptr to force the UcxExchange op to create its
+    // own, private UcxExchangeClient.
+    result.push_back(
+        std::make_unique<facebook::velox::ucx_exchange::UcxExchange>(
+            operatorId, ctx, planNode, nullptr));
+    // Add an order-by node. SortingKeys and SortOrders will be taken from
+    // the MergeExchangeNode.
+    result.push_back(std::make_unique<CudfOrderBy>(operatorId, ctx, planNode));
+    return result;
+  }
+
+  bool keepOperator() const override {
+    return !CudfConfig::getInstance().exchange;
+  }
+};
+
+/// PartitionedOutputAdapter - Replaces with UcxPartitionedOutput for UCX
+/// transport
+class PartitionedOutputAdapter : public OperatorAdapter {
+ public:
+  PartitionedOutputAdapter() : OperatorAdapter("PartitionedOutput") {}
+
+  bool canHandle(const exec::Operator* op) const override {
+    return CudfConfig::getInstance().exchange &&
+        dynamic_cast<const exec::PartitionedOutput*>(op) != nullptr;
+  }
+
+  bool canRunOnGPU(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* /*ctx*/) const override {
+    auto poNode =
+        std::dynamic_pointer_cast<const core::PartitionedOutputNode>(planNode);
+    if (!poNode || !CudfConfig::getInstance().exchange) {
+      return false;
+    }
+    if (poNode->transportType() !=
+        core::PartitionedOutputNode::TransportType::kUcx) {
+      return false;
+    }
+    if (poNode->isArbitrary()) {
+      LOG(FATAL)
+          << "Arbitrary partitioning is not supported by cudf UCX exchange";
+    }
+    return true;
+  }
+
+  bool acceptsGpuInput() const override {
+    return true;
+  }
+
+  bool producesGpuOutput() const override {
+    return false;
+  }
+
+  std::vector<std::unique_ptr<exec::Operator>> createReplacements(
+      const exec::Operator* op,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* ctx,
+      int32_t operatorId) const override {
+    std::vector<std::unique_ptr<exec::Operator>> result;
+    auto partitionOp = dynamic_cast<const exec::PartitionedOutput*>(op);
+    auto poNode =
+        std::dynamic_pointer_cast<const core::PartitionedOutputNode>(planNode);
+    result.push_back(
+        std::make_unique<facebook::velox::ucx_exchange::UcxPartitionedOutput>(
+            operatorId, ctx, poNode, partitionOp->getEagerFlush()));
+
+    return result;
+  }
+
+  bool keepOperator() const override {
+    return !CudfConfig::getInstance().exchange;
+  }
+};
+
 /// Registration Function
 void registerAllOperatorAdapters() {
   auto& registry = OperatorAdapterRegistry::getInstance();
@@ -759,6 +980,9 @@ void registerAllOperatorAdapters() {
   registry.registerAdapter(std::make_unique<ValuesAdapter>());
   registry.registerAdapter(std::make_unique<CallbackSinkAdapter>());
   registry.registerAdapter(std::make_unique<TopNRowNumberAdapter>());
+  registry.registerAdapter(std::make_unique<ExchangeAdapter>());
+  registry.registerAdapter(std::make_unique<MergeExchangeAdapter>());
+  registry.registerAdapter(std::make_unique<PartitionedOutputAdapter>());
 }
 
 } // namespace facebook::velox::cudf_velox

@@ -53,6 +53,13 @@ struct CudfConfig {
   /// Query session configs for the cuDF Operators.
   static constexpr const char* kCudfTopNBatchSize{"cudf.topk_batch_size"};
 
+  static constexpr const char* kUcxExchange{"cudf.exchange"};
+  static constexpr const char* kUcxxErrorHandling{"ucxx.error_handling"};
+  static constexpr const char* kUcxIntraNodeExchange{
+      "cudf.intra_node_exchange"};
+  static constexpr const char* kUcxxBlockingPolling{"ucxx.blocking_polling"};
+  static constexpr const char* kUcxExchangeLogLevel{"cudf.exchange_log_level"};
+
   /// Singleton CudfConfig instance.
   /// Clients must set the configs below before invoking registerCudf().
   static CudfConfig& getInstance();
@@ -62,7 +69,7 @@ struct CudfConfig {
 
   /// Enable cudf by default.
   /// Clients can disable here and enable it via the QueryConfig as well.
-  bool enabled{true};
+  bool enabled{false};
 
   /// Enable debug printing.
   bool debugEnabled{false};
@@ -86,10 +93,10 @@ struct CudfConfig {
   /// Register all the functions with the functionNamePrefix.
   std::string functionNamePrefix;
 
-  /// Enable AST in expression evaluation.
+  /// Enable AST in expression evaluation
   bool astExpressionEnabled{true};
 
-  /// Enable JIT in expression evaluation.
+  /// Enable JIT in expression evaluation
   bool jitExpressionEnabled{true};
 
   /// Priority of AST expression. Expression with higher priority is chosen for
@@ -129,6 +136,23 @@ struct CudfConfig {
   // Register the Spark or Presto functions, the value could be either spark or
   // presto.
   std::string functionEngine{"presto"};
+
+  /// Whether UCX exchange is enabled.
+  bool exchange{false};
+
+  /// Whether to enable error handling in UCXX endpoints.
+  bool ucxxErrorHandling{true};
+
+  /// Whether intra-node exchange optimization is enabled.
+  /// When disabled, all transfers use UCXX even within the same node.
+  bool intraNodeExchange{false};
+
+  /// Whether to use blocking polling in UCXX.
+  bool ucxxBlockingPolling{true};
+
+  /// VLOG level for ucx-exchange source files (0 = silent, 1-3 = increasing
+  /// verbosity). Applied via google::SetVLOGLevel when Communicator starts.
+  int32_t exchangeLogLevel{0};
 };
 
 } // namespace facebook::velox::cudf_velox

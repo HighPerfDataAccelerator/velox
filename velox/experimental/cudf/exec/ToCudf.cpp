@@ -28,6 +28,8 @@
 #include "velox/experimental/cudf/expression/AstExpression.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
 #include "velox/experimental/cudf/expression/JitExpression.h"
+#include "velox/experimental/ucx-exchange/UcxExchangeClient.h"
+#include "velox/experimental/ucx-exchange/UcxPartitionedOutput.h"
 
 #include "folly/Conv.h"
 #include "velox/exec/Driver.h"
@@ -41,6 +43,12 @@
 #include <iostream>
 
 static const std::string kCudfAdapterName = "cuDF";
+DEFINE_bool(velox_cudf_enabled, true, "Enable cuDF-Velox acceleration");
+DEFINE_string(velox_cudf_memory_resource, "async", "Memory resource for cuDF");
+DEFINE_bool(velox_cudf_debug, false, "Enable debug printing");
+DEFINE_bool(velox_ucx_exchange, true, "Enable UCX exchange");
+
+using namespace facebook::velox::ucx_exchange;
 
 namespace facebook::velox::cudf_velox {
 
@@ -268,6 +276,7 @@ bool CompileState::compile(bool allowCpuFallback) {
     }
   }
 
+  VLOG(3) << "- CompileState::compile";
   return replacementsMade;
 }
 
@@ -411,11 +420,28 @@ void CudfConfig::initialize(
   if (config.find(kCudfLogFallback) != config.end()) {
     logFallback = folly::to<bool>(config[kCudfLogFallback]);
   }
+
   if (config.find(kCudfTopNBatchSize) != config.end()) {
     topNBatchSize = folly::to<int32_t>(config[kCudfTopNBatchSize]);
   }
   if (config.find(kCudfFunctionEngine) != config.end()) {
     functionEngine = config[kCudfFunctionEngine];
+  }
+
+  if (config.find(kUcxExchange) != config.end()) {
+    exchange = folly::to<bool>(config[kUcxExchange]);
+  }
+  if (config.find(kUcxIntraNodeExchange) != config.end()) {
+    intraNodeExchange = folly::to<bool>(config[kUcxIntraNodeExchange]);
+  }
+  if (config.find(kUcxxErrorHandling) != config.end()) {
+    ucxxErrorHandling = folly::to<bool>(config[kUcxxErrorHandling]);
+  }
+  if (config.find(kUcxxBlockingPolling) != config.end()) {
+    ucxxBlockingPolling = folly::to<bool>(config[kUcxxBlockingPolling]);
+  }
+  if (config.find(kUcxExchangeLogLevel) != config.end()) {
+    exchangeLogLevel = folly::to<int32_t>(config[kUcxExchangeLogLevel]);
   }
 }
 
