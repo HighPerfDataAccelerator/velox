@@ -1173,7 +1173,7 @@ void Task::initializePartitionOutput() {
   if (partitionedOutputNode != nullptr) {
     VELOX_CHECK(hasPartitionedOutput());
     VELOX_CHECK_GT(numOutputDrivers, 0);
-    VLOG(0) << "initializing OutputBufferManager with "
+    VLOG(1) << "initializing OutputBufferManager with "
             << partitionedOutputNode->numPartitions() << " partitions and "
             << numOutputDrivers << " drivers";
     bufferManager->initializeTask(
