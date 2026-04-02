@@ -229,6 +229,7 @@ RowVectorPtr CudfFromVelox::getOutput() {
     // Note: outputType_ may differ from actual input type because
     // ToCudf uses the downstream operator's output type, not the
     // upstream operator's output type.
+    gpuTimer_.start(stream);
     auto mr = cudf::get_current_device_resource_ref();
     auto dummy = cudf::make_numeric_column(
         cudf::data_type(cudf::type_id::INT8),
@@ -239,12 +240,14 @@ RowVectorPtr CudfFromVelox::getOutput() {
     std::vector<std::unique_ptr<cudf::column>> cols;
     cols.push_back(std::move(dummy));
     auto tbl = std::make_unique<cudf::table>(std::move(cols));
-    return std::make_shared<CudfVector>(
+    auto out = std::make_shared<CudfVector>(
         selectedInputs[0]->pool(),
         outputType_,
         totalSize,
         std::move(tbl),
         stream);
+    gpuTimer_.stop(stream);
+    return out;
   }
 
   // Batched HtoD with OOM resilience: if GPU memory is exhausted, reduce the
@@ -254,8 +257,10 @@ RowVectorPtr CudfFromVelox::getOutput() {
   std::unique_ptr<cudf::table> tbl;
   for (int attempt = 0;; ++attempt) {
     try {
+      gpuTimer_.start(stream);
       tbl = with_arrow::toCudfTableBatched(
           selectedInputs, selectedInputs[0]->pool(), stream);
+      gpuTimer_.stop(stream);
       break;
     } catch (const std::bad_alloc& e) {
       if (selectedInputs.size() > 1) {
@@ -311,6 +316,14 @@ RowVectorPtr CudfFromVelox::getOutput() {
 
 void CudfFromVelox::close() {
   cudf::get_default_stream().synchronize();
+  auto gpuNs = gpuTimer_.totalNanos();
+  if (gpuNs > 0) {
+    auto lockedStats = stats_.wlock();
+    lockedStats->addRuntimeStat(
+        kGpuComputeNanos,
+        RuntimeCounter(
+            static_cast<int64_t>(gpuNs), RuntimeCounter::Unit::kNanos));
+  }
   exec::Operator::close();
   inputs_.clear();
 }
@@ -384,8 +397,10 @@ RowVectorPtr CudfToVelox::getOutput() {
       finished_ = noMoreInput_ && inputs_.empty();
       return nullptr;
     }
+    gpuTimer_.start(stream);
     RowVectorPtr output =
         with_arrow::toVeloxColumn(tableView, pool(), outputType_, "", stream, cudf::get_current_device_resource_ref());
+    gpuTimer_.stop(stream);
     stream.synchronize();
     finished_ = noMoreInput_ && inputs_.empty();
     if (output->type()->kindEquals(outputType_)) {
@@ -479,8 +494,10 @@ RowVectorPtr CudfToVelox::getOutput() {
     return nullptr;
   }
 
+  gpuTimer_.start(stream);
   RowVectorPtr output = with_arrow::toVeloxColumn(
       resultTable->view(), pool(), outputType_, "", stream, cudf::get_current_device_resource_ref());
+  gpuTimer_.stop(stream);
   stream.synchronize();
   finished_ = noMoreInput_ && inputs_.empty();
   if (output->type()->kindEquals(outputType_)) {
@@ -505,6 +522,14 @@ RowVectorPtr CudfToVelox::getOutput() {
 }
 
 void CudfToVelox::close() {
+  auto gpuNs = gpuTimer_.totalNanos();
+  if (gpuNs > 0) {
+    auto lockedStats = stats_.wlock();
+    lockedStats->addRuntimeStat(
+        kGpuComputeNanos,
+        RuntimeCounter(
+            static_cast<int64_t>(gpuNs), RuntimeCounter::Unit::kNanos));
+  }
   exec::Operator::close();
   inputs_.clear();
 }

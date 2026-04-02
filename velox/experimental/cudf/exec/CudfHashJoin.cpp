@@ -119,6 +119,13 @@ cudf::table_view createExtendedTableView(
 } // namespace
 
 void CudfHashJoinProbe::close() {
+  auto gpuNs = gpuTimer_.totalNanos();
+  if (gpuNs > 0) {
+    auto lockedStats = stats_.wlock();
+    lockedStats->addRuntimeStat(
+        kGpuComputeNanos,
+        RuntimeCounter(gpuNs, RuntimeCounter::Unit::kNanos));
+  }
   Operator::close();
   filterEvaluator_.reset();
   scalars_.clear();
@@ -2388,6 +2395,8 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
     }
   }
 
+  gpuTimer_.start(stream);
+
   // Build hash tables on-demand (transient). Construction is deferred from
   // the build phase to here so that at most GpuGuard-max hash table sets
   // exist at any instant, rather than one per Spark task.
@@ -2587,6 +2596,8 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
       }
     }
   }
+
+  gpuTimer_.stop(stream);
 
   // Release transient hash tables immediately after probing to free GPU
   // memory for other tasks. They'll be rebuilt on the next getOutput() call.

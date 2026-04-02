@@ -152,7 +152,10 @@ void CudfTopN::addInput(RowVectorPtr input) {
   // Take topk of each input, add to batch.
   // If got kBatchSize_ batches, concat batches and topk once.
   // During getOutput, concat batches and topk once.
+  auto inputStream = cudfInput->stream();
+  gpuTimer_.start(inputStream);
   topNBatches_.push_back(getTopKBatch(cudfInput, count_));
+  gpuTimer_.stop(inputStream);
   // sum of sizes of topNBatches_ >= count_, then concat and topk once.
   auto totalSize = std::accumulate(
       topNBatches_.begin(),
@@ -165,7 +168,9 @@ void CudfTopN::addInput(RowVectorPtr input) {
     auto stream = cudfGlobalStreamPool().get_stream();
     auto mr = cudf::get_current_device_resource_ref();
 
+    gpuTimer_.start(stream);
     auto result = mergeTopK(topNBatches_, count_, stream, mr);
+    gpuTimer_.stop(stream);
     topNBatches_.clear();
     topNBatches_.push_back(std::move(result));
   }
@@ -184,7 +189,9 @@ RowVectorPtr CudfTopN::getOutput() {
 
   auto stream = topNBatches_[0]->stream();
   auto mr = cudf::get_current_device_resource_ref();
+  gpuTimer_.start(stream);
   auto result = mergeTopK(topNBatches_, count_, stream, mr);
+  gpuTimer_.stop(stream);
   topNBatches_.clear();
   finished_ = noMoreInput_ && topNBatches_.empty();
   return result;

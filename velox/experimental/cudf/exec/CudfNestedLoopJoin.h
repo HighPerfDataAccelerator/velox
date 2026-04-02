@@ -17,6 +17,7 @@
 #pragma once
 
 #include "velox/experimental/cudf/exec/NvtxHelper.h"
+#include "velox/experimental/cudf/exec/GpuTimer.h"
 #include "velox/experimental/cudf/expression/AstExpression.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
@@ -128,6 +129,8 @@ class CudfNestedLoopJoinProbe
 
   // For right/full: track which build rows have been matched.
   std::vector<std::unique_ptr<cudf::column>> rightMatchedFlags_;
+
+  GpuTimer gpuTimer_;
 
   std::unique_ptr<cudf::table> crossJoinAndFilter(
       cudf::table_view leftView,

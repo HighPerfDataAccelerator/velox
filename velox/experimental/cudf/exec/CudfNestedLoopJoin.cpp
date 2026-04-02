@@ -351,6 +351,13 @@ void CudfNestedLoopJoinProbe::noMoreInput() {
 }
 
 void CudfNestedLoopJoinProbe::close() {
+  auto gpuNs = gpuTimer_.totalNanos();
+  if (gpuNs > 0) {
+    auto lockedStats = stats_.wlock();
+    lockedStats->addRuntimeStat(
+        kGpuComputeNanos,
+        RuntimeCounter(gpuNs, RuntimeCounter::Unit::kNanos));
+  }
   Operator::close();
   buildData_.reset();
   rightMatchedFlags_.clear();
@@ -1007,6 +1014,7 @@ RowVectorPtr CudfNestedLoopJoinProbe::getOutput() {
   auto leftView = cudfInput->getTableView();
 
   std::vector<std::unique_ptr<cudf::table>> cudfOutputs;
+  gpuTimer_.start(stream);
   switch (joinType_) {
     case core::JoinType::kInner:
       cudfOutputs = innerJoin(leftView, stream);
@@ -1027,6 +1035,7 @@ RowVectorPtr CudfNestedLoopJoinProbe::getOutput() {
       VELOX_FAIL(
           "Unsupported NLJ type: {}", static_cast<int>(joinType_));
   }
+  gpuTimer_.stop(stream);
 
   cudfInput.reset();
   input_.reset();

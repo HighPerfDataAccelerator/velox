@@ -17,6 +17,7 @@
 #pragma once
 
 #include "velox/experimental/cudf/exec/NvtxHelper.h"
+#include "velox/experimental/cudf/exec/GpuTimer.h"
 
 #include "velox/exec/Operator.h"
 
@@ -45,6 +46,17 @@ class CudfExpand : public exec::Operator, public NvtxHelper {
     return noMoreInput_ && input_ == nullptr;
   }
 
+  void close() override {
+    auto gpuNs = gpuTimer_.totalNanos();
+    if (gpuNs > 0) {
+      auto lockedStats = stats_.wlock();
+      lockedStats->addRuntimeStat(
+          kGpuComputeNanos,
+          RuntimeCounter(gpuNs, RuntimeCounter::Unit::kNanos));
+    }
+    Operator::close();
+  }
+
  private:
   static constexpr column_index_t kConstantChannel =
       std::numeric_limits<column_index_t>::max();
@@ -60,6 +72,8 @@ class CudfExpand : public exec::Operator, public NvtxHelper {
       constantScalars_;
 
   int32_t rowIndex_{0};
+
+  GpuTimer gpuTimer_;
 };
 
 } // namespace facebook::velox::cudf_velox

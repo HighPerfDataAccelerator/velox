@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "velox/experimental/cudf/exec/GpuTimer.h"
 #include "velox/experimental/cudf/exec/NvtxHelper.h"
 #include "velox/experimental/cudf/expression/AstExpression.h"
 #include "velox/experimental/cudf/expression/AstExpressionUtils.h"
@@ -251,6 +252,8 @@ class CudfHashJoinProbe : public exec::Operator, public NvtxHelper {
   // For Right joins, only one driver collects the unmatched rows mask and
   // emits. This value is set true only for that driver. See noMoreInput
   bool isLastDriver_{false};
+
+  GpuTimer gpuTimer_;
 
   static constexpr auto oobPolicy = cudf::out_of_bounds_policy::NULLIFY;
   /**

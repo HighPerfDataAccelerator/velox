@@ -17,6 +17,7 @@
 #pragma once
 
 #include "velox/experimental/cudf/exec/NvtxHelper.h"
+#include "velox/experimental/cudf/exec/GpuTimer.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
 #include "velox/exec/Driver.h"
@@ -63,6 +64,7 @@ class CudfFromVelox : public exec::Operator, public NvtxHelper {
   std::size_t currentOutputSize_ = 0;
   int64_t currentOutputBytes_ = 0;
   bool finished_ = false;
+  GpuTimer gpuTimer_;
 };
 
 class CudfToVelox : public exec::Operator, public NvtxHelper {
@@ -100,6 +102,7 @@ class CudfToVelox : public exec::Operator, public NvtxHelper {
   std::optional<uint64_t> averageRowSize_;
   std::deque<CudfVectorPtr> inputs_;
   bool finished_ = false;
+  GpuTimer gpuTimer_;
 };
 
 } // namespace facebook::velox::cudf_velox

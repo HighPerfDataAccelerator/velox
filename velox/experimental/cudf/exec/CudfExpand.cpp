@@ -166,6 +166,8 @@ RowVectorPtr CudfExpand::getOutput() {
   auto inputView = cudfInput->getTableView();
   auto stream = cudfInput->stream();
 
+  gpuTimer_.start(stream);
+
   const auto& rowProjection = fieldProjections_[rowIndex_];
   const auto& rowScalars = constantScalars_[rowIndex_];
   const auto numColumns = rowProjection.size();
@@ -185,6 +187,8 @@ RowVectorPtr CudfExpand::getOutput() {
 
   auto outputTable = std::make_unique<cudf::table>(
       std::move(outputColumns));
+
+  gpuTimer_.stop(stream);
 
   ++rowIndex_;
   if (rowIndex_ ==

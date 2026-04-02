@@ -16,6 +16,7 @@
 #pragma once
 
 #include "velox/experimental/cudf/exec/NvtxHelper.h"
+#include "velox/experimental/cudf/exec/GpuTimer.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
 #include "velox/core/PlanNode.h"
@@ -120,6 +121,8 @@ class CudfWindow : public exec::Operator, public NvtxHelper {
   std::vector<cudf::order> sortOrders_;
   std::vector<cudf::null_order> sortNullOrders_;
   std::vector<WindowFunctionSpec> functionSpecs_;
+
+  GpuTimer gpuTimer_;
 
   // Scratch storage for the struct column_view children returned by
   // multiSortKeyStructView. Mutable because computeRankColumn is const.

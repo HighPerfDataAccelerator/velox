@@ -393,8 +393,10 @@ void CudfWindow::noMoreInput() {
       getConcatenatedTable(inputs_, inputType_, stream);
   inputs_.clear();
 
+  gpuTimer_.start(stream);
   auto outputTable =
       computeOutputTable(std::move(inputTable), stream);
+  gpuTimer_.stop(stream);
   output_ = std::make_shared<CudfVector>(
       pool(),
       outputType_,
@@ -416,6 +418,13 @@ RowVectorPtr CudfWindow::getOutput() {
 }
 
 void CudfWindow::close() {
+  auto gpuNs = gpuTimer_.totalNanos();
+  if (gpuNs > 0) {
+    auto lockedStats = stats_.wlock();
+    lockedStats->addRuntimeStat(
+        kGpuComputeNanos,
+        RuntimeCounter(gpuNs, RuntimeCounter::Unit::kNanos));
+  }
   exec::Operator::close();
   inputs_.clear();
   output_.reset();

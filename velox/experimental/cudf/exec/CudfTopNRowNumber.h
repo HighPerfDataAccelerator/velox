@@ -16,6 +16,7 @@
 #pragma once
 
 #include "velox/experimental/cudf/exec/NvtxHelper.h"
+#include "velox/experimental/cudf/exec/GpuTimer.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
 #include "velox/core/PlanNode.h"
@@ -50,6 +51,17 @@ class CudfTopNRowNumber : public exec::Operator, public NvtxHelper {
 
   bool isFinished() override;
 
+  void close() override {
+    auto gpuNs = gpuTimer_.totalNanos();
+    if (gpuNs > 0) {
+      auto lockedStats = stats_.wlock();
+      lockedStats->addRuntimeStat(
+          kGpuComputeNanos,
+          RuntimeCounter(gpuNs, RuntimeCounter::Unit::kNanos));
+    }
+    Operator::close();
+  }
+
  private:
   const int32_t limit_;
   const bool generateRowNumber_;
@@ -64,6 +76,8 @@ class CudfTopNRowNumber : public exec::Operator, public NvtxHelper {
 
   std::vector<CudfVectorPtr> inputBatches_;
   bool finished_ = false;
+
+  GpuTimer gpuTimer_;
 };
 
 } // namespace facebook::velox::cudf_velox

@@ -61,6 +61,8 @@ void CudfShufflePartition::addInput(RowVectorPtr input) {
   // First column is the hash value produced by the exchange hash expression.
   auto firstCol = tableView.column(0);
 
+  gpuTimer_.start(stream);
+
   // PID = hash % numPartitions  (on GPU)
   auto numPartScalar = cudf::numeric_scalar<int32_t>(numPartitions_, true, stream);
   auto pidCol = cudf::binary_operation(
@@ -90,6 +92,8 @@ void CudfShufflePartition::addInput(RowVectorPtr input) {
       offsets.size(),
       static_cast<size_t>(numPartitions_) + 1,
       "cudf::partition must return numPartitions+1 offsets");
+
+  gpuTimer_.stop(stream);
 
   output_ = std::make_shared<CudfVector>(
       pool(),

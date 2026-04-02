@@ -18,6 +18,7 @@
 
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConfig.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConnectorSplit.h"
+#include "velox/experimental/cudf/exec/GpuTimer.h"
 #include "velox/experimental/cudf/exec/NvtxHelper.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
 
@@ -170,6 +171,7 @@ class CudfHiveDataSource : public DataSource, public NvtxHelper {
 
   dwio::common::RuntimeStatistics runtimeStats_;
   std::atomic<uint64_t> totalRemainingFilterTime_{0};
+  cudf_velox::GpuTimer gpuTimer_;
 
   // Create callback data for total scan timing calculation
   struct TotalScanTimeCallbackData {

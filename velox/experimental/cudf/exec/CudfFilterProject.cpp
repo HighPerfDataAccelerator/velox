@@ -17,6 +17,7 @@
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/CudfFilterProject.h"
 #include "velox/experimental/cudf/exec/GpuGuard.h"
+#include "velox/experimental/cudf/exec/GpuTimer.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
@@ -300,10 +301,13 @@ RowVectorPtr CudfFilterProject::getOutput() {
         e.what());
   }
 
+  gpuTimer_.start(stream);
+
   try {
     if (hasFilter_) {
       filter(inputTableColumns, stream);
       if (!inputTableColumns.empty() && inputTableColumns[0]->size() == 0) {
+        gpuTimer_.stop(stream);
         input_.reset();
         if (!accumulatedOutputs_.empty() && noMoreInput_) {
           return flushAccumulatedOutputs();
@@ -312,19 +316,27 @@ RowVectorPtr CudfFilterProject::getOutput() {
       }
     }
   } catch (const std::bad_alloc& e) {
+    gpuTimer_.stop(stream);
     input_.reset();
     VELOX_FAIL(
-        "CudfFilterProject[{}]: GPU OOM in filter: {}", planNodeId(), e.what());
+        "CudfFilterProject[{}]: GPU OOM in filter: {}",
+        planNodeId(),
+        e.what());
   }
 
   std::vector<std::unique_ptr<cudf::column>> outputColumns;
   try {
     outputColumns = project(inputTableColumns, stream);
   } catch (const std::bad_alloc& e) {
+    gpuTimer_.stop(stream);
     input_.reset();
     VELOX_FAIL(
-        "CudfFilterProject[{}]: GPU OOM in project: {}", planNodeId(), e.what());
+        "CudfFilterProject[{}]: GPU OOM in project: {}",
+        planNodeId(),
+        e.what());
   }
+
+  gpuTimer_.stop(stream);
 
   if (outputColumns.empty()) {
     // Zero-column projection (e.g. COUNT(*)).  Downstream aggregation

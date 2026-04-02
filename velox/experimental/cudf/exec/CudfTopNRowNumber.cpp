@@ -131,6 +131,8 @@ RowVectorPtr CudfTopNRowNumber::getOutput() {
   auto stream = cudfGlobalStreamPool().get_stream();
   auto mr = cudf::get_current_device_resource_ref();
 
+  gpuTimer_.start(stream);
+
   // Concatenate all input batches.
   std::vector<cudf::table_view> views;
   std::vector<rmm::cuda_stream_view> inputStreams;
@@ -175,6 +177,8 @@ RowVectorPtr CudfTopNRowNumber::getOutput() {
   } else {
     result = std::move(filtered);
   }
+
+  gpuTimer_.stop(stream);
 
   auto const numRows = result->num_rows();
   stream.synchronize();
