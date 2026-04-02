@@ -194,6 +194,7 @@ void CudfLocalPartition::addInput(RowVectorPtr input) {
       enqueuePartition(partition, cudfVector);
       return;
     }
+    gpuTimer_.start(stream);
     auto [partitionedTable, partitionOffsets] = [&]() {
       auto tableView = cudfVector->getTableView();
       // Use cudf hash partitioning
@@ -259,6 +260,7 @@ void CudfLocalPartition::addInput(RowVectorPtr input) {
     // copies are still in flight, causing illegal memory access when using
     // non-stream-ordered memory resources (pool, arena).
     stream.synchronize();
+    gpuTimer_.stop(stream);
 
     for (auto& [pid, vec] : partitionVectors) {
       enqueuePartition(pid, vec);

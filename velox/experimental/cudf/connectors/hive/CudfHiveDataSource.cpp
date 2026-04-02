@@ -227,6 +227,7 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
           ? targetBytes
           : std::numeric_limits<int64_t>::max();
       GpuGuard coalescedGpuGuard;
+      gpuTimer_.start(stream_);
       auto coalesceLoopStartUs = getCurrentTimeMicro();
       while (splitReader_->has_next()) {
         auto tableWithMetadata = splitReader_->read_chunk();
@@ -265,6 +266,7 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
           (getCurrentTimeMicro() - coalesceLoopStartUs) * 1000,
           std::memory_order_relaxed);
       auto result = flushAccumulated();
+      gpuTimer_.stop(stream_);
       if (result == nullptr) {
         return nullptr;
       }
@@ -282,6 +284,7 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
       return nullptr;
     }
     gpuGuard.emplace();
+    gpuTimer_.start(stream_);
     auto tableWithMetadata = splitReader_->read_chunk();
     cudfTable = std::move(tableWithMetadata.tbl);
     metadata = std::move(tableWithMetadata.metadata);
@@ -292,6 +295,7 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
         exptSplitReader_, "Experimental cudf split reader not present");
 
     gpuGuard.emplace();
+    gpuTimer_.start(stream_);
     while (true) {
       if (!exptMetadataInitialized_) {
         initExperimentalReaderMetadata();
@@ -347,6 +351,9 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
   }
   totalRemainingFilterTime_.fetch_add(
       filterTimeUs * 1000, std::memory_order_relaxed);
+
+  gpuTimer_.stop(stream_);
+  LOG(WARNING) << "CudfHiveDataSource::next() gpuTimer_ stopped";
 
   // Output RowVectorPtr
   const auto nRows = cudfTable->num_rows();
@@ -720,6 +727,16 @@ CudfHiveDataSource::getRuntimeStats() {
            totalRemainingFilterTime_.load(std::memory_order_relaxed),
            RuntimeCounter::Unit::kNanos)},
   });
+  auto gpuNs = gpuTimer_.totalNanos();
+  LOG(WARNING) << "CudfHiveDataSource::getRuntimeStats() "
+               << "gpuComputeNanos=" << gpuNs
+               << " totalScanTime="
+               << ioStatistics_->totalScanTime();
+  if (gpuNs > 0) {
+    res.emplace(
+        cudf_velox::kGpuComputeNanos,
+        RuntimeMetric(gpuNs, RuntimeCounter::Unit::kNanos));
+  }
   if (numCoalescedBatches_ > 0) {
     res.emplace(
         "numCoalescedBatches", RuntimeMetric(numCoalescedBatches_));

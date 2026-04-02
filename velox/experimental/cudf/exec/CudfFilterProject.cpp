@@ -17,6 +17,7 @@
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/CudfFilterProject.h"
 #include "velox/experimental/cudf/exec/GpuGuard.h"
+#include "velox/experimental/cudf/exec/GpuTimer.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
@@ -281,10 +282,14 @@ RowVectorPtr CudfFilterProject::getOutput() {
   auto stream = cudfInput->stream();
   auto inputTableColumns = cudfInput->release()->release();
 
+  gpuTimer_.start(stream);
+
   if (hasFilter_) {
     filter(inputTableColumns, stream);
   }
   auto outputColumns = project(inputTableColumns, stream);
+
+  gpuTimer_.stop(stream);
 
   auto outputTable = std::make_unique<cudf::table>(std::move(outputColumns));
   auto const numColumns = outputTable->num_columns();

@@ -15,6 +15,7 @@
  */
 #pragma once
 
+#include "velox/experimental/cudf/exec/GpuTimer.h"
 #include "velox/experimental/cudf/exec/NvtxHelper.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
@@ -60,6 +61,17 @@ class CudfLocalPartition : public exec::Operator, public NvtxHelper {
 
   bool isFinished() override;
 
+  void close() override {
+    auto gpuNs = gpuTimer_.totalNanos();
+    if (gpuNs > 0) {
+      auto lockedStats = stats_.wlock();
+      lockedStats->addRuntimeStat(
+          kGpuComputeNanos,
+          RuntimeCounter(gpuNs, RuntimeCounter::Unit::kNanos));
+    }
+    Operator::close();
+  }
+
   static bool shouldReplace(
       const std::shared_ptr<const core::LocalPartitionNode>& planNode);
 
@@ -77,6 +89,7 @@ class CudfLocalPartition : public exec::Operator, public NvtxHelper {
   std::vector<ContinueFuture> futures_;
 
   std::vector<column_index_t> partitionKeyIndices_;
+  GpuTimer gpuTimer_;
 };
 
 } // namespace facebook::velox::cudf_velox

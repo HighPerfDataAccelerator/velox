@@ -1013,6 +1013,7 @@ void CudfHashAggregation::processAccumulatedPartialInputs() {
   }
 
   auto stream = cudfGlobalStreamPool().get_stream();
+  gpuTimer_.start(stream);
   auto tbl =
       getConcatenatedTable(accumulatedPartialInputs_, inputType_, stream);
 
@@ -1029,6 +1030,7 @@ void CudfHashAggregation::processAccumulatedPartialInputs() {
   } else {
     computeIntermediateGroupbyPartial(cudfBatch);
   }
+  gpuTimer_.stop(stream);
 
   {
     auto lockedStats = stats_.wlock();
@@ -1072,11 +1074,14 @@ void CudfHashAggregation::addInput(RowVectorPtr input) {
     }
     {
       GpuGuard gpuGuard;
+      auto inputStream = cudfInput->stream();
+      gpuTimer_.start(inputStream);
       if (isDistinct_) {
         computeIntermediateDistinctPartial(cudfInput);
       } else {
         computeIntermediateGroupbyPartial(cudfInput);
       }
+      gpuTimer_.stop(inputStream);
     }
     return;
   }
@@ -1235,6 +1240,7 @@ RowVectorPtr CudfHashAggregation::getOutput() {
   }
 
   auto stream = cudfGlobalStreamPool().get_stream();
+  gpuTimer_.start(stream);
 
   auto tbl = getConcatenatedTable(inputs_, inputType_, stream);
   inputs_.clear();
@@ -1247,14 +1253,17 @@ RowVectorPtr CudfHashAggregation::getOutput() {
 
   // Use tbl->view() instead of moving the table.
   // tbl stays alive until the end of this function, keeping the view valid.
+  CudfVectorPtr result;
   if (isDistinct_) {
-    return getDistinctKeys(tbl->view(), groupingKeyInputChannels_, stream);
+    result = getDistinctKeys(tbl->view(), groupingKeyInputChannels_, stream);
   } else if (isGlobal_) {
-    return doGlobalAggregation(tbl->view(), stream);
+    result = doGlobalAggregation(tbl->view(), stream);
   } else {
-    return doGroupByAggregation(
+    result = doGroupByAggregation(
         tbl->view(), groupingKeyInputChannels_, aggregators_, stream);
   }
+  gpuTimer_.stop(stream);
+  return result;
 }
 
 void CudfHashAggregation::noMoreInput() {
