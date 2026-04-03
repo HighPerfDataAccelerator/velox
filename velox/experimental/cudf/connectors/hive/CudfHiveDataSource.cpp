@@ -353,7 +353,6 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
       filterTimeUs * 1000, std::memory_order_relaxed);
 
   gpuTimer_.stop(stream_);
-  LOG(WARNING) << "CudfHiveDataSource::next() gpuTimer_ stopped";
 
   // Output RowVectorPtr
   const auto nRows = cudfTable->num_rows();
