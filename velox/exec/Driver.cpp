@@ -23,6 +23,15 @@
 using facebook::velox::common::testutil::TestValue;
 
 namespace facebook::velox::exec {
+
+namespace {
+GpuOperatorHook gpuOperatorHook;
+} // namespace
+
+void Driver::setGpuOperatorHook(GpuOperatorHook hook) {
+  gpuOperatorHook = hook;
+}
+
 namespace {
 
 // Checks if output channel is produced using identity projection and returns
@@ -467,14 +476,31 @@ bool Driver::checkUnderArbitration(ContinueFuture* future) {
 }
 
 namespace {
+inline bool needsGpuLock(Operator* op) {
+  return gpuOperatorHook.shouldLock &&
+      gpuOperatorHook.shouldLock(op);
+}
+
 inline void addInput(Operator* op, const RowVectorPtr& input) {
   if (FOLLY_LIKELY(!op->dryRun())) {
-    op->addInput(input);
+    if (FOLLY_UNLIKELY(needsGpuLock(op))) {
+      gpuOperatorHook.lock();
+      op->addInput(input);
+      gpuOperatorHook.unlock();
+    } else {
+      op->addInput(input);
+    }
   }
 }
 
 inline void getOutput(Operator* op, RowVectorPtr& result) {
-  result = op->getOutput();
+  if (FOLLY_UNLIKELY(needsGpuLock(op))) {
+    gpuOperatorHook.lock();
+    result = op->getOutput();
+    gpuOperatorHook.unlock();
+  } else {
+    result = op->getOutput();
+  }
   if (FOLLY_UNLIKELY(op->shouldDropOutput())) {
     result = nullptr;
   }
@@ -704,11 +730,17 @@ StopReason Driver::runInternal(
                       TestValue::adjust(
                           "facebook::velox::exec::Driver::runInternal::noMoreInput",
                           nextOp);
+                      if (needsGpuLock(nextOp)) {
+                        gpuOperatorHook.lock();
+                      }
                       CALL_OPERATOR(
                           nextOp->noMoreInput(),
                           nextOp,
                           curOperatorId_ + 1,
                           kOpMethodNoMoreInput);
+                      if (needsGpuLock(nextOp)) {
+                        gpuOperatorHook.unlock();
+                      }
                     });
                 break;
               }

@@ -342,8 +342,24 @@ struct PushdownFilters {
 using PipelinePushdownFilters =
     std::vector<folly::Synchronized<PushdownFilters>>;
 
+/// Hook for GPU concurrency control on cuDF operators.
+/// When set, the Driver calls shouldLock(op) before each
+/// getOutput/addInput/noMoreInput; if true, it calls lock()
+/// before and unlock() after the operator method.
+struct GpuOperatorHook {
+  using ShouldLockFn = bool (*)(Operator*);
+  using LockFn = void (*)();
+  using UnlockFn = void (*)();
+
+  ShouldLockFn shouldLock{nullptr};
+  LockFn lock{nullptr};
+  UnlockFn unlock{nullptr};
+};
+
 class Driver : public std::enable_shared_from_this<Driver> {
  public:
+  static void setGpuOperatorHook(GpuOperatorHook hook);
+
   static void enqueue(std::shared_ptr<Driver> instance);
 
   /// Run the pipeline until it produces a batch of data or gets blocked.
