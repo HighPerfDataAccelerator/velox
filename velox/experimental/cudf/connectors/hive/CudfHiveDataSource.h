@@ -18,6 +18,7 @@
 
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConfig.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConnectorSplit.h"
+#include "velox/experimental/cudf/exec/GpuTimer.h"
 #include "velox/experimental/cudf/exec/NvtxHelper.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
 
@@ -170,6 +171,7 @@ class CudfHiveDataSource : public DataSource, public NvtxHelper {
 
   dwio::common::RuntimeStatistics runtimeStats_;
   std::atomic<uint64_t> totalRemainingFilterTime_{0};
+  cudf_velox::GpuTimer gpuTimer_;
 
   // Create callback data for total scan timing calculation
   struct TotalScanTimeCallbackData {
@@ -204,6 +206,11 @@ class CudfHiveDataSource : public DataSource, public NvtxHelper {
     size_t fileSize;
     uint64_t start;
     uint64_t length;
+    // Prevents the ReadFile from being destroyed on the IO executor
+    // thread.  HDFS files close via JNI; keeping the shared_ptr here
+    // ensures the file handle outlives the async read and is destroyed
+    // on the calling thread (when asyncFileReads_ is cleared).
+    std::shared_ptr<ReadFile> readFile;
   };
   std::vector<AsyncFileRead> asyncFileReads_;
 

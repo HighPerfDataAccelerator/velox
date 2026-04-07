@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "velox/experimental/cudf/exec/GpuTimer.h"
 #include "velox/experimental/cudf/exec/NvtxHelper.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
@@ -61,6 +62,13 @@ class CudfFilterProject : public exec::Operator, public NvtxHelper {
   bool isFinished() override;
 
   void close() override {
+    auto gpuNs = gpuTimer_.totalNanos();
+    if (gpuNs > 0) {
+      auto lockedStats = stats_.wlock();
+      lockedStats->addRuntimeStat(
+          kGpuComputeNanos,
+          RuntimeCounter(gpuNs, RuntimeCounter::Unit::kNanos));
+    }
     Operator::close();
     projectEvaluators_.clear();
     filterEvaluator_.reset();
@@ -90,6 +98,8 @@ class CudfFilterProject : public exec::Operator, public NvtxHelper {
   std::vector<CudfVectorPtr> accumulatedOutputs_;
   int64_t accumulatedOutputRows_{0};
   int64_t accumulatedOutputBytes_{0};
+
+  GpuTimer gpuTimer_;
 };
 
 bool canBeEvaluatedByCudf(

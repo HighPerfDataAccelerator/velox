@@ -51,8 +51,6 @@
 
 #include <cuda_runtime.h>
 
-#include <filesystem>
-#include <fstream>
 #include <future>
 #include <limits>
 #include <memory>
@@ -229,6 +227,7 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
           ? targetBytes
           : std::numeric_limits<int64_t>::max();
       GpuGuard coalescedGpuGuard;
+      gpuTimer_.start(stream_);
       auto coalesceLoopStartUs = getCurrentTimeMicro();
       while (splitReader_->has_next()) {
         auto tableWithMetadata = splitReader_->read_chunk();
@@ -267,6 +266,7 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
           (getCurrentTimeMicro() - coalesceLoopStartUs) * 1000,
           std::memory_order_relaxed);
       auto result = flushAccumulated();
+      gpuTimer_.stop(stream_);
       if (result == nullptr) {
         return nullptr;
       }
@@ -284,6 +284,7 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
       return nullptr;
     }
     gpuGuard.emplace();
+    gpuTimer_.start(stream_);
     auto tableWithMetadata = splitReader_->read_chunk();
     cudfTable = std::move(tableWithMetadata.tbl);
     metadata = std::move(tableWithMetadata.metadata);
@@ -294,6 +295,7 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
         exptSplitReader_, "Experimental cudf split reader not present");
 
     gpuGuard.emplace();
+    gpuTimer_.start(stream_);
     while (true) {
       if (!exptMetadataInitialized_) {
         initExperimentalReaderMetadata();
@@ -349,6 +351,8 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
   }
   totalRemainingFilterTime_.fetch_add(
       filterTimeUs * 1000, std::memory_order_relaxed);
+
+  gpuTimer_.stop(stream_);
 
   // Output RowVectorPtr
   const auto nRows = cudfTable->num_rows();
@@ -462,14 +466,47 @@ void CudfHiveDataSource::addSplit(std::shared_ptr<ConnectorSplit> split) {
                               uint64_t length)
         -> AsyncFileRead {
       auto colNames = readColumnNames_;
-      auto future = std::async(
-          std::launch::async,
-          [path, colNames, start]()
-              -> std::shared_ptr<cudf_velox::PinnedHostBuffer> {
-            return selectiveParquetRead(path, colNames, start);
-          });
-      const auto fsize = std::filesystem::file_size(path);
-      return {future.share(), fsize, start, length};
+      const auto fileHandleKey = FileHandleKey{
+          .filename = path,
+          .tokenProvider = connectorQueryCtx_->fsTokenProvider()};
+      auto fileProperties = FileProperties{};
+      auto fileHandleCachePtr = fileHandleFactory_->generate(
+          fileHandleKey, &fileProperties,
+          ioStats_ ? ioStats_.get() : nullptr);
+      auto readFile = fileHandleCachePtr->file;
+      const auto fsize = readFile->size();
+
+      if (executor_) {
+        // Dispatch onto the IO executor whose threads are JVM-attached,
+        // so HDFS (libhdfs JNI) pread operations work correctly —
+        // unlike std::async threads which are not attached to the JVM.
+        auto promise = std::make_shared<
+            std::promise<std::shared_ptr<cudf_velox::PinnedHostBuffer>>>();
+        auto future = promise->get_future().share();
+
+        // Capture readFile by value (shared_ptr copy) to keep the file
+        // handle alive for the duration of the async read.
+        executor_->add(
+            [promise, readFile, colNames = std::move(colNames), start]() {
+              try {
+                auto buf =
+                    selectiveParquetRead(readFile.get(), colNames, start);
+                promise->set_value(std::move(buf));
+              } catch (...) {
+                promise->set_exception(std::current_exception());
+              }
+            });
+
+        return {std::move(future), fsize, start, length,
+                std::move(readFile)};
+      }
+
+      // Fallback: no executor — run synchronously.
+      auto buf = selectiveParquetRead(readFile.get(), colNames, start);
+      std::promise<std::shared_ptr<cudf_velox::PinnedHostBuffer>> promise;
+      promise.set_value(std::move(buf));
+      return {promise.get_future().share(), fsize, start, length,
+              std::move(readFile)};
     };
 
     auto preReadStartUs = getCurrentTimeMicro();
@@ -689,6 +726,16 @@ CudfHiveDataSource::getRuntimeStats() {
            totalRemainingFilterTime_.load(std::memory_order_relaxed),
            RuntimeCounter::Unit::kNanos)},
   });
+  auto gpuNs = gpuTimer_.totalNanos();
+  LOG(WARNING) << "CudfHiveDataSource::getRuntimeStats() "
+               << "gpuComputeNanos=" << gpuNs
+               << " totalScanTime="
+               << ioStatistics_->totalScanTime();
+  if (gpuNs > 0) {
+    res.emplace(
+        cudf_velox::kGpuComputeNanos,
+        RuntimeMetric(gpuNs, RuntimeCounter::Unit::kNanos));
+  }
   if (numCoalescedBatches_ > 0) {
     res.emplace(
         "numCoalescedBatches", RuntimeMetric(numCoalescedBatches_));

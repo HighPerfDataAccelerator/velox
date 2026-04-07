@@ -17,6 +17,7 @@
 #pragma once
 
 #include "velox/experimental/cudf/exec/NvtxHelper.h"
+#include "velox/experimental/cudf/exec/GpuTimer.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
 #include "velox/exec/Operator.h"
@@ -61,6 +62,7 @@ class CudfOrderBy : public exec::Operator, public NvtxHelper {
   std::vector<cudf::order> columnOrder_;
   std::vector<cudf::null_order> nullOrder_;
   bool finished_{false};
+  GpuTimer gpuTimer_;
 };
 
 } // namespace facebook::velox::cudf_velox

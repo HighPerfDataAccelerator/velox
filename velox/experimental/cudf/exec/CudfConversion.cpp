@@ -200,10 +200,12 @@ RowVectorPtr CudfFromVelox::getOutput() {
 
   auto stream = cudfGlobalStreamPool().get_stream();
 
+  gpuTimer_.start(stream);
   // Batched HtoD: issues N async from_arrow calls, ONE sync, then GPU concat.
   // Avoids the CPU-side mergeRowVectors copy and N separate sync round-trips.
   auto tbl =
       with_arrow::toCudfTableBatched(selectedInputs, selectedInputs[0]->pool(), stream);
+  gpuTimer_.stop(stream);
 
   VELOX_CHECK_NOT_NULL(tbl);
 
@@ -220,6 +222,14 @@ RowVectorPtr CudfFromVelox::getOutput() {
 
 void CudfFromVelox::close() {
   cudf::get_default_stream().synchronize();
+  auto gpuNs = gpuTimer_.totalNanos();
+  if (gpuNs > 0) {
+    auto lockedStats = stats_.wlock();
+    lockedStats->addRuntimeStat(
+        kGpuComputeNanos,
+        RuntimeCounter(
+            static_cast<int64_t>(gpuNs), RuntimeCounter::Unit::kNanos));
+  }
   exec::Operator::close();
   inputs_.clear();
 }
@@ -293,8 +303,10 @@ RowVectorPtr CudfToVelox::getOutput() {
       finished_ = noMoreInput_ && inputs_.empty();
       return nullptr;
     }
+    gpuTimer_.start(stream);
     RowVectorPtr output =
         with_arrow::toVeloxColumn(tableView, pool(), "", stream);
+    gpuTimer_.stop(stream);
     finished_ = noMoreInput_ && inputs_.empty();
     if (output->type()->kindEquals(outputType_)) {
       output->setType(outputType_);
@@ -387,8 +399,10 @@ RowVectorPtr CudfToVelox::getOutput() {
     return nullptr;
   }
 
+  gpuTimer_.start(stream);
   RowVectorPtr output =
       with_arrow::toVeloxColumn(resultTable->view(), pool(), "", stream);
+  gpuTimer_.stop(stream);
   finished_ = noMoreInput_ && inputs_.empty();
   if (output->type()->kindEquals(outputType_)) {
     output->setType(outputType_);
@@ -412,6 +426,14 @@ RowVectorPtr CudfToVelox::getOutput() {
 }
 
 void CudfToVelox::close() {
+  auto gpuNs = gpuTimer_.totalNanos();
+  if (gpuNs > 0) {
+    auto lockedStats = stats_.wlock();
+    lockedStats->addRuntimeStat(
+        kGpuComputeNanos,
+        RuntimeCounter(
+            static_cast<int64_t>(gpuNs), RuntimeCounter::Unit::kNanos));
+  }
   exec::Operator::close();
   inputs_.clear();
 }

@@ -16,6 +16,7 @@
 #pragma once
 
 #include "velox/experimental/cudf/exec/NvtxHelper.h"
+#include "velox/experimental/cudf/exec/GpuTimer.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
 #include "velox/exec/Operator.h"
@@ -63,10 +64,23 @@ class CudfShufflePartition : public exec::Operator, public NvtxHelper {
     return finished_ && output_ == nullptr;
   }
 
+  void close() override {
+    auto gpuNs = gpuTimer_.totalNanos();
+    if (gpuNs > 0) {
+      auto lockedStats = stats_.wlock();
+      lockedStats->addRuntimeStat(
+          kGpuComputeNanos,
+          RuntimeCounter(gpuNs, RuntimeCounter::Unit::kNanos));
+    }
+    Operator::close();
+  }
+
  private:
   const int32_t numPartitions_;
   CudfVectorPtr output_;
   bool finished_ = false;
+
+  GpuTimer gpuTimer_;
 };
 
 } // namespace facebook::velox::cudf_velox

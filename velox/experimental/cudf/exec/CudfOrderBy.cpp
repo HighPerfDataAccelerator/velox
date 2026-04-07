@@ -89,8 +89,10 @@ void CudfOrderBy::noMoreInput() {
 
   auto keys = tbl->view().select(sortKeys_);
   auto values = tbl->view();
+  gpuTimer_.start(stream);
   auto result =
       cudf::sort_by_key(values, keys, columnOrder_, nullOrder_, stream);
+  gpuTimer_.stop(stream);
   auto const size = result->num_rows();
   outputTable_ = std::make_shared<CudfVector>(
       pool(), outputType_, size, std::move(result), stream);
@@ -105,6 +107,13 @@ RowVectorPtr CudfOrderBy::getOutput() {
 }
 
 void CudfOrderBy::close() {
+  auto gpuNs = gpuTimer_.totalNanos();
+  if (gpuNs > 0) {
+    auto lockedStats = stats_.wlock();
+    lockedStats->addRuntimeStat(
+        kGpuComputeNanos,
+        RuntimeCounter(gpuNs, RuntimeCounter::Unit::kNanos));
+  }
   exec::Operator::close();
   // Release stored inputs
   // Release cudf memory resources

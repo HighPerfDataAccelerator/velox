@@ -53,6 +53,13 @@
 namespace facebook::velox::cudf_velox {
 
 void CudfHashJoinProbe::close() {
+  auto gpuNs = gpuTimer_.totalNanos();
+  if (gpuNs > 0) {
+    auto lockedStats = stats_.wlock();
+    lockedStats->addRuntimeStat(
+        kGpuComputeNanos,
+        RuntimeCounter(gpuNs, RuntimeCounter::Unit::kNanos));
+  }
   Operator::close();
   filterEvaluator_.reset();
   scalars_.clear();
@@ -1254,6 +1261,8 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
     }
   }
 
+  gpuTimer_.start(stream);
+
   std::vector<std::unique_ptr<cudf::table>> cudfOutputs;
   switch (joinNode_->joinType()) {
     case core::JoinType::kInner:
@@ -1277,6 +1286,8 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
     default:
       VELOX_FAIL("Unsupported join type: ", joinNode_->joinType());
   }
+
+  gpuTimer_.stop(stream);
 
   // Release input CudfVector to free GPU memory before creating output.
   // This reduces peak memory from (input + output) to max(input, output).

@@ -33,6 +33,10 @@
 #include <unordered_map>
 #include <vector>
 
+namespace facebook::velox {
+class ReadFile;
+} // namespace facebook::velox
+
 namespace facebook::velox::cudf_velox {
 class PinnedHostBuffer;
 } // namespace facebook::velox::cudf_velox
@@ -153,9 +157,10 @@ makeDataSourcesFromSourceInfo(
 /// reconstruct a compact valid Parquet buffer in pinned host memory.
 /// Falls back to reading the full file if readColumnNames is empty,
 /// splitStart > 0 (sub-file splits), or selective read would not save IO.
+/// Uses the Velox ReadFile abstraction, supporting local, HDFS, S3, etc.
 std::shared_ptr<facebook::velox::cudf_velox::PinnedHostBuffer>
 selectiveParquetRead(
-    const std::string& filePath,
+    facebook::velox::ReadFile* readFile,
     const std::vector<std::string>& readColumnNames,
     uint64_t splitStart = 0);
 
