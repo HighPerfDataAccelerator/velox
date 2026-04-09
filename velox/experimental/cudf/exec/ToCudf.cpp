@@ -222,9 +222,9 @@ bool CompileState::compile(bool allowCpuFallback) {
     }
     if (thisOpProps.producesGpuOutput and
         (nextOperatorIsNotGpu or isLastOperatorOfTask) and planNode) {
-      const bool skipForExternalGpu = isLastOperatorOfTask &&
-          ctx->queryConfig().get<bool>(
+      const bool skipCfg = ctx->queryConfig().get<bool>(
               CudfConfig::kCudfSkipOutputToVelox, false);
+      const bool skipForExternalGpu = isLastOperatorOfTask && skipCfg;
       if (!skipForExternalGpu) {
         replaceOp.push_back(
             std::make_unique<CudfToVelox>(
@@ -305,9 +305,9 @@ struct CudfDriverAdapter {
 
   // Call operator needed by DriverAdapter
   bool operator()(const exec::DriverFactory& factory, exec::Driver& driver) {
-    if (!driver.driverCtx()->queryConfig().get<bool>(
-            CudfConfig::kCudfEnabled, CudfConfig::getInstance().enabled) &&
-        allowCpuFallback_) {
+    bool cudfEnabled = driver.driverCtx()->queryConfig().get<bool>(
+            CudfConfig::kCudfEnabled, CudfConfig::getInstance().enabled);
+    if (!cudfEnabled && allowCpuFallback_) {
       return false;
     }
     auto state = CompileState(factory, driver);
