@@ -16,6 +16,7 @@
 
 #include "velox/experimental/cudf/exec/PinnedArrowInterop.h"
 #include "velox/experimental/cudf/exec/PinnedHostMemory.h"
+#include "velox/experimental/cudf/exec/SyncWait.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 
@@ -320,7 +321,7 @@ std::unique_ptr<cudf::table> toCudfTable(
     facebook::velox::memory::MemoryPool* pool,
     rmm::cuda_stream_view stream) {
   auto async = toCudfTableNoSync(veloxTable, pool, stream);
-  stream.synchronize();
+  synchronizeStreamAndRecord(stream);
   async.releaseArrow();
   return std::move(async.table);
 }
@@ -359,7 +360,7 @@ std::unique_ptr<cudf::table> toCudfTableBatched(
   // and reads from the source table device buffers. Without this sync, the
   // source tables' GPU memory could be freed (when `pending` goes out of
   // scope) while the concatenation kernel is still reading from them.
-  stream.synchronize();
+  synchronizeStreamAndRecord(stream);
 
   for (auto& p : pending) {
     p.releaseArrow();

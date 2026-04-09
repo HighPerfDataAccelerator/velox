@@ -17,6 +17,7 @@
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/CudfFilterProject.h"
 #include "velox/experimental/cudf/exec/GpuGuard.h"
+#include "velox/experimental/cudf/exec/SyncWait.h"
 #include "velox/experimental/cudf/exec/GpuTimer.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
@@ -280,9 +281,8 @@ RowVectorPtr CudfFilterProject::getOutput() {
   auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input_);
   VELOX_CHECK_NOT_NULL(cudfInput);
   auto stream = cudfInput->stream();
-  auto inputTableColumns = cudfInput->release()->release();
-
   gpuTimer_.start(stream);
+  auto inputTableColumns = cudfInput->release()->release();
 
   if (hasFilter_) {
     filter(inputTableColumns, stream);
@@ -367,11 +367,13 @@ RowVectorPtr CudfFilterProject::flushAccumulatedOutputs() {
   for (auto& out : accumulatedOutputs_) {
     tableViews.push_back(out->getTableView());
     if (out->stream() != stream) {
-      out->stream().synchronize();
+      synchronizeStreamAndRecord(out->stream());
     }
   }
+  gpuTimer_.start(stream);
   auto concatenated = cudf::concatenate(tableViews, stream);
-  stream.synchronize();
+  synchronizeStreamAndRecord(stream);
+  gpuTimer_.stop(stream);
 
   auto pool = accumulatedOutputs_[0]->pool();
   auto totalRows = accumulatedOutputRows_;

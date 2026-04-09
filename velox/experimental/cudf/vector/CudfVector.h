@@ -55,6 +55,18 @@ class CudfVector : public RowVector {
       std::unique_ptr<cudf::packed_table>&& packedTable,
       rmm::cuda_stream_view stream);
 
+  /// Constructs a CudfVector that borrows a table_view from an
+  /// externally-owned table.  The sourceRef keeps the backing
+  /// cudf::table alive for the lifetime of this CudfVector.
+  /// Zero GPU work — no copy.
+  CudfVector(
+      velox::memory::MemoryPool* pool,
+      TypePtr type,
+      vector_size_t size,
+      cudf::table_view view,
+      std::shared_ptr<cudf::table> sourceRef,
+      rmm::cuda_stream_view stream);
+
   rmm::cuda_stream_view stream() const {
     return stream_;
   }
@@ -71,11 +83,12 @@ class CudfVector : public RowVector {
   uint64_t estimateFlatSize() const override;
 
  private:
-  // Storage for either an owned table or packed table.
-  // Only one is active at a time - using variant enforces this at compile time.
+  // Storage for owned table, packed table, or borrowed reference.
+  // Only one is active at a time.
   using TableStorage = std::variant<
       std::unique_ptr<cudf::table>,
-      std::unique_ptr<cudf::packed_table>>;
+      std::unique_ptr<cudf::packed_table>,
+      std::shared_ptr<cudf::table>>;
   TableStorage tableStorage_;
 
   // Table view - always valid, points to either table_->view() or

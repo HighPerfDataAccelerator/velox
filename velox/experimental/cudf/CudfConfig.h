@@ -50,6 +50,8 @@ struct CudfConfig {
       "velox.cudf.skip_output_to_velox"};
   static constexpr const char* kCudfGpuTargetBatchBytes{
       "cudf.gpu_target_batch_bytes"};
+  static constexpr const char* kCudfProfilingSync{
+      "cudf.profiling_sync"};
 
   /// Singleton CudfConfig instance.
   /// Clients must set the configs below before invoking registerCudf().
@@ -128,6 +130,12 @@ struct CudfConfig {
   /// number of rows already consumes significant memory.
   /// Default 2 GiB.  Set to 0 to fall back to row-based accumulation.
   int64_t gpuTargetBatchBytes{2LL * 1024 * 1024 * 1024};
+
+  /// When true, force cudaDeviceSynchronize() after each GPU operator
+  /// method (getOutput, addInput, noMoreInput). This serializes GPU work
+  /// per operator so that wall_time - gpu_event_time accurately reflects
+  /// non-GPU overhead. Kills CPU-GPU pipelining; use for profiling only.
+  bool profilingSync{false};
 };
 
 } // namespace facebook::velox::cudf_velox

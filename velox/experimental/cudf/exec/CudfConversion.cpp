@@ -18,6 +18,7 @@
 #include "velox/experimental/cudf/exec/CudfConversion.h"
 #include "velox/experimental/cudf/exec/GpuGuard.h"
 #include "velox/experimental/cudf/exec/NvtxHelper.h"
+#include "velox/experimental/cudf/exec/SyncWait.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
@@ -221,7 +222,7 @@ RowVectorPtr CudfFromVelox::getOutput() {
 }
 
 void CudfFromVelox::close() {
-  cudf::get_default_stream().synchronize();
+  synchronizeStreamAndRecord(cudf::get_default_stream());
   auto gpuNs = gpuTimer_.totalNanos();
   if (gpuNs > 0) {
     auto lockedStats = stats_.wlock();
@@ -370,7 +371,7 @@ RowVectorPtr CudfToVelox::getOutput() {
       // async on `stream` and read from the original input's device buffers.
       // Without this, the original's GPU memory may be freed (when `input` is
       // reassigned below) while the copy kernels are still reading from it.
-      stream.synchronize();
+      synchronizeStreamAndRecord(stream);
 
       // Replace the original input with the second part
       input = std::move(secondPartVector);
@@ -390,16 +391,17 @@ RowVectorPtr CudfToVelox::getOutput() {
   }
 
   // Concatenate the selected tables on the GPU
+  gpuTimer_.start(stream);
   auto resultTable = getConcatenatedTable(selectedInputs, outputType_, stream);
 
   // Convert the concatenated table to a RowVector
   const auto size = resultTable->num_rows();
   VELOX_CHECK_NOT_NULL(resultTable);
   if (size == 0) {
+    gpuTimer_.stop(stream);
     return nullptr;
   }
 
-  gpuTimer_.start(stream);
   RowVectorPtr output =
       with_arrow::toVeloxColumn(resultTable->view(), pool(), "", stream);
   gpuTimer_.stop(stream);

@@ -108,10 +108,22 @@ class CudfHashJoinBuild : public exec::Operator, public NvtxHelper {
 
   bool isFinished() override;
 
+  void close() override {
+    auto gpuNs = gpuTimer_.totalNanos();
+    if (gpuNs > 0) {
+      auto lockedStats = stats_.wlock();
+      lockedStats->addRuntimeStat(
+          kGpuComputeNanos,
+          RuntimeCounter(gpuNs, RuntimeCounter::Unit::kNanos));
+    }
+    Operator::close();
+  }
+
  private:
   std::shared_ptr<const core::HashJoinNode> joinNode_;
   std::vector<CudfVectorPtr> inputs_;
   ContinueFuture future_{ContinueFuture::makeEmpty()};
+  GpuTimer gpuTimer_;
 };
 
 /**

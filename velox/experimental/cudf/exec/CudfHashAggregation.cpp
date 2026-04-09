@@ -18,6 +18,7 @@
 #include "velox/experimental/cudf/exec/CudfFilterProject.h"
 #include "velox/experimental/cudf/exec/CudfHashAggregation.h"
 #include "velox/experimental/cudf/exec/GpuGuard.h"
+#include "velox/experimental/cudf/exec/SyncWait.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 
@@ -44,6 +45,7 @@
 namespace {
 
 using namespace facebook::velox;
+using facebook::velox::cudf_velox::synchronizeStreamAndRecord;
 
 #define DEFINE_SIMPLE_AGGREGATOR(Name, name, KIND)                            \
   struct Name##Aggregator : cudf_velox::CudfHashAggregation::Aggregator {     \
@@ -501,7 +503,7 @@ struct ApproxDistinctAggregator : cudf_velox::CudfHashAggregation::Aggregator {
         stream.value()));
 
     // Sync stream before stack-allocated offsets goes out of scope
-    stream.synchronize();
+    synchronizeStreamAndRecord(stream);
 
     auto offsets_column = std::make_unique<cudf::column>(
         cudf::data_type{cudf::type_id::INT32},
@@ -535,7 +537,7 @@ struct ApproxDistinctAggregator : cudf_velox::CudfHashAggregation::Aggregator {
         num_offsets * sizeof(cudf::size_type),
         cudaMemcpyDeviceToHost,
         stream.value()));
-    stream.synchronize(); // Need host_offsets before proceeding
+    synchronizeStreamAndRecord(stream); // Need host_offsets before proceeding
 
     cudf::size_type first_offset = host_offsets[0];
     cudf::size_type first_size = host_offsets[1] - first_offset;

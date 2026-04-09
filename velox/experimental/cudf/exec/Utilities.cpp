@@ -15,6 +15,7 @@
  */
 
 #include "velox/experimental/cudf/exec/Utilities.h"
+#include "velox/experimental/cudf/exec/SyncWait.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 
 #include <cudf/column/column.hpp>
@@ -258,7 +259,7 @@ std::unique_ptr<cudf::table> getConcatenatedTable(
   // `stream` and the buffers would otherwise be freed on the original stream.
   auto output = cudf::concatenate(
       tableViews, stream, cudf::get_current_device_resource_ref());
-  stream.synchronize();
+  synchronizeStreamAndRecord(stream);
   return output;
 }
 
@@ -323,7 +324,7 @@ std::vector<std::unique_ptr<cudf::table>> getConcatenatedTableBatched(
             stream,
             cudf::get_current_device_resource_ref()));
   }
-  stream.synchronize();
+  synchronizeStreamAndRecord(stream);
   return outputTables;
 }
 

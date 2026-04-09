@@ -79,17 +79,14 @@ void CudfOrderBy::noMoreInput() {
   }
 
   auto stream = cudfGlobalStreamPool().get_stream();
+  gpuTimer_.start(stream);
   auto tbl = getConcatenatedTable(inputs_, outputType_, stream);
-
-  // Release input data after synchronizing
-  stream.synchronize();
   inputs_.clear();
 
   VELOX_CHECK_NOT_NULL(tbl);
 
   auto keys = tbl->view().select(sortKeys_);
   auto values = tbl->view();
-  gpuTimer_.start(stream);
   auto result =
       cudf::sort_by_key(values, keys, columnOrder_, nullOrder_, stream);
   gpuTimer_.stop(stream);

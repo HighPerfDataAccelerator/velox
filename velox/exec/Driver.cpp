@@ -18,6 +18,7 @@
 
 #include "velox/common/process/TraceContext.h"
 #include "velox/exec/Task.h"
+#include "velox/experimental/cudf/exec/SyncWait.h"
 #include "velox/vector/LazyVector.h"
 
 using facebook::velox::common::testutil::TestValue;
@@ -481,12 +482,27 @@ inline bool needsGpuLock(Operator* op) {
       gpuOperatorHook.shouldLock(op);
 }
 
+inline void gpuProfilingSync(Operator* op) {
+  if (FOLLY_UNLIKELY(gpuOperatorHook.profilingSync != nullptr)) {
+    facebook::velox::cudf_velox::CurrentGpuOperatorScope scope(op);
+    facebook::velox::cudf_velox::measureGpuSyncWait([&]() {
+      gpuOperatorHook.profilingSync();
+    });
+  }
+}
+
+inline void gpuLockAndRecord(Operator* op) {
+  gpuOperatorHook.lock();
+}
+
 inline void addInput(Operator* op, const RowVectorPtr& input) {
   if (FOLLY_LIKELY(!op->dryRun())) {
+    facebook::velox::cudf_velox::CurrentGpuOperatorScope scope(op);
     if (FOLLY_UNLIKELY(needsGpuLock(op))) {
-      gpuOperatorHook.lock();
+      gpuLockAndRecord(op);
       op->addInput(input);
       gpuOperatorHook.unlock();
+      gpuProfilingSync(op);
     } else {
       op->addInput(input);
     }
@@ -494,10 +510,12 @@ inline void addInput(Operator* op, const RowVectorPtr& input) {
 }
 
 inline void getOutput(Operator* op, RowVectorPtr& result) {
+  facebook::velox::cudf_velox::CurrentGpuOperatorScope scope(op);
   if (FOLLY_UNLIKELY(needsGpuLock(op))) {
-    gpuOperatorHook.lock();
+    gpuLockAndRecord(op);
     result = op->getOutput();
     gpuOperatorHook.unlock();
+    gpuProfilingSync(op);
   } else {
     result = op->getOutput();
   }
@@ -730,8 +748,10 @@ StopReason Driver::runInternal(
                       TestValue::adjust(
                           "facebook::velox::exec::Driver::runInternal::noMoreInput",
                           nextOp);
+                      facebook::velox::cudf_velox::CurrentGpuOperatorScope
+                          scope(nextOp);
                       if (needsGpuLock(nextOp)) {
-                        gpuOperatorHook.lock();
+                        gpuLockAndRecord(nextOp);
                       }
                       CALL_OPERATOR(
                           nextOp->noMoreInput(),
@@ -740,6 +760,7 @@ StopReason Driver::runInternal(
                           kOpMethodNoMoreInput);
                       if (needsGpuLock(nextOp)) {
                         gpuOperatorHook.unlock();
+                        gpuProfilingSync(nextOp);
                       }
                     });
                 break;

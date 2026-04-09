@@ -16,6 +16,7 @@
 #include "velox/experimental/cudf/CudfQueryConfig.h"
 #include "velox/experimental/cudf/exec/CudfTopN.h"
 #include "velox/experimental/cudf/exec/GpuGuard.h"
+#include "velox/experimental/cudf/exec/SyncWait.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 
 #include <cudf/detail/copy.hpp>
@@ -96,7 +97,7 @@ CudfVectorPtr CudfTopN::mergeTopK(
   // The caller destroys the input batches after we return, freeing those
   // buffers via cudaFreeAsync on the original streams.  Without this sync the
   // frees can race ahead of the reads on `stream`.
-  stream.synchronize();
+  synchronizeStreamAndRecord(stream);
 
   return std::make_shared<CudfVector>(
       topNBatches[0]->pool(),

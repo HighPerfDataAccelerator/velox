@@ -474,12 +474,16 @@ void CudfConfig::initialize(
   if (config.find(kCudfPackedDtoH) != config.end()) {
     packedDtoH = folly::to<bool>(config[kCudfPackedDtoH]);
   }
+  if (config.find(kCudfProfilingSync) != config.end()) {
+    profilingSync = folly::to<bool>(config[kCudfProfilingSync]);
+  }
   LOG(WARNING) << "CudfConfig initialized: gpuTargetBatchRows="
                << gpuTargetBatchRows
                << " gpuTargetBatchBytes=" << gpuTargetBatchBytes
                << " pinnedPoolSize=" << pinnedPoolSize
                << " hostAsPinnedThreshold=" << hostAsPinnedThreshold
-               << " packedDtoH=" << packedDtoH;
+               << " packedDtoH=" << packedDtoH
+               << " profilingSync=" << profilingSync;
 }
 
 } // namespace facebook::velox::cudf_velox

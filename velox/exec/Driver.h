@@ -350,10 +350,17 @@ struct GpuOperatorHook {
   using ShouldLockFn = bool (*)(Operator*);
   using LockFn = void (*)();
   using UnlockFn = void (*)();
+  using SyncFn = void (*)();
 
   ShouldLockFn shouldLock{nullptr};
   LockFn lock{nullptr};
   UnlockFn unlock{nullptr};
+
+  /// When non-null, called after each GPU operator method (getOutput,
+  /// addInput, noMoreInput) to force GPU synchronization. This serializes
+  /// GPU work per operator, ensuring wall time accurately reflects each
+  /// operator's own GPU cost. Intended for profiling only.
+  SyncFn profilingSync{nullptr};
 };
 
 class Driver : public std::enable_shared_from_this<Driver> {

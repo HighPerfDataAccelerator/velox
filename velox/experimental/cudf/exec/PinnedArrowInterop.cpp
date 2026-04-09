@@ -20,6 +20,7 @@
 
 #include "velox/experimental/cudf/exec/PinnedArrowInterop.h"
 #include "velox/experimental/cudf/exec/PinnedHostMemory.h"
+#include "velox/experimental/cudf/exec/SyncWait.h"
 #include "velox/experimental/cudf/CudfConfig.h"
 
 #include <glog/logging.h>
@@ -470,7 +471,7 @@ cudf::unique_device_array_t pinnedToArrowHost(
     stats.fallbackCalls.fetch_add(1, std::memory_order_relaxed);
     stats.fallbackBuffers.fetch_add(bufs, std::memory_order_relaxed);
     copyDeviceBuffersToPinnedHost(&devArray->array, stream);
-    stream.synchronize();
+    synchronizeStreamAndRecord(stream);
     auto calls = stats.fallbackCalls.load(std::memory_order_relaxed);
     if ((calls & (calls - 1)) == 0 || (calls % 500) == 0) {
       stats.dump("legacy");
@@ -495,7 +496,7 @@ cudf::unique_device_array_t pinnedToArrowHost(
         devSize,
         cudaMemcpyDeviceToHost,
         stream.value()));
-    stream.synchronize();
+    synchronizeStreamAndRecord(stream);
 
     auto* raw = new ArrowDeviceArray;
     std::memset(raw, 0, sizeof(ArrowDeviceArray));
@@ -545,7 +546,7 @@ cudf::unique_device_array_t pinnedToArrowHost(
   stats.fallbackCalls.fetch_add(1, std::memory_order_relaxed);
   stats.fallbackBuffers.fetch_add(bufs, std::memory_order_relaxed);
   copyDeviceBuffersToPinnedHost(&devArray->array, stream);
-  stream.synchronize();
+  synchronizeStreamAndRecord(stream);
   auto calls = stats.fallbackCalls.load(std::memory_order_relaxed);
   if ((calls & (calls - 1)) == 0 || (calls % 500) == 0) {
     stats.dump("packed-fallback-to-legacy");

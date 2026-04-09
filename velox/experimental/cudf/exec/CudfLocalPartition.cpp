@@ -16,6 +16,7 @@
 
 #include "velox/experimental/cudf/exec/CudfLocalPartition.h"
 #include "velox/experimental/cudf/exec/GpuGuard.h"
+#include "velox/experimental/cudf/exec/SyncWait.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
 #include "velox/core/PlanNode.h"
@@ -259,7 +260,7 @@ void CudfLocalPartition::addInput(RowVectorPtr input) {
     // this sync, partitionedTable could be freed (end of scope) while the
     // copies are still in flight, causing illegal memory access when using
     // non-stream-ordered memory resources (pool, arena).
-    stream.synchronize();
+    synchronizeStreamAndRecord(stream);
     gpuTimer_.stop(stream);
 
     for (auto& [pid, vec] : partitionVectors) {
