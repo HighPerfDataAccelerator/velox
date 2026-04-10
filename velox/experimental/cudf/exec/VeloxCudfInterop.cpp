@@ -272,11 +272,48 @@ AsyncHtoD toCudfTableNoSync(
     const facebook::velox::RowVectorPtr& veloxTable,
     facebook::velox::memory::MemoryPool* pool,
     rmm::cuda_stream_view stream) {
-  // Flatten nested encodings (e.g. dictionary-of-dictionary) that the Arrow
-  // bridge cannot export.  BaseVector::copy always produces flat output.
-  auto flat = facebook::velox::BaseVector::create<facebook::velox::RowVector>(
-      veloxTable->type(), veloxTable->size(), pool);
-  flat->copy(veloxTable.get(), 0, 0, veloxTable->size());
+  // Flatten nested encodings (e.g. dictionary, constant, RLE) that the Arrow
+  // bridge cannot export.  Handles children whose logical size differs from
+  // the RowVector size (e.g. PrestoVectorSerde may produce undersized backing
+  // vectors for constant or all-null columns in broadcast joins with AQE).
+  auto numRows = veloxTable->size();
+  auto numChildren = veloxTable->childrenSize();
+  std::vector<facebook::velox::VectorPtr> flatChildren(numChildren);
+  for (int i = 0; i < numChildren; ++i) {
+    auto child = veloxTable->childAt(i);
+    if (!child) {
+      continue;
+    }
+    if (child->isFlatEncoding() && child->size() == numRows) {
+      // Already flat with correct size - use as-is.
+      flatChildren[i] = child;
+      continue;
+    }
+    if (child->size() >= numRows) {
+      // Source has enough rows for a direct copy into flat vector.
+      auto target = facebook::velox::BaseVector::create(
+          child->type(), numRows, pool);
+      target->copy(child.get(), 0, 0, numRows);
+      flatChildren[i] = std::move(target);
+      continue;
+    }
+    // Child has fewer rows than the RowVector (constant-encoded or all-null
+    // column from serde).  Re-wrap at the correct size then flatten.
+    auto resized = child->isConstantEncoding()
+        ? facebook::velox::BaseVector::wrapInConstant(numRows, 0, child)
+        : facebook::velox::BaseVector::createNullConstant(
+              child->type(), numRows, pool);
+    auto target = facebook::velox::BaseVector::create(
+        child->type(), numRows, pool);
+    target->copy(resized.get(), 0, 0, numRows);
+    flatChildren[i] = std::move(target);
+  }
+  auto flat = std::make_shared<facebook::velox::RowVector>(
+      pool,
+      veloxTable->type(),
+      veloxTable->nulls(),
+      numRows,
+      std::move(flatChildren));
 
   AsyncHtoD result;
   ArrowOptions arrowOptions{true, true};
