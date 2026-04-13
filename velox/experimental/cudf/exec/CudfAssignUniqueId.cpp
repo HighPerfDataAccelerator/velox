@@ -140,6 +140,13 @@ std::unique_ptr<cudf::column> CudfAssignUniqueId::generateIdColumn(
 
   auto list_sequence = cudf::lists::sequences(
       d_starts_column_view, d_sizes_column_view, stream, mr);
+  // Wait for async operations before starts/sizes vectors and device buffers
+  // go out of scope. The device_buffer constructors at lines 122-125 do async
+  // H2D from the host vectors, and sequences() launches async kernels reading
+  // from d_starts/d_sizes_buffer. Without sync, the RMM pool may recycle the
+  // device memory while kernels are still reading, causing SIGSEGV under
+  // concurrent GPU tasks.
+  stream.synchronize();
   // Discard offsets.
   return std::move(list_sequence->release().children[1]);
 }

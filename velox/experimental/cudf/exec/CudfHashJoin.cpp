@@ -60,6 +60,7 @@ void CudfHashJoinProbe::close() {
         kGpuComputeNanos,
         RuntimeCounter(gpuNs, RuntimeCounter::Unit::kNanos));
   }
+  hashObject_.reset();
   Operator::close();
   filterEvaluator_.reset();
   scalars_.clear();
@@ -168,15 +169,18 @@ void CudfHashJoinBuild::noMoreInput() {
     VLOG(2) << "Calling CudfHashJoinBuild::noMoreInput";
   }
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
-  GpuGuard gpuGuard;
   Operator::noMoreInput();
   std::vector<ContinuePromise> promises;
   std::vector<std::shared_ptr<exec::Driver>> peers;
-  // Only last driver collects all answers
+  // Only last driver collects all answers.
+  // Do NOT hold GpuGuard here — allPeersFinished may set a future and return,
+  // leaving the semaphore held while waiting for peer drivers.
   if (!operatorCtx_->task()->allPeersFinished(
           planNodeId(), operatorCtx_->driver(), &future_, promises, peers)) {
     return;
   }
+  // All peers finished — acquire GPU semaphore for hash table build.
+  GpuGuard gpuGuard;
   // Collect results from peers
   for (auto& peer : peers) {
     auto op = peer->findOperator(planNodeId());
@@ -1114,7 +1118,11 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
     VLOG(2) << "Calling CudfHashJoinProbe::getOutput";
   }
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
-  GpuGuard gpuGuard;
+
+  // GpuGuard is NOT acquired here — it was the root cause of the Q21
+  // deadlock (semaphore held while waiting for shuffle I/O data from
+  // other tasks that themselves need the semaphore for H2D). The guard
+  // is acquired below, only after data is confirmed ready for GPU work.
 
   if (finished_ or !hashObject_.has_value()) {
     return nullptr;
@@ -1170,6 +1178,7 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
     // If no more input, emit unmatched-right rows if needed.
     if (joinNode_->isRightJoin() && noMoreInput_ && !finished_ &&
         isLastDriver_) {
+      GpuGuard gpuGuard;
       auto& rightTables = hashObject_.value().first;
       auto stream = cudfGlobalStreamPool().get_stream();
       std::vector<std::unique_ptr<cudf::table>> toConcat;
@@ -1233,6 +1242,11 @@ RowVectorPtr CudfHashJoinProbe::getOutput() {
     }
     return nullptr;
   }
+
+  // Acquire GPU semaphore now — data is ready, actual GPU join work begins.
+  // This is the Spark Rapids-style pattern: acquire before GPU compute,
+  // hold through the entire join kernel, release when getOutput() returns.
+  GpuGuard gpuGuard;
 
   auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input_);
   VELOX_CHECK_NOT_NULL(cudfInput);

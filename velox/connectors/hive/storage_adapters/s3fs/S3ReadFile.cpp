@@ -19,6 +19,8 @@
 #include "velox/connectors/hive/storage_adapters/s3fs/S3Counters.h"
 #include "velox/connectors/hive/storage_adapters/s3fs/S3Util.h"
 
+#include <algorithm>
+
 #include <aws/core/Aws.h>
 #include <aws/s3/S3Client.h>
 #include <aws/s3/model/GetObjectRequest.h>
@@ -35,6 +37,57 @@ namespace {
 Aws::IOStreamFactory AwsWriteableStreamFactory(void* data, int64_t nbytes) {
   return [=]() { return Aws::New<StringViewStream>("", data, nbytes); };
 }
+
+// A streambuf that scatters sequential bytes into multiple target buffers.
+// Bytes falling in null (gap) ranges are consumed but discarded.
+class ScatterBuf : public std::streambuf {
+ public:
+  explicit ScatterBuf(const std::vector<folly::Range<char*>>& buffers)
+      : buffers_(buffers) {}
+
+ protected:
+  std::streamsize xsputn(const char_type* s, std::streamsize count) override {
+    std::streamsize consumed = 0;
+    while (consumed < count && rangeIdx_ < buffers_.size()) {
+      const auto& range = buffers_[rangeIdx_];
+      auto remaining =
+          static_cast<std::streamsize>(range.size()) - rangePos_;
+      auto n = std::min(remaining, count - consumed);
+      if (range.data()) {
+        ::memcpy(range.data() + rangePos_, s + consumed, n);
+      }
+      consumed += n;
+      rangePos_ += n;
+      if (rangePos_ >= static_cast<std::streamsize>(range.size())) {
+        ++rangeIdx_;
+        rangePos_ = 0;
+      }
+    }
+    return consumed;
+  }
+
+  int_type overflow(int_type ch) override {
+    if (traits_type::eq_int_type(ch, traits_type::eof())) {
+      return traits_type::not_eof(ch);
+    }
+    char_type c = traits_type::to_char_type(ch);
+    return xsputn(&c, 1) == 1 ? ch : traits_type::eof();
+  }
+
+ private:
+  const std::vector<folly::Range<char*>>& buffers_;
+  size_t rangeIdx_ = 0;
+  std::streamsize rangePos_ = 0;
+};
+
+// An iostream wrapping ScatterBuf for use as an Aws::IOStream.
+// Follows the StringViewStream pattern: the streambuf is embedded via
+// multiple inheritance to avoid a separate heap allocation.
+class ScatterStream : ScatterBuf, public std::iostream {
+ public:
+  explicit ScatterStream(const std::vector<folly::Range<char*>>& buffers)
+      : ScatterBuf(buffers), std::iostream(this) {}
+};
 
 } // namespace
 
@@ -96,27 +149,26 @@ class S3ReadFile ::Impl {
       uint64_t offset,
       const std::vector<folly::Range<char*>>& buffers,
       const FileIoContext& context) const {
-    // 'buffers' contains Ranges(data, size)  with some gaps (data = nullptr) in
-    // between. This call must populate the ranges (except gap ranges)
-    // sequentially starting from 'offset'. AWS S3 GetObject does not support
-    // multi-range. AWS S3 also charges by number of read requests and not size.
-    // The idea here is to use a single read spanning all the ranges and then
-    // populate individual ranges. We pre-allocate a buffer to support this.
-    size_t length = 0;
-    for (const auto range : buffers) {
-      length += range.size();
-    }
-    // TODO: allocate from a memory pool
-    std::string result(length, 0);
-    preadInternal(offset, length, static_cast<char*>(result.data()));
-    size_t resultOffset = 0;
-    for (auto range : buffers) {
+    // 'buffers' contains Ranges(data, size) with gaps (data == nullptr).
+    // AWS S3 GetObject does not support multi-range, so we issue a single
+    // GET spanning all ranges.  A ScatterStream writes the response
+    // directly into the caller's buffers, eliminating the temporary
+    // allocation + memcpy that the previous implementation required.
+    size_t totalSpan = 0;
+    size_t bytesNeeded = 0;
+    for (const auto& range : buffers) {
+      totalSpan += range.size();
       if (range.data()) {
-        memcpy(range.data(), &(result.data()[resultOffset]), range.size());
+        bytesNeeded += range.size();
       }
-      resultOffset += range.size();
     }
-    return length;
+    if (bytesNeeded == 0) {
+      return 0;
+    }
+    preadInternal(offset, totalSpan, [&buffers]() {
+      return Aws::New<ScatterStream>("S3ScatterStream", buffers);
+    });
+    return bytesNeeded;
   }
 
   uint64_t size() const {
@@ -130,7 +182,7 @@ class S3ReadFile ::Impl {
   }
 
   bool shouldCoalesce() const {
-    return false;
+    return true;
   }
 
   std::string getName() const {
@@ -138,20 +190,19 @@ class S3ReadFile ::Impl {
   }
 
  private:
-  // The assumption here is that "position" has space for at least "length"
-  // bytes.
-  void preadInternal(uint64_t offset, uint64_t length, char* position) const {
-    // Read the desired range of bytes.
+  // Issues an S3 GET for [offset, offset+length) using the given stream
+  // factory to receive the response body.
+  void preadInternal(
+      uint64_t offset,
+      uint64_t length,
+      Aws::IOStreamFactory streamFactory) const {
     Aws::S3::Model::GetObjectRequest request;
-    Aws::S3::Model::GetObjectResult result;
-
     request.SetBucket(awsString(bucket_));
     request.SetKey(awsString(key_));
     std::stringstream ss;
     ss << "bytes=" << offset << "-" << offset + length - 1;
     request.SetRange(awsString(ss.str()));
-    request.SetResponseStreamFactory(
-        AwsWriteableStreamFactory(position, length));
+    request.SetResponseStreamFactory(std::move(streamFactory));
     RECORD_METRIC_VALUE(kMetricS3ActiveConnections);
     RECORD_METRIC_VALUE(kMetricS3GetObjectCalls);
     auto outcome = client_->GetObject(request);
@@ -163,13 +214,22 @@ class S3ReadFile ::Impl {
     VELOX_CHECK_AWS_OUTCOME(outcome, "Failed to get S3 object", bucket_, key_);
   }
 
+  // Convenience overload: reads into a pre-allocated contiguous buffer.
+  void preadInternal(uint64_t offset, uint64_t length, char* position) const {
+    preadInternal(offset, length, AwsWriteableStreamFactory(position, length));
+  }
+
   Aws::S3::S3Client* client_;
   std::string bucket_;
   std::string key_;
   int64_t length_ = -1;
 };
 
-S3ReadFile::S3ReadFile(std::string_view path, Aws::S3::S3Client* client) {
+S3ReadFile::S3ReadFile(
+    std::string_view path,
+    Aws::S3::S3Client* client,
+    folly::Executor* executor)
+    : executor_(executor) {
   impl_ = std::make_shared<Impl>(path, client);
 }
 
@@ -199,6 +259,35 @@ uint64_t S3ReadFile::preadv(
     const std::vector<folly::Range<char*>>& buffers,
     const FileIoContext& context) const {
   return impl_->preadv(offset, buffers, context);
+}
+
+folly::SemiFuture<uint64_t> S3ReadFile::preadvAsync(
+    uint64_t offset,
+    const std::vector<folly::Range<char*>>& buffers,
+    const FileIoContext& context) const {
+  if (!executor_) {
+    return ReadFile::preadvAsync(offset, buffers, context);
+  }
+  auto impl = impl_; // prevent Impl destruction while async in-flight
+  auto [promise, future] = folly::makePromiseContract<uint64_t>();
+  executor_->add([impl,
+                  _promise = std::move(promise),
+                  _offset = offset,
+                  _buffers = buffers,
+                  _context = context]() mutable {
+    try {
+      auto result = impl->preadv(_offset, _buffers, _context);
+      _promise.setValue(result);
+    } catch (...) {
+      _promise.setException(
+          folly::exception_wrapper(std::current_exception()));
+    }
+  });
+  return std::move(future);
+}
+
+bool S3ReadFile::hasPreadvAsync() const {
+  return executor_ != nullptr;
 }
 
 uint64_t S3ReadFile::size() const {

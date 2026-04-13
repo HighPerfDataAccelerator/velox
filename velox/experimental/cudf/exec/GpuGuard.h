@@ -23,10 +23,27 @@ void unlockGpu();
 
 namespace facebook::velox::cudf_velox {
 
-/// RAII guard that limits concurrent GPU usage across Velox pipeline tasks.
-/// Forwards to gluten::lockGpu / unlockGpu which are ref-counted per thread.
+/// Pipeline-level GPU region — thread-local boolean.
+///
+/// beginGpuRegion() is idempotent: first call acquires the semaphore,
+/// subsequent calls are no-ops. endGpuRegion() releases once.
+/// This lets the semaphore span an entire pipeline iteration [H2D, D2H]
+/// even when accumulating operators cause the source to be called N times
+/// before the sink produces output.
+void beginGpuRegion();
+void endGpuRegion();
+bool isInGpuRegion();
+
+/// RAII guard for GPU work. Automatically starts a GPU region on
+/// construction (idempotent — only the first GpuGuard in a pipeline
+/// iteration actually acquires the semaphore). The nested lockGpu/unlockGpu
+/// keeps refcount > 0 so the semaphore is never released between operators.
+///
+/// The region is ended explicitly by calling endGpuRegion() at D2H points
+/// (CudfToVelox, HashJoinBuild::addInput, etc.), NOT by ~GpuGuard.
 struct GpuGuard {
   GpuGuard() {
+    beginGpuRegion();
     gluten::lockGpu();
   }
   ~GpuGuard() {

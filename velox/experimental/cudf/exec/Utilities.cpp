@@ -28,6 +28,7 @@
 #include <cudf/utilities/error.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/prefetch.hpp>
+#include <cuda_runtime.h>
 
 #include <rmm/mr/arena_memory_resource.hpp>
 #include <rmm/mr/cuda_async_managed_memory_resource.hpp>
@@ -44,11 +45,18 @@
 #include <cstdlib>
 #include <limits>
 #include <memory>
+#include <sstream>
 #include <string_view>
+
+namespace gluten {
+std::string gpuMemoryTrackerBreakdownString(uint64_t visiblePayloadBytes)
+    __attribute__((weak));
+}
 
 namespace facebook::velox::cudf_velox {
 
 namespace {
+
 /// \brief Makes a cuda resource
 [[nodiscard]] auto makeCudaMr() {
   return std::make_shared<rmm::mr::cuda_memory_resource>();
@@ -167,16 +175,54 @@ uint64_t estimateColumnViewBytes(cudf::column_view const& col) {
 }
 } // namespace
 
-uint64_t estimateTableBytes(std::unique_ptr<cudf::table>& table) {
-  if (!table || table->num_columns() == 0 || table->num_rows() == 0) {
+uint64_t estimateTableBytes(cudf::table_view const& table) {
+  if (table.num_columns() == 0 || table.num_rows() == 0) {
     return 0;
   }
   uint64_t totalBytes = 0;
-  auto view = table->view();
-  for (int i = 0; i < view.num_columns(); ++i) {
-    totalBytes += estimateColumnViewBytes(view.column(i));
+  for (int i = 0; i < table.num_columns(); ++i) {
+    totalBytes += estimateColumnViewBytes(table.column(i));
   }
   return totalBytes;
+}
+
+uint64_t estimateTableBytes(std::unique_ptr<cudf::table>& table) {
+  if (!table) {
+    return 0;
+  }
+  return estimateTableBytes(table->view());
+}
+
+std::string gpuMemorySnapshotString() {
+  size_t freeMem = 0;
+  size_t totalMem = 0;
+  auto err = cudaMemGetInfo(&freeMem, &totalMem);
+  if (err != cudaSuccess) {
+    cudaGetLastError();
+    std::ostringstream out;
+    out << "gpuMem{error=" << cudaGetErrorString(err) << "}";
+    return out.str();
+  }
+
+  const auto usedMem = totalMem >= freeMem ? totalMem - freeMem : 0;
+  std::ostringstream out;
+  out << "gpuMem{free=" << succinctBytes(freeMem)
+      << ", used=" << succinctBytes(usedMem)
+      << ", total=" << succinctBytes(totalMem) << "}";
+  return out.str();
+}
+
+std::string gpuMemoryBreakdownString(uint64_t visiblePayloadBytes) {
+  std::ostringstream out;
+  out << gpuMemorySnapshotString();
+  if (gluten::gpuMemoryTrackerBreakdownString != nullptr) {
+    auto trackerBreakdown =
+        gluten::gpuMemoryTrackerBreakdownString(visiblePayloadBytes);
+    if (!trackerBreakdown.empty()) {
+      out << ", " << trackerBreakdown;
+    }
+  }
+  return out.str();
 }
 
 std::unique_ptr<cudf::table> concatenateTables(
@@ -195,8 +241,12 @@ std::unique_ptr<cudf::table> concatenateTables(
       tables.end(),
       std::back_inserter(tableViews),
       [&](const auto& tbl) { return tbl->view(); });
-  return cudf::concatenate(
+  auto result = cudf::concatenate(
       tableViews, stream, cudf::get_current_device_resource_ref());
+  // Sync before source tables go out of scope — cudf::concatenate reads
+  // from tableViews asynchronously, and RMM pool deallocate is immediate.
+  stream.synchronize();
+  return result;
 }
 
 std::unique_ptr<cudf::table> makeEmptyTable(TypePtr const& inputType) {

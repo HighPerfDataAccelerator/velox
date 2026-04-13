@@ -25,6 +25,7 @@
 #include <rmm/mr/device_memory_resource.hpp>
 
 #include <memory>
+#include <string>
 #include <string_view>
 
 namespace facebook::velox::cudf_velox {
@@ -93,8 +94,20 @@ getConcatenatedTableBatched(
 /// does not require releasing or copying the table.  It may slightly
 /// undercount for nested types (LIST, STRUCT with children) but is
 /// accurate enough for coalescing decisions.
+[[nodiscard]] uint64_t estimateTableBytes(cudf::table_view const& table);
+
+/// Estimates the total memory size of a cudf table by summing per-column
+/// data + null-mask buffer sizes for an owned table.
 [[nodiscard]] uint64_t estimateTableBytes(
     std::unique_ptr<cudf::table>& table);
+
+/// Returns a compact snapshot of current device memory reported by CUDA.
+/// This reflects actual device pressure and complements table-size estimates.
+[[nodiscard]] std::string gpuMemorySnapshotString();
+
+/// Returns a snapshot that combines actual device pressure with allocator-side
+/// live / retained proxies for a known visible payload.
+[[nodiscard]] std::string gpuMemoryBreakdownString(uint64_t visiblePayloadBytes);
 
 /**
  * @brief Wrapper for CUDA events used for stream synchronization.

@@ -19,9 +19,11 @@
 #include "velox/experimental/cudf/exec/GpuGuard.h"
 #include "velox/experimental/cudf/exec/GpuTimer.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
+#include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
+#include "velox/common/base/Exceptions.h"
 #include "velox/common/memory/Memory.h"
 #include "velox/expression/Expr.h"
 #include "velox/expression/FieldReference.h"
@@ -258,88 +260,122 @@ void CudfFilterProject::addInput(RowVectorPtr input) {
 
 RowVectorPtr CudfFilterProject::getOutput() {
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
+  const bool debugEnabled = CudfConfig::getInstance().debugEnabled;
+  uint64_t inputBytes = 0;
+  uint64_t outputBytes = 0;
+  vector_size_t inputRows = 0;
+  vector_size_t outputRows = 0;
   GpuGuard gpuGuard;
+  std::cerr << "GPU_MEM_SNAPSHOT [filterProject-entry] "
+               << gpuMemorySnapshotString()
+               << std::endl;
 
-  if (allInputProcessed()) {
-    if (!hasFilter_) {
+  try {
+    if (allInputProcessed()) {
+      if (!hasFilter_) {
+        return nullptr;
+      }
+      if (!accumulatedOutputs_.empty() && noMoreInput_) {
+        return flushAccumulatedOutputs();
+      }
       return nullptr;
     }
-    if (!accumulatedOutputs_.empty() && noMoreInput_) {
-      return flushAccumulatedOutputs();
+    if (input_->size() == 0) {
+      input_.reset();
+      if (!accumulatedOutputs_.empty() && noMoreInput_) {
+        return flushAccumulatedOutputs();
+      }
+      return nullptr;
     }
-    return nullptr;
-  }
-  if (input_->size() == 0) {
+
+    auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input_);
+    VELOX_CHECK_NOT_NULL(cudfInput);
+    auto stream = cudfInput->stream();
+    inputBytes = cudfInput->estimateFlatSize();
+    inputRows = cudfInput->size();
+    if (debugEnabled) {
+      LOG(INFO) << "CudfFilterProject::getOutput start: inputRows=" << inputRows
+                << ", inputBytes=" << succinctBytes(inputBytes)
+                << ", " << gpuMemorySnapshotString();
+    }
+    auto inputTableColumns = cudfInput->release()->release();
+
+    gpuTimer_.start(stream);
+
+    if (hasFilter_) {
+      filter(inputTableColumns, stream);
+    }
+    auto outputColumns = project(inputTableColumns, stream);
+
+    gpuTimer_.stop(stream);
+
+    auto outputTable = std::make_unique<cudf::table>(std::move(outputColumns));
+    auto const numColumns = outputTable->num_columns();
+    auto const size = outputTable->num_rows();
+    outputRows = size;
+    outputBytes = estimateTableBytes(outputTable);
+    if (debugEnabled) {
+      LOG(INFO) << "CudfFilterProject::getOutput produced: rows=" << size
+                << ", columns=" << numColumns
+                << ", outputBytes=" << succinctBytes(outputBytes)
+                << ", " << gpuMemorySnapshotString();
+    }
+
+    auto pool = input_->pool();
     input_.reset();
-    if (!accumulatedOutputs_.empty() && noMoreInput_) {
+
+    if (numColumns == 0 || size == 0) {
+      if (!accumulatedOutputs_.empty() && noMoreInput_) {
+        return flushAccumulatedOutputs();
+      }
+      return nullptr;
+    }
+
+    auto cudfOutput = std::make_shared<CudfVector>(
+        pool, outputType_, size, std::move(outputTable), stream);
+
+    if (!hasFilter_) {
+      return cudfOutput;
+    }
+
+    auto targetBytes = CudfConfig::getInstance().gpuTargetBatchBytes;
+    auto minRows = CudfConfig::getInstance().gpuTargetBatchRows;
+    if (targetBytes <= 0 && minRows <= 0) {
+      return cudfOutput;
+    }
+
+    accumulatedOutputRows_ += size;
+    accumulatedOutputBytes_ += cudfOutput->estimateFlatSize();
+    accumulatedOutputs_.push_back(std::move(cudfOutput));
+
+    bool thresholdReached;
+    if (targetBytes > 0 && minRows > 0) {
+      thresholdReached =
+          accumulatedOutputBytes_ >= targetBytes ||
+          accumulatedOutputRows_ >= minRows;
+    } else if (targetBytes > 0) {
+      thresholdReached = accumulatedOutputBytes_ >= targetBytes;
+    } else {
+      thresholdReached = accumulatedOutputRows_ >= minRows;
+    }
+    if (thresholdReached) {
       return flushAccumulatedOutputs();
     }
     return nullptr;
+  } catch (const std::exception& e) {
+    LOG(ERROR) << "CudfFilterProject::getOutput failed: " << e.what()
+               << ", hasFilter=" << hasFilter_
+               << ", noMoreInput=" << noMoreInput_
+               << ", inputRows=" << inputRows
+               << ", outputRows=" << outputRows
+               << ", inputBytes=" << succinctBytes(inputBytes)
+               << ", outputBytes=" << succinctBytes(outputBytes)
+               << ", accumulatedOutputBytes="
+               << succinctBytes(accumulatedOutputBytes_)
+               << ", accumulatedOutputs=" << accumulatedOutputs_.size()
+               << ", " << gpuMemorySnapshotString();
+    throw;
   }
-
-  auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input_);
-  VELOX_CHECK_NOT_NULL(cudfInput);
-  auto stream = cudfInput->stream();
-  auto inputTableColumns = cudfInput->release()->release();
-
-  gpuTimer_.start(stream);
-
-  if (hasFilter_) {
-    filter(inputTableColumns, stream);
-  }
-  auto outputColumns = project(inputTableColumns, stream);
-
-  gpuTimer_.stop(stream);
-
-  auto outputTable = std::make_unique<cudf::table>(std::move(outputColumns));
-  auto const numColumns = outputTable->num_columns();
-  auto const size = outputTable->num_rows();
-  if (CudfConfig::getInstance().debugEnabled) {
-    VLOG(1) << "cudfProject Output: " << size << " rows, " << numColumns
-            << " columns";
-  }
-
-  auto pool = input_->pool();
-  input_.reset();
-
-  if (numColumns == 0 || size == 0) {
-    if (!accumulatedOutputs_.empty() && noMoreInput_) {
-      return flushAccumulatedOutputs();
-    }
-    return nullptr;
-  }
-
-  auto cudfOutput = std::make_shared<CudfVector>(
-      pool, outputType_, size, std::move(outputTable), stream);
-
-  if (!hasFilter_) {
-    return cudfOutput;
-  }
-
-  auto targetBytes = CudfConfig::getInstance().gpuTargetBatchBytes;
-  auto minRows = CudfConfig::getInstance().gpuTargetBatchRows;
-  if (targetBytes <= 0 && minRows <= 0) {
-    return cudfOutput;
-  }
-
-  accumulatedOutputRows_ += size;
-  accumulatedOutputBytes_ += cudfOutput->estimateFlatSize();
-  accumulatedOutputs_.push_back(std::move(cudfOutput));
-
-  bool thresholdReached;
-  if (targetBytes > 0 && minRows > 0) {
-    thresholdReached =
-        accumulatedOutputBytes_ >= targetBytes ||
-        accumulatedOutputRows_ >= minRows;
-  } else if (targetBytes > 0) {
-    thresholdReached = accumulatedOutputBytes_ >= targetBytes;
-  } else {
-    thresholdReached = accumulatedOutputRows_ >= minRows;
-  }
-  if (thresholdReached) {
-    return flushAccumulatedOutputs();
-  }
-  return nullptr;
 }
 
 RowVectorPtr CudfFilterProject::flushAccumulatedOutputs() {

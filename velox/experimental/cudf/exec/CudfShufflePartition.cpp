@@ -95,6 +95,12 @@ void CudfShufflePartition::addInput(RowVectorPtr input) {
 
   gpuTimer_.stop(stream);
 
+  // Sync before locals go out of scope — cudf::partition reads from pidCol
+  // and input tableView asynchronously. When addInput() returns, pidCol is
+  // destroyed and cudfVec may be the last reference to the input CudfVector.
+  // RMM pool deallocate is immediate, so device buffers would be freed while
+  // the async partition kernel is still reading.
+  stream.synchronize();
   output_ = std::make_shared<CudfVector>(
       pool(),
       outputType_,

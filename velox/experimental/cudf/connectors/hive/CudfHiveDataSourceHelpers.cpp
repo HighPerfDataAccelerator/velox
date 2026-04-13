@@ -191,6 +191,12 @@ std::future<size_t> BufferedInputDataSource::device_read_async(
                           hostBuffer->size(),
                           cudaMemcpyHostToDevice,
                           stream.value()));
+                      // Wait for the async H2D copy to complete before
+                      // hostBuffer goes out of scope. PinnedHostBuffer uses a
+                      // pool allocator, so freed memory is immediately reusable
+                      // by other threads — the DMA engine would read from
+                      // recycled addresses without this sync.
+                      CUDF_CUDA_TRY(cudaStreamSynchronize(stream.value()));
                       return hostBuffer->size();
                     });
   return toStdFuture(std::move(future));

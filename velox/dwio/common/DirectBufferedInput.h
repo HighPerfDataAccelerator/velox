@@ -171,7 +171,7 @@ class DirectBufferedInput : public BufferedInput {
   bool shouldPreload(int32_t numPages = 0) override;
 
   bool shouldPrefetchStripes() const override {
-    return false;
+    return true;
   }
 
   void setNumStripes(int32_t numStripes) override {

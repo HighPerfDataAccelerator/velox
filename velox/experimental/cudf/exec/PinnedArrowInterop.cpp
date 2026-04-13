@@ -218,11 +218,32 @@ void attachHostBufToArrowBuffer(
 /// `idx` is advanced past the current column and all its children.
 void buildArrowColumnFromPacked(
     const SerializedColumn* meta,
+    size_t metaCount,
     size_t& idx,
     uint8_t* hostBase,
+    size_t hostBufSize,
     const std::shared_ptr<PinnedHostBuffer>& hostBuf,
     ArrowArray* out) {
+  if (idx >= metaCount) {
+    throw std::runtime_error(
+        "buildArrowColumnFromPacked: metadata index " + std::to_string(idx) +
+        " out of bounds (metaCount=" + std::to_string(metaCount) + ")");
+  }
   auto& col = meta[idx++];
+
+  // Validate that a buffer region [offset, offset+size) falls within hostBuf.
+  auto validateBufRange = [&](int64_t offset, int64_t size,
+                              const char* label) {
+    if (offset < 0 ||
+        static_cast<size_t>(offset) + static_cast<size_t>(size) >
+            hostBufSize) {
+      throw std::runtime_error(
+          std::string("buildArrowColumnFromPacked: ") + label +
+          " offset=" + std::to_string(offset) +
+          " size=" + std::to_string(size) +
+          " exceeds hostBufSize=" + std::to_string(hostBufSize));
+    }
+  };
 
   auto typeId = col.type.id();
   bool isString = (typeId == cudf::type_id::STRING);
@@ -234,6 +255,12 @@ void buildArrowColumnFromPacked(
     // Peek at the offsets child to determine offset width.
     CUDF_EXPECTS(
         col.num_children >= 1, "String column must have offsets child");
+    if (idx >= metaCount) {
+      throw std::runtime_error(
+          "buildArrowColumnFromPacked: string offsets child index " +
+          std::to_string(idx) +
+          " out of bounds (metaCount=" + std::to_string(metaCount) + ")");
+    }
     auto& offsetsCol = meta[idx]; // peek, don't advance yet
     bool largeOffsets = (offsetsCol.type.id() == cudf::type_id::INT64);
 
@@ -248,6 +275,7 @@ void buildArrowColumnFromPacked(
       auto* buf = ArrowArrayBuffer(out, 0);
       auto maskBytes =
           static_cast<int64_t>(cudf::bitmask_allocation_size_bytes(col.size));
+      validateBufRange(col.null_mask_offset, maskBytes, "string validity");
       attachHostBufToArrowBuffer(
           buf, hostBuf, hostBase + col.null_mask_offset, maskBytes);
       out->buffers[0] = buf->data;
@@ -265,6 +293,8 @@ void buildArrowColumnFromPacked(
         static_cast<int64_t>(col.size + 1) * offsetElemSize;
     auto* offsetsBuf = ArrowArrayBuffer(out, 1);
     if (offsetsCol.data_offset != -1) {
+      validateBufRange(
+          offsetsCol.data_offset, offsetsBytes, "string offsets");
       attachHostBufToArrowBuffer(
           offsetsBuf,
           hostBuf,
@@ -287,6 +317,7 @@ void buildArrowColumnFromPacked(
 
     auto* charsBuf = ArrowArrayBuffer(out, 2);
     if (col.data_offset != -1 && charsSize > 0) {
+      validateBufRange(col.data_offset, charsSize, "string chars");
       attachHostBufToArrowBuffer(
           charsBuf, hostBuf, hostBase + col.data_offset, charsSize);
     }
@@ -375,6 +406,14 @@ void buildArrowColumnFromPacked(
         arrowType = NANOARROW_TYPE_DECIMAL128;
         elemSize = 16;
         break;
+      case cudf::type_id::STRUCT:
+        arrowType = NANOARROW_TYPE_STRUCT;
+        elemSize = 0; // struct has only validity buffer; children handled below
+        break;
+      case cudf::type_id::LIST:
+        arrowType = NANOARROW_TYPE_LIST;
+        elemSize = 0; // list has validity + int32 offsets; handled below
+        break;
       default:
         arrowType = NANOARROW_TYPE_BINARY;
         elemSize = 0;
@@ -390,6 +429,7 @@ void buildArrowColumnFromPacked(
       auto* buf = ArrowArrayBuffer(out, 0);
       auto maskBytes =
           static_cast<int64_t>(cudf::bitmask_allocation_size_bytes(col.size));
+      validateBufRange(col.null_mask_offset, maskBytes, "validity");
       attachHostBufToArrowBuffer(
           buf, hostBuf, hostBase + col.null_mask_offset, maskBytes);
       out->buffers[0] = buf->data;
@@ -399,15 +439,28 @@ void buildArrowColumnFromPacked(
     if (col.data_offset != -1 && elemSize > 0) {
       auto* buf = ArrowArrayBuffer(out, 1);
       auto dataBytes = static_cast<int64_t>(col.size) * elemSize;
+      validateBufRange(col.data_offset, dataBytes, "data");
       attachHostBufToArrowBuffer(
           buf, hostBuf, hostBase + col.data_offset, dataBytes);
       out->buffers[1] = buf->data;
     } else if (col.data_offset != -1 && arrowType == NANOARROW_TYPE_BOOL) {
+      // cudf::pack stores BOOL8 as 1 byte per element (not bit-packed).
+      // Use the actual byte count from packed data.
       auto* buf = ArrowArrayBuffer(out, 1);
-      auto dataBytes =
-          static_cast<int64_t>(cudf::bitmask_allocation_size_bytes(col.size));
+      auto dataBytes = static_cast<int64_t>(col.size);
+      validateBufRange(col.data_offset, dataBytes, "bool data");
       attachHostBufToArrowBuffer(
           buf, hostBuf, hostBase + col.data_offset, dataBytes);
+      out->buffers[1] = buf->data;
+    } else if (arrowType == NANOARROW_TYPE_LIST && col.data_offset != -1) {
+      // LIST has validity (buf[0], handled above) + int32 offsets (buf[1]).
+      // The offsets buffer has (size + 1) int32 entries.
+      auto* buf = ArrowArrayBuffer(out, 1);
+      auto offsetsBytes =
+          static_cast<int64_t>(col.size + 1) * sizeof(int32_t);
+      validateBufRange(col.data_offset, offsetsBytes, "list offsets");
+      attachHostBufToArrowBuffer(
+          buf, hostBuf, hostBase + col.data_offset, offsetsBytes);
       out->buffers[1] = buf->data;
     }
 
@@ -417,7 +470,8 @@ void buildArrowColumnFromPacked(
           ArrowArrayAllocateChildren(out, col.num_children));
       for (int c = 0; c < col.num_children; ++c) {
         buildArrowColumnFromPacked(
-            meta, idx, hostBase, hostBuf, out->children[c]);
+            meta, metaCount, idx, hostBase, hostBufSize, hostBuf,
+            out->children[c]);
       }
     }
   }
@@ -431,6 +485,8 @@ void buildArrowFromPackedHost(
     int64_t numRows,
     ArrowArray* out) {
   auto* meta = reinterpret_cast<const SerializedColumn*>(metadata.data());
+  size_t metaCount = metadata.size() / sizeof(SerializedColumn);
+  size_t hostBufSize = hostBuf->size();
   // First entry is a stub: size == number of top-level columns
   size_t idx = 1;
 
@@ -442,7 +498,8 @@ void buildArrowFromPackedHost(
 
   for (int c = 0; c < numColumns; ++c) {
     buildArrowColumnFromPacked(
-        meta, idx, hostBuf->data(), hostBuf, out->children[c]);
+        meta, metaCount, idx, hostBuf->data(), hostBufSize, hostBuf,
+        out->children[c]);
   }
 
   NANOARROW_THROW_NOT_OK(ArrowArrayFinishBuilding(

@@ -228,6 +228,10 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
           : std::numeric_limits<int64_t>::max();
       GpuGuard coalescedGpuGuard;
       gpuTimer_.start(stream_);
+      std::cerr << "GPU_MEM_SNAPSHOT [scan-post-GpuGuard] "
+                   << gpuMemorySnapshotString()
+                   << " (coalesced path, GPU lock acquired)"
+                   << std::endl;
       auto coalesceLoopStartUs = getCurrentTimeMicro();
       while (splitReader_->has_next()) {
         auto tableWithMetadata = splitReader_->read_chunk();
@@ -285,7 +289,22 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
     }
     gpuGuard.emplace();
     gpuTimer_.start(stream_);
-    auto tableWithMetadata = splitReader_->read_chunk();
+    std::cerr << "GPU_MEM_SNAPSHOT [scan-post-GpuGuard] "
+                 << gpuMemorySnapshotString()
+                 << " (single-file path, GPU lock acquired)"
+                 << std::endl;
+    auto tableWithMetadata = [&]() {
+      try {
+        return splitReader_->read_chunk();
+      } catch (const std::exception& e) {
+        LOG(ERROR) << "CudfHiveDataSource::next read_chunk failed: "
+                   << e.what()
+                   << ", split=" << split_->filePath
+                   << ", targetBytes=" << succinctBytes(targetBytes)
+                   << ", " << gpuMemoryBreakdownString(0);
+        throw;
+      }
+    }();
     cudfTable = std::move(tableWithMetadata.tbl);
     metadata = std::move(tableWithMetadata.metadata);
   } else {
@@ -1151,6 +1170,10 @@ std::unique_ptr<cudf::table> CudfHiveDataSource::readNextExperimentalBatch(
               byteRange.size(),
               cudaMemcpyHostToDevice,
               stream_.value()));
+          // Sync before hostBuffer goes out of scope — cudaMemcpyAsync
+          // reads from pinned host memory asynchronously, and the pool
+          // allocator recycles the address immediately on free.
+          stream_.synchronize();
         }
       });
 

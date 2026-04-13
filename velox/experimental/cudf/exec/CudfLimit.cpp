@@ -94,6 +94,11 @@ RowVectorPtr CudfLimit::getOutput() {
     if (remainingLimit_ == 0) {
       finished_ = true;
     }
+    // Sync before releasing input — cudf::table() does async deep copy from
+    // slicedTable view which references input's device buffers. RMM pool
+    // deallocate is immediate, so input_.reset() would free memory while the
+    // async copy kernel is still reading.
+    cudfInput->stream().synchronize();
     auto output = std::make_shared<cudf_velox::CudfVector>(
         input_->pool(),
         input_->type(),
@@ -129,6 +134,11 @@ RowVectorPtr CudfLimit::getOutput() {
       cudfInput->stream(),
       cudf::get_current_device_resource_ref());
 
+  // Sync before releasing input — cudf::table() does async deep copy from
+  // slicedTable view which references input's device buffers. RMM pool
+  // deallocate is immediate, so input_.reset() would free memory while the
+  // async copy kernel is still reading.
+  cudfInput->stream().synchronize();
   auto output = std::make_shared<cudf_velox::CudfVector>(
       input_->pool(),
       input_->type(),

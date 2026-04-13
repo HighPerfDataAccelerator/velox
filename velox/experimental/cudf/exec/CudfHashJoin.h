@@ -54,8 +54,6 @@ class CudfExpression;
  */
 class CudfHashJoinBridge : public exec::JoinBridge {
  public:
-  // The bridge transfers all build side batches and the hash join objects
-  // constructed from them to the probe operator
   /** @brief Hash tables paired with their corresponding join objects for
    * batched processing */
   using hash_type = std::pair<
@@ -66,16 +64,12 @@ class CudfHashJoinBridge : public exec::JoinBridge {
 
   std::optional<hash_type> hashOrFuture(ContinueFuture* future);
 
-  // Store and retrieve the CUDA stream used for building the hash join.
   void setBuildStream(rmm::cuda_stream_view buildStream);
 
   std::optional<rmm::cuda_stream_view> getBuildStream();
 
  private:
-  /** @brief Hash tables and join objects transferred from build to probe
-   * operators */
   std::optional<hash_type> hashObject_;
-  /** @brief CUDA stream used by build operator for proper synchronization */
   std::optional<rmm::cuda_stream_view> buildStream_;
 };
 
@@ -211,7 +205,7 @@ class CudfHashJoinProbe : public exec::Operator, public NvtxHelper {
   // hanging problem at the producer side caused by the early query finish.
   bool skipInput_{false};
 
-  /** @brief CUDA stream from build operator for synchronization */
+  /** @brief CUDA stream used during hash table construction */
   std::optional<rmm::cuda_stream_view> buildStream_;
   /** @brief CUDA event for coordinating stream synchronization */
   std::unique_ptr<CudaEvent> cudaEvent_;

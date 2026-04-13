@@ -345,6 +345,12 @@ void registerCudf() {
       mrMode, CudfConfig::getInstance().memoryPercent);
   cudf::set_current_device_resource(mr.get());
   mr_ = mr;
+  {
+    auto snap = cudf_velox::gpuMemorySnapshotString();
+    fprintf(stderr, "GPU_MEM_SNAPSHOT [registerCudf-post-RMM-init] %s mrMode=%s memoryPercent=%d\n",
+            snap.c_str(), mrMode.c_str(), CudfConfig::getInstance().memoryPercent);
+    fflush(stderr);
+  }
 
   // Temporarily lower cudf logger level so pinned pool init is visible.
   cudf::default_logger().set_level(rapids_logger::level_enum::info);
@@ -402,6 +408,11 @@ void registerCudf() {
   }
 
   isCudfRegistered = true;
+  {
+    auto snap = cudf_velox::gpuMemorySnapshotString();
+    fprintf(stderr, "GPU_MEM_SNAPSHOT [registerCudf-complete] %s\n", snap.c_str());
+    fflush(stderr);
+  }
 }
 
 void unregisterCudf() {

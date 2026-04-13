@@ -15,6 +15,7 @@
  */
 
 #include "velox/dwio/common/DirectBufferedInput.h"
+#include <folly/futures/Future.h>
 #include "velox/common/memory/Allocation.h"
 #include "velox/common/process/TraceContext.h"
 #include "velox/common/testutil/TestValue.h"
@@ -326,10 +327,72 @@ std::vector<cache::CachePin> DirectCoalescedLoad::loadData(bool prefetch) {
     size += request.loadSize;
   }
 
+  // Total bytes across all buffers (data + gap ranges).
+  int64_t totalBytes = 0;
+  for (const auto& buf : buffers) {
+    totalBytes += buf.size();
+  }
+
+  constexpr int64_t kParallelReadThreshold = 16 << 20; // 16 MB
+  constexpr int64_t kParallelChunkSize = 8 << 20; // 8 MB per sub-read
+
   uint64_t usecs = 0;
   {
     MicrosecondTimer timer(&usecs);
-    input_->read(buffers, requests_[0].region.offset, LogType::FILE);
+
+    if (totalBytes > kParallelReadThreshold && input_->hasReadAsync()) {
+      // Split the buffer list into chunks and issue parallel sub-reads.
+      const int64_t startOffset = requests_[0].region.offset;
+      std::vector<folly::SemiFuture<uint64_t>> futures;
+
+      int64_t chunkStart = 0; // byte position within the buffer sequence
+      size_t bufIdx = 0; // current index into 'buffers'
+      int64_t bufConsumed = 0; // bytes already consumed in buffers[bufIdx]
+
+      while (chunkStart < totalBytes) {
+        const int64_t chunkEnd =
+            std::min(chunkStart + kParallelChunkSize, totalBytes);
+        int64_t remaining = chunkEnd - chunkStart;
+
+        // Build sub-buffer list for this chunk by slicing the master list.
+        std::vector<folly::Range<char*>> chunkBuffers;
+        while (remaining > 0 && bufIdx < buffers.size()) {
+          const auto& buf = buffers[bufIdx];
+          const int64_t available =
+              static_cast<int64_t>(buf.size()) - bufConsumed;
+          const int64_t take = std::min(remaining, available);
+
+          if (buf.data() == nullptr) {
+            // Gap range — create a null sub-range of 'take' bytes.
+            chunkBuffers.push_back(folly::Range<char*>(
+                nullptr,
+                reinterpret_cast<char*>(static_cast<uint64_t>(take))));
+          } else {
+            chunkBuffers.push_back(
+                folly::Range<char*>(buf.data() + bufConsumed, take));
+          }
+
+          bufConsumed += take;
+          remaining -= take;
+          if (bufConsumed >= static_cast<int64_t>(buf.size())) {
+            ++bufIdx;
+            bufConsumed = 0;
+          }
+        }
+
+        futures.push_back(input_->readAsync(
+            chunkBuffers, startOffset + chunkStart, LogType::FILE));
+        chunkStart = chunkEnd;
+      }
+
+      // Wait for all parallel sub-reads to complete.
+      auto results = folly::collectAll(std::move(futures)).wait().value();
+      for (auto& result : results) {
+        result.throwUnlessValue();
+      }
+    } else {
+      input_->read(buffers, requests_[0].region.offset, LogType::FILE);
+    }
   }
 
   ioStatistics_->read().increment(size + overread);

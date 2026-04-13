@@ -386,11 +386,20 @@ RowVectorPtr toVeloxColumn(
   }
 
   auto arrowSchema = cudf::to_arrow_schema(table, metadata);
-  auto veloxTable = importFromArrowAsOwner(*arrowSchema, arrowArray, pool);
-  auto castedPtr =
-      std::dynamic_pointer_cast<facebook::velox::RowVector>(veloxTable);
-  VELOX_CHECK_NOT_NULL(castedPtr);
-  return castedPtr;
+  try {
+    auto veloxTable = importFromArrowAsOwner(*arrowSchema, arrowArray, pool);
+    auto castedPtr =
+        std::dynamic_pointer_cast<facebook::velox::RowVector>(veloxTable);
+    VELOX_CHECK_NOT_NULL(castedPtr);
+    return castedPtr;
+  } catch (const std::exception& e) {
+    LOG(ERROR) << "importFromArrowAsOwner failed in packed D2H path: "
+               << e.what() << " (table: " << table.num_columns() << " cols, "
+               << table.num_rows() << " rows, arrowArray.length="
+               << arrowArray.length
+               << ", n_children=" << arrowArray.n_children << ")";
+    throw;
+  }
 }
 
 template <typename Iterator>

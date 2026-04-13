@@ -27,7 +27,10 @@ namespace facebook::velox::filesystems {
 /// Implementation of s3 read file.
 class S3ReadFile : public ReadFile {
  public:
-  S3ReadFile(std::string_view path, Aws::S3::S3Client* client);
+  S3ReadFile(
+      std::string_view path,
+      Aws::S3::S3Client* client,
+      folly::Executor* executor = nullptr);
 
   ~S3ReadFile() override;
 
@@ -46,6 +49,13 @@ class S3ReadFile : public ReadFile {
       uint64_t offset,
       const std::vector<folly::Range<char*>>& buffers,
       const FileIoContext& context = {}) const final;
+
+  folly::SemiFuture<uint64_t> preadvAsync(
+      uint64_t offset,
+      const std::vector<folly::Range<char*>>& buffers,
+      const FileIoContext& context = {}) const override;
+
+  bool hasPreadvAsync() const override;
 
   uint64_t size() const final;
 
@@ -66,6 +76,7 @@ class S3ReadFile : public ReadFile {
 
   class Impl;
   std::shared_ptr<Impl> impl_;
+  folly::Executor* executor_ = nullptr;
 };
 
 } // namespace facebook::velox::filesystems
