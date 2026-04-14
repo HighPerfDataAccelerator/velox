@@ -15,6 +15,7 @@
  */
 
 #include "velox/experimental/cudf/CudfConfig.h"
+#include "velox/experimental/cudf/exec/BroadcastHashTableCache.h"
 #include "velox/experimental/cudf/exec/CudfHashJoin.h"
 #include "velox/experimental/cudf/exec/GpuGuard.h"
 #include "velox/experimental/cudf/exec/SyncWait.h"
@@ -247,6 +248,45 @@ void CudfHashJoinBuild::noMoreInput() {
     }
   };
 
+  // Compute cache key for cross-task hash table sharing.
+  // Key = planNodeId + first column's device pointer. With Level 1
+  // broadcast sharing all tasks point to the same GPU data, so keys
+  // match and the hash table is built only once. Non-broadcast joins
+  // have different data per task, so keys differ and each task builds
+  // independently.
+  uintptr_t dataFingerprint = 0;
+  if (!inputs_.empty()) {
+    auto firstView = inputs_[0]->getTableView();
+    if (firstView.num_columns() > 0 && firstView.num_rows() > 0) {
+      dataFingerprint =
+          reinterpret_cast<uintptr_t>(firstView.column(0).head());
+    }
+  }
+  std::string cacheKey =
+      planNodeId() + ":" + std::to_string(dataFingerprint);
+
+  auto& cache = BroadcastHashTableCache::instance();
+  auto cacheResult = cache.acquire(cacheKey);
+
+  auto joinBridge = operatorCtx_->task()->getCustomJoinBridge(
+      operatorCtx_->driverCtx()->splitGroupId, planNodeId());
+  auto cudfHashJoinBridge =
+      std::dynamic_pointer_cast<CudfHashJoinBridge>(joinBridge);
+
+  if (!cacheResult.isLeader && cacheResult.hashTable.has_value()) {
+    // Follower: reuse the shared hash table (tables + hash_join).
+    inputs_.clear();
+    cudfHashJoinBridge->setHashTable(std::move(cacheResult.hashTable));
+    return;
+  }
+
+  // Leader path (or cancelled/failed follower promoted to leader).
+  bool publishToCache = cacheResult.isLeader;
+  std::optional<BroadcastBuildGuard> buildGuard;
+  if (publishToCache) {
+    buildGuard.emplace(cacheKey);
+  }
+
   if (CudfConfig::getInstance().debugEnabled) {
     VLOG(1) << "CudfHashJoinBuild: build batches";
     VLOG(1) << "Build batches number of columns: "
@@ -266,6 +306,7 @@ void CudfHashJoinBuild::noMoreInput() {
   for (auto const& tbl : tbls) {
     VELOX_CHECK_NOT_NULL(tbl);
   }
+
   if (CudfConfig::getInstance().debugEnabled) {
     VLOG(1) << "Build table number of columns: " << tbls[0]->num_columns();
     for (auto i = 0; i < tbls.size(); i++) {
@@ -312,16 +353,23 @@ void CudfHashJoinBuild::noMoreInput() {
   }
   gpuTimer_.stop(stream);
 
+  // Synchronize so the hash table is fully materialized in GPU memory
+  // before followers use it on their own CUDA streams.
+  stream.synchronize();
+
   std::vector<std::shared_ptr<cudf::table>> shared_tbls;
   for (auto& tbl : tbls) {
     shared_tbls.push_back(std::move(tbl));
   }
-  // set hash table to CudfHashJoinBridge
-  auto joinBridge = operatorCtx_->task()->getCustomJoinBridge(
-      operatorCtx_->driverCtx()->splitGroupId, planNodeId());
-  auto cudfHashJoinBridge =
-      std::dynamic_pointer_cast<CudfHashJoinBridge>(joinBridge);
 
+  // Publish to global cache for other tasks (RAII guard disarmed).
+  if (publishToCache) {
+    auto hashResult =
+        std::make_pair(shared_tbls, hashObjects);
+    buildGuard->complete(hashResult);
+  }
+
+  // Set on local bridge for this task's probe operators.
   cudfHashJoinBridge->setBuildStream(stream);
   cudfHashJoinBridge->setHashTable(
       std::make_optional(
