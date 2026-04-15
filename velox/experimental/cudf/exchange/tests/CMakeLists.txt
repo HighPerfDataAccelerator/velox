@@ -12,16 +12,33 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-add_subdirectory(exec)
-add_subdirectory(exchange)
-add_subdirectory(connectors)
-add_subdirectory(vector)
-add_subdirectory(expression)
+add_executable(velox_cudf_exchange_test
+  Main.cpp
+  GpuSerializedPageTest.cc
+  GpuMultiFragmentTest.cc
+  GpuLockStub.cc
+)
 
-if(VELOX_BUILD_TESTING)
-  add_subdirectory(tests)
-endif()
+target_link_libraries(
+  velox_cudf_exchange_test
+  velox_cudf_exchange
+  velox_cudf_vector
+  velox_cudf_exec
+  velox_exec
+  velox_exec_test_lib
+  velox_test_util
+  velox_dwio_dwrf_reader
+  velox_hive_connector
+  gtest
+)
 
-if(VELOX_ENABLE_BENCHMARKS)
-  add_subdirectory(benchmarks)
-endif()
+add_test(
+  NAME velox_cudf_exchange_test
+  COMMAND velox_cudf_exchange_test
+  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+set_tests_properties(
+  velox_cudf_exchange_test
+  PROPERTIES LABELS cuda_driver TIMEOUT 3000
+)
