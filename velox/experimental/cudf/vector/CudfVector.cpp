@@ -107,6 +107,28 @@ CudfVector::CudfVector(
   flatSize_ = 0; // borrowed, don't count towards memory
 }
 
+CudfVector::CudfVector(
+    velox::memory::MemoryPool* pool,
+    TypePtr type,
+    vector_size_t size,
+    cudf::table_view view,
+    std::shared_ptr<rmm::device_buffer> backingBuffer,
+    rmm::cuda_stream_view stream)
+    : RowVector(
+          pool,
+          std::move(type),
+          BufferPtr(nullptr),
+          size,
+          std::vector<VectorPtr>(),
+          std::nullopt),
+      tableStorage_{std::move(backingBuffer)},
+      tabView_{view},
+      stream_{stream} {
+  logDefaultStreamIfNeeded(stream_, "CudfVector(device_buffer)");
+  auto& buf = std::get<std::shared_ptr<rmm::device_buffer>>(tableStorage_);
+  flatSize_ = buf ? buf->size() : 0;
+}
+
 std::unique_ptr<cudf::table> CudfVector::release() {
   flatSize_ = 0;
   if (auto* tablePtr =
@@ -114,8 +136,8 @@ std::unique_ptr<cudf::table> CudfVector::release() {
     // Constructed from owned table - just move it out
     return std::move(*tablePtr);
   }
-  // Constructed from packed_table or borrowed — materialize a table
-  // from the view. This copies the data.
+  // Constructed from packed_table, borrowed table, or device_buffer —
+  // materialize a table from the view. This copies the data.
   auto mr = cudf::get_current_device_resource_ref();
   auto materializedTable = std::make_unique<cudf::table>(tabView_, stream_, mr);
   synchronizeStreamAndRecord(stream_);
@@ -126,6 +148,9 @@ std::unique_ptr<cudf::table> CudfVector::release() {
   } else if (auto* sharedPtr =
                  std::get_if<std::shared_ptr<cudf::table>>(&tableStorage_)) {
     sharedPtr->reset();
+  } else if (auto* bufPtr =
+                 std::get_if<std::shared_ptr<rmm::device_buffer>>(&tableStorage_)) {
+    bufPtr->reset();
   }
   return materializedTable;
 }
