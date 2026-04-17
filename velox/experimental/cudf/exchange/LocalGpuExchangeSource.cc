@@ -68,6 +68,11 @@ class LocalGpuExchangeSource : public exec::ExchangeSource {
   folly::SemiFuture<Response> request(
       uint32_t maxBytes,
       std::chrono::microseconds maxWait) override {
+    LOG(WARNING) << "LocalGpuExchangeSource::request taskId=" << remoteTaskId_
+                 << " destination=" << destination_
+                 << " sequence=" << sequence_
+                 << " maxBytes=" << maxBytes
+                 << " maxWaitUs=" << maxWait.count();
     auto promise = VeloxPromise<Response>("LocalGpuExchangeSource::request");
     auto future = promise.getSemiFuture();
     {
@@ -89,12 +94,17 @@ class LocalGpuExchangeSource : public exec::ExchangeSource {
                               std::vector<std::unique_ptr<folly::IOBuf>> data,
                               int64_t sequence,
                               std::vector<int64_t> remainingBytes) {
+      LOG(WARNING) << "LocalGpuExchangeSource::resultCallback taskId="
+                   << remoteTaskId_ << " destination=" << destination_
+                   << " dataSize=" << data.size()
+                   << " callbackSeq=" << sequence
+                   << " requestedSeq=" << requestedSequence;
       {
         std::lock_guard<std::mutex> l(mutex_);
-        // This function is called either for a result or timeout. Only the
-        // first of these calls has an effect.
         auto iter = timeouts_.find(self);
         if (iter == timeouts_.end()) {
+          LOG(WARNING) << "LocalGpuExchangeSource::resultCallback "
+                       << "DOUBLE-FIRE ignored taskId=" << remoteTaskId_;
           return;
         }
         timeouts_.erase(iter);
@@ -171,8 +181,11 @@ class LocalGpuExchangeSource : public exec::ExchangeSource {
 
     registerTimeout(self, resultCallback, maxWait);
 
-    buffers->getData(
+    auto ok = buffers->getData(
         remoteTaskId_, destination_, maxBytes, sequence_, resultCallback);
+    LOG(WARNING) << "LocalGpuExchangeSource::request getData returned ok="
+                 << ok << " for taskId=" << remoteTaskId_
+                 << " destination=" << destination_;
 
     return future;
   }
@@ -299,6 +312,8 @@ std::shared_ptr<exec::ExchangeSource> createLocalGpuExchangeSource(
     std::shared_ptr<exec::ExchangeQueue> queue,
     memory::MemoryPool* pool) {
   if (strncmp(taskId.c_str(), "gpu-local://", 12) == 0) {
+    LOG(WARNING) << "createLocalGpuExchangeSource creating source taskId="
+                 << taskId << " destination=" << destination;
     return std::make_shared<LocalGpuExchangeSource>(
         taskId, destination, std::move(queue), pool);
   }
