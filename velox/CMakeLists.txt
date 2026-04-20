@@ -71,6 +71,11 @@ if(VELOX_ENABLE_WAVE OR VELOX_ENABLE_CUDF)
   add_subdirectory(experimental/gpu)
   if(${VELOX_ENABLE_CUDF})
     add_subdirectory(experimental/cudf)
+    # ucx-exchange dir is staged but not yet hooked — requires UCX/UCXX libs
+    # in the build container. Enable via VELOX_ENABLE_UCX once UCX is installed.
+    if(${VELOX_ENABLE_UCX})
+      add_subdirectory(experimental/ucx-exchange)
+    endif()
   endif()
   if(${VELOX_ENABLE_WAVE})
     add_subdirectory(experimental/wave)
