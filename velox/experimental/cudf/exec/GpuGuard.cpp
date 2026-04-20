@@ -18,40 +18,36 @@
 #include <iostream>
 #include <thread>
 
+// MPP livelock diagnosis: GpuGuard is bypassed entirely. beginGpuRegion /
+// endGpuRegion are no-ops to prove the lock is a symptom, not the root cause
+// of the MppNativeQueryExec hang on Q1. Symbols are kept exported so other
+// TUs that reference them still link. Stderr markers are compiled out to keep
+// executor logs quiet; flip VELOX_GPUGUARD_TRACE to 1 to re-enable.
+#ifndef VELOX_GPUGUARD_TRACE
+#define VELOX_GPUGUARD_TRACE 0
+#endif
+
 namespace facebook::velox::cudf_velox {
 
-namespace {
-thread_local bool gpuRegionActive = false;
-} // namespace
-
 void beginGpuRegion() {
-  auto tid = std::this_thread::get_id();
-  if (!gpuRegionActive) {
-    std::cerr << "GPU_REGION [begin-acquire] tid=" << tid
-              << " caller=" << __builtin_return_address(0) << std::endl;
-    gluten::lockGpu();
-    gpuRegionActive = true;
-  } else {
-    std::cerr << "GPU_REGION [begin-noop] tid=" << tid
-              << " caller=" << __builtin_return_address(0) << std::endl;
-  }
+  // MPP livelock diagnosis: no-op.
+#if VELOX_GPUGUARD_TRACE
+  std::cerr << "GPU_REGION [begin-bypass] tid="
+            << std::this_thread::get_id() << std::endl;
+#endif
 }
 
 void endGpuRegion() {
-  auto tid = std::this_thread::get_id();
-  if (gpuRegionActive) {
-    gpuRegionActive = false;
-    std::cerr << "GPU_REGION [end-release] tid=" << tid
-              << " caller=" << __builtin_return_address(0) << std::endl;
-    gluten::unlockGpu();
-  } else {
-    std::cerr << "GPU_REGION [end-noop] tid=" << tid
-              << " caller=" << __builtin_return_address(0) << std::endl;
-  }
+  // MPP livelock diagnosis: no-op.
+#if VELOX_GPUGUARD_TRACE
+  std::cerr << "GPU_REGION [end-bypass] tid="
+            << std::this_thread::get_id() << std::endl;
+#endif
 }
 
 bool isInGpuRegion() {
-  return gpuRegionActive;
+  // Reflect the bypass: no region is ever active.
+  return false;
 }
 
 } // namespace facebook::velox::cudf_velox
