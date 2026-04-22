@@ -40,7 +40,7 @@ class GpuExchange : public exec::SourceOperator {
   GpuExchange(
       int32_t operatorId,
       exec::DriverCtx* driverCtx,
-      const std::shared_ptr<const GpuExchangeNode>& gpuExchangeNode,
+      const std::shared_ptr<const core::PlanNode>& planNode,
       std::shared_ptr<exec::ExchangeClient> exchangeClient);
 
   ~GpuExchange() override {

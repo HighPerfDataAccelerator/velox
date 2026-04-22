@@ -29,6 +29,50 @@ using DataAvailableCallback = std::function<void(
     int64_t sequence,
     std::vector<int64_t> remainingBytes)>;
 
+/// Callback variant for OutputBufferManager::getPages(). Hands SerializedPage
+/// objects to the consumer directly without going through getIOBuf(). Used by
+/// in-process GPU exchange paths where the underlying SerializedPage subclass
+/// (e.g. GpuSerializedPage) cannot materialize an IOBuf. Semantics match
+/// DataAvailableCallback (nullptr in pages = end-of-data marker).
+using PagesAvailableCallback = std::function<void(
+    std::vector<std::unique_ptr<SerializedPageBase>> pages,
+    int64_t sequence,
+    std::vector<int64_t> remainingBytes)>;
+
+/// A unique_ptr-compatible SerializedPageBase wrapper that retains a
+/// shared_ptr to an inner page. DestinationBuffer::getPages() uses this to
+/// transfer pages out of its `data_` deque (which stores shared_ptr) into the
+/// unique_ptr-typed return vector without losing shared ownership. Downstream
+/// consumers that need the concrete inner type can call innerShared().
+class SharedSerializedPage : public SerializedPageBase {
+ public:
+  explicit SharedSerializedPage(std::shared_ptr<SerializedPageBase> inner)
+      : inner_(std::move(inner)) {}
+
+  uint64_t size() const override {
+    return inner_->size();
+  }
+  std::optional<int64_t> numRows() const override {
+    return inner_->numRows();
+  }
+  std::unique_ptr<ByteInputStream> prepareStreamForDeserialize() override {
+    return inner_->prepareStreamForDeserialize();
+  }
+  std::unique_ptr<folly::IOBuf> getIOBuf() const override {
+    return inner_->getIOBuf();
+  }
+
+  /// Returns the underlying shared page. Consumers can dynamic_cast this to
+  /// the concrete subclass (e.g. GpuSerializedPage) to access subclass data
+  /// without invoking virtual methods like getIOBuf().
+  const std::shared_ptr<SerializedPageBase>& innerShared() const {
+    return inner_;
+  }
+
+ private:
+  std::shared_ptr<SerializedPageBase> inner_;
+};
+
 /// Callback provided to indicate if the consumer of a destination buffer is
 /// currently active or not. It is used by arbitrary output buffer to optimize
 /// the http based streaming shuffle in Prestissimo. For instance, the arbitrary
@@ -40,14 +84,25 @@ using DataAvailableCallback = std::function<void(
 using DataConsumerActiveCheckCallback = std::function<bool()>;
 
 struct DataAvailable {
+  // IOBuf-path callback + payload. Populated when DestinationBuffer was
+  // waiting on getData().
   DataAvailableCallback callback{nullptr};
-  int64_t sequence{0};
   std::vector<std::unique_ptr<folly::IOBuf>> data;
+
+  // Pages-path callback + payload. Populated when DestinationBuffer was
+  // waiting on getPages() instead (GPU exchange path). Exactly one of
+  // `callback` and `pagesCallback` is non-null on a live notification.
+  PagesAvailableCallback pagesCallback{nullptr};
+  std::vector<std::unique_ptr<SerializedPageBase>> pages;
+
+  int64_t sequence{0};
   std::vector<int64_t> remainingBytes;
 
   void notify() {
     if (callback) {
       callback(std::move(data), sequence, remainingBytes);
+    } else if (pagesCallback) {
+      pagesCallback(std::move(pages), sequence, remainingBytes);
     }
   }
 };
@@ -161,6 +216,30 @@ class DestinationBuffer {
       DataConsumerActiveCheckCallback activeCheck,
       ArbitraryBuffer* arbitraryBuffer = nullptr);
 
+  /// Structural mirror of Data for the getPages path.
+  struct PagesData {
+    /// Pages available at this buffer. Each entry is wrapped in
+    /// SharedSerializedPage to bridge DestinationBuffer's shared_ptr storage
+    /// into the unique_ptr-typed result. nullptr entries are end-of-data
+    /// markers.
+    std::vector<std::unique_ptr<SerializedPageBase>> pages;
+
+    std::vector<int64_t> remainingBytes;
+    bool immediate{false};
+  };
+
+  /// Symmetric to getData() but yields pages directly. Used by consumers that
+  /// cannot accept an IOBuf representation (e.g. GpuSerializedPage whose
+  /// getIOBuf() throws). If there is no data, `notify` is installed and
+  /// invoked when data is added. Only one of notify_/pagesNotify_ is live at
+  /// a time per destination.
+  PagesData getPages(
+      uint64_t maxBytes,
+      int64_t sequence,
+      PagesAvailableCallback notify,
+      DataConsumerActiveCheckCallback activeCheck,
+      ArbitraryBuffer* arbitraryBuffer = nullptr);
+
   /// Removes data from the queue and returns removed data. If 'fromGetData' we
   /// do not give a warning for the case where no data is removed, otherwise we
   /// expect that data does get freed. We cannot assert that data gets deleted
@@ -191,6 +270,9 @@ class DestinationBuffer {
   // The sequence number of the first in 'data_'.
   int64_t sequence_ = 0;
   DataAvailableCallback notify_{nullptr};
+  // Alternate notify slot used by getPages() consumers. Exactly one of
+  // notify_/pagesNotify_ is non-null at a time (we assert this in setters).
+  PagesAvailableCallback pagesNotify_{nullptr};
   DataConsumerActiveCheckCallback aliveCheck_{nullptr};
   // The sequence number of the first item to pass to 'notify'.
   int64_t notifySequence_{0};
@@ -304,6 +386,17 @@ class OutputBuffer {
       uint64_t maxSize,
       int64_t sequence,
       DataAvailableCallback notify,
+      DataConsumerActiveCheckCallback activeCheck);
+
+  /// Pages-variant of getData() that hands SerializedPage objects to `notify`
+  /// directly instead of IOBufs. Used by consumers that cannot accept an IOBuf
+  /// representation (e.g. GPU-resident pages whose getIOBuf() throws). Semantics
+  /// mirror getData() exactly.
+  void getPages(
+      int destination,
+      uint64_t maxBytes,
+      int64_t sequence,
+      PagesAvailableCallback notify,
       DataConsumerActiveCheckCallback activeCheck);
 
   /// Continues any possibly waiting producers. Called when the producer task

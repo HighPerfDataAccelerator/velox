@@ -25,10 +25,13 @@
 #include "velox/experimental/cudf/exec/CudfTopN.h"
 #include "velox/experimental/cudf/exec/OperatorAdapters.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
+#include "velox/experimental/cudf/exchange/GpuExchange.h"
+#include "velox/experimental/cudf/exchange/GpuPartitionedOutput.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
 
 #include "velox/exec/AssignUniqueId.h"
 #include "velox/exec/CallbackSink.h"
+#include "velox/exec/Exchange.h"
 #include "velox/exec/FilterProject.h"
 #include "velox/exec/HashAggregation.h"
 #include "velox/exec/HashBuild.h"
@@ -36,6 +39,7 @@
 #include "velox/exec/Limit.h"
 #include "velox/exec/LocalPartition.h"
 #include "velox/exec/OrderBy.h"
+#include "velox/exec/PartitionedOutput.h"
 #include "velox/exec/StreamingAggregation.h"
 #include "velox/exec/TableScan.h"
 #include "velox/exec/Task.h"
@@ -677,6 +681,116 @@ class CallbackSinkAdapter : public OperatorAdapter {
   }
 };
 
+/// LocalGpuExchangeAdapter - Replaces exec::Exchange with GpuExchange so
+/// same-process, same-GPU inter-task exchanges pass CudfVectors through
+/// (wrapped in GpuSerializedPage) instead of Presto-serializing D2H + H2D.
+///
+/// Gated by the env flag VELOX_CUDF_LOCAL_GPU_EXCHANGE. When disabled,
+/// keepOperator() returns true so ToCudf preserves the stock CPU path.
+class LocalGpuExchangeAdapter : public OperatorAdapter {
+ public:
+  LocalGpuExchangeAdapter() : OperatorAdapter("LocalGpuExchange") {}
+
+  static bool enabled() {
+    static bool value = [] {
+      const char* e = std::getenv("VELOX_CUDF_LOCAL_GPU_EXCHANGE");
+      return e && *e && std::string(e) != "0" && std::string(e) != "false";
+    }();
+    return value;
+  }
+
+  bool canHandle(const exec::Operator* op) const override {
+    return enabled() && dynamic_cast<const exec::Exchange*>(op) != nullptr;
+  }
+
+  bool canRunOnGPU(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* /*ctx*/) const override {
+    return enabled() &&
+        std::dynamic_pointer_cast<const core::ExchangeNode>(planNode) !=
+        nullptr;
+  }
+
+  bool acceptsGpuInput() const override {
+    return false;
+  }
+
+  bool producesGpuOutput() const override {
+    // GpuExchange unwraps CudfVectors from GpuSerializedPage -> CudfVector
+    // (a RowVector subclass); downstream cuDF ops consume it directly.
+    return true;
+  }
+
+  std::vector<std::unique_ptr<exec::Operator>> createReplacements(
+      const exec::Operator* op,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* ctx,
+      int32_t operatorId) const override {
+    std::vector<std::unique_ptr<exec::Operator>> result;
+    // Hand off the already-wired ExchangeClient so the GpuExchange
+    // inherits addRemoteTaskId() / noMoreRemoteTasks() state.
+    auto* exchangeOp =
+        const_cast<exec::Exchange*>(dynamic_cast<const exec::Exchange*>(op));
+    auto client = exchangeOp ? exchangeOp->releaseExchangeClient() : nullptr;
+    result.push_back(
+        std::make_unique<GpuExchange>(operatorId, ctx, planNode, client));
+    return result;
+  }
+
+  bool keepOperator() const override {
+    return !enabled();
+  }
+};
+
+/// LocalGpuPartitionedOutputAdapter - Replaces exec::PartitionedOutput with
+/// GpuPartitionedOutput. Keeps the producer side on GPU so pages enqueued
+/// to OutputBufferManager are GpuSerializedPages wrapping CudfVectors.
+class LocalGpuPartitionedOutputAdapter : public OperatorAdapter {
+ public:
+  LocalGpuPartitionedOutputAdapter()
+      : OperatorAdapter("LocalGpuPartitionedOutput") {}
+
+  bool canHandle(const exec::Operator* op) const override {
+    return LocalGpuExchangeAdapter::enabled() &&
+        dynamic_cast<const exec::PartitionedOutput*>(op) != nullptr;
+  }
+
+  bool canRunOnGPU(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* /*ctx*/) const override {
+    return LocalGpuExchangeAdapter::enabled() &&
+        std::dynamic_pointer_cast<const core::PartitionedOutputNode>(
+               planNode) != nullptr;
+  }
+
+  bool acceptsGpuInput() const override {
+    return true;
+  }
+
+  bool producesGpuOutput() const override {
+    return false;
+  }
+
+  std::vector<std::unique_ptr<exec::Operator>> createReplacements(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* ctx,
+      int32_t operatorId) const override {
+    auto poNode =
+        std::dynamic_pointer_cast<const core::PartitionedOutputNode>(planNode);
+    std::vector<std::unique_ptr<exec::Operator>> result;
+    result.push_back(
+        std::make_unique<GpuPartitionedOutput>(operatorId, ctx, poNode));
+    return result;
+  }
+
+  bool keepOperator() const override {
+    return !LocalGpuExchangeAdapter::enabled();
+  }
+};
+
 /// Registration Function
 void registerAllOperatorAdapters() {
   auto& registry = OperatorAdapterRegistry::getInstance();
@@ -695,6 +809,9 @@ void registerAllOperatorAdapters() {
   registry.registerAdapter(std::make_unique<LimitAdapter>());
   registry.registerAdapter(std::make_unique<LocalPartitionAdapter>());
   registry.registerAdapter(std::make_unique<LocalExchangeAdapter>());
+  registry.registerAdapter(std::make_unique<LocalGpuExchangeAdapter>());
+  registry.registerAdapter(
+      std::make_unique<LocalGpuPartitionedOutputAdapter>());
   registry.registerAdapter(std::make_unique<AssignUniqueIdAdapter>());
   registry.registerAdapter(std::make_unique<ValuesAdapter>());
   registry.registerAdapter(std::make_unique<CallbackSinkAdapter>());

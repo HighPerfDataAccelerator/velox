@@ -64,6 +64,17 @@ class Exchange : public SourceOperator {
 
   bool isFinished() override;
 
+  /// Transfers ownership of the internal ExchangeClient out of this
+  /// operator. Used by the cuDF OperatorAdapter to hand the already-wired
+  /// client (with its remote task ids, etc.) to the GPU-native replacement
+  /// operator before the old Exchange is destroyed. After calling this the
+  /// old Exchange's close() / destructor becomes a no-op on the client.
+  std::shared_ptr<ExchangeClient> releaseExchangeClient() {
+    auto client = std::move(exchangeClient_);
+    exchangeClient_.reset();
+    return client;
+  }
+
  protected:
   virtual VectorSerde* getSerde();
 

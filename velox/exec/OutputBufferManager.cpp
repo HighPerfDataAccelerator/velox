@@ -111,6 +111,20 @@ bool OutputBufferManager::getData(
   return false;
 }
 
+bool OutputBufferManager::getPages(
+    const std::string& taskId,
+    int destination,
+    uint64_t maxBytes,
+    int64_t sequence,
+    PagesAvailableCallback notify,
+    DataConsumerActiveCheckCallback activeCheck) {
+  if (auto buffer = getBufferIfExists(taskId)) {
+    buffer->getPages(destination, maxBytes, sequence, notify, activeCheck);
+    return true;
+  }
+  return false;
+}
+
 void OutputBufferManager::initializeTask(
     std::shared_ptr<Task> task,
     core::PartitionedOutputNode::Kind kind,

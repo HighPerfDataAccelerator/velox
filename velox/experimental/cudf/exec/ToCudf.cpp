@@ -27,6 +27,10 @@
 #include "velox/experimental/cudf/exec/CudfOperator.h"
 #include "velox/experimental/cudf/exec/CudfOrderBy.h"
 #include "velox/experimental/cudf/exec/CudfTopN.h"
+#include "velox/experimental/cudf/exchange/GpuExchange.h"
+#include "velox/experimental/cudf/exchange/GpuExchangeNode.h"
+#include "velox/experimental/cudf/exchange/GpuPartitionedOutput.h"
+#include "velox/experimental/cudf/exchange/GpuPartitionedOutputNode.h"
 #include "velox/experimental/cudf/exec/OperatorAdapters.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
@@ -69,6 +73,52 @@ template <class... Deriveds, class Base>
 bool isAnyOf(const Base* p) {
   return ((dynamic_cast<const Deriveds*>(p) != nullptr) || ...);
 }
+
+/// Translator mapping a GpuPartitionedOutputNode plan node to the
+/// corresponding GpuPartitionedOutput operator. Registered with
+/// exec::Operator so Velox can instantiate the GPU sink for MPP shuffle
+/// without going through the CPU PartitionedOutput path.
+class GpuPartitionedOutputTranslator
+    : public exec::Operator::PlanNodeTranslator {
+ public:
+  std::unique_ptr<exec::Operator> toOperator(
+      exec::DriverCtx* ctx,
+      int32_t id,
+      const core::PlanNodePtr& node) override {
+    if (auto gpo =
+            std::dynamic_pointer_cast<const GpuPartitionedOutputNode>(node)) {
+      return std::make_unique<GpuPartitionedOutput>(id, ctx, gpo);
+    }
+    return nullptr;
+  }
+
+  std::optional<uint32_t> maxDrivers(const core::PlanNodePtr& node) override {
+    if (std::dynamic_pointer_cast<const GpuPartitionedOutputNode>(node)) {
+      return 1;
+    }
+    return std::nullopt;
+  }
+};
+
+/// Translator mapping a GpuExchangeNode plan node to the GpuExchange
+/// source operator. GpuExchange is a SourceOperator that consumes pages
+/// from an ExchangeClient queue; GpuExchangeNode reports
+/// requiresExchangeClient() == true so Velox dispatches to the
+/// client-aware toOperator overload.
+class GpuExchangeTranslator : public exec::Operator::PlanNodeTranslator {
+ public:
+  std::unique_ptr<exec::Operator> toOperator(
+      exec::DriverCtx* ctx,
+      int32_t id,
+      const core::PlanNodePtr& node,
+      std::shared_ptr<exec::ExchangeClient> exchangeClient) override {
+    if (auto gex = std::dynamic_pointer_cast<const GpuExchangeNode>(node)) {
+      return std::make_unique<GpuExchange>(
+          id, ctx, gex, std::move(exchangeClient));
+    }
+    return nullptr;
+  }
+};
 
 } // namespace
 
@@ -395,6 +445,14 @@ void registerCudf() {
 
   exec::Operator::registerOperator(
       std::make_unique<CudfHashJoinBridgeTranslator>());
+  // Register MPP GPU exchange translators so Velox can instantiate GPU
+  // sink/source operators directly from GpuPartitionedOutputNode /
+  // GpuExchangeNode plan nodes (no CPU PartitionedOutput / ExchangeNode
+  // intermediary).
+  exec::Operator::registerOperator(
+      std::make_unique<GpuPartitionedOutputTranslator>());
+  exec::Operator::registerOperator(
+      std::make_unique<GpuExchangeTranslator>());
   CudfDriverAdapter cda{CudfConfig::getInstance().allowCpuFallback};
   exec::DriverAdapter cudfAdapter{kCudfAdapterName, {}, cda};
   exec::DriverFactory::registerAdapter(cudfAdapter);

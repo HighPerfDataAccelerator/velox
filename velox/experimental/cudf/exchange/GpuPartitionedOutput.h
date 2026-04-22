@@ -30,6 +30,14 @@ namespace facebook::velox::cudf_velox {
 /// Supports kPartitioned (hash), kBroadcast, and kArbitrary output kinds.
 class GpuPartitionedOutput : public exec::Operator {
  public:
+  /// Overload that accepts the stock core::PartitionedOutputNode so that a
+  /// cuDF OperatorAdapter can replace the default CPU PartitionedOutput
+  /// operator without a separate GPU-specific PlanNode.
+  GpuPartitionedOutput(
+      int32_t operatorId,
+      exec::DriverCtx* ctx,
+      const std::shared_ptr<const core::PartitionedOutputNode>& planNode);
+
   GpuPartitionedOutput(
       int32_t operatorId,
       exec::DriverCtx* ctx,

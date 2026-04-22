@@ -92,6 +92,20 @@ class OutputBufferManager {
       DataAvailableCallback notify,
       DataConsumerActiveCheckCallback activeCheck = nullptr);
 
+  /// Pages variant of getData() -- see the getData() comment above for the
+  /// semantics of all parameters; this method behaves identically except that
+  /// it delivers SerializedPage objects to `notify` rather than IOBufs. Used
+  /// by consumers that cannot accept an IOBuf representation (e.g. GPU-resident
+  /// pages whose getIOBuf() would throw). Returns false if no buffer is
+  /// registered for `taskId`, otherwise returns true.
+  bool getPages(
+      const std::string& taskId,
+      int destination,
+      uint64_t maxBytes,
+      int64_t sequence,
+      PagesAvailableCallback notify,
+      DataConsumerActiveCheckCallback activeCheck = nullptr);
+
   void removeTask(const std::string& taskId);
 
   static const std::shared_ptr<OutputBufferManager>& getInstanceRef();

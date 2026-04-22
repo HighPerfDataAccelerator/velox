@@ -27,6 +27,54 @@
 
 namespace facebook::velox::cudf_velox {
 
+namespace {
+GpuPartitionedOutputNode::Kind coreKindToGpu(core::PartitionedOutputNode::Kind k) {
+  switch (k) {
+    case core::PartitionedOutputNode::Kind::kPartitioned:
+      return GpuPartitionedOutputNode::Kind::kPartitioned;
+    case core::PartitionedOutputNode::Kind::kBroadcast:
+      return GpuPartitionedOutputNode::Kind::kBroadcast;
+    case core::PartitionedOutputNode::Kind::kArbitrary:
+      return GpuPartitionedOutputNode::Kind::kArbitrary;
+  }
+  VELOX_UNREACHABLE();
+}
+} // namespace
+
+GpuPartitionedOutput::GpuPartitionedOutput(
+    int32_t operatorId,
+    exec::DriverCtx* ctx,
+    const std::shared_ptr<const core::PartitionedOutputNode>& planNode)
+    : exec::Operator(
+          ctx,
+          planNode->outputType(),
+          operatorId,
+          planNode->id(),
+          "GpuPartitionedOutput"),
+      // core::PartitionedOutputNode::single() yields kPartitioned + N=1 with
+      // GatherPartitionFunctionSpec. From the data-flow perspective that is
+      // identical to kArbitrary: one destination, no real partitioning. Route
+      // via arbitraryInput() so we don't need a partitionFunction_.
+      kind_(
+          (planNode->isPartitioned() && planNode->numPartitions() == 1)
+              ? GpuPartitionedOutputNode::Kind::kArbitrary
+              : coreKindToGpu(planNode->kind())),
+      numDestinations_(planNode->numPartitions()),
+      keyChannels_(
+          (planNode->isPartitioned() && planNode->numPartitions() > 1)
+              ? exec::toChannels(planNode->inputType(), planNode->keys())
+              : std::vector<column_index_t>{}),
+      partitionFunction_(
+          (planNode->isPartitioned() && planNode->numPartitions() > 1)
+              ? planNode->partitionFunctionSpec().create(
+                    numDestinations_,
+                    /*localExchange=*/false)
+              : nullptr),
+      bufferManager_(exec::OutputBufferManager::getInstanceRef()),
+      bufferReleaseFn_([task = operatorCtx_->task()]() {}) {
+  VELOX_USER_CHECK_GT(numDestinations_, 0, "numDestinations must be positive");
+}
+
 GpuPartitionedOutput::GpuPartitionedOutput(
     int32_t operatorId,
     exec::DriverCtx* ctx,
@@ -95,59 +143,39 @@ RowVectorPtr GpuPartitionedOutput::getOutput() {
 
 void GpuPartitionedOutput::partitionAndEnqueue(
     std::shared_ptr<CudfVector> cudfVec) {
-  VELOX_CHECK_NOT_NULL(
-      partitionFunction_,
-      "Partition function required for kPartitioned output");
-
   auto tableView = cudfVec->getTableView();
   auto stream = cudfVec->stream();
-  auto numRows = cudfVec->size();
 
-  // Use the Velox partition function to compute partition IDs on CPU.
-  // The partition function works on RowVector (CudfVector is a subclass).
-  std::vector<uint32_t> partitions(numRows);
-  auto singlePartition = partitionFunction_->partition(*cudfVec, partitions);
-
-  if (singlePartition.has_value()) {
-    // All rows go to the same destination -- no GPU partitioning needed.
-    enqueuePartition(singlePartition.value(), std::move(cudfVec));
-    return;
-  }
-
-  // Build a cudf column from the partition IDs to drive cudf::partition().
-  // We need to get partition IDs to GPU for cudf::partition to reorder rows.
-  //
-  // Allocate device column for partition IDs.
-  auto pidColDev = cudf::make_numeric_column(
-      cudf::data_type{cudf::type_id::INT32},
-      numRows,
-      cudf::mask_state::UNALLOCATED,
-      stream);
-
-  // Copy partition IDs host->device.
-  static_assert(sizeof(uint32_t) == sizeof(int32_t));
-  CUDF_CUDA_TRY(cudaMemcpyAsync(
-      pidColDev->mutable_view().head<int32_t>(),
-      reinterpret_cast<const int32_t*>(partitions.data()),
-      numRows * sizeof(int32_t),
-      cudaMemcpyHostToDevice,
-      stream.value()));
-
-  // cudf::partition reorders rows so that rows with the same partition are
-  // contiguous. offsets[i] is the start index of partition i.
-  auto [partitioned, offsets] = cudf::partition(
-      tableView,
-      pidColDev->view(),
-      static_cast<cudf::size_type>(numDestinations_),
-      stream);
+  // GPU-native partitioning. Invoking the stock CPU partition function here
+  // (as we used to) called childAt() on CudfVector, which FATALs because
+  // CudfVectors have childrenSize_=0 (children live on GPU). This mirrors
+  // CudfLocalPartition::addInput.
+  auto [partitioned, offsets] = [&]() {
+    if (!keyChannels_.empty()) {
+      // HASH: partition on keyChannels using cudf::hash_partition.
+      std::vector<cudf::size_type> partitionKeyIndices;
+      partitionKeyIndices.reserve(keyChannels_.size());
+      for (const auto& ch : keyChannels_) {
+        partitionKeyIndices.push_back(static_cast<cudf::size_type>(ch));
+      }
+      return cudf::hash_partition(
+          tableView,
+          partitionKeyIndices,
+          numDestinations_,
+          cudf::hash_id::HASH_MURMUR3,
+          cudf::DEFAULT_HASH_SEED,
+          stream);
+    }
+    // No keys -> RoundRobin. start_partition=0 yields stable assignment.
+    return cudf::round_robin_partition(
+        tableView, numDestinations_, /*start_partition=*/0, stream);
+  }();
   VELOX_CHECK_EQ(
       offsets.size(),
       static_cast<size_t>(numDestinations_) + 1,
-      "cudf::partition must return numPartitions+1 offsets");
+      "cudf partition must return numPartitions+1 offsets");
 
-  // Sync: cudf::partition reads from pidColDev and input tableView
-  // asynchronously. We must synchronize before pidColDev goes out of scope
-  // and before slicing the partitioned table.
+  // Sync before slicing (cudf partition APIs are async on `stream`).
   stream.synchronize();
 
   // TODO(mpp): GPU lock is disabled for MPP prototype. Re-enable with proper

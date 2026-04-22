@@ -90,100 +90,101 @@ class LocalGpuExchangeSource : public exec::ExchangeSource {
     // Callback invoked by OutputBufferManager when data is available,
     // or by the timer thread on timeout (with empty data).
     // Since this lambda may outlive 'this', we capture a shared_ptr (self).
-    auto resultCallback = [self, requestedSequence, buffers, this](
-                              std::vector<std::unique_ptr<folly::IOBuf>> data,
-                              int64_t sequence,
-                              std::vector<int64_t> remainingBytes) {
-      LOG(WARNING) << "LocalGpuExchangeSource::resultCallback taskId="
-                   << remoteTaskId_ << " destination=" << destination_
-                   << " dataSize=" << data.size()
-                   << " callbackSeq=" << sequence
-                   << " requestedSeq=" << requestedSequence;
-      {
-        std::lock_guard<std::mutex> l(mutex_);
-        auto iter = timeouts_.find(self);
-        if (iter == timeouts_.end()) {
-          LOG(WARNING) << "LocalGpuExchangeSource::resultCallback "
-                       << "DOUBLE-FIRE ignored taskId=" << remoteTaskId_;
-          return;
-        }
-        timeouts_.erase(iter);
-      }
-
-      if (requestedSequence > sequence && !data.empty()) {
-        int64_t nExtra = requestedSequence - sequence;
-        VELOX_CHECK(nExtra < data.size());
-        data.erase(data.cbegin(), data.cbegin() + nExtra);
-        sequence = requestedSequence;
-      }
-      if (data.empty()) {
-        sequence = requestedSequence;
-      }
-
-      // Convert IOBuf data to PrestoSerializedPages and enqueue them into
-      // the ExchangeQueue, exactly like the CPU LocalExchangeSource.
-      // In the GPU exchange path, the producer enqueues GpuSerializedPages
-      // into OutputBufferManager. However, the getData() callback receives
-      // IOBuf clones. For a same-process GPU exchange, the pages flowing
-      // through here will be PrestoSerializedPage wrappers. A future
-      // optimization could bypass IOBuf entirely for GPU pages.
-      std::vector<std::unique_ptr<exec::SerializedPageBase>> pages;
-      bool atEnd = false;
-      int64_t totalBytes = 0;
-      for (auto& inputPage : data) {
-        if (!inputPage) {
-          atEnd = true;
-          // Keep looping, there could be extra end markers.
-          continue;
-        }
-        totalBytes += inputPage->length();
-        inputPage->unshare();
-        pages.push_back(
-            std::make_unique<exec::PrestoSerializedPage>(std::move(inputPage)));
-        inputPage = nullptr;
-      }
-
-      numPages_ += pages.size();
-      totalBytes_ += totalBytes;
-
-      VeloxPromise<Response> requestPromise;
-      {
-        std::vector<ContinuePromise> queuePromises;
-        {
-          std::lock_guard<std::mutex> l(queue_->mutex());
-          requestPending_ = false;
-          requestPromise = std::move(promise_);
-          for (auto& page : pages) {
-            queue_->enqueueLocked(std::move(page), queuePromises);
+    auto resultCallback =
+        [self, requestedSequence, buffers, this](
+            std::vector<std::unique_ptr<exec::SerializedPageBase>> data,
+            int64_t sequence,
+            std::vector<int64_t> remainingBytes) {
+          LOG(WARNING) << "LocalGpuExchangeSource::resultCallback taskId="
+                       << remoteTaskId_ << " destination=" << destination_
+                       << " dataSize=" << data.size()
+                       << " callbackSeq=" << sequence
+                       << " requestedSeq=" << requestedSequence;
+          {
+            std::lock_guard<std::mutex> l(mutex_);
+            auto iter = timeouts_.find(self);
+            if (iter == timeouts_.end()) {
+              LOG(WARNING) << "LocalGpuExchangeSource::resultCallback "
+                           << "DOUBLE-FIRE ignored taskId=" << remoteTaskId_;
+              return;
+            }
+            timeouts_.erase(iter);
           }
-          if (atEnd) {
-            queue_->enqueueLocked(nullptr, queuePromises);
-            atEnd_ = true;
-          }
-          if (!data.empty()) {
-            sequence_ = sequence + pages.size();
-          }
-        }
-        for (auto& promise : queuePromises) {
-          promise.setValue();
-        }
-      }
 
-      // Outside of queue mutex.
-      if (atEnd_) {
-        buffers->deleteResults(remoteTaskId_, destination_);
-      }
+          if (requestedSequence > sequence && !data.empty()) {
+            int64_t nExtra = requestedSequence - sequence;
+            VELOX_CHECK(nExtra < data.size());
+            data.erase(data.cbegin(), data.cbegin() + nExtra);
+            sequence = requestedSequence;
+          }
+          if (data.empty()) {
+            sequence = requestedSequence;
+          }
 
-      if (!requestPromise.isFulfilled()) {
-        requestPromise.setValue(Response{totalBytes, atEnd_, remainingBytes});
-      }
-    };
+          // Pages arrive already typed as SerializedPageBase (wrapped in
+          // SharedSerializedPage by DestinationBuffer::getPages). Enqueue them
+          // into the ExchangeQueue directly with no IOBuf detour -- this is
+          // what lets GpuSerializedPage flow through without getIOBuf().
+          // nullptr entries are end-of-data markers (same convention as the
+          // IOBuf path used by the CPU LocalExchangeSource).
+          bool atEnd = false;
+          int64_t totalBytes = 0;
+          int64_t numDataPages = 0;
+          for (auto& page : data) {
+            if (!page) {
+              atEnd = true;
+              // Keep looping, there could be extra end markers.
+              continue;
+            }
+            totalBytes += page->size();
+            ++numDataPages;
+          }
+
+          numPages_ += numDataPages;
+          totalBytes_ += totalBytes;
+
+          VeloxPromise<Response> requestPromise;
+          {
+            std::vector<ContinuePromise> queuePromises;
+            {
+              std::lock_guard<std::mutex> l(queue_->mutex());
+              requestPending_ = false;
+              requestPromise = std::move(promise_);
+              for (auto& page : data) {
+                if (!page) {
+                  continue;
+                }
+                queue_->enqueueLocked(std::move(page), queuePromises);
+              }
+              if (atEnd) {
+                queue_->enqueueLocked(nullptr, queuePromises);
+                atEnd_ = true;
+              }
+              if (!data.empty()) {
+                sequence_ = sequence + numDataPages;
+              }
+            }
+            for (auto& promise : queuePromises) {
+              promise.setValue();
+            }
+          }
+
+          // Outside of queue mutex.
+          if (atEnd_) {
+            buffers->deleteResults(remoteTaskId_, destination_);
+          }
+
+          if (!requestPromise.isFulfilled()) {
+            requestPromise.setValue(
+                Response{totalBytes, atEnd_, remainingBytes});
+          }
+        };
 
     registerTimeout(self, resultCallback, maxWait);
 
-    auto ok = buffers->getData(
+    auto ok = buffers->getPages(
         remoteTaskId_, destination_, maxBytes, sequence_, resultCallback);
-    LOG(WARNING) << "LocalGpuExchangeSource::request getData returned ok="
+    LOG(WARNING) << "LocalGpuExchangeSource::request getPages returned ok="
                  << ok << " for taskId=" << remoteTaskId_
                  << " destination=" << destination_;
 
@@ -235,7 +236,7 @@ class LocalGpuExchangeSource : public exec::ExchangeSource {
 
  private:
   using ResultCallback = std::function<void(
-      std::vector<std::unique_ptr<folly::IOBuf>> data,
+      std::vector<std::unique_ptr<exec::SerializedPageBase>> data,
       int64_t sequence,
       std::vector<int64_t> remainingBytes)>;
 

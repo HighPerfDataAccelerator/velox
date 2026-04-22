@@ -17,6 +17,7 @@
 
 #include "velox/common/Casts.h"
 #include "velox/exec/Exchange.h"
+#include "velox/exec/OutputBuffer.h"
 #include "velox/exec/Task.h"
 #include "velox/experimental/cudf/exchange/GpuSerializedPage.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
@@ -26,13 +27,13 @@ namespace facebook::velox::cudf_velox {
 GpuExchange::GpuExchange(
     int32_t operatorId,
     exec::DriverCtx* driverCtx,
-    const std::shared_ptr<const GpuExchangeNode>& gpuExchangeNode,
+    const std::shared_ptr<const core::PlanNode>& planNode,
     std::shared_ptr<exec::ExchangeClient> exchangeClient)
     : SourceOperator(
           driverCtx,
-          gpuExchangeNode->outputType(),
+          planNode->outputType(),
           operatorId,
-          gpuExchangeNode->id(),
+          planNode->id(),
           "GpuExchange"),
       preferredOutputBatchBytes_{
           driverCtx->queryConfig().preferredOutputBatchBytes()},
@@ -146,8 +147,24 @@ RowVectorPtr GpuExchange::getOutput() {
     }
 
     // GPU fast path: if the page is a GpuSerializedPage, unwrap the
-    // CudfVector directly (zero-copy).
-    auto* gpuPage = dynamic_cast<GpuSerializedPage*>(page.get());
+    // CudfVector directly (zero-copy). OutputBufferManager wraps pages in
+    // SharedSerializedPage when forwarding; peek through the wrapper so the
+    // inner GpuSerializedPage is still recognized.
+    GpuSerializedPage* gpuPage = nullptr;
+    auto* shared = dynamic_cast<exec::SharedSerializedPage*>(page.get());
+    if (shared) {
+      gpuPage =
+          dynamic_cast<GpuSerializedPage*>(shared->innerShared().get());
+    } else {
+      gpuPage = dynamic_cast<GpuSerializedPage*>(page.get());
+    }
+    LOG(WARNING) << "GpuExchange::getOutput taskId=" << operatorCtx_->task()->taskId()
+                 << " page_type=" << typeid(*page).name()
+                 << " shared_wrapper=" << (shared ? "yes" : "no")
+                 << " inner_type="
+                 << (shared ? typeid(*shared->innerShared()).name() : "n/a")
+                 << " gpu_cast=" << (gpuPage ? "hit" : "miss")
+                 << " size=" << page->size();
     if (gpuPage != nullptr) {
       const uint64_t rawInputBytes = gpuPage->size();
       auto result = gpuPage->cudfVector();
