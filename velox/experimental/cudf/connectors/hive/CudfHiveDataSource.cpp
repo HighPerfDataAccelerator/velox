@@ -1121,7 +1121,7 @@ std::unique_ptr<cudf::table> CudfHiveDataSource::readNextExperimentalBatch(
     auto singleRG = cudf::host_span<cudf::size_type const>(
         &exptFilteredRowGroups_[batchEnd], 1);
     auto byteRanges =
-        exptSplitReader_->payload_column_chunks_byte_ranges(
+        exptSplitReader_->all_column_chunks_byte_ranges(
             singleRG, exptResolvedOptions_);
     int64_t rgBytes = 0;
     for (auto const& br : byteRanges) {
@@ -1140,7 +1140,7 @@ std::unique_ptr<cudf::table> CudfHiveDataSource::readNextExperimentalBatch(
   exptNextRGIndex_ = batchEnd;
 
   const auto columnChunkByteRanges =
-      exptSplitReader_->payload_column_chunks_byte_ranges(
+      exptSplitReader_->all_column_chunks_byte_ranges(
           batchSpan, exptResolvedOptions_);
 
   std::vector<rmm::device_buffer> columnChunkBuffers(
@@ -1205,17 +1205,19 @@ std::unique_ptr<cudf::table> CudfHiveDataSource::readNextExperimentalBatch(
         static_cast<size_t>(columnChunkByteRanges[i].size())});
   }
 
-  const auto totalRows =
-      exptSplitReader_->total_rows_in_row_groups(batchSpan);
-  auto const scalarTrue = cudf::numeric_scalar<bool>(true, true, stream_);
-  auto allTrueRowMask =
-      cudf::make_column_from_scalar(scalarTrue, totalRows, stream_);
-
-  auto tableWithMetadata = exptSplitReader_->materialize_payload_columns(
+  // Use materialize_all_columns (one-pass) instead of materialize_payload_columns
+  // (two-pass). The two-pass API requires a prior materialize_filter_columns
+  // pass to populate the reader's internal state machine; calling
+  // materialize_payload_columns without that prior pass left state uninitialized
+  // and caused decode-time illegal memory access. Row-level filter pushdown is
+  // therefore sacrificed (same pushdown granularity as the default
+  // chunked_parquet_reader: row-group-level via filter_row_groups_with_stats,
+  // then row-level apply_boolean_mask below). Row-group pruning is still active
+  // because batchSpan is taken from exptFilteredRowGroups_ which was pruned by
+  // filter_row_groups_with_stats in initExperimentalReaderMetadata.
+  auto tableWithMetadata = exptSplitReader_->materialize_all_columns(
       batchSpan,
       columnChunkData,
-      allTrueRowMask->view(),
-      cudf::io::parquet::experimental::use_data_page_mask::NO,
       exptResolvedOptions_,
       stream_,
       cudf::get_current_device_resource_ref());
