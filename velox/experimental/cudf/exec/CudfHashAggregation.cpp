@@ -71,7 +71,17 @@ using namespace facebook::velox;
           #Name "Aggregator does not yet support constant input");            \
       auto& request = requests.emplace_back();                                \
       output_idx = requests.size() - 1;                                       \
-      request.values = tbl.column(inputIndex);                                \
+      auto col = tbl.column(inputIndex);                                      \
+      /* AGG-01-b: Spark partial-avg / decimal-sum emits STRUCT<sum,_> at     \
+         partial output; at merge/final steps the simple aggregators must    \
+         unwrap child(0) so cuDF doesn't see (STRUCT, SUM/MIN/MAX) which is  \
+         rejected by is_valid_aggregation (cudf aggregation.hpp:1342). */    \
+      if (!exec::isRawInput(step) &&                                          \
+          col.type().id() == cudf::type_id::STRUCT &&                         \
+          col.num_children() > 0) {                                           \
+        col = col.child(0);                                                   \
+      }                                                                       \
+      request.values = col;                                                   \
       request.aggregations.push_back(                                         \
           cudf::make_##name##_aggregation<cudf::groupby_aggregation>());      \
     }                                                                         \
@@ -96,8 +106,15 @@ using namespace facebook::velox;
           cudf::make_##name##_aggregation<cudf::reduce_aggregation>();        \
       auto const cudfOutputType =                                             \
           cudf::data_type(cudf_velox::veloxToCudfTypeId(outputType));         \
+      auto reduceCol = input.column(inputIndex);                              \
+      /* Same STRUCT unwrap as addGroupbyRequest for the global-agg path. */  \
+      if (!exec::isRawInput(step) &&                                          \
+          reduceCol.type().id() == cudf::type_id::STRUCT &&                   \
+          reduceCol.num_children() > 0) {                                     \
+        reduceCol = reduceCol.child(0);                                       \
+      }                                                                       \
       auto const resultScalar = cudf::reduce(                                 \
-          input.column(inputIndex), *aggRequest, cudfOutputType, stream);     \
+          reduceCol, *aggRequest, cudfOutputType, stream);                    \
       return cudf::make_column_from_scalar(*resultScalar, 1, stream);         \
     }                                                                         \
                                                                               \
@@ -722,7 +739,10 @@ std::string getOriginalName(const std::string& kind) {
 bool hasFinalAggs(
     std::vector<core::AggregationNode::Aggregate> const& aggregates) {
   return std::any_of(aggregates.begin(), aggregates.end(), [](auto const& agg) {
-    return agg.call->name().ends_with("_merge_extract");
+    // Spark emits typed companion names like sum_merge_extract_DOUBLE and
+    // count_merge_extract_BIGINT, so match substring not suffix.
+    // See plan/issue-cudf-aggregation-empty-input.md (AGG-01-b).
+    return agg.call->name().find("_merge_extract") != std::string::npos;
   });
 }
 
