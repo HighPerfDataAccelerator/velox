@@ -1126,6 +1126,7 @@ void CudfHiveDataSource::initExperimentalReaderMetadata() {
 
 std::unique_ptr<cudf::table> CudfHiveDataSource::readNextExperimentalBatch(
     cudf::io::table_metadata& metadata) {
+  try {
   EXPT_TRACE("enter idx=" << exptNextRGIndex_ << "/" << exptFilteredRowGroups_.size());
   VELOX_CHECK(exptMetadataInitialized_);
   if (exptNextRGIndex_ >= exptFilteredRowGroups_.size()) {
@@ -1138,11 +1139,15 @@ std::unique_ptr<cudf::table> CudfHiveDataSource::readNextExperimentalBatch(
   size_t batchEnd = exptNextRGIndex_;
   int64_t batchCompressedBytes = 0;
   while (batchEnd < exptFilteredRowGroups_.size()) {
+    EXPT_TRACE("size-probe iter batchEnd=" << batchEnd
+               << " before all_column_chunks_byte_ranges");
     auto singleRG = cudf::host_span<cudf::size_type const>(
         &exptFilteredRowGroups_[batchEnd], 1);
     auto byteRanges =
         exptSplitReader_->all_column_chunks_byte_ranges(
             singleRG, exptResolvedOptions_);
+    EXPT_TRACE("size-probe iter batchEnd=" << batchEnd
+               << " after all_column_chunks_byte_ranges n=" << byteRanges.size());
     int64_t rgBytes = 0;
     for (auto const& br : byteRanges) {
       rgBytes += br.size();
@@ -1299,6 +1304,15 @@ std::unique_ptr<cudf::table> CudfHiveDataSource::readNextExperimentalBatch(
   }
   EXPT_TRACE("return (no filter) rows=" << cudfTable->num_rows());
   return cudfTable;
+  } catch (const std::exception& e) {
+    std::cerr << "[EXPT EXCEPTION] readNextExperimentalBatch: " << e.what()
+              << std::endl << std::flush;
+    throw;
+  } catch (...) {
+    std::cerr << "[EXPT EXCEPTION] readNextExperimentalBatch: unknown C++ exception"
+              << std::endl << std::flush;
+    throw;
+  }
 }
 
 } // namespace facebook::velox::cudf_velox::connector::hive
