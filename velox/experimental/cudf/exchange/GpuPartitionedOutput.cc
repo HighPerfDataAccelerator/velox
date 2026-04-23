@@ -248,19 +248,18 @@ bool GpuPartitionedOutput::enqueuePartition(
 
 void GpuPartitionedOutput::broadcastInput(
     std::shared_ptr<CudfVector> cudfVec) {
-  // Broadcast: send the same data to all destinations. The shared_ptr
-  // inside GpuSerializedPage ensures the GPU memory stays alive until
+  // Broadcast: Velox's kBroadcast OutputBuffer owns all N DestinationBuffers
+  // and internally replicates the shared payload to all of them on enqueue.
+  // We MUST call enqueue with destination=0 -- OutputBuffer::enqueue asserts
+  // destination==0 for kind_==kBroadcast (see OutputBuffer.cpp:557 and
+  // enqueueBroadcastOutputLocked).
+  //
+  // The shared_ptr inside GpuSerializedPage keeps the GPU memory alive until
   // all consumers have consumed their pages.
   //
   // TODO(mpp): GPU lock disabled for prototype.
   // endGpuRegion();
-
-  for (int dest = 0; dest < numDestinations_; ++dest) {
-    if (enqueuePartition(dest, cudfVec)) {
-      // Backpressure from one destination.
-      return;
-    }
-  }
+  enqueuePartition(0, std::move(cudfVec));
 }
 
 void GpuPartitionedOutput::arbitraryInput(
