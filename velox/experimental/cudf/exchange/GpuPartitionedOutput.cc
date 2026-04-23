@@ -234,7 +234,7 @@ bool GpuPartitionedOutput::enqueuePartition(
   // 200 destinations of a hash-partitioned batch that happened to have no
   // matching rows) has size()==0, and Velox's accounting VELOX_CHECK_GT
   // (OutputBuffer.cpp:760) fires with freedBytes=0 when such a page is
-  // eventually freed. See plan/issue-outputbuffer-zero-bytes.md (OUT-01).
+  // eventually freed. See plan/issue-outputbuffer-zero-bytes.md.
   if (page->size() == 0) {
     return false;
   }

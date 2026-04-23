@@ -72,10 +72,10 @@ using namespace facebook::velox;
       auto& request = requests.emplace_back();                                \
       output_idx = requests.size() - 1;                                       \
       auto col = tbl.column(inputIndex);                                      \
-      /* AGG-01-b: Spark partial-avg / decimal-sum emits STRUCT<sum,_> at     \
-         partial output; at merge/final steps the simple aggregators must    \
-         unwrap child(0) so cuDF doesn't see (STRUCT, SUM/MIN/MAX) which is  \
-         rejected by is_valid_aggregation (cudf aggregation.hpp:1342). */    \
+      /* Spark partial-avg / decimal-sum emits STRUCT<sum,_> at partial       \
+         output; at merge/final steps the simple aggregators must unwrap     \
+         child(0) so cuDF doesn't see (STRUCT, SUM/MIN/MAX) -- rejected by   \
+         is_valid_aggregation (cudf aggregation.hpp:1342). */                \
       if (!exec::isRawInput(step) &&                                          \
           col.type().id() == cudf::type_id::STRUCT &&                         \
           col.num_children() > 0) {                                           \
@@ -741,7 +741,7 @@ bool hasFinalAggs(
   return std::any_of(aggregates.begin(), aggregates.end(), [](auto const& agg) {
     // Spark emits typed companion names like sum_merge_extract_DOUBLE and
     // count_merge_extract_BIGINT, so match substring not suffix.
-    // See plan/issue-cudf-aggregation-empty-input.md (AGG-01-b).
+    // See plan/issue-cudf-aggregation-empty-input.md.
     return agg.call->name().find("_merge_extract") != std::string::npos;
   });
 }
@@ -882,6 +882,33 @@ void CudfHashAggregation::initialize() {
   aggregators_ = toAggregators(*aggregationNode_, *operatorCtx_);
   intermediateAggregators_ =
       toIntermediateAggregators(*aggregationNode_, *operatorCtx_);
+
+  // toIntermediateAggregators naively sets inputIndex = numGroupingKeys + i,
+  // assuming the intermediate table is laid out as
+  // [key0, key1, ..., agg0, agg1, ...]. But when the upstream is a shuffle
+  // Exchange (Gluten/Spark path), the actual table has a
+  // hash_with_seed(...) partition-column prefix: [hash, key0, key1, aggs].
+  // Rebase inputIndex off the actual group-key positions so aggregators
+  // point at the correct agg source columns. Assumes keys are contiguous.
+  if (!groupingKeyOutputChannels_.empty() &&
+      !intermediateAggregators_.empty()) {
+    const auto keyMax = *std::max_element(
+        groupingKeyOutputChannels_.begin(), groupingKeyOutputChannels_.end());
+    const auto firstAggCol = static_cast<uint32_t>(keyMax) + 1;
+    const auto expected = static_cast<uint32_t>(numGroupingKeys);
+    if (firstAggCol != expected) {
+      LOG(WARNING) << "CudfHashAggregation: rebasing intermediate agg "
+                   << "inputIndex by offset=" << (firstAggCol - expected)
+                   << " (keyMax=" << keyMax << " numGroupingKeys="
+                   << numGroupingKeys << ")";
+      for (size_t i = 0; i < intermediateAggregators_.size(); ++i) {
+        if (intermediateAggregators_[i] != nullptr) {
+          intermediateAggregators_[i]->inputIndex =
+              firstAggCol + static_cast<uint32_t>(i);
+        }
+      }
+    }
+  }
 
   // Check that aggregate result type match the output type.
   // TODO: This is output schema validation. In velox CPU, it's done using
@@ -1127,14 +1154,19 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
     std::vector<column_index_t> const& groupByKeys,
     std::vector<std::unique_ptr<Aggregator>>& aggregators,
     rmm::cuda_stream_view stream) {
-  // AGG-01 defensive: cuDF's verify_valid_requests (groupby.cu:192) doesn't
-  // short-circuit on 0-row input; it rejects (STRUCT, SUM)-style combos even
-  // when there's nothing to aggregate. Return nullptr for empty inputs so
-  // callers (computeIntermediateGroupbyPartial / getOutput) treat it as
+  // cuDF's verify_valid_requests (groupby.cu:192) doesn't short-circuit on
+  // 0-row input; it rejects (STRUCT, SUM)-style combos even when there's
+  // nothing to aggregate. Return nullptr for empty inputs so callers
+  // (computeIntermediateGroupbyPartial / getOutput) treat it as
   // "no output this tick".
   if (tableView.num_rows() == 0) {
     return nullptr;
   }
+
+  VLOG(1) << "doGroupByAggregation: rows=" << tableView.num_rows()
+          << " cols=" << tableView.num_columns()
+          << " groupByKeys=" << groupByKeys.size()
+          << " aggregators=" << aggregators.size();
   auto groupbyKeyView =
       tableView.select(groupByKeys.begin(), groupByKeys.end());
 
@@ -1285,7 +1317,7 @@ RowVectorPtr CudfHashAggregation::getOutput() {
     return nullptr;
   }
 
-  // AGG-01: when noMoreInput_ AND inputs_ is empty, don't invoke cuDF groupby.
+  // When noMoreInput_ AND inputs_ is empty, don't invoke cuDF groupby.
   // cuDF's verify_valid_requests (groupby.cu:192) runs BEFORE the
   // `_keys.num_rows() == 0` short-circuit, so 0-row partition slices with
   // merge_extract aggregations (SUM on STRUCT etc) trip the type/agg check.

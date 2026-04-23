@@ -764,7 +764,7 @@ void OutputBuffer::updateAfterAcknowledgeLocked(
   // original VELOX_CHECK_GT(freedBytes, 0) fires as INVALID_STATE and
   // cascades into consumer-replica deadlocks across Q1/Q3/etc. Byte
   // accounting just underreports on the free side; there is no data loss.
-  // See plan/issue-outputbuffer-zero-bytes.md (OUT-01).
+  // See plan/issue-outputbuffer-zero-bytes.md.
   if (freedBytes == 0) {
     VLOG(1) << "OutputBuffer::updateAfterAcknowledgeLocked: freedPages="
             << freedPages
