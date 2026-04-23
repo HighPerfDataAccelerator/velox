@@ -771,12 +771,19 @@ CudfHybridScanReaderPtr CudfHiveDataSource::createExperimentalSplitReader() {
 
   // Setup page index if available
   auto const pageIndexByteRange = exptSplitReader->page_index_byte_range();
+  EXPT_TRACE("createExptSplitReader pageIndex.is_empty="
+             << pageIndexByteRange.is_empty()
+             << " offset=" << pageIndexByteRange.offset()
+             << " size=" << pageIndexByteRange.size());
   if (not pageIndexByteRange.is_empty()) {
     auto const pageIndexBytes = dataSource_->host_read(
         pageIndexByteRange.offset(), pageIndexByteRange.size());
     exptSplitReader->setup_page_index(
         cudf::host_span<uint8_t const>{
             pageIndexBytes->data(), pageIndexBytes->size()});
+    EXPT_TRACE("createExptSplitReader setup_page_index done");
+  } else {
+    EXPT_TRACE("createExptSplitReader SKIP setup_page_index (empty range)");
   }
 
   return exptSplitReader;
