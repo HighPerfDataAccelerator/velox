@@ -39,6 +39,7 @@
 #include "velox/common/file/File.h"
 
 #include <list>
+#include <optional>
 #include <stack>
 #include <string>
 #include <unordered_map>
@@ -496,8 +497,8 @@ std::shared_ptr<PinnedHostBuffer> selectiveParquetRead(
 
   // Step 2: Build children indices for schema tree navigation.
   static NvtxRegisteredStringT const clipName{"SelectiveRead::ClipMetadata"};
-  auto clipRange = std::make_unique<::nvtx3::scoped_range_in<VeloxDomain>>(
-      ::nvtx3::event_attributes{clipName});
+  std::optional<::nvtx3::scoped_range_in<VeloxDomain>> clipRange;
+  clipRange.emplace(::nvtx3::event_attributes{clipName});
   const auto childrenIdx = buildChildrenIdx(metadata.schema);
 
   // Step 3: Build the set of needed column names
