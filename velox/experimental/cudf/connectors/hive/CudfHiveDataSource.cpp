@@ -1216,7 +1216,7 @@ std::unique_ptr<cudf::table> CudfHiveDataSource::readNextExperimentalBatch(
       columnChunkData,
       allTrueRowMask->view(),
       cudf::io::parquet::experimental::use_data_page_mask::NO,
-      readerOptions_,
+      exptResolvedOptions_,
       stream_,
       cudf::get_current_device_resource_ref());
 
