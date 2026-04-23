@@ -757,7 +757,19 @@ void OutputBuffer::updateAfterAcknowledgeLocked(
     VELOX_CHECK_EQ(freedBytes, 0);
     return;
   }
-  VELOX_CHECK_GT(freedBytes, 0);
+  // Relaxed for MPP-cudf path: GpuSerializedPage::size() returns
+  // cudfVector->estimateFlatSize(), which can legitimately be 0 for
+  // empty/degenerate partition slices (200-way hash partitioning of a small
+  // batch produces many dest buffers with 0-row / 0-byte pages). The
+  // original VELOX_CHECK_GT(freedBytes, 0) fires as INVALID_STATE and
+  // cascades into consumer-replica deadlocks across Q1/Q3/etc. Byte
+  // accounting just underreports on the free side; there is no data loss.
+  // See plan/issue-outputbuffer-zero-bytes.md (OUT-01).
+  if (freedBytes == 0) {
+    VLOG(1) << "OutputBuffer::updateAfterAcknowledgeLocked: freedPages="
+            << freedPages
+            << " but freedBytes=0 (likely GPU pages with empty flat-size)";
+  }
 
   updateStatsWithFreedPagesLocked(freedPages, freedBytes);
 

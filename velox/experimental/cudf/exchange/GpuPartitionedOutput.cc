@@ -228,6 +228,17 @@ bool GpuPartitionedOutput::enqueuePartition(
 
   auto page = std::make_unique<GpuSerializedPage>(std::move(partitionData));
 
+  // Skip zero-byte pages to avoid the OutputBuffer::updateAfterAcknowledgeLocked
+  // freedBytes>0 assertion. GpuSerializedPage::size() reports
+  // cudfVector->estimateFlatSize(); an empty partition slice (e.g. one of the
+  // 200 destinations of a hash-partitioned batch that happened to have no
+  // matching rows) has size()==0, and Velox's accounting VELOX_CHECK_GT
+  // (OutputBuffer.cpp:760) fires with freedBytes=0 when such a page is
+  // eventually freed. See plan/issue-outputbuffer-zero-bytes.md (OUT-01).
+  if (page->size() == 0) {
+    return false;
+  }
+
   {
     auto lockedStats = stats_.wlock();
     lockedStats->addOutputVector(page->size(), page->numRows().value_or(0));
