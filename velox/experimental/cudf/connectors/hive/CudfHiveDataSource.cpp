@@ -289,6 +289,7 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
     }
 
     // Single-file path (no coalesced files).
+    VELOX_NVTX_SCOPED("HiveNext::SingleFileReadChunk");
     if (not splitReader_->has_next()) {
       return nullptr;
     }

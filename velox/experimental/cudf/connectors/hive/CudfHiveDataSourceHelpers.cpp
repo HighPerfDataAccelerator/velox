@@ -154,11 +154,16 @@ void BufferedInputDataSource::load(rmm::cuda_stream_view stream) {
 
 std::unique_ptr<cudf::io::datasource::buffer>
 BufferedInputDataSource::host_read(size_t offset, size_t size) {
+  VELOX_NVTX_SCOPED("BufferedDS::host_read_alloc");
   if (offset >= fileSize_) {
     return cudf::io::datasource::buffer::create(std::vector<uint8_t>{});
   }
   const size_t readSize = std::min(size, fileSize_ - offset);
-  auto buf = std::make_shared<PinnedHostBuffer>(readSize);
+  std::shared_ptr<PinnedHostBuffer> buf;
+  {
+    VELOX_NVTX_SCOPED("BufferedDS::AllocPinned");
+    buf = std::make_shared<PinnedHostBuffer>(readSize);
+  }
   if (buf->isPinned()) {
     pinnedAllocBytes_.fetch_add(readSize, std::memory_order_relaxed);
   } else {
@@ -170,6 +175,7 @@ BufferedInputDataSource::host_read(size_t offset, size_t size) {
 
 size_t
 BufferedInputDataSource::host_read(size_t offset, size_t size, uint8_t* dst) {
+  VELOX_NVTX_SCOPED("BufferedDS::host_read_dst");
   if (offset >= fileSize_) {
     return 0;
   }
@@ -202,6 +208,7 @@ std::future<size_t> BufferedInputDataSource::device_read_async(
   VELOX_CHECK(input_->executor() != nullptr, "IO executor is not initialized");
   auto future = folly::via(input_->executor())
                     .thenValue([this, offset, size, dst, stream](auto&&) {
+                      VELOX_NVTX_SCOPED("BufferedDS::device_read_async");
                       auto hostBuffer = this->host_read(offset, size);
                       CUDF_CUDA_TRY(cudaMemcpyAsync(
                           dst,
@@ -222,11 +229,19 @@ void BufferedInputDataSource::readContiguous(
     size_t offset,
     size_t size,
     uint8_t* dst) {
+  VELOX_NVTX_SCOPED("BufferedDS::readContiguous");
   using namespace facebook::velox::dwio::common;
   // BufferedInput::read gives us a stream over the exact region.
-  auto stream = input_->read(offset, size, LogType::FILE);
+  std::unique_ptr<SeekableInputStream> stream;
+  {
+    VELOX_NVTX_SCOPED("BufferedDS::input_read");
+    stream = input_->read(offset, size, LogType::FILE);
+  }
   VELOX_CHECK(stream != nullptr, "read() returned null stream");
-  stream->readFully(reinterpret_cast<char*>(dst), size);
+  {
+    VELOX_NVTX_SCOPED("BufferedDS::readFully");
+    stream->readFully(reinterpret_cast<char*>(dst), size);
+  }
 }
 
 referenceToNameConverter::referenceToNameConverter(
