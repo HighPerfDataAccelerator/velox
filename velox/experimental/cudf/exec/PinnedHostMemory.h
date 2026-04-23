@@ -56,7 +56,7 @@ struct PinnedAllocStats {
                peak, cur, std::memory_order_relaxed)) {
     }
     auto total = pc + fallbackCount.load(std::memory_order_relaxed);
-    if ((total & (total - 1)) == 0 || (total % 100000) == 0) {
+    if ((total % 100000) == 0) {
       dump("alloc");
     }
   }
@@ -65,7 +65,7 @@ struct PinnedAllocStats {
     auto fc = fallbackCount.fetch_add(1, std::memory_order_relaxed) + 1;
     fallbackBytes.fetch_add(bytes, std::memory_order_relaxed);
     auto total = pinnedCount.load(std::memory_order_relaxed) + fc;
-    if ((total & (total - 1)) == 0 || (total % 100000) == 0) {
+    if ((total % 100000) == 0) {
       dump("fallback");
     }
   }
@@ -119,8 +119,7 @@ class PreferredPinnedPool {
 
     // Fast path: try pinned pool.
     try {
-      auto mr = cudf::get_pinned_memory_resource();
-      void* ptr = mr.allocate_sync(bytes);
+      void* ptr = cachedMr_.allocate_sync(bytes);
       PinnedAllocStats::instance().recordPinned(bytes);
       return {ptr, true};
     } catch (...) {
@@ -151,8 +150,7 @@ class PreferredPinnedPool {
     if (pinned) {
       PinnedAllocStats::instance().recordFree(bytes);
       try {
-        auto mr = cudf::get_pinned_memory_resource();
-        mr.deallocate_sync(ptr, bytes);
+        cachedMr_.deallocate_sync(ptr, bytes);
       } catch (...) {
         // If deallocation fails (poisoned context), just leak rather than
         // crash.  This is a last-resort safety net.
@@ -178,6 +176,13 @@ class PreferredPinnedPool {
   PreferredPinnedPool() = default;
   mutable std::mutex mu_;
   std::unordered_set<void*> pageablePtrs_;
+  // Cache the pinned mr reference once. cudf::get_pinned_memory_resource()
+  // acquires a global mutex (host_mr_mutex) on every call, which becomes a
+  // hot contention point on paths that allocate thousands of small pinned
+  // buffers per query (e.g. parquet scan host_read callbacks). The mr ref
+  // is stable once cudf's lazy init completes and Gluten never calls
+  // config_default_pinned_memory_resource to swap it, so caching is safe.
+  rmm::host_device_async_resource_ref cachedMr_{cudf::get_pinned_memory_resource()};
 };
 
 /// RAII host buffer that prefers pinned memory for fast PCIe DMA transfers.
