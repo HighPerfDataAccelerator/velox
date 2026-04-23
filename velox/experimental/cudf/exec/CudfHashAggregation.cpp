@@ -1107,6 +1107,14 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
     std::vector<column_index_t> const& groupByKeys,
     std::vector<std::unique_ptr<Aggregator>>& aggregators,
     rmm::cuda_stream_view stream) {
+  // AGG-01 defensive: cuDF's verify_valid_requests (groupby.cu:192) doesn't
+  // short-circuit on 0-row input; it rejects (STRUCT, SUM)-style combos even
+  // when there's nothing to aggregate. Return nullptr for empty inputs so
+  // callers (computeIntermediateGroupbyPartial / getOutput) treat it as
+  // "no output this tick".
+  if (tableView.num_rows() == 0) {
+    return nullptr;
+  }
   auto groupbyKeyView =
       tableView.select(groupByKeys.begin(), groupByKeys.end());
 
@@ -1254,6 +1262,17 @@ RowVectorPtr CudfHashAggregation::getOutput() {
   }
 
   if (inputs_.empty() && !noMoreInput_) {
+    return nullptr;
+  }
+
+  // AGG-01: when noMoreInput_ AND inputs_ is empty, don't invoke cuDF groupby.
+  // cuDF's verify_valid_requests (groupby.cu:192) runs BEFORE the
+  // `_keys.num_rows() == 0` short-circuit, so 0-row partition slices with
+  // merge_extract aggregations (SUM on STRUCT etc) trip the type/agg check.
+  // Return nullptr -- the contract the Driver uses for "no output this tick".
+  // See plan/issue-cudf-aggregation-empty-input.md.
+  if (inputs_.empty() && noMoreInput_) {
+    finished_ = true;
     return nullptr;
   }
 
