@@ -169,6 +169,38 @@ RowVectorPtr GpuExchange::getOutput() {
       const uint64_t rawInputBytes = gpuPage->size();
       auto result = gpuPage->cudfVector();
 
+      // Gluten shuffle payloads prepend a hash_with_seed(...) partition column
+      // that Velox's HashPartitionFunctionSpec does not strip. The declared
+      // consumer-side ExchangeNode outputType excludes that hash prefix, so
+      // the received CudfVector can have more cuDF columns than the logical
+      // output schema. Reconcile by dropping the leading (actual - declared)
+      // columns. See plan/issue-cudf-aggregation-empty-input.md root-cause
+      // trace.
+      if (result) {
+        const auto declared = static_cast<size_t>(outputType_->size());
+        const auto actualCols =
+            static_cast<size_t>(result->getTableView().num_columns());
+        if (actualCols > declared) {
+          const auto delta = actualCols - declared;
+          auto stream = result->stream();
+          auto view = result->getTableView();
+          std::vector<cudf::column_view> keep;
+          keep.reserve(declared);
+          for (size_t i = delta; i < actualCols; ++i) {
+            keep.push_back(view.column(i));
+          }
+          auto slicedTable = std::make_unique<cudf::table>(
+              cudf::table_view(keep), stream);
+          stream.synchronize();
+          result = std::make_shared<CudfVector>(
+              result->pool(),
+              outputType_,
+              result->size(),
+              std::move(slicedTable),
+              stream);
+        }
+      }
+
       // Release the page now that we have taken its vector.
       page.reset();
 
