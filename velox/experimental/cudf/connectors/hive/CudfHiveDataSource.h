@@ -18,6 +18,7 @@
 
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConfig.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConnectorSplit.h"
+#include "velox/experimental/cudf/connectors/hive/CudfHiveDataSourceHelpers.hpp"
 #include "velox/experimental/cudf/exec/GpuTimer.h"
 #include "velox/experimental/cudf/exec/NvtxHelper.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
@@ -245,6 +246,11 @@ class CudfHiveDataSource : public DataSource, public NvtxHelper {
   std::vector<cudf::size_type> exptFilteredRowGroups_;
   size_t exptNextRGIndex_{0};
   cudf::io::parquet_reader_options exptResolvedOptions_;
+  // Owns the AST nodes that exptResolvedOptions_.get_filter() references.
+  // Must live as long as exptResolvedOptions_ because
+  // parquet_reader_options::set_filter stores only a reference to the
+  // expression; its backing tree storage lives inside the converter.
+  std::unique_ptr<referenceToNameConverter> exptExprConverter_;
 };
 
 } // namespace facebook::velox::cudf_velox::connector::hive

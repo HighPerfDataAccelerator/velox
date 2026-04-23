@@ -1151,11 +1151,14 @@ void CudfHiveDataSource::initExperimentalReaderMetadata() {
 
   if (readerOptions_.get_filter().has_value()) {
     EXPT_TRACE("has filter, converting ref->name");
-    auto exprConverter = referenceToNameConverter(
+    // The converter owns the AST tree that backs the converted expression;
+    // exptResolvedOptions_.set_filter only stores a reference to it, so the
+    // converter must outlive exptResolvedOptions_. Store as member.
+    exptExprConverter_ = std::make_unique<referenceToNameConverter>(
         readerOptions_.get_filter(),
         exptSplitReader_->parquet_metadata().schema,
         readColumnNames_);
-    exptResolvedOptions_.set_filter(exprConverter.convertedExpression());
+    exptResolvedOptions_.set_filter(exptExprConverter_->convertedExpression());
     EXPT_TRACE("filter converted");
 
     auto footerBytes = fetchFooterBytes(dataSource_);
