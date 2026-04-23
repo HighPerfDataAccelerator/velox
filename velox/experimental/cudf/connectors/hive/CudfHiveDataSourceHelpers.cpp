@@ -17,6 +17,7 @@
 #include "velox/experimental/cudf/connectors/hive/CudfHiveDataSourceHelpers.hpp"
 
 #include "velox/dwio/common/BufferedInput.h"
+#include "velox/dwio/common/CachedBufferedInput.h"
 #include "velox/dwio/parquet/thrift/ParquetThriftTypes.h"
 #include "velox/experimental/cudf/exec/NvtxHelper.h"
 #include "velox/experimental/cudf/exec/PinnedHostMemory.h"
@@ -231,7 +232,26 @@ void BufferedInputDataSource::readContiguous(
     uint8_t* dst) {
   VELOX_NVTX_SCOPED("BufferedDS::readContiguous");
   using namespace facebook::velox::dwio::common;
-  // BufferedInput::read gives us a stream over the exact region.
+
+  // Fast path: bypass the BufferedInput stream layer for non-caching inputs.
+  // cudf's on-demand Parquet reader calls host_read many times per row group
+  // without ever using enqueue/load, so BufferedInput::read falls back to its
+  // "Unplanned read" branch and constructs a fresh SeekableInputStream with
+  // memory-pool-backed loadQuantum read-ahead every call. The stream is torn
+  // down after a single readFully, so read-ahead and pool allocation are pure
+  // overhead. Skipping the stream layer preserves correctness because the
+  // only functional contributions of that layer here are (a) serving cached
+  // regions from prior enqueue/load cycles, which we never perform, and
+  // (b) cache hits from CachedBufferedInput, which only applies when the
+  // async data cache is enabled. Fall back to the original path if the
+  // underlying BufferedInput is a CachedBufferedInput so cache hits remain
+  // possible.
+  if (!dynamic_cast<const CachedBufferedInput*>(input_.get())) {
+    VELOX_NVTX_SCOPED("BufferedDS::preadDirect");
+    input_->getReadFile()->pread(offset, size, dst);
+    return;
+  }
+
   std::unique_ptr<SeekableInputStream> stream;
   {
     VELOX_NVTX_SCOPED("BufferedDS::input_read");
