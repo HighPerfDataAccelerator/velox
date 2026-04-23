@@ -1196,14 +1196,14 @@ std::unique_ptr<cudf::table> CudfHiveDataSource::readNextExperimentalBatch(
 
   std::vector<cudf::device_span<uint8_t const>> columnChunkData;
   columnChunkData.reserve(columnChunkBuffers.size());
-  std::transform(
-      columnChunkBuffers.begin(),
-      columnChunkBuffers.end(),
-      std::back_inserter(columnChunkData),
-      [](auto& buffer) {
-        return cudf::device_span<uint8_t const>{
-            static_cast<uint8_t*>(buffer.data()), buffer.size()};
-      });
+  for (size_t i = 0; i < columnChunkBuffers.size(); ++i) {
+    // Buffers are allocated with padded size (round_up_safe to multiple of 8)
+    // for alignment, but the span must advertise only the actual byteRange size
+    // so Parquet decode does not read past real data into uninitialized padding.
+    columnChunkData.push_back(cudf::device_span<uint8_t const>{
+        static_cast<uint8_t*>(columnChunkBuffers[i].data()),
+        static_cast<size_t>(columnChunkByteRanges[i].size())});
+  }
 
   const auto totalRows =
       exptSplitReader_->total_rows_in_row_groups(batchSpan);
