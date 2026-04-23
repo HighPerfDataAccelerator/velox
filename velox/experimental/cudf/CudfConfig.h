@@ -52,6 +52,8 @@ struct CudfConfig {
       "cudf.gpu_target_batch_bytes"};
   static constexpr const char* kCudfProfilingSync{
       "cudf.profiling_sync"};
+  static constexpr const char* kCudfProfilingTimersEnabled{
+      "cudf.profiling_timers_enabled"};
 
   /// Singleton CudfConfig instance.
   /// Clients must set the configs below before invoking registerCudf().
@@ -136,6 +138,14 @@ struct CudfConfig {
   /// per operator so that wall_time - gpu_event_time accurately reflects
   /// non-GPU overhead. Kills CPU-GPU pipelining; use for profiling only.
   bool profilingSync{false};
+
+  /// Master switch for all per-operator / per-fetch / per-shuffle-op
+  /// profiling timers (GpuTimer event records, UcxFetchTimer,
+  /// GpuShuffleCatalog fine-grained chrono).  Default true preserves
+  /// historical observability. Set false for bench runs where the ~7%
+  /// overhead of dense cudaEventRecord + steady_clock::now is not worth
+  /// the per-op breakdown.
+  bool profilingTimersEnabled{true};
 };
 
 } // namespace facebook::velox::cudf_velox

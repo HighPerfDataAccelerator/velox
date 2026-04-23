@@ -477,6 +477,10 @@ void CudfConfig::initialize(
   if (config.find(kCudfProfilingSync) != config.end()) {
     profilingSync = folly::to<bool>(config[kCudfProfilingSync]);
   }
+  if (config.find(kCudfProfilingTimersEnabled) != config.end()) {
+    profilingTimersEnabled =
+        folly::to<bool>(config[kCudfProfilingTimersEnabled]);
+  }
   LOG(WARNING) << "CudfConfig initialized: gpuTargetBatchRows="
                << gpuTargetBatchRows
                << " gpuTargetBatchBytes=" << gpuTargetBatchBytes

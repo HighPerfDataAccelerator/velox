@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "velox/experimental/cudf/CudfConfig.h"
+
 #include <cuda_runtime.h>
 #include <rmm/cuda_stream_view.hpp>
 
@@ -36,16 +38,28 @@ namespace facebook::velox::cudf_velox {
 /// At close() time, call totalNanos() to get the accumulated GPU time
 /// and report it as a RuntimeStat.  totalNanos() may trigger a
 /// partial sync (cudaEventSynchronize) on the last pending interval.
+///
+/// Gated by CudfConfig::profilingTimersEnabled (default true).  When
+/// disabled, no cudaEvent* calls are issued and totalNanos() returns 0.
+/// Measured ~7-8% warm-state speedup on q3/q7 sf1000 4-GPU when off,
+/// due to driver-lock contention under dense cudaEventRecord.
 class GpuTimer {
  public:
   GpuTimer() {
+    if (!kEnabled()) {
+      return;
+    }
     cudaEventCreateWithFlags(&startEvt_, cudaEventDefault);
     cudaEventCreateWithFlags(&stopEvt_, cudaEventDefault);
   }
 
   ~GpuTimer() {
-    cudaEventDestroy(startEvt_);
-    cudaEventDestroy(stopEvt_);
+    if (startEvt_) {
+      cudaEventDestroy(startEvt_);
+    }
+    if (stopEvt_) {
+      cudaEventDestroy(stopEvt_);
+    }
   }
 
   GpuTimer(const GpuTimer&) = delete;
@@ -56,6 +70,9 @@ class GpuTimer {
   /// resolved first via cudaEventQuery (non-blocking when the GPU
   /// has already caught up, which is the common case).
   void start(rmm::cuda_stream_view stream) {
+    if (!kEnabled()) {
+      return;
+    }
     resolvePending();
     cudaEventRecord(startEvt_, stream.value());
     started_ = true;
@@ -63,6 +80,9 @@ class GpuTimer {
 
   /// Record the end of a GPU timing interval.
   void stop(rmm::cuda_stream_view stream) {
+    if (!kEnabled()) {
+      return;
+    }
     if (!started_) {
       return;
     }
@@ -74,11 +94,25 @@ class GpuTimer {
   /// Return the total accumulated GPU-side nanoseconds.
   /// Forces resolution of any pending interval (may sync).
   uint64_t totalNanos() {
+    if (!kEnabled()) {
+      return 0;
+    }
     resolvePending();
     return accumulatedNs_;
   }
 
  private:
+  /// Read CudfConfig::profilingTimersEnabled once at first call and cache.
+  /// The config is initialized early in VeloxBackend init before any cudf
+  /// operator runs, so this cached value is stable for the lifetime of
+  /// the process.  Branch-predictable — every timer method exits early
+  /// when false, incurring no cudaEvent* calls.
+  static bool kEnabled() {
+    static const bool enabled =
+        CudfConfig::getInstance().profilingTimersEnabled;
+    return enabled;
+  }
+
   void resolvePending() {
     if (!pending_) {
       return;
