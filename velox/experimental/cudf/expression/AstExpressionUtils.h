@@ -317,7 +317,15 @@ bool isAstExprSupported(const std::shared_ptr<velox::exec::Expr>& expr) {
     return false;
   }
 
-  LOG(WARNING) << "Unsupported expression by AST: " << expr->toString();
+  // Cosmetic: demote from WARNING to VLOG(1). This fires during priority
+  // probing in createCudfExpression (ExpressionEvaluator.cpp ~1355) for every
+  // expression evaluated -- the AST evaluator just reports "I can't handle
+  // this" and the priority fallback correctly picks cuDF non-AST (the
+  // function evaluator, priority 50). This is NOT a CPU fallback; data stays
+  // on GPU. The original WARNING level spammed logs and misled readers into
+  // thinking a CPU fallback had occurred. See plan/issue-ast-fallback.md
+  // (AST-01).
+  VLOG(1) << "Unsupported expression by AST: " << expr->toString();
   return false;
 }
 
