@@ -52,9 +52,19 @@
 #include <cuda_runtime.h>
 
 #include <future>
+#include <iostream>
 #include <limits>
 #include <memory>
 #include <string>
+#include <thread>
+
+// TEMP: trace macro to pinpoint SIGABRT line in experimental reader path.
+// std::endl flushes; plus explicit << std::flush in case of custom streams.
+#define EXPT_TRACE(msg) \
+  do { \
+    std::cerr << "[EXPT tid=" << std::this_thread::get_id() \
+              << " @L" << __LINE__ << "] " << msg << std::endl << std::flush; \
+  } while (0)
 
 namespace facebook::velox::cudf_velox::connector::hive {
 
@@ -1072,26 +1082,33 @@ RowVectorPtr CudfHiveDataSource::flushAccumulated() {
 }
 
 void CudfHiveDataSource::initExperimentalReaderMetadata() {
+  EXPT_TRACE("init enter");
   VELOX_CHECK(!exptMetadataInitialized_);
   exptFilteredRowGroups_ = exptSplitReader_->all_row_groups(readerOptions_);
+  EXPT_TRACE("after all_row_groups count=" << exptFilteredRowGroups_.size());
 
   exptResolvedOptions_ = readerOptions_;
 
   if (readerOptions_.get_filter().has_value()) {
+    EXPT_TRACE("has filter, converting ref->name");
     auto exprConverter = referenceToNameConverter(
         readerOptions_.get_filter(),
         exptSplitReader_->parquet_metadata().schema,
         readColumnNames_);
     exptResolvedOptions_.set_filter(exprConverter.convertedExpression());
+    EXPT_TRACE("filter converted");
 
     auto footerBytes = fetchFooterBytes(dataSource_);
+    EXPT_TRACE("before tmp reader construct");
     auto tmpExptSplitReader = std::make_unique<CudfHybridScanReader>(
         cudf::host_span<uint8_t const>{
             footerBytes->data(), footerBytes->size()},
         exptResolvedOptions_);
+    EXPT_TRACE("before filter_row_groups_with_stats");
     exptFilteredRowGroups_ =
         tmpExptSplitReader->filter_row_groups_with_stats(
             exptFilteredRowGroups_, exptResolvedOptions_, stream_);
+    EXPT_TRACE("after filter_row_groups_with_stats count=" << exptFilteredRowGroups_.size());
   }
 
   if (not exptResolvedOptions_.get_filter().has_value()) {
@@ -1104,12 +1121,15 @@ void CudfHiveDataSource::initExperimentalReaderMetadata() {
 
   exptNextRGIndex_ = 0;
   exptMetadataInitialized_ = true;
+  EXPT_TRACE("init exit");
 }
 
 std::unique_ptr<cudf::table> CudfHiveDataSource::readNextExperimentalBatch(
     cudf::io::table_metadata& metadata) {
+  EXPT_TRACE("enter idx=" << exptNextRGIndex_ << "/" << exptFilteredRowGroups_.size());
   VELOX_CHECK(exptMetadataInitialized_);
   if (exptNextRGIndex_ >= exptFilteredRowGroups_.size()) {
+    EXPT_TRACE("early return: no more row groups");
     return nullptr;
   }
 
@@ -1138,10 +1158,13 @@ std::unique_ptr<cudf::table> CudfHiveDataSource::readNextExperimentalBatch(
       exptFilteredRowGroups_.data() + exptNextRGIndex_,
       batchEnd - exptNextRGIndex_);
   exptNextRGIndex_ = batchEnd;
+  EXPT_TRACE("batchSpan size=" << batchSpan.size() << " totalBytes=" << batchCompressedBytes);
 
+  EXPT_TRACE("before all_column_chunks_byte_ranges");
   const auto columnChunkByteRanges =
       exptSplitReader_->all_column_chunks_byte_ranges(
           batchSpan, exptResolvedOptions_);
+  EXPT_TRACE("after all_column_chunks_byte_ranges n=" << columnChunkByteRanges.size());
 
   std::vector<rmm::device_buffer> columnChunkBuffers(
       columnChunkByteRanges.size());
@@ -1186,13 +1209,20 @@ std::unique_ptr<cudf::table> CudfHiveDataSource::readNextExperimentalBatch(
         }
       });
 
+  EXPT_TRACE("after buffer alloc + enqueue loop: bufs=" << columnChunkBuffers.size()
+             << " ioFutures=" << ioFutures.size());
+
   if (auto bufferedInput =
           dynamic_cast<BufferedInputDataSource*>(dataSource_.get())) {
+    EXPT_TRACE("before bufferedInput->load");
     bufferedInput->load(stream_);
+    EXPT_TRACE("after bufferedInput->load");
   }
+  EXPT_TRACE("before ioFutures wait");
   std::for_each(ioFutures.begin(), ioFutures.end(), [](auto& future) {
     future.get();
   });
+  EXPT_TRACE("after ioFutures wait");
 
   std::vector<cudf::device_span<uint8_t const>> columnChunkData;
   columnChunkData.reserve(columnChunkBuffers.size());
@@ -1217,6 +1247,7 @@ std::unique_ptr<cudf::table> CudfHiveDataSource::readNextExperimentalBatch(
   // default chunked_parquet_reader: row-group-level via
   // filter_row_groups_with_stats in initExperimentalReaderMetadata, then
   // row-level apply_boolean_mask below).
+  EXPT_TRACE("before setup_chunking_for_all_columns columnChunkData.size=" << columnChunkData.size());
   exptSplitReader_->setup_chunking_for_all_columns(
       0,  // chunk_read_limit: unlimited
       0,  // pass_read_limit: unlimited
@@ -1225,33 +1256,48 @@ std::unique_ptr<cudf::table> CudfHiveDataSource::readNextExperimentalBatch(
       exptResolvedOptions_,
       stream_,
       cudf::get_current_device_resource_ref());
+  EXPT_TRACE("after setup_chunking_for_all_columns");
 
   std::vector<std::unique_ptr<cudf::table>> chunks;
+  int chunkLoopIter = 0;
   while (exptSplitReader_->has_next_table_chunk()) {
+    EXPT_TRACE("chunk loop iter=" << chunkLoopIter << " before materialize_all_columns_chunk");
     auto chunk = exptSplitReader_->materialize_all_columns_chunk();
+    EXPT_TRACE("chunk loop iter=" << chunkLoopIter << " after materialize rows="
+               << (chunk.tbl ? chunk.tbl->num_rows() : -1));
     metadata = std::move(chunk.metadata);
     if (chunk.tbl && chunk.tbl->num_rows() > 0) {
       chunks.push_back(std::move(chunk.tbl));
     }
+    chunkLoopIter++;
   }
+  EXPT_TRACE("chunk loop exit iters=" << chunkLoopIter << " chunks.size=" << chunks.size());
 
   if (chunks.empty()) {
+    EXPT_TRACE("return nullptr (empty chunks)");
     return nullptr;
   }
 
+  EXPT_TRACE("before concat/select");
   std::unique_ptr<cudf::table> cudfTable = (chunks.size() == 1)
       ? std::move(chunks[0])
       : concatenateTables(std::move(chunks), stream_);
+  EXPT_TRACE("after concat rows=" << cudfTable->num_rows());
 
   if (readerOptions_.get_filter().has_value()) {
+    EXPT_TRACE("before compute_column filter");
     auto filterMask = cudf::compute_column(
         *cudfTable, readerOptions_.get_filter().value(), stream_);
-    return cudf::apply_boolean_mask(
+    EXPT_TRACE("after compute_column, before apply_boolean_mask");
+    auto result = cudf::apply_boolean_mask(
         cudfTable->view(),
         filterMask->view(),
         stream_,
         cudf::get_current_device_resource_ref());
+    EXPT_TRACE("after apply_boolean_mask rows=" << result->num_rows());
+    return result;
   }
+  EXPT_TRACE("return (no filter) rows=" << cudfTable->num_rows());
   return cudfTable;
 }
 
