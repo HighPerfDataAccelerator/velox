@@ -215,6 +215,7 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
   if (not useExperimentalSplitReader_) {
     // Lazily create the multi-source reader on first next() call.
     if (coalescedMultiSourcePending_) {
+      VELOX_NVTX_SCOPED("HiveNext::WaitCoalescedReaderCreate");
       createCoalescedMultiSourceReader();
     }
 
@@ -229,35 +230,39 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
       GpuGuard coalescedGpuGuard;
       gpuTimer_.start(stream_);
       auto coalesceLoopStartUs = getCurrentTimeMicro();
-      while (splitReader_->has_next()) {
-        auto tableWithMetadata = splitReader_->read_chunk();
-        if (tableWithMetadata.tbl && tableWithMetadata.tbl->num_rows() > 0) {
-          auto& tbl = tableWithMetadata.tbl;
-          if (remainingFilterExprSet_) {
-            auto cols = tbl->release();
-            const auto originalNumColumns = cols.size();
-            auto filterResult = cudfExpressionEvaluator_->eval(
-                cols, stream_, cudf::get_current_device_resource_ref());
-            std::vector<std::unique_ptr<cudf::column>> origCols;
-            origCols.reserve(originalNumColumns);
-            std::move(
-                cols.begin(),
-                cols.begin() + originalNumColumns,
-                std::back_inserter(origCols));
-            auto origTable =
-                std::make_unique<cudf::table>(std::move(origCols));
-            tbl = cudf::apply_boolean_mask(
-                *origTable,
-                asView(filterResult),
-                stream_,
-                cudf::get_current_device_resource_ref());
-          }
-          if (tbl->num_rows() > 0) {
-            auto tableBytes = estimateTableBytes(tbl);
-            accumulatedTables_.push_back(std::move(tbl));
-            accumulatedBytes_ += tableBytes;
-            if (accumulatedBytes_ >= effectiveTarget) {
-              break;
+      {
+        VELOX_NVTX_SCOPED("HiveNext::SplitReadLoop");
+        while (splitReader_->has_next()) {
+          auto tableWithMetadata = splitReader_->read_chunk();
+          if (tableWithMetadata.tbl && tableWithMetadata.tbl->num_rows() > 0) {
+            auto& tbl = tableWithMetadata.tbl;
+            if (remainingFilterExprSet_) {
+              VELOX_NVTX_SCOPED("HiveNext::RemainingFilterEval");
+              auto cols = tbl->release();
+              const auto originalNumColumns = cols.size();
+              auto filterResult = cudfExpressionEvaluator_->eval(
+                  cols, stream_, cudf::get_current_device_resource_ref());
+              std::vector<std::unique_ptr<cudf::column>> origCols;
+              origCols.reserve(originalNumColumns);
+              std::move(
+                  cols.begin(),
+                  cols.begin() + originalNumColumns,
+                  std::back_inserter(origCols));
+              auto origTable =
+                  std::make_unique<cudf::table>(std::move(origCols));
+              tbl = cudf::apply_boolean_mask(
+                  *origTable,
+                  asView(filterResult),
+                  stream_,
+                  cudf::get_current_device_resource_ref());
+            }
+            if (tbl->num_rows() > 0) {
+              auto tableBytes = estimateTableBytes(tbl);
+              accumulatedTables_.push_back(std::move(tbl));
+              accumulatedBytes_ += tableBytes;
+              if (accumulatedBytes_ >= effectiveTarget) {
+                break;
+              }
             }
           }
         }
@@ -265,7 +270,11 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
       totalCoalesceBufferTimeNs_.fetch_add(
           (getCurrentTimeMicro() - coalesceLoopStartUs) * 1000,
           std::memory_order_relaxed);
-      auto result = flushAccumulated();
+      RowVectorPtr result;
+      {
+        VELOX_NVTX_SCOPED("HiveNext::FlushAccumulated");
+        result = flushAccumulated();
+      }
       gpuTimer_.stop(stream_);
       if (result == nullptr) {
         return nullptr;
@@ -308,8 +317,11 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
         }
       }
 
-      if (!hasCoalescedFiles || !advanceToNextCoalescedFile()) {
-        return nullptr;
+      {
+        VELOX_NVTX_SCOPED("HiveNext::AdvanceNextFile");
+        if (!hasCoalescedFiles || !advanceToNextCoalescedFile()) {
+          return nullptr;
+        }
       }
     }
   }
@@ -326,6 +338,7 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
   uint64_t filterTimeUs{0};
   // Apply remaining filter if present
   if (remainingFilterExprSet_) {
+    VELOX_NVTX_SCOPED("HiveNext::RemainingFilterEval");
     MicrosecondTimer filterTimer(&filterTimeUs);
     auto cudfTableColumns = cudfTable->release();
     const auto originalNumColumns = cudfTableColumns.size();
@@ -369,11 +382,15 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
     cudfTable = std::make_unique<cudf::table>(std::move(originalColumns));
   }
 
-  auto output = cudfIsRegistered()
-      ? std::make_shared<CudfVector>(
-            pool_, outputType_, nRows, std::move(cudfTable), stream_)
-      : with_arrow::toVeloxColumn(
-            cudfTable->view(), pool_, outputType_->names(), stream_);
+  RowVectorPtr output;
+  {
+    VELOX_NVTX_SCOPED("HiveNext::CudfToVelox");
+    output = cudfIsRegistered()
+        ? std::make_shared<CudfVector>(
+              pool_, outputType_, nRows, std::move(cudfTable), stream_)
+        : with_arrow::toVeloxColumn(
+              cudfTable->view(), pool_, outputType_->names(), stream_);
+  }
 
   // Check if conversion yielded a nullptr
   VELOX_CHECK_NOT_NULL(output, "Cudf to Velox conversion yielded a nullptr");
@@ -488,6 +505,7 @@ void CudfHiveDataSource::addSplit(std::shared_ptr<ConnectorSplit> split) {
         // handle alive for the duration of the async read.
         executor_->add(
             [promise, readFile, colNames = std::move(colNames), start]() {
+              VELOX_NVTX_SCOPED("AsyncIORead");
               try {
                 auto buf =
                     selectiveParquetRead(readFile.get(), colNames, start);
@@ -812,13 +830,16 @@ void CudfHiveDataSource::createCoalescedMultiSourceReader() {
   std::vector<cudf::host_span<const std::byte>> bufferSpans;
   bufferSpans.reserve(asyncFileReads_.size());
 
-  for (auto& asyncRead : asyncFileReads_) {
-    auto pinnedBuf = asyncRead.future.get();
-    VELOX_CHECK_NOT_NULL(pinnedBuf, "Async file read returned null");
-    bufferSpans.push_back(cudf::host_span<const std::byte>(
-        reinterpret_cast<const std::byte*>(pinnedBuf->data()),
-        pinnedBuf->size()));
-    coalescedPinnedBuffers_.push_back(std::move(pinnedBuf));
+  {
+    VELOX_NVTX_SCOPED("WaitAsyncFileReads");
+    for (auto& asyncRead : asyncFileReads_) {
+      auto pinnedBuf = asyncRead.future.get();
+      VELOX_CHECK_NOT_NULL(pinnedBuf, "Async file read returned null");
+      bufferSpans.push_back(cudf::host_span<const std::byte>(
+          reinterpret_cast<const std::byte*>(pinnedBuf->data()),
+          pinnedBuf->size()));
+      coalescedPinnedBuffers_.push_back(std::move(pinnedBuf));
+    }
   }
 
   totalPreReadTimeNs_.fetch_add(
@@ -847,12 +868,15 @@ void CudfHiveDataSource::createCoalescedMultiSourceReader() {
     readerOptions_.set_column_names(readColumnNames_);
   }
 
-  splitReader_ = std::make_unique<cudf::io::chunked_parquet_reader>(
-      cudfHiveConfig_->maxChunkReadLimit(),
-      cudfHiveConfig_->maxPassReadLimit(),
-      readerOptions_,
-      stream_,
-      cudf::get_current_device_resource_ref());
+  {
+    VELOX_NVTX_SCOPED("BuildChunkedReader");
+    splitReader_ = std::make_unique<cudf::io::chunked_parquet_reader>(
+        cudfHiveConfig_->maxChunkReadLimit(),
+        cudfHiveConfig_->maxPassReadLimit(),
+        readerOptions_,
+        stream_,
+        cudf::get_current_device_resource_ref());
+  }
 
   coalescedMultiSourcePending_ = false;
 
@@ -895,7 +919,10 @@ bool CudfHiveDataSource::advanceToNextCoalescedFile() {
     auto& asyncRead = asyncFileReads_[fileIdx];
     // Wait for this file's IO to complete (likely already done while
     // GPU was processing the previous file).
-    currentFilePinnedBuffer_ = asyncRead.future.get();
+    {
+      VELOX_NVTX_SCOPED("WaitNextFileRead");
+      currentFilePinnedBuffer_ = asyncRead.future.get();
+    }
     VELOX_CHECK_NOT_NULL(
         currentFilePinnedBuffer_, "Async file read returned null");
 
@@ -930,39 +957,43 @@ bool CudfHiveDataSource::advanceToNextCoalescedFile() {
       readerOptions_.set_column_names(readColumnNames_);
     }
 
-    if (useExperimentalSplitReader_) {
-      dataSource_ =
-          std::move(makeDataSourcesFromSourceInfo(
-                        cudf::io::source_info(
-                            cudf::host_span<const std::byte>(
-                                reinterpret_cast<const std::byte*>(
-                                    currentFilePinnedBuffer_->data()),
-                                currentFilePinnedBuffer_->size())))
-                        .front());
-      auto const footerBytes = fetchFooterBytes(dataSource_);
-      exptSplitReader_ = std::make_unique<CudfHybridScanReader>(
-          cudf::host_span<uint8_t const>{
-              footerBytes->data(), footerBytes->size()},
-          readerOptions_);
-      auto const pageIndexByteRange =
-          exptSplitReader_->page_index_byte_range();
-      if (not pageIndexByteRange.is_empty()) {
-        auto const pageIndexBytes = dataSource_->host_read(
-            pageIndexByteRange.offset(), pageIndexByteRange.size());
-        exptSplitReader_->setup_page_index(
+    {
+      VELOX_NVTX_SCOPED("BuildReaderForFile");
+      if (useExperimentalSplitReader_) {
+        dataSource_ =
+            std::move(makeDataSourcesFromSourceInfo(
+                          cudf::io::source_info(
+                              cudf::host_span<const std::byte>(
+                                  reinterpret_cast<const std::byte*>(
+                                      currentFilePinnedBuffer_->data()),
+                                  currentFilePinnedBuffer_->size())))
+                          .front());
+        auto const footerBytes = fetchFooterBytes(dataSource_);
+        exptSplitReader_ = std::make_unique<CudfHybridScanReader>(
             cudf::host_span<uint8_t const>{
-                pageIndexBytes->data(), pageIndexBytes->size()});
+                footerBytes->data(), footerBytes->size()},
+            readerOptions_);
+        auto const pageIndexByteRange =
+            exptSplitReader_->page_index_byte_range();
+        if (not pageIndexByteRange.is_empty()) {
+          auto const pageIndexBytes = dataSource_->host_read(
+              pageIndexByteRange.offset(), pageIndexByteRange.size());
+          exptSplitReader_->setup_page_index(
+              cudf::host_span<uint8_t const>{
+                  pageIndexBytes->data(), pageIndexBytes->size()});
+        }
+      } else {
+        splitReader_ = std::make_unique<cudf::io::chunked_parquet_reader>(
+            cudfHiveConfig_->maxChunkReadLimit(),
+            cudfHiveConfig_->maxPassReadLimit(),
+            readerOptions_,
+            stream_,
+            cudf::get_current_device_resource_ref());
       }
-    } else {
-      splitReader_ = std::make_unique<cudf::io::chunked_parquet_reader>(
-          cudfHiveConfig_->maxChunkReadLimit(),
-          cudfHiveConfig_->maxPassReadLimit(),
-          readerOptions_,
-          stream_,
-          cudf::get_current_device_resource_ref());
     }
   } else {
     // No async pre-read available; read from disk synchronously.
+    VELOX_NVTX_SCOPED("BuildReaderForFile");
     if (useExperimentalSplitReader_) {
       setupCudfDataSourceAndOptions();
       auto const footerBytes = fetchFooterBytes(dataSource_);

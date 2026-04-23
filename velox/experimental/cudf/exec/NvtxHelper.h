@@ -104,4 +104,20 @@ constexpr std::string_view extractClassAndFunction(
 
 #define VELOX_NVTX_FUNC_RANGE() NVTX3_FUNC_RANGE_IN(VeloxDomain)
 
+#define VELOX_NVTX_CONCAT_IMPL(a, b) a##b
+#define VELOX_NVTX_CONCAT(a, b) VELOX_NVTX_CONCAT_IMPL(a, b)
+
+// Mark a scoped NVTX range in the Velox domain with a static label.
+// The label is registered once (per call site) for low overhead.
+#define VELOX_NVTX_SCOPED(name)                                                \
+  static ::facebook::velox::cudf_velox::NvtxRegisteredStringT const            \
+      VELOX_NVTX_CONCAT(__velox_nvtx_str_, __LINE__){name};                    \
+  ::nvtx3::scoped_range_in<                                                    \
+      ::facebook::velox::cudf_velox::VeloxDomain> const                        \
+      VELOX_NVTX_CONCAT(__velox_nvtx_rng_, __LINE__) {                         \
+    ::nvtx3::event_attributes {                                                \
+      VELOX_NVTX_CONCAT(__velox_nvtx_str_, __LINE__)                           \
+    }                                                                          \
+  }
+
 } // namespace facebook::velox::cudf_velox

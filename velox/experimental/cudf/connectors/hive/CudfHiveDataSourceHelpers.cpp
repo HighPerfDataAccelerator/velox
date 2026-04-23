@@ -18,6 +18,7 @@
 
 #include "velox/dwio/common/BufferedInput.h"
 #include "velox/dwio/parquet/thrift/ParquetThriftTypes.h"
+#include "velox/experimental/cudf/exec/NvtxHelper.h"
 #include "velox/experimental/cudf/exec/PinnedHostMemory.h"
 
 #include <cudf/ast/detail/expression_transformer.hpp>
@@ -85,7 +86,10 @@ void BufferedInputDataSource::enqueueForDevice(
 }
 
 void BufferedInputDataSource::load(rmm::cuda_stream_view stream) {
-  input_->load(velox::dwio::common::LogType::FILE);
+  {
+    VELOX_NVTX_SCOPED("BufferedLoad::InputLoad");
+    input_->load(velox::dwio::common::LogType::FILE);
+  }
 
   if (pendingChunks_.empty()) {
     return;
@@ -97,38 +101,51 @@ void BufferedInputDataSource::load(rmm::cuda_stream_view stream) {
     totalBytes += chunk.size;
   }
 
-  auto pinnedBuf = std::make_shared<PinnedHostBuffer>(totalBytes);
+  std::shared_ptr<PinnedHostBuffer> pinnedBuf;
+  {
+    VELOX_NVTX_SCOPED("BufferedLoad::AllocPinned");
+    pinnedBuf = std::make_shared<PinnedHostBuffer>(totalBytes);
+  }
   if (pinnedBuf->isPinned()) {
     pinnedAllocBytes_.fetch_add(totalBytes, std::memory_order_relaxed);
   } else {
     pageableAllocBytes_.fetch_add(totalBytes, std::memory_order_relaxed);
   }
 
-  uint64_t hostOffset = 0;
-  for (auto& chunk : pendingChunks_) {
-    chunk.stream->readFully(
-        reinterpret_cast<char*>(pinnedBuf->data() + hostOffset), chunk.size);
-    hostOffset += chunk.size;
+  {
+    VELOX_NVTX_SCOPED("BufferedLoad::ReadFully");
+    uint64_t hostOffset = 0;
+    for (auto& chunk : pendingChunks_) {
+      chunk.stream->readFully(
+          reinterpret_cast<char*>(pinnedBuf->data() + hostOffset), chunk.size);
+      hostOffset += chunk.size;
+    }
   }
 
   // Phase 2 (GPU): one bulk H2D into a staging device buffer, then D2D scatter.
   rmm::device_buffer staging(totalBytes, stream);
-  CUDF_CUDA_TRY(cudaMemcpyAsync(
-      staging.data(),
-      pinnedBuf->data(),
-      totalBytes,
-      cudaMemcpyHostToDevice,
-      stream.value()));
-
-  hostOffset = 0;
-  for (const auto& chunk : pendingChunks_) {
+  {
+    VELOX_NVTX_SCOPED("BufferedLoad::H2DStaging");
     CUDF_CUDA_TRY(cudaMemcpyAsync(
-        chunk.deviceDst,
-        static_cast<uint8_t*>(staging.data()) + hostOffset,
-        chunk.size,
-        cudaMemcpyDeviceToDevice,
+        staging.data(),
+        pinnedBuf->data(),
+        totalBytes,
+        cudaMemcpyHostToDevice,
         stream.value()));
-    hostOffset += chunk.size;
+  }
+
+  {
+    VELOX_NVTX_SCOPED("BufferedLoad::D2DScatter");
+    uint64_t hostOffset = 0;
+    for (const auto& chunk : pendingChunks_) {
+      CUDF_CUDA_TRY(cudaMemcpyAsync(
+          chunk.deviceDst,
+          static_cast<uint8_t*>(staging.data()) + hostOffset,
+          chunk.size,
+          cudaMemcpyDeviceToDevice,
+          stream.value()));
+      hostOffset += chunk.size;
+    }
   }
 
   pendingChunks_.clear();
@@ -419,7 +436,12 @@ std::shared_ptr<PinnedHostBuffer> selectiveParquetRead(
   const auto fileSize = readFile->size();
 
   auto fullRead = [&]() {
-    auto buf = std::make_shared<PinnedHostBuffer>(fileSize);
+    VELOX_NVTX_SCOPED("SelectiveRead::FullRead");
+    std::shared_ptr<PinnedHostBuffer> buf;
+    {
+      VELOX_NVTX_SCOPED("SelectiveRead::AllocPinnedBuf");
+      buf = std::make_shared<PinnedHostBuffer>(fileSize);
+    }
     readFile->pread(0, fileSize, buf->data());
     return buf;
   };
@@ -443,6 +465,7 @@ std::shared_ptr<PinnedHostBuffer> selectiveParquetRead(
   // avoiding any dependency on cuDF internal APIs.
   pqthrift::FileMetaData metadata;
   {
+    VELOX_NVTX_SCOPED("SelectiveRead::ReadFooter");
     // Read the ender (footer_len + magic) from the end of the file.
     uint8_t enderBuf[kEnderLen];
     readFile->pread(fileSize - kEnderLen, kEnderLen, enderBuf);
@@ -472,6 +495,9 @@ std::shared_ptr<PinnedHostBuffer> selectiveParquetRead(
   }
 
   // Step 2: Build children indices for schema tree navigation.
+  static NvtxRegisteredStringT const clipName{"SelectiveRead::ClipMetadata"};
+  auto clipRange = std::make_unique<::nvtx3::scoped_range_in<VeloxDomain>>(
+      ::nvtx3::event_attributes{clipName});
   const auto childrenIdx = buildChildrenIdx(metadata.schema);
 
   // Step 3: Build the set of needed column names
@@ -624,10 +650,14 @@ std::shared_ptr<PinnedHostBuffer> selectiveParquetRead(
     }
   }
 
+  // End ClipMetadata range before moving on to serialization.
+  clipRange.reset();
+
   // Step 6: Serialize the clipped footer using Velox Thrift Compact Protocol.
   auto outTransport =
       std::make_shared<apache::thrift::transport::TMemoryBuffer>();
   {
+    VELOX_NVTX_SCOPED("SelectiveRead::SerializeFooter");
     apache::thrift::protocol::TCompactProtocolT<
         apache::thrift::transport::TMemoryBuffer>
         outProtocol(outTransport);
@@ -639,7 +669,11 @@ std::shared_ptr<PinnedHostBuffer> selectiveParquetRead(
 
   const size_t totalBufSize =
       kHeaderLen + totalChunkBytes + newFooterSize + kEnderLen;
-  auto buf = std::make_shared<PinnedHostBuffer>(totalBufSize);
+  std::shared_ptr<PinnedHostBuffer> buf;
+  {
+    VELOX_NVTX_SCOPED("SelectiveRead::AllocPinnedBuf");
+    buf = std::make_shared<PinnedHostBuffer>(totalBufSize);
+  }
   uint8_t* dst = buf->data();
 
   // Write PAR1 header
@@ -648,9 +682,12 @@ std::shared_ptr<PinnedHostBuffer> selectiveParquetRead(
   size_t dstOffset = kHeaderLen;
 
   // Step 7: Read needed column chunks from file and write to buffer
-  for (const auto& chunk : chunksToRead) {
-    readFile->pread(chunk.srcOffset, chunk.size, dst + dstOffset);
-    dstOffset += chunk.size;
+  {
+    VELOX_NVTX_SCOPED("SelectiveRead::PreadChunks");
+    for (const auto& chunk : chunksToRead) {
+      readFile->pread(chunk.srcOffset, chunk.size, dst + dstOffset);
+      dstOffset += chunk.size;
+    }
   }
 
   // Write footer
