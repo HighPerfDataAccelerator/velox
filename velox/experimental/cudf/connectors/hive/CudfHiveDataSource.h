@@ -251,13 +251,6 @@ class CudfHiveDataSource : public DataSource, public NvtxHelper {
   // parquet_reader_options::set_filter stores only a reference to the
   // expression; its backing tree storage lives inside the converter.
   std::unique_ptr<referenceToNameConverter> exptExprConverter_;
-
-  // DEBUG (B): dummy always-true filter for experimental path to bypass
-  // cudf select_columns(ALL_COLUMNS) SIGSEGV on complex filter AST.
-  // Real row-level filter is still enforced via apply_boolean_mask
-  // in readNextExperimentalBatch.
-  cudf::ast::tree exptNoFilterTree_;
-  std::unique_ptr<cudf::numeric_scalar<bool>> exptNoFilterScalar_;
 };
 
 } // namespace facebook::velox::cudf_velox::connector::hive

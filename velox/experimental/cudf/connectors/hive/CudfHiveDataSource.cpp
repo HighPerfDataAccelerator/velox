@@ -1149,24 +1149,31 @@ void CudfHiveDataSource::initExperimentalReaderMetadata() {
 
   exptResolvedOptions_ = readerOptions_;
 
-  // DEBUG (B): override exptResolvedOptions_ filter with a dummy always-true
-  // IDENTITY(literal(true)) to bypass cudf select_columns(ALL_COLUMNS) crash
-  // on complex filter AST. exptResolvedOptions_ was just copied from
-  // readerOptions_ so its filter is a reference to the real subfield filter;
-  // overriding with a dummy literal lets experimental reader initialize
-  // without the buggy filter walk. Row-group stats pruning is forfeit;
-  // the outer cudf::apply_boolean_mask in readNextExperimentalBatch still
-  // enforces the real filter on the output table.
-  exptNoFilterScalar_ =
-      std::make_unique<cudf::numeric_scalar<bool>>(true, true, stream_);
-  auto const& dummyLit =
-      exptNoFilterTree_.push(cudf::ast::literal(*exptNoFilterScalar_));
-  auto const& dummyFilter =
-      exptNoFilterTree_.push(cudf::ast::operation(
-          cudf::ast::ast_operator::IDENTITY, dummyLit));
-  exptResolvedOptions_.set_filter(dummyFilter);
-  EXPT_TRACE("DEBUG(B): filter overridden to dummy IDENTITY(literal(true)); "
-             "row-group stats pruning skipped");
+  if (readerOptions_.get_filter().has_value()) {
+    EXPT_TRACE("has filter, converting ref->name");
+    // Converter owns convertedExpr_ (cudf::ast::tree) which backs the
+    // name-based filter referenced by exptResolvedOptions_.set_filter(...).
+    // Must outlive exptResolvedOptions_; stored as class member.
+    exptExprConverter_ = std::make_unique<referenceToNameConverter>(
+        readerOptions_.get_filter(),
+        exptSplitReader_->parquet_metadata().schema,
+        readColumnNames_);
+    exptResolvedOptions_.set_filter(exptExprConverter_->convertedExpression());
+    EXPT_TRACE("filter converted to name-based");
+
+    auto footerBytes = fetchFooterBytes(dataSource_);
+    EXPT_TRACE("before tmp reader construct");
+    auto tmpExptSplitReader = std::make_unique<CudfHybridScanReader>(
+        cudf::host_span<uint8_t const>{
+            footerBytes->data(), footerBytes->size()},
+        exptResolvedOptions_);
+    EXPT_TRACE("before filter_row_groups_with_stats");
+    exptFilteredRowGroups_ =
+        tmpExptSplitReader->filter_row_groups_with_stats(
+            exptFilteredRowGroups_, exptResolvedOptions_, stream_);
+    EXPT_TRACE("after filter_row_groups_with_stats count="
+               << exptFilteredRowGroups_.size());
+  }
 
   exptNextRGIndex_ = 0;
   exptMetadataInitialized_ = true;
