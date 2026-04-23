@@ -51,12 +51,17 @@
 
 #include <cuda_runtime.h>
 
+#include <csignal>
+#include <cstdlib>
+#include <execinfo.h>
+#include <exception>
 #include <future>
 #include <iostream>
 #include <limits>
 #include <memory>
 #include <string>
 #include <thread>
+#include <unistd.h>
 
 // TEMP: trace macro to pinpoint SIGABRT line in experimental reader path.
 // std::endl flushes; plus explicit << std::flush in case of custom streams.
@@ -65,6 +70,54 @@
     std::cerr << "[EXPT tid=" << std::this_thread::get_id() \
               << " @L" << __LINE__ << "] " << msg << std::endl << std::flush; \
   } while (0)
+
+namespace {
+// Handlers installed once at library load time to surface what is hidden by
+// a plain SIGABRT: C++ exceptions that propagate to std::terminate (e.g.
+// uncaught throws, exceptions from noexcept functions or destructors) and
+// direct abort() calls (rare but possible inside cudf).
+void exptAbortHandler(int sig) {
+  void* buf[64];
+  int n = backtrace(buf, 64);
+  const char prefix[] = "[EXPT SIGABRT] backtrace:\n";
+  write(STDERR_FILENO, prefix, sizeof(prefix) - 1);
+  backtrace_symbols_fd(buf, n, STDERR_FILENO);
+  // Restore default handler and re-raise so process actually dies.
+  signal(sig, SIG_DFL);
+  raise(sig);
+}
+
+struct ExptDebugInstaller {
+  ExptDebugInstaller() {
+    std::set_terminate([]() {
+      std::cerr << "[EXPT TERMINATE] handler fired tid="
+                << std::this_thread::get_id() << std::endl
+                << std::flush;
+      if (auto ep = std::current_exception()) {
+        try {
+          std::rethrow_exception(ep);
+        } catch (const std::exception& e) {
+          std::cerr << "[EXPT TERMINATE] what(): " << e.what() << std::endl
+                    << std::flush;
+        } catch (...) {
+          std::cerr << "[EXPT TERMINATE] non-std exception" << std::endl
+                    << std::flush;
+        }
+      } else {
+        std::cerr << "[EXPT TERMINATE] no current_exception() set"
+                  << std::endl << std::flush;
+      }
+      void* buf[64];
+      int n = backtrace(buf, 64);
+      backtrace_symbols_fd(buf, n, STDERR_FILENO);
+      std::abort();
+    });
+    signal(SIGABRT, exptAbortHandler);
+  }
+};
+
+[[maybe_unused]] const ExptDebugInstaller g_expt_debug_installer;
+} // namespace
 
 namespace facebook::velox::cudf_velox::connector::hive {
 
