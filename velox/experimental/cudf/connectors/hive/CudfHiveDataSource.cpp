@@ -1205,36 +1205,54 @@ std::unique_ptr<cudf::table> CudfHiveDataSource::readNextExperimentalBatch(
         static_cast<size_t>(columnChunkByteRanges[i].size())});
   }
 
-  // Use materialize_all_columns (one-pass) instead of materialize_payload_columns
-  // (two-pass). The two-pass API requires a prior materialize_filter_columns
-  // pass to populate the reader's internal state machine; calling
-  // materialize_payload_columns without that prior pass left state uninitialized
-  // and caused decode-time illegal memory access. Row-level filter pushdown is
-  // therefore sacrificed (same pushdown granularity as the default
-  // chunked_parquet_reader: row-group-level via filter_row_groups_with_stats,
-  // then row-level apply_boolean_mask below). Row-group pruning is still active
-  // because batchSpan is taken from exptFilteredRowGroups_ which was pruned by
-  // filter_row_groups_with_stats in initExperimentalReaderMetadata.
-  auto tableWithMetadata = exptSplitReader_->materialize_all_columns(
+  // Use the chunked materialize_all_columns API. The single-call
+  // materialize_all_columns asserts "Hybrid scan reader must only create one
+  // pass per chunking setup" internally, so it can only be invoked once per
+  // reader, but readNextExperimentalBatch is called once per next() batch.
+  // setup_chunking_for_all_columns + materialize_all_columns_chunk loop
+  // resets the chunking state each batch, allowing repeated invocation on the
+  // same reader. chunk_read_limit=0 and pass_read_limit=0 mean no size cap, so
+  // the entire batch is materialized in as few chunks as cudf decides.
+  // Row-level filter pushdown is not used (same pushdown granularity as the
+  // default chunked_parquet_reader: row-group-level via
+  // filter_row_groups_with_stats in initExperimentalReaderMetadata, then
+  // row-level apply_boolean_mask below).
+  exptSplitReader_->setup_chunking_for_all_columns(
+      0,  // chunk_read_limit: unlimited
+      0,  // pass_read_limit: unlimited
       batchSpan,
       columnChunkData,
       exptResolvedOptions_,
       stream_,
       cudf::get_current_device_resource_ref());
 
-  metadata = std::move(tableWithMetadata.metadata);
+  std::vector<std::unique_ptr<cudf::table>> chunks;
+  while (exptSplitReader_->has_next_table_chunk()) {
+    auto chunk = exptSplitReader_->materialize_all_columns_chunk();
+    metadata = std::move(chunk.metadata);
+    if (chunk.tbl && chunk.tbl->num_rows() > 0) {
+      chunks.push_back(std::move(chunk.tbl));
+    }
+  }
+
+  if (chunks.empty()) {
+    return nullptr;
+  }
+
+  std::unique_ptr<cudf::table> cudfTable = (chunks.size() == 1)
+      ? std::move(chunks[0])
+      : concatenateTables(std::move(chunks), stream_);
 
   if (readerOptions_.get_filter().has_value()) {
-    std::unique_ptr<cudf::table> table = std::move(tableWithMetadata.tbl);
     auto filterMask = cudf::compute_column(
-        *table, readerOptions_.get_filter().value(), stream_);
+        *cudfTable, readerOptions_.get_filter().value(), stream_);
     return cudf::apply_boolean_mask(
-        table->view(),
+        cudfTable->view(),
         filterMask->view(),
         stream_,
         cudf::get_current_device_resource_ref());
   }
-  return std::move(tableWithMetadata.tbl);
+  return cudfTable;
 }
 
 } // namespace facebook::velox::cudf_velox::connector::hive
