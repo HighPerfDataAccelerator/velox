@@ -53,17 +53,12 @@ set(
 )
 velox_resolve_dependency_url(kvikio)
 
-# cudf v26.04.00 release (2026-04-08). Upgraded from fc213fc1 (Feb 10) to
-# pick up PR #21515 "Expand and improve AST expression support in Parquet
-# readers" which degrades unsupported filter expressions to always_true
-# instead of letting invalid AST refs leak into select_columns and crash
-# get_column_names_in_expression. Also brings hybrid_scan API refinements
-# (device spans, mr arg) and RMM/stream cleanups.
+# cudf commit fc213fc from 2026-02-10
 set(VELOX_cudf_VERSION 26.04 CACHE STRING "cudf version")
-set(VELOX_cudf_COMMIT f9c3cf195768647ac39d98674a614ca414cd1baa)
+set(VELOX_cudf_COMMIT fc213fc1ad889e2edf291b5555764ce677cb5dfa)
 set(
   VELOX_cudf_BUILD_SHA256_CHECKSUM
-  3406f14759c04437944a9e6f6b8f6b36713112ae51e30149739c53345395b6b0
+  f2c8eec90cb8571188e5bdd32222da208c353bbe1066c56bb3052a988feda1a2
 )
 set(VELOX_cudf_SOURCE_URL "https://github.com/rapidsai/cudf/archive/${VELOX_cudf_COMMIT}.tar.gz")
 velox_resolve_dependency_url(cudf)
