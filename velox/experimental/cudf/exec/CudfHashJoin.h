@@ -71,6 +71,15 @@ class CudfHashJoinBridge : public exec::JoinBridge {
 
   std::optional<rmm::cuda_stream_view> getBuildStream();
 
+  // Drop the bridge's reference to build-side tables and hash_join objects.
+  // Each probe operator already cached its own shared_ptr copy via
+  // hashOrFuture() during isBlocked(); dropping the bridge's copy does not
+  // invalidate any in-flight probe. Intended to be called from the last
+  // probe driver's noMoreInput() barrier. Without this, the bridge holds
+  // the build-side data until splitGroupState teardown at task end, which
+  // can include post-join aggregation + shuffle write.
+  void releaseBuildData();
+
  private:
   /** @brief Hash tables and join objects transferred from build to probe
    * operators */

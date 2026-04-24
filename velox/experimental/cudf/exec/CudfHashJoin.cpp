@@ -172,6 +172,16 @@ std::optional<rmm::cuda_stream_view> CudfHashJoinBridge::getBuildStream() {
   return buildStream_;
 }
 
+void CudfHashJoinBridge::releaseBuildData() {
+  std::lock_guard<std::mutex> l(mutex_);
+  // Resetting the optionals drops the bridge's shared_ptr refs to
+  // cudf::table and cudf::hash_join. Probe operators keep their own
+  // shared_ptr copies until their isFinished() resets them; actual device
+  // buffer release happens when the last shared_ptr is dropped.
+  hashObject_.reset();
+  buildStream_.reset();
+}
+
 CudfHashJoinBuild::CudfHashJoinBuild(
     int32_t operatorId,
     exec::DriverCtx* driverCtx,
@@ -552,12 +562,17 @@ void CudfHashJoinProbe::noMoreInput() {
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
   GpuGuard gpuGuard;
   Operator::noMoreInput();
-  if (!joinNode_->isRightJoin() && !joinNode_->isRightSemiFilterJoin()) {
-    return;
-  }
+
+  // allPeersFinished participates for every join type. Required for
+  // right-joins correctness (existing) and also lets the last probe driver
+  // drop the bridge's build-side reference. By the time every probe driver
+  // has reached noMoreInput, each has long since cached its own shared_ptr
+  // copy via hashOrFuture() in isBlocked(), so the bridge's copy is
+  // redundant. Non-right-join non-last drivers do not block on future_
+  // (see isBlocked); the future set by allPeersFinished is simply
+  // resolved by the last driver's SCOPE_EXIT and destructed unused.
   std::vector<ContinuePromise> promises;
   std::vector<std::shared_ptr<exec::Driver>> peers;
-  // Only last driver collects all answers
   if (!operatorCtx_->task()->allPeersFinished(
           planNodeId(), operatorCtx_->driver(), &future_, promises, peers)) {
     return;
@@ -605,38 +620,49 @@ void CudfHashJoinProbe::noMoreInput() {
       }
       synchronizeStreamAndRecord(stream);
     }
-    return;
+  } else if (joinNode_->isRightSemiFilterJoin()) {
+    // Collect results from peers.
+    for (auto& peer : peers) {
+      auto op = peer->findOperator(planNodeId());
+      auto* probe = dynamic_cast<CudfHashJoinProbe*>(op);
+      VELOX_CHECK_NOT_NULL(probe);
+      inputs_.insert(
+          inputs_.end(), probe->inputs_.begin(), probe->inputs_.end());
+    }
+
+    auto stream = cudfGlobalStreamPool().get_stream();
+    auto tbl = getConcatenatedTable(
+        inputs_, joinNode_->sources()[1]->outputType(), stream);
+
+    VELOX_CHECK_NOT_NULL(tbl);
+
+    if (CudfConfig::getInstance().debugEnabled) {
+      VLOG(1) << "Probe table number of columns: " << tbl->num_columns();
+      VLOG(1) << "Probe table number of rows: " << tbl->num_rows();
+    }
+
+    // Store the concatenated table in input_.
+    input_ = std::make_shared<CudfVector>(
+        operatorCtx_->pool(),
+        joinNode_->outputType(),
+        tbl->num_rows(),
+        std::move(tbl),
+        stream);
+
+    inputs_.clear();
   }
 
-  // Handling RightSemiFilterJoin
-  // Collect results from peers
-  for (auto& peer : peers) {
-    auto op = peer->findOperator(planNodeId());
-    auto* probe = dynamic_cast<CudfHashJoinProbe*>(op);
-    VELOX_CHECK_NOT_NULL(probe);
-    inputs_.insert(inputs_.end(), probe->inputs_.begin(), probe->inputs_.end());
+  // Last-driver-only: drop the bridge's reference to the build-side
+  // tables and hash_join. Each peer probe already has its own shared_ptr
+  // copy cached in hashObject_, so the bridge's copy is redundant beyond
+  // this point. Releasing here shortens the build-side lifetime from
+  // "task end" (splitGroupState teardown) to "last probe isFinished",
+  // cutting out the post-join agg / shuffle-write window.
+  auto joinBridge = operatorCtx_->task()->getCustomJoinBridge(
+      operatorCtx_->driverCtx()->splitGroupId, planNodeId());
+  if (auto b = std::dynamic_pointer_cast<CudfHashJoinBridge>(joinBridge)) {
+    b->releaseBuildData();
   }
-
-  auto stream = cudfGlobalStreamPool().get_stream();
-  auto tbl = getConcatenatedTable(
-      inputs_, joinNode_->sources()[1]->outputType(), stream);
-
-  VELOX_CHECK_NOT_NULL(tbl);
-
-  if (CudfConfig::getInstance().debugEnabled) {
-    VLOG(1) << "Probe table number of columns: " << tbl->num_columns();
-    VLOG(1) << "Probe table number of rows: " << tbl->num_rows();
-  }
-
-  // Store the concatenated table in input_
-  input_ = std::make_shared<CudfVector>(
-      operatorCtx_->pool(),
-      joinNode_->outputType(),
-      tbl->num_rows(),
-      std::move(tbl),
-      stream);
-
-  inputs_.clear();
 }
 
 std::unique_ptr<cudf::table> CudfHashJoinProbe::unfilteredOutput(
