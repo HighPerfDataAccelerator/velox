@@ -558,7 +558,8 @@ struct ApproxDistinctAggregator : cudf_velox::CudfHashAggregation::Aggregator {
             static_cast<cuda::std::byte*>(aligned_sketch.data()), first_size),
         precision_,
         kNullPolicy,
-        kNanPolicy);
+        kNanPolicy,
+        stream);
 
     for (cudf::size_type i = 1; i < sketch_column.size(); ++i) {
       cudf::size_type start_offset = host_offsets[i];
