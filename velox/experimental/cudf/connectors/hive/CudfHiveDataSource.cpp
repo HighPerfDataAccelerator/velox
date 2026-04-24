@@ -578,14 +578,18 @@ void CudfHiveDataSource::addSplit(std::shared_ptr<ConnectorSplit> split) {
         auto future = promise->get_future().share();
 
         // Capture readFile by value (shared_ptr copy) to keep the file
-        // handle alive for the duration of the async read.
+        // handle alive for the duration of the async read. Pass the
+        // process-wide ioExecutor() into selectiveParquetRead so the
+        // per-chunk pread dispatch runs in parallel on a distinct pool
+        // (not the outer executor_ we are already sitting on, which
+        // would risk starving ourselves).
         executor_->add(
             [promise, readFile, colNames = std::move(colNames), start,
              length]() {
               VELOX_NVTX_SCOPED("AsyncIORead");
               try {
                 auto buf = selectiveParquetRead(
-                    readFile.get(), colNames, start, length);
+                    readFile.get(), colNames, start, length, ioExecutor());
                 promise->set_value(std::move(buf));
               } catch (...) {
                 promise->set_exception(std::current_exception());
@@ -596,9 +600,10 @@ void CudfHiveDataSource::addSplit(std::shared_ptr<ConnectorSplit> split) {
                 std::move(readFile)};
       }
 
-      // Fallback: no executor — run synchronously.
-      auto buf =
-          selectiveParquetRead(readFile.get(), colNames, start, length);
+      // Fallback: no executor — run synchronously on the caller thread,
+      // still parallelizing per-chunk preads across ioExecutor().
+      auto buf = selectiveParquetRead(
+          readFile.get(), colNames, start, length, ioExecutor());
       std::promise<std::shared_ptr<cudf_velox::PinnedHostBuffer>> promise;
       promise.set_value(std::move(buf));
       return {promise.get_future().share(), fsize, start, length,

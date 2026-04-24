@@ -30,6 +30,9 @@
 #include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/prefetch.hpp>
 
+#include <folly/executors/CPUThreadPoolExecutor.h>
+#include <folly/executors/thread_factory/NamedThreadFactory.h>
+
 #include <rmm/mr/arena_memory_resource.hpp>
 #include <rmm/mr/cuda_async_managed_memory_resource.hpp>
 #include <rmm/mr/cuda_async_memory_resource.hpp>
@@ -151,6 +154,17 @@ std::shared_ptr<rmm::mr::device_memory_resource> createMemoryResource(
 cudf::detail::cuda_stream_pool& cudfGlobalStreamPool() {
   return cudf::detail::global_cuda_stream_pool();
 };
+
+folly::Executor* ioExecutor() {
+  // Process-wide pool, lazy-initialized on first use. 32 threads roughly
+  // matches the per-node NVMe concurrency our local Parquet reads benefit
+  // from; tune if we move to HDFS/S3. Shared across all
+  // CudfHiveDataSource instances so FIFO ordering reflects task-arrival
+  // order across Spark drivers.
+  static auto executor = std::make_unique<folly::CPUThreadPoolExecutor>(
+      32, std::make_shared<folly::NamedThreadFactory>("cudf-pread"));
+  return executor.get();
+}
 
 namespace {
 uint64_t estimateColumnViewBytes(cudf::column_view const& col) {

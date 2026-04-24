@@ -22,6 +22,8 @@
 #include "velox/experimental/cudf/exec/NvtxHelper.h"
 #include "velox/experimental/cudf/exec/PinnedHostMemory.h"
 
+#include <folly/futures/Future.h>
+
 #include <cudf/ast/detail/expression_transformer.hpp>
 #include <cudf/ast/detail/operators.hpp>
 #include <cudf/ast/expressions.hpp>
@@ -481,7 +483,8 @@ std::shared_ptr<PinnedHostBuffer> selectiveParquetRead(
     ReadFile* readFile,
     const std::vector<std::string>& readColumnNames,
     uint64_t splitStart,
-    uint64_t splitLength) {
+    uint64_t splitLength,
+    folly::Executor* ioExec) {
   const auto filePath = readFile->getName();
   const auto fileSize = readFile->size();
 
@@ -786,12 +789,55 @@ std::shared_ptr<PinnedHostBuffer> selectiveParquetRead(
   std::memcpy(dst, &magic, kHeaderLen);
   size_t dstOffset = kHeaderLen;
 
-  // Step 7: Read needed column chunks from file and write to buffer
+  // Step 7: Read needed column chunks from file and write to buffer.
+  // When ioExec is provided and there is more than one chunk, dispatch
+  // each pread as an independent task onto the shared I/O pool so that
+  // chunks within a single split are read in parallel. Dispatch of this
+  // split's chunks is batch-atomic (global mutex) so that concurrently-
+  // calling drivers cannot interleave their chunks ahead of ours in the
+  // pool's FIFO queue. Overall: earlier-arriving splits finish all their
+  // preads before later-arriving splits start theirs, letting the
+  // earlier split begin GPU decompress while the later split waits in
+  // the queue.
   {
     VELOX_NVTX_SCOPED("SelectiveRead::PreadChunks");
-    for (const auto& chunk : chunksToRead) {
-      readFile->pread(chunk.srcOffset, chunk.size, dst + dstOffset);
-      dstOffset += chunk.size;
+    if (ioExec != nullptr && chunksToRead.size() > 1) {
+      // Precompute the destination offset for each chunk so that lambdas
+      // are independent (no shared mutable state).
+      std::vector<size_t> dstOffsets(chunksToRead.size());
+      size_t running = dstOffset;
+      for (size_t i = 0; i < chunksToRead.size(); ++i) {
+        dstOffsets[i] = running;
+        running += chunksToRead[i].size;
+      }
+
+      std::vector<folly::Future<folly::Unit>> futures;
+      futures.reserve(chunksToRead.size());
+      {
+        // Process-wide mutex held only across the enqueue loop. Each
+        // enqueue is microsecond-level; the mutex serializes at dispatch
+        // time but does not block the actual pread work, which runs on
+        // pool worker threads.
+        static std::mutex sPreadDispatchMutex;
+        std::lock_guard<std::mutex> lock(sPreadDispatchMutex);
+        for (size_t i = 0; i < chunksToRead.size(); ++i) {
+          auto const srcOffset = chunksToRead[i].srcOffset;
+          auto const size = chunksToRead[i].size;
+          auto const off = dstOffsets[i];
+          futures.push_back(folly::via(
+              ioExec, [readFile, srcOffset, size, dst, off]() {
+                readFile->pread(srcOffset, size, dst + off);
+              }));
+        }
+      }
+      // collect() rethrows the first exception if any pread failed.
+      folly::collect(std::move(futures)).get();
+      dstOffset = running;
+    } else {
+      for (const auto& chunk : chunksToRead) {
+        readFile->pread(chunk.srcOffset, chunk.size, dst + dstOffset);
+        dstOffset += chunk.size;
+      }
     }
   }
 

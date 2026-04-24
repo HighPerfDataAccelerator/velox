@@ -21,6 +21,8 @@
 #include <cudf/detail/utilities/stream_pool.hpp>
 #include <cudf/table/table.hpp>
 
+#include <folly/Executor.h>
+
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/mr/device_memory_resource.hpp>
 
@@ -43,6 +45,15 @@ createMemoryResource(std::string_view mode, int percent);
  * @brief Returns the global CUDA stream pool used by cudf.
  */
 [[nodiscard]] cudf::detail::cuda_stream_pool& cudfGlobalStreamPool();
+
+/**
+ * @brief Process-wide I/O thread pool used for chunk-level parallel pread
+ * dispatch inside selectiveParquetRead. Shared across all
+ * CudfHiveDataSource instances so that task-arrival ordering carries
+ * through to pread scheduling (earlier-arriving splits are dispatched
+ * onto the pool's FIFO queue first and therefore served first).
+ */
+[[nodiscard]] folly::Executor* ioExecutor();
 
 // Concatenate a vector of cuDF tables into a single table
 [[nodiscard]] std::unique_ptr<cudf::table> concatenateTables(

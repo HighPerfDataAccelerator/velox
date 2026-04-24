@@ -18,6 +18,8 @@
 
 #include "velox/dwio/common/BufferedInput.h"
 
+#include <folly/Executor.h>
+
 #include <atomic>
 #include <cudf/ast/detail/expression_transformer.hpp>
 #include <cudf/ast/detail/operators.hpp>
@@ -167,11 +169,20 @@ makeDataSourcesFromSourceInfo(
 /// Falls back to reading the full file if readColumnNames is empty or the
 /// selective read would not save significant IO.
 /// Uses the Velox ReadFile abstraction, supporting local, HDFS, S3, etc.
+///
+/// If `ioExec` is non-null and the file has more than one column chunk to
+/// read, the per-chunk `pread` calls are dispatched in parallel onto the
+/// executor as independent tasks. Dispatch of a single split's chunks is
+/// batch-atomic (protected by a process-wide mutex), so with a FIFO task
+/// queue later-arriving splits never have their chunks interleave ahead
+/// of an earlier split's chunks. Set `ioExec == nullptr` to force the
+/// original sequential pread loop (used as a fallback/testing path).
 std::shared_ptr<facebook::velox::cudf_velox::PinnedHostBuffer>
 selectiveParquetRead(
     facebook::velox::ReadFile* readFile,
     const std::vector<std::string>& readColumnNames,
     uint64_t splitStart = 0,
-    uint64_t splitLength = std::numeric_limits<uint64_t>::max());
+    uint64_t splitLength = std::numeric_limits<uint64_t>::max(),
+    folly::Executor* ioExec = nullptr);
 
 } // namespace facebook::velox::cudf_velox::connector::hive
