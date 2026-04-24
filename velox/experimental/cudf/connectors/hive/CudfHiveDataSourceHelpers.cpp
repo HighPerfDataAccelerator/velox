@@ -150,6 +150,14 @@ void BufferedInputDataSource::load(rmm::cuda_stream_view stream) {
     }
   }
 
+  // The H2D above reads from pinnedBuf, which is about to go out of scope
+  // and return its memory to the pinned pool. Sync the stream so the pool
+  // does not reuse that memory before the async copy has executed.
+  {
+    VELOX_NVTX_SCOPED("BufferedLoad::SyncBeforePinnedRelease");
+    stream.synchronize();
+  }
+
   pendingChunks_.clear();
 }
 
@@ -217,6 +225,11 @@ std::future<size_t> BufferedInputDataSource::device_read_async(
                           hostBuffer->size(),
                           cudaMemcpyHostToDevice,
                           stream.value()));
+                      // hostBuffer is about to be destroyed when this lambda
+                      // returns; its memory goes back to the pinned pool and
+                      // may be reused before the async H2D has executed on
+                      // the stream. Sync to keep it alive.
+                      stream.synchronize();
                       return hostBuffer->size();
                     });
   return toStdFuture(std::move(future));
@@ -467,9 +480,17 @@ std::string getTopLevelColumnName(
 std::shared_ptr<PinnedHostBuffer> selectiveParquetRead(
     ReadFile* readFile,
     const std::vector<std::string>& readColumnNames,
-    uint64_t splitStart) {
+    uint64_t splitStart,
+    uint64_t splitLength) {
   const auto filePath = readFile->getName();
   const auto fileSize = readFile->size();
+
+  // Clamp the split range to the file: splitLength may arrive as sentinel
+  // max or oversize when the caller only has the file path.
+  const uint64_t splitEndExclusive =
+      (splitStart >= fileSize) ? fileSize
+      : (splitLength > fileSize - splitStart) ? fileSize
+      : splitStart + splitLength;
 
   auto fullRead = [&]() {
     VELOX_NVTX_SCOPED("SelectiveRead::FullRead");
@@ -482,8 +503,11 @@ std::shared_ptr<PinnedHostBuffer> selectiveParquetRead(
     return buf;
   };
 
-  // Fall back to full read if no column projection or sub-file split
-  if (readColumnNames.empty() || splitStart > 0) {
+  // Fall back to full read only when there is no column projection. Byte-
+  // range splits (splitStart > 0) are handled via row group filtering below;
+  // the old fallback also triggered on splitStart > 0 and produced incorrect
+  // results for byte-range splits, so we drop it here.
+  if (readColumnNames.empty()) {
     return fullRead();
   }
 
@@ -614,7 +638,41 @@ std::shared_ptr<PinnedHostBuffer> selectiveParquetRead(
     clippedMetadata.schema = std::move(clippedSchema);
   }
 
+  // Determine a row group's starting byte offset in the source file.
+  // Prefers the optional RowGroup.file_offset when set by the writer; falls
+  // back to the minimum offset across its column chunks (dictionary page
+  // offset or data page offset, whichever comes first on disk).
+  auto rowGroupStartOffset = [](const pqthrift::RowGroup& rg) -> int64_t {
+    if (rg.__isset.file_offset && rg.file_offset > 0) {
+      return rg.file_offset;
+    }
+    int64_t minOffset = std::numeric_limits<int64_t>::max();
+    for (const auto& cc : rg.columns) {
+      int64_t s = cc.meta_data.data_page_offset;
+      if (cc.meta_data.__isset.dictionary_page_offset &&
+          cc.meta_data.dictionary_page_offset > 0 &&
+          cc.meta_data.dictionary_page_offset < s) {
+        s = cc.meta_data.dictionary_page_offset;
+      }
+      if (s < minOffset) {
+        minOffset = s;
+      }
+    }
+    return minOffset;
+  };
+
+  int64_t totalKeptRows = 0;
   for (auto& rg : metadata.row_groups) {
+    // Row group ownership: keep a row group iff its starting offset falls
+    // in [splitStart, splitEndExclusive). This matches how Spark and cuDF
+    // on-demand reader assign row groups to byte-range splits, so each
+    // row group is owned by exactly one split across the whole job.
+    const int64_t rgStart = rowGroupStartOffset(rg);
+    if (rgStart < static_cast<int64_t>(splitStart) ||
+        rgStart >= static_cast<int64_t>(splitEndExclusive)) {
+      continue;
+    }
+
     pqthrift::RowGroup clippedRg;
     clippedRg.total_byte_size = 0;
     clippedRg.num_rows = rg.num_rows;
@@ -641,12 +699,23 @@ std::shared_ptr<PinnedHostBuffer> selectiveParquetRead(
       clippedRg.total_compressed_size += cc.meta_data.total_compressed_size;
     }
 
+    totalKeptRows += rg.num_rows;
     clippedMetadata.row_groups.push_back(std::move(clippedRg));
   }
 
-  // Check if selective read saves significant IO (>20% savings)
+  // When row groups were filtered by byte range, num_rows in the clipped
+  // footer must reflect only the kept row groups, not the original total.
+  clippedMetadata.num_rows = totalKeptRows;
+
+  // Check if selective read saves significant IO (>20% savings). Only
+  // valid when this split covers the whole file — for byte-range splits
+  // (splitStart > 0) fullRead would bypass row group filtering and
+  // return all rows, breaking correctness. So skip this optimization
+  // whenever the split is not the whole file.
+  const bool coversWholeFile =
+      (splitStart == 0) && (splitEndExclusive == fileSize);
   const int64_t fullReadCost = static_cast<int64_t>(fileSize);
-  if (totalChunkBytes > fullReadCost * 80 / 100) {
+  if (coversWholeFile && totalChunkBytes > fullReadCost * 80 / 100) {
     return fullRead();
   }
 

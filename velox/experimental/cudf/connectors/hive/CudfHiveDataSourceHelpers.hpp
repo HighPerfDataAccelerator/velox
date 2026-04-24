@@ -28,6 +28,7 @@
 #include <cudf/io/parquet_schema.hpp>
 #include <cudf/io/types.hpp>
 
+#include <limits>
 #include <list>
 #include <string>
 #include <unordered_map>
@@ -153,15 +154,24 @@ makeDataSourcesFromSourceInfo(
     size_t maxSizeEstimate = 0);
 
 /// Read a Parquet file selectively: parse footer, identify needed column
-/// chunks based on readColumnNames, read only those byte ranges, and
-/// reconstruct a compact valid Parquet buffer in pinned host memory.
-/// Falls back to reading the full file if readColumnNames is empty,
-/// splitStart > 0 (sub-file splits), or selective read would not save IO.
+/// chunks based on readColumnNames, filter row groups whose starting byte
+/// offset falls in [splitStart, splitStart + splitLength), read only
+/// those byte ranges, and reconstruct a compact valid Parquet buffer in
+/// pinned host memory.
+///
+/// Row group ownership follows the Spark + Parquet convention: a row
+/// group belongs to the split that contains its starting offset. For the
+/// whole-file case (splitStart == 0, splitLength == fileSize), all row
+/// groups are kept.
+///
+/// Falls back to reading the full file if readColumnNames is empty or the
+/// selective read would not save significant IO.
 /// Uses the Velox ReadFile abstraction, supporting local, HDFS, S3, etc.
 std::shared_ptr<facebook::velox::cudf_velox::PinnedHostBuffer>
 selectiveParquetRead(
     facebook::velox::ReadFile* readFile,
     const std::vector<std::string>& readColumnNames,
-    uint64_t splitStart = 0);
+    uint64_t splitStart = 0,
+    uint64_t splitLength = std::numeric_limits<uint64_t>::max());
 
 } // namespace facebook::velox::cudf_velox::connector::hive

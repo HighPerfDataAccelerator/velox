@@ -537,7 +537,19 @@ void CudfHiveDataSource::addSplit(std::shared_ptr<ConnectorSplit> split) {
   coalescedPinnedBuffers_.clear();
   coalescedMultiSourcePending_ = false;
 
-  if (!split_->coalescedFiles.empty()) {
+  // Decide whether to use the Velox-side pre-read path. The default
+  // (non-experimental) reader always benefits from pre-read because it
+  // feeds cuDF in-memory host_spans instead of going through the slow
+  // BufferedInputDataSource on-demand host_read callback. We require a
+  // non-empty column projection so selectiveParquetRead can produce a
+  // clipped Parquet buffer; empty projection falls back to the on-demand
+  // path below. The experimental reader keeps its original behavior of
+  // only pre-reading secondary coalesced files (primary is sync).
+  const bool hasColProjection = !readColumnNames_.empty();
+  const bool usePreReadPrimary = !useExperimentalSplitReader_ && hasColProjection;
+  const bool hasCoalesced = !split_->coalescedFiles.empty();
+
+  if (usePreReadPrimary || hasCoalesced) {
     pendingFiles_ = split_->coalescedFiles;
     for (const auto& fileRange : pendingFiles_) {
       completedBytes_ += fileRange.length;
@@ -568,11 +580,12 @@ void CudfHiveDataSource::addSplit(std::shared_ptr<ConnectorSplit> split) {
         // Capture readFile by value (shared_ptr copy) to keep the file
         // handle alive for the duration of the async read.
         executor_->add(
-            [promise, readFile, colNames = std::move(colNames), start]() {
+            [promise, readFile, colNames = std::move(colNames), start,
+             length]() {
               VELOX_NVTX_SCOPED("AsyncIORead");
               try {
-                auto buf =
-                    selectiveParquetRead(readFile.get(), colNames, start);
+                auto buf = selectiveParquetRead(
+                    readFile.get(), colNames, start, length);
                 promise->set_value(std::move(buf));
               } catch (...) {
                 promise->set_exception(std::current_exception());
@@ -584,7 +597,8 @@ void CudfHiveDataSource::addSplit(std::shared_ptr<ConnectorSplit> split) {
       }
 
       // Fallback: no executor — run synchronously.
-      auto buf = selectiveParquetRead(readFile.get(), colNames, start);
+      auto buf =
+          selectiveParquetRead(readFile.get(), colNames, start, length);
       std::promise<std::shared_ptr<cudf_velox::PinnedHostBuffer>> promise;
       promise.set_value(std::move(buf));
       return {promise.get_future().share(), fsize, start, length,
@@ -594,9 +608,11 @@ void CudfHiveDataSource::addSplit(std::shared_ptr<ConnectorSplit> split) {
     auto preReadStartUs = getCurrentTimeMicro();
 
     if (!useExperimentalSplitReader_) {
-      // Multi-source approach (like spark-rapids): async-read ALL files
-      // (primary + coalesced) into individual pinned buffers, then create
-      // ONE chunked_parquet_reader with all buffers as multiple sources.
+      // Multi-source approach (like spark-rapids): async-read the primary
+      // plus any coalesced files into individual pinned buffers, then
+      // create ONE chunked_parquet_reader fed by those buffers as multi-
+      // source. When there are no coalesced files this still applies to
+      // just the primary, giving single-file splits the same fast path.
       const size_t totalFiles = 1 + pendingFiles_.size();
       asyncFileReads_.reserve(totalFiles);
       asyncFileReads_.push_back(launchAsyncRead(
