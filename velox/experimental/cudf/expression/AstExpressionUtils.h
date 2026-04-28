@@ -37,8 +37,23 @@
 #include <cudf/unary.hpp>
 #include <cudf/utilities/traits.hpp>
 
+#include <unordered_set>
+
 namespace facebook::velox::cudf_velox {
 namespace {
+
+// Expressions handled by CudfFunction / FunctionExpression rather than the
+// cuDF AST compute_column path. Used by isAstExprSupported to silence the
+// "Unsupported expression by AST" warning -- the FunctionExpression
+// evaluator picks them up.
+const std::unordered_set<std::string> kFunctionExprNames = {
+    "might_contain",
+    "xxhash64_with_seed",
+    "hash_with_seed",
+    "murmur3hash_with_seed",
+    "isnull",
+    "row_constructor",
+};
 
 cudf::ast::literal createLiteral(
     const VectorPtr& vector,
@@ -252,6 +267,12 @@ bool isAstExprSupported(const std::shared_ptr<velox::exec::Expr>& expr) {
     }
     LOG(WARNING) << "Field " << name << "not found, in expression "
                  << expr->toString();
+    return false;
+  }
+
+  // Function-evaluator-handled expressions (bloom-filter / hash family).
+  // Silently return false -- the FunctionExpression evaluator picks them up.
+  if (kFunctionExprNames.count(name)) {
     return false;
   }
 

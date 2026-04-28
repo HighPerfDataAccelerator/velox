@@ -997,9 +997,10 @@ void registerSparkFunctions(const std::string& prefix) {
         return std::make_shared<HashFunction>(expr);
       },
       {FunctionSignatureBuilder()
-           .returnType("bigint")
+           .returnType("integer")
            .constantArgumentType("integer")
            .argumentType("any")
+           .variableArity("any")
            .build()});
 
   registerCudfFunction(
