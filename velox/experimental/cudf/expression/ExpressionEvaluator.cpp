@@ -1216,13 +1216,48 @@ void registerCudfFunctions(
   }
 }
 
+// Look up a CudfFunction in the registry, tolerating prefix drift.
+// Functions are registered as `prefix + bareName` (see registerSparkFunctions
+// / registerBuiltinFunctions). At lookup time, expr->name() may arrive either
+// with or without the configured prefix depending on the upstream binding
+// (Spark-Gluten vs Presto). Try, in order:
+//   1) the literal name (covers the no-drift common case),
+//   2) prefix + name (covers expr->name() arriving without prefix),
+//   3) name with the configured prefix stripped (covers expr->name()
+//      arriving with prefix when registry keys are bare).
+// Returning nullptr is reserved for genuinely-unregistered functions; the
+// callers (FunctionExpression::create / canEvaluate) treat null as "fall
+// through" and we want recursive eval of registered functions to succeed.
 std::shared_ptr<CudfFunction> createCudfFunction(
     const std::string& name,
     const std::shared_ptr<velox::exec::Expr>& expr) {
   auto& registry = getCudfFunctionRegistry();
-  auto it = registry.find(name);
-  if (it != registry.end()) {
-    return it->second.factory(name, expr);
+  auto tryLookup = [&](const std::string& key)
+      -> std::shared_ptr<CudfFunction> {
+    auto it = registry.find(key);
+    if (it != registry.end()) {
+      return it->second.factory(key, expr);
+    }
+    return nullptr;
+  };
+  if (auto fn = tryLookup(name)) {
+    return fn;
+  }
+  const auto& prefix = CudfConfig::getInstance().functionNamePrefix;
+  if (!prefix.empty()) {
+    // expr->name() came in without prefix; try with prefix prepended.
+    if (name.size() < prefix.size() ||
+        name.compare(0, prefix.size(), prefix) != 0) {
+      if (auto fn = tryLookup(prefix + name)) {
+        return fn;
+      }
+    } else {
+      // expr->name() already starts with prefix; try with prefix stripped
+      // (in case it was registered bare).
+      if (auto fn = tryLookup(name.substr(prefix.size()))) {
+        return fn;
+      }
+    }
   }
   return nullptr;
 }
@@ -1646,15 +1681,51 @@ std::shared_ptr<FunctionExpression> FunctionExpression::create(
   node->expr_ = expr;
   node->inputRowSchema_ = inputRowSchema;
 
+  // FieldReference is handled directly in eval() by indexing into
+  // inputColumnViews; no CudfFunction is needed. Skip the registry lookup
+  // so we don't trip the fail-fast diagnostic below for plain column refs.
+  if (std::dynamic_pointer_cast<velox::exec::FieldReference>(expr)) {
+    return node;
+  }
+
   auto name = expr->name();
   node->function_ = createCudfFunction(name, expr);
 
-  if (node->function_) {
-    for (const auto& input : expr->inputs()) {
-      if (input->name() != "literal") {
-        node->subexpressions_.push_back(
-            createCudfExpression(input, inputRowSchema));
+  if (!node->function_) {
+    // Surface a precise diagnostic now rather than at eval-time, when the
+    // generic "Unsupported expression for recursive evaluation" message
+    // hides the real cause (registry miss / prefix drift / un-registered
+    // function). Listing a few registry entries keeps this actionable
+    // without dumping the full table.
+    auto& registry = getCudfFunctionRegistry();
+    std::string sample;
+    size_t shown = 0;
+    for (const auto& [key, _] : registry) {
+      if (shown++ >= 8) {
+        sample += ", ...";
+        break;
       }
+      if (!sample.empty()) {
+        sample += ", ";
+      }
+      sample += key;
+    }
+    VELOX_FAIL(
+        "createCudfFunction returned null for nested expression; expr->name()='{}', "
+        "configured prefix='{}', registry size={}, sample keys=[{}]. "
+        "This typically means the function is not registered for the active "
+        "engine ({}), or the engine prefix drifted between registration and lookup.",
+        name,
+        CudfConfig::getInstance().functionNamePrefix,
+        registry.size(),
+        sample,
+        CudfConfig::getInstance().functionEngine);
+  }
+
+  for (const auto& input : expr->inputs()) {
+    if (input->name() != "literal") {
+      node->subexpressions_.push_back(
+          createCudfExpression(input, inputRowSchema));
     }
   }
 
@@ -1694,8 +1765,16 @@ ColumnOrView FunctionExpression::eval(
     return result;
   }
 
+  // function_ being null here means FunctionExpression::create did not
+  // populate it (should not happen now that create VELOX_FAILs when the
+  // registry lookup misses). Keep the message specific so future regressions
+  // are easy to diagnose.
   VELOX_FAIL(
-      "Unsupported expression for recursive evaluation: " + expr_->name());
+      "FunctionExpression::eval invoked with null function_ for nested "
+      "expression: name='{}', type='{}'. The CudfFunction registry lookup "
+      "returned null at create time; check engine/prefix configuration.",
+      expr_->name(),
+      expr_->type() ? expr_->type()->toString() : "<null>");
 }
 
 void FunctionExpression::close() {
@@ -1749,9 +1828,24 @@ bool FunctionExpression::canEvaluate(std::shared_ptr<velox::exec::Expr> expr) {
   }
 
   auto& registry = getCudfFunctionRegistry();
+  // Mirror the prefix-tolerant lookup used by createCudfFunction so that
+  // canEvaluate and create agree on whether a name is registered, even when
+  // the engine prefix has drifted between registration and lookup.
   auto it = registry.find(expr->name());
   if (it == registry.end()) {
-    return false;
+    const auto& prefix = CudfConfig::getInstance().functionNamePrefix;
+    if (!prefix.empty()) {
+      const auto& exprName = expr->name();
+      if (exprName.size() < prefix.size() ||
+          exprName.compare(0, prefix.size(), prefix) != 0) {
+        it = registry.find(prefix + exprName);
+      } else {
+        it = registry.find(exprName.substr(prefix.size()));
+      }
+    }
+    if (it == registry.end()) {
+      return false;
+    }
   }
   const auto& spec = it->second;
   if (!matchCallAgainstSignatures(*expr, spec.signatures)) {
