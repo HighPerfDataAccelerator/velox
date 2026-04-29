@@ -1111,9 +1111,10 @@ class MightContainFunction : public CudfFunction {
         1,
         "might_contain receives 1 column input (bloom is literal)");
     auto inputView = asView(inputColumns[0]);
-    VELOX_CHECK_EQ(
-        inputView.type().id(),
-        cudf::type_id::INT64,
+    // cudf::type_id is a plain enum -- fmt v11 can't format it, so use
+    // VELOX_CHECK with a static message instead of VELOX_CHECK_EQ.
+    VELOX_CHECK(
+        inputView.type().id() == cudf::type_id::INT64,
         "might_contain hash input must be bigint");
     const auto numRows = inputView.size();
 
