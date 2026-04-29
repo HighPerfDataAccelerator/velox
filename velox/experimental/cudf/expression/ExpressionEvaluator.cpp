@@ -1111,21 +1111,37 @@ class MightContainFunction : public CudfFunction {
         1,
         "might_contain receives 1 column input (bloom is literal)");
     auto inputView = asView(inputColumns[0]);
-    // cudf::type_id is a plain enum -- fmt v11 can't format it, so use
-    // VELOX_CHECK with a static message instead of VELOX_CHECK_EQ.
-    VELOX_CHECK(
-        inputView.type().id() == cudf::type_id::INT64,
-        "might_contain hash input must be bigint");
+    // Spark's BloomFilterMightContain on Gluten can arrive with the hash
+    // key as either bigint (post-cast) or int (when xxhash64 isn't applied
+    // before the predicate). Read either width into int64; folly::hasher
+    // sign-extends naturally.
+    const auto inputType = inputView.type().id();
     const auto numRows = inputView.size();
-
     std::vector<int64_t> hostKeys(numRows);
     if (numRows > 0) {
-      CUDF_CUDA_TRY(cudaMemcpyAsync(
-          hostKeys.data(),
-          inputView.data<int64_t>(),
-          numRows * sizeof(int64_t),
-          cudaMemcpyDeviceToHost,
-          stream.value()));
+      if (inputType == cudf::type_id::INT64) {
+        CUDF_CUDA_TRY(cudaMemcpyAsync(
+            hostKeys.data(),
+            inputView.data<int64_t>(),
+            numRows * sizeof(int64_t),
+            cudaMemcpyDeviceToHost,
+            stream.value()));
+      } else if (inputType == cudf::type_id::INT32) {
+        std::vector<int32_t> tmp(numRows);
+        CUDF_CUDA_TRY(cudaMemcpyAsync(
+            tmp.data(),
+            inputView.data<int32_t>(),
+            numRows * sizeof(int32_t),
+            cudaMemcpyDeviceToHost,
+            stream.value()));
+        stream.synchronize();
+        for (cudf::size_type i = 0; i < numRows; ++i) {
+          hostKeys[i] = static_cast<int64_t>(tmp[i]);
+        }
+      } else {
+        VELOX_FAIL(
+            "might_contain hash input must be bigint or int (saw cudf type_id");
+      }
     }
 
     std::vector<cudf::bitmask_type> hostNulls;
