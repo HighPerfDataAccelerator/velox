@@ -46,6 +46,10 @@
 #include <cudf/strings/convert/convert_integers.hpp>
 #include <cudf/unary.hpp>
 
+#include <folly/hash/Hash.h>
+
+#include "velox/common/base/BloomFilter.h"
+
 namespace facebook::velox::cudf_velox {
 namespace {
 
@@ -1027,6 +1031,124 @@ class ConcatFunction : public CudfFunction {
   size_t numInputs_{0};
 };
 
+// Spark might_contain(varbinary serializedBloomFilter, bigint hashKey) -> bool.
+// The bloom filter is a constant literal (Spark constant-folds it during DPP).
+// We deserialize it once at construction time, then per batch we copy the
+// int64 input column to host, run velox::BloomFilter::mayContain on each
+// element, and upload the resulting bool column back to device. A full-GPU
+// implementation is deferred; bloom probes for runtime DPP run on small
+// batches, so the host round-trip is acceptable.
+class MightContainFunction : public CudfFunction {
+ public:
+  explicit MightContainFunction(
+      const std::shared_ptr<velox::exec::Expr>& expr) {
+    using velox::exec::ConstantExpr;
+    VELOX_CHECK_EQ(
+        expr->inputs().size(), 2, "might_contain expects exactly 2 inputs");
+    auto bloomExpr =
+        std::dynamic_pointer_cast<ConstantExpr>(expr->inputs()[0]);
+    VELOX_CHECK_NOT_NULL(
+        bloomExpr, "might_contain bloom filter must be a constant");
+    auto bloomValue = bloomExpr->value();
+    if (bloomValue->isNullAt(0)) {
+      hasFilter_ = false;
+      return;
+    }
+    auto sv = bloomValue->as<SimpleVector<StringView>>()->valueAt(0);
+    serialized_.assign(sv.data(), sv.size());
+    hasFilter_ = true;
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    VELOX_CHECK_EQ(
+        inputColumns.size(),
+        1,
+        "might_contain receives 1 column input (bloom is literal)");
+    auto inputView = asView(inputColumns[0]);
+    VELOX_CHECK_EQ(
+        inputView.type().id(),
+        cudf::type_id::INT64,
+        "might_contain hash input must be bigint");
+    const auto numRows = inputView.size();
+
+    std::vector<int64_t> hostKeys(numRows);
+    if (numRows > 0) {
+      CUDF_CUDA_TRY(cudaMemcpyAsync(
+          hostKeys.data(),
+          inputView.data<int64_t>(),
+          numRows * sizeof(int64_t),
+          cudaMemcpyDeviceToHost,
+          stream.value()));
+    }
+
+    std::vector<cudf::bitmask_type> hostNulls;
+    const cudf::bitmask_type* deviceNulls = inputView.null_mask();
+    if (deviceNulls != nullptr) {
+      const auto words = cudf::bitmask_allocation_size_bytes(numRows) /
+          sizeof(cudf::bitmask_type);
+      hostNulls.resize(words);
+      CUDF_CUDA_TRY(cudaMemcpyAsync(
+          hostNulls.data(),
+          deviceNulls,
+          words * sizeof(cudf::bitmask_type),
+          cudaMemcpyDeviceToHost,
+          stream.value()));
+    }
+    stream.synchronize();
+
+    std::vector<uint8_t> hostResult(numRows, 0);
+    for (cudf::size_type i = 0; i < numRows; ++i) {
+      if (!hasFilter_) {
+        continue;
+      }
+      if (!hostNulls.empty()) {
+        const bool valid = (hostNulls[i / 32] >> (i % 32)) & 1u;
+        if (!valid) {
+          continue;
+        }
+      }
+      const uint64_t hashed = folly::hasher<int64_t>()(hostKeys[i]);
+      hostResult[i] =
+          velox::BloomFilter<>::mayContain(serialized_.c_str(), hashed) ? 1u
+                                                                        : 0u;
+    }
+
+    rmm::device_buffer data(numRows * sizeof(uint8_t), stream, mr);
+    if (numRows > 0) {
+      CUDF_CUDA_TRY(cudaMemcpyAsync(
+          data.data(),
+          hostResult.data(),
+          numRows * sizeof(uint8_t),
+          cudaMemcpyHostToDevice,
+          stream.value()));
+    }
+
+    rmm::device_buffer nullMask{};
+    cudf::size_type nullCount = 0;
+    if (deviceNulls != nullptr) {
+      nullMask = rmm::device_buffer(
+          deviceNulls,
+          cudf::bitmask_allocation_size_bytes(numRows),
+          stream,
+          mr);
+      nullCount = inputView.null_count();
+    }
+    return std::make_unique<cudf::column>(
+        cudf::data_type{cudf::type_id::BOOL8},
+        numRows,
+        std::move(data),
+        std::move(nullMask),
+        nullCount);
+  }
+
+ private:
+  std::string serialized_;
+  bool hasFilter_{false};
+};
+
 bool registerCudfFunction(
     const std::string& name,
     CudfFunctionFactory factory,
@@ -1095,6 +1217,17 @@ void registerSparkFunctions(const std::string& prefix) {
            .returnType("date")
            .argumentType("date")
            .constantArgumentType("integer")
+           .build()});
+
+  registerCudfFunction(
+      prefix + "might_contain",
+      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<MightContainFunction>(expr);
+      },
+      {FunctionSignatureBuilder()
+           .returnType("boolean")
+           .constantArgumentType("varbinary")
+           .argumentType("bigint")
            .build()});
 }
 
