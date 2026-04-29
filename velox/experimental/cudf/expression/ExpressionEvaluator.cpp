@@ -1116,31 +1116,53 @@ class MightContainFunction : public CudfFunction {
     // before the predicate). Read either width into int64; folly::hasher
     // sign-extends naturally.
     const auto inputType = inputView.type().id();
+    const auto inputTypeInt = static_cast<int>(inputType);
     const auto numRows = inputView.size();
     std::vector<int64_t> hostKeys(numRows);
+    auto copyAsInt64 = [&](auto sample) {
+      using T = decltype(sample);
+      std::vector<T> tmp(numRows);
+      CUDF_CUDA_TRY(cudaMemcpyAsync(
+          tmp.data(),
+          inputView.data<T>(),
+          numRows * sizeof(T),
+          cudaMemcpyDeviceToHost,
+          stream.value()));
+      stream.synchronize();
+      for (cudf::size_type i = 0; i < numRows; ++i) {
+        hostKeys[i] = static_cast<int64_t>(tmp[i]);
+      }
+    };
     if (numRows > 0) {
-      if (inputType == cudf::type_id::INT64) {
-        CUDF_CUDA_TRY(cudaMemcpyAsync(
-            hostKeys.data(),
-            inputView.data<int64_t>(),
-            numRows * sizeof(int64_t),
-            cudaMemcpyDeviceToHost,
-            stream.value()));
-      } else if (inputType == cudf::type_id::INT32) {
-        std::vector<int32_t> tmp(numRows);
-        CUDF_CUDA_TRY(cudaMemcpyAsync(
-            tmp.data(),
-            inputView.data<int32_t>(),
-            numRows * sizeof(int32_t),
-            cudaMemcpyDeviceToHost,
-            stream.value()));
-        stream.synchronize();
-        for (cudf::size_type i = 0; i < numRows; ++i) {
-          hostKeys[i] = static_cast<int64_t>(tmp[i]);
-        }
-      } else {
-        VELOX_FAIL(
-            "might_contain hash input must be bigint or int (saw cudf type_id");
+      switch (inputType) {
+        case cudf::type_id::INT64:
+          CUDF_CUDA_TRY(cudaMemcpyAsync(
+              hostKeys.data(),
+              inputView.data<int64_t>(),
+              numRows * sizeof(int64_t),
+              cudaMemcpyDeviceToHost,
+              stream.value()));
+          break;
+        case cudf::type_id::INT32:
+          copyAsInt64(int32_t{});
+          break;
+        case cudf::type_id::INT16:
+          copyAsInt64(int16_t{});
+          break;
+        case cudf::type_id::INT8:
+          copyAsInt64(int8_t{});
+          break;
+        case cudf::type_id::UINT64:
+          copyAsInt64(uint64_t{});
+          break;
+        case cudf::type_id::UINT32:
+          copyAsInt64(uint32_t{});
+          break;
+        default:
+          VELOX_FAIL(
+              "might_contain hash input must be an integer type; saw "
+              "cudf type_id={}",
+              inputTypeInt);
       }
     }
 
