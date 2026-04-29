@@ -784,6 +784,42 @@ class HashFunction : public CudfFunction {
   uint32_t seedValue_;
 };
 
+// Spark xxhash64_with_seed(seed:bigint, c1, c2, ...) -> bigint.
+// Wraps cudf::hashing::xxhash_64 with the seed Spark passes (default 42).
+// Without GPU support the consumer-side HASH partition fell back to CPU,
+// causing non-deterministic routing (drivers race for splits) and Q12's
+// row count to fluctuate between runs. Native GPU lookup also matches
+// Spark's XxHash64 output bit-pattern.
+class XxHash64Function : public CudfFunction {
+ public:
+  XxHash64Function(const std::shared_ptr<velox::exec::Expr>& expr) {
+    using velox::exec::ConstantExpr;
+    VELOX_CHECK_GE(
+        expr->inputs().size(), 2, "xxhash64 expects at least 2 inputs");
+    auto seedExpr = std::dynamic_pointer_cast<ConstantExpr>(expr->inputs()[0]);
+    VELOX_CHECK_NOT_NULL(seedExpr, "xxhash64 seed must be a constant");
+    seedValue_ = static_cast<uint64_t>(
+        seedExpr->value()->as<SimpleVector<int64_t>>()->valueAt(0));
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    VELOX_CHECK(!inputColumns.empty());
+    std::vector<cudf::column_view> cols;
+    cols.reserve(inputColumns.size());
+    for (auto& c : inputColumns) {
+      cols.push_back(asView(c));
+    }
+    return cudf::hashing::xxhash_64(
+        cudf::table_view(cols), seedValue_, stream, mr);
+  }
+
+ private:
+  uint64_t seedValue_;
+};
+
 class YearFunction : public CudfFunction {
  public:
   explicit YearFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
@@ -1194,6 +1230,18 @@ void registerSparkFunctions(const std::string& prefix) {
       {FunctionSignatureBuilder()
            .returnType("integer")
            .constantArgumentType("integer")
+           .argumentType("any")
+           .variableArity("any")
+           .build()});
+
+  registerCudfFunction(
+      prefix + "xxhash64_with_seed",
+      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<XxHash64Function>(expr);
+      },
+      {FunctionSignatureBuilder()
+           .returnType("bigint")
+           .constantArgumentType("bigint")
            .argumentType("any")
            .variableArity("any")
            .build()});
