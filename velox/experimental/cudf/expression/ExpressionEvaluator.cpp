@@ -1087,12 +1087,19 @@ class MightContainFunction : public CudfFunction {
         bloomExpr, "might_contain bloom filter must be a constant");
     auto bloomValue = bloomExpr->value();
     if (bloomValue->isNullAt(0)) {
+      LOG(WARNING) << "MightContainFunction: bloom literal is NULL; "
+                   << "the upstream Spark runtime DPP did not materialize "
+                   << "the bloom (BloomFilterMightContain not handled by "
+                   << "MppNativeQueryExec.materializeScalarSubqueries) -- "
+                   << "all rows will be filtered out (count=0 symptom).";
       hasFilter_ = false;
       return;
     }
     auto sv = bloomValue->as<SimpleVector<StringView>>()->valueAt(0);
     serialized_.assign(sv.data(), sv.size());
     hasFilter_ = true;
+    LOG(WARNING) << "MightContainFunction: bloom literal received size="
+                 << serialized_.size() << " bytes (hasFilter=true)";
   }
 
   ColumnOrView eval(
