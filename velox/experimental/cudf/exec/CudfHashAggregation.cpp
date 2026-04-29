@@ -728,7 +728,13 @@ core::AggregationNode::Step getCompanionStep(
   }
 
   // The format is count_merge_extract_BIGINT or count_merge_extract.
+  // In a SINGLE-step aggregation node, _merge_extract companions receive raw
+  // input (not intermediate state) so they must use kSingle signatures and
+  // aggregation logic rather than kFinal.
   if (kind.find("_merge_extract") != std::string::npos) {
+    if (step == core::AggregationNode::Step::kSingle) {
+      return core::AggregationNode::Step::kSingle;
+    }
     return core::AggregationNode::Step::kFinal;
   }
 
