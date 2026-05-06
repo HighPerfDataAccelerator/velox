@@ -173,10 +173,21 @@ TEST_F(CudfExpressionSelectionTest, signatureArityAndConstantsSubstr) {
   // OK: 2-arg substr with constant start
   auto ok2 = compileExecExpr("substr(name, 1)", rowType_, execCtx_.get());
   ASSERT_TRUE(canBeEvaluatedByCudf(ok2, /*deep=*/true));
+  ASSERT_NO_THROW(createCudfExpression(ok2, rowType_));
 
   // OK: 3-arg substr with constant start and length
   auto ok3 = compileExecExpr("substr(name, 1, 5)", rowType_, execCtx_.get());
   ASSERT_TRUE(canBeEvaluatedByCudf(ok3, /*deep=*/true));
+  ASSERT_NO_THROW(createCudfExpression(ok3, rowType_));
+
+  // OK: Spark parsing can keep integer literals as INTEGER instead of BIGINT.
+  auto ok3Integer = compileExecExpr(
+      "substr(name, 1, 5)",
+      rowType_,
+      execCtx_.get(),
+      {.parseIntegerAsBigint = false, .functionPrefix = ""});
+  ASSERT_TRUE(canBeEvaluatedByCudf(ok3Integer, /*deep=*/true));
+  ASSERT_NO_THROW(createCudfExpression(ok3Integer, rowType_));
 
   // Bad: start must be constant
   auto badConst = compileExecExpr("substr(name, a)", rowType_, execCtx_.get());

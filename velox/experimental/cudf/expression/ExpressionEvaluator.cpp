@@ -543,6 +543,22 @@ class SwitchFunction : public CudfFunction {
   std::unique_ptr<cudf::scalar> right_;
 };
 
+int64_t readSubstringIntegerConstant(
+    const VectorPtr& value,
+    const char* argumentName) {
+  switch (value->typeKind()) {
+    case TypeKind::INTEGER:
+      return value->as<SimpleVector<int32_t>>()->valueAt(0);
+    case TypeKind::BIGINT:
+      return value->as<SimpleVector<int64_t>>()->valueAt(0);
+    default:
+      VELOX_FAIL(
+          "substr {} must be an INTEGER or BIGINT constant; saw {}",
+          argumentName,
+          value->type()->toString());
+  }
+}
+
 class SubstrFunction : public CudfFunction {
  public:
   SubstrFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
@@ -556,7 +572,7 @@ class SubstrFunction : public CudfFunction {
     VELOX_CHECK_NOT_NULL(startExpr, "substr start must be a constant");
 
     auto startValue =
-        startExpr->value()->as<SimpleVector<int64_t>>()->valueAt(0);
+        readSubstringIntegerConstant(startExpr->value(), "start");
     start_ = static_cast<cudf::size_type>(startValue);
     if (startValue >= 1) {
       // cuDF indexing starts at 0.
@@ -571,7 +587,7 @@ class SubstrFunction : public CudfFunction {
       VELOX_CHECK_NOT_NULL(lengthExpr, "substr length must be a constant");
 
       auto lengthValue =
-          lengthExpr->value()->as<SimpleVector<int64_t>>()->valueAt(0);
+          readSubstringIntegerConstant(lengthExpr->value(), "length");
       // cuDF uses indices [begin, end).
       // Presto uses length as the length of the substring.
       // We compute the end as start + length.
