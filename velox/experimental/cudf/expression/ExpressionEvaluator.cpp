@@ -1425,8 +1425,31 @@ bool registerBuiltinFunctions(const std::string& prefix) {
        FunctionSignatureBuilder()
            .returnType("varchar")
            .argumentType("varchar")
+           .constantArgumentType("integer")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("varchar")
+           .argumentType("varchar")
            .constantArgumentType("bigint")
            .constantArgumentType("bigint")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("varchar")
+           .argumentType("varchar")
+           .constantArgumentType("bigint")
+           .constantArgumentType("integer")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("varchar")
+           .argumentType("varchar")
+           .constantArgumentType("integer")
+           .constantArgumentType("bigint")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("varchar")
+           .argumentType("varchar")
+           .constantArgumentType("integer")
+           .constantArgumentType("integer")
            .build()});
 
   // Coalesce is special form and doesn't have a prefix in its name.
