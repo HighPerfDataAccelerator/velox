@@ -1069,17 +1069,38 @@ void CudfHashAggregation::computePartialGroupbyStreaming(CudfVectorPtr tbl) {
   // For every input, we'll do a groupby and compact results with the existing
   // intermediate groupby results.
 
+  // [INSTRUMENT] entry: input + current buffered state
+  LOG(WARNING) << "STREAM_PARTIAL[" << planNodeId() << "] addInput: input_rows="
+               << tbl->size() << " input_bytes=" << tbl->estimateFlatSize()
+               << " buffered_rows="
+               << (bufferedResult_ ? static_cast<int64_t>(bufferedResult_->size()) : -1)
+               << " buffered_bytes="
+               << (bufferedResult_
+                       ? static_cast<int64_t>(bufferedResult_->estimateFlatSize())
+                       : -1);
+
   auto inputTableStream = tbl->stream();
   // Use getTableView() to avoid expensive materialization for packed_table.
   // tbl stays alive during this function call, keeping the view valid.
   auto permutedInputView = tbl->getTableView().select(
       aggregationInputChannels_.begin(), aggregationInputChannels_.end());
+
+  LOG(WARNING) << "STREAM_PARTIAL[" << planNodeId()
+               << "] before doGroupBy(aggregators_)";
   auto groupbyOnInput = doGroupByAggregation(
       permutedInputView,
       groupingKeyOutputChannels_,
       aggregators_,
       bufferedResultType_,
       inputTableStream);
+  LOG(WARNING) << "STREAM_PARTIAL[" << planNodeId()
+               << "] after doGroupBy(aggregators_): per_batch_rows="
+               << (groupbyOnInput ? static_cast<int64_t>(groupbyOnInput->size())
+                                  : -1)
+               << " per_batch_bytes="
+               << (groupbyOnInput
+                       ? static_cast<int64_t>(groupbyOnInput->estimateFlatSize())
+                       : -1);
 
   // If we already have partial output, concatenate the new results with it.
   if (bufferedResult_) {
@@ -1095,10 +1116,16 @@ void CudfHashAggregation::computePartialGroupbyStreaming(CudfVectorPtr tbl) {
         std::vector<rmm::cuda_stream_view>{inputTableStream},
         partialOutputStream);
 
+    LOG(WARNING) << "STREAM_PARTIAL[" << planNodeId() << "] before concat";
     // Concatenate the tables
     auto concatenatedTable =
         cudf::concatenate(tablesToConcat, partialOutputStream, get_output_mr());
+    LOG(WARNING) << "STREAM_PARTIAL[" << planNodeId()
+                 << "] after concat: concat_rows="
+                 << concatenatedTable->num_rows();
 
+    LOG(WARNING) << "STREAM_PARTIAL[" << planNodeId()
+                 << "] before doGroupBy(intermediateAggregators_)";
     // Now we have to groupby again but this time with intermediate aggregators.
     // Keep concatenatedTable alive while we use its view.
     auto compactedOutput = doGroupByAggregation(
@@ -1107,6 +1134,15 @@ void CudfHashAggregation::computePartialGroupbyStreaming(CudfVectorPtr tbl) {
         intermediateAggregators_,
         bufferedResultType_,
         partialOutputStream);
+    LOG(WARNING) << "STREAM_PARTIAL[" << planNodeId()
+                 << "] after doGroupBy(intermediateAggregators_): compacted_rows="
+                 << (compactedOutput
+                         ? static_cast<int64_t>(compactedOutput->size())
+                         : -1)
+                 << " compacted_bytes="
+                 << (compactedOutput
+                         ? static_cast<int64_t>(compactedOutput->estimateFlatSize())
+                         : -1);
     bufferedResult_ = compactedOutput;
   } else {
     // First time processing, just store the result of the input batch's groupby
@@ -1193,15 +1229,36 @@ void CudfHashAggregation::computeFinalGroupbyStreaming(CudfVectorPtr tbl) {
 }
 
 void CudfHashAggregation::computeSingleGroupbyStreaming(CudfVectorPtr tbl) {
+  // [INSTRUMENT] entry: input + current buffered state
+  LOG(WARNING) << "STREAM_SINGLE[" << planNodeId() << "] addInput: input_rows="
+               << tbl->size() << " input_bytes=" << tbl->estimateFlatSize()
+               << " buffered_rows="
+               << (bufferedResult_ ? static_cast<int64_t>(bufferedResult_->size()) : -1)
+               << " buffered_bytes="
+               << (bufferedResult_
+                       ? static_cast<int64_t>(bufferedResult_->estimateFlatSize())
+                       : -1);
+
   auto inputTableStream = tbl->stream();
   auto permutedInputView = tbl->getTableView().select(
       aggregationInputChannels_.begin(), aggregationInputChannels_.end());
+
+  LOG(WARNING) << "STREAM_SINGLE[" << planNodeId()
+               << "] before doGroupBy(partialAggregators_)";
   auto groupbyOnInput = doGroupByAggregation(
       permutedInputView,
       groupingKeyOutputChannels_,
       partialAggregators_,
       bufferedResultType_,
       inputTableStream);
+  LOG(WARNING) << "STREAM_SINGLE[" << planNodeId()
+               << "] after doGroupBy(partialAggregators_): per_batch_rows="
+               << (groupbyOnInput ? static_cast<int64_t>(groupbyOnInput->size())
+                                  : -1)
+               << " per_batch_bytes="
+               << (groupbyOnInput
+                       ? static_cast<int64_t>(groupbyOnInput->estimateFlatSize())
+                       : -1);
 
   if (bufferedResult_) {
     std::vector<cudf::table_view> tablesToConcat;
@@ -1213,15 +1270,30 @@ void CudfHashAggregation::computeSingleGroupbyStreaming(CudfVectorPtr tbl) {
         std::vector<rmm::cuda_stream_view>{inputTableStream},
         partialOutputStream);
 
+    LOG(WARNING) << "STREAM_SINGLE[" << planNodeId() << "] before concat";
     auto concatenatedTable =
         cudf::concatenate(tablesToConcat, partialOutputStream, get_temp_mr());
+    LOG(WARNING) << "STREAM_SINGLE[" << planNodeId()
+                 << "] after concat: concat_rows="
+                 << concatenatedTable->num_rows();
 
+    LOG(WARNING) << "STREAM_SINGLE[" << planNodeId()
+                 << "] before doGroupBy(intermediateAggregators_)";
     auto compactedOutput = doGroupByAggregation(
         concatenatedTable->view(),
         groupingKeyOutputChannels_,
         intermediateAggregators_,
         bufferedResultType_,
         partialOutputStream);
+    LOG(WARNING) << "STREAM_SINGLE[" << planNodeId()
+                 << "] after doGroupBy(intermediateAggregators_): compacted_rows="
+                 << (compactedOutput
+                         ? static_cast<int64_t>(compactedOutput->size())
+                         : -1)
+                 << " compacted_bytes="
+                 << (compactedOutput
+                         ? static_cast<int64_t>(compactedOutput->estimateFlatSize())
+                         : -1);
     bufferedResult_ = compactedOutput;
   } else {
     bufferedResult_ = groupbyOnInput;
