@@ -723,8 +723,22 @@ core::AggregationNode::Step getCompanionStep(
     return core::AggregationNode::Step::kIntermediate;
   }
 
+  // _partial companion: raw input -> partial state. Behavior depends on
+  // the requested step:
+  //   - kPartial (first-pass slot reading raw input): use kPartial
+  //     (raw -> struct).
+  //   - kIntermediate / other (an accumulator slot whose input is the
+  //     already-flushed partial state from bufferedResult_): merge
+  //     partial states, keep them as intermediate (use kIntermediate).
+  // Without slot-aware dispatch, a fixed kPartial return makes the
+  // intermediate streaming accumulator try to read struct(sum, count)
+  // as raw values, triggering cuDF "Invalid type/aggregation combination"
+  // at groupby.cu.
   if (kind.ends_with("_partial")) {
-    return core::AggregationNode::Step::kPartial;
+    if (step == core::AggregationNode::Step::kPartial) {
+      return core::AggregationNode::Step::kPartial;
+    }
+    return core::AggregationNode::Step::kIntermediate;
   }
 
   // The format is count_merge_extract_BIGINT or count_merge_extract.
