@@ -991,6 +991,17 @@ void CudfHashAggregation::initialize() {
   // limit on high-cardinality final aggregations.
   streamingEnabled_ = !isGlobal_;
 
+  // Experimental override: env var CUDF_DISABLE_AGG_STREAMING=1 forces the
+  // non-streaming (inputs_-accumulate then final concat) path even when
+  // streaming would otherwise be picked. Used to A/B compare streaming
+  // overhead against per-driver concat cost when row count fits under
+  // 2^31. Read once per operator construction.
+  if (const char* disable = std::getenv("CUDF_DISABLE_AGG_STREAMING")) {
+    if (std::string_view(disable) == "1") {
+      streamingEnabled_ = false;
+    }
+  }
+
   // Make aggregators for intermediate step when streaming is enabled.
   // Distinct does not need any aggregators.
   if (streamingEnabled_ && !isDistinct_) {
