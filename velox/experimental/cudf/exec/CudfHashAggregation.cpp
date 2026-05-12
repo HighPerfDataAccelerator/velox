@@ -1294,6 +1294,38 @@ void CudfHashAggregation::computeSingleGroupbyStreaming(CudfVectorPtr tbl) {
                  << (compactedOutput
                          ? static_cast<int64_t>(compactedOutput->estimateFlatSize())
                          : -1);
+
+    // Runtime heuristic: when streaming compaction fails to reduce row
+    // count (concat input and compacted output are nearly the same size),
+    // the data has no key-overlap between batches (e.g. lineitem sorted
+    // by the group key feeds disjoint key ranges to each batch). In that
+    // case, every further batch pays the full O(bufferedResult_) D2D copy
+    // cost in the next concat without any compaction benefit. Stop
+    // streaming, preserve current cumulative state as one inputs_ entry,
+    // and let future addInputs accumulate raw inputs for one-shot concat
+    // at noMoreInput time.
+    static constexpr int64_t kStreamingFallbackMinConcatRows = 1'000'000;
+    static constexpr double kStreamingFallbackCompactionThreshold = 0.95;
+    const int64_t concatRows = concatenatedTable->num_rows();
+    const int64_t compactedRows =
+        compactedOutput ? static_cast<int64_t>(compactedOutput->size()) : 0;
+    const double compactionRatio = concatRows > 0
+        ? static_cast<double>(compactedRows) / concatRows
+        : 0.0;
+    if (concatRows > kStreamingFallbackMinConcatRows &&
+        compactionRatio > kStreamingFallbackCompactionThreshold) {
+      LOG(WARNING)
+          << "STREAM_SINGLE[" << planNodeId()
+          << "] disabling streaming: compaction ineffective "
+          << "(concat_rows=" << concatRows
+          << " compacted_rows=" << compactedRows
+          << " ratio=" << compactionRatio
+          << "). Falling back to non-streaming concat-once.";
+      inputs_.push_back(std::move(compactedOutput));
+      bufferedResult_.reset();
+      streamingEnabled_ = false;
+      return;
+    }
     bufferedResult_ = compactedOutput;
   } else {
     bufferedResult_ = groupbyOnInput;
