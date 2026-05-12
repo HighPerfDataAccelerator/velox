@@ -982,14 +982,16 @@ void CudfHashAggregation::initialize() {
       aggregationNode_->step(),
       outputType_,
       aggregationInput.constants);
-  // The hasCompanionAggregates guard (PR #16488) kept streaming on
-  // Presto-style plans only (bare function names like "avg"). With the
-  // slot-aware getCompanionStep above, _merge_extract companions can
-  // correctly participate in the 4-slot streaming pipeline, so the
-  // guard is no longer needed; removing it lets MPP single-task plans
-  // (which always use companion names) avoid the 2^31 column-size
-  // limit on high-cardinality final aggregations.
-  streamingEnabled_ = !isGlobal_;
+  // EXPERIMENT: restore the original hasCompanionAggregates guard
+  // (temporarily reverts Patch B) so Q18 falls back to non-streaming
+  // concat-once. Keeps Patch A (slot-aware getCompanionStep) + Patch C
+  // (companionAwareIntermediateType) + Patch D (slot-aware _partial)
+  // so Q17's canBeEvaluatedByCudf signature lookup still works on GPU
+  // via the non-streaming aggregators_ slot. Goal: see whether
+  // non-streaming Q18 actually OOMs at the same scale or works (proving
+  // streaming-specific overhead is the OOM trigger, not raw data size).
+  streamingEnabled_ =
+      !hasCompanionAggregates(aggregationNode_->aggregates()) && !isGlobal_;
 
   // Make aggregators for intermediate step when streaming is enabled.
   // Distinct does not need any aggregators.
