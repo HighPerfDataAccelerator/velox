@@ -170,9 +170,13 @@ void CudfLocalPartition::enqueuePartition(
     return;
   }
 
+  // estimateFlatSize() returns the real GPU device buffer size; size() is
+  // the row count (mistakenly used as bytes in upstream baseline) and
+  // retainedSize() returns ~0 for cudf-owned tables (children list empty),
+  // both of which defeat LocalExchangeMemoryManager backpressure.
   ContinueFuture future;
-  auto blockingReason =
-      queues_[partitionIndex]->enqueue(cudfVector, cudfVector->size(), &future);
+  auto blockingReason = queues_[partitionIndex]->enqueue(
+      cudfVector, cudfVector->estimateFlatSize(), &future);
   if (blockingReason != exec::BlockingReason::kNotBlocked) {
     blockingReasons_.push_back(blockingReason);
     futures_.push_back(std::move(future));
@@ -255,10 +259,13 @@ void CudfLocalPartition::addInput(RowVectorPtr input) {
       enqueuePartition(i, partitionCudfVector);
     }
   } else {
-    // Single partition case.
+    // Single partition case. Use estimateFlatSize() for CudfVector since
+    // retainedSize() returns ~0 for cudf tables (children list is empty).
     ContinueFuture future;
-    auto blockingReason =
-        queues_[0]->enqueue(input, input->retainedSize(), &future);
+    auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input);
+    const uint64_t bytes =
+        cudfInput ? cudfInput->estimateFlatSize() : input->retainedSize();
+    auto blockingReason = queues_[0]->enqueue(input, bytes, &future);
     if (blockingReason != exec::BlockingReason::kNotBlocked) {
       blockingReasons_.push_back(blockingReason);
       futures_.push_back(std::move(future));

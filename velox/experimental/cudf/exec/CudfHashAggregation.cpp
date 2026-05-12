@@ -728,12 +728,18 @@ core::AggregationNode::Step getCompanionStep(
   }
 
   // The format is count_merge_extract_BIGINT or count_merge_extract.
-  // In a SINGLE-step aggregation node, _merge_extract companions receive raw
-  // input (not intermediate state) so they must use kSingle signatures and
-  // aggregation logic rather than kFinal.
+  // _merge_extract companion: input is intermediate state (e.g.
+  // row(sum, count) for avg); output depends on the requested step.
+  //   - kPartial / kIntermediate (streaming slot building a partial or
+  //     intermediate accumulator): merge intermediate states, keep them
+  //     as intermediate (sum+count grow, no extract).
+  //   - kFinal / kSingle (final extraction or canBeEvaluatedByCudf
+  //     signature check against the plan-level final signature): consume
+  //     intermediate state and produce the final value.
   if (kind.find("_merge_extract") != std::string::npos) {
-    if (step == core::AggregationNode::Step::kSingle) {
-      return core::AggregationNode::Step::kSingle;
+    if (step == core::AggregationNode::Step::kPartial ||
+        step == core::AggregationNode::Step::kIntermediate) {
+      return core::AggregationNode::Step::kIntermediate;
     }
     return core::AggregationNode::Step::kFinal;
   }
@@ -755,6 +761,28 @@ std::string getOriginalName(const std::string& kind) {
   }
 
   return kind;
+}
+
+// Resolve the intermediate (partial-output) type of an aggregate. For
+// companion aggregates whose input is already intermediate state
+// (_merge, _merge_extract), the intermediate type IS the input type:
+// velox CPU exec::resolveIntermediateType only knows raw-input
+// signatures for the base function and will fail when given an
+// already-intermediate row(...) input.
+TypePtr companionAwareIntermediateType(
+    core::AggregationNode::Aggregate const& aggregate) {
+  const auto& kind = aggregate.call->name();
+  if (kind.ends_with("_merge") ||
+      kind.find("_merge_extract") != std::string::npos) {
+    VELOX_CHECK_EQ(
+        aggregate.rawInputTypes.size(),
+        1,
+        "Companion aggregate must have exactly one input type: {}",
+        kind);
+    return aggregate.rawInputTypes[0];
+  }
+  return exec::resolveIntermediateType(
+      getOriginalName(kind), aggregate.rawInputTypes);
 }
 
 bool hasFinalAggs(
@@ -849,9 +877,8 @@ auto toAggregators(
     auto const kind = aggregate.call->name();
     auto const constant = constants[i];
     auto const companionStep = getCompanionStep(kind, step);
-    const auto originalName = getOriginalName(kind);
     const auto resultType = exec::isPartialOutput(companionStep)
-        ? exec::resolveIntermediateType(originalName, aggregate.rawInputTypes)
+        ? companionAwareIntermediateType(aggregate)
         : outputType->childAt(numKeys + i);
 
     aggregators.push_back(createAggregator(
@@ -873,9 +900,7 @@ RowTypePtr getFinalStepBufferedType(
 
   for (auto i = 0; i < aggregationNode.aggregates().size(); ++i) {
     auto const& aggregate = aggregationNode.aggregates()[i];
-    const auto originalName = getOriginalName(aggregate.call->name());
-    types[numKeys + i] =
-        exec::resolveIntermediateType(originalName, aggregate.rawInputTypes);
+    types[numKeys + i] = companionAwareIntermediateType(aggregate);
   }
 
   return ROW(std::move(names), std::move(types));
@@ -943,8 +968,14 @@ void CudfHashAggregation::initialize() {
       aggregationNode_->step(),
       outputType_,
       aggregationInput.constants);
-  streamingEnabled_ =
-      !hasCompanionAggregates(aggregationNode_->aggregates()) && !isGlobal_;
+  // The hasCompanionAggregates guard (PR #16488) kept streaming on
+  // Presto-style plans only (bare function names like "avg"). With the
+  // slot-aware getCompanionStep above, _merge_extract companions can
+  // correctly participate in the 4-slot streaming pipeline, so the
+  // guard is no longer needed; removing it lets MPP single-task plans
+  // (which always use companion names) avoid the 2^31 column-size
+  // limit on high-cardinality final aggregations.
+  streamingEnabled_ = !isGlobal_;
 
   // Make aggregators for intermediate step when streaming is enabled.
   // Distinct does not need any aggregators.
