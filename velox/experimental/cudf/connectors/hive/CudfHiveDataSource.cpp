@@ -218,6 +218,13 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
     auto tableWithMetadata = splitReader_->read_chunk();
     cudfTable = std::move(tableWithMetadata.tbl);
     metadata = std::move(tableWithMetadata.metadata);
+    // Capture per-chunk emit size so we can correlate scan-level batch
+    // granularity against downstream operator NVTX events. Used to localize
+    // where the 960-batch fragmentation seen in Q8 originates.
+    LOG(WARNING) << "CudfHiveDataSource::next chunk: rows="
+                 << cudfTable->num_rows()
+                 << " cols=" << cudfTable->num_columns()
+                 << " split=" << split_->filePath;
   } else {
     // Read table using the experimental parquet reader
     VELOX_CHECK_NOT_NULL(
