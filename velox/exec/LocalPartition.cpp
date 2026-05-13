@@ -301,6 +301,22 @@ RowVectorPtr LocalExchange::getOutput() {
     VELOX_CHECK(!drained);
     auto lockedStats = stats_.wlock();
     lockedStats->addInputVector(data->estimateFlatSize(), data->size());
+    // Diagnose per-driver pull counts for Q8 batch fragmentation
+    // investigation. Sampled to avoid log explosion.
+    static thread_local int64_t pullCounter{0};
+    static thread_local int64_t pulledRows{0};
+    ++pullCounter;
+    pulledRows += data->size();
+    if (pullCounter <= 5 || pullCounter % 100 == 0) {
+      LOG(WARNING) << "LE_PULL node=" << operatorCtx_->driver()
+                          ->driverCtx()->task->taskId()
+                   << " pipe=" << operatorCtx_->driverCtx()->pipelineId
+                   << " drv=" << operatorCtx_->driverCtx()->driverId
+                   << " partition=" << partition_
+                   << " pull#" << pullCounter
+                   << " rows=" << data->size()
+                   << " totalRows=" << pulledRows;
+    }
     return data;
   }
 

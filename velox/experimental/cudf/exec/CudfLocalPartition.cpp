@@ -190,6 +190,25 @@ void CudfLocalPartition::addInput(RowVectorPtr input) {
   auto cudfVector = std::dynamic_pointer_cast<CudfVector>(input);
   VELOX_CHECK(cudfVector, "Input must be a CudfVector");
   auto stream = cudfVector->stream();
+  // Diagnose per-driver addInput counts for Q8 fragmentation
+  // investigation. Sampled to avoid log explosion.
+  {
+    static thread_local int64_t addCounter{0};
+    static thread_local int64_t addedRows{0};
+    ++addCounter;
+    addedRows += cudfVector->size();
+    if (addCounter <= 5 || addCounter % 100 == 0) {
+      LOG(WARNING) << "LP_ADD task="
+                   << operatorCtx_->driverCtx()->task->taskId()
+                   << " pipe=" << operatorCtx_->driverCtx()->pipelineId
+                   << " drv=" << operatorCtx_->driverCtx()->driverId
+                   << " numQueues=" << queues_.size()
+                   << " numPartitions=" << numPartitions_
+                   << " add#" << addCounter
+                   << " rows=" << cudfVector->size()
+                   << " totalRows=" << addedRows;
+    }
+  }
 
   if (numPartitions_ > 1) {
     if (partitionFunctionType_ == PartitionFunctionType::kRoundRobin) {
