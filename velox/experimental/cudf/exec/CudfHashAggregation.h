@@ -169,8 +169,19 @@ class CudfHashAggregation : public exec::Operator, public NvtxHelper {
 
   void computeSingleGroupbyStreaming(CudfVectorPtr tbl);
 
+  // K-batched streaming: when streamingBatchK_ > 1, addInput pushes the
+  // per-batch pre-aggregated result onto pendingResults_ instead of
+  // immediately merging into bufferedResult_. Merging happens once every
+  // K batches, reducing total D2D copy cost from O(M^2) to O(M^2/K).
+  void flushPendingToBufferedSingle();
+
   CudfVectorPtr bufferedResult_;
   RowTypePtr bufferedResultType_;
+  std::vector<cudf_velox::CudfVectorPtr> pendingResults_;
+  // K for K-batched streaming, read once from CUDF_STREAMING_BATCH_K env
+  // var in initialize(). Default 1 preserves the original "merge every
+  // batch into bufferedResult_" behavior.
+  int streamingBatchK_{1};
 };
 
 // Step-aware aggregation function registry

@@ -992,13 +992,35 @@ void CudfHashAggregation::initialize() {
   streamingEnabled_ = !isGlobal_;
 
   // Experimental override: env var CUDF_DISABLE_AGG_STREAMING=1 forces the
-  // non-streaming (inputs_-accumulate then final concat) path even when
-  // streaming would otherwise be picked. Used to A/B compare streaming
-  // overhead against per-driver concat cost when row count fits under
-  // 2^31. Read once per operator construction.
-  if (const char* disable = std::getenv("CUDF_DISABLE_AGG_STREAMING")) {
-    if (std::string_view(disable) == "1") {
-      streamingEnabled_ = false;
+  // non-streaming (inputs_-accumulate then final concat) path. Limited to
+  // kSingle step only -- a global disable would also block PARTIAL stages,
+  // and PARTIAL's bufferedResult_ flush mechanism is what keeps high-card
+  // groupby (Q17 lineitem) under cuDF's 2^31 column-size limit. PARTIAL
+  // streaming must stay on so that the upstream stage's row count is
+  // bounded before reaching kSingle's inputs_ accumulation.
+  if (isSingleStep_) {
+    if (const char* disable = std::getenv("CUDF_DISABLE_AGG_STREAMING")) {
+      if (std::string_view(disable) == "1") {
+        streamingEnabled_ = false;
+      }
+    }
+  }
+
+  // K-batched streaming knob: when CUDF_STREAMING_BATCH_K=K with K>=2, the
+  // single-step streaming path buffers K per-batch pre-aggregated results
+  // in pendingResults_ before doing a single merge into bufferedResult_.
+  // This reduces total D2D concat cost by a factor of K when compaction
+  // ratio is high (each subsequent merge would otherwise copy the full
+  // bufferedResult_). Default 1 preserves the original behavior.
+  streamingBatchK_ = 1;
+  if (const char* k = std::getenv("CUDF_STREAMING_BATCH_K")) {
+    try {
+      const int parsed = std::stoi(k);
+      if (parsed >= 1) {
+        streamingBatchK_ = parsed;
+      }
+    } catch (...) {
+      // Fall through with default.
     }
   }
 
@@ -1271,6 +1293,17 @@ void CudfHashAggregation::computeSingleGroupbyStreaming(CudfVectorPtr tbl) {
                        ? static_cast<int64_t>(groupbyOnInput->estimateFlatSize())
                        : -1);
 
+  if (streamingBatchK_ > 1) {
+    // K-batched path: defer the cross-batch merge. Accumulate up to K
+    // per-batch pre-aggregated results before paying one O(bufferedResult_)
+    // D2D copy + one intermediate-agg pass.
+    pendingResults_.push_back(groupbyOnInput);
+    if (static_cast<int>(pendingResults_.size()) >= streamingBatchK_) {
+      flushPendingToBufferedSingle();
+    }
+    return;
+  }
+
   if (bufferedResult_) {
     std::vector<cudf::table_view> tablesToConcat;
     tablesToConcat.push_back(bufferedResult_->getTableView());
@@ -1341,6 +1374,77 @@ void CudfHashAggregation::computeSingleGroupbyStreaming(CudfVectorPtr tbl) {
   } else {
     bufferedResult_ = groupbyOnInput;
   }
+}
+
+void CudfHashAggregation::flushPendingToBufferedSingle() {
+  if (pendingResults_.empty()) {
+    return;
+  }
+
+  // Pick a target stream: bufferedResult_'s stream if present, otherwise
+  // the first pending entry's stream.
+  auto targetStream =
+      bufferedResult_ ? bufferedResult_->stream() : pendingResults_.front()->stream();
+
+  // Build the concat input list: [bufferedResult_] + all pendingResults_.
+  std::vector<cudf::table_view> tablesToConcat;
+  tablesToConcat.reserve(pendingResults_.size() + 1);
+  if (bufferedResult_) {
+    tablesToConcat.push_back(bufferedResult_->getTableView());
+  }
+  std::vector<rmm::cuda_stream_view> inputStreams;
+  inputStreams.reserve(pendingResults_.size());
+  for (const auto& p : pendingResults_) {
+    tablesToConcat.push_back(p->getTableView());
+    if (p->stream() != targetStream) {
+      inputStreams.push_back(p->stream());
+    }
+  }
+  if (!inputStreams.empty()) {
+    cudf::detail::join_streams(inputStreams, targetStream);
+  }
+
+  LOG(WARNING) << "STREAM_SINGLE[" << planNodeId()
+               << "] flush K-batched: pending_size=" << pendingResults_.size()
+               << " buffered_rows="
+               << (bufferedResult_ ? static_cast<int64_t>(bufferedResult_->size())
+                                   : -1);
+
+  auto concatenatedTable =
+      cudf::concatenate(tablesToConcat, targetStream, get_temp_mr());
+  auto compactedOutput = doGroupByAggregation(
+      concatenatedTable->view(),
+      groupingKeyOutputChannels_,
+      intermediateAggregators_,
+      bufferedResultType_,
+      targetStream);
+  LOG(WARNING) << "STREAM_SINGLE[" << planNodeId()
+               << "] flush K-batched after agg: concat_rows="
+               << concatenatedTable->num_rows() << " compacted_rows="
+               << (compactedOutput
+                       ? static_cast<int64_t>(compactedOutput->size())
+                       : -1);
+
+  // Apply the same compaction-ratio fallback heuristic as the K=1 path.
+  static constexpr int64_t kStreamingFallbackMinConcatRows = 1'000'000;
+  static constexpr double kStreamingFallbackCompactionThreshold = 0.95;
+  const int64_t concatRows = concatenatedTable->num_rows();
+  const int64_t compactedRows =
+      compactedOutput ? static_cast<int64_t>(compactedOutput->size()) : 0;
+  const double compactionRatio =
+      concatRows > 0 ? static_cast<double>(compactedRows) / concatRows : 0.0;
+  pendingResults_.clear();
+  if (concatRows > kStreamingFallbackMinConcatRows &&
+      compactionRatio > kStreamingFallbackCompactionThreshold) {
+    LOG(WARNING) << "STREAM_SINGLE[" << planNodeId()
+                 << "] disabling streaming after K-batched flush: ratio="
+                 << compactionRatio;
+    inputs_.push_back(std::move(compactedOutput));
+    bufferedResult_.reset();
+    streamingEnabled_ = false;
+    return;
+  }
+  bufferedResult_ = compactedOutput;
 }
 
 void CudfHashAggregation::addInput(RowVectorPtr input) {
@@ -1529,20 +1633,31 @@ RowVectorPtr CudfHashAggregation::getOutput() {
 
   // Single streaming: finalize with final-step aggregators.
   if (isSingleStep_ && !isGlobal_ && !isDistinct_ && streamingEnabled_) {
-    finished_ = true;
-    if (!bufferedResult_) {
-      return nullptr;
+    // Drain any K-batched pending entries into bufferedResult_ before
+    // running finalAggregators_. flushPendingToBufferedSingle may itself
+    // trip the compaction-ratio fallback and disable streaming, in which
+    // case we fall through to the inputs_ concat path below.
+    if (!pendingResults_.empty()) {
+      flushPendingToBufferedSingle();
     }
-    auto stream = bufferedResult_->stream();
-    auto result = doGroupByAggregation(
-        bufferedResult_->getTableView(),
-        groupingKeyOutputChannels_,
-        finalAggregators_,
-        outputType_,
-        stream);
-    stream.synchronize();
-    bufferedResult_.reset();
-    return result;
+    if (streamingEnabled_) {
+      finished_ = true;
+      if (!bufferedResult_) {
+        return nullptr;
+      }
+      auto stream = bufferedResult_->stream();
+      auto result = doGroupByAggregation(
+          bufferedResult_->getTableView(),
+          groupingKeyOutputChannels_,
+          finalAggregators_,
+          outputType_,
+          stream);
+      stream.synchronize();
+      bufferedResult_.reset();
+      return result;
+    }
+    // If streaming was disabled by the heuristic during the flush, fall
+    // through to the non-streaming inputs_ concat path below.
   }
 
   // Final streaming: finalize with the step's own aggregators.
