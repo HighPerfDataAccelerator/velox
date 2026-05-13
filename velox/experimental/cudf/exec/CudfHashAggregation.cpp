@@ -1177,16 +1177,14 @@ void CudfHashAggregation::computePartialGroupbyStreaming(CudfVectorPtr tbl) {
                          ? static_cast<int64_t>(compactedOutput->estimateFlatSize())
                          : -1);
     bufferedResult_ = compactedOutput;
-    partialConcatEvents_++;
     partialCumulativeSmallRows_ += groupbyOnInput->size();
 
-    // Convergence detection: after the first cross-batch merge, check
-    // whether bufferedResult_ is compacting relative to cumulative small
-    // input. If not, switch to bypass mode. Earlier detection saves one
-    // batch worth of wasted concat+agg work on non-converging cases (Q18);
-    // safe for converging cases (Q17 ratio at first concat is ~0.54, well
-    // below the 0.75 threshold).
-    if (!partialBypassMode_ && partialConcatEvents_ >= 1) {
+    // Convergence detection: after each cross-batch merge, check whether
+    // bufferedResult_ is compacting relative to cumulative small input.
+    // If not, switch to bypass mode. Q17 ratio at first concat is ~0.54
+    // (well below 0.75 threshold) so it stays accumulating; Q18 ratio is
+    // 1.0 and trips immediately.
+    if (!partialBypassMode_) {
       static constexpr double kPartialBypassThreshold = 0.75;
       const int64_t bufRows = bufferedResult_->size();
       const double ratio = partialCumulativeSmallRows_ > 0

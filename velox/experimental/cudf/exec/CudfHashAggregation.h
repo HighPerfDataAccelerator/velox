@@ -183,10 +183,10 @@ class CudfHashAggregation : public exec::Operator, public NvtxHelper {
   // batch into bufferedResult_" behavior.
   int streamingBatchK_{1};
 
-  // Partial-streaming convergence detection. After at least 2 cross-batch
-  // concat+merge events in computePartialGroupbyStreaming, compare the
-  // current bufferedResult_ row count against the cumulative pre-aggregated
-  // input row count. If the ratio exceeds kPartialBypassThreshold (0.75),
+  // Partial-streaming convergence detection. After each cross-batch
+  // concat+merge in computePartialGroupbyStreaming, compare the current
+  // bufferedResult_ row count against the cumulative pre-aggregated input
+  // row count. If the ratio exceeds kPartialBypassThreshold (0.75),
   // cross-batch merging is failing to compact (typical for high-cardinality
   // group keys whose per-batch key ranges are disjoint, e.g., Q18
   // lineitem-by-l_orderkey). Switch to bypass mode: subsequent batches'
@@ -194,7 +194,6 @@ class CudfHashAggregation : public exec::Operator, public NvtxHelper {
   // into bufferedResult_. Avoids the O(N^2) D2D cost of repeatedly
   // concatenating with a growing buffered state that never compacts.
   bool partialBypassMode_{false};
-  int partialConcatEvents_{0};
   int64_t partialCumulativeSmallRows_{0};
 };
 
