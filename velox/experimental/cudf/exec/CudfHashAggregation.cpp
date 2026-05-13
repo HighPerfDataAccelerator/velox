@@ -1006,28 +1006,16 @@ void CudfHashAggregation::initialize() {
     }
   }
 
-  // EXPERIMENTAL: restore the hasCompanionAggregates-style guard via env var
-  // to verify that d2f2b3cc2 (enable streaming for _merge_extract companions)
-  // is the cause of Q8/Q9 regression vs 5/11 baseline. When
-  // CUDF_RESTORE_COMPANION_NONSTREAMING=1, any aggregate whose kind ends
-  // with _partial / _merge / contains _merge_extract triggers non-streaming
-  // (inputs_ accumulate + one concat at noMoreInput) for THIS operator.
-  // Expected: Q8 returns to ~3.84s; Q17 OOMs at 2^31 (proves why d2f2b3cc2
-  // removed the guard originally).
+  // EXPERIMENTAL: when CUDF_RESTORE_COMPANION_NONSTREAMING=1, force
+  // non-streaming for *every* groupby aggregation operator. Tightest possible
+  // test to isolate whether the Q8/Q9 regression is in the streaming path
+  // itself or somewhere else in the binary.
   if (const char* restore = std::getenv("CUDF_RESTORE_COMPANION_NONSTREAMING")) {
     if (std::string_view(restore) == "1") {
-      bool hasCompanion = false;
-      for (const auto& agg : aggregationNode_->aggregates()) {
-        const auto& kind = agg.call->name();
-        if (kind.ends_with("_partial") || kind.ends_with("_merge") ||
-            kind.find("_merge_extract") != std::string::npos) {
-          hasCompanion = true;
-          break;
-        }
-      }
-      if (hasCompanion) {
-        streamingEnabled_ = false;
-      }
+      LOG(WARNING) << "AGG_INIT[" << planNodeId()
+                   << "] CUDF_RESTORE_COMPANION_NONSTREAMING=1 set; "
+                   << "forcing non-streaming (was " << streamingEnabled_ << ")";
+      streamingEnabled_ = false;
     }
   }
 
