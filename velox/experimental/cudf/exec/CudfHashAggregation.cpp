@@ -735,6 +735,16 @@ core::AggregationNode::Step getCompanionStep(
   // as raw values, triggering cuDF "Invalid type/aggregation combination"
   // at groupby.cu.
   if (kind.ends_with("_partial")) {
+    // EXPERIMENTAL: env var CUDF_PARTIAL_COMPANION_LEGACY_STEP=1 reverts the
+    // slot-aware logic introduced by c65bd2c8f and returns kPartial
+    // unconditionally (the pre-c65bd2c8f / 5/11 behavior). Used to isolate
+    // whether c65bd2c8f is the root cause of the Q8/Q9 regression.
+    if (const char* legacy =
+            std::getenv("CUDF_PARTIAL_COMPANION_LEGACY_STEP")) {
+      if (std::string_view(legacy) == "1") {
+        return core::AggregationNode::Step::kPartial;
+      }
+    }
     if (step == core::AggregationNode::Step::kPartial) {
       return core::AggregationNode::Step::kPartial;
     }
