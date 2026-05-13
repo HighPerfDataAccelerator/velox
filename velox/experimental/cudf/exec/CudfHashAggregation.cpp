@@ -1177,10 +1177,32 @@ void CudfHashAggregation::computePartialGroupbyStreaming(CudfVectorPtr tbl) {
                          ? static_cast<int64_t>(compactedOutput->estimateFlatSize())
                          : -1);
     bufferedResult_ = compactedOutput;
+    partialConcatEvents_++;
+    partialCumulativeSmallRows_ += groupbyOnInput->size();
+
+    // Convergence detection: after at least 2 cross-batch merges, check
+    // whether bufferedResult_ is compacting relative to cumulative small
+    // input. If not, switch to bypass mode.
+    if (!partialBypassMode_ && partialConcatEvents_ >= 2) {
+      static constexpr double kPartialBypassThreshold = 0.75;
+      const int64_t bufRows = bufferedResult_->size();
+      const double ratio = partialCumulativeSmallRows_ > 0
+          ? static_cast<double>(bufRows) /
+              static_cast<double>(partialCumulativeSmallRows_)
+          : 0.0;
+      if (ratio > kPartialBypassThreshold) {
+        LOG(WARNING) << "STREAM_PARTIAL[" << planNodeId()
+                     << "] partial bypass mode triggered: ratio="
+                     << ratio << " buf_rows=" << bufRows
+                     << " cum_small=" << partialCumulativeSmallRows_;
+        partialBypassMode_ = true;
+      }
+    }
   } else {
     // First time processing, just store the result of the input batch's groupby
     // This means we're storing the stream from the first batch.
     bufferedResult_ = groupbyOnInput;
+    partialCumulativeSmallRows_ += groupbyOnInput->size();
   }
 }
 
@@ -1604,9 +1626,15 @@ RowVectorPtr CudfHashAggregation::getOutput() {
 
   // Handle partial groupby and distinct.
   if (isPartialOutput_ && !isGlobal_ && streamingEnabled_) {
-    if (bufferedResult_ &&
-        bufferedResult_->estimateFlatSize() >
-            maxPartialAggregationMemoryUsage_) {
+    // In bypass mode, flush bufferedResult_ every getOutput regardless of
+    // size. Combined with computePartialGroupbyStreaming's bypass branch,
+    // this means each addInput's pre-aggregated output is emitted directly
+    // to the downstream stage without further cross-batch merging.
+    const bool bypassFlush = partialBypassMode_ && bufferedResult_;
+    if (bypassFlush ||
+        (bufferedResult_ &&
+         bufferedResult_->estimateFlatSize() >
+             maxPartialAggregationMemoryUsage_)) {
       // This is basically a flush of the partial output.
       return releaseAndResetPartialOutput();
     }
