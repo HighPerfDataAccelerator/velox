@@ -776,6 +776,14 @@ bool hasCompanionAggregates(
   });
 }
 
+bool hasNonPartialCompanionAggregates(
+    std::vector<core::AggregationNode::Aggregate> const& aggregates) {
+  return std::any_of(aggregates.begin(), aggregates.end(), [](auto const& agg) {
+    const auto& name = agg.call->name();
+    return isCompanionAggregateName(name) && !name.ends_with("_partial");
+  });
+}
+
 struct AggregationInputChannels {
   std::vector<column_index_t> channels;
   std::vector<VectorPtr> constants;
@@ -834,7 +842,8 @@ auto toAggregators(
     core::AggregationNode const& aggregationNode,
     core::AggregationNode::Step step,
     TypePtr const& outputType,
-    std::vector<VectorPtr> const& constants) {
+    std::vector<VectorPtr> const& constants,
+    bool useRequestedStepForCompanions = false) {
   bool const isGlobal = aggregationNode.groupingKeys().empty();
   const auto numKeys = aggregationNode.groupingKeys().size();
 
@@ -848,14 +857,20 @@ auto toAggregators(
     auto const inputIndex = numKeys + i;
     auto const kind = aggregate.call->name();
     auto const constant = constants[i];
-    auto const companionStep = getCompanionStep(kind, step);
+    auto const companionStep =
+        useRequestedStepForCompanions ? step : getCompanionStep(kind, step);
     const auto originalName = getOriginalName(kind);
     const auto resultType = exec::isPartialOutput(companionStep)
         ? exec::resolveIntermediateType(originalName, aggregate.rawInputTypes)
         : outputType->childAt(numKeys + i);
 
     aggregators.push_back(createAggregator(
-        companionStep, kind, inputIndex, constant, isGlobal, resultType));
+        companionStep,
+        useRequestedStepForCompanions ? originalName : kind,
+        inputIndex,
+        constant,
+        isGlobal,
+        resultType));
   }
   return aggregators;
 }
@@ -943,8 +958,14 @@ void CudfHashAggregation::initialize() {
       aggregationNode_->step(),
       outputType_,
       aggregationInput.constants);
+  const bool hasCompanions =
+      hasCompanionAggregates(aggregationNode_->aggregates());
+  const bool canStreamPartialCompanions =
+      aggregationNode_->step() == core::AggregationNode::Step::kPartial &&
+      hasCompanions &&
+      !hasNonPartialCompanionAggregates(aggregationNode_->aggregates());
   streamingEnabled_ =
-      !hasCompanionAggregates(aggregationNode_->aggregates()) && !isGlobal_;
+      (!hasCompanions || canStreamPartialCompanions) && !isGlobal_;
 
   // Make aggregators for intermediate step when streaming is enabled.
   // Distinct does not need any aggregators.
@@ -961,7 +982,8 @@ void CudfHashAggregation::initialize() {
         *aggregationNode_,
         core::AggregationNode::Step::kIntermediate,
         bufferedResultType_,
-        nullConstants);
+        nullConstants,
+        canStreamPartialCompanions);
 
     if (isSingleStep_) {
       partialAggregators_ = toAggregators(
