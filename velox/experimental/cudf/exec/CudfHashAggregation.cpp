@@ -723,17 +723,37 @@ core::AggregationNode::Step getCompanionStep(
     return core::AggregationNode::Step::kIntermediate;
   }
 
+  // _partial companion: raw input -> partial state. Behavior depends on
+  // the requested step:
+  //   - kPartial (first-pass slot reading raw input): use kPartial
+  //     (raw -> struct).
+  //   - kIntermediate / other (an accumulator slot whose input is the
+  //     already-flushed partial state from bufferedResult_): merge
+  //     partial states, keep them as intermediate (use kIntermediate).
+  // Without slot-aware dispatch, a fixed kPartial return makes the
+  // intermediate streaming accumulator try to read struct(sum, count)
+  // as raw values, triggering cuDF "Invalid type/aggregation combination"
+  // at groupby.cu.
   if (kind.ends_with("_partial")) {
-    return core::AggregationNode::Step::kPartial;
+    if (step == core::AggregationNode::Step::kPartial) {
+      return core::AggregationNode::Step::kPartial;
+    }
+    return core::AggregationNode::Step::kIntermediate;
   }
 
   // The format is count_merge_extract_BIGINT or count_merge_extract.
-  // In a SINGLE-step aggregation node, _merge_extract companions receive raw
-  // input (not intermediate state) so they must use kSingle signatures and
-  // aggregation logic rather than kFinal.
+  // _merge_extract companion: input is intermediate state (e.g.
+  // row(sum, count) for avg); output depends on the requested step.
+  //   - kPartial / kIntermediate (streaming slot building a partial or
+  //     intermediate accumulator): merge intermediate states, keep them
+  //     as intermediate (sum+count grow, no extract).
+  //   - kFinal / kSingle (final extraction or canBeEvaluatedByCudf
+  //     signature check against the plan-level final signature): consume
+  //     intermediate state and produce the final value.
   if (kind.find("_merge_extract") != std::string::npos) {
-    if (step == core::AggregationNode::Step::kSingle) {
-      return core::AggregationNode::Step::kSingle;
+    if (step == core::AggregationNode::Step::kPartial ||
+        step == core::AggregationNode::Step::kIntermediate) {
+      return core::AggregationNode::Step::kIntermediate;
     }
     return core::AggregationNode::Step::kFinal;
   }
@@ -755,6 +775,28 @@ std::string getOriginalName(const std::string& kind) {
   }
 
   return kind;
+}
+
+// Resolve the intermediate (partial-output) type of an aggregate. For
+// companion aggregates whose input is already intermediate state
+// (_merge, _merge_extract), the intermediate type IS the input type:
+// velox CPU exec::resolveIntermediateType only knows raw-input
+// signatures for the base function and will fail when given an
+// already-intermediate row(...) input.
+TypePtr companionAwareIntermediateType(
+    core::AggregationNode::Aggregate const& aggregate) {
+  const auto& kind = aggregate.call->name();
+  if (kind.ends_with("_merge") ||
+      kind.find("_merge_extract") != std::string::npos) {
+    VELOX_CHECK_EQ(
+        aggregate.rawInputTypes.size(),
+        1,
+        "Companion aggregate must have exactly one input type: {}",
+        kind);
+    return aggregate.rawInputTypes[0];
+  }
+  return exec::resolveIntermediateType(
+      getOriginalName(kind), aggregate.rawInputTypes);
 }
 
 bool hasFinalAggs(
@@ -861,7 +903,7 @@ auto toAggregators(
         useRequestedStepForCompanions ? step : getCompanionStep(kind, step);
     const auto originalName = getOriginalName(kind);
     const auto resultType = exec::isPartialOutput(companionStep)
-        ? exec::resolveIntermediateType(originalName, aggregate.rawInputTypes)
+        ? companionAwareIntermediateType(aggregate)
         : outputType->childAt(numKeys + i);
 
     aggregators.push_back(createAggregator(
@@ -888,9 +930,7 @@ RowTypePtr getFinalStepBufferedType(
 
   for (auto i = 0; i < aggregationNode.aggregates().size(); ++i) {
     auto const& aggregate = aggregationNode.aggregates()[i];
-    const auto originalName = getOriginalName(aggregate.call->name());
-    types[numKeys + i] =
-        exec::resolveIntermediateType(originalName, aggregate.rawInputTypes);
+    types[numKeys + i] = companionAwareIntermediateType(aggregate);
   }
 
   return ROW(std::move(names), std::move(types));
@@ -1045,18 +1085,27 @@ void CudfHashAggregation::setupGroupingKeyChannelProjections(
 void CudfHashAggregation::computePartialGroupbyStreaming(CudfVectorPtr tbl) {
   // For every input, we'll do a groupby and compact results with the existing
   // intermediate groupby results.
-
   auto inputTableStream = tbl->stream();
   // Use getTableView() to avoid expensive materialization for packed_table.
   // tbl stays alive during this function call, keeping the view valid.
   auto permutedInputView = tbl->getTableView().select(
       aggregationInputChannels_.begin(), aggregationInputChannels_.end());
+
   auto groupbyOnInput = doGroupByAggregation(
       permutedInputView,
       groupingKeyOutputChannels_,
       aggregators_,
       bufferedResultType_,
       inputTableStream);
+
+  // doGroupByAggregation returns nullptr when the input batch produces no
+  // output groups (for example all-null grouping keys with ignoreNullKeys_
+  // active). Skip the merge / state-update so we don't deref nullptr in
+  // the bufferedResult_ branch's getTableView() or in the first-time
+  // branch's size() accounting below.
+  if (!groupbyOnInput) {
+    return;
+  }
 
   // If we already have partial output, concatenate the new results with it.
   if (bufferedResult_) {
@@ -1072,7 +1121,6 @@ void CudfHashAggregation::computePartialGroupbyStreaming(CudfVectorPtr tbl) {
         std::vector<rmm::cuda_stream_view>{inputTableStream},
         partialOutputStream);
 
-    // Concatenate the tables
     auto concatenatedTable =
         cudf::concatenate(tablesToConcat, partialOutputStream, get_output_mr());
 
@@ -1085,10 +1133,36 @@ void CudfHashAggregation::computePartialGroupbyStreaming(CudfVectorPtr tbl) {
         bufferedResultType_,
         partialOutputStream);
     bufferedResult_ = compactedOutput;
+    partialCumulativeInputRows_ += groupbyOnInput->size();
+
+    // Convergence detection: after each cross-batch merge, check whether
+    // bufferedResult_ is compacting relative to cumulative small input.
+    // If not, switch to bypass mode. Q17 ratio at first concat is ~0.54
+    // (well below 0.75 threshold) so it stays accumulating; Q18 ratio is
+    // 1.0 and trips immediately.
+    if (!partialBypassMode_) {
+      static constexpr double kPartialBypassThreshold = 0.75;
+      const int64_t bufRows = bufferedResult_->size();
+      const double ratio = partialCumulativeInputRows_ > 0
+          ? static_cast<double>(bufRows) /
+              static_cast<double>(partialCumulativeInputRows_)
+          : 0.0;
+      if (ratio > kPartialBypassThreshold) {
+        // Fires at most once per operator lifetime (partialBypassMode_ is
+        // sticky), but kept at LOG(INFO) so the transition is visible in
+        // production logs -- it's a one-shot state-change event, not noise.
+        LOG(INFO) << "STREAM_PARTIAL[" << planNodeId()
+                  << "] partial bypass mode triggered: ratio="
+                  << ratio << " buf_rows=" << bufRows
+                  << " cum_input=" << partialCumulativeInputRows_;
+        partialBypassMode_ = true;
+      }
+    }
   } else {
     // First time processing, just store the result of the input batch's groupby
     // This means we're storing the stream from the first batch.
     bufferedResult_ = groupbyOnInput;
+    partialCumulativeInputRows_ += groupbyOnInput->size();
   }
 }
 
@@ -1173,6 +1247,7 @@ void CudfHashAggregation::computeSingleGroupbyStreaming(CudfVectorPtr tbl) {
   auto inputTableStream = tbl->stream();
   auto permutedInputView = tbl->getTableView().select(
       aggregationInputChannels_.begin(), aggregationInputChannels_.end());
+
   auto groupbyOnInput = doGroupByAggregation(
       permutedInputView,
       groupingKeyOutputChannels_,
@@ -1354,6 +1429,13 @@ CudfVectorPtr CudfHashAggregation::releaseAndResetPartialOutput() {
   }
 
   numInputRows_ = 0;
+  // Reset cumulative input-row counter so the post-flush bypass-trigger
+  // ratio compares bufferedResult_ against rows newly accumulated AFTER
+  // the flush, not against the (now-released) pre-flush input total.
+  // Without this reset, a memory-limit flush that fires before bypass has
+  // triggered can leave the ratio permanently low and suppress later
+  // bypass detection on subsequent high-cardinality batches.
+  partialCumulativeInputRows_ = 0;
   return std::exchange(bufferedResult_, nullptr);
 }
 
@@ -1362,9 +1444,20 @@ RowVectorPtr CudfHashAggregation::getOutput() {
 
   // Handle partial groupby and distinct.
   if (isPartialOutput_ && !isGlobal_ && streamingEnabled_) {
-    if (bufferedResult_ &&
-        bufferedResult_->estimateFlatSize() >
-            maxPartialAggregationMemoryUsage_) {
+    // In bypass mode, flush bufferedResult_ every getOutput regardless of
+    // size, instead of waiting for the maxPartialAggregationMemoryUsage_
+    // threshold. computePartialGroupbyStreaming itself still does the
+    // cross-batch concat + intermediate-aggregator merge each addInput
+    // (there is no skip-merge branch keyed on partialBypassMode_), so the
+    // bypass saves only the flush-latency / late-emit memory; the
+    // per-batch merge CPU/GPU cost is still paid, which preserves
+    // semantic correctness vs. emitting raw doGroupByAggregation output.
+    // See partialBypassMode_ trigger in computePartialGroupbyStreaming.
+    const bool bypassFlush = partialBypassMode_ && bufferedResult_;
+    if (bypassFlush ||
+        (bufferedResult_ &&
+         bufferedResult_->estimateFlatSize() >
+             maxPartialAggregationMemoryUsage_)) {
       // This is basically a flush of the partial output.
       return releaseAndResetPartialOutput();
     }

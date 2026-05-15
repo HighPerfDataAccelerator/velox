@@ -198,6 +198,10 @@ class LocalExchange : public SourceOperator {
   const std::shared_ptr<LocalExchangeQueue> queue_{nullptr};
   ContinueFuture future_;
   BlockingReason blockingReason_{BlockingReason::kNotBlocked};
+
+  // Diagnostic counters for Q8 batch fragmentation investigation.
+  int64_t lePullCount_{0};
+  int64_t lePullRows_{0};
 };
 
 /// Hash partitions the data using specified keys. The number of partitions is

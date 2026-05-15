@@ -77,6 +77,12 @@ class CudfLocalPartition : public exec::Operator, public NvtxHelper {
   std::vector<ContinueFuture> futures_;
 
   std::vector<column_index_t> partitionKeyIndices_;
+
+  // Diagnostic counters for Q8 batch fragmentation investigation.
+  int64_t lpAddCount_{0};
+  int64_t lpAddRows_{0};
+  int64_t lpEnqueueCount_{0};
+  int64_t lpEnqueueRows_{0};
 };
 
 } // namespace facebook::velox::cudf_velox

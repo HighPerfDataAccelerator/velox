@@ -301,6 +301,9 @@ RowVectorPtr LocalExchange::getOutput() {
     VELOX_CHECK(!drained);
     auto lockedStats = stats_.wlock();
     lockedStats->addInputVector(data->estimateFlatSize(), data->size());
+    // Track per-LocalExchange-instance pull counts; flush in close().
+    ++lePullCount_;
+    lePullRows_ += data->size();
     return data;
   }
 
@@ -318,6 +321,15 @@ bool LocalExchange::isFinished() {
 }
 
 void LocalExchange::close() {
+  // Flush diagnostic counts at consumer-side close.
+  LOG(WARNING) << "LE_SUMMARY task="
+               << operatorCtx_->driverCtx()->task->taskId()
+               << " node=" << planNodeId()
+               << " pipe=" << operatorCtx_->driverCtx()->pipelineId
+               << " drv=" << operatorCtx_->driverCtx()->driverId
+               << " partition=" << partition_
+               << " pullCount=" << lePullCount_
+               << " pullRows=" << lePullRows_;
   Operator::close();
   if (queue_) {
     queue_->close();

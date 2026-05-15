@@ -142,7 +142,11 @@ class CudfHashAggregation : public exec::Operator, public NvtxHelper {
   const bool isDistinct_;
   // Single means it's a single step aggregation (partial + final combined).
   const bool isSingleStep_;
-  // Streaming aggregation is disabled if companion aggregates are present.
+  // Streaming aggregation is enabled when (a) the aggregate is grouped (not
+  // global) AND (b) either no companion aggregates are present OR the step
+  // is kPartial with all-`_partial` companions (the latter carve-out lets
+  // Spark MPP partial-stage groupbys stream; see CudfHashAggregation::initialize
+  // for the gating logic and the canStreamPartialCompanions flag).
   bool streamingEnabled_{true};
 
   // Maximum memory usage for partial aggregation.
@@ -171,6 +175,31 @@ class CudfHashAggregation : public exec::Operator, public NvtxHelper {
 
   CudfVectorPtr bufferedResult_;
   RowTypePtr bufferedResultType_;
+
+  // Partial-streaming convergence detection. After each cross-batch
+  // concat+merge in computePartialGroupbyStreaming, compare the current
+  // bufferedResult_ row count against the cumulative pre-aggregated input
+  // row count.
+  //
+  // Threshold kPartialBypassThreshold = 0.75: derived from "if 2 batches
+  // pre-aggregated to S rows each fail to combine below 1.5*S after merge,
+  // future batches won't help" -- i.e. group-key ranges are effectively
+  // disjoint and continued merging is wasted D2D work. 0.75 = 1.5/2 leaves
+  // some margin around the threshold for noise. Anything > 0.75 is treated
+  // as "not converging".
+  //
+  // If the ratio exceeds 0.75, switch to bypass mode: subsequent batches'
+  // pre-aggregated results are flushed downstream directly without merging
+  // into bufferedResult_. Avoids the O(N^2) D2D cost of repeatedly
+  // concatenating with a growing buffered state that never compacts.
+  // Typical trip cases: high-cardinality group keys whose per-batch key
+  // ranges are disjoint (e.g., Q18 lineitem-by-l_orderkey, ratio = 1.0 on
+  // first concat).
+  //
+  // partialBypassMode_ is sticky: once set, the operator stays in bypass
+  // for the rest of its lifetime (no transition back to compacting mode).
+  bool partialBypassMode_{false};
+  int64_t partialCumulativeInputRows_{0};
 };
 
 // Step-aware aggregation function registry

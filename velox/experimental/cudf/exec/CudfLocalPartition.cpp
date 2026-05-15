@@ -169,6 +169,9 @@ void CudfLocalPartition::enqueuePartition(
     // Skip empty partitions.
     return;
   }
+  // Diagnostic: count actual enqueue events (post-hash-partition).
+  ++lpEnqueueCount_;
+  lpEnqueueRows_ += cudfVector->size();
 
   // estimateFlatSize() returns the real GPU device buffer size; size() is
   // the row count (mistakenly used as bytes in upstream baseline) and
@@ -190,6 +193,11 @@ void CudfLocalPartition::addInput(RowVectorPtr input) {
   auto cudfVector = std::dynamic_pointer_cast<CudfVector>(input);
   VELOX_CHECK(cudfVector, "Input must be a CudfVector");
   auto stream = cudfVector->stream();
+  // Diagnose per-driver addInput counts for Q8 fragmentation
+  // investigation. Track per-operator-instance totals; flush at
+  // noMoreInput via separate path below.
+  ++lpAddCount_;
+  lpAddRows_ += cudfVector->size();
 
   if (numPartitions_ > 1) {
     if (partitionFunctionType_ == PartitionFunctionType::kRoundRobin) {
@@ -265,6 +273,13 @@ void CudfLocalPartition::addInput(RowVectorPtr input) {
     auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input);
     const uint64_t bytes =
         cudfInput ? cudfInput->estimateFlatSize() : input->retainedSize();
+    // Diagnostic: count enqueue on the single-partition pass-through path
+    // too, so LP_SUMMARY's enqueueCount/enqueueRows include both fan-out
+    // and pass-through topologies. cudfVector is the validated downcast
+    // from addInput's top, so size() here matches the actual enqueued
+    // payload rather than input->size() of the unchecked upstream type.
+    ++lpEnqueueCount_;
+    lpEnqueueRows_ += cudfVector->size();
     auto blockingReason = queues_[0]->enqueue(input, bytes, &future);
     if (blockingReason != exec::BlockingReason::kNotBlocked) {
       blockingReasons_.push_back(blockingReason);
@@ -290,6 +305,17 @@ void CudfLocalPartition::noMoreInput() {
   for (const auto& queue : queues_) {
     queue->noMoreData();
   }
+  // Flush diagnostic counts at producer-side end-of-data.
+  LOG(WARNING) << "LP_SUMMARY task="
+               << operatorCtx_->driverCtx()->task->taskId()
+               << " node=" << planNodeId()
+               << " pipe=" << operatorCtx_->driverCtx()->pipelineId
+               << " drv=" << operatorCtx_->driverCtx()->driverId
+               << " numQueues=" << queues_.size()
+               << " addInputCount=" << lpAddCount_
+               << " addInputRows=" << lpAddRows_
+               << " enqueueCount=" << lpEnqueueCount_
+               << " enqueueRows=" << lpEnqueueRows_;
 }
 
 bool CudfLocalPartition::isFinished() {
