@@ -27,29 +27,43 @@ namespace facebook::velox::cudf_velox {
 CudfOrderBy::CudfOrderBy(
     int32_t operatorId,
     exec::DriverCtx* driverCtx,
-    const std::shared_ptr<const core::OrderByNode>& orderByNode)
+    const std::shared_ptr<const core::PlanNode>& planNode)
     : CudfOperatorBase(
           operatorId,
           driverCtx,
-          orderByNode->outputType(),
-          orderByNode->id(),
+          planNode->outputType(),
+          planNode->id(),
           "CudfOrderBy",
           nvtx3::rgb{64, 224, 208}, // Turquoise
           NvtxMethodFlag::kAll,
           std::nullopt,
-          orderByNode),
-      orderByNode_(orderByNode) {
-  sortKeys_.reserve(orderByNode->sortingKeys().size());
-  columnOrder_.reserve(orderByNode->sortingKeys().size());
-  nullOrder_.reserve(orderByNode->sortingKeys().size());
-  for (int i = 0; i < orderByNode->sortingKeys().size(); ++i) {
+          planNode) {
+  const std::vector<core::FieldAccessTypedExprPtr>* sortingKeys = nullptr;
+  const std::vector<core::SortOrder>* sortingOrders = nullptr;
+  if (auto orderByNode =
+          std::dynamic_pointer_cast<const core::OrderByNode>(planNode)) {
+    sortingKeys = &orderByNode->sortingKeys();
+    sortingOrders = &orderByNode->sortingOrders();
+  } else if (
+      auto mergeExchangeNode =
+          std::dynamic_pointer_cast<const core::MergeExchangeNode>(planNode)) {
+    sortingKeys = &mergeExchangeNode->sortingKeys();
+    sortingOrders = &mergeExchangeNode->sortingOrders();
+  }
+  VELOX_CHECK_NOT_NULL(
+      sortingKeys, "CudfOrderBy requires an OrderBy or MergeExchange node");
+
+  sortKeys_.reserve(sortingKeys->size());
+  columnOrder_.reserve(sortingKeys->size());
+  nullOrder_.reserve(sortingKeys->size());
+  for (auto i = 0; i < sortingKeys->size(); ++i) {
     const auto channel =
-        exec::exprToChannel(orderByNode->sortingKeys()[i].get(), outputType_);
+        exec::exprToChannel((*sortingKeys)[i].get(), outputType_);
     VELOX_CHECK(
         channel != kConstantChannel,
         "OrderBy doesn't allow constant sorting keys");
     sortKeys_.push_back(channel);
-    auto const& sortingOrder = orderByNode->sortingOrders()[i];
+    const auto& sortingOrder = (*sortingOrders)[i];
     columnOrder_.push_back(
         sortingOrder.isAscending() ? cudf::order::ASCENDING
                                    : cudf::order::DESCENDING);

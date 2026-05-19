@@ -16,10 +16,43 @@
 
 #pragma once
 
+#include "velox/experimental/ucx-exchange/UcxExchangeClient.h"
+
 #include "velox/exec/Driver.h"
 #include "velox/exec/Operator.h"
 
+#include <memory>
+#include <string>
+#include <unordered_map>
+
 namespace facebook::velox::cudf_velox {
+
+struct TaskPipelineKey {
+  std::string taskId;
+  int pipelineId;
+
+  TaskPipelineKey(const std::string& taskId, int pipelineId)
+      : taskId(taskId), pipelineId(pipelineId) {}
+
+  bool operator==(const TaskPipelineKey& other) const {
+    return taskId == other.taskId && pipelineId == other.pipelineId;
+  }
+
+  struct Hash {
+    std::size_t operator()(const TaskPipelineKey& key) const {
+      const auto taskHash = std::hash<std::string>{}(key.taskId);
+      const auto pipelineHash = std::hash<int>{}(key.pipelineId);
+      return taskHash ^ (pipelineHash << 1);
+    }
+  };
+};
+
+using UcxExchangeClientMap = std::unordered_map<
+    TaskPipelineKey,
+    std::weak_ptr<ucx_exchange::UcxExchangeClient>,
+    TaskPipelineKey::Hash>;
+
+UcxExchangeClientMap& getUcxExchangeClientMap();
 
 class CompileState {
  public:

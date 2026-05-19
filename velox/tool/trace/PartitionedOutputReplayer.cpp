@@ -174,7 +174,8 @@ core::PlanNodePtr PartitionedOutputReplayer::createPlanNode(
       originalNode->partitionFunctionSpecPtr(),
       originalNode->outputType(),
       serdeKind_,
-      source);
+      source,
+      originalNode->transportType());
 }
 
 } // namespace facebook::velox::tool::trace
