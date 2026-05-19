@@ -15,6 +15,7 @@
  */
 
 #include "velox/experimental/cudf/exec/AggregationRegistry.h"
+#include "velox/experimental/cudf/exec/CudfAggregation.h"
 #include "velox/experimental/cudf/exec/CudfGroupby.h"
 #include "velox/experimental/cudf/exec/CudfReduce.h"
 #include "velox/experimental/cudf/exec/PrestoAggregateFunctions.h"
@@ -243,6 +244,59 @@ TEST_F(StepAwareAggregationRegistryTest, avgFinalStepValidation) {
 
   EXPECT_TRUE(groupbySupported)
       << "Final step avg(ROW(DOUBLE,BIGINT)) should be supported";
+}
+
+TEST_F(StepAwareAggregationRegistryTest, companionStepRoutingIsSlotAware) {
+  EXPECT_EQ(
+      getCompanionStep("avg_partial", core::AggregationNode::Step::kPartial),
+      core::AggregationNode::Step::kPartial);
+  EXPECT_EQ(
+      getCompanionStep("avg_partial", core::AggregationNode::Step::kSingle),
+      core::AggregationNode::Step::kPartial);
+  EXPECT_EQ(
+      getCompanionStep(
+          "avg_partial", core::AggregationNode::Step::kIntermediate),
+      core::AggregationNode::Step::kIntermediate);
+  EXPECT_EQ(
+      getCompanionStep(
+          "avg_merge_extract", core::AggregationNode::Step::kIntermediate),
+      core::AggregationNode::Step::kIntermediate);
+  EXPECT_EQ(
+      getCompanionStep(
+          "count_merge_extract_BIGINT", core::AggregationNode::Step::kFinal),
+      core::AggregationNode::Step::kFinal);
+}
+
+TEST_F(
+    StepAwareAggregationRegistryTest,
+    partialCompanionIntermediateValidationUsesIntermediateState) {
+  auto intermediateType = ROW({DOUBLE(), BIGINT()});
+  auto avgPartialIntermediateCall = std::make_shared<core::CallTypedExpr>(
+      intermediateType,
+      std::vector<core::TypedExprPtr>{
+          std::make_shared<core::FieldAccessTypedExpr>(
+              intermediateType, "intermediate")},
+      "avg_partial");
+
+  EXPECT_TRUE(canGroupbyAggregationBeEvaluatedByCudf(
+      *avgPartialIntermediateCall,
+      core::AggregationNode::Step::kIntermediate,
+      {intermediateType},
+      queryCtx_.get()));
+}
+
+TEST_F(StepAwareAggregationRegistryTest, typedMergeExtractIsFinalAggregate) {
+  auto call = std::make_shared<core::CallTypedExpr>(
+      BIGINT(),
+      std::vector<core::TypedExprPtr>{
+          std::make_shared<core::FieldAccessTypedExpr>(
+              ROW({BIGINT()}), "intermediate")},
+      "count_merge_extract_BIGINT");
+  std::vector<core::AggregationNode::Aggregate> aggregates = {
+      core::AggregationNode::Aggregate{
+          call, {ROW({BIGINT()})}, nullptr, {}, {}}};
+
+  EXPECT_TRUE(hasFinalAggs(aggregates));
 }
 
 TEST_F(StepAwareAggregationRegistryTest, sumStepConsistency) {

@@ -34,6 +34,7 @@
 #include <cudf/copying.hpp>
 #include <cudf/detail/utilities/stream_pool.hpp>
 #include <cudf/unary.hpp>
+#include <glog/logging.h>
 
 namespace {
 
@@ -643,7 +644,13 @@ void CudfGroupby::initialize() {
       aggregationNode_->step(),
       outputType_,
       aggregationInput.constants);
-  streamingEnabled_ = !hasCompanionAggregates(aggregationNode_->aggregates());
+  const bool hasCompanions =
+      hasCompanionAggregates(aggregationNode_->aggregates());
+  const bool canStreamPartialCompanions =
+      aggregationNode_->step() == core::AggregationNode::Step::kPartial &&
+      hasCompanions &&
+      !hasNonPartialCompanionAggregates(aggregationNode_->aggregates());
+  streamingEnabled_ = !hasCompanions || canStreamPartialCompanions;
 
   // Make aggregators for intermediate step when streaming is enabled.
   if (streamingEnabled_) {
@@ -704,6 +711,13 @@ void CudfGroupby::computePartialGroupbyStreaming(CudfVectorPtr tbl) {
       bufferedResultType_,
       inputTableStream);
 
+  // doGroupByAggregation returns nullptr if the input batch produces no groups
+  // (for example all-null keys with ignoreNullKeys_ active). Skip state updates
+  // to avoid dereferencing nullptr below.
+  if (!groupbyOnInput) {
+    return;
+  }
+
   // If we already have partial output, concatenate the new results with it.
   if (bufferedResult_) {
     auto partialOutputStream = bufferedResult_->stream();
@@ -725,10 +739,28 @@ void CudfGroupby::computePartialGroupbyStreaming(CudfVectorPtr tbl) {
         bufferedResultType_,
         partialOutputStream);
     bufferedResult_ = compactedOutput;
+    partialCumulativeInputRows_ += groupbyOnInput->size();
+
+    if (!partialBypassMode_) {
+      static constexpr double kPartialBypassThreshold = 0.75;
+      const auto bufferedRows = bufferedResult_->size();
+      const auto ratio = partialCumulativeInputRows_ > 0
+          ? static_cast<double>(bufferedRows) /
+              static_cast<double>(partialCumulativeInputRows_)
+          : 0.0;
+      if (ratio > kPartialBypassThreshold) {
+        LOG(INFO) << "STREAM_PARTIAL[" << planNodeId()
+                  << "] partial bypass mode triggered: ratio=" << ratio
+                  << " buffered_rows=" << bufferedRows
+                  << " cumulative_input_rows=" << partialCumulativeInputRows_;
+        partialBypassMode_ = true;
+      }
+    }
   } else {
     // First time processing, just store the result of the input batch's groupby
     // This means we're storing the stream from the first batch.
     bufferedResult_ = groupbyOnInput;
+    partialCumulativeInputRows_ += groupbyOnInput->size();
   }
 }
 
@@ -901,6 +933,7 @@ CudfVectorPtr CudfGroupby::releaseAndResetBufferedResult() {
   }
 
   numInputRows_ = 0;
+  partialCumulativeInputRows_ = 0;
   // We're moving bufferedResult_ to the caller because we want it to be null
   // after this call.
   return std::move(bufferedResult_);
@@ -909,9 +942,11 @@ CudfVectorPtr CudfGroupby::releaseAndResetBufferedResult() {
 RowVectorPtr CudfGroupby::doGetOutput() {
   // Handle partial streaming groupby.
   if (isPartialOutput_ && streamingEnabled_) {
-    if (bufferedResult_ &&
-        bufferedResult_->estimateFlatSize() >
-            maxPartialAggregationMemoryUsage_) {
+    const bool bypassFlush = partialBypassMode_ && bufferedResult_;
+    if (bypassFlush ||
+        (bufferedResult_ &&
+         bufferedResult_->estimateFlatSize() >
+             maxPartialAggregationMemoryUsage_)) {
       return releaseAndResetBufferedResult();
     }
     if (not noMoreInput_) {

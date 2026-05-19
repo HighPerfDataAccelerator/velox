@@ -64,12 +64,26 @@ core::AggregationNode::Step getCompanionStep(
     return core::AggregationNode::Step::kIntermediate;
   }
 
+  // Spark _partial companions read raw input in plan-level single/partial
+  // slots, but read already-buffered partial state in streaming accumulator
+  // slots.
   if (kind.ends_with("_partial")) {
-    return core::AggregationNode::Step::kPartial;
+    if (step == core::AggregationNode::Step::kSingle ||
+        step == core::AggregationNode::Step::kPartial) {
+      return core::AggregationNode::Step::kPartial;
+    }
+    return core::AggregationNode::Step::kIntermediate;
   }
 
   // The format is count_merge_extract_BIGINT or count_merge_extract.
+  // _merge_extract companions consume intermediate state. Streaming partial
+  // and intermediate slots preserve that state; final and single slots extract
+  // the final value.
   if (kind.find("_merge_extract") != std::string::npos) {
+    if (step == core::AggregationNode::Step::kPartial ||
+        step == core::AggregationNode::Step::kIntermediate) {
+      return core::AggregationNode::Step::kIntermediate;
+    }
     return core::AggregationNode::Step::kFinal;
   }
 
@@ -120,6 +134,34 @@ bool hasCompanionAggregates(
   });
 }
 
+bool hasNonPartialCompanionAggregates(
+    std::vector<core::AggregationNode::Aggregate> const& aggregates) {
+  return std::any_of(aggregates.begin(), aggregates.end(), [](auto const& agg) {
+    const auto& name = agg.call->name();
+    return isCompanionAggregateName(name) && !name.ends_with("_partial");
+  });
+}
+
+namespace {
+
+TypePtr companionAwareIntermediateType(
+    const core::AggregationNode::Aggregate& aggregate) {
+  const auto& kind = aggregate.call->name();
+  if (kind.ends_with("_merge") ||
+      kind.find("_merge_extract") != std::string::npos) {
+    VELOX_CHECK_EQ(
+        aggregate.rawInputTypes.size(),
+        1,
+        "Companion aggregate must have exactly one input type: {}",
+        kind);
+    return aggregate.rawInputTypes[0];
+  }
+  return exec::resolveIntermediateType(
+      getOriginalName(kind), aggregate.rawInputTypes);
+}
+
+} // namespace
+
 std::vector<ResolvedAggregateInfo> resolveAggregateInfos(
     core::AggregationNode const& aggregationNode,
     core::AggregationNode::Step step,
@@ -132,9 +174,8 @@ std::vector<ResolvedAggregateInfo> resolveAggregateInfos(
   for (size_t i = 0; i < aggregationNode.aggregates().size(); ++i) {
     auto const& aggregate = aggregationNode.aggregates()[i];
     auto const companionStep = getCompanionStep(aggregate.call->name(), step);
-    const auto originalName = getOriginalName(aggregate.call->name());
     const auto resultType = exec::isPartialOutput(companionStep)
-        ? exec::resolveIntermediateType(originalName, aggregate.rawInputTypes)
+        ? companionAwareIntermediateType(aggregate)
         : outputType->childAt(numKeys + i);
 
     params.emplace_back(
@@ -211,9 +252,7 @@ RowTypePtr getBufferedResultType(core::AggregationNode const& aggregationNode) {
 
   for (auto i = 0; i < aggregationNode.aggregates().size(); ++i) {
     auto const& aggregate = aggregationNode.aggregates()[i];
-    const auto originalName = getOriginalName(aggregate.call->name());
-    types[numKeys + i] =
-        exec::resolveIntermediateType(originalName, aggregate.rawInputTypes);
+    types[numKeys + i] = companionAwareIntermediateType(aggregate);
   }
 
   return ROW(std::move(names), std::move(types));
@@ -222,7 +261,7 @@ RowTypePtr getBufferedResultType(core::AggregationNode const& aggregationNode) {
 bool hasFinalAggs(
     std::vector<core::AggregationNode::Aggregate> const& aggregates) {
   return std::any_of(aggregates.begin(), aggregates.end(), [](auto const& agg) {
-    return agg.call->name().ends_with("_merge_extract");
+    return agg.call->name().find("_merge_extract") != std::string::npos;
   });
 }
 
