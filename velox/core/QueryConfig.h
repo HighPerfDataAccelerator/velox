@@ -340,6 +340,16 @@ class QueryConfig {
       2UL << 20,
       "Minimum bytes to accumulate before unblocking an exchange consumer.")
 
+  /// Minimum rows to accumulate in UcxPartitionedOutput before flushing.
+  /// Set to 0 to disable accumulation.
+  VELOX_QUERY_CONFIG(
+      kUcxPartitionedOutputBatchRows,
+      ucxPartitionedOutputBatchRows,
+      "cudf.partitioned_output_batch_rows",
+      int64_t,
+      10'000,
+      "Minimum rows to accumulate in UcxPartitionedOutput before flushing.")
+
   VELOX_QUERY_CONFIG(
       kMaxPartialAggregationMemory,
       maxPartialAggregationMemoryUsage,

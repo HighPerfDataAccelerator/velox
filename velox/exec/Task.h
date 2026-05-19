@@ -39,6 +39,38 @@ class IndexLookupJoinBridge;
 class NestedLoopJoinBridge;
 class SpatialJoinBridge;
 class SplitListener;
+class Task;
+
+class PartitionedOutputBufferManager {
+ public:
+  virtual ~PartitionedOutputBufferManager() = default;
+
+  virtual bool supports(
+      const core::PartitionedOutputNode& node,
+      const core::QueryConfig& queryConfig) const = 0;
+
+  virtual void initializeTask(
+      std::shared_ptr<Task> task,
+      core::PartitionedOutputNode::Kind kind,
+      int numPartitions,
+      int numOutputDrivers) = 0;
+
+  virtual void updateOutputBuffers(
+      const std::string& taskId,
+      int numBuffers,
+      bool noMoreBuffers) = 0;
+
+  virtual std::optional<OutputBuffer::Stats> stats(
+      const std::string& taskId) = 0;
+
+  virtual void removeTask(const std::string& taskId) = 0;
+};
+
+void registerPartitionedOutputBufferManager(
+    std::shared_ptr<PartitionedOutputBufferManager> manager);
+
+void unregisterPartitionedOutputBufferManager(
+    PartitionedOutputBufferManager* manager);
 
 class Task : public std::enable_shared_from_this<Task> {
  public:
@@ -1334,6 +1366,8 @@ class Task : public std::enable_shared_from_this<Task> {
   // Execution mode. In this case we will need to update the number of output
   // drivers in the end. False otherwise.
   bool groupedPartitionedOutput_{false};
+  std::shared_ptr<PartitionedOutputBufferManager>
+      partitionedOutputBufferManager_;
   // The number of splits groups we run concurrently.
   uint32_t concurrentSplitGroups_{1};
 

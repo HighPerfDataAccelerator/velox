@@ -30,10 +30,12 @@
 #include "velox/experimental/cudf/expression/AstExpression.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
 #include "velox/experimental/cudf/expression/JitExpression.h"
+#include "velox/experimental/ucx-exchange/UcxOutputQueueManager.h"
 
 #include "folly/Conv.h"
 #include "velox/exec/Driver.h"
 #include "velox/exec/Operator.h"
+#include "velox/exec/Task.h"
 #include "velox/exec/Values.h"
 
 #include <cudf/detail/nvtx/ranges.hpp>
@@ -52,6 +54,56 @@ namespace {
 template <class... Deriveds, class Base>
 bool isAnyOf(const Base* p) {
   return ((dynamic_cast<const Deriveds*>(p) != nullptr) || ...);
+}
+
+class UcxPartitionedOutputBufferManager
+    : public exec::PartitionedOutputBufferManager {
+ public:
+  bool supports(
+      const core::PartitionedOutputNode& node,
+      const core::QueryConfig& queryConfig) const override {
+    const auto& config = CudfConfig::getInstance();
+    const auto cudfEnabled =
+        queryConfig.get<bool>(CudfConfig::kCudfEnabled, config.enabled);
+    return cudfEnabled && config.exchange &&
+        node.transportType() ==
+        core::PartitionedOutputNode::TransportType::kUcx;
+  }
+
+  void initializeTask(
+      std::shared_ptr<exec::Task> task,
+      core::PartitionedOutputNode::Kind kind,
+      int numPartitions,
+      int numOutputDrivers) override {
+    auto queueManager = ucx_exchange::UcxOutputQueueManager::getInstanceRef();
+    queueManager->initializeTask(
+        std::move(task), kind, numPartitions, numOutputDrivers);
+  }
+
+  void updateOutputBuffers(
+      const std::string& taskId,
+      int numBuffers,
+      bool noMoreBuffers) override {
+    auto queueManager = ucx_exchange::UcxOutputQueueManager::getInstanceRef();
+    queueManager->updateOutputBuffers(taskId, numBuffers, noMoreBuffers);
+  }
+
+  std::optional<exec::OutputBuffer::Stats> stats(
+      const std::string& taskId) override {
+    auto queueManager = ucx_exchange::UcxOutputQueueManager::getInstanceRef();
+    return queueManager->stats(taskId);
+  }
+
+  void removeTask(const std::string& taskId) override {
+    auto queueManager = ucx_exchange::UcxOutputQueueManager::getInstanceRef();
+    queueManager->removeTask(taskId);
+  }
+};
+
+std::shared_ptr<exec::PartitionedOutputBufferManager>&
+ucxPartitionedOutputBufferManagerRegistration() {
+  static std::shared_ptr<exec::PartitionedOutputBufferManager> manager;
+  return manager;
 }
 
 } // namespace
@@ -176,7 +228,7 @@ bool CompileState::compile(bool allowCpuFallback) {
     bool isPureCpuOperator = true;
 
     if (adapter) {
-      keepOperator = adapter->keepOperator();
+      keepOperator = adapter->keepOperator(oper, planNode, ctx);
       if (keepOperator == 0) {
         if (planNode && thisOpProps.canRunOnGPU) {
           auto replacements =
@@ -307,6 +359,12 @@ void registerCudf() {
 
   // Register operator adapters
   registerAllOperatorAdapters();
+  auto& ucxPartitionedOutputBufferManager =
+      ucxPartitionedOutputBufferManagerRegistration();
+  ucxPartitionedOutputBufferManager =
+      std::make_shared<UcxPartitionedOutputBufferManager>();
+  exec::registerPartitionedOutputBufferManager(
+      ucxPartitionedOutputBufferManager);
 
   auto prefix = CudfConfig::getInstance().functionNamePrefix;
   registerBuiltinFunctions(prefix);
@@ -349,6 +407,14 @@ void registerCudf() {
 }
 
 void unregisterCudf() {
+  auto& ucxPartitionedOutputBufferManager =
+      ucxPartitionedOutputBufferManagerRegistration();
+  if (ucxPartitionedOutputBufferManager) {
+    exec::unregisterPartitionedOutputBufferManager(
+        ucxPartitionedOutputBufferManager.get());
+    ucxPartitionedOutputBufferManager.reset();
+  }
+
   output_mr_.reset();
   mr_.reset();
   exec::DriverFactory::adapters.erase(
@@ -418,6 +484,21 @@ void CudfConfig::initialize(
   }
   if (config.find(kCudfTopNBatchSize) != config.end()) {
     topNBatchSize = folly::to<int32_t>(config[kCudfTopNBatchSize]);
+  }
+  if (config.find(kUcxExchange) != config.end()) {
+    exchange = folly::to<bool>(config[kUcxExchange]);
+  }
+  if (config.find(kUcxxErrorHandling) != config.end()) {
+    ucxxErrorHandling = folly::to<bool>(config[kUcxxErrorHandling]);
+  }
+  if (config.find(kUcxIntraNodeExchange) != config.end()) {
+    intraNodeExchange = folly::to<bool>(config[kUcxIntraNodeExchange]);
+  }
+  if (config.find(kUcxxBlockingPolling) != config.end()) {
+    ucxxBlockingPolling = folly::to<bool>(config[kUcxxBlockingPolling]);
+  }
+  if (config.find(kUcxExchangeLogLevel) != config.end()) {
+    exchangeLogLevel = folly::to<int32_t>(config[kUcxExchangeLogLevel]);
   }
   if (config.find(kCudfTimestampUnit) != config.end()) {
     const auto& unit = config[kCudfTimestampUnit];

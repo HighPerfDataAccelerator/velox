@@ -67,6 +67,7 @@ const std::vector<config::ConfigProperty>& QueryConfig::registeredProperties() {
     VELOX_REGISTER_QUERY_CONFIG(kMaxExchangeBufferSize);
     VELOX_REGISTER_QUERY_CONFIG(kMaxMergeExchangeBufferSize);
     VELOX_REGISTER_QUERY_CONFIG(kMinExchangeOutputBatchBytes);
+    VELOX_REGISTER_QUERY_CONFIG(kUcxPartitionedOutputBatchRows);
 
     // Aggregation.
     VELOX_REGISTER_QUERY_CONFIG(kMaxPartialAggregationMemory);

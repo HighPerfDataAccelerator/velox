@@ -1343,10 +1343,27 @@ void ExchangeNode::addDetails(std::stringstream& stream) const {
   addVectorSerdeKind(serdeKind_, stream);
 }
 
+namespace {
+const auto& exchangeTransportTypeNames() {
+  static const folly::F14FastMap<ExchangeNode::TransportType, std::string_view>
+      kNames = {
+          {ExchangeNode::TransportType::kHttp, "HTTP"},
+          {ExchangeNode::TransportType::kUcx, "UCX"},
+      };
+  return kNames;
+}
+} // namespace
+
+VELOX_DEFINE_EMBEDDED_ENUM_NAME(
+    ExchangeNode,
+    TransportType,
+    exchangeTransportTypeNames)
+
 folly::dynamic ExchangeNode::serialize() const {
   auto obj = PlanNode::serialize();
   obj["outputType"] = ExchangeNode::outputType()->serialize();
   obj["serdeKind"] = serdeKind_;
+  obj["transportType"] = toName(transportType_);
   return obj;
 }
 
@@ -1358,10 +1375,14 @@ void ExchangeNode::accept(
 
 // static
 PlanNodePtr ExchangeNode::create(const folly::dynamic& obj, void* context) {
+  const auto transportType = obj.count("transportType")
+      ? toTransportType(obj["transportType"].asString())
+      : TransportType::kHttp;
   return std::make_shared<ExchangeNode>(
       deserializePlanNodeId(obj),
       deserializeRowType(obj["outputType"]),
-      obj["serdeKind"].asString());
+      obj["serdeKind"].asString(),
+      transportType);
 }
 
 UnnestNode::UnnestNode(
@@ -3250,8 +3271,9 @@ MergeExchangeNode::MergeExchangeNode(
     const RowTypePtr& type,
     const std::vector<FieldAccessTypedExprPtr>& sortingKeys,
     const std::vector<SortOrder>& sortingOrders,
-    std::string serdeKind)
-    : ExchangeNode(id, type, std::move(serdeKind)),
+    std::string serdeKind,
+    TransportType transportType)
+    : ExchangeNode(id, type, std::move(serdeKind), transportType),
       sortingKeys_(sortingKeys),
       sortingOrders_(sortingOrders) {}
 
@@ -3267,6 +3289,7 @@ folly::dynamic MergeExchangeNode::serialize() const {
   obj["sortingKeys"] = ISerializable::serialize(sortingKeys_);
   obj["sortingOrders"] = serializeSortingOrders(sortingOrders_);
   obj["serdeKind"] = serdeKind();
+  obj["transportType"] = toName(transportType());
   return obj;
 }
 
@@ -3284,12 +3307,16 @@ PlanNodePtr MergeExchangeNode::create(
   const auto sortingKeys = deserializeFields(obj["sortingKeys"], context);
   const auto sortingOrders = deserializeSortingOrders(obj["sortingOrders"]);
   const auto serdeKind = obj["serdeKind"].asString();
+  const auto transportType = obj.count("transportType")
+      ? toTransportType(obj["transportType"].asString())
+      : TransportType::kHttp;
   return std::make_shared<MergeExchangeNode>(
       deserializePlanNodeId(obj),
       outputType,
       sortingKeys,
       sortingOrders,
-      serdeKind);
+      serdeKind,
+      transportType);
 }
 
 void LocalPartitionNode::addDetails(std::stringstream& stream) const {
@@ -3354,7 +3381,8 @@ PartitionedOutputNode::PartitionedOutputNode(
     PartitionFunctionSpecPtr partitionFunctionSpec,
     RowTypePtr outputType,
     std::string serdeKind,
-    PlanNodePtr source)
+    PlanNodePtr source,
+    TransportType transportType)
     : PlanNode(id),
       kind_(kind),
       sources_{{std::move(source)}},
@@ -3363,7 +3391,8 @@ PartitionedOutputNode::PartitionedOutputNode(
       replicateNullsAndAny_(replicateNullsAndAny),
       partitionFunctionSpec_(std::move(partitionFunctionSpec)),
       serdeKind_(std::move(serdeKind)),
-      outputType_(std::move(outputType)) {
+      outputType_(std::move(outputType)),
+      transportType_(transportType) {
   VELOX_USER_CHECK_GT(numPartitions_, 0);
   if (numPartitions_ == 1) {
     VELOX_USER_CHECK(
@@ -3388,7 +3417,8 @@ std::shared_ptr<PartitionedOutputNode> PartitionedOutputNode::broadcast(
     int numPartitions,
     RowTypePtr outputType,
     std::string serdeKind,
-    PlanNodePtr source) {
+    PlanNodePtr source,
+    TransportType transportType) {
   std::vector<TypedExprPtr> noKeys;
   return std::make_shared<PartitionedOutputNode>(
       id,
@@ -3399,7 +3429,8 @@ std::shared_ptr<PartitionedOutputNode> PartitionedOutputNode::broadcast(
       std::make_shared<GatherPartitionFunctionSpec>(),
       std::move(outputType),
       serdeKind,
-      std::move(source));
+      std::move(source),
+      transportType);
 }
 
 // static
@@ -3407,7 +3438,8 @@ std::shared_ptr<PartitionedOutputNode> PartitionedOutputNode::arbitrary(
     const PlanNodeId& id,
     RowTypePtr outputType,
     std::string serdeKind,
-    PlanNodePtr source) {
+    PlanNodePtr source,
+    TransportType transportType) {
   std::vector<TypedExprPtr> noKeys;
   return std::make_shared<PartitionedOutputNode>(
       id,
@@ -3418,7 +3450,8 @@ std::shared_ptr<PartitionedOutputNode> PartitionedOutputNode::arbitrary(
       std::make_shared<GatherPartitionFunctionSpec>(),
       std::move(outputType),
       serdeKind,
-      std::move(source));
+      std::move(source),
+      transportType);
 }
 
 // static
@@ -3426,7 +3459,8 @@ std::shared_ptr<PartitionedOutputNode> PartitionedOutputNode::single(
     const PlanNodeId& id,
     RowTypePtr outputType,
     std::string serdeKind,
-    PlanNodePtr source) {
+    PlanNodePtr source,
+    TransportType transportType) {
   std::vector<TypedExprPtr> noKeys;
   return std::make_shared<PartitionedOutputNode>(
       id,
@@ -3437,7 +3471,8 @@ std::shared_ptr<PartitionedOutputNode> PartitionedOutputNode::single(
       std::make_shared<GatherPartitionFunctionSpec>(),
       std::move(outputType),
       serdeKind,
-      std::move(source));
+      std::move(source),
+      transportType);
 }
 
 void EnforceSingleRowNode::addDetails(std::stringstream& /* stream */) const {
@@ -3476,6 +3511,24 @@ const auto& partitionKindNames() {
 
 VELOX_DEFINE_EMBEDDED_ENUM_NAME(PartitionedOutputNode, Kind, partitionKindNames)
 
+namespace {
+const auto& partitionedOutputTransportTypeNames() {
+  static const folly::F14FastMap<
+      PartitionedOutputNode::TransportType,
+      std::string_view>
+      kNames = {
+          {PartitionedOutputNode::TransportType::kHttp, "HTTP"},
+          {PartitionedOutputNode::TransportType::kUcx, "UCX"},
+      };
+  return kNames;
+}
+} // namespace
+
+VELOX_DEFINE_EMBEDDED_ENUM_NAME(
+    PartitionedOutputNode,
+    TransportType,
+    partitionedOutputTransportTypeNames)
+
 void PartitionedOutputNode::addDetails(std::stringstream& stream) const {
   if (kind_ == Kind::kBroadcast) {
     stream << "BROADCAST";
@@ -3509,6 +3562,7 @@ folly::dynamic PartitionedOutputNode::serialize() const {
   obj["partitionFunctionSpec"] = partitionFunctionSpec_->serialize();
   obj["serdeKind"] = serdeKind_;
   obj["outputType"] = outputType_->serialize();
+  obj["transportType"] = toName(transportType_);
   return obj;
 }
 
@@ -3522,6 +3576,9 @@ void PartitionedOutputNode::accept(
 PlanNodePtr PartitionedOutputNode::create(
     const folly::dynamic& obj,
     void* context) {
+  const auto transportType = obj.count("transportType")
+      ? toTransportType(obj["transportType"].asString())
+      : TransportType::kHttp;
   return std::make_shared<PartitionedOutputNode>(
       deserializePlanNodeId(obj),
       toKind(obj["kind"].asString()),
@@ -3532,7 +3589,8 @@ PlanNodePtr PartitionedOutputNode::create(
           obj["partitionFunctionSpec"], context),
       deserializeRowType(obj["outputType"]),
       obj["serdeKind"].asString(),
-      deserializeSingleSource(obj, context));
+      deserializeSingleSource(obj, context),
+      transportType);
 }
 
 SpatialJoinNode::SpatialJoinNode(

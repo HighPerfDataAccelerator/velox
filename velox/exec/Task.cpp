@@ -45,6 +45,27 @@ using facebook::velox::common::testutil::TestValue;
 namespace facebook::velox::exec {
 namespace {
 
+std::mutex& partitionedOutputBufferManagerRegistryMutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+
+std::shared_ptr<PartitionedOutputBufferManager>&
+partitionedOutputBufferManagerRegistry() {
+  static std::shared_ptr<PartitionedOutputBufferManager> manager;
+  return manager;
+}
+
+std::shared_ptr<PartitionedOutputBufferManager>
+getRegisteredPartitionedOutputBufferManager(
+    const core::PartitionedOutputNode& node,
+    const core::QueryConfig& queryConfig) {
+  std::lock_guard<std::mutex> lock(
+      partitionedOutputBufferManagerRegistryMutex());
+  auto& manager = partitionedOutputBufferManagerRegistry();
+  return manager && manager->supports(node, queryConfig) ? manager : nullptr;
+}
+
 // RAII helper class to satisfy given promises and notify listeners of an event
 // connected to the promises outside of the mutex that guards the promises.
 // Inactive on creation. Must be activated explicitly by calling 'activate'.
@@ -265,6 +286,24 @@ void noMoreSplitsForStore(
 }
 
 } // namespace
+
+void registerPartitionedOutputBufferManager(
+    std::shared_ptr<PartitionedOutputBufferManager> manager) {
+  VELOX_CHECK_NOT_NULL(manager);
+  std::lock_guard<std::mutex> lock(
+      partitionedOutputBufferManagerRegistryMutex());
+  partitionedOutputBufferManagerRegistry() = std::move(manager);
+}
+
+void unregisterPartitionedOutputBufferManager(
+    PartitionedOutputBufferManager* manager) {
+  std::lock_guard<std::mutex> lock(
+      partitionedOutputBufferManagerRegistryMutex());
+  auto& registeredManager = partitionedOutputBufferManagerRegistry();
+  if (registeredManager.get() == manager) {
+    registeredManager.reset();
+  }
+}
 
 std::string executionModeString(Task::ExecutionMode mode) {
   switch (mode) {
@@ -1151,6 +1190,8 @@ void Task::initializePartitionOutput() {
       "PartitionedOutputBufferManager was already destructed");
   std::shared_ptr<const core::PartitionedOutputNode> partitionedOutputNode{
       nullptr};
+  std::shared_ptr<PartitionedOutputBufferManager>
+      partitionedOutputBufferManager;
   int numOutputDrivers{0};
   {
     std::unique_lock<std::timed_mutex> l(mutex_);
@@ -1171,6 +1212,10 @@ void Task::initializePartitionOutput() {
         if (partitionedOutputNode != nullptr) {
           numDriversInPartitionedOutput_ = factory->numDrivers;
           groupedPartitionedOutput_ = factory->groupedExecution;
+          partitionedOutputBufferManager =
+              getRegisteredPartitionedOutputBufferManager(
+                  *partitionedOutputNode, queryCtx_->queryConfig());
+          partitionedOutputBufferManager_ = partitionedOutputBufferManager;
           numOutputDrivers = factory->groupedExecution
               ? factory->numDrivers * planFragment_.numSplitGroups
               : factory->numDrivers;
@@ -1197,6 +1242,13 @@ void Task::initializePartitionOutput() {
         partitionedOutputNode->kind(),
         partitionedOutputNode->numPartitions(),
         numOutputDrivers);
+    if (partitionedOutputBufferManager) {
+      partitionedOutputBufferManager->initializeTask(
+          shared_from_this(),
+          partitionedOutputNode->kind(),
+          partitionedOutputNode->numPartitions(),
+          numOutputDrivers);
+    }
   }
 }
 
@@ -2191,6 +2243,8 @@ bool Task::updateOutputBuffers(int numBuffers, bool noMoreBuffers) {
       bufferManager,
       "Unable to initialize task. "
       "OutputBufferManager was already destructed");
+  std::shared_ptr<PartitionedOutputBufferManager>
+      partitionedOutputBufferManager;
   {
     std::lock_guard<std::timed_mutex> l(mutex_);
     if (noMoreOutputBuffers_) {
@@ -2200,8 +2254,15 @@ bool Task::updateOutputBuffers(int numBuffers, bool noMoreBuffers) {
     if (noMoreBuffers) {
       noMoreOutputBuffers_ = true;
     }
+    partitionedOutputBufferManager = partitionedOutputBufferManager_;
   }
-  return bufferManager->updateOutputBuffers(taskId_, numBuffers, noMoreBuffers);
+  auto result =
+      bufferManager->updateOutputBuffers(taskId_, numBuffers, noMoreBuffers);
+  if (partitionedOutputBufferManager) {
+    partitionedOutputBufferManager->updateOutputBuffers(
+        taskId_, numBuffers, noMoreBuffers);
+  }
+  return result;
 }
 
 int Task::getOutputPipelineId() const {
@@ -2694,6 +2755,12 @@ ContinueFuture Task::terminate(TaskState terminalState) {
 
 void Task::maybeRemoveFromOutputBufferManager() {
   if (hasPartitionedOutput()) {
+    std::shared_ptr<PartitionedOutputBufferManager>
+        partitionedOutputBufferManager;
+    {
+      std::lock_guard<std::timed_mutex> l(mutex_);
+      partitionedOutputBufferManager = partitionedOutputBufferManager_;
+    }
     if (auto bufferManager = bufferManager_.lock()) {
       // Capture output buffer stats before deleting the buffer.
       {
@@ -2703,6 +2770,16 @@ void Task::maybeRemoveFromOutputBufferManager() {
         }
       }
       bufferManager->removeTask(taskId_);
+    }
+    if (partitionedOutputBufferManager) {
+      {
+        std::lock_guard<std::timed_mutex> l(mutex_);
+        auto optStats = partitionedOutputBufferManager->stats(taskId_);
+        if (optStats.has_value() && optStats.value().totalPagesSent > 0) {
+          taskStats_.outputBufferStats = optStats;
+        }
+      }
+      partitionedOutputBufferManager->removeTask(taskId_);
     }
   }
 }
