@@ -137,6 +137,21 @@ std::optional<rmm::cuda_stream_view> CudfHashJoinBridge::getBuildStream() {
   return buildStream_;
 }
 
+void CudfHashJoinBridge::setFilteredJoins(
+    CudfHashJoinBridge::filtered_join_type filteredJoins) {
+  std::lock_guard<std::mutex> l(mutex_);
+  VELOX_CHECK(
+      !filteredJoins_.has_value(),
+      "CudfHashJoinBridge already has filtered joins");
+  filteredJoins_ = std::move(filteredJoins);
+}
+
+std::optional<CudfHashJoinBridge::filtered_join_type>
+CudfHashJoinBridge::getFilteredJoins() {
+  std::lock_guard<std::mutex> l(mutex_);
+  return filteredJoins_;
+}
+
 CudfHashJoinBuild::CudfHashJoinBuild(
     int32_t operatorId,
     exec::DriverCtx* driverCtx,
@@ -246,15 +261,18 @@ void CudfHashJoinBuild::doNoMoreInput() {
   }
 
   // Construct hash_join object for join types that use hb->inner_join() or
-  // hb->left_join(). Semi filter and anti joins use standalone cudf functions
-  // (e.g., mixed_left_semi_join, filtered_join) that build hash tables
-  // internally, so they don't need this.
+  // hb->left_join(). No-filter left-semi-filter and anti joins use
+  // cudf::filtered_join, which is also a reusable build-once/probe-many handle
+  // and is cached below.
   bool buildHashJoin =
       (joinNode_->isInnerJoin() || joinNode_->isLeftJoin() ||
        joinNode_->isRightJoin() || joinNode_->isFullJoin() ||
        joinNode_->isLeftSemiProjectJoin());
+  const bool buildFilteredJoin = !joinNode_->filter() &&
+      (joinNode_->isLeftSemiFilterJoin() || joinNode_->isAntiJoin());
 
   std::vector<std::shared_ptr<cudf::hash_join>> hashObjects;
+  std::vector<std::shared_ptr<cudf::filtered_join>> filteredJoins;
   for (auto i = 0; i < tbls.size(); i++) {
     hashObjects.push_back(
         (buildHashJoin) ? std::make_shared<cudf::hash_join>(
@@ -265,12 +283,32 @@ void CudfHashJoinBuild::doNoMoreInput() {
     if (buildHashJoin) {
       VELOX_CHECK_NOT_NULL(hashObjects.back());
     }
+    bool buildThisFilteredJoin = buildFilteredJoin;
+    if (buildThisFilteredJoin && joinNode_->isAntiJoin() &&
+        joinNode_->isNullAware() &&
+        cudf::has_nulls(tbls[i]->view().select(buildKeyIndices))) {
+      buildThisFilteredJoin = false;
+    }
+    filteredJoins.push_back(
+        buildThisFilteredJoin
+            ? std::make_shared<cudf::filtered_join>(
+                  tbls[i]->view().select(buildKeyIndices),
+                  cudf::null_equality::UNEQUAL,
+                  stream)
+            : nullptr);
+    if (buildThisFilteredJoin) {
+      VELOX_CHECK_NOT_NULL(filteredJoins.back());
+    }
     if (CudfConfig::getInstance().debugEnabled) {
       if (hashObjects.back() != nullptr) {
         VLOG(2) << "hashObject " << i << " is not nullptr "
                 << hashObjects.back().get() << "\n";
       } else {
         VLOG(2) << "hashObject " << i << " is *** nullptr\n";
+      }
+      if (filteredJoins.back() != nullptr) {
+        VLOG(2) << "filteredJoin " << i << " is not nullptr "
+                << filteredJoins.back().get() << "\n";
       }
     }
   }
@@ -286,6 +324,7 @@ void CudfHashJoinBuild::doNoMoreInput() {
       std::dynamic_pointer_cast<CudfHashJoinBridge>(joinBridge);
 
   cudfHashJoinBridge->setBuildStream(stream);
+  cudfHashJoinBridge->setFilteredJoins(std::move(filteredJoins));
   cudfHashJoinBridge->setHashTable(
       std::make_optional(
           std::make_pair(std::move(shared_tbls), std::move(hashObjects))));
@@ -1269,12 +1308,20 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::leftSemiFilterJoin(
           stream,
           get_temp_mr());
     } else {
-      cudf::filtered_join filter_join(
-          rightTableView.select(rightKeyIndices_),
-          cudf::null_equality::UNEQUAL,
-          stream);
-      leftJoinIndices = filter_join.semi_join(
-          leftTableView.select(leftKeyIndices_), stream, get_temp_mr());
+      VELOX_CHECK(filteredJoins_.has_value());
+      auto& filteredJoins = filteredJoins_.value();
+      VELOX_CHECK_LT(i, filteredJoins.size());
+      VELOX_CHECK_NOT_NULL(filteredJoins[i]);
+      if (buildStream_.has_value()) {
+        cudaEvent_->recordFrom(stream).waitOn(buildStream_.value());
+      }
+      leftJoinIndices = filteredJoins[i]->semi_join(
+          leftTableView.select(leftKeyIndices_),
+          buildStream_.has_value() ? buildStream_.value() : stream,
+          get_temp_mr());
+      if (buildStream_.has_value()) {
+        cudaEvent_->recordFrom(buildStream_.value()).waitOn(stream);
+      }
     }
 
     auto leftIndicesSpan =
@@ -1917,12 +1964,20 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::antiJoin(
       leftJoinIndices = std::make_unique<rmm::device_uvector<cudf::size_type>>(
           0, stream, get_temp_mr());
     } else {
-      cudf::filtered_join filter_join(
-          rightTableView.select(rightKeyIndices_),
-          cudf::null_equality::UNEQUAL,
-          stream);
-      leftJoinIndices = filter_join.anti_join(
-          leftTableView.select(leftKeyIndices_), stream, get_temp_mr());
+      VELOX_CHECK(filteredJoins_.has_value());
+      auto& filteredJoins = filteredJoins_.value();
+      VELOX_CHECK_EQ(filteredJoins.size(), 1);
+      VELOX_CHECK_NOT_NULL(filteredJoins[0]);
+      if (buildStream_.has_value()) {
+        cudaEvent_->recordFrom(stream).waitOn(buildStream_.value());
+      }
+      leftJoinIndices = filteredJoins[0]->anti_join(
+          leftTableView.select(leftKeyIndices_),
+          buildStream_.has_value() ? buildStream_.value() : stream,
+          get_temp_mr());
+      if (buildStream_.has_value()) {
+        cudaEvent_->recordFrom(buildStream_.value()).waitOn(stream);
+      }
     }
   }
 
@@ -2147,6 +2202,7 @@ exec::BlockingReason CudfHashJoinProbe::isBlocked(ContinueFuture* future) {
   }
   hashObject_ = std::move(hashObject);
   buildStream_ = cudfJoinBridge->getBuildStream();
+  filteredJoins_ = cudfJoinBridge->getFilteredJoins();
 
   // Lazy initialize matched flags only when build side is done
   if (joinNode_->isRightJoin() || joinNode_->isFullJoin()) {
@@ -2239,6 +2295,7 @@ bool CudfHashJoinProbe::isFinished() {
   // Release hashObject_ if finished
   if (isFinished) {
     hashObject_.reset();
+    filteredJoins_.reset();
   }
   return isFinished;
 }

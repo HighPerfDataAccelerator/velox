@@ -28,6 +28,7 @@
 
 #include <cudf/ast/expressions.hpp>
 #include <cudf/copying.hpp>
+#include <cudf/join/filtered_join.hpp>
 #include <cudf/join/hash_join.hpp>
 #include <cudf/table/table.hpp>
 
@@ -62,10 +63,15 @@ class CudfHashJoinBridge : public exec::JoinBridge {
   using hash_type = std::pair<
       std::vector<std::shared_ptr<cudf::table>>,
       std::vector<std::shared_ptr<cudf::hash_join>>>;
+  using filtered_join_type = std::vector<std::shared_ptr<cudf::filtered_join>>;
 
   void setHashTable(std::optional<hash_type> hashObject);
 
   std::optional<hash_type> hashOrFuture(ContinueFuture* future);
+
+  void setFilteredJoins(filtered_join_type filteredJoins);
+
+  std::optional<filtered_join_type> getFilteredJoins();
 
   // Store and retrieve the CUDA stream used for building the hash join.
   void setBuildStream(rmm::cuda_stream_view buildStream);
@@ -76,6 +82,7 @@ class CudfHashJoinBridge : public exec::JoinBridge {
   /** @brief Hash tables and join objects transferred from build to probe
    * operators */
   std::optional<hash_type> hashObject_;
+  std::optional<filtered_join_type> filteredJoins_;
   /** @brief CUDA stream used by build operator for proper synchronization */
   std::optional<rmm::cuda_stream_view> buildStream_;
 };
@@ -173,6 +180,7 @@ class CudfHashJoinProbe : public CudfOperatorBase {
   std::shared_ptr<const core::HashJoinNode> joinNode_;
   /** @brief Hash tables and join objects received from build operator */
   std::optional<hash_type> hashObject_;
+  std::optional<CudfHashJoinBridge::filtered_join_type> filteredJoins_;
 
   // Filter related members
   /** @brief Whether to use AST-based filtering (false if filter spans both
