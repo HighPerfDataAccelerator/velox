@@ -96,8 +96,13 @@ bool isCountFunctionName(std::string_view kind);
 bool hasOnlyConstantArguments(const core::CallTypedExpr& call);
 
 // Returns true if the aggregation node contains companion aggregates
-// (e.g. _merge, _partial, _merge_extract suffixes), which disables streaming.
+// (e.g. _merge, _partial, _merge_extract suffixes).
 bool hasCompanionAggregates(
+    std::vector<core::AggregationNode::Aggregate> const& aggregates);
+
+// Returns true if the aggregation node contains a companion aggregate that is
+// not a Spark partial companion.
+bool hasNonPartialCompanionAggregates(
     std::vector<core::AggregationNode::Aggregate> const& aggregates);
 
 // Compute the intermediate ROW type used for buffered results in kFinal/kSingle

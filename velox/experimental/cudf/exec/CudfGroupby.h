@@ -122,7 +122,10 @@ class CudfGroupby : public CudfOperatorBase {
 
   const bool isPartialOutput_;
   const bool isSingleStep_;
-  // Streaming aggregation is disabled if companion aggregates are present.
+  // Streaming aggregation is enabled for bare-name aggregates and for Spark
+  // kPartial plans whose companions are all *_partial. The latter lets Spark
+  // MPP partial-stage groupbys stream while keeping merge/extract companions on
+  // the non-streaming path unless separately enabled.
   bool streamingEnabled_{true};
   const int64_t maxPartialAggregationMemoryUsage_;
   int64_t numInputRows_ = 0;
@@ -135,6 +138,14 @@ class CudfGroupby : public CudfOperatorBase {
   TypePtr inputType_;
   RowTypePtr bufferedResultType_;
   CudfVectorPtr bufferedResult_;
+
+  // Sticky mode for high-cardinality partial streaming that does not compact.
+  // If buffered rows stay above 75% of the cumulative pre-aggregated rows after
+  // a cross-batch merge, every subsequent getOutput() flushes immediately
+  // instead of waiting for the memory threshold. This limits retained buffered
+  // state while preserving the existing per-batch merge semantics.
+  bool partialBypassMode_{false};
+  int64_t partialCumulativeInputRows_{0};
 };
 
 } // namespace facebook::velox::cudf_velox
