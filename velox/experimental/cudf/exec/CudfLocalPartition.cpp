@@ -171,8 +171,8 @@ void CudfLocalPartition::enqueuePartition(
   }
 
   ContinueFuture future;
-  auto blockingReason =
-      queues_[partitionIndex]->enqueue(cudfVector, cudfVector->size(), &future);
+  auto blockingReason = queues_[partitionIndex]->enqueue(
+      cudfVector, cudfVector->estimateFlatSize(), &future);
   if (blockingReason != exec::BlockingReason::kNotBlocked) {
     blockingReasons_.push_back(blockingReason);
     futures_.push_back(std::move(future));
@@ -256,8 +256,8 @@ void CudfLocalPartition::doAddInput(RowVectorPtr input) {
   } else {
     // Single partition case.
     ContinueFuture future;
-    auto blockingReason =
-        queues_[0]->enqueue(input, input->retainedSize(), &future);
+    auto blockingReason = queues_[0]->enqueue(
+        input, cudfVector->estimateFlatSize(), &future);
     if (blockingReason != exec::BlockingReason::kNotBlocked) {
       blockingReasons_.push_back(blockingReason);
       futures_.push_back(std::move(future));
