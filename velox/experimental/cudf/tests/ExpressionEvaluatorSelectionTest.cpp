@@ -23,6 +23,7 @@
 #include "velox/experimental/cudf/tests/utils/ExpressionTestUtil.h"
 
 #include "velox/common/memory/Memory.h"
+#include "velox/core/Expressions.h"
 #include "velox/core/QueryCtx.h"
 #include "velox/expression/ConstantExpr.h"
 #include "velox/functions/prestosql/registration/RegistrationFunctions.h"
@@ -57,6 +58,7 @@ class CudfExpressionSelectionTest : public ::testing::Test {
         {"c", INTEGER()},
         {"name", VARCHAR()},
         {"date", TIMESTAMP()},
+        {"dt", DATE()},
         {"c", INTEGER()},
     });
 
@@ -282,14 +284,78 @@ TEST_F(CudfExpressionSelectionTest, signatureArityAndConstantsSubstr) {
   // OK: 2-arg substr with constant start
   auto ok2 = compileExecExpr("substr(name, 1)", rowType_, execCtx_.get());
   ASSERT_TRUE(canBeEvaluatedByCudf(ok2, /*deep=*/true));
+  ASSERT_NO_THROW(createCudfExpression(ok2, rowType_));
 
   // OK: 3-arg substr with constant start and length
   auto ok3 = compileExecExpr("substr(name, 1, 5)", rowType_, execCtx_.get());
   ASSERT_TRUE(canBeEvaluatedByCudf(ok3, /*deep=*/true));
+  ASSERT_NO_THROW(createCudfExpression(ok3, rowType_));
+
+  // OK: Spark parsing can keep integer literals as INTEGER instead of BIGINT.
+  auto ok3Integer = compileExecExpr(
+      "substr(name, 1, 5)",
+      rowType_,
+      execCtx_.get(),
+      {.parseIntegerAsBigint = false, .functionPrefix = ""});
+  ASSERT_TRUE(canBeEvaluatedByCudf(ok3Integer, /*deep=*/true));
+  ASSERT_NO_THROW(createCudfExpression(ok3Integer, rowType_));
 
   // Bad: start must be constant
   auto badConst = compileExecExpr("substr(name, a)", rowType_, execCtx_.get());
   ASSERT_FALSE(canBeEvaluatedByCudf(badConst, /*deep=*/true));
+}
+
+TEST_F(CudfExpressionSelectionTest, dateAndIntegerToVarcharCasts) {
+  auto dateCast =
+      compileExecExpr("cast(dt as varchar)", rowType_, execCtx_.get());
+  ASSERT_TRUE(canBeEvaluatedByCudf(dateCast, /*deep=*/true));
+
+  auto dateTryCast =
+      compileExecExpr("try_cast(dt as varchar)", rowType_, execCtx_.get());
+  ASSERT_TRUE(canBeEvaluatedByCudf(dateTryCast, /*deep=*/true));
+
+  auto intCast =
+      compileExecExpr("cast(c as varchar)", rowType_, execCtx_.get());
+  ASSERT_TRUE(canBeEvaluatedByCudf(intCast, /*deep=*/true));
+
+  auto intTryCast =
+      compileExecExpr("try_cast(c as varchar)", rowType_, execCtx_.get());
+  ASSERT_TRUE(canBeEvaluatedByCudf(intTryCast, /*deep=*/true));
+}
+
+TEST_F(CudfExpressionSelectionTest, dateFormatSupportedFormatValidation) {
+  auto ok =
+      compileExecExpr("date_format(date, '%Y%m%d')", rowType_, execCtx_.get());
+  ASSERT_TRUE(canBeEvaluatedByCudf(ok, /*deep=*/true));
+
+  auto okTime = compileExecExpr(
+      "date_format(date, '%Y-%m-%d %H:%i:%S')", rowType_, execCtx_.get());
+  ASSERT_TRUE(canBeEvaluatedByCudf(okTime, /*deep=*/true));
+
+  auto unsupported =
+      compileExecExpr("date_format(date, '%M')", rowType_, execCtx_.get());
+  ASSERT_FALSE(canBeEvaluatedByCudf(unsupported, /*deep=*/true));
+
+  auto nonConstantFormat =
+      compileExecExpr("date_format(date, name)", rowType_, execCtx_.get());
+  ASSERT_FALSE(canBeEvaluatedByCudf(nonConstantFormat, /*deep=*/true));
+}
+
+TEST_F(CudfExpressionSelectionTest, sparkHashAndBloomFunctions) {
+  auto xxhash =
+      compileExecExpr("xxhash64_with_seed(42, a)", rowType_, execCtx_.get());
+  ASSERT_TRUE(canBeEvaluatedByCudf(xxhash, /*deep=*/true));
+
+  std::vector<core::TypedExprPtr> args;
+  args.push_back(std::make_shared<core::ConstantTypedExpr>(
+      VARBINARY(), variant::binary(std::string("serialized-bloom-filter"))));
+  args.push_back(std::make_shared<core::FieldAccessTypedExpr>(BIGINT(), "a"));
+  auto typed = std::make_shared<core::CallTypedExpr>(
+      BOOLEAN(), std::move(args), "might_contain");
+  exec::ExprSet exprSet(
+      {typed}, execCtx_.get(), /*enableConstantFolding*/ false);
+  auto mightContain = exprSet.expr(0);
+  ASSERT_TRUE(canBeEvaluatedByCudf(mightContain, /*deep=*/true));
 }
 
 TEST_F(CudfExpressionSelectionTest, signatureCastsInDivide) {

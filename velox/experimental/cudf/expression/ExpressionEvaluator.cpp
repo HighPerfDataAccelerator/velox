@@ -13,6 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/Validation.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/expression/AstUtils.h"
@@ -47,6 +48,8 @@
 #include <cudf/strings/case.hpp>
 #include <cudf/strings/combine.hpp>
 #include <cudf/strings/contains.hpp>
+#include <cudf/strings/convert/convert_datetime.hpp>
+#include <cudf/strings/convert/convert_integers.hpp>
 #include <cudf/strings/find.hpp>
 #include <cudf/strings/replace.hpp>
 #include <cudf/strings/slice.hpp>
@@ -62,9 +65,58 @@
 #include <rmm/device_uvector.hpp>
 
 #include <memory>
+#include <optional>
 
 namespace facebook::velox::cudf_velox {
 namespace {
+
+std::optional<std::string> prestoToCudfDateFormat(
+    const std::string& prestoFormat) {
+  std::string result;
+  result.reserve(prestoFormat.size() * 2);
+  for (size_t i = 0; i < prestoFormat.size(); ++i) {
+    if (prestoFormat[i] != '%') {
+      result += prestoFormat[i];
+      continue;
+    }
+    if (i + 1 >= prestoFormat.size()) {
+      return std::nullopt;
+    }
+    ++i;
+    switch (prestoFormat[i]) {
+      case 'Y':
+      case 'y':
+      case 'm':
+      case 'd':
+      case 'H':
+      case 'I':
+      case 'S':
+      case 'f':
+      case 'j':
+        result += '%';
+        result += prestoFormat[i];
+        break;
+      case 'i':
+        result += "%M";
+        break;
+      case 's':
+        result += "%S";
+        break;
+      case 'h':
+        result += "%I";
+        break;
+      case 'T':
+        result += "%H:%M:%S";
+        break;
+      case '%':
+        result += "%%";
+        break;
+      default:
+        return std::nullopt;
+    }
+  }
+  return result;
+}
 
 bool decimalScalarIsZero(
     const cudf::scalar& scalar,
@@ -340,17 +392,38 @@ class SplitFunction : public CudfFunction {
 
 class CastFunction : public CudfFunction {
  public:
+  enum class CastMode {
+    kFixedWidth,
+    kDateToString,
+    kIntToString,
+  };
+
   CastFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
     VELOX_CHECK_EQ(expr->inputs().size(), 1, "cast expects exactly 1 input");
 
     targetCudfType_ = cudf_velox::veloxToCudfDataType(expr->type());
     auto sourceType =
         cudf_velox::veloxToCudfDataType(expr->inputs()[0]->type());
-    VELOX_CHECK(
-        cudf::is_supported_cast(sourceType, targetCudfType_),
-        "Cast from {} to {} is not supported",
-        expr->inputs()[0]->type()->toString(),
-        expr->type()->toString());
+    const auto& srcVeloxType = expr->inputs()[0]->type();
+    const auto& dstVeloxType = expr->type();
+
+    if (srcVeloxType->isDate() && dstVeloxType->kind() == TypeKind::VARCHAR) {
+      castMode_ = CastMode::kDateToString;
+    } else if (
+        (srcVeloxType->kind() == TypeKind::TINYINT ||
+         srcVeloxType->kind() == TypeKind::SMALLINT ||
+         srcVeloxType->kind() == TypeKind::INTEGER ||
+         srcVeloxType->kind() == TypeKind::BIGINT) &&
+        dstVeloxType->kind() == TypeKind::VARCHAR) {
+      castMode_ = CastMode::kIntToString;
+    } else {
+      castMode_ = CastMode::kFixedWidth;
+      VELOX_CHECK(
+          cudf::is_supported_cast(sourceType, targetCudfType_),
+          "Cast from {} to {} is not supported",
+          expr->inputs()[0]->type()->toString(),
+          expr->type()->toString());
+    }
   }
 
   ColumnOrView eval(
@@ -358,11 +431,70 @@ class CastFunction : public CudfFunction {
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr) const override {
     auto inputCol = asView(inputColumns[0]);
-    return cudf::cast(inputCol, targetCudfType_, stream, mr);
+    switch (castMode_) {
+      case CastMode::kDateToString:
+        return cudf::strings::from_timestamps(
+            inputCol,
+            "%Y-%m-%d",
+            cudf::strings_column_view(cudf::column_view{
+                cudf::data_type{cudf::type_id::STRING},
+                0,
+                nullptr,
+                nullptr,
+                0}),
+            stream,
+            mr);
+      case CastMode::kIntToString:
+        return cudf::strings::from_integers(inputCol, stream, mr);
+      case CastMode::kFixedWidth:
+        return cudf::cast(inputCol, targetCudfType_, stream, mr);
+    }
+    VELOX_UNREACHABLE();
   }
 
  private:
   cudf::data_type targetCudfType_;
+  CastMode castMode_{CastMode::kFixedWidth};
+};
+
+class DateFormatFunction : public CudfFunction {
+ public:
+  DateFormatFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
+    using velox::exec::ConstantExpr;
+    VELOX_CHECK_EQ(
+        expr->inputs().size(), 2, "date_format expects exactly 2 inputs");
+
+    auto formatExpr =
+        std::dynamic_pointer_cast<ConstantExpr>(expr->inputs()[1]);
+    VELOX_CHECK_NOT_NULL(
+        formatExpr, "date_format format string must be a constant");
+    auto cudfFormat = prestoToCudfDateFormat(formatExpr->value()->toString(0));
+    VELOX_CHECK(
+        cudfFormat.has_value(),
+        "date_format has an unsupported format string");
+    cudfFormat_ = std::move(cudfFormat.value());
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    auto inputCol = asView(inputColumns[0]);
+    return cudf::strings::from_timestamps(
+        inputCol,
+        cudfFormat_,
+        cudf::strings_column_view(cudf::column_view{
+            cudf::data_type{cudf::type_id::STRING},
+            0,
+            nullptr,
+            nullptr,
+            0}),
+        stream,
+        mr);
+  }
+
+ private:
+  std::string cudfFormat_;
 };
 
 class CardinalityFunction : public CudfFunction {
@@ -1105,6 +1237,22 @@ class SwitchFunction : public CudfFunction {
   std::unique_ptr<cudf::scalar> right_;
 };
 
+int64_t readSubstringIntegerConstant(
+    const VectorPtr& value,
+    const char* argumentName) {
+  switch (value->typeKind()) {
+    case TypeKind::INTEGER:
+      return value->as<SimpleVector<int32_t>>()->valueAt(0);
+    case TypeKind::BIGINT:
+      return value->as<SimpleVector<int64_t>>()->valueAt(0);
+    default:
+      VELOX_FAIL(
+          "substr {} must be an INTEGER or BIGINT constant; saw {}",
+          argumentName,
+          value->type()->toString());
+  }
+}
+
 class SubstrFunction : public CudfFunction {
  public:
   SubstrFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
@@ -1117,8 +1265,7 @@ class SubstrFunction : public CudfFunction {
     auto startExpr = std::dynamic_pointer_cast<ConstantExpr>(expr->inputs()[1]);
     VELOX_CHECK_NOT_NULL(startExpr, "substr start must be a constant");
 
-    auto startValue =
-        startExpr->value()->as<SimpleVector<int64_t>>()->valueAt(0);
+    auto startValue = readSubstringIntegerConstant(startExpr->value(), "start");
     start_ = static_cast<cudf::size_type>(startValue);
     if (startValue >= 1) {
       // cuDF indexing starts at 0.
@@ -1133,7 +1280,7 @@ class SubstrFunction : public CudfFunction {
       VELOX_CHECK_NOT_NULL(lengthExpr, "substr length must be a constant");
 
       auto lengthValue =
-          lengthExpr->value()->as<SimpleVector<int64_t>>()->valueAt(0);
+          readSubstringIntegerConstant(lengthExpr->value(), "length");
       // cuDF uses indices [begin, end).
       // Presto uses length as the length of the substring.
       // We compute the end as start + length.
@@ -1159,6 +1306,57 @@ class SubstrFunction : public CudfFunction {
   cudf::size_type start_{0};
   cudf::size_type end_{0};
   bool hasEnd_{false};
+};
+
+template <int NullMode>
+class RowConstructorFunction : public CudfFunction {
+ public:
+  explicit RowConstructorFunction(
+      const std::shared_ptr<velox::exec::Expr>& /*expr*/) {}
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    VELOX_CHECK(
+        !inputColumns.empty(), "row_constructor requires at least one input");
+
+    const auto numRows = asView(inputColumns[0]).size();
+    std::vector<std::unique_ptr<cudf::column>> children;
+    children.reserve(inputColumns.size());
+    for (auto& col : inputColumns) {
+      children.push_back(std::make_unique<cudf::column>(
+          asView(col), stream, mr));
+    }
+
+    rmm::device_buffer nullMask{};
+    cudf::size_type nullCount = 0;
+    if constexpr (NullMode == 1 || NullMode == 2) {
+      std::vector<cudf::column_view> childViews;
+      childViews.reserve(children.size());
+      for (const auto& child : children) {
+        childViews.push_back(child->view());
+      }
+      auto tableView = cudf::table_view(childViews);
+      auto maskAndCount = [&]() {
+        if constexpr (NullMode == 1) {
+          return cudf::bitmask_and(tableView, stream, mr);
+        } else {
+          return cudf::bitmask_or(tableView, stream, mr);
+        }
+      }();
+      nullMask = std::move(maskAndCount.first);
+      nullCount = maskAndCount.second;
+    }
+
+    return std::make_unique<cudf::column>(
+        cudf::data_type{cudf::type_id::STRUCT},
+        numRows,
+        rmm::device_buffer{},
+        std::move(nullMask),
+        nullCount,
+        std::move(children));
+  }
 };
 
 class CoalesceFunction : public CudfFunction {
@@ -1836,16 +2034,38 @@ std::shared_ptr<CudfFunction> createCudfFunction(
     const std::string& name,
     const std::shared_ptr<velox::exec::Expr>& expr) {
   auto& registry = getCudfFunctionRegistry();
-  auto it = registry.find(name);
-  if (it == registry.end()) {
+  auto tryLookup = [&](const std::string& key)
+      -> std::shared_ptr<CudfFunction> {
+    auto it = registry.find(key);
+    if (it == registry.end()) {
+      return nullptr;
+    }
+    for (const auto& spec : it->second) {
+      // Empty signatures matching must be allowed to handle dynamic special
+      // cases like cast and row_constructor.
+      if (spec.signatures.empty() ||
+          matchCallAgainstSignatures(*expr, spec.signatures)) {
+        return spec.factory(key, expr);
+      }
+    }
     return nullptr;
+  };
+
+  if (auto function = tryLookup(name)) {
+    return function;
   }
-  for (const auto& spec : it->second) {
-    // Empty signatures matching must be allowed to handle
-    // the special case of cast
-    if (spec.signatures.empty() ||
-        matchCallAgainstSignatures(*expr, spec.signatures)) {
-      return spec.factory(name, expr);
+
+  const auto& prefix = CudfConfig::getInstance().functionNamePrefix;
+  if (!prefix.empty()) {
+    const bool hasPrefix =
+        name.size() >= prefix.size() &&
+        name.compare(0, prefix.size(), prefix) == 0;
+    if (!hasPrefix) {
+      if (auto function = tryLookup(prefix + name)) {
+        return function;
+      }
+    } else if (auto function = tryLookup(name.substr(prefix.size()))) {
+      return function;
     }
   }
   return nullptr;
@@ -1898,8 +2118,31 @@ bool registerBuiltinFunctions(const std::string& prefix) {
        FunctionSignatureBuilder()
            .returnType("varchar")
            .argumentType("varchar")
+           .constantArgumentType("integer")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("varchar")
+           .argumentType("varchar")
            .constantArgumentType("bigint")
            .constantArgumentType("bigint")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("varchar")
+           .argumentType("varchar")
+           .constantArgumentType("bigint")
+           .constantArgumentType("integer")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("varchar")
+           .argumentType("varchar")
+           .constantArgumentType("integer")
+           .constantArgumentType("bigint")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("varchar")
+           .argumentType("varchar")
+           .constantArgumentType("integer")
+           .constantArgumentType("integer")
            .build()});
 
   // Coalesce is special form and doesn't have a prefix in its name.
@@ -2006,6 +2249,18 @@ bool registerBuiltinFunctions(const std::string& prefix) {
        FunctionSignatureBuilder()
            .returnType("integer")
            .argumentType("date")
+           .build()});
+
+  registerCudfFunction(
+      prefix + "date_format",
+      [](const std::string&,
+         const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<DateFormatFunction>(expr);
+      },
+      {FunctionSignatureBuilder()
+           .returnType("varchar")
+           .argumentType("timestamp")
+           .constantArgumentType("varchar")
            .build()});
 
   registerCudfFunction(
@@ -2122,6 +2377,30 @@ bool registerBuiltinFunctions(const std::string& prefix) {
       {
           // Cast needs special handling dynamically using cudf.
       });
+
+  registerCudfFunction(
+      "row_constructor_with_null",
+      [](const std::string&,
+         const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<RowConstructorFunction<1>>(expr);
+      },
+      {});
+
+  registerCudfFunction(
+      "row_constructor",
+      [](const std::string&,
+         const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<RowConstructorFunction<0>>(expr);
+      },
+      {});
+
+  registerCudfFunction(
+      "row_constructor_with_all_null",
+      [](const std::string&,
+         const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<RowConstructorFunction<2>>(expr);
+      },
+      {});
 
   //
   // regular binary operators
@@ -2321,15 +2600,40 @@ std::shared_ptr<FunctionExpression> FunctionExpression::create(
   node->expr_ = expr;
   node->inputRowSchema_ = inputRowSchema;
 
+  if (std::dynamic_pointer_cast<velox::exec::FieldReference>(expr)) {
+    return node;
+  }
+
   auto name = expr->name();
   node->function_ = createCudfFunction(name, expr);
 
-  if (node->function_) {
-    for (const auto& input : expr->inputs()) {
-      if (input->name() != "literal") {
-        node->subexpressions_.push_back(
-            createCudfExpression(input, inputRowSchema));
+  if (!node->function_) {
+    auto& registry = getCudfFunctionRegistry();
+    std::string sample;
+    size_t shown = 0;
+    for (const auto& [key, _] : registry) {
+      if (shown++ >= 8) {
+        sample += ", ...";
+        break;
       }
+      if (!sample.empty()) {
+        sample += ", ";
+      }
+      sample += key;
+    }
+    VELOX_FAIL(
+        "createCudfFunction returned null for expression '{}'; configured "
+        "prefix='{}', registry size={}, sample keys=[{}]",
+        name,
+        CudfConfig::getInstance().functionNamePrefix,
+        registry.size(),
+        sample);
+  }
+
+  for (const auto& input : expr->inputs()) {
+    if (input->name() != "literal") {
+      node->subexpressions_.push_back(
+          createCudfExpression(input, inputRowSchema));
     }
   }
 
@@ -2369,7 +2673,8 @@ ColumnOrView FunctionExpression::eval(
   }
 
   VELOX_FAIL(
-      "Unsupported expression for recursive evaluation: " + expr_->name());
+      "FunctionExpression::eval invoked with null function_ for expression '{}'",
+      expr_->name());
 }
 
 void FunctionExpression::close() {
@@ -2394,18 +2699,53 @@ bool FunctionExpression::canEvaluate(std::shared_ptr<velox::exec::Expr> expr) {
     }
     auto src = cudf_velox::veloxToCudfDataType(srcType);
     auto dst = cudf_velox::veloxToCudfDataType(dstType);
-    return cudf::is_supported_cast(src, dst);
+    if (cudf::is_supported_cast(src, dst)) {
+      return true;
+    }
+    if (srcType->isDate() && dstType->kind() == TypeKind::VARCHAR) {
+      return true;
+    }
+    const auto srcKind = srcType->kind();
+    if ((srcKind == TypeKind::TINYINT || srcKind == TypeKind::SMALLINT ||
+         srcKind == TypeKind::INTEGER || srcKind == TypeKind::BIGINT) &&
+        dstType->kind() == TypeKind::VARCHAR) {
+      return true;
+    }
+    return false;
   }
 
   auto& registry = getCudfFunctionRegistry();
-  auto it = registry.find(expr->name());
-  if (it == registry.end()) {
-    return false;
+  std::vector<std::string> candidates{expr->name()};
+  const auto& prefix = CudfConfig::getInstance().functionNamePrefix;
+  if (!prefix.empty()) {
+    const auto& exprName = expr->name();
+    const bool hasPrefix =
+        exprName.size() >= prefix.size() &&
+        exprName.compare(0, prefix.size(), prefix) == 0;
+    candidates.push_back(
+        hasPrefix ? exprName.substr(prefix.size()) : prefix + exprName);
   }
-  for (const auto& spec : it->second) {
-    if (spec.signatures.empty() ||
-        matchCallAgainstSignatures(*expr, spec.signatures)) {
-      return true;
+
+  for (const auto& candidate : candidates) {
+    auto it = registry.find(candidate);
+    if (it == registry.end()) {
+      continue;
+    }
+    for (const auto& spec : it->second) {
+      if (spec.signatures.empty() ||
+          matchCallAgainstSignatures(*expr, spec.signatures)) {
+        if (candidate == prefix + "date_format" ||
+            candidate == "date_format") {
+          auto formatExpr = std::dynamic_pointer_cast<velox::exec::ConstantExpr>(
+              expr->inputs()[1]);
+          if (!formatExpr) {
+            return false;
+          }
+          return prestoToCudfDateFormat(formatExpr->value()->toString(0))
+              .has_value();
+        }
+        return true;
+      }
     }
   }
   return false;

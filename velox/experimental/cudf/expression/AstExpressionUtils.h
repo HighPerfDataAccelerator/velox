@@ -38,6 +38,8 @@
 #include <cudf/unary.hpp>
 #include <cudf/utilities/traits.hpp>
 
+#include <unordered_set>
+
 namespace facebook::velox::cudf_velox {
 namespace {
 
@@ -233,6 +235,17 @@ const std::unordered_map<std::string, Op> unaryOps = [] {
   return merged;
 }();
 
+const std::unordered_set<std::string> kFunctionExprNames = {
+    "hash_with_seed",
+    "isnull",
+    "might_contain",
+    "murmur3hash_with_seed",
+    "row_constructor",
+    "row_constructor_with_all_null",
+    "row_constructor_with_null",
+    "xxhash64_with_seed",
+};
+
 namespace detail {
 
 // return the AST operator for the given expression name, if any
@@ -326,6 +339,10 @@ bool isAstExprSupported(const std::shared_ptr<velox::exec::Expr>& expr) {
     }
     LOG(WARNING) << "Field " << name << "not found, in expression "
                  << expr->toString();
+    return false;
+  }
+
+  if (kFunctionExprNames.count(name) != 0) {
     return false;
   }
 
