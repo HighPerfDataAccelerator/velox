@@ -22,6 +22,7 @@
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
 #include "velox/common/memory/Memory.h"
+#include "velox/common/time/Timer.h"
 #include "velox/expression/Expr.h"
 #include "velox/expression/FieldReference.h"
 
@@ -245,19 +246,60 @@ RowVectorPtr CudfFilterProject::doGetOutput() {
   VELOX_CHECK_NOT_NULL(cudfInput);
   auto stream = cudfInput->stream();
   auto inputTableColumns = cudfInput->release()->release();
+  const auto inputColumns = inputTableColumns.size();
+  const auto inputRows = input_->size();
   auto outputSize = input_->size();
+  const auto trace = perfTraceEnabled();
+  const auto traceSync = trace && perfTraceSyncEnabled();
+  uint64_t filterUs{0};
+  uint64_t projectUs{0};
+  const auto totalStartUs = trace ? getCurrentTimeMicro() : 0;
 
   if (hasFilter_) {
+    if (traceSync) {
+      stream.synchronize();
+    }
+    const auto filterStartUs = trace ? getCurrentTimeMicro() : 0;
     filter(inputTableColumns, stream);
+    if (traceSync) {
+      stream.synchronize();
+    }
+    if (trace) {
+      filterUs = getCurrentTimeMicro() - filterStartUs;
+    }
   }
   if (!inputTableColumns.empty()) {
     outputSize = inputTableColumns.front()->size();
   }
+  if (traceSync) {
+    stream.synchronize();
+  }
+  const auto projectStartUs = trace ? getCurrentTimeMicro() : 0;
   auto outputColumns = project(inputTableColumns, stream);
+  if (traceSync) {
+    stream.synchronize();
+  }
+  if (trace) {
+    projectUs = getCurrentTimeMicro() - projectStartUs;
+  }
 
   auto outputTable = std::make_unique<cudf::table>(std::move(outputColumns));
   auto const numColumns = outputTable->num_columns();
   auto const size = numColumns > 0 ? outputTable->num_rows() : outputSize;
+  if (trace) {
+    LOG(WARNING) << "CUDF_PERF_TRACE filter_project node=" << planNodeId()
+                 << " operator_id=" << operatorId()
+                 << " input_rows=" << inputRows
+                 << " input_cols=" << inputColumns
+                 << " output_rows=" << size
+                 << " output_cols=" << numColumns
+                 << " has_filter=" << hasFilter_
+                 << " project_exprs=" << projectEvaluators_.size()
+                 << " filter_us=" << filterUs
+                 << " project_us=" << projectUs
+                 << " total_us=" << getCurrentTimeMicro() - totalStartUs
+                 << " sync=" << traceSync;
+  }
   if (CudfConfig::getInstance().debugEnabled) {
     VLOG(1) << "cudfProject Output: " << size << " rows, " << numColumns
             << " columns";

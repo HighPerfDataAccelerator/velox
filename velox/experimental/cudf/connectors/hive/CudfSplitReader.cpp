@@ -17,6 +17,7 @@
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/connectors/hive/CudfSplitReader.h"
 #include "velox/experimental/cudf/connectors/hive/CudfSplitReaderHelpers.h"
+#include "velox/experimental/cudf/exec/DebugUtil.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 
 #include "velox/common/caching/CacheTTLController.h"
@@ -115,9 +116,17 @@ std::optional<std::unique_ptr<cudf::table>> CudfSplitReader::next(
     return std::nullopt;
   }
   auto cudfTable = std::move(chunkOpt.value());
+  const auto perfTrace = perfTraceEnabled();
 
   TotalScanTimeCallbackData* callbackData =
-      new TotalScanTimeCallbackData{startTimeUs, ioStatistics_};
+      new TotalScanTimeCallbackData{
+          startTimeUs,
+          ioStatistics_,
+          perfTrace,
+          useExperimentalCudfReader_,
+          cudfTable->num_rows(),
+          cudfTable->num_columns(),
+          perfTrace ? split_->filePath : std::string{}};
 
   // Launch host callback to calculate timing when scan completes
   cudaLaunchHostFunc(
@@ -357,6 +366,13 @@ void CudfSplitReader::totalScanTimeCalculator(void* userData) {
 
   // Update totalScanTime
   data->ioStatistics->incTotalScanTimeNs(elapsedNs);
+
+  if (data->perfTrace) {
+    LOG(WARNING) << "CUDF_PERF_TRACE scan_chunk elapsed_us=" << elapsedUs
+                 << " rows=" << data->numRows << " cols=" << data->numColumns
+                 << " experimental=" << data->useExperimentalCudfReader
+                 << " split=" << data->splitPath;
+  }
 
   delete data;
 }

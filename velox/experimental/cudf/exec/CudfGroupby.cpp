@@ -22,6 +22,7 @@
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 
+#include "velox/common/time/Timer.h"
 #include "velox/exec/Aggregate.h"
 #include "velox/exec/AggregateFunctionRegistry.h"
 #include "velox/exec/HashAggregation.h"
@@ -870,6 +871,14 @@ CudfVectorPtr CudfGroupby::doGroupByAggregation(
     std::vector<std::unique_ptr<GroupbyAggregator>>& aggregators,
     TypePtr const& outputType,
     rmm::cuda_stream_view stream) {
+  const auto trace = perfTraceEnabled();
+  const auto traceSync = trace && perfTraceSyncEnabled();
+  if (traceSync) {
+    stream.synchronize();
+  }
+  const auto totalStartUs = trace ? getCurrentTimeMicro() : 0;
+  const auto inputRows = tableView.num_rows();
+  const auto inputColumns = tableView.num_columns();
   auto groupbyKeyView =
       tableView.select(groupByKeys.begin(), groupByKeys.end());
 
@@ -885,8 +894,15 @@ CudfVectorPtr CudfGroupby::doGroupByAggregation(
     aggregator->addGroupbyRequest(tableView, requests);
   }
 
+  const auto aggregateStartUs = trace ? getCurrentTimeMicro() : 0;
   auto [groupKeys, results] =
       groupByOwner.aggregate(requests, stream, get_output_mr());
+  if (traceSync) {
+    stream.synchronize();
+  }
+  const auto aggregateUs = trace ? getCurrentTimeMicro() - aggregateStartUs : 0;
+
+  const auto materializeStartUs = trace ? getCurrentTimeMicro() : 0;
   // flatten the results
   std::vector<std::unique_ptr<cudf::column>> resultColumns;
 
@@ -904,8 +920,28 @@ CudfVectorPtr CudfGroupby::doGroupByAggregation(
 
   // make a cudf table out of columns
   auto resultTable = std::make_unique<cudf::table>(std::move(resultColumns));
+  if (traceSync) {
+    stream.synchronize();
+  }
+  const auto materializeUs =
+      trace ? getCurrentTimeMicro() - materializeStartUs : 0;
 
   auto numRows = resultTable->num_rows();
+  if (trace) {
+    LOG(WARNING) << "CUDF_PERF_TRACE groupby node=" << planNodeId()
+                 << " operator_id=" << operatorId()
+                 << " input_rows=" << inputRows
+                 << " input_cols=" << inputColumns
+                 << " output_rows=" << numRows
+                 << " output_cols=" << resultTable->num_columns()
+                 << " keys=" << groupByKeys.size()
+                 << " aggregators=" << aggregators.size()
+                 << " requests=" << requests.size()
+                 << " aggregate_us=" << aggregateUs
+                 << " materialize_us=" << materializeUs
+                 << " total_us=" << getCurrentTimeMicro() - totalStartUs
+                 << " sync=" << traceSync;
+  }
 
   // velox expects nullptr instead of a table with 0 rows
   if (numRows == 0) {

@@ -23,7 +23,31 @@
 
 #include <cuda_runtime.h>
 
+#include <cstdlib>
+#include <string_view>
+
 namespace facebook::velox::cudf_velox {
+
+inline bool isTruthyCudfTraceEnv(const char* value) {
+  if (value == nullptr || value[0] == '\0') {
+    return false;
+  }
+  const std::string_view flag{value};
+  return flag != "0" && flag != "false" && flag != "FALSE" &&
+      flag != "off" && flag != "OFF";
+}
+
+inline bool perfTraceEnabled() {
+  static const bool enabled =
+      isTruthyCudfTraceEnv(std::getenv("VELOX_CUDF_PERF_TRACE"));
+  return enabled;
+}
+
+inline bool perfTraceSyncEnabled() {
+  static const bool enabled =
+      isTruthyCudfTraceEnv(std::getenv("VELOX_CUDF_PERF_TRACE_SYNC"));
+  return enabled;
+}
 
 /// Helper function to check for CUDA errors in debug mode.
 inline void checkCudaErrorInDebug() {

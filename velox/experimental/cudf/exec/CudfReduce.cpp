@@ -23,6 +23,7 @@
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 
+#include "velox/common/time/Timer.h"
 #include "velox/exec/Aggregate.h"
 #include "velox/exec/AggregateFunctionRegistry.h"
 #include "velox/exec/Task.h"
@@ -638,12 +639,24 @@ RowVectorPtr CudfReduce::doGetOutput() {
   }
 
   auto stream = cudfGlobalStreamPool().get_stream();
+  const auto trace = perfTraceEnabled();
+  const auto traceSync = trace && perfTraceSyncEnabled();
+  const auto inputBatches = inputs_.size();
+  const auto inputRows = numInputRows_;
+  if (traceSync) {
+    for (const auto& input : inputs_) {
+      input->stream().synchronize();
+    }
+  }
+  const auto totalStartUs = trace ? getCurrentTimeMicro() : 0;
+  const auto concatStartUs = trace ? getCurrentTimeMicro() : 0;
 
   auto tbl = getConcatenatedTable(
       std::move(inputs_), inputType_, stream, get_output_mr());
 
   // Release input data after synchronizing.
   stream.synchronize();
+  const auto concatUs = trace ? getCurrentTimeMicro() - concatStartUs : 0;
   inputs_.clear();
 
   if (noMoreInput_) {
@@ -656,7 +669,27 @@ RowVectorPtr CudfReduce::doGetOutput() {
       ? tbl->view()
       : tbl->view().select(
             aggregationInputChannels_.begin(), aggregationInputChannels_.end());
+  const auto reduceStartUs = trace ? getCurrentTimeMicro() : 0;
   auto output = doGlobalAggregation(tableView, stream);
+  if (traceSync) {
+    stream.synchronize();
+  }
+  const auto reduceUs = trace ? getCurrentTimeMicro() - reduceStartUs : 0;
+  if (trace) {
+    LOG(WARNING) << "CUDF_PERF_TRACE reduce node=" << planNodeId()
+                 << " operator_id=" << operatorId()
+                 << " input_batches=" << inputBatches
+                 << " input_rows=" << inputRows
+                 << " input_cols=" << tableView.num_columns()
+                 << " output_rows=" << output->size()
+                 << " aggregates=" << aggregators_.size()
+                 << " partial_output=" << isPartialOutput_
+                 << " no_more_input=" << noMoreInput_
+                 << " concat_us=" << concatUs
+                 << " reduce_us=" << reduceUs
+                 << " total_us=" << getCurrentTimeMicro() - totalStartUs
+                 << " sync=" << traceSync;
+  }
   if (isPartialOutput_ && !noMoreInput_) {
     numInputRows_ = 0;
   }

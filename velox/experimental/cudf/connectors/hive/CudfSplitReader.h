@@ -34,6 +34,8 @@
 #include <cudf/io/parquet.hpp>
 #include <cudf/io/types.hpp>
 
+#include <string>
+
 namespace facebook::velox::cudf_velox::connector::hive {
 
 using namespace facebook::velox::connector;
@@ -131,6 +133,11 @@ class CudfSplitReader : public NvtxHelper {
   struct TotalScanTimeCallbackData {
     uint64_t startTimeUs;
     std::shared_ptr<io::IoStatistics> ioStatistics;
+    bool perfTrace;
+    bool useExperimentalCudfReader;
+    int64_t numRows;
+    int32_t numColumns;
+    std::string splitPath;
   };
 
   static void totalScanTimeCalculator(void* userData);
