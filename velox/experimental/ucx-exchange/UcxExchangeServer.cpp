@@ -17,6 +17,7 @@
 #include <glog/logging.h>
 #include <rmm/cuda_stream_view.hpp>
 #include "cuda_runtime.h"
+#include "velox/common/EnumDefine.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/ucx-exchange/Communicator.h"
 #include "velox/experimental/ucx-exchange/IntraNodeTransferRegistry.h"

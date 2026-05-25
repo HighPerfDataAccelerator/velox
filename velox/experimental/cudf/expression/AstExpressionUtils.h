@@ -332,14 +332,7 @@ bool isAstExprSupported(const std::shared_ptr<velox::exec::Expr>& expr) {
     return isSupportedLiteral(type);
   }
   if (auto fieldExpr = std::dynamic_pointer_cast<FieldReference>(expr)) {
-    const auto fieldName =
-        fieldExpr->inputs().empty() ? name : fieldExpr->inputs()[0]->name();
-    if (fieldExpr->field() == fieldName) {
-      return true;
-    }
-    LOG(WARNING) << "Field " << name << "not found, in expression "
-                 << expr->toString();
-    return false;
+    return fieldExpr->inputs().empty();
   }
 
   if (kFunctionExprNames.count(name) != 0) {
