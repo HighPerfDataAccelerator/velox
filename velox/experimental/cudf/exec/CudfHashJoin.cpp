@@ -82,7 +82,27 @@ void CudfHashJoinProbe::close() {
   Operator::close();
   filterEvaluator_.reset();
   scalars_.clear();
-  tree_ = {};
+  tree_.reset();
+  cudaEvent_.reset();
+}
+
+cudf::ast::tree& CudfHashJoinProbe::filterTree() {
+  if (!tree_) {
+    tree_ = std::make_unique<cudf::ast::tree>();
+  }
+  return *tree_;
+}
+
+const cudf::ast::expression& CudfHashJoinProbe::filterExpression() const {
+  VELOX_CHECK(tree_ != nullptr, "Filter AST has not been initialized");
+  return tree_->back();
+}
+
+CudaEvent& CudfHashJoinProbe::cudaEvent() {
+  if (!cudaEvent_) {
+    cudaEvent_ = std::make_unique<CudaEvent>(cudaEventDisableTiming);
+  }
+  return *cudaEvent_;
 }
 
 void CudfHashJoinBridge::setHashTable(
@@ -393,8 +413,7 @@ CudfHashJoinProbe::CudfHashJoinProbe(
           fmt::format("[{}]", joinNode->id())),
       joinNode_(joinNode),
       probeType_(joinNode_->sources()[0]->outputType()),
-      buildType_(joinNode_->sources()[1]->outputType()),
-      cudaEvent_(std::make_unique<CudaEvent>(cudaEventDisableTiming)) {
+      buildType_(joinNode_->sources()[1]->outputType()) {
   if (CudfConfig::getInstance().debugEnabled) {
     VLOG(2) << "CudfHashJoinProbe constructor";
   }
@@ -482,8 +501,11 @@ CudfHashJoinProbe::CudfHashJoinProbe(
               << rightColumnIndicesToGather_[i];
     }
   }
+}
 
-  // Setup filter in case it exists
+void CudfHashJoinProbe::initialize() {
+  Operator::initialize();
+
   if (joinNode_->filter()) {
     // simplify expression
     exec::ExprSet exprs({joinNode_->filter()}, operatorCtx_->execCtx());
@@ -504,10 +526,11 @@ CudfHashJoinProbe::CudfHashJoinProbe(
     // in whole tables
 
     // create ast tree
+    auto& tree = filterTree();
     if (joinNode_->isRightJoin() || joinNode_->isRightSemiFilterJoin()) {
       createAstTree(
           exprs.exprs()[0],
-          tree_,
+          tree,
           scalars_,
           buildType_,
           probeType_,
@@ -516,7 +539,7 @@ CudfHashJoinProbe::CudfHashJoinProbe(
     } else {
       createAstTree(
           exprs.exprs()[0],
-          tree_,
+          tree,
           scalars_,
           probeType_,
           buildType_,
@@ -718,7 +741,7 @@ std::unique_ptr<cudf::table> CudfHashJoinProbe::unfilteredOutput(
   }
   if (buildStream_.has_value()) {
     // Ensure deallocation of build table happens after probe gathers
-    cudaEvent_->recordFrom(stream).waitOn(buildStream_.value());
+    cudaEvent().recordFrom(stream).waitOn(buildStream_.value());
   }
   stream.synchronize();
   return std::make_unique<cudf::table>(std::move(joinedCols));
@@ -774,7 +797,7 @@ std::unique_ptr<cudf::table> CudfHashJoinProbe::filteredOutput(
   joinedCols = std::move(filteredjoinedCols);
   if (buildStream_.has_value()) {
     // Ensure any deallocation of join indices is ordered wrt probe gathers
-    cudaEvent_->recordFrom(stream).waitOn(buildStream_.value());
+    cudaEvent().recordFrom(stream).waitOn(buildStream_.value());
   }
   stream.synchronize();
   return std::make_unique<cudf::table>(std::move(joinedCols));
@@ -796,7 +819,7 @@ std::unique_ptr<cudf::table> CudfHashJoinProbe::filteredOutputIndices(
           extendedRightView,
           leftIndicesCol,
           rightIndicesCol,
-          tree_.back(),
+          filterExpression(),
           joinKind,
           stream,
           get_temp_mr());
@@ -852,7 +875,7 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::innerJoin(
     VELOX_CHECK_NOT_NULL(hb);
     if (buildStream_.has_value()) {
       // Make build stream wait for probe tables to become valid
-      cudaEvent_->recordFrom(stream).waitOn(buildStream_.value());
+      cudaEvent().recordFrom(stream).waitOn(buildStream_.value());
     }
     auto [leftJoinIndices, rightJoinIndices] = hb->inner_join(
         leftTableView.select(leftKeyIndices_),
@@ -861,7 +884,7 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::innerJoin(
         get_temp_mr());
     if (buildStream_.has_value()) {
       // Make probe stream wait for join completion before using indices
-      cudaEvent_->recordFrom(buildStream_.value()).waitOn(stream);
+      cudaEvent().recordFrom(buildStream_.value()).waitOn(stream);
     }
 
     auto leftIndicesSpan =
@@ -928,7 +951,7 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::leftJoin(
 
     VELOX_CHECK_NOT_NULL(hb);
     if (buildStream_.has_value()) {
-      cudaEvent_->recordFrom(stream).waitOn(buildStream_.value());
+      cudaEvent().recordFrom(stream).waitOn(buildStream_.value());
     }
     auto [leftJoinIndices, rightJoinIndices] = hb->left_join(
         leftTableView.select(leftKeyIndices_),
@@ -936,7 +959,7 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::leftJoin(
         buildStream_.has_value() ? buildStream_.value() : stream,
         get_temp_mr());
     if (buildStream_.has_value()) {
-      cudaEvent_->recordFrom(buildStream_.value()).waitOn(stream);
+      cudaEvent().recordFrom(buildStream_.value()).waitOn(stream);
     }
 
     auto leftIndicesSpan =
@@ -983,7 +1006,7 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::rightJoin(
 
     VELOX_CHECK_NOT_NULL(hb);
     if (buildStream_.has_value()) {
-      cudaEvent_->recordFrom(stream).waitOn(buildStream_.value());
+      cudaEvent().recordFrom(stream).waitOn(buildStream_.value());
     }
     auto [leftJoinIndices, rightJoinIndices] = hb->inner_join(
         leftTableView.select(leftKeyIndices_),
@@ -991,7 +1014,7 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::rightJoin(
         buildStream_.has_value() ? buildStream_.value() : stream,
         get_temp_mr());
     if (buildStream_.has_value()) {
-      cudaEvent_->recordFrom(buildStream_.value()).waitOn(stream);
+      cudaEvent().recordFrom(buildStream_.value()).waitOn(stream);
     }
     if (!joinNode_->filter()) {
       // Mark matched build rows by checking which row indices appear in
@@ -1125,7 +1148,7 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::fullJoin(
 
     VELOX_CHECK_NOT_NULL(hb);
     if (buildStream_.has_value()) {
-      cudaEvent_->recordFrom(stream).waitOn(buildStream_.value());
+      cudaEvent().recordFrom(stream).waitOn(buildStream_.value());
     }
     // Use left_join to get all probe rows (matched + unmatched).
     // Track matched build rows in rightMatchedFlags_ for last driver to emit
@@ -1136,7 +1159,7 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::fullJoin(
         buildStream_.has_value() ? buildStream_.value() : stream,
         get_temp_mr());
     if (buildStream_.has_value()) {
-      cudaEvent_->recordFrom(buildStream_.value()).waitOn(stream);
+      cudaEvent().recordFrom(buildStream_.value()).waitOn(stream);
     }
     if (!joinNode_->filter()) {
       // Mark matched build rows by checking which row indices appear in
@@ -1189,7 +1212,7 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::fullJoin(
               rightTableView,
               leftIndicesCol,
               rightIndicesCol,
-              tree_.back(),
+              filterExpression(),
               cudf::join_kind::LEFT_JOIN,
               stream,
               get_temp_mr());
@@ -1269,7 +1292,7 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::leftSemiFilterJoin(
           rightTableView.select(rightKeyIndices_),
           leftTableView,
           rightTableView,
-          tree_.back(),
+          filterExpression(),
           cudf::null_equality::UNEQUAL,
           stream,
           get_temp_mr());
@@ -1290,14 +1313,14 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::leftSemiFilterJoin(
       VELOX_CHECK_LT(i, filteredJoins.size());
       VELOX_CHECK_NOT_NULL(filteredJoins[i]);
       if (buildStream_.has_value()) {
-        cudaEvent_->recordFrom(stream).waitOn(buildStream_.value());
+        cudaEvent().recordFrom(stream).waitOn(buildStream_.value());
       }
       leftJoinIndices = filteredJoins[i]->semi_join(
           leftTableView.select(leftKeyIndices_),
           buildStream_.has_value() ? buildStream_.value() : stream,
           get_temp_mr());
       if (buildStream_.has_value()) {
-        cudaEvent_->recordFrom(buildStream_.value()).waitOn(stream);
+        cudaEvent().recordFrom(buildStream_.value()).waitOn(stream);
       }
     }
 
@@ -1437,7 +1460,7 @@ CudfHashJoinProbe::leftSemiProjectJoin(
     VELOX_CHECK_NOT_NULL(hb);
     if (buildStream_.has_value()) {
       // Make build stream wait for probe tables to become valid
-      cudaEvent_->recordFrom(stream).waitOn(buildStream_.value());
+      cudaEvent().recordFrom(stream).waitOn(buildStream_.value());
     }
     auto [leftJoinIndices, rightJoinIndices] = hb->inner_join(
         leftTableView.select(leftKeyIndices_),
@@ -1446,7 +1469,7 @@ CudfHashJoinProbe::leftSemiProjectJoin(
         get_temp_mr());
     if (buildStream_.has_value()) {
       // Make probe stream wait for join completion before using indices
-      cudaEvent_->recordFrom(buildStream_.value()).waitOn(stream);
+      cudaEvent().recordFrom(buildStream_.value()).waitOn(stream);
     }
 
     if (leftJoinIndices->size() == 0) {
@@ -1471,7 +1494,7 @@ CudfHashJoinProbe::leftSemiProjectJoin(
           extendedRightView,
           leftIndicesSpan,
           rightIndicesSpan,
-          tree_.back(),
+          filterExpression(),
           cudf::join_kind::INNER_JOIN,
           stream,
           get_temp_mr());
@@ -1572,7 +1595,7 @@ CudfHashJoinProbe::leftSemiProjectJoin(
   outputCols.back() = std::move(matchCol);
 
   if (buildStream_.has_value()) {
-    cudaEvent_->recordFrom(stream).waitOn(buildStream_.value());
+    cudaEvent().recordFrom(stream).waitOn(buildStream_.value());
   }
   stream.synchronize();
 
@@ -1601,7 +1624,7 @@ CudfHashJoinProbe::rightSemiFilterJoin(
         leftTableView.select(leftKeyIndices_),
         rightTableView,
         leftTableView,
-        tree_.back(),
+        filterExpression(),
         cudf::null_equality::UNEQUAL,
         stream,
         get_temp_mr());
@@ -1670,7 +1693,7 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::antiJoin(
         rightTableView.select(rightKeyIndices_),
         leftTableView,
         rightTableView,
-        tree_.back(),
+        filterExpression(),
         cudf::null_equality::UNEQUAL,
         stream,
         get_temp_mr());
@@ -1692,14 +1715,14 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::antiJoin(
       VELOX_CHECK_EQ(filteredJoins.size(), 1);
       VELOX_CHECK_NOT_NULL(filteredJoins[0]);
       if (buildStream_.has_value()) {
-        cudaEvent_->recordFrom(stream).waitOn(buildStream_.value());
+        cudaEvent().recordFrom(stream).waitOn(buildStream_.value());
       }
       leftJoinIndices = filteredJoins[0]->anti_join(
           leftTableView.select(leftKeyIndices_),
           buildStream_.has_value() ? buildStream_.value() : stream,
           get_temp_mr());
       if (buildStream_.has_value()) {
-        cudaEvent_->recordFrom(buildStream_.value()).waitOn(stream);
+        cudaEvent().recordFrom(buildStream_.value()).waitOn(stream);
       }
     }
   }

@@ -163,6 +163,8 @@ class CudfHashJoinProbe : public exec::Operator, public NvtxHelper {
       exec::DriverCtx* driverCtx,
       std::shared_ptr<const core::HashJoinNode> joinNode);
 
+  void initialize() override;
+
   bool needsInput() const override;
 
   void addInput(RowVectorPtr input) override;
@@ -199,6 +201,12 @@ class CudfHashJoinProbe : public exec::Operator, public NvtxHelper {
   bool isFinished() override;
 
  private:
+  cudf::ast::tree& filterTree();
+
+  const cudf::ast::expression& filterExpression() const;
+
+  CudaEvent& cudaEvent();
+
   std::shared_ptr<const core::HashJoinNode> joinNode_;
   /** @brief Hash tables and join objects received from build operator */
   std::optional<hash_type> hashObject_;
@@ -212,7 +220,7 @@ class CudfHashJoinProbe : public exec::Operator, public NvtxHelper {
 
   // Filter related members
   /** @brief CUDF AST tree for join filter evaluation */
-  cudf::ast::tree tree_;
+  std::unique_ptr<cudf::ast::tree> tree_;
   /** @brief Scalar values used in filter expressions */
   std::vector<std::unique_ptr<cudf::scalar>> scalars_;
   /** @brief Precompute instructions for left (probe) table columns */
