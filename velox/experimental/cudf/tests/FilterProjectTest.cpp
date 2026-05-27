@@ -1181,6 +1181,27 @@ TEST_F(CudfFilterProjectTest, DISABLED_dereference) {
   assertQuery(plan, "SELECT c1, c2 FROM tmp WHERE c1 % 10 = 5");
 }
 
+TEST_F(CudfFilterProjectTest, dereferenceInputStruct) {
+  auto structVector = makeRowVector(
+      {"col_0", "col_1"},
+      {makeNullableFlatVector<double>({1.5, std::nullopt, 3.5, 4.5}),
+       makeFlatVector<int64_t>({10, 20, 30, 40})},
+      [](auto row) { return row == 2; });
+  auto data = makeRowVector({"avg_state"}, {structVector});
+
+  auto plan = PlanBuilder()
+                  .values({data})
+                  .project(
+                      {"avg_state.col_0 AS sum", "avg_state.col_1 AS count"})
+                  .planNode();
+
+  auto expected = makeRowVector({
+      makeNullableFlatVector<double>({1.5, std::nullopt, std::nullopt, 4.5}),
+      makeNullableFlatVector<int64_t>({10, 20, std::nullopt, 40}),
+  });
+  AssertQueryBuilder(plan).assertResults(expected);
+}
+
 TEST_F(CudfFilterProjectTest, cardinality) {
   auto input = makeArrayVector<int64_t>({{1, 2, 3}, {1, 2}, {}});
   auto data = makeRowVector({input});

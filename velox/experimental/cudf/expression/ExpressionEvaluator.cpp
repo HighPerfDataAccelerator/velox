@@ -2600,7 +2600,14 @@ std::shared_ptr<FunctionExpression> FunctionExpression::create(
   node->expr_ = expr;
   node->inputRowSchema_ = inputRowSchema;
 
-  if (std::dynamic_pointer_cast<velox::exec::FieldReference>(expr)) {
+  if (auto fieldExpr =
+          std::dynamic_pointer_cast<velox::exec::FieldReference>(expr)) {
+    for (const auto& input : fieldExpr->inputs()) {
+      if (input->name() != "literal") {
+        node->subexpressions_.push_back(
+            createCudfExpression(input, inputRowSchema));
+      }
+    }
     return node;
   }
 
@@ -2648,9 +2655,51 @@ ColumnOrView FunctionExpression::eval(
   using velox::exec::FieldReference;
 
   if (auto fieldExpr = std::dynamic_pointer_cast<FieldReference>(expr_)) {
-    auto name = fieldExpr->name();
-    auto columnIndex = inputRowSchema_->getChildIdx(name);
-    return inputColumnViews[columnIndex];
+    if (fieldExpr->inputs().empty()) {
+      auto columnIndex = inputRowSchema_->getChildIdx(fieldExpr->field());
+      return inputColumnViews[columnIndex];
+    }
+
+    VELOX_CHECK_EQ(
+        fieldExpr->inputs().size(),
+        1,
+        "Nested field reference expects exactly one input");
+    VELOX_CHECK_EQ(
+        subexpressions_.size(),
+        1,
+        "Nested field reference expects exactly one compiled input");
+
+    auto parentResult = subexpressions_[0]->eval(inputColumnViews, stream, mr);
+    auto parentView = asView(parentResult);
+    VELOX_CHECK(
+        parentView.type().id() == cudf::type_id::STRUCT,
+        "Nested field reference expects a STRUCT parent, got {}",
+        static_cast<int>(parentView.type().id()));
+
+    const auto& parentType = fieldExpr->inputs()[0]->type();
+    VELOX_CHECK(
+        parentType->isRow(),
+        "Nested field reference expects a ROW parent type, got {}",
+        parentType->toString());
+    const auto childIndex = parentType->asRow().getChildIdx(fieldExpr->field());
+    VELOX_CHECK_LT(
+        childIndex,
+        parentView.num_children(),
+        "Nested field index {} is out of bounds for STRUCT with {} children",
+        childIndex,
+        parentView.num_children());
+
+    auto childView = parentView.child(childIndex);
+    if (parentView.has_nulls() ||
+        std::holds_alternative<std::unique_ptr<cudf::column>>(parentResult)) {
+      auto result = std::make_unique<cudf::column>(childView, stream, mr);
+      if (parentView.has_nulls()) {
+        mergeSecondaryNullsIntoResult(*result, parentView, stream, mr);
+      }
+      return result;
+    }
+
+    return childView;
   }
 
   if (function_) {
