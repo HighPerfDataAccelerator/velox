@@ -164,7 +164,27 @@ struct PlanNodeStats {
 std::unordered_map<core::PlanNodeId, PlanNodeStats> toPlanStats(
     const TaskStats& taskStats);
 
-folly::dynamic toPlanStatsJson(const facebook::velox::exec::TaskStats& stats);
+/// Emits a folly::dynamic array of per-operator metrics for every node in
+/// the plan, one entry per (planNodeId, operatorType). Used by downstream
+/// observability tooling (e.g. Gluten's MPP per-operator metrics dump) to
+/// avoid re-running queries under VLOG to collect stats.
+///
+/// When @p structuredTimings is true, the four CpuWallTiming fields
+/// (isBlockedTiming, addInputTiming, getOutputTiming, finishTiming,
+/// cpuWallTiming) are emitted as nested objects with raw numeric fields
+/// (cpuNanos, wallNanos, count), and each RuntimeMetric entry in
+/// customStats is emitted as a nested object with raw numeric fields
+/// (sum, count, min, max, unit). When false (the default, preserved for
+/// callers that expect the legacy schema), the same fields are emitted as
+/// human-readable strings via their .toString() representation.
+folly::dynamic toPlanStatsJson(
+    const facebook::velox::exec::TaskStats& stats,
+    bool structuredTimings = false);
+
+/// Set when the build of Velox carries the @p structuredTimings overload of
+/// toPlanStatsJson. Downstream consumers can use this macro to feature-detect
+/// the schema-version-2 output without runtime probing.
+#define VELOX_HAS_STRUCTURED_TIMING_PLAN_STATS 1
 
 using PlanNodeAnnotation =
     std::function<std::string(const core::PlanNodeId& id)>;

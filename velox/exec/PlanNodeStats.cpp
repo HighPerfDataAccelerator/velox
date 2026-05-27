@@ -258,7 +258,49 @@ std::unordered_map<core::PlanNodeId, PlanNodeStats> toPlanStats(
   return planStats;
 }
 
-folly::dynamic toPlanStatsJson(const facebook::velox::exec::TaskStats& stats) {
+namespace {
+
+// Builds a folly::dynamic for a CpuWallTiming value. When @p structured is
+// true emits a nested object with raw numeric fields suitable for downstream
+// aggregation (no regex parse-back required). Otherwise falls back to the
+// human-readable .toString() representation that callers have historically
+// relied on.
+folly::dynamic timingToDynamic(
+    const CpuWallTiming& timing,
+    bool structured) {
+  if (!structured) {
+    return folly::dynamic(timing.toString());
+  }
+  folly::dynamic obj = folly::dynamic::object;
+  obj["count"] = static_cast<int64_t>(timing.count);
+  obj["wallNanos"] = static_cast<int64_t>(timing.wallNanos);
+  obj["cpuNanos"] = static_cast<int64_t>(timing.cpuNanos);
+  return obj;
+}
+
+// Same idea for RuntimeMetric. Emits sum/count/min/max as raw numerics plus
+// the original unit's int code so consumers can convert nanos vs. bytes vs.
+// items without parsing succinct strings.
+folly::dynamic runtimeMetricToDynamic(
+    const RuntimeMetric& metric,
+    bool structured) {
+  if (!structured) {
+    return folly::dynamic(metric.toString());
+  }
+  folly::dynamic obj = folly::dynamic::object;
+  obj["unit"] = static_cast<int64_t>(metric.unit);
+  obj["sum"] = static_cast<int64_t>(metric.sum);
+  obj["count"] = static_cast<int64_t>(metric.count);
+  obj["min"] = static_cast<int64_t>(metric.min);
+  obj["max"] = static_cast<int64_t>(metric.max);
+  return obj;
+}
+
+} // namespace
+
+folly::dynamic toPlanStatsJson(
+    const facebook::velox::exec::TaskStats& stats,
+    bool structuredTimings) {
   folly::dynamic jsonStats = folly::dynamic::array;
   auto planStats = facebook::velox::exec::toPlanStats(stats);
   for (const auto& planStat : planStats) {
@@ -274,11 +316,16 @@ folly::dynamic toPlanStatsJson(const facebook::velox::exec::TaskStats& stats) {
       stat["outputRows"] = operatorStat.second->outputRows;
       stat["outputVectors"] = operatorStat.second->outputVectors;
       stat["outputBytes"] = operatorStat.second->outputBytes;
-      stat["isBlockedTiming"] = operatorStat.second->isBlockedTiming.toString();
-      stat["addInputTiming"] = operatorStat.second->addInputTiming.toString();
-      stat["getOutputTiming"] = operatorStat.second->getOutputTiming.toString();
-      stat["finishTiming"] = operatorStat.second->finishTiming.toString();
-      stat["cpuWallTiming"] = operatorStat.second->cpuWallTiming.toString();
+      stat["isBlockedTiming"] =
+          timingToDynamic(operatorStat.second->isBlockedTiming, structuredTimings);
+      stat["addInputTiming"] =
+          timingToDynamic(operatorStat.second->addInputTiming, structuredTimings);
+      stat["getOutputTiming"] =
+          timingToDynamic(operatorStat.second->getOutputTiming, structuredTimings);
+      stat["finishTiming"] =
+          timingToDynamic(operatorStat.second->finishTiming, structuredTimings);
+      stat["cpuWallTiming"] =
+          timingToDynamic(operatorStat.second->cpuWallTiming, structuredTimings);
       stat["blockedWallNanos"] = operatorStat.second->blockedWallNanos;
       stat["peakMemoryBytes"] = operatorStat.second->peakMemoryBytes;
       stat["numMemoryAllocations"] = operatorStat.second->numMemoryAllocations;
@@ -292,7 +339,7 @@ folly::dynamic toPlanStatsJson(const facebook::velox::exec::TaskStats& stats) {
 
       folly::dynamic cs = folly::dynamic::object;
       for (const auto& cstat : operatorStat.second->customStats) {
-        cs[cstat.first] = cstat.second.toString();
+        cs[cstat.first] = runtimeMetricToDynamic(cstat.second, structuredTimings);
       }
       stat["customStats"] = cs;
 
