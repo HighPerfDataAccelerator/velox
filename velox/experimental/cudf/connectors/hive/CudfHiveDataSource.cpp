@@ -20,6 +20,7 @@
 #include "velox/experimental/cudf/connectors/hive/CudfHiveDataSource.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveDataSourceHelpers.hpp"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveTableHandle.h"
+#include "velox/experimental/cudf/exec/GpuMemoryTrackerBridge.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
@@ -50,6 +51,8 @@
 
 #include <cuda_runtime.h>
 #include <nvtx3/nvtx3.hpp>
+
+#include <fmt/format.h>
 
 #include <filesystem>
 #include <memory>
@@ -215,6 +218,9 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
       return nullptr;
     }
 
+    ScopedGpuMemoryOperatorContext gpuMemoryAttribution(
+        fmt::format(
+            "CudfHiveDataSource[phase=read_chunk,split={}]", split_->filePath));
     auto tableWithMetadata = splitReader_->read_chunk();
     cudfTable = std::move(tableWithMetadata.tbl);
     metadata = std::move(tableWithMetadata.metadata);

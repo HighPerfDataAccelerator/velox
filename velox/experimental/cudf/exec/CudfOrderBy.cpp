@@ -16,6 +16,7 @@
 
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/exec/CudfOrderBy.h"
+#include "velox/experimental/cudf/exec/GpuMemoryTrackerBridge.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/NvtxHelper.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
@@ -94,10 +95,28 @@ void CudfOrderBy::noMoreInput() {
     return;
   }
 
+  int64_t inputRows = 0;
+  int64_t inputColumns = 0;
+  for (const auto& input : inputs_) {
+    inputRows += input->getTableView().num_rows();
+    inputColumns = input->getTableView().num_columns();
+  }
   auto stream = cudfGlobalStreamPool().get_stream();
   // Using the output memory resource to allow spilling to CPU memory.
-  auto tbl = getConcatenatedTable(
-      std::move(inputs_), outputType_, stream, get_output_mr());
+  auto tbl = [&]() {
+    ScopedGpuMemoryOperatorContext gpuMemoryAttribution(
+        fmt::format(
+            "CudfOrderBy[node={},op={},pipeline={},driver={},phase=concat,rows={},columns={},batches={}]",
+            planNodeId(),
+            operatorId(),
+            operatorCtx_->driverCtx()->pipelineId,
+            operatorCtx_->driverCtx()->driverId,
+            inputRows,
+            inputColumns,
+            inputs_.size()));
+    return getConcatenatedTable(
+        std::move(inputs_), outputType_, stream, get_output_mr());
+  }();
 
   // Release input data after synchronizing
   stream.synchronize();
@@ -107,8 +126,20 @@ void CudfOrderBy::noMoreInput() {
 
   auto keys = tbl->view().select(sortKeys_);
   auto values = tbl->view();
-  auto result = cudf::sort_by_key(
-      values, keys, columnOrder_, nullOrder_, stream, get_output_mr());
+  auto result = [&]() {
+    ScopedGpuMemoryOperatorContext gpuMemoryAttribution(
+        fmt::format(
+            "CudfOrderBy[node={},op={},pipeline={},driver={},phase=sort_by_key,rows={},columns={},sortKeys={}]",
+            planNodeId(),
+            operatorId(),
+            operatorCtx_->driverCtx()->pipelineId,
+            operatorCtx_->driverCtx()->driverId,
+            values.num_rows(),
+            values.num_columns(),
+            sortKeys_.size()));
+    return cudf::sort_by_key(
+        values, keys, columnOrder_, nullOrder_, stream, get_output_mr());
+  }();
   auto const size = result->num_rows();
   outputTable_ = std::make_shared<CudfVector>(
       pool(), outputType_, size, std::move(result), stream);

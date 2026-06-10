@@ -52,6 +52,7 @@ void Acceptor::cStyleAMCallback(
       it != communicator->acceptor_.handleToEndpointRef_.end(),
       "Could not find endpoint reference");
   std::shared_ptr<EndpointRef> epRef = it->second;
+  const std::string peerAddress = epRef->getPeerAddress();
 
   const PartitionKey key = {handshakePtr->taskId, handshakePtr->destination};
 
@@ -62,9 +63,9 @@ void Acceptor::cStyleAMCallback(
   //
   // Previous approach used IP comparison (getLocalIpAddresses), which fails
   // when multiple Docker containers share the same host IP address.
+  const bool sameWorker = handshakePtr->workerId == communicator->getWorkerId();
   bool isIntraNodeTransfer =
-      cudf_velox::CudfConfig::getInstance().intraNodeExchange &&
-      (handshakePtr->workerId == communicator->getWorkerId());
+      cudf_velox::CudfConfig::getInstance().intraNodeExchange && sameWorker;
 
   // Disable intra-node when the task is not yet initialized (placeholder
   // queue from sinks connecting before initializeTask) or when the task
@@ -72,14 +73,28 @@ void Acceptor::cStyleAMCallback(
   // packed_columns — the intra-node source's destructive move would
   // corrupt it for other servers).
   if (isIntraNodeTransfer) {
-    if (!UcxOutputQueueManager::getInstanceRef()->canUseIntraNode(key.taskId)) {
+    auto queueMgr = UcxOutputQueueManager::getInstanceRef();
+    const bool canUseIntraNode = queueMgr->canUseIntraNode(key.taskId);
+    VLOG(2) << "[UCX-ACCEPTOR-INTRA-CHECK] task=" << key.taskId
+            << " destination=" << key.destination << " peer=" << peerAddress
+            << " sourceWorkerId=" << handshakePtr->workerId
+            << " localWorkerId=" << communicator->getWorkerId()
+            << " sameWorker=" << sameWorker
+            << " canUseIntraNode=" << canUseIntraNode
+            << " queue=" << queueMgr->describeQueueForIntraNode(key.taskId);
+    if (!canUseIntraNode) {
       VLOG(2) << "[ACCEPTOR] Disabling intra-node for task " << key.taskId
               << " (not initialized or broadcast)";
       isIntraNodeTransfer = false;
     }
+  } else {
+    VLOG(2) << "[UCX-ACCEPTOR-REMOTE] task=" << key.taskId
+            << " destination=" << key.destination << " peer=" << peerAddress
+            << " sourceWorkerId=" << handshakePtr->workerId
+            << " localWorkerId=" << communicator->getWorkerId()
+            << " sameWorker=" << sameWorker << " intraNodeEnabled="
+            << cudf_velox::CudfConfig::getInstance().intraNodeExchange;
   }
-
-  std::string peerIp = epRef->getPeerIp();
 
   auto exchangeServer =
       UcxExchangeServer::create(communicator, epRef, key, isIntraNodeTransfer);
@@ -90,7 +105,7 @@ void Acceptor::cStyleAMCallback(
   // Register exchangeServer with communicator.
   communicator->registerCommElement(exchangeServer);
   VLOG(2) << "[ACCEPTOR] new server: " << exchangeServer->toString()
-          << " peerIp=" << peerIp
+          << " peer=" << peerAddress
           << " isIntraNodeTransfer=" << isIntraNodeTransfer;
 
   // Send HandshakeResponse back to the source to inform about intra-node
@@ -103,6 +118,7 @@ void Acceptor::cStyleAMCallback(
   uint64_t responseTag = getHandshakeResponseTag(keyHash);
 
   VLOG(3) << "Sending HandshakeResponse to " << key.toString()
+          << " peer=" << peerAddress
           << " isIntraNodeTransfer=" << response->isIntraNodeTransfer
           << " tag=" << std::hex << responseTag;
 
@@ -112,13 +128,14 @@ void Acceptor::cStyleAMCallback(
       sizeof(*response),
       ucxx::Tag{responseTag},
       false,
-      [response, keyStr = key.toString()](
+      [response, keyStr = key.toString(), peerAddress](
           ucs_status_t status, std::shared_ptr<void> arg) {
         if (status == UCS_OK) {
-          VLOG(3) << "HandshakeResponse sent successfully to " << keyStr;
+          VLOG(3) << "HandshakeResponse sent successfully to " << keyStr
+                  << " peer=" << peerAddress;
         } else {
           VLOG(0) << "Failed to send HandshakeResponse to " << keyStr << ": "
-                  << ucs_status_string(status);
+                  << ucs_status_string(status) << " peer=" << peerAddress;
         }
       },
       response);

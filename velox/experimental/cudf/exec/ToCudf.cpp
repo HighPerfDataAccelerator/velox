@@ -39,8 +39,21 @@
 #include <cudf/detail/nvtx/ranges.hpp>
 
 #include <cuda.h>
+#include <cuda_runtime.h>
 
+#include <dlfcn.h>
+#include <glog/logging.h>
+
+#include <algorithm>
+#include <cctype>
+#include <cstdlib>
 #include <iostream>
+#include <mutex>
+#include <string>
+#include <typeinfo>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
 static const std::string kCudfAdapterName = "cuDF";
 DEFINE_bool(velox_cudf_enabled, true, "Enable cuDF-Velox acceleration");
@@ -59,7 +72,270 @@ bool isAnyOf(const Base* p) {
   return ((dynamic_cast<const Deriveds*>(p) != nullptr) || ...);
 }
 
+bool envFlagEnabled(const char* name) {
+  const char* value = std::getenv(name);
+  if (value == nullptr || value[0] == '\0') {
+    return false;
+  }
+  std::string normalized(value);
+  std::transform(
+      normalized.begin(),
+      normalized.end(),
+      normalized.begin(),
+      [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  return normalized != "0" && normalized != "false" && normalized != "off" &&
+      normalized != "no";
+}
+
+// Per-thread GPU operator-attribution context. The velox operators set this
+// (through ScopedGpuMemoryOperatorContext, which dlsym-resolves the extern "C"
+// setter defined at the bottom of this file), and the memory tracker reads it
+// when recording each allocation. Read the thread-local directly here to avoid
+// a reader-side dlsym (the setter still goes through dlsym so the header stays
+// usable from a standalone Velox build).
+thread_local std::string tlsGpuOperatorContext;
+
+std::string currentGpuOperatorContext() {
+  if (tlsGpuOperatorContext.empty()) {
+    return "unknown";
+  }
+  return tlsGpuOperatorContext;
+}
+
+class OutputMemoryResourceTracker final
+    : public rmm::mr::device_memory_resource {
+ public:
+  explicit OutputMemoryResourceTracker(
+      std::shared_ptr<rmm::mr::device_memory_resource> upstream,
+      std::string label)
+      : upstream_(std::move(upstream)), label_(std::move(label)) {}
+
+  void dumpDiagnostics(const std::string& prefix) {
+    struct ContextSummary {
+      std::size_t bytes{0};
+      std::size_t count{0};
+    };
+    std::vector<std::pair<std::string, ContextSummary>> summaries;
+    std::size_t activeBytes = 0;
+    std::size_t activeCount = 0;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      std::unordered_map<std::string, ContextSummary> byContext;
+      activeCount = activeAllocations_.size();
+      for (const auto& entry : activeAllocations_) {
+        activeBytes += entry.second.bytes;
+        auto& summary = byContext[entry.second.context];
+        summary.bytes += entry.second.bytes;
+        ++summary.count;
+      }
+      summaries.reserve(byContext.size());
+      for (const auto& entry : byContext) {
+        summaries.emplace_back(entry.first, entry.second);
+      }
+    }
+
+    std::sort(
+        summaries.begin(),
+        summaries.end(),
+        [](const auto& left, const auto& right) {
+          if (left.second.bytes != right.second.bytes) {
+            return left.second.bytes > right.second.bytes;
+          }
+          return left.second.count > right.second.count;
+        });
+
+    LOG(ERROR) << prefix << " " << label_
+               << " activeOutputBytes=" << activeBytes
+               << " activeOutputMiB=" << (activeBytes / 1048576.0)
+               << " activeOutputCount=" << activeCount
+               << " upstreamType=" << typeid(*upstream_).name();
+    const auto limit = std::min<std::size_t>(summaries.size(), 30);
+    for (std::size_t i = 0; i < limit; ++i) {
+      LOG(ERROR) << prefix << " " << label_ << " activeContext rank=" << i
+                 << " bytes=" << summaries[i].second.bytes
+                 << " MiB=" << (summaries[i].second.bytes / 1048576.0)
+                 << " count=" << summaries[i].second.count
+                 << " context=" << summaries[i].first;
+    }
+  }
+
+ private:
+  struct ActiveAllocation {
+    std::size_t bytes;
+    std::string context;
+  };
+
+  void* do_allocate(std::size_t bytes, rmm::cuda_stream_view stream) override {
+    try {
+      void* ptr = upstream_->allocate(stream, bytes);
+      recordAllocation(ptr, bytes);
+      return ptr;
+    } catch (const std::exception& e) {
+      dumpFailure(bytes, e.what());
+      throw;
+    } catch (...) {
+      dumpFailure(bytes, "unknown exception");
+      throw;
+    }
+  }
+
+  void do_deallocate(
+      void* ptr,
+      std::size_t bytes,
+      rmm::cuda_stream_view stream) noexcept override {
+    upstream_->deallocate(stream, ptr, bytes);
+    std::lock_guard<std::mutex> lock(mutex_);
+    activeAllocations_.erase(ptr);
+  }
+
+  bool do_is_equal(
+      rmm::mr::device_memory_resource const& other) const noexcept override {
+    if (&other == this) {
+      return true;
+    }
+    if (auto* wrapped =
+            dynamic_cast<const OutputMemoryResourceTracker*>(&other)) {
+      return upstream_->is_equal(*wrapped->upstream_);
+    }
+    return upstream_->is_equal(other);
+  }
+
+  void recordAllocation(void* ptr, std::size_t bytes) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    activeAllocations_[ptr] =
+        ActiveAllocation{bytes, currentGpuOperatorContext()};
+  }
+
+  void dumpFailure(std::size_t requestedBytes, const char* error) {
+    std::size_t freeMem = 0;
+    std::size_t totalMem = 0;
+    const auto memErr = cudaMemGetInfo(&freeMem, &totalMem);
+
+    LOG(ERROR) << label_ << " OOM requestedBytes=" << requestedBytes
+               << " requestedMiB=" << (requestedBytes / 1048576.0)
+               << " error=" << (error == nullptr ? "unknown" : error)
+               << " currentContext=" << currentGpuOperatorContext()
+               << " cudaMemGetInfoStatus="
+               << (memErr == cudaSuccess ? "ok" : cudaGetErrorString(memErr))
+               << " cudaFreeBytes=" << freeMem
+               << " cudaFreeMiB=" << (freeMem / 1048576.0)
+               << " cudaTotalBytes=" << totalMem
+               << " cudaTotalMiB=" << (totalMem / 1048576.0)
+               << " upstreamType=" << typeid(*upstream_).name();
+    dumpDiagnostics(label_ + " OOM");
+  }
+
+  std::shared_ptr<rmm::mr::device_memory_resource> upstream_;
+  std::string label_;
+  std::mutex mutex_;
+  std::unordered_map<void*, ActiveAllocation> activeAllocations_;
+};
+
+std::mutex& outputMemoryTrackerRegistryMutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+
+std::vector<std::weak_ptr<OutputMemoryResourceTracker>>&
+outputMemoryTrackerRegistry() {
+  static std::vector<std::weak_ptr<OutputMemoryResourceTracker>> trackers;
+  return trackers;
+}
+
+void registerOutputMemoryTracker(
+    const std::shared_ptr<OutputMemoryResourceTracker>& tracker) {
+  std::lock_guard<std::mutex> lock(outputMemoryTrackerRegistryMutex());
+  auto& trackers = outputMemoryTrackerRegistry();
+  trackers.erase(
+      std::remove_if(
+          trackers.begin(),
+          trackers.end(),
+          [](const auto& weak) { return weak.expired(); }),
+      trackers.end());
+  trackers.push_back(tracker);
+}
+
+void dumpRegisteredOutputMemoryTrackers(const std::string& prefix) {
+  std::vector<std::shared_ptr<OutputMemoryResourceTracker>> trackers;
+  {
+    std::lock_guard<std::mutex> lock(outputMemoryTrackerRegistryMutex());
+    auto& registry = outputMemoryTrackerRegistry();
+    for (auto it = registry.begin(); it != registry.end();) {
+      if (auto tracker = it->lock()) {
+        trackers.push_back(std::move(tracker));
+        ++it;
+      } else {
+        it = registry.erase(it);
+      }
+    }
+  }
+  if (trackers.empty()) {
+    LOG(ERROR) << prefix << " cudfMemoryResources activeTrackerCount=0";
+    return;
+  }
+  LOG(ERROR) << prefix
+             << " cudfMemoryResources activeTrackerCount=" << trackers.size();
+  for (auto& tracker : trackers) {
+    tracker->dumpDiagnostics(prefix);
+  }
+}
+
+std::shared_ptr<rmm::mr::device_memory_resource> maybeWrapSharedMemoryResource(
+    std::shared_ptr<rmm::mr::device_memory_resource> resource) {
+  if (!envFlagEnabled("GLUTEN_GPU_MEMORY_OOM_DUMP")) {
+    return resource;
+  }
+  LOG(INFO)
+      << "CudfSharedPoolMemoryResource OOM dump wrapper enabled upstreamType="
+      << typeid(*resource).name();
+  auto tracker = std::make_shared<OutputMemoryResourceTracker>(
+      std::move(resource), "CudfSharedPoolMemoryResource");
+  registerOutputMemoryTracker(tracker);
+  return tracker;
+}
+
+std::shared_ptr<rmm::mr::device_memory_resource> maybeWrapOutputMemoryResource(
+    std::shared_ptr<rmm::mr::device_memory_resource> resource) {
+  if (!envFlagEnabled("GLUTEN_GPU_MEMORY_OOM_DUMP")) {
+    return resource;
+  }
+  LOG(INFO) << "CudfOutputMemoryResource OOM dump wrapper enabled upstreamType="
+            << typeid(*resource).name();
+  auto tracker = std::make_shared<OutputMemoryResourceTracker>(
+      std::move(resource), "CudfOutputMemoryResource");
+  registerOutputMemoryTracker(tracker);
+  return tracker;
+}
+
 } // namespace
+
+extern "C" void glutenCudfDumpMemoryResources(const char* prefix) {
+  dumpRegisteredOutputMemoryTrackers(
+      prefix == nullptr ? std::string("GpuMemoryTracker")
+                        : std::string(prefix));
+}
+
+// GPU memory operator-attribution context, exported so the velox-side
+// ScopedGpuMemoryOperatorContext (which dlsym-resolves these to stay usable in
+// a standalone Velox build) can tag each allocation with its operator. Without
+// these definitions the dump reports context=unavailable/unknown. Marked
+// default-visibility so dlsym(RTLD_DEFAULT, ...) finds them inside
+// libgluten.so.
+extern "C" __attribute__((visibility("default"))) const char*
+glutenGpuMemoryTrackerCurrentOperatorContext() {
+  return tlsGpuOperatorContext.empty() ? nullptr
+                                       : tlsGpuOperatorContext.c_str();
+}
+
+extern "C" __attribute__((visibility("default"))) void
+glutenGpuMemoryTrackerSetCurrentOperatorContext(const char* context) {
+  tlsGpuOperatorContext = (context == nullptr) ? std::string() : context;
+}
+
+extern "C" __attribute__((visibility("default"))) void
+glutenGpuMemoryTrackerClearCurrentOperatorContext() {
+  tlsGpuOperatorContext.clear();
+}
 
 core::PlanNodePtr CompileState::getPlanNode(const core::PlanNodeId& id) const {
   auto& nodes = driverFactory_.planNodes;
@@ -324,16 +600,28 @@ void registerCudf() {
   const std::string mrMode = CudfConfig::getInstance().memoryResource;
   auto mr = cudf_velox::createMemoryResource(
       mrMode, CudfConfig::getInstance().memoryPercent);
+  mr = maybeWrapSharedMemoryResource(mr);
   cudf::set_current_device_resource(mr.get());
+  // rmm::device_buffer and other ref-based allocations default to
+  // rmm::mr::get_current_device_resource_ref(), which is a SEPARATE slot from
+  // the pointer-based current resource set by cudf::set_current_device_resource
+  // above. Without also setting the ref-based slot, device_buffer allocations
+  // (UCX receive buffers, operator outputs) bypass this pool and fall back to
+  // the default non-pool cuda_memory_resource, growing device memory unbounded
+  // across a sustained session until the device OOMs. Point the ref-based
+  // current resource at the same pool so all allocations share its budget.
+  cudf::set_current_device_resource_ref(mr.get());
   mr_ = mr;
 
   const auto& outputMrMode = CudfConfig::getInstance().outputMemoryResource;
   if (!outputMrMode.empty() && outputMrMode != mrMode) {
     output_mr_ = cudf_velox::createMemoryResource(
         outputMrMode, CudfConfig::getInstance().memoryPercent);
+    output_mr_ = maybeWrapSharedMemoryResource(output_mr_);
   } else {
     output_mr_ = mr_;
   }
+  output_mr_ = maybeWrapOutputMemoryResource(output_mr_);
 
   exec::Operator::registerOperator(
       std::make_unique<CudfHashJoinBridgeTranslator>());

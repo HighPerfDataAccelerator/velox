@@ -18,8 +18,10 @@
 #include <cudf/detail/nvtx/ranges.hpp>
 #include <cudf/io/types.hpp>
 #include <cudf/table/table.hpp>
+#include <fmt/format.h>
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/exec_policy.hpp>
+#include <limits>
 #include "velox/experimental/ucx-exchange/IntraNodeTransferRegistry.h"
 
 namespace facebook::velox::ucx_exchange {
@@ -46,9 +48,12 @@ void UcxOutputQueueManager::initializeTask(
           std::move(task), numDestinations, numDrivers, kind);
     } else {
       if (!it->second->initialize(task, numDestinations, numDrivers, kind)) {
-        VELOX_FAIL(
-            "Registering a cudf output queue for pre-existing taskId {}",
+        VELOX_CHECK(
+            it->second->isInitialized(),
+            "Registering a cudf output queue for pre-existing uninitialized taskId {}",
             taskId);
+        VLOG(2) << "[QUEUE-MGR] task=" << taskId
+                << " initializeTask ignored (already initialized)";
       }
     }
   });
@@ -139,10 +144,63 @@ void UcxOutputQueueManager::getData(
   outputQueue->getData(destination, notify);
 }
 
+void UcxOutputQueueManager::getData(
+    const std::string& taskId,
+    int destination,
+    uint64_t maxBytes,
+    int64_t sequence,
+    UcxDataAvailableCallbackV2 notify) {
+  std::shared_ptr<UcxOutputQueue> outputQueue;
+  bool taskRemoved = false;
+  queues_.withLock([&](auto& queues) {
+    auto it = queues.find(taskId);
+    if (it == queues.end()) {
+      if (removedTasks_.withLock(
+              [&](auto& removed) { return removed.count(taskId) > 0; })) {
+        VLOG(2) << "[QUEUE-MGR] task=" << taskId << " dest=" << destination
+                << " getData ignored (task already removed)";
+        taskRemoved = true;
+        return;
+      }
+      VLOG(2)
+          << "[QUEUE-MGR] task=" << taskId << " dest=" << destination
+          << " creating placeholder queue (server arrived before task init)";
+      outputQueue = std::make_shared<UcxOutputQueue>(nullptr, destination, 0);
+      queues[taskId] = outputQueue;
+    } else {
+      outputQueue = it->second;
+    }
+  });
+  if (taskRemoved) {
+    notify(nullptr, sequence, {});
+    return;
+  }
+  outputQueue->getData(destination, maxBytes, sequence, notify);
+}
+
 bool UcxOutputQueueManager::canUseIntraNode(const std::string& taskId) {
   auto queue = getQueueIfExists(taskId);
-  return queue && queue->isInitialized() &&
+  if (!queue) {
+    return true;
+  }
+  // Placeholder partitioned queues are safe for intra-node: the server will
+  // wait until initializeTask() upgrades the queue and data arrives. Broadcast
+  // is the unsafe case because one packed_columns may be shared by
+  // destinations.
+  return !queue->isInitialized() ||
       queue->kind() != core::PartitionedOutputNode::Kind::kBroadcast;
+}
+
+std::string UcxOutputQueueManager::describeQueueForIntraNode(
+    const std::string& taskId) {
+  auto queue = getQueueIfExists(taskId);
+  if (!queue) {
+    return "missing";
+  }
+  return fmt::format(
+      "initialized={} kind={}",
+      queue->isInitialized(),
+      core::PartitionedOutputNode::toName(queue->kind()));
 }
 
 void UcxOutputQueueManager::removeTask(const std::string& taskId) {
@@ -150,9 +208,8 @@ void UcxOutputQueueManager::removeTask(const std::string& taskId) {
       queues_.withLock([&](auto& queues) -> std::shared_ptr<UcxOutputQueue> {
         auto it = queues.find(taskId);
         if (it == queues.end()) {
-          // Already removed. Clear any stale "removed" state so the task ID
-          // can be reused.
-          removedTasks_.withLock([&](auto& removed) { removed.erase(taskId); });
+          // Already removed. Keep the tombstone so late getData() calls from
+          // stale UCX servers cannot recreate zombie placeholder queues.
           return nullptr;
         }
         auto taskQueue = it->second;

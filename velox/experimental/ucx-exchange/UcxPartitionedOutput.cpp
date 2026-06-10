@@ -15,10 +15,14 @@
  */
 #include "velox/experimental/ucx-exchange/UcxPartitionedOutput.h"
 #include <fmt/format.h>
+#include <algorithm>
+#include <cstdlib>
 #include "velox/core/PlanNode.h"
 #include "velox/core/QueryConfig.h"
 #include "velox/exec/Driver.h"
 #include "velox/exec/Operator.h"
+#include "velox/experimental/cudf/exec/GpuMemoryTrackerBridge.h"
+#include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
 #include <cudf/concatenate.hpp>
@@ -69,6 +73,19 @@ UcxPartitionedOutput::UcxPartitionedOutput(
       pipelineId_(ctx->pipelineId),
       driverId_(ctx->driverId),
       targetRowsPerChunk_(ctx->queryConfig().ucxPartitionedOutputBatchRows()) {
+  if (driverId_ == 0) {
+    const auto numDrivers = ctx->task->numOutputDrivers();
+    sharedQueueManager()->initializeTask(
+        ctx->task,
+        planNode->kind(),
+        static_cast<int>(numPartitions_),
+        numDrivers);
+    VLOG(2) << "UcxPartitionedOutput initialized queue task="
+            << ctx->task->taskId() << " destinations=" << numPartitions_
+            << " drivers=" << numDrivers
+            << " kind=" << core::PartitionedOutputNode::toName(planNode->kind())
+            << " targetRowsPerChunk=" << targetRowsPerChunk_;
+  }
   this->initPartitionKeys(planNode);
   auto sources = planNode->sources();
   std::vector<std::string> inNames, outNames;
@@ -146,6 +163,24 @@ void UcxPartitionedOutput::flushPending() {
       mergedTable = cudf::concatenate(
           views, stream, cudf::get_current_device_resource_ref());
 
+      // Order each input's stream-ordered async free AFTER this concat read on `stream`.
+      // The producer-side host-sync loop above only guarantees the read sees ready data;
+      // it does NOT order the inputs' cudaFreeAsync (issued on their own heterogeneous
+      // streams when pendingInputs_ is cleared) after the concat. Because device_buffer
+      // allocations default to the recycling pool, an unbridged free lets the pool reclaim
+      // an input block while the concat is still reading it -> silent cross-stream value
+      // corruption (row count intact) on multi-GPU MPP. Mirror the reverse bridge that
+      // getConcatenatedTable (Utilities.cpp) applies.
+      {
+        std::vector<rmm::cuda_stream_view> inputStreams;
+        inputStreams.reserve(pendingInputs_.size());
+        for (auto& v : pendingInputs_) {
+          inputStreams.push_back(v->stream());
+        }
+        CudaEvent freeAfterConcat(cudaEventDisableTiming);
+        streamsWaitForStream(freeAfterConcat, inputStreams, stream);
+      }
+
       // Free input GPU memory before partitioning (peak = 2x -> 1x).
       pendingInputs_.clear();
 
@@ -161,12 +196,13 @@ void UcxPartitionedOutput::flushPending() {
         equalPartition(tableView, stream);
       }
     } else {
+      const auto tableRows = tableView.num_rows();
       auto packedCols = cudf::pack(tableView, stream);
       stream.synchronize();
       auto packedColsPtr = std::make_unique<cudf::packed_columns>(
           std::move(packedCols.metadata), std::move(packedCols.gpu_data));
       queueManager->enqueue(
-          this->taskId(), 0, std::move(packedColsPtr), tableView.num_rows());
+          this->taskId(), 0, std::move(packedColsPtr), tableRows);
     }
 
     // Check backpressure after enqueue.
@@ -285,6 +321,18 @@ void UcxPartitionedOutput::hashPartition(
     rmm::cuda_stream_view stream) {
   VLOG(3) << "@" << taskId() << "#" << pipelineId_ << "/" << driverId_
           << " Hashing and partitioning into " << numPartitions_ << " chunks";
+  ScopedGpuMemoryOperatorContext gpuMemoryAttribution(
+      fmt::format(
+          "UcxPartitionedOutput[node={},op={},pipeline={},driver={},phase=hash_partition,rows={},columns={},numPartitions={},keys={},spec={}]",
+          planNodeId(),
+          operatorId(),
+          pipelineId_,
+          driverId_,
+          tableView.num_rows(),
+          tableView.num_columns(),
+          numPartitions_,
+          partitionKeyIndices_.size(),
+          spec_));
 
   // Use cudf hash partitioning
   std::vector<cudf::size_type> partitionKeyIndices;
@@ -328,6 +376,18 @@ void UcxPartitionedOutput::splitAndEnqueue(
     cudf::table_view tableView,
     std::vector<cudf::size_type> offsets,
     rmm::cuda_stream_view stream) {
+  ScopedGpuMemoryOperatorContext gpuMemoryAttribution(
+      fmt::format(
+          "UcxPartitionedOutput[node={},op={},pipeline={},driver={},phase=contiguous_split,rows={},columns={},numPartitions={},offsets={},spec={}]",
+          planNodeId(),
+          operatorId(),
+          pipelineId_,
+          driverId_,
+          tableView.num_rows(),
+          tableView.num_columns(),
+          numPartitions_,
+          offsets.size(),
+          spec_));
   auto contiguousTables = cudf::contiguous_split(tableView, offsets, stream);
 
   // Synchronize the stream to ensure CUDA operations complete before enqueuing.
@@ -340,8 +400,37 @@ void UcxPartitionedOutput::splitAndEnqueue(
   auto queueManager = sharedQueueManager();
   for (int i = 0; i < numPartitions_; ++i) {
     auto const& partitionTable = contiguousTables[i];
-    if (partitionTable.table.num_rows() == 0) {
+    const auto partitionRows = partitionTable.table.num_rows();
+    if (partitionRows == 0) {
       // Skip empty partitions.
+      continue;
+    }
+
+    const bool rowChunkingNeeded =
+        targetRowsPerChunk_ > 0 && partitionRows > targetRowsPerChunk_;
+    if (rowChunkingNeeded) {
+      cudf::size_type rowsPerChunk = std::min<cudf::size_type>(
+          partitionRows, static_cast<cudf::size_type>(targetRowsPerChunk_));
+      VLOG(2) << "UcxPartitionedOutput chunking task=" << taskId()
+              << " destination=" << i << " rows=" << partitionRows
+              << " rowsPerChunk=" << rowsPerChunk
+              << " targetRowsPerChunk=" << targetRowsPerChunk_;
+      for (cudf::size_type start = 0; start < partitionRows;
+           start += rowsPerChunk) {
+        const auto end =
+            std::min<cudf::size_type>(partitionRows, start + rowsPerChunk);
+        auto slicedTables = cudf::slice(partitionTable.table, {start, end});
+        VELOX_CHECK_EQ(slicedTables.size(), 1);
+        auto packedCols = cudf::pack(slicedTables[0], stream);
+        stream.synchronize();
+        auto packedColsPtr = std::make_unique<cudf::packed_columns>(
+            std::move(packedCols.metadata), std::move(packedCols.gpu_data));
+        queueManager->enqueue(
+            this->taskId(),
+            i,
+            std::move(packedColsPtr),
+            slicedTables[0].num_rows());
+      }
       continue;
     }
 

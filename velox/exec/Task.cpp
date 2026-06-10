@@ -191,6 +191,29 @@ std::string makeUuid() {
   return boost::lexical_cast<std::string>(boost::uuids::random_generator()());
 }
 
+#ifdef VELOX_ENABLE_CUDF
+bool isUcxExchangePlanNode(
+    const core::PlanNode* planNode,
+    const core::PlanNodeId& planNodeId) {
+  if (planNode == nullptr) {
+    return false;
+  }
+  if (planNode->id() == planNodeId) {
+    const auto* exchangeNode =
+        dynamic_cast<const core::ExchangeNode*>(planNode);
+    return exchangeNode != nullptr &&
+        exchangeNode->transportType() ==
+        core::ExchangeNode::TransportType::kUcx;
+  }
+  for (const auto& source : planNode->sources()) {
+    if (isUcxExchangePlanNode(source.get(), planNodeId)) {
+      return true;
+    }
+  }
+  return false;
+}
+#endif
+
 // Returns true if an operator is a hash join operator given 'operatorType'.
 bool isHashJoinOperator(const std::string& operatorType) {
   return (operatorType == OperatorType::kHashBuild) ||
@@ -2593,6 +2616,11 @@ ContinueFuture Task::terminate(TaskState terminalState) {
 
       // Process remaining remote splits.
       if (getExchangeClientLocked(nodeId) != nullptr) {
+#ifdef VELOX_ENABLE_CUDF
+        if (isUcxExchangePlanNode(planFragment_.planNode.get(), nodeId)) {
+          continue;
+        }
+#endif
         std::vector<exec::Split> splits;
         for (auto& [groupId, store] : state.groupSplitsStores) {
           if (!store) {

@@ -1235,9 +1235,7 @@ TEST_F(CudfSimpleFilterProjectTest, castDateToVarcharPreEpoch) {
 
 TEST_F(CudfSimpleFilterProjectTest, castDateToVarcharNull) {
   auto result = evaluateOnce<std::string>(
-      "cast(c0 as varchar)",
-      {DATE()},
-      std::optional<int32_t>(std::nullopt));
+      "cast(c0 as varchar)", {DATE()}, std::optional<int32_t>(std::nullopt));
   EXPECT_FALSE(result.has_value());
 }
 
@@ -1390,8 +1388,7 @@ TEST_F(CudfSimpleFilterProjectTest, dateFormatTwoDigitYear) {
 TEST_F(CudfSimpleFilterProjectTest, dateFormatNull) {
   // NULL propagation — cuDF copies bitmask from input
   auto result = evaluateOnce<std::string>(
-      "date_format(c0, '%Y%m%d')",
-      std::optional<Timestamp>(std::nullopt));
+      "date_format(c0, '%Y%m%d')", std::optional<Timestamp>(std::nullopt));
   EXPECT_FALSE(result.has_value());
 }
 
@@ -1405,7 +1402,8 @@ TEST_F(CudfSimpleFilterProjectTest, dateFormatLiteralPercent) {
 
 // End-to-end test for Query 2's date_format CASE WHEN pattern on the GPU.
 // Original query (Snowflake-to-Presto rewrite):
-//   SELECT CASE WHEN date_format(CAST(tddat AS timestamp), '%Y%m%d') = '00010101'
+//   SELECT CASE WHEN date_format(CAST(tddat AS timestamp), '%Y%m%d') =
+//   '00010101'
 //               THEN '00000000'
 //               ELSE date_format(CAST(tddat AS timestamp), '%Y%m%d')
 //          END AS tddat
@@ -1416,10 +1414,10 @@ TEST_F(CudfSimpleFilterProjectTest, dateFormatLiteralPercent) {
 // For 0001-01-01 handling, use Query 1's CAST(date AS varchar) pattern instead.
 TEST_F(CudfFilterProjectTest, dateFormatQuery2Pattern) {
   auto dates = makeNullableFlatVector<int32_t>(
-      {DATE()->toDays("2024-03-15"),  // normal date
-       DATE()->toDays("1970-01-01"),  // epoch
-       DATE()->toDays("2027-10-18"),  // far future
-       std::nullopt},                  // NULL — should propagate
+      {DATE()->toDays("2024-03-15"), // normal date
+       DATE()->toDays("1970-01-01"), // epoch
+       DATE()->toDays("2027-10-18"), // far future
+       std::nullopt}, // NULL — should propagate
       DATE());
   auto plan =
       PlanBuilder()
@@ -1434,10 +1432,10 @@ TEST_F(CudfFilterProjectTest, dateFormatQuery2Pattern) {
 
   auto expected = makeRowVector({
       makeNullableFlatVector<StringView>({
-          "20240315"_sv,  // normal date passthrough
-          "00000000"_sv,  // epoch matched → replaced
-          "20271018"_sv,  // far future passthrough
-          std::nullopt,   // NULL propagation
+          "20240315"_sv, // normal date passthrough
+          "00000000"_sv, // epoch matched → replaced
+          "20271018"_sv, // far future passthrough
+          std::nullopt, // NULL propagation
       }),
   });
   facebook::velox::test::assertEqualVectors(expected, result);
@@ -1466,30 +1464,28 @@ TEST_F(CudfFilterProjectTest, castDateToVarcharQuery1Pattern) {
   // dashes), so the comparison literal uses dashes. The original query compared
   // against '00010101' (dashless) which is a semantic mismatch.
   auto dates = makeNullableFlatVector<int32_t>(
-      {DATE()->toDays("0001-01-01"),  // SAP null date — should match
-       DATE()->toDays("2024-03-15"),  // normal date — should not match
-       DATE()->toDays("1970-01-01"),  // epoch — should not match
+      {DATE()->toDays("0001-01-01"), // SAP null date — should match
+       DATE()->toDays("2024-03-15"), // normal date — should not match
+       DATE()->toDays("1970-01-01"), // epoch — should not match
        DATE()->toDays("2027-10-18"), // far future — should not match
-       std::nullopt},                 // NULL — should propagate as NULL
+       std::nullopt}, // NULL — should propagate as NULL
       DATE());
-  auto plan =
-      PlanBuilder()
-          .values({makeRowVector({dates})})
-          .project(
-              {"CASE WHEN cast(c0 as varchar) = '0001-01-01'"
-               " THEN '00000000'"
-               " ELSE cast(c0 as varchar)"
-               " END AS result"})
-          .planNode();
+  auto plan = PlanBuilder()
+                  .values({makeRowVector({dates})})
+                  .project({"CASE WHEN cast(c0 as varchar) = '0001-01-01'"
+                            " THEN '00000000'"
+                            " ELSE cast(c0 as varchar)"
+                            " END AS result"})
+                  .planNode();
   auto result = AssertQueryBuilder(plan).copyResults(pool());
 
   auto expected = makeRowVector({
       makeNullableFlatVector<StringView>({
-          "00000000"_sv,   // 0001-01-01 matched → replaced
+          "00000000"_sv, // 0001-01-01 matched → replaced
           "2024-03-15"_sv, // normal date passthrough
           "1970-01-01"_sv, // epoch passthrough
           "2027-10-18"_sv, // far future passthrough
-          std::nullopt,    // NULL propagation
+          std::nullopt, // NULL propagation
       }),
   });
   facebook::velox::test::assertEqualVectors(expected, result);

@@ -47,11 +47,16 @@ jobs:
           PR_OWNER: ${{ github.event.pull_request.head.repo.owner.login }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           JOB_TRIGGER: ${{ github.event_name }}
+          BASE_REPO: ${{ github.repository }}
+          BASE_OWNER: ${{ github.repository_owner }}
         run: |
           echo "JOB_TRIGGER: $JOB_TRIGGER"
           if [[ "$JOB_TRIGGER" == "pull_request" ]]; then
+            # Compare against the PR's base repo/owner rather than a hardcoded
+            # upstream, so this job also works on forks whose base branch (e.g.
+            # stream) does not exist on facebookincubator/velox.
             merge_base_commit=$(gh api -q '.merge_base_commit.sha' \
-              /repos/facebookincubator/velox/compare/facebookincubator:$BASE_REF...$PR_OWNER:$HEAD_REF \
+              /repos/$BASE_REPO/compare/$BASE_OWNER:$BASE_REF...$PR_OWNER:$HEAD_REF \
             )
 
             range="$merge_base_commit..$HEAD_SHA"

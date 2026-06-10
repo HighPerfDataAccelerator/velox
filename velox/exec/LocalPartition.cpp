@@ -327,8 +327,7 @@ void LocalExchange::close() {
                << " node=" << planNodeId()
                << " pipe=" << operatorCtx_->driverCtx()->pipelineId
                << " drv=" << operatorCtx_->driverCtx()->driverId
-               << " partition=" << partition_
-               << " pullCount=" << lePullCount_
+               << " partition=" << partition_ << " pullCount=" << lePullCount_
                << " pullRows=" << lePullRows_;
   Operator::close();
   if (queue_) {

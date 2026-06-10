@@ -97,6 +97,11 @@ class UcxExchangeQueue {
       ContinuePromise* stalePromise);
 
   int32_t size() const {
+    std::lock_guard<std::mutex> l(mutex_);
+    return sizeLocked();
+  }
+
+  int32_t sizeLocked() const {
     return queue_.size();
   }
 
@@ -159,7 +164,8 @@ class UcxExchangeQueue {
   }
 
   std::vector<ContinuePromise> clearAllPromisesLocked() {
-    std::vector<ContinuePromise> promises(promises_.size());
+    std::vector<ContinuePromise> promises;
+    promises.reserve(promises_.size());
     auto it = promises_.begin();
     while (it != promises_.end()) {
       promises.push_back(std::move(it->second));
@@ -182,7 +188,7 @@ class UcxExchangeQueue {
   bool noMoreSources_{false};
   bool atEnd_{false};
 
-  std::mutex mutex_;
+  mutable std::mutex mutex_;
   std::deque<PackedTableWithStreamPtr> queue_;
   // The map from consumer id to the waiting promise
   folly::F14FastMap<int, ContinuePromise> promises_;

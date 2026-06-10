@@ -15,6 +15,8 @@
  */
 #include "velox/experimental/ucx-exchange/UcxExchangeQueue.h"
 
+#include <algorithm>
+
 namespace facebook::velox::ucx_exchange {
 
 void UcxExchangeQueue::noMoreSources() {

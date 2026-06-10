@@ -17,6 +17,7 @@
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/exec/CudfHashJoin.h"
+#include "velox/experimental/cudf/exec/GpuMemoryTrackerBridge.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
@@ -268,6 +269,22 @@ void CudfHashJoinBuild::noMoreInput() {
               << ": number of rows: " << inputs_[i]->getTableView().num_rows();
     }
   }
+
+  int64_t buildRows = 0;
+  int32_t buildColumns = 0;
+  for (const auto& input : inputs_) {
+    buildRows += input->getTableView().num_rows();
+    buildColumns = input->getTableView().num_columns();
+  }
+  ScopedGpuMemoryOperatorContext gpuMemoryAttribution(
+      fmt::format(
+          "CudfHashJoinBuild[node={},op={},pipeline={},driver={},phase=build_hash_table,rows={},columns={}]",
+          planNodeId(),
+          operatorId(),
+          operatorCtx_->driverCtx()->pipelineId,
+          operatorCtx_->driverCtx()->driverId,
+          buildRows,
+          buildColumns));
 
   auto stream = cudfGlobalStreamPool().get_stream();
   // Using output_mr here to allow spilling queued up large tables

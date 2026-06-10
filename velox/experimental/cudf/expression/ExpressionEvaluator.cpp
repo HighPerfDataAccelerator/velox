@@ -18,6 +18,7 @@
 #include "velox/experimental/cudf/expression/AstUtils.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
 
+#include "velox/common/base/BloomFilter.h"
 #include "velox/expression/ConstantExpr.h"
 #include "velox/expression/FieldReference.h"
 #include "velox/expression/FunctionSignature.h"
@@ -37,18 +38,16 @@
 #include <cudf/strings/case.hpp>
 #include <cudf/strings/combine.hpp>
 #include <cudf/strings/contains.hpp>
+#include <cudf/strings/convert/convert_datetime.hpp>
+#include <cudf/strings/convert/convert_integers.hpp>
 #include <cudf/strings/find.hpp>
 #include <cudf/strings/slice.hpp>
 #include <cudf/strings/split/split.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/transform.hpp>
-#include <cudf/strings/convert/convert_datetime.hpp>
-#include <cudf/strings/convert/convert_integers.hpp>
 #include <cudf/unary.hpp>
 
 #include <folly/hash/Hash.h>
-
-#include "velox/common/base/BloomFilter.h"
 
 namespace facebook::velox::cudf_velox {
 namespace {
@@ -71,20 +70,36 @@ static std::optional<std::string> prestoToCudfDateFormat(
     ++i;
     switch (prestoFormat[i]) {
       // Direct matches (cuDF has same specifier and meaning):
-      case 'Y': case 'y': case 'm': case 'd':
-      case 'H': case 'I': case 'S': case 'f':
+      case 'Y':
+      case 'y':
+      case 'm':
+      case 'd':
+      case 'H':
+      case 'I':
+      case 'S':
+      case 'f':
       case 'j':
         result += '%';
         result += prestoFormat[i];
         break;
       // Translations (same meaning, different specifier):
-      case 'i': result += "%M"; break; // Presto minutes -> cuDF minutes
-      case 's': result += "%S"; break; // Presto seconds (lowercase alias)
-      case 'h': result += "%I"; break; // Presto 12h hour alias
+      case 'i':
+        result += "%M";
+        break; // Presto minutes -> cuDF minutes
+      case 's':
+        result += "%S";
+        break; // Presto seconds (lowercase alias)
+      case 'h':
+        result += "%I";
+        break; // Presto 12h hour alias
       // Composite expansion:
-      case 'T': result += "%H:%M:%S"; break; // 24h time
+      case 'T':
+        result += "%H:%M:%S";
+        break; // 24h time
       // Literal percent:
-      case '%': result += "%%"; break;
+      case '%':
+        result += "%%";
+        break;
       // Unsupported — name-dependent specifiers (crash with empty names):
       // Presto %M (month name), %W (weekday name), %a, %b, %p, %r
       // Unsupported — no cuDF equivalent for unpadded variants:
@@ -247,8 +262,7 @@ class CastFunction : public CudfFunction {
     const auto& srcVeloxType = expr->inputs()[0]->type();
     const auto& dstVeloxType = expr->type();
 
-    if (srcVeloxType->isDate() &&
-        dstVeloxType->kind() == TypeKind::VARCHAR) {
+    if (srcVeloxType->isDate() && dstVeloxType->kind() == TypeKind::VARCHAR) {
       castMode_ = CastMode::kDateToString;
     } else if (
         (srcVeloxType->kind() == TypeKind::TINYINT ||
@@ -279,12 +293,13 @@ class CastFunction : public CudfFunction {
         return cudf::strings::from_timestamps(
             inputCol,
             "%Y-%m-%d",
-            cudf::strings_column_view(cudf::column_view{
-                cudf::data_type{cudf::type_id::STRING},
-                0,
-                nullptr,
-                nullptr,
-                0}),
+            cudf::strings_column_view(
+                cudf::column_view{
+                    cudf::data_type{cudf::type_id::STRING},
+                    0,
+                    nullptr,
+                    nullptr,
+                    0}),
             stream,
             mr);
       case CastMode::kIntToString:
@@ -328,12 +343,13 @@ class DateFormatFunction : public CudfFunction {
     return cudf::strings::from_timestamps(
         inputCol,
         cudfFormat_,
-        cudf::strings_column_view(cudf::column_view{
-            cudf::data_type{cudf::type_id::STRING},
-            0,
-            nullptr,
-            nullptr,
-            0}),
+        cudf::strings_column_view(
+            cudf::column_view{
+                cudf::data_type{cudf::type_id::STRING},
+                0,
+                nullptr,
+                nullptr,
+                0}),
         stream,
         mr);
   }
@@ -571,8 +587,7 @@ class SubstrFunction : public CudfFunction {
     auto startExpr = std::dynamic_pointer_cast<ConstantExpr>(expr->inputs()[1]);
     VELOX_CHECK_NOT_NULL(startExpr, "substr start must be a constant");
 
-    auto startValue =
-        readSubstringIntegerConstant(startExpr->value(), "start");
+    auto startValue = readSubstringIntegerConstant(startExpr->value(), "start");
     start_ = static_cast<cudf::size_type>(startValue);
     if (startValue >= 1) {
       // cuDF indexing starts at 0.
@@ -624,16 +639,14 @@ class SubstrFunction : public CudfFunction {
 template <int NullMode>
 class RowConstructorFunction : public CudfFunction {
  public:
-  RowConstructorFunction(
-      const std::shared_ptr<velox::exec::Expr>& /*expr*/) {}
+  RowConstructorFunction(const std::shared_ptr<velox::exec::Expr>& /*expr*/) {}
 
   ColumnOrView eval(
       std::vector<ColumnOrView>& inputColumns,
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr) const override {
     VELOX_CHECK(
-        !inputColumns.empty(),
-        "row_constructor requires at least one input");
+        !inputColumns.empty(), "row_constructor requires at least one input");
 
     auto const numRows = asView(inputColumns[0]).size();
 
@@ -641,8 +654,7 @@ class RowConstructorFunction : public CudfFunction {
     children.reserve(inputColumns.size());
     for (auto& col : inputColumns) {
       children.push_back(
-          std::make_unique<cudf::column>(
-              asView(col), stream, mr));
+          std::make_unique<cudf::column>(asView(col), stream, mr));
     }
 
     rmm::device_buffer null_mask{};
@@ -650,28 +662,24 @@ class RowConstructorFunction : public CudfFunction {
 
     if constexpr (NullMode == 1) {
       // ANY child null -> struct null
-      auto tbl_view = cudf::table_view(
-          [&]() {
-            std::vector<cudf::column_view> views;
-            for (auto& c : children)
-              views.push_back(c->view());
-            return views;
-          }());
-      auto [mask, nc] =
-          cudf::bitmask_and(tbl_view, stream, mr);
+      auto tbl_view = cudf::table_view([&]() {
+        std::vector<cudf::column_view> views;
+        for (auto& c : children)
+          views.push_back(c->view());
+        return views;
+      }());
+      auto [mask, nc] = cudf::bitmask_and(tbl_view, stream, mr);
       null_mask = std::move(mask);
       null_count = nc;
     } else if constexpr (NullMode == 2) {
       // ALL children null -> struct null
-      auto tbl_view = cudf::table_view(
-          [&]() {
-            std::vector<cudf::column_view> views;
-            for (auto& c : children)
-              views.push_back(c->view());
-            return views;
-          }());
-      auto [mask, nc] =
-          cudf::bitmask_or(tbl_view, stream, mr);
+      auto tbl_view = cudf::table_view([&]() {
+        std::vector<cudf::column_view> views;
+        for (auto& c : children)
+          views.push_back(c->view());
+        return views;
+      }());
+      auto [mask, nc] = cudf::bitmask_or(tbl_view, stream, mr);
       null_mask = std::move(mask);
       null_count = nc;
     }
@@ -686,7 +694,6 @@ class RowConstructorFunction : public CudfFunction {
         std::move(children));
   }
 };
-
 
 class CoalesceFunction : public CudfFunction {
  public:
@@ -1097,8 +1104,7 @@ class MightContainFunction : public CudfFunction {
     using velox::exec::ConstantExpr;
     VELOX_CHECK_EQ(
         expr->inputs().size(), 2, "might_contain expects exactly 2 inputs");
-    auto bloomExpr =
-        std::dynamic_pointer_cast<ConstantExpr>(expr->inputs()[0]);
+    auto bloomExpr = std::dynamic_pointer_cast<ConstantExpr>(expr->inputs()[0]);
     VELOX_CHECK_NOT_NULL(
         bloomExpr, "might_contain bloom filter must be a constant");
     auto bloomValue = bloomExpr->value();
@@ -1286,8 +1292,8 @@ std::shared_ptr<CudfFunction> createCudfFunction(
     const std::string& name,
     const std::shared_ptr<velox::exec::Expr>& expr) {
   auto& registry = getCudfFunctionRegistry();
-  auto tryLookup = [&](const std::string& key)
-      -> std::shared_ptr<CudfFunction> {
+  auto tryLookup =
+      [&](const std::string& key) -> std::shared_ptr<CudfFunction> {
     auto it = registry.find(key);
     if (it != registry.end()) {
       return it->second.factory(key, expr);
@@ -1683,7 +1689,7 @@ bool registerBuiltinFunctions(const std::string& prefix) {
   } else {
     registerPrestoFunctions(prefix);
   }
-  
+
   registerCudfFunction(
       prefix + "date_add",
       [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
@@ -1707,8 +1713,7 @@ bool registerBuiltinFunctions(const std::string& prefix) {
 
   registerCudfFunction(
       prefix + "date_format",
-      [](const std::string&,
-         const std::shared_ptr<velox::exec::Expr>& expr) {
+      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
         return std::make_shared<DateFormatFunction>(expr);
       },
       {FunctionSignatureBuilder()
@@ -1723,28 +1728,22 @@ bool registerBuiltinFunctions(const std::string& prefix) {
   // FunctionSignature. The canEvaluate check handles validation.
   registerCudfFunction(
       "row_constructor_with_null",
-      [](const std::string&,
-         const std::shared_ptr<velox::exec::Expr>& expr) {
-        return std::make_shared<
-            RowConstructorFunction<1>>(expr);
+      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<RowConstructorFunction<1>>(expr);
       },
       {});
 
   registerCudfFunction(
       "row_constructor",
-      [](const std::string&,
-         const std::shared_ptr<velox::exec::Expr>& expr) {
-        return std::make_shared<
-            RowConstructorFunction<0>>(expr);
+      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<RowConstructorFunction<0>>(expr);
       },
       {});
 
   registerCudfFunction(
       "row_constructor_with_all_null",
-      [](const std::string&,
-         const std::shared_ptr<velox::exec::Expr>& expr) {
-        return std::make_shared<
-            RowConstructorFunction<2>>(expr);
+      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<RowConstructorFunction<2>>(expr);
       },
       {});
 
@@ -1898,8 +1897,7 @@ bool FunctionExpression::canEvaluate(std::shared_ptr<velox::exec::Expr> expr) {
   // struct dynamically derived from input types, so static signature
   // matching cannot express this. The actual GPU implementation
   // (RowConstructorFunction) handles any input combination.
-  if (opName == "row_constructor_with_null" ||
-      opName == "row_constructor" ||
+  if (opName == "row_constructor_with_null" || opName == "row_constructor" ||
       opName == "row_constructor_with_all_null") {
     return true;
   }
@@ -1932,13 +1930,12 @@ bool FunctionExpression::canEvaluate(std::shared_ptr<velox::exec::Expr> expr) {
   // This ensures unsupported format specifiers fall back to CPU gracefully
   // rather than crashing in the DateFormatFunction constructor.
   if (opName == "date_format" && expr->inputs().size() == 2) {
-    auto formatExpr = std::dynamic_pointer_cast<velox::exec::ConstantExpr>(
-        expr->inputs()[1]);
+    auto formatExpr =
+        std::dynamic_pointer_cast<velox::exec::ConstantExpr>(expr->inputs()[1]);
     if (!formatExpr) {
       return false;
     }
-    return prestoToCudfDateFormat(formatExpr->value()->toString(0))
-        .has_value();
+    return prestoToCudfDateFormat(formatExpr->value()->toString(0)).has_value();
   }
   return true;
 }

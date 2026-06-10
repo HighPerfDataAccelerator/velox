@@ -101,6 +101,15 @@ class UcxExchangeSource
   static constexpr int32_t kBackpressureHighWaterMark = 32;
   static constexpr int32_t kBackpressureLowWaterMark = 16;
 
+  // Aggregate in-flight RECEIVE byte cap (in addition to the count caps above).
+  // Receive buffers are allocated off the operator memory pool (raw cudaMalloc
+  // via a process-global resource), so without a byte bound the per-peer
+  // in-flight buffers (one UcxExchangeSource per producer peer) scale
+  // O(#peers) and collectively exhaust the GPU at 4 peers (OOM at
+  // concurrentGpuTasks=2, deadlock at =1). Read once; env-overridable via
+  // GLUTEN_UCX_MAX_INFLIGHT_RECV_BYTES (default 8 GiB).
+  static int64_t maxInFlightRecvBytes();
+
   // Returns runtime statistics. ExchangeSource is expected to report
   // background CPU time by including a runtime metric named
   // ExchangeClient::kBackgroundCpuTimeMs.

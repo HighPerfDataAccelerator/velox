@@ -16,6 +16,7 @@
 #include "velox/experimental/ucx-exchange/UcxExchangeServer.h"
 #include <glog/logging.h>
 #include <rmm/cuda_stream_view.hpp>
+#include <limits>
 #include "cuda_runtime.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/ucx-exchange/Communicator.h"
@@ -89,8 +90,15 @@ void UcxExchangeServer::process() {
       setState(ServerState::ReadyToTransfer);
       communicator_->addToWorkQueue(getSelfPtr());
       break;
-    case ServerState::ReadyToTransfer: {
-      // Fetch the data from UcxQueueManager and store it in the dataPtr_;
+    case ServerState::ReadyToTransfer:
+      // Count-only / rendezvous push (Presto-style): no consumer credit
+      // request. Go straight to dequeue + send; the data tagSend blocks at
+      // rendezvous until the source posts its matching tagRecv
+      // (getMetadata/getData), which is the sole flow-control mechanism.
+      setState(ServerState::DataRequestReady);
+      communicator_->addToWorkQueue(getSelfPtr());
+      break;
+    case ServerState::DataRequestReady:
       setState(ServerState::WaitingForDataFromQueue);
       // Register the callback with the destination queue to get data.
       // If the queue doesn't exist yet, getData will create an empty
@@ -98,40 +106,48 @@ void UcxExchangeServer::process() {
       // source task has initialized the queue and added data to it.
       // Use weak_ptr to prevent use-after-free if close() is called during
       // callback
-      std::weak_ptr<UcxExchangeServer> weakQueue = weak_from_this();
-      queueMgr_->getData(
-          partitionKey_.taskId,
-          partitionKey_.destination,
-          [weakQueue](
-              std::shared_ptr<cudf::packed_columns> data,
-              std::vector<int64_t> remainingBytes) {
-            auto self = weakQueue.lock();
-            if (!self) {
-              return; // Object was destroyed, safe to ignore
-            }
-            // Check if close() was called - avoid processing if we're shutting
-            // down
-            if (self->closed_.load(std::memory_order_acquire)) {
+      {
+        std::weak_ptr<UcxExchangeServer> weakQueue = weak_from_this();
+        queueMgr_->getData(
+            partitionKey_.taskId,
+            partitionKey_.destination,
+            // Unbounded per-fetch cap; rendezvous + queue-occupancy
+            // backpressure are the flow control (no byte-credit).
+            std::numeric_limits<uint64_t>::max(),
+            static_cast<int64_t>(sequenceNumber_),
+            [weakQueue](
+                std::shared_ptr<cudf::packed_columns> data,
+                int64_t sequence,
+                std::vector<int64_t> remainingBytes) {
+              auto self = weakQueue.lock();
+              if (!self) {
+                return; // Object was destroyed, safe to ignore
+              }
+              // Check if close() was called - avoid processing if we're
+              // shutting down
+              if (self->closed_.load(std::memory_order_acquire)) {
+                VLOG(3) << "@" << self->partitionKey_.taskId
+                        << " getData callback called after close, ignoring";
+                return;
+              }
+              // This upcall may be called from another thread than the
+              // communicator thread. It is called
+              // when data on the queue becomes available.
               VLOG(3) << "@" << self->partitionKey_.taskId
-                      << " getData callback called after close, ignoring";
-              return;
-            }
-            // This upcall may be called from another thread than the
-            // communicator thread. It is called
-            // when data on the queue becomes available.
-            VLOG(3) << "@" << self->partitionKey_.taskId
-                    << " Found data for client: "
-                    << self->partitionKey_.toString();
-            std::lock_guard<std::recursive_mutex> lock(self->dataMutex_);
-            VELOX_CHECK(
-                self->dataPtr_ == nullptr,
-                "Data pointer exists: Illegal state!");
-            self->dataPtr_ = std::move(data);
-            self->setState(ServerState::DataReady);
-            self->communicator_->addToWorkQueue(self);
-          });
+                      << " Found data for client: "
+                      << self->partitionKey_.toString()
+                      << " sequence=" << sequence;
+              std::lock_guard<std::recursive_mutex> lock(self->dataMutex_);
+              VELOX_CHECK(
+                  self->dataPtr_ == nullptr,
+                  "Data pointer exists: Illegal state!");
+              self->dataPtr_ = std::move(data);
+              self->setState(ServerState::DataReady);
+              self->communicator_->addToWorkQueue(self);
+            });
+      }
       this->communicator_->addToWorkQueue(getSelfPtr());
-    } break;
+      break;
     case ServerState::WaitingForDataFromQueue:
       // Waiting for data is handled by an upcall from the data queue. Nothing
       // to do
@@ -184,8 +200,17 @@ void UcxExchangeServer::close() {
           expected, desired, std::memory_order_acq_rel)) {
     return; // already closed.
   }
-  VLOG(3) << "@" << partitionKey_.taskId
-          << " Close UcxExchangeServer to remote " << partitionKey_.toString();
+  VLOG(2) << "[UCX-SERVER-CLOSE] task=" << partitionKey_.taskId
+          << " key=" << partitionKey_.toString() << " peer="
+          << (endpointRef_ ? endpointRef_->getPeerAddress() : "(unknown)")
+          << " state=" << getStateAsString() << " seq=" << sequenceNumber_
+          << " hasMetaRequest=" << (metaRequest_ != nullptr)
+          << " hasDataRequest=" << (dataRequest_ != nullptr)
+          << " hasDataPtr=" << (dataPtr_ != nullptr);
+
+  if (queueMgr_) {
+    queueMgr_->deleteResults(partitionKey_.taskId, partitionKey_.destination);
+  }
 
   // Cancel any outstanding requests. With weak_ptr callbacks, the callbacks
   // will safely no-op if we're destroyed before they complete.
@@ -351,9 +376,11 @@ void UcxExchangeServer::sendData() {
                     << " metadata successfully sent to " << tid
                     << " with tag: " << std::hex << metadataTag;
           } else {
-            VLOG(0) << "@" << self->partitionKey_.taskId
-                    << " Error in sendData, send metadata "
-                    << ucs_status_string(status) << " failed for task: " << tid;
+            VLOG(0) << "[UCX-SERVER-METADATA-SEND-ERROR] task="
+                    << self->partitionKey_.taskId << " key=" << tid
+                    << " seq=" << self->sequenceNumber_ << " tag=" << std::hex
+                    << metadataTag << std::dec
+                    << " status=" << ucs_status_string(status);
             self->setState(ServerState::Done);
             self->communicator_->addToWorkQueue(self);
           }
@@ -425,8 +452,10 @@ void UcxExchangeServer::sendComplete(
     std::shared_ptr<void> arg) {
   // Check if close() was called - avoid processing if we're shutting down
   if (closed_.load(std::memory_order_acquire)) {
-    VLOG(3) << "@" << partitionKey_.taskId
-            << " sendComplete called after close, ignoring";
+    VLOG(2) << "[UCX-SERVER-SEND-COMPLETE-AFTER-CLOSE] task="
+            << partitionKey_.taskId << " key=" << partitionKey_.toString()
+            << " seq=" << sequenceNumber_
+            << " status=" << ucs_status_string(status);
     return;
   }
   if (status == UCS_OK) {
@@ -452,9 +481,9 @@ void UcxExchangeServer::sendComplete(
             << " Releasing dataPtr_ in sendComplete.";
     setState(ServerState::ReadyToTransfer);
   } else {
-    VLOG(3) << "@" << partitionKey_.taskId
-            << " Error in sendComplete, send complete "
-            << ucs_status_string(status);
+    VLOG(0) << "[UCX-SERVER-DATA-SEND-ERROR] task=" << partitionKey_.taskId
+            << " key=" << partitionKey_.toString() << " seq=" << sequenceNumber_
+            << " bytes=" << bytes_ << " status=" << ucs_status_string(status);
     setState(ServerState::Done);
   }
   communicator_->addToWorkQueue(getSelfPtr());

@@ -66,6 +66,7 @@ class UcxExchangeServer
   enum class ServerState : uint32_t {
     Created,
     ReadyToTransfer,
+    DataRequestReady,
     WaitingForDataFromQueue,
     DataReady,
     WaitingForSendComplete,
@@ -107,6 +108,7 @@ class UcxExchangeServer
     const std::string stateMap[] = {
         "Created",
         "ReadyToTransfer",
+        "DataRequestReady",
         "WaitingForDataFromQueue",
         "DataReady",
         "WaitingForSendComplete",

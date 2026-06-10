@@ -252,19 +252,36 @@ void CudfLocalPartition::addInput(RowVectorPtr input) {
     // table each time. Currently out of scope because it would need a new
     // type of RowVector that can hold a table view and shared_ptr to the
     // table.
+    // Materialize each non-empty partition (copied on `stream`) first, then
+    // drain `stream` before publishing any of them to the shared exchange
+    // queue. A consuming driver dequeues these vectors and reads them on a
+    // different round-robin pool stream without waiting on `stream`; with the
+    // stream-ordered async MR that consumer (or an allocation recycle) would
+    // otherwise race the still-pending hash_partition/split/copy and read
+    // dropped or garbage rows (seen as Q17 ~29% low) or hit
+    // cudaErrorIllegalAddress. Mirrors the explicit drain in CudfHashJoin's
+    // build/probe handoff.
+    std::vector<std::pair<int, std::shared_ptr<CudfVector>>> readyPartitions;
+    readyPartitions.reserve(numPartitions_);
     for (int i = 0; i < numPartitions_; ++i) {
       auto partitionData = partitionedTables[i];
       if (partitionData.num_rows() == 0) {
         continue;
       }
 
-      auto partitionCudfVector = std::make_shared<CudfVector>(
-          pool(),
-          outputType_,
-          partitionData.num_rows(),
-          std::make_unique<cudf::table>(partitionData, stream, get_output_mr()),
-          stream);
-      enqueuePartition(i, partitionCudfVector);
+      readyPartitions.emplace_back(
+          i,
+          std::make_shared<CudfVector>(
+              pool(),
+              outputType_,
+              partitionData.num_rows(),
+              std::make_unique<cudf::table>(
+                  partitionData, stream, get_output_mr()),
+              stream));
+    }
+    stream.synchronize();
+    for (auto& [partitionIndex, partitionCudfVector] : readyPartitions) {
+      enqueuePartition(partitionIndex, partitionCudfVector);
     }
   } else {
     // Single partition case. Use estimateFlatSize() for CudfVector since

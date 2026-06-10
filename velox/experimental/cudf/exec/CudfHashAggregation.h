@@ -142,11 +142,10 @@ class CudfHashAggregation : public exec::Operator, public NvtxHelper {
   const bool isDistinct_;
   // Single means it's a single step aggregation (partial + final combined).
   const bool isSingleStep_;
-  // Streaming aggregation is enabled when (a) the aggregate is grouped (not
-  // global) AND (b) either no companion aggregates are present OR the step
-  // is kPartial with all-`_partial` companions (the latter carve-out lets
-  // Spark MPP partial-stage groupbys stream; see CudfHashAggregation::initialize
-  // for the gating logic and the canStreamPartialCompanions flag).
+  // Streaming aggregation is enabled for grouped aggregation when companion
+  // functions can be evaluated as state-preserving partial/intermediate merges
+  // or final extraction. Unsupported companion mixes fall back to the
+  // concatenate-at-output path.
   bool streamingEnabled_{true};
 
   // Maximum memory usage for partial aggregation.

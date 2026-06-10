@@ -52,9 +52,16 @@ namespace {
       makeCudaMr(), rmm::percent_of_free_device_memory(percent));
 }
 
-/// \brief Makes an async resource
-[[nodiscard]] auto makeAsyncMr() {
-  return std::make_shared<rmm::mr::cuda_async_memory_resource>();
+/// \brief Makes an async resource with a bounded release threshold.
+/// The default cuda_async_memory_resource keeps ALL freed blocks reserved
+/// (release_threshold unbounded), so at higher driver concurrency the cached
+/// pool hoards the whole device and the next allocation OOMs (observed at
+/// drivers=2: "Maximum pool size exceeded"). Cap the reserved/cached memory at
+/// `percent`% of free GPU so freed blocks are released back to the driver,
+/// leaving headroom for off-pool allocations (e.g. UCX recv buffers).
+[[nodiscard]] auto makeAsyncMr(int percent) {
+  return std::make_shared<rmm::mr::cuda_async_memory_resource>(
+      std::nullopt, rmm::percent_of_free_device_memory(percent));
 }
 
 /// \brief Makes a managed resource
@@ -112,7 +119,7 @@ std::shared_ptr<rmm::mr::device_memory_resource> createMemoryResource(
   if (mode == "pool")
     return makePoolMr(percent);
   if (mode == "async")
-    return makeAsyncMr();
+    return makeAsyncMr(percent);
   if (mode == "arena")
     return makeArenaMr(percent);
   if (mode == "managed")

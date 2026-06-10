@@ -16,6 +16,8 @@
 #include "velox/experimental/ucx-exchange/UcxQueues.h"
 
 #include <atomic>
+#include <limits>
+#include <sstream>
 
 namespace facebook::velox::ucx_exchange {
 
@@ -69,9 +71,43 @@ void UcxDestinationQueue::enqueueFront(
 
 UcxDestinationQueue::Data UcxDestinationQueue::getData(
     UcxDataAvailableCallback notify) {
+  return getData(
+      std::numeric_limits<uint64_t>::max(),
+      sequence_,
+      [notify = std::move(notify)](
+          std::shared_ptr<cudf::packed_columns> data,
+          int64_t /*sequence*/,
+          std::vector<int64_t> remainingBytes) mutable {
+        if (notify) {
+          notify(std::move(data), std::move(remainingBytes));
+        }
+      });
+}
+
+UcxDestinationQueue::Data UcxDestinationQueue::getData(
+    uint64_t maxBytes,
+    int64_t sequence,
+    UcxDataAvailableCallbackV2 notify) {
+  VELOX_CHECK_GE(
+      sequence, sequence_, "Get received for an already acknowledged item");
+  VELOX_CHECK(
+      notify_ == nullptr && notifyV2_ == nullptr,
+      "UcxDestinationQueue already has a pending data notification");
+  if (sequence > sequence_) {
+    // Minimal V2 implementation only supports in-order requests. The full
+    // Presto-style ack path can skip prefixes later; for now, install the
+    // notify and wait for the requested sequence to become available.
+    notifyV2_ = std::move(notify);
+    notifySequence_ = sequence;
+    notifyMaxBytes_ = maxBytes;
+    return {};
+  }
+
   if (queue_.empty()) {
     // delay notification.
-    notify_ = std::move(notify);
+    notifyV2_ = std::move(notify);
+    notifySequence_ = sequence;
+    notifyMaxBytes_ = maxBytes;
     return {};
   }
 
@@ -79,6 +115,8 @@ UcxDestinationQueue::Data UcxDestinationQueue::getData(
   auto data = std::move(queue_.front());
   queue_.pop_front();
   stats_.recordDequeue(data.get());
+  const auto resultSequence = sequence_;
+  ++sequence_;
 
   std::vector<int64_t> remainingBytes;
   remainingBytes.reserve(queue_.size());
@@ -90,10 +128,10 @@ UcxDestinationQueue::Data UcxDestinationQueue::getData(
     }
     remainingBytes.push_back(queue_[i]->gpu_data->size());
   }
-  return {std::move(data), std::move(remainingBytes), true};
+  return {std::move(data), resultSequence, std::move(remainingBytes), true};
 }
 
-void UcxDestinationQueue::deleteResults() {
+UcxDataAvailable UcxDestinationQueue::deleteResults() {
   for (auto i = 0; i < queue_.size(); ++i) {
     if (queue_[i] == nullptr) {
       VELOX_CHECK_EQ(i, queue_.size() - 1, "null marker found in the middle");
@@ -101,27 +139,56 @@ void UcxDestinationQueue::deleteResults() {
     }
   }
   queue_.clear();
+
+  UcxDataAvailable result;
+  result.callback = std::move(notify_);
+  result.callbackV2 = std::move(notifyV2_);
+  result.sequence = notifySequence_;
+  clearNotify();
+  return result;
 }
 
 UcxDataAvailable UcxDestinationQueue::getAndClearNotify() {
-  if (notify_ == nullptr) {
+  if (notify_ == nullptr && notifyV2_ == nullptr) {
     return UcxDataAvailable();
   }
+  auto savedV1 = std::move(notify_);
+  auto savedV2 = std::move(notifyV2_);
+  const auto savedSequence = notifySequence_;
+  const auto savedMaxBytes = notifyMaxBytes_;
+  clearNotify();
+
+  auto data = getData(
+      savedMaxBytes == 0 ? std::numeric_limits<uint64_t>::max() : savedMaxBytes,
+      savedSequence,
+      nullptr);
+  if (!data.immediate) {
+    notify_ = std::move(savedV1);
+    notifyV2_ = std::move(savedV2);
+    notifySequence_ = savedSequence;
+    notifyMaxBytes_ = savedMaxBytes;
+    return UcxDataAvailable();
+  }
+
   UcxDataAvailable result;
-  result.callback = notify_;
-  auto data = getData(nullptr);
+  result.callback = std::move(savedV1);
+  result.callbackV2 = std::move(savedV2);
+  result.sequence = data.sequence;
   result.data = std::move(data.data);
   result.remainingBytes = std::move(data.remainingBytes);
-  clearNotify();
   return result;
 }
 
 void UcxDestinationQueue::clearNotify() {
   notify_ = nullptr;
+  notifyV2_ = nullptr;
+  notifySequence_ = 0;
+  notifyMaxBytes_ = 0;
 }
 
 void UcxDestinationQueue::finish() {
   VELOX_CHECK_NULL(notify_, "notify must be cleared before finish");
+  VELOX_CHECK_NULL(notifyV2_, "V2 notify must be cleared before finish");
   VELOX_CHECK(queue_.empty(), "data must be fetched before finish");
 }
 
@@ -132,6 +199,8 @@ UcxDestinationQueue::Stats UcxDestinationQueue::stats() const {
 std::string UcxDestinationQueue::toString() {
   std::stringstream out;
   out << "[available: " << queue_.size() << ", "
+      << "sequence: " << sequence_ << ", "
+      << (notifyV2_ ? "notifyV2 registered, " : "")
       << (notify_ ? "notify registered, " : "") << this << "]";
   return out.str();
 }
@@ -312,7 +381,7 @@ void UcxOutputQueue::getData(int destination, UcxDataAvailableCallback notify) {
         updateStatsWithFreedLocked(data.data->gpu_data->size(), 1L, promises);
       }
     } else {
-      data = UcxDestinationQueue::Data{nullptr, {}, true};
+      data = UcxDestinationQueue::Data{nullptr, 0, {}, true};
     }
   }
   // outside lock: If we have data, then return it immediately.
@@ -324,6 +393,63 @@ void UcxOutputQueue::getData(int destination, UcxDataAvailableCallback notify) {
             << " server waiting for data (callback installed)";
   }
   // wake up any producers that are waiting for queue to become less full.
+  for (auto& promise : promises) {
+    promise.setValue();
+  }
+}
+
+void UcxOutputQueue::getData(
+    int destination,
+    uint64_t maxBytes,
+    int64_t sequence,
+    UcxDataAvailableCallbackV2 notify) {
+  UcxDestinationQueue::Data data;
+  std::vector<ContinuePromise> promises;
+  {
+    std::lock_guard<std::mutex> l(mutex_);
+    for (int i = queues_.size(); i <= destination; ++i) {
+      queues_.emplace_back(std::make_unique<UcxDestinationQueue>());
+    }
+    auto* queue = queues_[destination].get();
+    if (queue) {
+      std::weak_ptr<UcxOutputQueue> weakSelf = shared_from_this();
+      data = queue->getData(
+          maxBytes,
+          sequence,
+          [notify, weakSelf](
+              std::shared_ptr<cudf::packed_columns> data,
+              int64_t sequence,
+              std::vector<int64_t> remainingBytes) {
+            std::vector<ContinuePromise> promises;
+            int64_t bytes = data ? data->gpu_data->size() : -1L;
+            notify(std::move(data), sequence, std::move(remainingBytes));
+            if (bytes >= 0L) {
+              auto self = weakSelf.lock();
+              if (!self) {
+                return;
+              }
+              std::lock_guard<std::mutex> l(self->mutex_);
+              self->updateStatsWithFreedLocked(bytes, 1L, promises);
+            }
+            for (auto& promise : promises) {
+              promise.setValue();
+            }
+          });
+      if (data.data) {
+        updateStatsWithFreedLocked(data.data->gpu_data->size(), 1L, promises);
+      }
+    } else {
+      data = UcxDestinationQueue::Data{nullptr, sequence, {}, true};
+    }
+  }
+  if (data.immediate) {
+    notify(std::move(data.data), data.sequence, std::move(data.remainingBytes));
+  } else {
+    VLOG(2) << "[QUEUE] task=" << (task_ ? task_->taskId() : "n/a")
+            << " dest=" << destination
+            << " server waiting for V2 data (callback installed)"
+            << " sequence=" << sequence << " maxBytes=" << maxBytes;
+  }
   for (auto& promise : promises) {
     promise.setValue();
   }
@@ -499,13 +625,16 @@ void UcxOutputQueue::deleteResults(int destination) {
     // remember destination queue fill stats
     int64_t bytes = queue->stats().bytesQueued;
     int64_t packedCols = queue->stats().packedColumnsQueued;
-    queue->deleteResults();
-    dataAvailable = queue->getAndClearNotify();
+    dataAvailable = queue->deleteResults();
     queue->finish();
     queues_[destination] = nullptr;
     isFinished = isFinishedLocked();
     // update UcxOutputQueue stats
-    updateStatsWithFreedLocked(bytes, packedCols, promises);
+    if (bytes > 0 || packedCols > 0) {
+      updateStatsWithFreedLocked(bytes, packedCols, promises);
+    } else {
+      promises = std::move(promises_);
+    }
   }
 
   // Outside of mutex.

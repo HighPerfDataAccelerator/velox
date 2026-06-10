@@ -18,6 +18,7 @@
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/exec/CudfFilterProject.h"
 #include "velox/experimental/cudf/exec/CudfHashAggregation.h"
+#include "velox/experimental/cudf/exec/GpuMemoryTrackerBridge.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
@@ -40,6 +41,8 @@
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/unary.hpp>
 #include <cudf/utilities/error.hpp>
+
+#include <fmt/format.h>
 
 #include <vector>
 
@@ -265,6 +268,12 @@ struct MeanAggregator : cudf_velox::CudfHashAggregation::Aggregator {
   std::unique_ptr<cudf::column> makeOutputColumn(
       std::vector<cudf::groupby::aggregation_result>& results,
       rmm::cuda_stream_view stream) override {
+    VELOX_CHECK(
+        resultType->isRow() || step == core::AggregationNode::Step::kSingle ||
+            step == core::AggregationNode::Step::kFinal,
+        "Mean {} aggregation expects row(sum, count) intermediate type, got {}",
+        core::AggregationNode::toName(step),
+        resultType->toString());
     const auto& outputType = asRowType(resultType);
     switch (step) {
       case core::AggregationNode::Step::kSingle:
@@ -793,7 +802,11 @@ TypePtr companionAwareIntermediateType(
         1,
         "Companion aggregate must have exactly one input type: {}",
         kind);
-    return aggregate.rawInputTypes[0];
+    if (aggregate.rawInputTypes[0]->isRow()) {
+      return aggregate.rawInputTypes[0];
+    }
+    return exec::resolveIntermediateType(
+        getOriginalName(kind), aggregate.rawInputTypes);
   }
   return exec::resolveIntermediateType(
       getOriginalName(kind), aggregate.rawInputTypes);
@@ -802,7 +815,7 @@ TypePtr companionAwareIntermediateType(
 bool hasFinalAggs(
     std::vector<core::AggregationNode::Aggregate> const& aggregates) {
   return std::any_of(aggregates.begin(), aggregates.end(), [](auto const& agg) {
-    return agg.call->name().ends_with("_merge_extract");
+    return agg.call->name().find("_merge_extract") != std::string::npos;
   });
 }
 
@@ -824,6 +837,35 @@ bool hasNonPartialCompanionAggregates(
     const auto& name = agg.call->name();
     return isCompanionAggregateName(name) && !name.ends_with("_partial");
   });
+}
+
+bool canStreamCompanionAggregate(
+    std::string const& name,
+    core::AggregationNode::Step step) {
+  if (!isCompanionAggregateName(name)) {
+    return true;
+  }
+  switch (step) {
+    case core::AggregationNode::Step::kPartial:
+      return name.ends_with("_partial");
+    case core::AggregationNode::Step::kIntermediate:
+      return true;
+    case core::AggregationNode::Step::kFinal:
+      return name.ends_with("_merge") ||
+          name.find("_merge_extract") != std::string::npos;
+    case core::AggregationNode::Step::kSingle:
+      return name.find("_merge_extract") != std::string::npos;
+  }
+  return false;
+}
+
+bool canStreamCompanionAggregates(
+    std::vector<core::AggregationNode::Aggregate> const& aggregates,
+    core::AggregationNode::Step step) {
+  return std::all_of(
+      aggregates.begin(), aggregates.end(), [step](auto const& agg) {
+        return canStreamCompanionAggregate(agg.call->name(), step);
+      });
 }
 
 struct AggregationInputChannels {
@@ -1004,8 +1046,10 @@ void CudfHashAggregation::initialize() {
       aggregationNode_->step() == core::AggregationNode::Step::kPartial &&
       hasCompanions &&
       !hasNonPartialCompanionAggregates(aggregationNode_->aggregates());
-  streamingEnabled_ =
-      (!hasCompanions || canStreamPartialCompanions) && !isGlobal_;
+  const bool canStreamCompanions = !hasCompanions ||
+      canStreamCompanionAggregates(
+          aggregationNode_->aggregates(), aggregationNode_->step());
+  streamingEnabled_ = canStreamCompanions && !isGlobal_;
 
   // Make aggregators for intermediate step when streaming is enabled.
   // Distinct does not need any aggregators.
@@ -1124,6 +1168,17 @@ void CudfHashAggregation::computePartialGroupbyStreaming(CudfVectorPtr tbl) {
     auto concatenatedTable =
         cudf::concatenate(tablesToConcat, partialOutputStream, get_output_mr());
 
+    // Order the input batch's deallocation after the concatenate read. The
+    // concat reads groupbyOnInput (produced on inputTableStream) on
+    // partialOutputStream; without making inputTableStream wait for the concat,
+    // its stream-ordered async free can let cudaMallocAsync recycle the block
+    // while the concat is still reading it (cudaErrorIllegalAddress).
+    CudaEvent concatEvent(cudaEventDisableTiming);
+    streamsWaitForStream(
+        concatEvent,
+        std::vector<rmm::cuda_stream_view>{inputTableStream},
+        partialOutputStream);
+
     // Now we have to groupby again but this time with intermediate aggregators.
     // Keep concatenatedTable alive while we use its view.
     auto compactedOutput = doGroupByAggregation(
@@ -1152,8 +1207,8 @@ void CudfHashAggregation::computePartialGroupbyStreaming(CudfVectorPtr tbl) {
         // sticky), but kept at LOG(INFO) so the transition is visible in
         // production logs -- it's a one-shot state-change event, not noise.
         LOG(INFO) << "STREAM_PARTIAL[" << planNodeId()
-                  << "] partial bypass mode triggered: ratio="
-                  << ratio << " buf_rows=" << bufRows
+                  << "] partial bypass mode triggered: ratio=" << ratio
+                  << " buf_rows=" << bufRows
                   << " cum_input=" << partialCumulativeInputRows_;
         partialBypassMode_ = true;
       }
@@ -1188,6 +1243,17 @@ void CudfHashAggregation::computePartialDistinctStreaming(CudfVectorPtr tbl) {
 
     auto concatenatedTable =
         cudf::concatenate(tablesToConcat, partialOutputStream, get_output_mr());
+
+    // Order the input batch's deallocation after the concatenate read. The
+    // concat reads tbl (produced on inputTableStream) on partialOutputStream;
+    // without making inputTableStream wait for the concat, its stream-ordered
+    // async free can let cudaMallocAsync recycle the block while the concat is
+    // still reading it (cudaErrorIllegalAddress).
+    CudaEvent concatEvent(cudaEventDisableTiming);
+    streamsWaitForStream(
+        concatEvent,
+        std::vector<rmm::cuda_stream_view>{inputTableStream},
+        partialOutputStream);
 
     // Do a distinct on the concatenated results.
     // Keep concatenatedTable alive while we use its view.
@@ -1234,6 +1300,18 @@ void CudfHashAggregation::computeFinalGroupbyStreaming(CudfVectorPtr tbl) {
 
   auto concatenatedTable =
       cudf::concatenate(tablesToConcat, finalStream, get_temp_mr());
+
+  // Order the input batch's deallocation after the concatenate read. The concat
+  // reads tbl (produced on inputTableStream) on finalStream; without making
+  // inputTableStream wait for the concat, its stream-ordered async free can let
+  // cudaMallocAsync recycle the block while the concat is still reading it
+  // (cudaErrorIllegalAddress).
+  CudaEvent concatEvent(cudaEventDisableTiming);
+  streamsWaitForStream(
+      concatEvent,
+      std::vector<rmm::cuda_stream_view>{inputTableStream},
+      finalStream);
+
   auto compactedOutput = doGroupByAggregation(
       concatenatedTable->view(),
       groupingKeyOutputChannels_,
@@ -1267,6 +1345,17 @@ void CudfHashAggregation::computeSingleGroupbyStreaming(CudfVectorPtr tbl) {
 
     auto concatenatedTable =
         cudf::concatenate(tablesToConcat, partialOutputStream, get_temp_mr());
+
+    // Order the input batch's deallocation after the concatenate read. The
+    // concat reads groupbyOnInput (produced on inputTableStream) on
+    // partialOutputStream; without making inputTableStream wait for the concat,
+    // its stream-ordered async free can let cudaMallocAsync recycle the block
+    // while the concat is still reading it (cudaErrorIllegalAddress).
+    CudaEvent concatEvent(cudaEventDisableTiming);
+    streamsWaitForStream(
+        concatEvent,
+        std::vector<rmm::cuda_stream_view>{inputTableStream},
+        partialOutputStream);
 
     auto compactedOutput = doGroupByAggregation(
         concatenatedTable->view(),
@@ -1321,6 +1410,20 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
     std::vector<std::unique_ptr<Aggregator>>& aggregators,
     TypePtr const& outputType,
     rmm::cuda_stream_view stream) {
+  ScopedGpuMemoryOperatorContext gpuMemoryAttribution(
+      fmt::format(
+          "CudfAggregation[node={},op={},pipeline={},driver={},phase=groupby,rows={},columns={},groupKeys={},aggs={},global={},distinct={},streaming={}]",
+          planNodeId(),
+          operatorId(),
+          operatorCtx_->driverCtx()->pipelineId,
+          operatorCtx_->driverCtx()->driverId,
+          tableView.num_rows(),
+          tableView.num_columns(),
+          groupByKeys.size(),
+          aggregators.size(),
+          isGlobal_,
+          isDistinct_,
+          streamingEnabled_));
   auto groupbyKeyView =
       tableView.select(groupByKeys.begin(), groupByKeys.end());
 
