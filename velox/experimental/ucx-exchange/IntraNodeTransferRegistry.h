@@ -18,6 +18,7 @@
 #include <cudf/contiguous_split.hpp>
 #include <rmm/cuda_stream_view.hpp>
 #include <condition_variable>
+#include <functional>
 #include <future>
 #include <map>
 #include <memory>
@@ -25,6 +26,7 @@
 #include <optional>
 #include <string>
 #include <unordered_set>
+#include <vector>
 
 namespace facebook::velox::ucx_exchange {
 
@@ -64,6 +66,11 @@ struct IntraNodeTransferEntry {
   std::condition_variable dataAvailable; // Source waits on this for data
   std::mutex entryMutex;
   bool ready{false}; // True when data is ready to retrieve
+  // One-shot wakeups for sources that registered via registerWaiter() before
+  // the data was ready, so a same-process consumer can stay dormant instead of
+  // busy-polling the single-threaded Communicator work queue. Fired and cleared
+  // by publish()/cancelTask(). Guarded by entryMutex.
+  std::vector<std::function<void()>> wakeCallbacks;
 };
 
 /// @brief Singleton registry for intra-node data transfers.
@@ -106,6 +113,20 @@ class IntraNodeTransferRegistry {
   ///         Data is nullptr when atEnd is true.
   [[nodiscard]] std::optional<IntraNodeTransferResult> poll(
       const IntraNodeTransferKey& key);
+
+  /// @brief Register a one-shot wakeup for a same-process consumer that polled
+  /// and found no data, so it can go dormant instead of busy-re-queuing on the
+  /// single-threaded Communicator. @p wake is invoked exactly once when
+  /// publish() (or cancelTask()) makes data available for @p key.
+  /// @param key The unique key identifying this transfer
+  /// @param wake Callback fired once when data becomes available or the task is
+  ///        cancelled; must be safe to call from the Communicator thread.
+  /// @return true if data is ALREADY available (or the task is cancelled) — the
+  ///         caller should re-poll instead of going dormant; false if registered
+  ///         (the caller should go dormant and will be woken via @p wake).
+  [[nodiscard]] bool registerWaiter(
+      const IntraNodeTransferKey& key,
+      std::function<void()> wake);
 
   /// @brief Wait for and retrieve data from intra-node transfer registry.
   /// Source calls this - blocks until data is available or timeout.

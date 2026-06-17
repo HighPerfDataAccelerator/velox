@@ -277,12 +277,13 @@ void UcxExchangeServer::sendData() {
 
       IntraNodeTransferKey key{
           partitionKey_.taskId, partitionKey_.destination, sequenceNumber_};
-      // Stream value is unused: the consumer (UcxExchangeSource::
-      // onIntraNodeData) allocates its own pool stream for downstream ops.
+      const auto stream = dataPtr_->gpu_data->stream();
+      // The consumer tags uniquely owned pages with this stream so downstream
+      // reads and stream-ordered async frees remain ordered with the buffer.
       // dataPtr_ is already a shared_ptr, pass directly to share ownership.
       intraNodeRetrieveFuture_ =
           IntraNodeTransferRegistry::getInstance()->publish(
-              key, dataPtr_, rmm::cuda_stream_default, /*atEnd=*/false);
+              key, dataPtr_, stream, /*atEnd=*/false);
       dataPtr_.reset();
       intraNodeAtEndPublished_ = false;
 

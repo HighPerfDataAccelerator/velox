@@ -183,12 +183,13 @@ bool UcxOutputQueueManager::canUseIntraNode(const std::string& taskId) {
   if (!queue) {
     return true;
   }
-  // Placeholder partitioned queues are safe for intra-node: the server will
-  // wait until initializeTask() upgrades the queue and data arrives. Broadcast
-  // is the unsafe case because one packed_columns may be shared by
-  // destinations.
-  return !queue->isInitialized() ||
-      queue->kind() != core::PartitionedOutputNode::Kind::kBroadcast;
+  // Placeholder partitioned queues are safe for intra-node: the server waits
+  // until initializeTask() upgrades the queue and data arrives. Broadcast is
+  // also safe: a broadcast packed_columns is shared (use_count > 1) across
+  // destinations, and UcxExchangeSource::onIntraNodeData clones such shared
+  // pages (DtoD) instead of moving the device buffer out, so a consuming
+  // destination never corrupts the shared source for the others.
+  return true;
 }
 
 std::string UcxOutputQueueManager::describeQueueForIntraNode(

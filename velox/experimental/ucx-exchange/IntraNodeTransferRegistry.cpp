@@ -72,6 +72,7 @@ std::future<void> IntraNodeTransferRegistry::publish(
   }
 
   // Update the entry with data (under entry's own mutex)
+  std::vector<std::function<void()>> toWake;
   {
     std::lock_guard<std::mutex> entryLock(entry->entryMutex);
     entry->data = std::move(data);
@@ -80,10 +81,20 @@ std::future<void> IntraNodeTransferRegistry::publish(
     entry->ready = true;
     // Get the future while holding the lock to avoid race with consumer
     future = entry->retrievedPromise.get_future();
+    // Collect one-shot wakeups registered before the data was ready. Setting
+    // ready and draining wakeCallbacks under the same entryMutex that
+    // registerWaiter() takes guarantees no lost wakeup: a registerWaiter() that
+    // ran first added its callback here; one that runs later sees ready==true.
+    toWake.swap(entry->wakeCallbacks);
   }
 
   // Notify waiting source
   entry->dataAvailable.notify_one();
+
+  // Fire the dormant-source wakeups outside the entry lock.
+  for (auto& wake : toWake) {
+    wake();
+  }
 
   VLOG(2) << "[INTRA-REG] publish: task=" << key.taskId
           << " dest=" << key.destination << " seq=" << key.sequenceNumber
@@ -152,6 +163,38 @@ std::optional<IntraNodeTransferResult> IntraNodeTransferRegistry::poll(
           << " atEnd=" << result.atEnd;
 
   return result;
+}
+
+bool IntraNodeTransferRegistry::registerWaiter(
+    const IntraNodeTransferKey& key,
+    std::function<void()> wake) {
+  std::shared_ptr<IntraNodeTransferEntry> entry;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    // A cancelled task will never publish; tell the caller to re-poll so it
+    // observes the atEnd result instead of going dormant forever.
+    if (cancelledTasks_.count(key.taskId)) {
+      return true;
+    }
+    auto it = registry_.find(key);
+    if (it != registry_.end()) {
+      entry = it->second;
+    } else {
+      // Create the entry so a subsequent publish() finds it and fires the
+      // wakeup, mirroring waitFor()'s create-on-miss behavior.
+      entry = std::make_shared<IntraNodeTransferEntry>();
+      registry_[key] = entry;
+    }
+  }
+
+  // Check ready and enqueue the wakeup under the same entryMutex that publish()
+  // takes, so the register-vs-publish race cannot drop a wakeup.
+  std::lock_guard<std::mutex> entryLock(entry->entryMutex);
+  if (entry->ready) {
+    return true;
+  }
+  entry->wakeCallbacks.push_back(std::move(wake));
+  return false;
 }
 
 IntraNodeTransferResult IntraNodeTransferRegistry::waitFor(
@@ -259,17 +302,27 @@ void IntraNodeTransferRegistry::cancelTask(const std::string& taskId) {
   }
 
   // Fulfill promises outside the lock to avoid potential deadlocks.
+  std::vector<std::function<void()>> toWake;
   for (auto& entry : entriesToFulfill) {
     std::lock_guard<std::mutex> entryLock(entry->entryMutex);
     if (!entry->ready) {
       entry->ready = true;
       entry->atEnd = true;
     }
+    // Wake any dormant source so it re-polls and observes the atEnd result.
+    for (auto& wake : entry->wakeCallbacks) {
+      toWake.push_back(std::move(wake));
+    }
+    entry->wakeCallbacks.clear();
     try {
       entry->retrievedPromise.set_value();
     } catch (const std::future_error&) {
       // Promise already satisfied — safe to ignore.
     }
+  }
+
+  for (auto& wake : toWake) {
+    wake();
   }
 
   VLOG(2) << "[INTRA-REG] cancelTask: task=" << taskId

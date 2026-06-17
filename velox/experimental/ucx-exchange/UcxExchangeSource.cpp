@@ -744,13 +744,28 @@ void UcxExchangeSource::waitForIntraNodeData() {
   auto result = IntraNodeTransferRegistry::getInstance()->poll(key);
 
   if (!result.has_value()) {
-    // Data not ready yet, re-queue to try again
-    ++intraNodePollCount_;
-    if (intraNodePollCount_ % 100 == 0) {
-      VLOG(2) << "[INTRA] [ExSrc " << toString() << " seq=" << sequenceNumber_
-              << "] still polling for data, polls=" << intraNodePollCount_;
+    // Event-driven wait: re-queuing here would busy-spin the single-threaded
+    // Communicator and can starve the same-process producer's publish() (which
+    // needs that same thread), livelocking the intra-node transfer. Instead
+    // register a one-shot wakeup and go dormant; publish()/cancelTask()
+    // re-enqueues this source exactly once when data is available. The weak_ptr
+    // keeps the wakeup safe if the source is destroyed first; the Communicator
+    // outlives its sources, so capturing it by shared_ptr is safe.
+    auto self = getSelfPtr();
+    std::weak_ptr<CommElement> weakSelf = self;
+    auto communicator = communicator_;
+    const bool readyNow =
+        IntraNodeTransferRegistry::getInstance()->registerWaiter(
+            key, [weakSelf, communicator]() {
+              if (auto source = weakSelf.lock()) {
+                communicator->addToWorkQueue(source);
+              }
+            });
+    if (readyNow) {
+      // Data landed (or the task was cancelled) between poll and register —
+      // re-poll once instead of going dormant.
+      communicator_->addToWorkQueue(self);
     }
-    communicator_->addToWorkQueue(getSelfPtr());
     return;
   }
 

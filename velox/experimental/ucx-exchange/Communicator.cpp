@@ -15,6 +15,7 @@
  */
 #include "velox/experimental/ucx-exchange/Communicator.h"
 #include <cuda_runtime.h>
+#include <folly/system/ThreadName.h>
 #include <ucxx/api.h>
 #include <ucxx/utils/ucx.h>
 #include <algorithm>
@@ -108,6 +109,9 @@ Communicator::~Communicator() {
 /// All operations of the communicator will be carried out in the thread
 /// that calls run.
 void Communicator::run() {
+  // Name the UCX progress thread so it is identifiable in nsys / thread dumps
+  // (it carries all cross-peer send/recv progress and the rendezvous waits).
+  folly::setThreadName("ucx-progress");
   VLOG(3) << "Using error handling mode: "
           << CudfConfig::getInstance().ucxxErrorHandling << std::endl;
   VLOG(3) << "Using blocking progress mode: "
