@@ -71,6 +71,10 @@ struct IntraNodeTransferEntry {
   // busy-polling the single-threaded Communicator work queue. Fired and cleared
   // by publish()/cancelTask(). Guarded by entryMutex.
   std::vector<std::function<void()>> wakeCallbacks;
+  // One-shot wakeups for producers waiting until the source has retrieved the
+  // published data. Fired and cleared when poll()/waitFor()/retrieve() consumes
+  // the entry, or when cancelTask() completes it as at-end.
+  std::vector<std::function<void()>> retrievedCallbacks;
 };
 
 /// @brief Singleton registry for intra-node data transfers.
@@ -104,7 +108,8 @@ class IntraNodeTransferRegistry {
       const IntraNodeTransferKey& key,
       std::shared_ptr<cudf::packed_columns> data,
       rmm::cuda_stream_view stream,
-      bool atEnd);
+      bool atEnd,
+      std::function<void()> onRetrieved = {});
 
   /// @brief Non-blocking poll for intra-node transfer data.
   /// Returns immediately whether data is available or not.

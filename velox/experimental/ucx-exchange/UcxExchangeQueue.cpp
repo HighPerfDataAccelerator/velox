@@ -40,7 +40,8 @@ void UcxExchangeQueue::close() {
 
 void UcxExchangeQueue::enqueueLocked(
     PackedTableWithStreamPtr&& data,
-    std::vector<ContinuePromise>& promises) {
+    std::vector<ContinuePromise>& promises,
+    int64_t reservedReceiveBytes) {
   if (data == nullptr) {
     ++numCompleted_;
     VLOG(2) << "[EX-QUEUE] source completed (null enqueued)"
@@ -56,6 +57,10 @@ void UcxExchangeQueue::enqueueLocked(
   }
 
   auto dataSize = data->gpuDataSize();
+  if (reservedReceiveBytes > 0) {
+    VELOX_CHECK_GE(pendingReceiveBytes_, reservedReceiveBytes);
+    pendingReceiveBytes_ -= reservedReceiveBytes;
+  }
   totalBytes_ += dataSize;
   if (peakBytes_ < totalBytes_) {
     peakBytes_ = totalBytes_;
@@ -97,6 +102,49 @@ void UcxExchangeQueue::enqueueLocked(
     VLOG(2) << "[EX-QUEUE] waking " << wokenConsumers << " consumers"
             << " queueSize=" << queue_.size();
   }
+}
+
+bool UcxExchangeQueue::shouldPauseReceive(
+    int32_t highWaterMark,
+    int64_t maxInFlightBytes,
+    BackpressureStats* stats) const {
+  std::lock_guard<std::mutex> l(mutex_);
+  auto current = backpressureStatsLocked();
+  if (stats != nullptr) {
+    *stats = current;
+  }
+  return current.queueSize > highWaterMark ||
+      current.inFlightBytes > maxInFlightBytes;
+}
+
+bool UcxExchangeQueue::tryReserveReceive(
+    int64_t bytes,
+    int64_t maxInFlightBytes,
+    BackpressureStats* stats) {
+  VELOX_CHECK_GE(bytes, 0);
+  std::lock_guard<std::mutex> l(mutex_);
+  auto current = backpressureStatsLocked();
+  if (stats != nullptr) {
+    *stats = current;
+  }
+  if (maxInFlightBytes > 0 && current.inFlightBytes > 0 &&
+      current.inFlightBytes + bytes > maxInFlightBytes) {
+    return false;
+  }
+  pendingReceiveBytes_ += bytes;
+  if (stats != nullptr) {
+    *stats = backpressureStatsLocked();
+  }
+  return true;
+}
+
+void UcxExchangeQueue::releaseReservedReceive(int64_t bytes) {
+  if (bytes <= 0) {
+    return;
+  }
+  std::lock_guard<std::mutex> l(mutex_);
+  VELOX_CHECK_GE(pendingReceiveBytes_, bytes);
+  pendingReceiveBytes_ -= bytes;
 }
 
 void UcxExchangeQueue::addPromiseLocked(

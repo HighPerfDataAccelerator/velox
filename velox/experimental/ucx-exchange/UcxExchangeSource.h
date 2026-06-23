@@ -142,6 +142,7 @@ class UcxExchangeSource
     WaitingForHandshakeResponse, // Waiting for server's HandshakeResponse
     ReadyToReceive,
     WaitingForMetadata,
+    WaitingForReceiveCredit,
     WaitingForData,
     WaitingForIntraNodeData, // Intra-node transfer: waiting on registry
     Done
@@ -178,7 +179,7 @@ class UcxExchangeSource
   std::shared_ptr<UcxExchangeSource> getSelfPtr();
 
   // Put the received data into the exchange queue.
-  void enqueue(PackedTableWithStreamPtr data);
+  void enqueue(PackedTableWithStreamPtr data, int64_t reservedReceiveBytes = 0);
 
   /// @brief Sets the endpoint for this receiver.
   void setEndpoint(std::shared_ptr<EndpointRef> endpointRef);
@@ -198,6 +199,12 @@ class UcxExchangeSource
   /// @param status indication by transport layer of transfer status
   /// @param arg the serialized form of the metadata
   void onMetadata(ucs_status_t status, std::shared_ptr<void> arg);
+
+  /// @brief Reserves receive credit and posts the data receive for a metadata
+  /// packet that has already arrived.
+  bool tryStartDataReceive(
+      const std::shared_ptr<DataAndMetadata>& ptr,
+      ReceiverState expectedState);
 
   /// @brief Called by the transport layer when data is available
   /// @param status indication by transport layer of transfer status
@@ -241,6 +248,7 @@ class UcxExchangeSource
         "WaitingForHandshakeResponse",
         "ReadyToReceive",
         "WaitingForMetadata",
+        "WaitingForReceiveCredit",
         "WaitingForData",
         "WaitingForIntraNodeData",
         "Done"};
@@ -261,6 +269,8 @@ class UcxExchangeSource
   /// Returns early without enqueuing if the source was never registered
   /// with the queue (i.e., registered_ is false).
   void deliverEndMarker();
+
+  void releaseReceiveReservation();
 
   /// @brief Sets the state to "desired" if and only if the current
   /// state is "expected".
@@ -309,6 +319,8 @@ class UcxExchangeSource
   // goes dormant. The consumer thread wakes it via resumeFromBackpressure()
   // when the queue drains to kBackpressureLowWaterMark.
   std::atomic<bool> backpressureActive_{false};
+  std::shared_ptr<DataAndMetadata> pendingReceive_;
+  int64_t reservedReceiveBytes_{0};
 
   // Some metrics/counters:
   UcxExchangeMetrics metrics_;

@@ -229,7 +229,6 @@ void Communicator::run() {
                 [](const auto& req) { return req->isCompleted(); }),
             deferredRequests_.end());
       }
-
       // All queues are drained. Now wait for UCXX network events.
       // In blocking mode, this will block until a UCXX event arrives
       // or worker_->signal() is called (from addToWorkQueue,

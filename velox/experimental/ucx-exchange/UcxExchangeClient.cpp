@@ -173,7 +173,7 @@ UcxExchangeClient::next(int consumerId, bool* atEnd, ContinueFuture* future) {
         VLOG(1) << "[PROGRESS] @" << taskId_ << " consumer=" << consumerId
                 << " dequeued=" << totalDequeued_
                 << " queueSize=" << queue_->sizeLocked()
-                << " queueBytes=" << queue_->totalBytes();
+                << " queueBytes=" << queue_->totalBytesLocked();
       }
     }
 

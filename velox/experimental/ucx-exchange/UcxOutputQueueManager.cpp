@@ -13,7 +13,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-// Assisted by watsonx Code Assistant
 #include "velox/experimental/ucx-exchange/UcxOutputQueueManager.h"
 #include <cudf/detail/nvtx/ranges.hpp>
 #include <cudf/io/types.hpp>
@@ -181,14 +180,11 @@ void UcxOutputQueueManager::getData(
 bool UcxOutputQueueManager::canUseIntraNode(const std::string& taskId) {
   auto queue = getQueueIfExists(taskId);
   if (!queue) {
-    return true;
+    return false;
   }
-  // Placeholder partitioned queues are safe for intra-node: the server waits
-  // until initializeTask() upgrades the queue and data arrives. Broadcast is
-  // also safe: a broadcast packed_columns is shared (use_count > 1) across
-  // destinations, and UcxExchangeSource::onIntraNodeData clones such shared
-  // pages (DtoD) instead of moving the device buffer out, so a consuming
-  // destination never corrupts the shared source for the others.
+  if (!queue->isInitialized()) {
+    return false;
+  }
   return true;
 }
 

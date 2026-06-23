@@ -33,7 +33,8 @@ std::future<void> IntraNodeTransferRegistry::publish(
     const IntraNodeTransferKey& key,
     std::shared_ptr<cudf::packed_columns> data,
     rmm::cuda_stream_view stream,
-    bool atEnd) {
+    bool atEnd,
+    std::function<void()> onRetrieved) {
   std::shared_ptr<IntraNodeTransferEntry> entry;
   std::future<void> future;
   bool entryExisted;
@@ -66,6 +67,9 @@ std::future<void> IntraNodeTransferRegistry::publish(
     VLOG(2) << "[INTRA-REG] publish skipped (task cancelled): task="
             << key.taskId << " dest=" << key.destination
             << " seq=" << key.sequenceNumber;
+    if (onRetrieved) {
+      onRetrieved();
+    }
     std::promise<void> p;
     p.set_value();
     return p.get_future();
@@ -86,6 +90,9 @@ std::future<void> IntraNodeTransferRegistry::publish(
     // registerWaiter() takes guarantees no lost wakeup: a registerWaiter() that
     // ran first added its callback here; one that runs later sees ready==true.
     toWake.swap(entry->wakeCallbacks);
+    if (onRetrieved) {
+      entry->retrievedCallbacks.push_back(std::move(onRetrieved));
+    }
   }
 
   // Notify waiting source
@@ -133,6 +140,7 @@ std::optional<IntraNodeTransferResult> IntraNodeTransferRegistry::poll(
   // race conditions. Previously, the lock was released before accessing
   // entry->data, entry->atEnd, and entry->retrievedPromise.
   IntraNodeTransferResult result;
+  std::vector<std::function<void()>> retrievedCallbacks;
   {
     std::lock_guard<std::mutex> entryLock(entry->entryMutex);
     if (!entry->ready) {
@@ -149,6 +157,7 @@ std::optional<IntraNodeTransferResult> IntraNodeTransferRegistry::poll(
 
     // Fulfill the promise to notify the server while still holding entry lock
     entry->retrievedPromise.set_value();
+    retrievedCallbacks.swap(entry->retrievedCallbacks);
   }
 
   // Remove entry from registry (after releasing entry lock but before
@@ -161,6 +170,10 @@ std::optional<IntraNodeTransferResult> IntraNodeTransferRegistry::poll(
   VLOG(2) << "[INTRA-REG] poll hit: task=" << key.taskId
           << " dest=" << key.destination << " seq=" << key.sequenceNumber
           << " atEnd=" << result.atEnd;
+
+  for (auto& wake : retrievedCallbacks) {
+    wake();
+  }
 
   return result;
 }
@@ -220,6 +233,7 @@ IntraNodeTransferResult IntraNodeTransferRegistry::waitFor(
   // to prevent race conditions. Previously, the lock was released before
   // accessing entry->data, entry->atEnd, and entry->retrievedPromise.
   IntraNodeTransferResult result;
+  std::vector<std::function<void()>> retrievedCallbacks;
   {
     std::unique_lock<std::mutex> entryLock(entry->entryMutex);
     if (!entry->ready) {
@@ -240,6 +254,7 @@ IntraNodeTransferResult IntraNodeTransferRegistry::waitFor(
 
     // Fulfill the promise to notify the server while still holding entry lock
     entry->retrievedPromise.set_value();
+    retrievedCallbacks.swap(entry->retrievedCallbacks);
   }
 
   // Remove entry from registry (after releasing entry lock but before
@@ -253,31 +268,47 @@ IntraNodeTransferResult IntraNodeTransferRegistry::waitFor(
           << " dest=" << key.destination << " seq=" << key.sequenceNumber
           << " atEnd=" << result.atEnd;
 
+  for (auto& wake : retrievedCallbacks) {
+    wake();
+  }
+
   return result;
 }
 
 std::shared_ptr<cudf::packed_columns> IntraNodeTransferRegistry::retrieve(
     const IntraNodeTransferKey& key) {
-  std::lock_guard<std::mutex> lock(mutex_);
+  std::vector<std::function<void()>> retrievedCallbacks;
+  std::shared_ptr<cudf::packed_columns> data;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
 
-  auto it = registry_.find(key);
-  if (it == registry_.end()) {
-    VLOG(0) << "Intra-node transfer entry not found: " << key.taskId
-            << " dest=" << key.destination << " seq=" << key.sequenceNumber;
-    return nullptr;
+    auto it = registry_.find(key);
+    if (it == registry_.end()) {
+      VLOG(0) << "Intra-node transfer entry not found: " << key.taskId
+              << " dest=" << key.destination << " seq=" << key.sequenceNumber;
+      return nullptr;
+    }
+
+    auto entry = it->second;
+    {
+      std::lock_guard<std::mutex> entryLock(entry->entryMutex);
+      data = std::move(entry->data);
+
+      // Fulfill the promise to notify the server that data has been retrieved
+      entry->retrievedPromise.set_value();
+      retrievedCallbacks.swap(entry->retrievedCallbacks);
+    }
+
+    // Remove the entry from the registry
+    registry_.erase(it);
   }
-
-  auto entry = it->second;
-  auto data = std::move(entry->data);
-
-  // Fulfill the promise to notify the server that data has been retrieved
-  entry->retrievedPromise.set_value();
-
-  // Remove the entry from the registry
-  registry_.erase(it);
 
   VLOG(3) << "Retrieved intra-node transfer: " << key.taskId
           << " dest=" << key.destination << " seq=" << key.sequenceNumber;
+
+  for (auto& wake : retrievedCallbacks) {
+    wake();
+  }
 
   return data;
 }
@@ -303,6 +334,7 @@ void IntraNodeTransferRegistry::cancelTask(const std::string& taskId) {
 
   // Fulfill promises outside the lock to avoid potential deadlocks.
   std::vector<std::function<void()>> toWake;
+  std::vector<std::function<void()>> retrievedCallbacks;
   for (auto& entry : entriesToFulfill) {
     std::lock_guard<std::mutex> entryLock(entry->entryMutex);
     if (!entry->ready) {
@@ -314,6 +346,10 @@ void IntraNodeTransferRegistry::cancelTask(const std::string& taskId) {
       toWake.push_back(std::move(wake));
     }
     entry->wakeCallbacks.clear();
+    for (auto& wake : entry->retrievedCallbacks) {
+      retrievedCallbacks.push_back(std::move(wake));
+    }
+    entry->retrievedCallbacks.clear();
     try {
       entry->retrievedPromise.set_value();
     } catch (const std::future_error&) {
@@ -322,6 +358,9 @@ void IntraNodeTransferRegistry::cancelTask(const std::string& taskId) {
   }
 
   for (auto& wake : toWake) {
+    wake();
+  }
+  for (auto& wake : retrievedCallbacks) {
     wake();
   }
 

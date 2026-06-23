@@ -16,7 +16,9 @@
 #include "velox/experimental/ucx-exchange/UcxExchangeServer.h"
 #include <glog/logging.h>
 #include <rmm/cuda_stream_view.hpp>
+#include <cstdlib>
 #include <limits>
+#include <string>
 #include "cuda_runtime.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/ucx-exchange/Communicator.h"
@@ -24,6 +26,36 @@
 #include "velox/experimental/ucx-exchange/UcxExchangeProtocol.h"
 
 namespace facebook::velox::ucx_exchange {
+
+namespace {
+
+bool intraNodeProducerPollRequeueEnabled() {
+  static const bool enabled = [] {
+    const char* value =
+        std::getenv("GLUTEN_UCX_INTRANODE_PRODUCER_POLL_REQUEUE");
+    return value != nullptr && value[0] != '\0' &&
+        !(value[0] == '0' && value[1] == '\0');
+  }();
+  return enabled;
+}
+
+int64_t intraNodeProducerPollRequeueLimit() {
+  static const int64_t limit = [] {
+    const char* value =
+        std::getenv("GLUTEN_UCX_INTRANODE_PRODUCER_POLL_REQUEUE_LIMIT");
+    if (value == nullptr || value[0] == '\0') {
+      return int64_t{-1};
+    }
+    try {
+      return static_cast<int64_t>(std::stoll(value));
+    } catch (...) {
+      return int64_t{-1};
+    }
+  }();
+  return limit;
+}
+
+} // namespace
 
 // Context wrappers for UCXX tagSend callbackData. These decouple the
 // ucxx::Request lifetime (which must survive for UCP wireup replay) from
@@ -160,7 +192,9 @@ void UcxExchangeServer::process() {
       // do
       break;
     case ServerState::WaitingForIntraNodeRetrieve:
-      // Intra-node transfer: check if the source has retrieved the data
+      // Intra-node transfer: the registry re-enqueues us when the source has
+      // retrieved the data. Do a non-blocking check only for that wakeup (or a
+      // defensive spurious work item); do not self-requeue and spin.
       if (intraNodeRetrieveFuture_.valid()) {
         auto status =
             intraNodeRetrieveFuture_.wait_for(std::chrono::milliseconds(0));
@@ -168,8 +202,11 @@ void UcxExchangeServer::process() {
           intraNodeRetrieveFuture_.get(); // Clear the future
           intraNodePollCount_ = 0;
           onIntraNodeRetrieveComplete();
-        } else {
-          // Not ready yet, re-queue to check later
+        } else if (
+            intraNodeProducerPollRequeueEnabled() &&
+            (intraNodeProducerPollRequeueLimit() < 0 ||
+             intraNodePollCount_ <
+                 static_cast<uint32_t>(intraNodeProducerPollRequeueLimit()))) {
           ++intraNodePollCount_;
           if (intraNodePollCount_ % 100 == 0) {
             VLOG(2) << "[INTRA] [ExSrv " << partitionKey_.toString()
@@ -283,13 +320,20 @@ void UcxExchangeServer::sendData() {
       // dataPtr_ is already a shared_ptr, pass directly to share ownership.
       intraNodeRetrieveFuture_ =
           IntraNodeTransferRegistry::getInstance()->publish(
-              key, dataPtr_, stream, /*atEnd=*/false);
+              key,
+              dataPtr_,
+              stream,
+              /*atEnd=*/false,
+              makeIntraNodeRetrieveWakeup());
       dataPtr_.reset();
       intraNodeAtEndPublished_ = false;
 
-      // Transition to WaitingForIntraNodeRetrieve state
+      // Go dormant until the source retrieves the entry and the registry wakeup
+      // re-enqueues this server.
       setState(ServerState::WaitingForIntraNodeRetrieve);
-      communicator_->addToWorkQueue(getSelfPtr());
+      if (intraNodeProducerPollRequeueEnabled()) {
+        communicator_->addToWorkQueue(getSelfPtr());
+      }
     } else {
       // Data pointer is null, so no more data will be coming.
       // Publish atEnd marker to registry
@@ -301,14 +345,21 @@ void UcxExchangeServer::sendData() {
           partitionKey_.taskId, partitionKey_.destination, sequenceNumber_};
       intraNodeRetrieveFuture_ =
           IntraNodeTransferRegistry::getInstance()->publish(
-              key, nullptr, rmm::cuda_stream_default, /*atEnd=*/true);
+              key,
+              nullptr,
+              rmm::cuda_stream_default,
+              /*atEnd=*/true,
+              makeIntraNodeRetrieveWakeup());
       intraNodeAtEndPublished_ = true;
 
       queueMgr_->deleteResults(partitionKey_.taskId, partitionKey_.destination);
 
-      // Wait for source to acknowledge atEnd before finishing
+      // Wait for source to acknowledge atEnd before finishing. The registry
+      // wakeup re-enqueues this server when that happens.
       setState(ServerState::WaitingForIntraNodeRetrieve);
-      communicator_->addToWorkQueue(getSelfPtr());
+      if (intraNodeProducerPollRequeueEnabled()) {
+        communicator_->addToWorkQueue(getSelfPtr());
+      }
     }
   } else {
     // REMOTE EXCHANGE PATH: Use UCXX for metadata and data transfer
@@ -488,6 +539,16 @@ void UcxExchangeServer::sendComplete(
     setState(ServerState::Done);
   }
   communicator_->addToWorkQueue(getSelfPtr());
+}
+
+std::function<void()> UcxExchangeServer::makeIntraNodeRetrieveWakeup() {
+  std::weak_ptr<CommElement> weakSelf = getSelfPtr();
+  auto communicator = communicator_;
+  return [weakSelf, communicator]() {
+    if (auto server = weakSelf.lock()) {
+      communicator->addToWorkQueue(server);
+    }
+  };
 }
 
 void UcxExchangeServer::onIntraNodeRetrieveComplete() {
