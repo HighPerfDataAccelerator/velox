@@ -29,6 +29,52 @@ namespace velox_connector = ::facebook::velox::connector;
 namespace velox_hive = ::facebook::velox::connector::hive;
 namespace velox_iceberg = ::facebook::velox::connector::hive::iceberg;
 
+namespace {
+
+std::string cleanPathForCudf(std::string path) {
+  constexpr std::string_view kFilePrefix = "file:";
+  constexpr std::string_view kS3APrefix = "s3a:";
+  if (path.compare(0, kFilePrefix.size(), kFilePrefix) == 0) {
+    path = path.substr(kFilePrefix.size());
+  } else if (path.compare(0, kS3APrefix.size(), kS3APrefix) == 0) {
+    // KvikIO does not support the "s3a:" prefix.
+    path.erase(kS3APrefix.size() - 2, 1);
+  }
+  return path;
+}
+
+std::vector<velox_iceberg::IcebergDeleteFile> copyDeleteFiles(
+    const std::vector<velox_iceberg::IcebergDeleteFile>& deleteFiles) {
+  std::vector<velox_iceberg::IcebergDeleteFile> copy;
+  copy.reserve(deleteFiles.size());
+  for (const auto& deleteFile : deleteFiles) {
+    copy.emplace_back(deleteFile);
+  }
+  return copy;
+}
+
+std::optional<uint64_t> getFileSize(
+    const velox_iceberg::HiveIcebergSplit& split,
+    FileHandleFactory* fileHandleFactory,
+    const velox_connector::ConnectorQueryCtx* connectorQueryCtx,
+    IoStats* ioStats) {
+  if (split.properties && split.properties->fileSize.has_value()) {
+    return static_cast<uint64_t>(*split.properties->fileSize);
+  }
+
+  const auto fileHandleKey = FileHandleKey{
+      .filename = cleanPathForCudf(split.filePath),
+      .tokenProvider = connectorQueryCtx->fsTokenProvider()};
+  auto fileProperties = FileProperties{};
+  auto fileHandleCachePtr =
+      fileHandleFactory->generate(fileHandleKey, &fileProperties, ioStats);
+  VELOX_CHECK_NOT_NULL(fileHandleCachePtr.get());
+  VELOX_CHECK_NOT_NULL(fileHandleCachePtr->file.get());
+  return fileHandleCachePtr->file->size();
+}
+
+} // namespace
+
 CudfIcebergDataSource::CudfIcebergDataSource(
     const RowTypePtr& outputType,
     const velox_connector::ConnectorTableHandlePtr& tableHandle,
@@ -54,9 +100,45 @@ void CudfIcebergDataSource::convertSplit(
   icebergSplit_ =
       checkedPointerCast<const velox_iceberg::HiveIcebergSplit>(split);
 
-  VELOX_CHECK(
-      icebergSplit_->start == 0,
-      "Sub-splits are not yet supported in CudfIcebergDataSource");
+  if (icebergSplit_->start != 0) {
+    const auto fileSize = getFileSize(
+        *icebergSplit_,
+        fileHandleFactory_,
+        connectorQueryCtx_,
+        ioStats_ ? ioStats_.get() : nullptr);
+    const auto splitEnd =
+        icebergSplit_->length == std::numeric_limits<uint64_t>::max()
+        ? *fileSize
+        : icebergSplit_->start + icebergSplit_->length;
+    const auto isWholeParquetSplit = icebergSplit_->fileFormat ==
+            dwio::common::FileFormat::PARQUET &&
+        icebergSplit_->start == 4 && splitEnd == *fileSize;
+    VELOX_CHECK(
+        isWholeParquetSplit,
+        "Sub-splits are not yet supported in CudfIcebergDataSource. "
+        "Split start: {}, length: {}, file size: {}",
+        icebergSplit_->start,
+        icebergSplit_->length,
+        *fileSize);
+
+    auto normalizedSplit = std::make_shared<velox_iceberg::HiveIcebergSplit>(
+        icebergSplit_->connectorId,
+        icebergSplit_->filePath,
+        icebergSplit_->fileFormat,
+        0,
+        *fileSize,
+        icebergSplit_->partitionKeys,
+        icebergSplit_->tableBucketNumber,
+        icebergSplit_->customSplitInfo,
+        icebergSplit_->extraFileInfo,
+        icebergSplit_->cacheable,
+        copyDeleteFiles(icebergSplit_->deleteFiles),
+        icebergSplit_->infoColumns,
+        icebergSplit_->properties,
+        icebergSplit_->dataSequenceNumber);
+    icebergSplit_ = normalizedSplit;
+    split = normalizedSplit;
+  }
 
   // Convert `ConnectorSplit` to `CudfHiveConnectorSplit`
   CudfHiveDataSource::convertSplit(split);
