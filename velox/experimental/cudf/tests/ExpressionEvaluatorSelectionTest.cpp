@@ -437,6 +437,13 @@ TEST_F(CudfExpressionSelectionTest, signatureArityAndConstantsSubstr) {
   auto ok3 = compileExecExpr("substr(name, 1, 5)", rowType_, execCtx_.get());
   ASSERT_TRUE(canBeEvaluatedByCudf(ok3, /*deep=*/true));
 
+  // OK: Spark can pass substring bounds as integer constants.
+  auto okIntegerBounds = compileExecExpr(
+      "substr(name, cast(1 as integer), cast(5 as integer))",
+      rowType_,
+      execCtx_.get());
+  ASSERT_TRUE(canBeEvaluatedByCudf(okIntegerBounds, /*deep=*/true));
+
   // Bad: start must be constant
   auto badConst = compileExecExpr("substr(name, a)", rowType_, execCtx_.get());
   ASSERT_FALSE(canBeEvaluatedByCudf(badConst, /*deep=*/true));

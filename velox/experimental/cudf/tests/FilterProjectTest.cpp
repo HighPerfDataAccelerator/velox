@@ -1866,6 +1866,28 @@ TEST_F(CudfFilterProjectTest, substrWithLength) {
       substrResults, calculatedSubstrResults);
 }
 
+TEST_F(CudfFilterProjectTest, substringWithIntegerBounds) {
+  auto input =
+      makeFlatVector<std::string>({"hellobutlonghello", "secondstring"});
+  auto data = makeRowVector({input});
+  auto substrPlan = PlanBuilder()
+                        .values({data})
+                        .project({
+                            "substring(c0, cast(1 as integer), "
+                            "cast(2 as integer)) AS c0"})
+                        .planNode();
+  auto substrResults = AssertQueryBuilder(substrPlan).copyResults(pool());
+
+  auto calculatedSubstrResults = makeRowVector({
+      makeFlatVector<std::string>({
+          "he",
+          "se",
+      }),
+  });
+  facebook::velox::test::assertEqualVectors(
+      substrResults, calculatedSubstrResults);
+}
+
 TEST_F(CudfFilterProjectTest, coalesceColumnWithLiteral) {
   vector_size_t batchSize = 100;
   auto vectors = makeVectors(rowType_, 1, batchSize);
