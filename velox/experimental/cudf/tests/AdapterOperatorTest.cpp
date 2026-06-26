@@ -21,6 +21,7 @@
 #include "velox/exec/tests/utils/AssertQueryBuilder.h"
 #include "velox/exec/tests/utils/OperatorTestBase.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
+#include "velox/functions/prestosql/aggregates/RegisterAggregateFunctions.h"
 #include "velox/functions/prestosql/registration/RegistrationFunctions.h"
 
 using namespace facebook::velox;
@@ -31,6 +32,8 @@ class AdapterOperatorTest : public OperatorTestBase {
  protected:
   void SetUp() override {
     OperatorTestBase::SetUp();
+    aggregate::prestosql::registerAllAggregateFunctions();
+    functions::prestosql::registerAllScalarFunctions();
     cudf_velox::CudfConfig::getInstance().allowCpuFallback = false;
     cudf_velox::registerCudf();
   }
@@ -38,6 +41,18 @@ class AdapterOperatorTest : public OperatorTestBase {
   void TearDown() override {
     cudf_velox::unregisterCudf();
     OperatorTestBase::TearDown();
+  }
+
+  bool wasCudfWindowUsed(const std::shared_ptr<exec::Task>& task) {
+    auto stats = task->taskStats();
+    for (const auto& pipelineStats : stats.pipelineStats) {
+      for (const auto& operatorStats : pipelineStats.operatorStats) {
+        if (operatorStats.operatorType == "CudfWindow") {
+          return true;
+        }
+      }
+    }
+    return false;
   }
 };
 
@@ -59,4 +74,30 @@ TEST_F(AdapterOperatorTest, adapterStatsMergedIntoPlanNode) {
 
   EXPECT_TRUE(projStats.isMultiOperatorTypeNode());
   EXPECT_TRUE(projStats.operatorStats.count("CudfToVelox"));
+}
+
+TEST_F(AdapterOperatorTest, fullPartitionWindowSumUsesCudfWindow) {
+  auto data = makeRowVector(
+      {"k0", "k1", "v"},
+      {makeFlatVector<int64_t>({1, 1, 1, 2, 2, 3}),
+       makeFlatVector<std::string>({"us", "us", "ca", "us", "us", "us"}),
+       makeNullableFlatVector<int64_t>({10, 20, 5, 7, std::nullopt, 1})});
+  createDuckDbTable({data});
+
+  auto plan = PlanBuilder()
+                  .values({data})
+                  .window(
+                      {"sum(v) over (partition by k0, k1 rows between "
+                       "unbounded preceding and unbounded following) as s"})
+                  .planNode();
+
+  auto task = AssertQueryBuilder(duckDbQueryRunner_)
+                  .config("cudf.enabled", true)
+                  .plan(plan)
+                  .assertResults(
+                      "SELECT k0, k1, v, sum(v) over (partition by k0, k1 "
+                      "rows between unbounded preceding and unbounded "
+                      "following) FROM tmp");
+
+  EXPECT_TRUE(wasCudfWindowUsed(task));
 }
