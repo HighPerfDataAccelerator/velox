@@ -898,6 +898,26 @@ TEST_F(CudfFilterProjectTest, timestampLiteralComparisons) {
   }
 }
 
+TEST_F(CudfFilterProjectTest, timestampNullPredicates) {
+  std::vector<std::optional<Timestamp>> timestamps = {
+      Timestamp(1735689599, 0), // 2024-12-31 23:59:59
+      std::nullopt,
+      Timestamp(1735689600, 0), // 2025-01-01 00:00:00
+      Timestamp(1736942400, 0), // 2025-01-15 12:00:00
+      std::nullopt,
+      Timestamp(1738367999, 0) // 2025-01-31 23:59:59
+  };
+
+  auto data = makeRowVector(
+      {"event_id", "event_ts"},
+      {makeFlatVector<int32_t>({1, 2, 3, 4, 5, 6}),
+       makeNullableFlatVector<Timestamp>(timestamps, TIMESTAMP())});
+  std::vector<RowVectorPtr> vectors{data};
+
+  assertFilterIds(vectors, "event_ts IS NULL", {2, 5});
+  assertFilterIds(vectors, "event_ts IS NOT NULL", {1, 3, 4, 6});
+}
+
 TEST_F(CudfFilterProjectTest, dateLiteralComparisons) {
   std::vector<int32_t> dates = {
       toDateDays("2024-12-31"),
@@ -1373,6 +1393,24 @@ TEST_F(CudfFilterProjectTest, round) {
   AssertQueryBuilder(plan).assertResults(expected);
 }
 
+TEST_F(CudfFilterProjectTest, roundFloating) {
+  auto data = makeRowVector({
+      makeFlatVector<double>({41.2389, -45.6789, 100.0}),
+      makeFlatVector<double>({2.0, 3.0, 0.02}),
+  });
+  parse::ParseOptions options;
+  options.parseIntegerAsBigint = false;
+
+  auto plan = PlanBuilder()
+                  .setParseOptions(options)
+                  .values({data})
+                  .project({"round(c0 * c1, 2) as c1"})
+                  .planNode();
+  auto expected =
+      makeRowVector({makeFlatVector<double>({82.48, -137.04, 2.0})});
+  AssertQueryBuilder(plan).assertResults(expected);
+}
+
 TEST_F(CudfFilterProjectTest, roundDecimal) {
   parse::ParseOptions options;
   options.parseIntegerAsBigint = false;
@@ -1637,6 +1675,23 @@ TEST_F(CudfFilterProjectTest, mixedLiteralProjection) {
   createDuckDbTable(vectors);
 
   testMixedLiteralProjection(vectors);
+}
+
+TEST_F(CudfFilterProjectTest, zeroColumnValuesConstantProjection) {
+  std::vector<RowVectorPtr> input = {makeRowVector(ROW({}), 1)};
+  auto plan = PlanBuilder()
+                  .values(input)
+                  .project(
+                      {"CAST(-1001 AS BIGINT) AS id",
+                       "'--' AS label",
+                       "CAST(-1001 AS BIGINT) AS parent_id"})
+                  .planNode();
+
+  auto expected = makeRowVector(
+      {makeFlatVector<int64_t>({-1001}),
+       makeFlatVector<std::string>({"--"}),
+       makeFlatVector<int64_t>({-1001})});
+  assertQuery(plan, expected);
 }
 
 TEST_F(CudfFilterProjectTest, dereference) {
@@ -2081,6 +2136,53 @@ TEST_F(CudfSimpleFilterProjectTest, castNumericToBoolean) {
     SCOPED_TRACE(expression);
     assertExpressionMatchesCpu(expression, input, input->rowType());
   }
+}
+
+TEST_F(CudfSimpleFilterProjectTest, castIntegralToVarchar) {
+  EXPECT_EQ(
+      evaluateOnce<std::string, int32_t>("cast(c0 as varchar)", 12345),
+      "12345");
+  EXPECT_EQ(
+      evaluateOnce<std::string, int64_t>(
+          "cast(c0 as varchar)", 9876543210LL),
+      "9876543210");
+  EXPECT_EQ(
+      evaluateOnce<std::string, int16_t>(
+          "cast(c0 as varchar)", static_cast<int16_t>(255)),
+      "255");
+  EXPECT_EQ(
+      evaluateOnce<std::string, int8_t>(
+          "try_cast(c0 as varchar)", static_cast<int8_t>(-7)),
+      "-7");
+  EXPECT_EQ(
+      evaluateOnce<std::string, int32_t>(
+          "cast(c0 as varchar)", std::optional<int32_t>{}),
+      std::nullopt);
+}
+
+TEST_F(CudfSimpleFilterProjectTest, castFloatingPointToVarchar) {
+  EXPECT_EQ(
+      evaluateOnce<std::string, double>("cast(c0 as varchar)", 12.5),
+      "12.5");
+  EXPECT_EQ(
+      evaluateOnce<std::string, float>(
+          "try_cast(c0 as varchar)", static_cast<float>(-7.25)),
+      "-7.25");
+  EXPECT_EQ(
+      evaluateOnce<std::string, double>(
+          "cast(c0 as varchar)", std::optional<double>{}),
+      std::nullopt);
+}
+
+TEST_F(CudfSimpleFilterProjectTest, castDateToVarchar) {
+  EXPECT_EQ(
+      evaluateOnce<std::string>(
+          "cast(c0 as varchar)", DATE(), DATE()->toDays("2024-03-15")),
+      "2024-03-15");
+  EXPECT_EQ(
+      evaluateOnce<std::string>(
+          "try_cast(c0 as varchar)", DATE(), std::optional<int32_t>{}),
+      std::nullopt);
 }
 
 TEST_F(CudfSimpleFilterProjectTest, rowConstructorAndDereference) {

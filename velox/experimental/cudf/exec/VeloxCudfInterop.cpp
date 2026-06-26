@@ -96,9 +96,10 @@ cudf::data_type veloxToCudfDataType(const TypePtr& type) {
     // case TypeKind::INTERVAL_DAY_TIME: return cudf::type_id::EMPTY;
     case TypeKind::ARRAY:
       return cudf::data_type{cudf::type_id::LIST};
+    case TypeKind::MAP:
+      return cudf::data_type{cudf::type_id::LIST};
     case TypeKind::ROW:
       return cudf::data_type{cudf::type_id::STRUCT};
-    // case TypeKind::MAP: return cudf::type_id::EMPTY;
     // case TypeKind::UNKNOWN: return cudf::type_id::EMPTY;
     // case TypeKind::FUNCTION: return cudf::type_id::EMPTY;
     // case TypeKind::OPAQUE: return cudf::type_id::EMPTY;
@@ -113,6 +114,60 @@ cudf::data_type veloxToCudfDataType(const TypePtr& type) {
 }
 
 namespace with_arrow {
+
+namespace {
+
+void replaceArrowFormatForCudfImport(ArrowSchema* schema, const char* format) {
+  // Velox's Arrow exporter owns the original format pointer and may not have
+  // allocated it with malloc, so do not free it on this import-side rewrite.
+  const size_t bufferLen = std::strlen(format) + 1;
+  auto* buffer = static_cast<char*>(std::malloc(bufferLen));
+  VELOX_CHECK_NOT_NULL(buffer);
+  std::memcpy(buffer, format, bufferLen);
+  schema->format = buffer;
+}
+
+void setArrowSchemaTypesForCudfImport(
+    ArrowSchema* schema,
+    const TypePtr& type) {
+  switch (type->kind()) {
+    case TypeKind::ROW: {
+      if (schema->n_children != static_cast<int64_t>(type->size())) {
+        break;
+      }
+      for (size_t i = 0; i < type->size(); ++i) {
+        setArrowSchemaTypesForCudfImport(schema->children[i], type->childAt(i));
+      }
+      break;
+    }
+    case TypeKind::ARRAY: {
+      if (schema->n_children == 1 && schema->children[0] != nullptr) {
+        setArrowSchemaTypesForCudfImport(schema->children[0], type->childAt(0));
+      }
+      break;
+    }
+    case TypeKind::MAP: {
+      // Velox exports MAP using Arrow's logical map format. libcudf imports
+      // the same physical layout as LIST<STRUCT<key,value>>, but rejects the
+      // Arrow MAP format itself, so downgrade only this import-side schema.
+      replaceArrowFormatForCudfImport(schema, "+l");
+      VELOX_CHECK_EQ(schema->n_children, 1);
+      VELOX_CHECK_NOT_NULL(schema->children[0]);
+      auto* entries = schema->children[0];
+      replaceArrowFormatForCudfImport(entries, "+s");
+      VELOX_CHECK_EQ(entries->n_children, 2);
+      VELOX_CHECK_NOT_NULL(entries->children[0]);
+      VELOX_CHECK_NOT_NULL(entries->children[1]);
+      setArrowSchemaTypesForCudfImport(entries->children[0], type->childAt(0));
+      setArrowSchemaTypesForCudfImport(entries->children[1], type->childAt(1));
+      break;
+    }
+    default:
+      break;
+  }
+}
+
+} // namespace
 
 std::unique_ptr<cudf::table> toCudfTable(
     const facebook::velox::RowVectorPtr& veloxTable,
@@ -147,17 +202,19 @@ std::unique_ptr<cudf::table> toCudfTable(
       .timestampTimeZone = timestampTimeZone,
       .exportVarbinaryAsString = true,
       .useDecimalTypeWidth = true};
+  auto exportVector = std::static_pointer_cast<BaseVector>(
+      std::make_shared<RowVector>(
+          veloxTable->pool(),
+          veloxTable->type(),
+          veloxTable->nulls(),
+          veloxTable->size(),
+          veloxTable->children()));
+  BaseVector::flattenVector(exportVector);
   ArrowArray arrowArray;
-  exportToArrow(
-      std::dynamic_pointer_cast<facebook::velox::BaseVector>(veloxTable),
-      arrowArray,
-      pool,
-      arrowOptions);
+  exportToArrow(exportVector, arrowArray, pool, arrowOptions);
   ArrowSchema arrowSchema;
-  exportToArrow(
-      std::dynamic_pointer_cast<facebook::velox::BaseVector>(veloxTable),
-      arrowSchema,
-      arrowOptions);
+  exportToArrow(exportVector, arrowSchema, arrowOptions);
+  setArrowSchemaTypesForCudfImport(&arrowSchema, exportVector->type());
   auto tbl = cudf::from_arrow(&arrowSchema, &arrowArray, stream, mr);
 
   // Synchronize before releasing Arrow resources.  cudf::from_arrow uses
@@ -179,29 +236,51 @@ std::unique_ptr<cudf::table> toCudfTable(
 
 namespace {
 
-void setArrowFormatBackToVarbinary(ArrowSchema* schema, const TypePtr& type) {
+void replaceArrowFormat(ArrowSchema* schema, const char* format) {
+  if (schema->format != nullptr) {
+    std::free(const_cast<char*>(schema->format));
+    schema->format = nullptr;
+  }
+  const size_t bufferLen = std::strlen(format) + 1;
+  auto* buffer = static_cast<char*>(std::malloc(bufferLen));
+  VELOX_CHECK_NOT_NULL(buffer);
+  std::memcpy(buffer, format, bufferLen);
+  schema->format = buffer;
+}
+
+void setArrowSchemaTypesFromVelox(ArrowSchema* schema, const TypePtr& type) {
   switch (type->kind()) {
     case TypeKind::ROW: {
       if (schema->n_children != static_cast<int64_t>(type->size())) {
         break;
       }
       for (size_t i = 0; i < type->size(); ++i) {
-        setArrowFormatBackToVarbinary(schema->children[i], type->childAt(i));
+        setArrowSchemaTypesFromVelox(schema->children[i], type->childAt(i));
       }
+      break;
+    }
+    case TypeKind::ARRAY: {
+      if (schema->n_children == 1 && schema->children[0] != nullptr) {
+        setArrowSchemaTypesFromVelox(schema->children[0], type->childAt(0));
+      }
+      break;
+    }
+    case TypeKind::MAP: {
+      replaceArrowFormat(schema, "+m");
+      VELOX_CHECK_EQ(schema->n_children, 1);
+      VELOX_CHECK_NOT_NULL(schema->children[0]);
+      auto* entries = schema->children[0];
+      replaceArrowFormat(entries, "+s");
+      VELOX_CHECK_EQ(entries->n_children, 2);
+      VELOX_CHECK_NOT_NULL(entries->children[0]);
+      VELOX_CHECK_NOT_NULL(entries->children[1]);
+      setArrowSchemaTypesFromVelox(entries->children[0], type->childAt(0));
+      setArrowSchemaTypesFromVelox(entries->children[1], type->childAt(1));
       break;
     }
     case TypeKind::VARBINARY: {
       // Replace any format string with "z" to indicate VARBINARY.
-      static constexpr const char* kVarbinaryArrowFormat = "z";
-      if (schema->format != nullptr) {
-        std::free(const_cast<char*>(schema->format));
-        schema->format = nullptr;
-      }
-      const size_t bufferLen = std::strlen(kVarbinaryArrowFormat) + 1;
-      auto* buffer = static_cast<char*>(std::malloc(bufferLen));
-      VELOX_CHECK_NOT_NULL(buffer);
-      std::memcpy(buffer, kVarbinaryArrowFormat, bufferLen);
-      schema->format = buffer;
+      replaceArrowFormat(schema, "z");
       break;
     }
     default:
@@ -239,10 +318,10 @@ RowVectorPtr toVeloxColumn(
   // needed for some types like VARBINARY which are exported as STRING (the
   // format is overridden to "z" when the exportVarbinaryAsString option is set
   // to true in the exportToArrow() call) because cuDF does not have a VARBINARY
-  // type. This code implements the other side of the conversion, to change the
-  // format back to "z" so that the data re-imports as VARBINARY.
+  // type. MAP also needs logical format restoration because cuDF exposes it as
+  // a LIST<STRUCT<key,value>> physical layout.
   if (outputType) {
-    setArrowFormatBackToVarbinary(&schemaCopy, *outputType);
+    setArrowSchemaTypesFromVelox(&schemaCopy, *outputType);
   }
 
   auto veloxTable = importFromArrowAsOwner(schemaCopy, arrayCopy, pool);
@@ -286,6 +365,14 @@ cudf::column_metadata getMetadataWithName(
     meta.children_meta.emplace_back(cudf::column_metadata(name + "_offsets"));
     meta.children_meta.push_back(
         getMetadataWithName(type->childAt(0), "element"));
+  } else if (type->kind() == facebook::velox::TypeKind::MAP) {
+    meta.children_meta.emplace_back(cudf::column_metadata(name + "_offsets"));
+    auto entries = cudf::column_metadata("entries");
+    entries.children_meta.push_back(
+        getMetadataWithName(type->childAt(0), "key"));
+    entries.children_meta.push_back(
+        getMetadataWithName(type->childAt(1), "value"));
+    meta.children_meta.push_back(std::move(entries));
   }
   return meta;
 }

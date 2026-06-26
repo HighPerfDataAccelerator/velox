@@ -184,6 +184,39 @@ TEST_F(CudfNestedLoopJoinTest, innerJoinWithFilter) {
   assertQuery(plan, "SELECT t.c0, u.c0 FROM t INNER JOIN u ON t.c0 < u.c0");
 }
 
+TEST_F(CudfNestedLoopJoinTest, innerJoinWithTimestampFilter) {
+  auto probeVectors = {makeRowVector(
+      {"p_id", "p_ts"},
+      {makeFlatVector<int32_t>({1, 2, 3}),
+       makeFlatVector<Timestamp>(
+           {Timestamp(10, 0), Timestamp(20, 0), Timestamp(30, 0)},
+           TIMESTAMP())})};
+
+  auto buildVectors = {makeRowVector(
+      {"b_id", "b_ts"},
+      {makeFlatVector<int32_t>({10, 11}),
+       makeFlatVector<Timestamp>(
+           {Timestamp(15, 0), Timestamp(25, 0)}, TIMESTAMP())})};
+
+  createDuckDbTable("t", {probeVectors});
+  createDuckDbTable("u", {buildVectors});
+
+  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  auto plan = PlanBuilder(planNodeIdGenerator)
+                  .values({probeVectors})
+                  .nestedLoopJoin(
+                      PlanBuilder(planNodeIdGenerator)
+                          .values({buildVectors})
+                          .planNode(),
+                      "p_ts > b_ts",
+                      {"p_id", "b_id"},
+                      core::JoinType::kInner)
+                  .planNode();
+
+  assertQuery(
+      plan, "SELECT t.p_id, u.b_id FROM t INNER JOIN u ON t.p_ts > u.b_ts");
+}
+
 // Test 6: Multiple batches (tests streaming behavior)
 TEST_F(CudfNestedLoopJoinTest, multipleBatches) {
   std::vector<RowVectorPtr> probeVectors;

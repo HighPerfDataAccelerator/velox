@@ -445,6 +445,20 @@ TEST_F(InteropTest, dictionary) {
   roundTrip(input);
 }
 
+TEST_F(InteropTest, dictionaryArrayOfStrings) {
+  constexpr int kSize = 6;
+  auto baseValues = makeArrayVector<StringView>({
+      {"a"_sv, "b"_sv},
+      {"c"_sv},
+      {},
+  });
+  auto indices = makeIndices(kSize, [](auto i) { return i % 3; });
+  auto dictionaryChild =
+      BaseVector::wrapInDictionary(nullptr, indices, kSize, baseValues);
+  auto input = makeRowVector({dictionaryChild});
+  roundTrip(input);
+}
+
 TEST_F(InteropTest, constant) {
   auto child = makeConstant<int64_t>(10, 5);
   auto input = makeRowVector({child});

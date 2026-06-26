@@ -33,6 +33,7 @@ add_library(
   CudfReduce.cpp
   CudfTopN.cpp
   CudfTopNRowNumber.cpp
+  CudfValues.cpp
   CudfWindow.cpp
   DebugUtil.cpp
   DecimalAggregationDevice.cu
@@ -61,6 +62,7 @@ target_link_libraries(
     velox_exception
     velox_exec
     velox_test_util
+    velox_ucx_exchange
 )
 
 target_compile_options(velox_cudf_exec PRIVATE -Wno-missing-field-initializers)

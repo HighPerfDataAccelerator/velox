@@ -83,6 +83,7 @@ CudfIcebergSplitReader::CudfIcebergSplitReader(
     std::shared_ptr<const velox_hive::HiveTableHandle> tableHandle,
     const RowTypePtr& outputType,
     const std::vector<std::string>& readColumnNames,
+    const std::vector<std::string>& outputReadColumnNames,
     FileHandleFactory* fileHandleFactory,
     folly::Executor* executor,
     const ::facebook::velox::connector::ConnectorQueryCtx* connectorQueryCtx,
@@ -106,7 +107,8 @@ CudfIcebergSplitReader::CudfIcebergSplitReader(
           useExperimentalCudfReader,
           subfieldFilterExpr),
       icebergSplit_(std::move(icebergSplit)),
-      hiveConfig_(hiveConfig) {}
+      hiveConfig_(hiveConfig),
+      outputReadColumnNames_(outputReadColumnNames) {}
 
 void CudfIcebergSplitReader::prepareSplit(
     dwio::common::RuntimeStatistics& runtimeStats) {
@@ -496,21 +498,23 @@ void CudfIcebergSplitReader::adaptColumns() {
   std::unordered_set<std::string> injectedNames;
   for (size_t i = 0; i < outputType_->size(); ++i) {
     const auto& fieldName = outputType_->nameOf(i);
+    const auto& readName =
+        i < outputReadColumnNames_.size() ? outputReadColumnNames_[i] : fieldName;
 
-    if (auto iter = split_->infoColumns.find(fieldName);
+    if (auto iter = split_->infoColumns.find(readName);
         iter != split_->infoColumns.end()) {
       injectedColumns_.push_back(
-          {i, fieldName, iter->second, outputType_->childAt(i)});
-      injectedNames.insert(fieldName);
-    } else if (auto it = icebergSplit_->partitionKeys.find(fieldName);
+          {i, readName, iter->second, outputType_->childAt(i)});
+      injectedNames.insert(readName);
+    } else if (auto it = icebergSplit_->partitionKeys.find(readName);
                it != icebergSplit_->partitionKeys.end()) {
       // Partition columns: Hive migrated table. In Hive-written data
       // files, partition column values are stored in partition metadata
       // rather than in the data file itself, following Hive's
       // partitioning convention.
       injectedColumns_.push_back(
-          {i, fieldName, it->second, outputType_->childAt(i)});
-      injectedNames.insert(fieldName);
+          {i, readName, it->second, outputType_->childAt(i)});
+      injectedNames.insert(readName);
     }
   }
 
@@ -534,15 +538,17 @@ void CudfIcebergSplitReader::adaptColumns() {
 
     for (size_t i = 0; i < outputType_->size(); ++i) {
       const auto& fieldName = outputType_->nameOf(i);
-      if (injectedNames.contains(fieldName)) {
+      const auto& readName =
+          i < outputReadColumnNames_.size() ? outputReadColumnNames_[i] : fieldName;
+      if (injectedNames.contains(readName)) {
         continue;
       }
-      if (not fileColumns.contains(fieldName)) {
+      if (not fileColumns.contains(readName)) {
         // Schema evolution: Column was added after the data file was written
         // and doesn't exist in older data files.
         injectedColumns_.push_back(
-            {i, fieldName, std::nullopt, outputType_->childAt(i)});
-        injectedNames.insert(fieldName);
+            {i, readName, std::nullopt, outputType_->childAt(i)});
+        injectedNames.insert(readName);
       }
     }
   }

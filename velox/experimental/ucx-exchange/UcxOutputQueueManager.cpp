@@ -71,6 +71,17 @@ void UcxOutputQueueManager::updateOutputBuffers(
   getQueue(taskId)->updateOutputBuffers(numBuffers, noMoreBuffers);
 }
 
+bool UcxOutputQueueManager::updateOutputBuffersIfExists(
+    std::string_view taskId,
+    int numBuffers,
+    bool noMoreBuffers) {
+  if (auto queue = getQueueIfExists(taskId)) {
+    queue->updateOutputBuffers(numBuffers, noMoreBuffers);
+    return true;
+  }
+  return false;
+}
+
 void UcxOutputQueueManager::enqueue(
     std::string_view taskId,
     int destination,

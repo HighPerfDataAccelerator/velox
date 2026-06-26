@@ -152,6 +152,7 @@ CudfIcebergDataSource::createCudfSplitReader() {
       tableHandle_,
       outputType_,
       readColumnNames_,
+      outputReadColumnNames_,
       fileHandleFactory_,
       executor_,
       connectorQueryCtx_,

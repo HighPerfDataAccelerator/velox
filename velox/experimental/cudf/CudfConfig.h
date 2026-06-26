@@ -50,8 +50,17 @@ struct CudfConfig {
   static constexpr const char* kCudfConcatOptimizationEnabled{
       "cudf.concat_optimization_enabled"};
   static constexpr const char* kCudfTimestampUnit{"cudf.timestamp_unit"};
+  // The value could be either spark or presto.
+  static constexpr const char* kCudfFunctionEngine{"cudf.function_engine"};
   /// Query session configs for the cuDF Operators.
   static constexpr const char* kCudfTopNBatchSize{"cudf.topk_batch_size"};
+
+  static constexpr const char* kUcxExchange{"cudf.exchange"};
+  static constexpr const char* kUcxxErrorHandling{"ucxx.error_handling"};
+  static constexpr const char* kUcxIntraNodeExchange{
+      "cudf.intra_node_exchange"};
+  static constexpr const char* kUcxxBlockingPolling{"ucxx.blocking_polling"};
+  static constexpr const char* kUcxExchangeLogLevel{"cudf.exchange_log_level"};
 
   /// Singleton CudfConfig instance.
   /// Clients must set the configs below before invoking registerCudf().
@@ -85,6 +94,9 @@ struct CudfConfig {
 
   /// Register all the functions with the functionNamePrefix.
   std::string functionNamePrefix;
+
+  /// Register Spark or Presto specific cuDF functions.
+  std::string functionEngine{"presto"};
 
   /// Enable AST in expression evaluation.
   bool astExpressionEnabled{true};
@@ -131,6 +143,21 @@ struct CudfConfig {
   /// "s" (seconds), "ms" (milliseconds), "us" (microseconds), "ns"
   /// (nanoseconds).
   cudf::type_id timestampUnit = cudf::type_id::TIMESTAMP_NANOSECONDS;
+
+  /// Whether UCX exchange is enabled.
+  bool exchange{false};
+
+  /// Whether to enable error handling in UCXX endpoints.
+  bool ucxxErrorHandling{true};
+
+  /// Whether intra-node exchange optimization is enabled.
+  bool intraNodeExchange{false};
+
+  /// Whether to use blocking polling in UCXX.
+  bool ucxxBlockingPolling{true};
+
+  /// VLOG level for ucx-exchange source files.
+  int32_t exchangeLogLevel{0};
 };
 
 } // namespace facebook::velox::cudf_velox

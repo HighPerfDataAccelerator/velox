@@ -30,6 +30,7 @@
 #include "velox/functions/prestosql/registration/RegistrationFunctions.h"
 #include "velox/functions/sparksql/registration/Register.h"
 #include "velox/type/Type.h"
+#include "velox/vector/BaseVector.h"
 
 #include <folly/ScopeGuard.h>
 #include <gtest/gtest.h>
@@ -63,6 +64,7 @@ class CudfExpressionSelectionTest : public ::testing::Test {
         {"c", INTEGER()},
         {"name", VARCHAR()},
         {"date", DATE()},
+        {"d", DOUBLE()},
         {"c", INTEGER()},
     });
 
@@ -123,6 +125,31 @@ TEST_F(CudfExpressionSelectionTest, astTopLevelWithFunctionPrecompute) {
   auto* ast = dynamic_cast<ASTExpression*>(cudfExpr.get());
   auto* jit = dynamic_cast<JitExpression*>(cudfExpr.get());
   ASSERT_TRUE(ast != nullptr || jit != nullptr);
+}
+
+TEST_F(CudfExpressionSelectionTest, decimalPredicateUsesFunctionEvaluator) {
+  auto prevAst = CudfConfig::getInstance().astExpressionEnabled;
+  auto prevJit = CudfConfig::getInstance().jitExpressionEnabled;
+  SCOPE_EXIT {
+    CudfConfig::getInstance().astExpressionEnabled = prevAst;
+    CudfConfig::getInstance().jitExpressionEnabled = prevJit;
+  };
+  CudfConfig::getInstance().astExpressionEnabled = true;
+  CudfConfig::getInstance().jitExpressionEnabled = true;
+
+  auto decimalRowType =
+      ROW({{"d0", DECIMAL(17, 2)}, {"d1", DECIMAL(17, 2)}});
+  auto expr = compileExecExpr(
+      "(d0 > CAST(0.0 AS DECIMAL(17, 2))) AND "
+      "(d1 > CAST(0.0 AS DECIMAL(17, 2)))",
+      decimalRowType,
+      execCtx_.get());
+
+  ASSERT_TRUE(canBeEvaluatedByCudf(expr, /*deep=*/true));
+  auto cudfExpr = createCudfExpression(expr, decimalRowType);
+  ASSERT_EQ(dynamic_cast<ASTExpression*>(cudfExpr.get()), nullptr);
+  ASSERT_EQ(dynamic_cast<JitExpression*>(cudfExpr.get()), nullptr);
+  ASSERT_NE(dynamic_cast<FunctionExpression*>(cudfExpr.get()), nullptr);
 }
 
 TEST_F(CudfExpressionSelectionTest, functionTopLevelWithNestedFunction) {
@@ -324,6 +351,25 @@ TEST_F(CudfExpressionSelectionTest, signatureAllowsColumnPatternLike) {
   ASSERT_FALSE(canBeEvaluatedByCudf(badColumnEscape, /*deep=*/true));
 }
 
+TEST_F(CudfExpressionSelectionTest, regexpLookaroundFallsBack) {
+  auto ok = compileExecExpr(
+      "regexp_replace(name, '^0+', '')", rowType_, execCtx_.get());
+  ASSERT_TRUE(canBeEvaluatedByCudf(ok, /*deep=*/true));
+
+  auto supportedLeadingZeroLookahead = compileExecExpr(
+      "regexp_replace(name, '^0+(?!$)', '')", rowType_, execCtx_.get());
+  ASSERT_TRUE(canBeEvaluatedByCudf(
+      supportedLeadingZeroLookahead, /*deep=*/true));
+
+  auto badLookahead = compileExecExpr(
+      "regexp_replace(name, '(?!x)0+', '')", rowType_, execCtx_.get());
+  ASSERT_FALSE(canBeEvaluatedByCudf(badLookahead, /*deep=*/true));
+
+  auto badLookbehind = compileExecExpr(
+      "regexp_extract(name, '(?<=x)[0-9]+', 0)", rowType_, execCtx_.get());
+  ASSERT_FALSE(canBeEvaluatedByCudf(badLookbehind, /*deep=*/true));
+}
+
 TEST_F(CudfExpressionSelectionTest, signatureAllowsColumnArgsStartswith) {
   // OK: pattern is a constant
   auto ok = compileExecExpr("startswith(name, 'ab')", rowType_, execCtx_.get());
@@ -442,6 +488,25 @@ TEST_F(CudfExpressionSelectionTest, signatureCastsInDivide) {
   ASSERT_TRUE(canBeEvaluatedByCudf(ok, /*deep=*/true));
 }
 
+TEST_F(CudfExpressionSelectionTest, castDateAndNumericToVarcharSupported) {
+  auto dateExpr =
+      compileExecExpr("cast(date AS varchar)", rowType_, execCtx_.get());
+  ASSERT_TRUE(canBeEvaluatedByCudf(dateExpr, /*deep=*/true));
+
+  auto intExpr =
+      compileExecExpr("try_cast(c AS varchar)", rowType_, execCtx_.get());
+  ASSERT_TRUE(canBeEvaluatedByCudf(intExpr, /*deep=*/true));
+
+  auto doubleExpr =
+      compileExecExpr("try_cast(d AS varchar)", rowType_, execCtx_.get());
+  ASSERT_TRUE(canBeEvaluatedByCudf(doubleExpr, /*deep=*/true));
+}
+
+TEST_F(CudfExpressionSelectionTest, varcharToRealCastFallsBack) {
+  auto expr = compileExecExpr("cast(name AS real)", rowType_, execCtx_.get());
+  ASSERT_FALSE(canBeEvaluatedByCudf(expr, /*deep=*/true));
+}
+
 TEST_F(CudfExpressionSelectionTest, signatureVarargsHashWithSeed) {
   facebook::velox::functions::sparksql::registerFunctions();
 
@@ -491,6 +556,25 @@ TEST_F(CudfExpressionSelectionTest, signatureTypeVariableCoalesce) {
   ASSERT_TRUE(canBeEvaluatedByCudf(ok2, /*deep=*/true));
 }
 
+TEST_F(CudfExpressionSelectionTest, coalesceComplexLiteralFallsBack) {
+  auto arrayType = ARRAY(VARCHAR());
+  auto arrayField =
+      std::make_shared<core::FieldAccessTypedExpr>(arrayType, "arr");
+  auto emptyArray = BaseVector::createConstant(
+      arrayType,
+      Variant::create<TypeKind::ARRAY>(std::vector<Variant>{}),
+      1,
+      pool_.get());
+  auto arrayLiteral = std::make_shared<core::ConstantTypedExpr>(emptyArray);
+  auto typedExpr = std::make_shared<core::CallTypedExpr>(
+      arrayType,
+      std::vector<core::TypedExprPtr>{arrayField, arrayLiteral},
+      "coalesce");
+  exec::ExprSet exprSet({typedExpr}, execCtx_.get(), false);
+
+  ASSERT_FALSE(canBeEvaluatedByCudf(exprSet.expr(0), /*deep=*/true));
+}
+
 TEST_F(CudfExpressionSelectionTest, signatureTypeVariableSwitchIf) {
   // OK: boolean + same type BIGINT
   auto ok1 = compileExecExpr("if(true, a, b)", rowType_, execCtx_.get());
@@ -536,6 +620,26 @@ TEST_F(CudfExpressionSelectionTest, constantFoldingStringAllocatesOnCompile) {
   ASSERT_NE(c, nullptr);
   // Verify the constant vector was created using the provided ExecCtx pool.
   ASSERT_EQ(c->value()->pool(), execCtx_->pool());
+}
+
+TEST_F(CudfExpressionSelectionTest, nullComplexLiteralCanBeProjected) {
+  const std::vector<TypePtr> types{
+      ARRAY(INTEGER()),
+      MAP(VARCHAR(), VARCHAR()),
+      ROW({"country_iso_code"}, {VARCHAR()}),
+  };
+
+  for (const auto& type : types) {
+    auto expr = std::make_shared<exec::ConstantExpr>(
+        BaseVector::createNullConstant(type, 1, pool_.get()));
+    ASSERT_TRUE(isNullComplexConstantLiteral(expr));
+    ASSERT_TRUE(canBeEvaluatedByCudf(expr, /*deep=*/true));
+  }
+
+  auto scalarNull = std::make_shared<exec::ConstantExpr>(
+      BaseVector::createNullConstant(VARCHAR(), 1, pool_.get()));
+  ASSERT_FALSE(isNullComplexConstantLiteral(scalarNull));
+  ASSERT_TRUE(canBeEvaluatedByCudf(scalarNull, /*deep=*/true));
 }
 
 } // namespace

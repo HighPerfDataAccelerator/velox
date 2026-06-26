@@ -159,10 +159,10 @@ class MapFunction : public exec::VectorFunction {
   }
 
   static std::vector<std::shared_ptr<exec::FunctionSignature>> signatures() {
-    // Support up to 10 key-value pairs (20 arguments) for MAP() function.
-    // array(K), array(V) -> map(K,V)
+    // Support wide generated Spark CreateMap expressions.
+    // key1, value1, ... -> map(K,V)
     std::vector<std::shared_ptr<exec::FunctionSignature>> signatures;
-    constexpr int kNumberOfSignatures = 10;
+    constexpr int kNumberOfSignatures = 64;
     signatures.reserve(kNumberOfSignatures);
     for (int i = 1; i <= kNumberOfSignatures; i++) {
       auto builder = exec::FunctionSignatureBuilder()

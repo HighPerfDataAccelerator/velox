@@ -26,14 +26,21 @@
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/OperatorAdapters.h"
 #include "velox/experimental/cudf/exec/PrestoAggregateFunctions.h"
+#include "velox/experimental/cudf/exec/SparkAggregateFunctions.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/expression/AstExpression.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
 #include "velox/experimental/cudf/expression/JitExpression.h"
+#include "velox/experimental/cudf/expression/PrestoFunctions.h"
+#include "velox/experimental/cudf/expression/SparkFunctions.h"
 
 #include "folly/Conv.h"
+#include "velox/core/PlanNode.h"
 #include "velox/exec/Driver.h"
+#include "velox/exec/HashBuild.h"
+#include "velox/exec/NestedLoopJoinBuild.h"
 #include "velox/exec/Operator.h"
+#include "velox/exec/PartitionedOutput.h"
 #include "velox/exec/Values.h"
 
 #include <cudf/detail/nvtx/ranges.hpp>
@@ -52,6 +59,63 @@ namespace {
 template <class... Deriveds, class Base>
 bool isAnyOf(const Base* p) {
   return ((dynamic_cast<const Deriveds*>(p) != nullptr) || ...);
+}
+
+bool isMppFinalOutputBoundary(
+    const exec::Operator* op,
+    const core::PlanNodePtr& planNode) {
+  if (dynamic_cast<const exec::PartitionedOutput*>(op) == nullptr) {
+    return false;
+  }
+
+  const auto poNode =
+      std::dynamic_pointer_cast<const core::PartitionedOutputNode>(planNode);
+  if (poNode == nullptr) {
+    return false;
+  }
+
+  return poNode->id().rfind("mpp_output_", 0) == 0 &&
+      poNode->transportType() ==
+      core::PartitionedOutputNode::TransportType::kHttp &&
+      poNode->isPartitioned() && poNode->numPartitions() == 1 &&
+      poNode->serdeKind() == "Presto";
+}
+
+RowTypePtr gpuInputBoundaryType(
+    const exec::Operator* op,
+    const core::PlanNodePtr& planNode) {
+  if (dynamic_cast<const exec::HashBuild*>(op) != nullptr) {
+    VELOX_CHECK_GT(
+        planNode->sources().size(), 1, "HashBuild requires a build-side source");
+    return planNode->sources()[1]->outputType();
+  }
+
+  if (dynamic_cast<const exec::NestedLoopJoinBuild*>(op) != nullptr) {
+    VELOX_CHECK_GT(
+        planNode->sources().size(),
+        1,
+        "NestedLoopJoinBuild requires a build-side source");
+    return planNode->sources()[1]->outputType();
+  }
+
+  if (auto partitionedOutput =
+          std::dynamic_pointer_cast<const core::PartitionedOutputNode>(
+              planNode)) {
+    return partitionedOutput->inputType();
+  }
+
+  if (auto topNRowNumber =
+          std::dynamic_pointer_cast<const core::TopNRowNumberNode>(planNode)) {
+    return topNRowNumber->inputType();
+  }
+
+  if (auto window = std::dynamic_pointer_cast<const core::WindowNode>(planNode)) {
+    return window->inputType();
+  }
+
+  VELOX_CHECK_GT(
+      planNode->sources().size(), 0, "GPU input boundary requires a source");
+  return planNode->sources()[0]->outputType();
 }
 
 } // namespace
@@ -155,7 +219,10 @@ bool CompileState::compile(bool allowCpuFallback) {
     if (previousOperatorIsNotGpu and thisOpProps.acceptsGpuInput and planNode) {
       replaceOp.push_back(
           std::make_unique<CudfFromVelox>(
-              id, planNode->outputType(), ctx, planNode->id() + "-from-velox"));
+              id,
+              gpuInputBoundaryType(oper, planNode),
+              ctx,
+              planNode->id() + "-from-velox"));
     }
     if (not replaceOp.empty()) {
       // from-velox only, because need to inserted before current operator.
@@ -212,6 +279,14 @@ bool CompileState::compile(bool allowCpuFallback) {
               id, planNode->outputType(), ctx, planNode->id() + "-to-velox"));
     }
 
+    if (!allowCpuFallback && isPureCpuOperator &&
+        isMppFinalOutputBoundary(oper, planNode)) {
+      LOG(WARNING)
+          << "Allowing MPP final output boundary under cuDF no-fallback gate: "
+          << oper->toString();
+      isPureCpuOperator = false;
+    }
+
     if (debugEnabled) {
       VLOG(1) << "Operator: ID " << oper->operatorId() << ": "
               << oper->toString() << ", keepOperator = " << keepOperator
@@ -231,7 +306,11 @@ bool CompileState::compile(bool allowCpuFallback) {
       // condition is if GPU replacement success or if CPU operators itself is
       // GPU compatible. or if specific CPU operator is allowed even when
       // fallback is disabled.
-      VELOX_CHECK(!isPureCpuOperator, "Replacement with cuDF operator failed");
+      VELOX_CHECK(
+          !isPureCpuOperator,
+          "Replacement with cuDF operator failed for operator: {}, plan node: {}",
+          oper->toString(),
+          planNode ? planNode->toString(true, false) : "<null>");
     } else if (isPureCpuOperator) {
       LOG(WARNING)
           << "Replacement with cuDF operator failed. Falling back to CPU execution";
@@ -310,7 +389,18 @@ void registerCudf() {
 
   auto prefix = CudfConfig::getInstance().functionNamePrefix;
   registerBuiltinFunctions(prefix);
-  registerPrestoAggregateFunctions(prefix);
+  const auto& functionEngine = CudfConfig::getInstance().functionEngine;
+  if (functionEngine == "spark") {
+    registerSparkFunctions(prefix);
+    registerSparkAggregateFunctions(prefix);
+  } else if (functionEngine == "presto") {
+    registerPrestoFunctions(prefix);
+    registerPrestoAggregateFunctions(prefix);
+  } else {
+    VELOX_FAIL(
+        "Invalid cuDF function engine: {}. Valid values are: spark, presto",
+        functionEngine);
+  }
 
   CUDF_FUNC_RANGE();
   cudaFree(nullptr); // Initialize CUDA context at startup
@@ -400,6 +490,9 @@ void CudfConfig::initialize(
   if (config.find(kCudfFunctionNamePrefix) != config.end()) {
     functionNamePrefix = config[kCudfFunctionNamePrefix];
   }
+  if (config.find(kCudfFunctionEngine) != config.end()) {
+    functionEngine = config[kCudfFunctionEngine];
+  }
   if (config.find(kCudfAstExpressionEnabled) != config.end()) {
     astExpressionEnabled = folly::to<bool>(config[kCudfAstExpressionEnabled]);
   }
@@ -418,6 +511,21 @@ void CudfConfig::initialize(
   }
   if (config.find(kCudfTopNBatchSize) != config.end()) {
     topNBatchSize = folly::to<int32_t>(config[kCudfTopNBatchSize]);
+  }
+  if (config.find(kUcxExchange) != config.end()) {
+    exchange = folly::to<bool>(config[kUcxExchange]);
+  }
+  if (config.find(kUcxIntraNodeExchange) != config.end()) {
+    intraNodeExchange = folly::to<bool>(config[kUcxIntraNodeExchange]);
+  }
+  if (config.find(kUcxxErrorHandling) != config.end()) {
+    ucxxErrorHandling = folly::to<bool>(config[kUcxxErrorHandling]);
+  }
+  if (config.find(kUcxxBlockingPolling) != config.end()) {
+    ucxxBlockingPolling = folly::to<bool>(config[kUcxxBlockingPolling]);
+  }
+  if (config.find(kUcxExchangeLogLevel) != config.end()) {
+    exchangeLogLevel = folly::to<int32_t>(config[kUcxExchangeLogLevel]);
   }
   if (config.find(kCudfTimestampUnit) != config.end()) {
     const auto& unit = config[kCudfTimestampUnit];

@@ -492,6 +492,27 @@ TEST_F(CudfFilterProjectTest, getConstantArraySupportedTypes) {
       "row_constructor(3, 'gamma'))");
 }
 
+TEST_F(CudfFilterProjectTest, getJsonObjectConstantPath) {
+  auto input = makeNullableFlatVector<std::string>({
+      R"({"origin_country_iso_codes":"US","release_year":2024,"entity_quality_score":0.75})",
+      R"({"release_year":"2025","entity_quality_score":"0.5"})",
+      R"({"origin_country_iso_codes":["US","CA"],"entity_quality_score":null})",
+      std::nullopt,
+  });
+  auto data = makeRowVector({input});
+
+  for (const auto& expression : {
+           "get_json_object(c0, '$.origin_country_iso_codes')",
+           "get_json_object(c0, '$.missing')",
+           "get_json_object(c0, cast(null as varchar))",
+           "try_cast(get_json_object(c0, '$.release_year') as integer)",
+           "try_cast(get_json_object(c0, '$.entity_quality_score') as double)",
+       }) {
+    SCOPED_TRACE(expression);
+    assertExpressionMatchesCpu(expression, data, data->rowType());
+  }
+}
+
 TEST_F(CudfFilterProjectTest, likeWithEscape) {
   auto input = makeNullableFlatVector<std::string>(
       {"a_c", "abc", "abc_", "a%c", std::nullopt, ""});

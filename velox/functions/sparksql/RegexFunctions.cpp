@@ -15,6 +15,7 @@
  */
 #include <folly/container/F14Map.h>
 #include <limits>
+#include <optional>
 #include "velox/functions/lib/Re2Functions.h"
 #include "velox/functions/lib/string/StringImpl.h"
 
@@ -23,11 +24,32 @@ namespace {
 
 using ::re2::RE2;
 
+constexpr const char* kLeadingZeroPreserveOneJavaPattern = "^0+(?!$)";
+constexpr const char* kLeadingZeroPreserveOneRe2Pattern = "^0+(.+)$";
+constexpr const char* kLeadingZeroPreserveOneJavaReplacement = "$1";
+
 void ensureRegexIsConstant(
     const char* functionName,
     const VectorPtr& patternVector) {
   if (!patternVector || !patternVector->isConstantEncoding()) {
     VELOX_USER_FAIL("{} requires a constant pattern.", functionName);
+  }
+}
+
+bool isLeadingZeroPreserveOneRegexpReplace(
+    const StringView& pattern,
+    const StringView& replacement) {
+  return pattern.getString() == kLeadingZeroPreserveOneJavaPattern &&
+      replacement.size() == 0;
+}
+
+void normalizeLeadingZeroPreserveOneRegexpReplace(
+    std::string& pattern,
+    std::optional<std::string>& replacement) {
+  if (replacement.has_value() &&
+      pattern == kLeadingZeroPreserveOneJavaPattern && replacement->empty()) {
+    pattern = kLeadingZeroPreserveOneRe2Pattern;
+    replacement = kLeadingZeroPreserveOneJavaReplacement;
   }
 }
 
@@ -66,7 +88,16 @@ struct RegexpReplaceFunction {
       const arg_type<Varchar>* replacement,
       const arg_type<int32_t>* /*position*/) {
     if (pattern) {
-      const auto processedPattern = prepareRegexpReplacePattern(*pattern);
+      auto patternText = pattern->getString();
+      std::optional<std::string> replacementText;
+      if (replacement) {
+        replacementText = replacement->getString();
+      }
+      normalizeLeadingZeroPreserveOneRegexpReplace(
+          patternText, replacementText);
+
+      const auto processedPattern =
+          prepareRegexpReplacePattern(StringView(patternText));
       re_.emplace(processedPattern, RE2::Quiet);
       VELOX_USER_CHECK(
           re_->ok(),
@@ -79,7 +110,8 @@ struct RegexpReplaceFunction {
         // be processed during initialization; otherwise, each row needs to be
         // processed separately.
         constantReplacement_ =
-            prepareRegexpReplaceReplacement(re_.value(), *replacement);
+            prepareRegexpReplaceReplacement(
+                re_.value(), StringView(replacementText.value()));
       }
     }
     cache_.setMaxCompiledRegexes(config.exprMaxCompiledRegexes());
@@ -160,10 +192,23 @@ struct RegexpReplaceFunction {
       const arg_type<Varchar>& pattern,
       const arg_type<Varchar>& replace,
       const arg_type<int32_t>& position) {
-    auto& re = ensurePattern(pattern);
+    std::optional<std::string> patternText;
+    std::optional<std::string> replacementText;
+    if (!re_.has_value() &&
+        isLeadingZeroPreserveOneRegexpReplace(pattern, replace)) {
+      patternText = kLeadingZeroPreserveOneRe2Pattern;
+      replacementText = kLeadingZeroPreserveOneJavaReplacement;
+    }
+
+    auto& re =
+        patternText.has_value() ? ensurePattern(StringView(patternText.value()))
+                                : ensurePattern(pattern);
     const auto& processedReplacement = constantReplacement_.has_value()
         ? constantReplacement_.value()
-        : prepareRegexpReplaceReplacement(re, replace);
+        : prepareRegexpReplaceReplacement(
+              re,
+              replacementText.has_value() ? StringView(replacementText.value())
+                                          : replace);
 
     std::string prefix(stringInput.data(), position);
     std::string targetString(

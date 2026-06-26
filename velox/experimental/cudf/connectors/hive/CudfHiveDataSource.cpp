@@ -41,6 +41,45 @@ namespace facebook::velox::cudf_velox::connector::hive {
 using namespace facebook::velox::connector;
 using namespace facebook::velox::connector::hive;
 
+namespace {
+
+bool isSupportedCudfReaderFilterType(const TypePtr& type) {
+  if (type == nullptr) {
+    return false;
+  }
+
+  switch (type->kind()) {
+    case TypeKind::ARRAY:
+    case TypeKind::MAP:
+    case TypeKind::ROW:
+    case TypeKind::UNKNOWN:
+      return false;
+    default:
+      return true;
+  }
+}
+
+TypePtr topLevelSubfieldType(
+    const hive::HiveTableHandle& tableHandle,
+    const RowTypePtr& outputType,
+    const common::Subfield& field) {
+  if (!field.valid()) {
+    return nullptr;
+  }
+
+  const auto& baseName = field.baseName();
+  if (tableHandle.dataColumns() &&
+      tableHandle.dataColumns()->containsChild(baseName)) {
+    return tableHandle.dataColumns()->findChild(baseName);
+  }
+  if (outputType && outputType->containsChild(baseName)) {
+    return outputType->findChild(baseName);
+  }
+  return nullptr;
+}
+
+} // namespace
+
 CudfHiveDataSource::CudfHiveDataSource(
     const RowTypePtr& outputType,
     const ConnectorTableHandlePtr& tableHandle,
@@ -60,8 +99,19 @@ CudfHiveDataSource::CudfHiveDataSource(
       outputType_(outputType),
       pool_(connectorQueryCtx->memoryPool()),
       expressionEvaluator_(connectorQueryCtx->expressionEvaluator()) {
+  tableHandle_ =
+      std::dynamic_pointer_cast<const hive::HiveTableHandle>(tableHandle);
+  VELOX_CHECK_NOT_NULL(
+      tableHandle_, "TableHandle must be an instance of HiveTableHandle");
+
+  auto addReadColumn = [&](std::string_view name) {
+    auto readName = toTopLevelReadColumnName(name);
+    if (readColumnSet_.emplace(readName).second) {
+      readColumnNames_.emplace_back(std::move(readName));
+    }
+  };
+
   // Set up column projection if needed
-  auto readColumnTypes = outputType_->children();
   for (const auto& outputName : outputType_->names()) {
     auto it = columnHandles.find(outputName);
     VELOX_CHECK(
@@ -70,14 +120,10 @@ CudfHiveDataSource::CudfHiveDataSource(
         outputName);
 
     auto* handle = static_cast<const hive::HiveColumnHandle*>(it->second.get());
-    readColumnSet_.emplace(handle->name());
-    readColumnNames_.emplace_back(handle->name());
+    auto outputReadName = toTopLevelReadColumnName(handle->name());
+    outputReadColumnNames_.emplace_back(outputReadName);
+    addReadColumn(outputReadName);
   }
-
-  tableHandle_ =
-      std::dynamic_pointer_cast<const hive::HiveTableHandle>(tableHandle);
-  VELOX_CHECK_NOT_NULL(
-      tableHandle_, "TableHandle must be an instance of HiveTableHandle");
 
   // Copy subfield filters.
   for (const auto& [k, v] : tableHandle_->subfieldFilters()) {
@@ -97,19 +143,43 @@ CudfHiveDataSource::CudfHiveDataSource(
 
   // Add fields in the filter to the columns to read if not there
   for (const auto& [field, _] : subfieldFilters_) {
-    if (readColumnSet_.count(field.toString()) == 0) {
-      readColumnSet_.emplace(field.toString());
-      readColumnNames_.emplace_back(field.toString());
+    addReadColumn(field.toString());
+  }
+
+  // Build a combined AST for subfield filters once. This is query-constant
+  // and doesn't depend on split-specific state. cuDF reader AST currently only
+  // supports scalar column predicates; keep complex columns in the post-scan
+  // remaining filter path to avoid invalid AST operators on MAP/ARRAY/ROW.
+  common::SubfieldFilters readerSubfieldFilters;
+  bool skippedReaderFilter = false;
+  if (!subfieldFilters_.empty()) {
+    for (const auto& [field, filter] : subfieldFilters_) {
+      if (field.path().size() != 1) {
+        skippedReaderFilter = true;
+        VLOG(1) << "Skipping nested cuDF reader filter pushdown for subfield: "
+                << field.toString();
+        continue;
+      }
+
+      const auto type = topLevelSubfieldType(*tableHandle_, outputType_, field);
+      if (!isSupportedCudfReaderFilterType(type)) {
+        skippedReaderFilter = true;
+        VLOG(1) << "Skipping complex cuDF reader filter pushdown for subfield: "
+                << field.toString();
+        continue;
+      }
+
+      readerSubfieldFilters.emplace(field.clone(), filter);
     }
   }
-  if (remainingFilter) {
-    remainingFilterExprSet_ = expressionEvaluator_->compile(remainingFilter);
+
+  const auto& postScanFilter =
+      skippedReaderFilter ? tableHandle_->remainingFilter() : remainingFilter;
+  if (postScanFilter) {
+    remainingFilterExprSet_ = expressionEvaluator_->compile(postScanFilter);
     for (const auto& field : remainingFilterExprSet_->distinctFields()) {
       // Add fields in the filter to the columns to read if not there
-      if (readColumnSet_.count(field->name()) == 0) {
-        readColumnSet_.emplace(field->name());
-        readColumnNames_.emplace_back(field->name());
-      }
+      addReadColumn(field->field());
     }
 
     auto const remainingFilterType = getTableRowType();
@@ -119,12 +189,13 @@ CudfHiveDataSource::CudfHiveDataSource(
     // readColumnNames_
   }
 
-  // Build a combined AST for all subfield filters once. This is query-constant
-  // and doesn't depend on split-specific state.
-  if (!subfieldFilters_.empty()) {
+  if (!readerSubfieldFilters.empty()) {
     auto const readerFilterType = getTableRowType();
     subfieldFilterExpr_ = &createAstFromSubfieldFilters(
-        subfieldFilters_, subfieldTree_, subfieldScalars_, readerFilterType);
+        readerSubfieldFilters,
+        subfieldTree_,
+        subfieldScalars_,
+        readerFilterType);
   }
 
   VELOX_CHECK_NOT_NULL(fileHandleFactory_, "No FileHandleFactory present");
@@ -319,6 +390,26 @@ const RowTypePtr CudfHiveDataSource::getTableRowType() {
   }
   cachedTableRowType_ = outputType_;
   return cachedTableRowType_;
+}
+
+std::string CudfHiveDataSource::toTopLevelReadColumnName(
+    std::string_view name) const {
+  if (tableHandle_ && tableHandle_->dataColumns()) {
+    const auto& dataColumns = tableHandle_->dataColumns();
+    if (dataColumns->containsChild(name)) {
+      return std::string{name};
+    }
+
+    const auto dot = name.find('.');
+    if (dot != std::string_view::npos) {
+      const auto topLevelName = name.substr(0, dot);
+      if (dataColumns->containsChild(topLevelName)) {
+        return std::string{topLevelName};
+      }
+    }
+  }
+
+  return std::string{name};
 }
 
 } // namespace facebook::velox::cudf_velox::connector::hive

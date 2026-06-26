@@ -49,6 +49,7 @@ class CudfIcebergSplitReader : public CudfSplitReader {
       std::shared_ptr<const velox_hive::HiveTableHandle> tableHandle,
       const RowTypePtr& outputType,
       const std::vector<std::string>& readColumnNames,
+      const std::vector<std::string>& outputReadColumnNames,
       FileHandleFactory* fileHandleFactory,
       folly::Executor* executor,
       const ::facebook::velox::connector::ConnectorQueryCtx* connectorQueryCtx,
@@ -137,6 +138,7 @@ class CudfIcebergSplitReader : public CudfSplitReader {
 
   std::shared_ptr<const velox_iceberg::HiveIcebergSplit> icebergSplit_;
   std::shared_ptr<const velox_hive::HiveConfig> hiveConfig_;
+  std::vector<std::string> outputReadColumnNames_;
 
   // cuDF-accelerated reader for Iceberg V3 deletion vector (Puffin-encoded
   // roaring bitmaps).

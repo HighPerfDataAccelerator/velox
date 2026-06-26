@@ -271,4 +271,24 @@ inline bool containsAstUnsupportedType(
   return false;
 }
 
+/// Returns true if expr's output type or any descendant output type is DECIMAL.
+/// Decimal expressions are handled by FunctionExpression today; selecting
+/// AST/JIT for a boolean parent can otherwise reach decimal literals during AST
+/// construction.
+inline bool containsDecimalTypeRecursive(
+    const std::shared_ptr<velox::exec::Expr>& expr) {
+  if (!expr) {
+    return false;
+  }
+  if (expr->type() && expr->type()->isDecimal()) {
+    return true;
+  }
+  for (const auto& input : expr->inputs()) {
+    if (containsDecimalTypeRecursive(input)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 } // namespace facebook::velox::cudf_velox

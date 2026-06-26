@@ -161,8 +161,9 @@ RowVectorPtr CudfFromVelox::doGetOutput() {
 
   VELOX_CHECK_NOT_NULL(tbl);
 
-  // Return a CudfVector that owns the cudf table
-  const auto size = tbl->num_rows();
+  // cuDF zero-column tables do not have a row count, so preserve the
+  // RowVector logical size for count/materialization paths.
+  const auto size = tbl->num_columns() == 0 ? input->size() : tbl->num_rows();
 
   return std::make_shared<CudfVector>(
       input->pool(), outputType_, size, std::move(tbl), stream);

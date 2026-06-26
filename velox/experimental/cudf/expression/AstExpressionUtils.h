@@ -37,8 +37,22 @@
 #include <cudf/unary.hpp>
 #include <cudf/utilities/traits.hpp>
 
+#include <unordered_set>
+
 namespace facebook::velox::cudf_velox {
 namespace {
+
+const std::unordered_set<std::string> kFunctionExprNames = {
+    "might_contain",
+    "xxhash64_with_seed",
+    "hash_with_seed",
+    "murmur3hash_with_seed",
+    "row_constructor",
+    "row_constructor_with_null",
+    "row_constructor_with_all_null",
+};
+
+constexpr const char* kTimestampCastInstruction = "timestamp_cast";
 
 cudf::ast::literal createLiteral(
     const VectorPtr& vector,
@@ -156,6 +170,7 @@ const std::unordered_map<std::string, Op> sparkBinaryOps = {
     {"multiply", Op::MUL},
     {"divide", Op::DIV},
     {"equalto", Op::EQUAL},
+    {"equalnullsafe", Op::NULL_EQUAL},
     {"lessthan", Op::LESS},
     {"greaterthan", Op::GREATER},
     {"lessthanorequal", Op::LESS_EQUAL},
@@ -196,6 +211,7 @@ const std::unordered_map<std::string, Op> prestoUnaryOps = {
 const std::unordered_map<std::string, Op> sparkUnaryOps = {
     {"not", Op::NOT},
     {"is_null", Op::IS_NULL},
+    {"isnull", Op::IS_NULL},
     // Trigonometric functions
     {"sin", Op::SIN},
     {"cos", Op::COS},
@@ -267,6 +283,60 @@ bool isOpAndInputsSupported(
   return false;
 }
 
+bool isComparisonOp(const cudf::ast::ast_operator op) {
+  switch (op) {
+    case Op::EQUAL:
+    case Op::NULL_EQUAL:
+    case Op::NOT_EQUAL:
+    case Op::LESS:
+    case Op::GREATER:
+    case Op::LESS_EQUAL:
+    case Op::GREATER_EQUAL:
+      return true;
+    default:
+      return false;
+  }
+}
+
+bool isTopLevelFieldReference(
+    const std::shared_ptr<velox::exec::Expr>& expr) {
+  using velox::exec::FieldReference;
+  auto fieldExpr = std::dynamic_pointer_cast<FieldReference>(expr);
+  if (!fieldExpr || !fieldExpr->inputs().empty()) {
+    return false;
+  }
+  const auto name =
+      stripPrefix(expr->name(), CudfConfig::getInstance().functionNamePrefix);
+  return fieldExpr->field() == name;
+}
+
+bool isTimestampFieldComparison(
+    const std::shared_ptr<velox::exec::Expr>& expr) {
+  const auto name =
+      stripPrefix(expr->name(), CudfConfig::getInstance().functionNamePrefix);
+  const auto it = binaryOps.find(name);
+  if (it == binaryOps.end() || !isComparisonOp(it->second)) {
+    return false;
+  }
+
+  const auto& inputs = expr->inputs();
+  if (inputs.size() != 2 || !inputs[0]->type()->isTimestamp() ||
+      !inputs[1]->type()->isTimestamp() ||
+      !isTopLevelFieldReference(inputs[0]) ||
+      !isTopLevelFieldReference(inputs[1])) {
+    return false;
+  }
+
+  try {
+    return isOpAndInputsSupported(
+        it->second,
+        {veloxToCudfDataType(inputs[0]->type()),
+         veloxToCudfDataType(inputs[1]->type())});
+  } catch (...) {
+    return false;
+  }
+}
+
 // not special form, name = function, so unsupported for astpure
 // "in", "between", "isnotnull" are not special form, but supported for astpure
 // enum class SpecialFormKind : int32_t {
@@ -286,6 +356,14 @@ bool isAstExprSupported(const std::shared_ptr<velox::exec::Expr>& expr) {
   using velox::exec::FieldReference;
   using Op = cudf::ast::ast_operator;
 
+  const auto name =
+      stripPrefix(expr->name(), CudfConfig::getInstance().functionNamePrefix);
+  const auto len = expr->inputs().size();
+
+  if (isTimestampFieldComparison(expr)) {
+    return true;
+  }
+
   // Reject expressions with types not yet supported in AST/JIT (currently
   // TIMESTAMP and DECIMAL).
   if (containsAstUnsupportedType(expr)) {
@@ -295,10 +373,6 @@ bool isAstExprSupported(const std::shared_ptr<velox::exec::Expr>& expr) {
     }
     return false;
   }
-
-  const auto name =
-      stripPrefix(expr->name(), CudfConfig::getInstance().functionNamePrefix);
-  const auto len = expr->inputs().size();
 
   // Literals and top-level field references are always supported in pure
   // AST/JIT. Nested field references are delegated to FunctionExpression so
@@ -334,6 +408,10 @@ bool isAstExprSupported(const std::shared_ptr<velox::exec::Expr>& expr) {
     LOG(WARNING) << "Nested FieldReference is not supported by AST/JIT and "
                  << "will fall back to FunctionExpression: "
                  << expr->toString();
+    return false;
+  }
+
+  if (kFunctionExprNames.count(name)) {
     return false;
   }
 
@@ -424,6 +502,10 @@ struct AstContext {
 
   cudf::ast::expression const& pushExprToTree(
       const std::shared_ptr<velox::exec::Expr>& expr);
+  cudf::ast::expression const& pushFieldReferenceToTree(
+      const std::shared_ptr<velox::exec::FieldReference>& fieldExpr);
+  cudf::ast::expression const& pushTimestampFieldReferenceToTree(
+      const std::shared_ptr<velox::exec::FieldReference>& fieldExpr);
   cudf::ast::expression const& addPrecomputeInstructionOnSide(
       size_t sideIdx,
       size_t columnIndex,
@@ -530,6 +612,52 @@ cudf::ast::expression const& AstContext::addPrecomputeInstruction(
   VELOX_FAIL("Field not found: {}", name);
 }
 
+cudf::ast::expression const& AstContext::pushFieldReferenceToTree(
+    const std::shared_ptr<velox::exec::FieldReference>& fieldExpr) {
+  const auto name = stripPrefix(
+      fieldExpr->name(), CudfConfig::getInstance().functionNamePrefix);
+  const auto fieldName =
+      fieldExpr->inputs().empty() ? name : fieldExpr->inputs()[0]->name();
+  for (size_t sideIdx = 0; sideIdx < inputRowSchema.size(); ++sideIdx) {
+    auto& schema = inputRowSchema[sideIdx];
+    if (schema.get()->containsChild(fieldName)) {
+      auto columnIndex = schema.get()->getChildIdx(fieldName);
+      // This column may be complex data type like ROW, we need to get the
+      // name from row. Push fieldName.name to the tree.
+      auto side = static_cast<cudf::ast::table_reference>(sideIdx);
+      if (fieldExpr->field() == fieldName) {
+        return tree.push(cudf::ast::column_reference(columnIndex, side));
+      } else if (!allowPureAstOnly) {
+        return addPrecomputeInstruction(
+            fieldName, "nested_column", fieldExpr->field());
+      } else {
+        VELOX_FAIL("Unsupported type for nested column operation");
+      }
+    }
+  }
+  VELOX_FAIL("Field not found: {}", name);
+}
+
+cudf::ast::expression const& AstContext::pushTimestampFieldReferenceToTree(
+    const std::shared_ptr<velox::exec::FieldReference>& fieldExpr) {
+  const auto name = stripPrefix(
+      fieldExpr->name(), CudfConfig::getInstance().functionNamePrefix);
+  const auto fieldName =
+      fieldExpr->inputs().empty() ? name : fieldExpr->inputs()[0]->name();
+  for (size_t sideIdx = 0; sideIdx < inputRowSchema.size(); ++sideIdx) {
+    auto& schema = inputRowSchema[sideIdx];
+    if (schema.get()->containsChild(fieldName)) {
+      auto columnIndex = schema.get()->getChildIdx(fieldName);
+      if (fieldExpr->field() == fieldName) {
+        return addPrecomputeInstructionOnSide(
+            sideIdx, columnIndex, kTimestampCastInstruction, "");
+      }
+      VELOX_FAIL("Unsupported nested timestamp field operation");
+    }
+  }
+  VELOX_FAIL("Field not found: {}", name);
+}
+
 /// Handles logical AND/OR expressions with multiple inputs by converting them
 /// into a chain of binary operations. For example, "a AND b AND c" becomes
 /// "(a AND b) AND c".
@@ -627,6 +755,17 @@ cudf::ast::expression const& AstContext::pushExprToTree(
       return multipleInputsToPairWise(expr);
     }
     VELOX_CHECK_EQ(len, 2);
+    if (detail::isTimestampFieldComparison(expr)) {
+      auto leftField =
+          std::dynamic_pointer_cast<FieldReference>(expr->inputs()[0]);
+      auto rightField =
+          std::dynamic_pointer_cast<FieldReference>(expr->inputs()[1]);
+      VELOX_CHECK_NOT_NULL(leftField);
+      VELOX_CHECK_NOT_NULL(rightField);
+      auto const& op1 = pushTimestampFieldReferenceToTree(leftField);
+      auto const& op2 = pushTimestampFieldReferenceToTree(rightField);
+      return tree.push(Operation{binaryOps.at(name), op1, op2});
+    }
     auto const& op1 = pushExprToTree(expr->inputs()[0]);
     auto const& op2 = pushExprToTree(expr->inputs()[1]);
     return tree.push(Operation{binaryOps.at(name), op1, op2});
@@ -706,27 +845,7 @@ cudf::ast::expression const& AstContext::pushExprToTree(
       VELOX_FAIL("Unsupported type for cast operation");
     }
   } else if (auto fieldExpr = std::dynamic_pointer_cast<FieldReference>(expr)) {
-    // Refer to the appropriate side
-    const auto fieldName =
-        fieldExpr->inputs().empty() ? name : fieldExpr->inputs()[0]->name();
-    for (size_t sideIdx = 0; sideIdx < inputRowSchema.size(); ++sideIdx) {
-      auto& schema = inputRowSchema[sideIdx];
-      if (schema.get()->containsChild(fieldName)) {
-        auto columnIndex = schema.get()->getChildIdx(fieldName);
-        // This column may be complex data type like ROW, we need to get the
-        // name from row. Push fieldName.name to the tree.
-        auto side = static_cast<cudf::ast::table_reference>(sideIdx);
-        if (fieldExpr->field() == fieldName) {
-          return tree.push(cudf::ast::column_reference(columnIndex, side));
-        } else if (!allowPureAstOnly) {
-          return addPrecomputeInstruction(
-              fieldName, "nested_column", fieldExpr->field());
-        } else {
-          VELOX_FAIL("Unsupported type for nested column operation");
-        }
-      }
-    }
-    VELOX_FAIL("Field not found: {}", name);
+    return pushFieldReferenceToTree(fieldExpr);
   } else {
     VELOX_UNREACHABLE("Unsupported expression: {}", name);
   }
@@ -793,6 +912,16 @@ std::vector<ColumnOrView> precomputeSubexpressions(
       auto view = inputColumnViews[dependent_column_index].child(
           nested_dependent_column_indices[0]);
       precomputedColumns.push_back(view);
+    } else if (ins_name == kTimestampCastInstruction) {
+      auto targetType =
+          cudf::data_type{CudfConfig::getInstance().timestampUnit};
+      auto view = inputColumnViews[dependent_column_index];
+      if (view.type() == targetType) {
+        precomputedColumns.push_back(view);
+      } else {
+        precomputedColumns.push_back(
+            cudf::cast(view, targetType, stream, get_output_mr()));
+      }
     } else {
       VELOX_FAIL("Unsupported precompute operation {}", ins_name);
     }

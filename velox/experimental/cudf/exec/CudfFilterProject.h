@@ -23,7 +23,10 @@
 #include "velox/core/PlanNode.h"
 #include "velox/exec/FilterProject.h"
 #include "velox/exec/Operator.h"
+#include "velox/expression/ConstantExpr.h"
 #include "velox/vector/ComplexVector.h"
+
+#include <cudf/scalar/scalar.hpp>
 
 namespace facebook::velox::cudf_velox {
 
@@ -48,7 +51,8 @@ class CudfFilterProject : public CudfOperatorBase {
 
   std::vector<std::unique_ptr<cudf::column>> project(
       std::vector<std::unique_ptr<cudf::column>>& inputTableColumns,
-      rmm::cuda_stream_view stream);
+      rmm::cuda_stream_view stream,
+      vector_size_t outputSize);
 
   exec::BlockingReason isBlocked(ContinueFuture* /*future*/) override {
     return exec::BlockingReason::kNotBlocked;
@@ -63,10 +67,17 @@ class CudfFilterProject : public CudfOperatorBase {
   void doClose() override {
     Operator::close();
     projectEvaluators_.clear();
+    literalScalars_.clear();
+    nullComplexLiteralProjections_.clear();
     filterEvaluator_.reset();
   }
 
  private:
+  struct NullComplexLiteralProjection {
+    TypePtr type;
+    column_index_t outputChannel;
+  };
+
   bool allInputProcessed();
 
   // If true exprs_[0] is a filter and the other expressions are projections
@@ -81,6 +92,9 @@ class CudfFilterProject : public CudfOperatorBase {
   CudfExpressionPtr filterEvaluator_;
 
   std::vector<velox::exec::IdentityProjection> resultProjections_;
+  std::vector<velox::exec::IdentityProjection> literalProjections_;
+  std::vector<std::unique_ptr<cudf::scalar>> literalScalars_;
+  std::vector<NullComplexLiteralProjection> nullComplexLiteralProjections_;
   std::vector<velox::exec::IdentityProjection> identityProjections_;
 };
 

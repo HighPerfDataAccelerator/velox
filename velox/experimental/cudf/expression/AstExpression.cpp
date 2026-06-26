@@ -124,6 +124,13 @@ ColumnOrView ASTExpression::eval(
 }
 
 bool ASTExpression::canEvaluate(std::shared_ptr<velox::exec::Expr> expr) {
+  if (containsDecimalTypeRecursive(expr)) {
+    if (cudf_velox::CudfConfig::getInstance().debugEnabled) {
+      LOG(WARNING) << "Expression contains DECIMAL and will not use AST/JIT: "
+                   << expr->toString();
+    }
+    return false;
+  }
   return detail::isAstExprSupported(expr);
 }
 

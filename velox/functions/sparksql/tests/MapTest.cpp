@@ -20,10 +20,25 @@
 #include "velox/functions/sparksql/tests/SparkFunctionBaseTest.h"
 #include "velox/type/Variant.h"
 
+#include <map>
 #include <stdint.h>
+#include <sstream>
 
 namespace facebook::velox::functions::sparksql::test {
 namespace {
+
+std::string makeMapExpression(int numArgs) {
+  std::ostringstream expression;
+  expression << "map(";
+  for (int i = 0; i < numArgs; ++i) {
+    if (i > 0) {
+      expression << ", ";
+    }
+    expression << "c" << i;
+  }
+  expression << ")";
+  return expression.str();
+}
 
 class MapTest : public SparkFunctionBaseTest {
  protected:
@@ -212,6 +227,28 @@ TEST_F(MapTest, tenKeyValuePairs) {
       expectedMap);
 }
 
+TEST_F(MapTest, fourteenKeyValuePairs) {
+  constexpr int kNumPairs = 14;
+  std::vector<VectorPtr> args;
+  args.reserve(kNumPairs * 2);
+
+  std::vector<std::map<int64_t, std::string>> expectedRows(3);
+  for (int i = 0; i < kNumPairs; ++i) {
+    const auto key = i + 1;
+    const auto value = "v" + std::to_string(key);
+    args.push_back(makeFlatVector<int64_t>({key, key + 100, key + 200}));
+    args.push_back(
+        makeFlatVector<std::string>({value, value + "_r1", value + "_r2"}));
+
+    expectedRows[0][key] = value;
+    expectedRows[1][key + 100] = value + "_r1";
+    expectedRows[2][key + 200] = value + "_r2";
+  }
+
+  auto expectedMap = makeMapVector<int64_t, std::string>(expectedRows);
+  testMap(makeMapExpression(kNumPairs * 2), args, expectedMap);
+}
+
 TEST_F(MapTest, errorCases) {
   auto inputVectorInt64 = makeNullableFlatVector<int64_t>({1, 2, 3});
   auto inputVectorDouble = makeNullableFlatVector<double>({4.0, 5.0, 6.0});
@@ -227,19 +264,17 @@ TEST_F(MapTest, errorCases) {
       {inputVectorInt64, inputVectorDouble, inputVectorInt64},
       "Scalar function signature is not supported: map(BIGINT, DOUBLE, BIGINT)");
 
-  // Test with 22 arguments (11 pairs) - exceeds the maximum of 10 key-value
-  // pairs supported by the map function.
+  // Test with 130 arguments (65 pairs) - exceeds the supported number of
+  // key-value pairs.
+  std::vector<VectorPtr> unsupportedArgs;
+  unsupportedArgs.reserve(130);
+  for (int i = 0; i < 130; ++i) {
+    unsupportedArgs.push_back(inputVectorDouble);
+  }
   testMapFails(
-      "map(c0, c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11, c12, c13, c14, c15, c16, c17, c18, c19, c20, c21)",
-      {inputVectorDouble, inputVectorDouble, inputVectorDouble,
-       inputVectorDouble, inputVectorDouble, inputVectorDouble,
-       inputVectorDouble, inputVectorDouble, inputVectorDouble,
-       inputVectorDouble, inputVectorDouble, inputVectorDouble,
-       inputVectorDouble, inputVectorDouble, inputVectorDouble,
-       inputVectorDouble, inputVectorDouble, inputVectorDouble,
-       inputVectorDouble, inputVectorDouble, inputVectorDouble,
-       inputVectorDouble},
-      "Scalar function signature is not supported: map(DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE, DOUBLE)");
+      makeMapExpression(130),
+      unsupportedArgs,
+      "Scalar function signature is not supported: map(");
 
   // Types of args.
   testMapFails(

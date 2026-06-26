@@ -157,13 +157,13 @@ class FunctionExpression : public CudfExpression {
   // (does not recursively check children)
   static bool canEvaluate(std::shared_ptr<velox::exec::Expr> expr);
 
- private:
   static std::unique_ptr<cudf::column> makeStructChildColumn(
       ColumnOrView& structColumn,
       cudf::size_type childIndex,
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr);
 
+ private:
   std::shared_ptr<velox::exec::Expr> expr_;
   std::shared_ptr<CudfFunction> function_;
   std::vector<std::shared_ptr<CudfExpression>> subexpressions_;
@@ -186,5 +186,8 @@ std::shared_ptr<CudfExpression> createCudfExpression(
 bool canBeEvaluatedByCudf(
     std::shared_ptr<velox::exec::Expr> expr,
     bool deep = true);
+
+bool isNullComplexConstantLiteral(
+    const std::shared_ptr<velox::exec::Expr>& expr);
 
 } // namespace facebook::velox::cudf_velox

@@ -52,20 +52,22 @@ std::vector<column_index_t> reorderInputChannels(
   std::vector<column_index_t> channels;
   channels.reserve(size);
 
-  std::unordered_set<std::string> keyNames;
+  std::unordered_set<column_index_t> keyChannels;
 
   for (const auto& key : partitionKeys) {
-    channels.push_back(exprToChannel(key.get(), inputType));
-    keyNames.insert(key->name());
+    const auto channel = exprToChannel(key.get(), inputType);
+    channels.push_back(channel);
+    keyChannels.insert(channel);
   }
 
   for (const auto& key : sortingKeys) {
-    channels.push_back(exprToChannel(key.get(), inputType));
-    keyNames.insert(key->name());
+    const auto channel = exprToChannel(key.get(), inputType);
+    channels.push_back(channel);
+    keyChannels.insert(channel);
   }
 
   for (auto i = 0; i < size; ++i) {
-    if (keyNames.count(inputType->nameOf(i)) == 0) {
+    if (keyChannels.count(i) == 0) {
       channels.push_back(i);
     }
   }

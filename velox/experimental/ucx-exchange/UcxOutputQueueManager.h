@@ -58,6 +58,13 @@ class UcxOutputQueueManager {
       int numBuffers,
       bool noMoreBuffers);
 
+  /// Same as updateOutputBuffers(), but returns false instead of failing when
+  /// the UCX output queue has not been created for this task.
+  bool updateOutputBuffersIfExists(
+      std::string_view taskId,
+      int numBuffers,
+      bool noMoreBuffers);
+
   /// @brief Enqueues a cudf packed column into the queue.
   /// @param taskId The unique task Id.
   /// @param destination The destination (partition, queue number) into which

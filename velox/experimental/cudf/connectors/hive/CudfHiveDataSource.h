@@ -100,6 +100,10 @@ class CudfHiveDataSource : public DataSource, public NvtxHelper {
   // Columns to read.
   std::vector<std::string> readColumnNames_;
 
+  // One entry per output column, using the physical read column name from the
+  // column handle rather than the TableScan output name.
+  std::vector<std::string> outputReadColumnNames_;
+
   std::shared_ptr<io::IoStatistics> ioStatistics_;
   std::shared_ptr<velox::IoStats> ioStats_;
 
@@ -114,6 +118,7 @@ class CudfHiveDataSource : public DataSource, public NvtxHelper {
  private:
   // Construct and cache a RowTypePtr for the table column names and types.
   const RowTypePtr getTableRowType();
+  std::string toTopLevelReadColumnName(std::string_view name) const;
   RowTypePtr cachedTableRowType_{};
 
   memory::MemoryPool* const pool_;
