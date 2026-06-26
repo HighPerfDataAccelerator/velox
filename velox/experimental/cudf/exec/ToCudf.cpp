@@ -279,10 +279,9 @@ bool CompileState::compile(bool allowCpuFallback) {
               id, planNode->outputType(), ctx, planNode->id() + "-to-velox"));
     }
 
-    if (!allowCpuFallback && isPureCpuOperator &&
-        isMppFinalOutputBoundary(oper, planNode)) {
+    if (isPureCpuOperator && isMppFinalOutputBoundary(oper, planNode)) {
       LOG(WARNING)
-          << "Allowing MPP final output boundary under cuDF no-fallback gate: "
+          << "Allowing MPP final output boundary outside cuDF fallback accounting: "
           << oper->toString();
       isPureCpuOperator = false;
     }
