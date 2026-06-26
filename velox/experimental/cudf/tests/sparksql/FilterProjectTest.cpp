@@ -318,6 +318,31 @@ TEST_F(CudfFilterProjectTest, getSupportedScalarElementTypes) {
   assertGetElementTypeMatchesCpu("timestamp", timestampArrays);
 }
 
+TEST_F(CudfFilterProjectTest, decimalComparisonAliases) {
+  auto input = makeRowVector(
+      {
+          makeNullableFlatVector<int64_t>(
+              {120, 150, 100, std::nullopt}, DECIMAL(10, 2)),
+          makeNullableFlatVector<int64_t>(
+              {120, 100, 200, 120}, DECIMAL(10, 2)),
+          makeNullableFlatVector<double>({0.0, 1.25, -1.5, std::nullopt}),
+      });
+
+  for (const auto& expression : {
+           "decimal_equalto(c0, c1)",
+           "decimal_notequalto(c0, c1)",
+           "decimal_greaterthan(c0, c1)",
+           "decimal_greaterthanorequal(c0, c1)",
+           "decimal_lessthan(c0, c1)",
+           "decimal_lessthanorequal(c0, c1)",
+           "decimal_equalto("
+           "try_cast(c2 as decimal(16, 5)), "
+           "cast(0.00000 as decimal(16, 5)))",
+       }) {
+    assertExpressionMatchesCpu(expression, input, input->rowType());
+  }
+}
+
 TEST_F(CudfFilterProjectTest, getSupportedComplexElementTypes) {
   // Cover complex ARRAY element types that cuDF list extraction can return.
   using OptionalIntArray = std::optional<std::vector<std::optional<int32_t>>>;

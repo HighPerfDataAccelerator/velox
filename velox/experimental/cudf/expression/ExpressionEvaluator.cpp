@@ -2480,20 +2480,27 @@ bool registerBuiltinFunctions(const std::string& prefix) {
   };
 
   registerComparisonOp(
-      {prefix + "equalto", prefix + "eq"}, cudf::binary_operator::EQUAL);
+      {prefix + "equalto", prefix + "eq", prefix + "decimal_equalto"},
+      cudf::binary_operator::EQUAL);
   registerComparisonOp(
-      {prefix + "notequalto", prefix + "neq"},
+      {prefix + "notequalto", prefix + "neq", prefix + "decimal_notequalto"},
       cudf::binary_operator::NOT_EQUAL);
   registerComparisonOp(
-      {prefix + "greaterthanorequal", prefix + "gte"},
+      {prefix + "greaterthanorequal",
+       prefix + "gte",
+       prefix + "decimal_greaterthanorequal"},
       cudf::binary_operator::GREATER_EQUAL);
   registerComparisonOp(
-      {prefix + "lessthanorequal", prefix + "lte"},
+      {prefix + "lessthanorequal",
+       prefix + "lte",
+       prefix + "decimal_lessthanorequal"},
       cudf::binary_operator::LESS_EQUAL);
   registerComparisonOp(
-      {prefix + "greaterthan", prefix + "gt"}, cudf::binary_operator::GREATER);
+      {prefix + "greaterthan", prefix + "gt", prefix + "decimal_greaterthan"},
+      cudf::binary_operator::GREATER);
   registerComparisonOp(
-      {prefix + "lessthan", prefix + "lt"}, cudf::binary_operator::LESS);
+      {prefix + "lessthan", prefix + "lt", prefix + "decimal_lessthan"},
+      cudf::binary_operator::LESS);
 
   //
   // regular unary operators
