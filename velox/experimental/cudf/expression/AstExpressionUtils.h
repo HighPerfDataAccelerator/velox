@@ -389,10 +389,15 @@ bool isAstExprSupported(const std::shared_ptr<velox::exec::Expr>& expr) {
                Op::EQUAL, {inputCudfDataTypes[0], inputCudfDataTypes[0]});
   }
 
-  // Cast operations: only INTEGER, BIGINT, DOUBLE supported in pure AST
+  // Cast operations: BIGINT and DOUBLE are supported in pure AST. cuDF AST only
+  // has CAST_TO_INT64, so INTEGER casts must be precomputed to preserve INT32
+  // output type before a parent AST comparison sees the value.
   if ((name == "cast" || name == "try_cast") && len == 1) {
     const auto outputKind = expr->type()->kind();
-    if (outputKind == TypeKind::INTEGER || outputKind == TypeKind::BIGINT) {
+    if (outputKind == TypeKind::INTEGER) {
+      return false;
+    }
+    if (outputKind == TypeKind::BIGINT) {
       return isOpAndInputsSupported(Op::CAST_TO_INT64, inputCudfDataTypes);
     }
     if (outputKind == TypeKind::DOUBLE) {
@@ -692,8 +697,7 @@ cudf::ast::expression const& AstContext::pushExprToTree(
     VELOX_CHECK_EQ(len, 1);
     auto const& op1 = pushExprToTree(expr->inputs()[0]);
     if (expr->type()->kind() == TypeKind::INTEGER) {
-      // No int32 cast in cudf ast
-      return tree.push(Operation{Op::CAST_TO_INT64, op1});
+      VELOX_FAIL("INTEGER casts must be precomputed outside cuDF AST");
     } else if (expr->type()->kind() == TypeKind::BIGINT) {
       return tree.push(Operation{Op::CAST_TO_INT64, op1});
     } else if (expr->type()->kind() == TypeKind::DOUBLE) {
