@@ -60,7 +60,8 @@ bool isFieldAccessExpr(const core::TypedExprPtr& expr) {
       nullptr;
 }
 
-bool isDefaultRowNumberFrame(const core::WindowNode::Frame& frame) {
+bool isUnboundedPrecedingToCurrentRowFrame(
+    const core::WindowNode::Frame& frame) {
   return frame.startType ==
       core::WindowNode::BoundType::kUnboundedPreceding &&
       frame.endType == core::WindowNode::BoundType::kCurrentRow &&
@@ -78,7 +79,7 @@ bool isSupportedRankLikeFunction(const core::WindowNode::Function& function) {
   const auto& name = function.functionCall->name();
   if ((name != "row_number" && name != "rank") || function.ignoreNulls ||
       !function.functionCall->inputs().empty() ||
-      !isDefaultRowNumberFrame(function.frame)) {
+      !isUnboundedPrecedingToCurrentRowFrame(function.frame)) {
     return false;
   }
 
@@ -111,6 +112,19 @@ bool isSupportedFullPartitionSumFunction(
   return isFieldAccessExpr(input) && isSupportedSumInputType(input->type());
 }
 
+bool isSupportedFirstValueFunction(
+    const core::WindowNode::Function& function) {
+  const auto& name = function.functionCall->name();
+  if ((name != "first" && name != "first_value") || function.ignoreNulls ||
+      function.functionCall->inputs().size() != 1 ||
+      !isUnboundedPrecedingToCurrentRowFrame(function.frame)) {
+    return false;
+  }
+
+  const auto& input = function.functionCall->inputs()[0];
+  return isFieldAccessExpr(input) && isSupportedScalarWindowType(input->type());
+}
+
 std::vector<cudf::column_view> selectColumns(
     cudf::table_view const& table,
     const std::vector<cudf::size_type>& channels) {
@@ -132,21 +146,28 @@ bool isSupportedCudfWindowNode(
 
   bool hasRowNumber = false;
   bool hasFullPartitionSum = false;
+  bool hasFirstValue = false;
   for (const auto& function : node->windowFunctions()) {
     if (isSupportedRankLikeFunction(function)) {
       hasRowNumber = true;
     } else if (isSupportedFullPartitionSumFunction(function)) {
       hasFullPartitionSum = true;
+    } else if (isSupportedFirstValueFunction(function)) {
+      hasFirstValue = true;
     } else {
       return false;
     }
   }
 
-  if (hasRowNumber && node->sortingKeys().empty()) {
+  if ((hasRowNumber || hasFirstValue) && node->sortingKeys().empty()) {
     return false;
   }
 
-  if (hasRowNumber && hasFullPartitionSum) {
+  if (hasFirstValue && node->partitionKeys().empty()) {
+    return false;
+  }
+
+  if ((hasRowNumber || hasFirstValue) && hasFullPartitionSum) {
     return false;
   }
 
@@ -449,6 +470,90 @@ std::unique_ptr<cudf::column> CudfWindow::computeFullPartitionSumColumn(
   return std::move(scattered->release()[0]);
 }
 
+std::unique_ptr<cudf::column> CudfWindow::computePartitionFirstColumn(
+    cudf::table_view const& sortedInput,
+    const core::WindowNode::Function& function,
+    const TypePtr& expectedType,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) const {
+  VELOX_CHECK(!partitionKeyChannels_.empty());
+
+  const auto valueChannel =
+      exec::exprToChannel(function.functionCall->inputs()[0].get(), inputType_);
+  VELOX_CHECK(
+      valueChannel != kConstantChannel,
+      "Window first input must be a column");
+
+  auto partitionColumns = selectColumns(sortedInput, partitionKeyChannels_);
+
+  cudf::groupby::groupby grouper(
+      cudf::table_view(partitionColumns),
+      cudf::null_policy::INCLUDE,
+      cudf::sorted::YES,
+      std::vector<cudf::order>(
+          partitionKeyChannels_.size(), cudf::order::ASCENDING),
+      std::vector<cudf::null_order>(
+          partitionKeyChannels_.size(), cudf::null_order::BEFORE));
+
+  std::vector<cudf::groupby::aggregation_request> requests(1);
+  requests[0].values = sortedInput.column(valueChannel);
+  requests[0].aggregations.push_back(
+      cudf::make_nth_element_aggregation<cudf::groupby_aggregation>(
+          0, cudf::null_policy::INCLUDE));
+
+  auto [groupKeys, results] = grouper.aggregate(requests, stream, mr);
+  VELOX_CHECK_EQ(results.size(), 1);
+  VELOX_CHECK_EQ(results[0].results.size(), 1);
+
+  auto firstByGroup = std::move(results[0].results[0]);
+  const auto expectedCudfType = veloxToCudfDataType(expectedType);
+  if (firstByGroup->type() != expectedCudfType) {
+    firstByGroup =
+        cudf::cast(firstByGroup->view(), expectedCudfType, stream, mr);
+  }
+
+  cudf::hash_join lookup(
+      groupKeys->view(),
+      cudf::nullable_join::YES,
+      cudf::null_equality::EQUAL,
+      0.5,
+      stream);
+
+  auto [leftJoinIndices, rightJoinIndices] = lookup.left_join(
+      cudf::table_view(partitionColumns),
+      static_cast<std::size_t>(sortedInput.num_rows()),
+      stream,
+      mr);
+
+  auto leftIndicesCol = cudf::column_view{
+      cudf::device_span<cudf::size_type const>{*leftJoinIndices}};
+  auto rightIndicesCol = cudf::column_view{
+      cudf::device_span<cudf::size_type const>{*rightJoinIndices}};
+
+  auto gatheredFirstValues = cudf::gather(
+      cudf::table_view{{firstByGroup->view()}},
+      rightIndicesCol,
+      cudf::out_of_bounds_policy::NULLIFY,
+      stream,
+      mr);
+  auto gatheredColumns = gatheredFirstValues->release();
+  VELOX_CHECK_EQ(gatheredColumns.size(), 1);
+
+  auto target = cudf::allocate_like(
+      gatheredColumns[0]->view(),
+      sortedInput.num_rows(),
+      cudf::mask_allocation_policy::RETAIN,
+      stream,
+      mr);
+  auto scattered = cudf::scatter(
+      cudf::table_view{{gatheredColumns[0]->view()}},
+      leftIndicesCol,
+      cudf::table_view{{target->view()}},
+      stream,
+      mr);
+  return std::move(scattered->release()[0]);
+}
+
 std::unique_ptr<cudf::table> CudfWindow::computeOutputTable(
     std::unique_ptr<cudf::table> input,
     rmm::cuda_stream_view stream,
@@ -532,6 +637,13 @@ std::unique_ptr<cudf::table> CudfWindow::computeOutputTable(
     if (functionName == "rank") {
       resultColumns.push_back(computeRankColumn(
           sortedView, outputType_->childAt(inputSize + i), stream, mr));
+    } else if (functionName == "first" || functionName == "first_value") {
+      resultColumns.push_back(computePartitionFirstColumn(
+          sortedView,
+          function,
+          outputType_->childAt(inputSize + i),
+          stream,
+          mr));
     } else {
       resultColumns.push_back(computeRowNumberColumn(
           sortedView, outputType_->childAt(inputSize + i), stream, mr));
