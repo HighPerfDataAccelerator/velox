@@ -22,6 +22,7 @@
 #include <velox/exec/Task.h>
 #include <velox/experimental/ucx-exchange/UcxOutputQueueManager.h>
 #include <chrono>
+#include <functional>
 #include <future>
 #include <memory>
 #include <tuple>
@@ -40,6 +41,7 @@ class UcxExchangeServer
   enum class ServerState : uint32_t {
     Created,
     ReadyToTransfer,
+    DataRequestReady,
     WaitingForDataFromQueue,
     DataReady,
     WaitingForSendComplete,
@@ -95,6 +97,10 @@ class UcxExchangeServer
   /// @brief Completion handler for intra-node transfer after source retrieves
   /// data.
   void onIntraNodeRetrieveComplete();
+
+  /// Registers a one-shot wakeup for the server after a published intra-node
+  /// entry is retrieved by the source.
+  std::function<void()> makeIntraNodeRetrieveWakeup();
 
   /// @brief Sets the new state of this exchange server using
   /// sequential consistency. Logs transitions at VLOG(2).

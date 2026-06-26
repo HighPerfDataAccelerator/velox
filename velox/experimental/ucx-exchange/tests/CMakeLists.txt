@@ -16,6 +16,7 @@ add_executable(
   ucx_exchange_test
   UcxOutputQueueManagerTest.cpp
   UcxExchangeTest.cpp
+  IntraNodeTransferRegistryTest.cpp
   Main.cpp
   UcxTestHelpers.cpp
   UcxTestData.cpp

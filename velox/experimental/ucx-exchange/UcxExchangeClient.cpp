@@ -103,6 +103,21 @@ UcxExchangeClient::next(int consumerId, bool* atEnd, ContinueFuture* future) {
       return data;
     }
 
+    // Revive backpressured sources on the empty/blocking path. When the queue
+    // has drained and next() is about to hand back a kWaitForProducer future,
+    // any source this client parked under backpressure must be woken now: no
+    // other thread revives a dormant source, and the consumer will not call
+    // next() again with data to trigger the data-path resume below. A consumer
+    // draining multiple exchanges (e.g. TPC-H Q17's correlated-aggregate join)
+    // otherwise hangs forever on a source that stopped reposting receives
+    // (observed as blockedWaitForProducer / WaitingForMetadata). The CAS in
+    // resumeFromBackpressure() no-ops a non-dormant source, and an empty queue
+    // can never warrant backpressure, so this is always safe.
+    if (data == nullptr &&
+        queue_->sizeLocked() <= UcxExchangeSource::kBackpressureLowWaterMark) {
+      sourcesToResume.assign(sources_.begin(), sources_.end());
+    }
+
     // TODO: Review this primitive form of flow control.
     // Maybe need to inspect the #bytes rather than the #tables?
     // Don't request more data when queue size exceeds the configured limit.
@@ -110,12 +125,12 @@ UcxExchangeClient::next(int consumerId, bool* atEnd, ContinueFuture* future) {
     // push-based — there is no mechanism to "request" or "not request" more
     // data. The server pushes unconditionally. Real backpressure is
     // implemented in UcxExchangeSource::process() (ReadyToReceive state).
-    if (data != nullptr && queue_->size() > maxQueuedColumns_) {
+    if (data != nullptr && queue_->sizeLocked() > maxQueuedColumns_) {
       if (!inFlowControl_) {
         inFlowControl_ = true;
         VLOG(1) << "[FLOW-CTRL] @" << taskId_ << " consumer=" << consumerId
                 << " entering flow control"
-                << " queueSize=" << queue_->size()
+                << " queueSize=" << queue_->sizeLocked()
                 << " maxQueued=" << maxQueuedColumns_;
       }
       return data;
@@ -123,7 +138,7 @@ UcxExchangeClient::next(int consumerId, bool* atEnd, ContinueFuture* future) {
       inFlowControl_ = false;
       VLOG(1) << "[FLOW-CTRL] @" << taskId_ << " consumer=" << consumerId
               << " leaving flow control"
-              << " queueSize=" << queue_->size()
+              << " queueSize=" << queue_->sizeLocked()
               << " maxQueued=" << maxQueuedColumns_;
     }
 
@@ -133,8 +148,8 @@ UcxExchangeClient::next(int consumerId, bool* atEnd, ContinueFuture* future) {
       if (totalDequeued_ % 1000 == 0) {
         VLOG(1) << "[PROGRESS] @" << taskId_ << " consumer=" << consumerId
                 << " dequeued=" << totalDequeued_
-                << " queueSize=" << queue_->size()
-                << " queueBytes=" << queue_->totalBytes();
+                << " queueSize=" << queue_->sizeLocked()
+                << " queueBytes=" << queue_->totalBytesLocked();
       }
     }
 
@@ -144,7 +159,7 @@ UcxExchangeClient::next(int consumerId, bool* atEnd, ContinueFuture* future) {
     // addToWorkQueue(), and holding queue_->mutex_ here would impose
     // queue_->mutex_ → WorkQueue::mutex_ ordering.
     if (data != nullptr &&
-        queue_->size() <= UcxExchangeSource::kBackpressureLowWaterMark) {
+        queue_->sizeLocked() <= UcxExchangeSource::kBackpressureLowWaterMark) {
       sourcesToResume.assign(sources_.begin(), sources_.end());
     }
   }

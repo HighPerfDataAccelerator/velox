@@ -42,6 +42,11 @@
 #include "velox/exec/TableScan.h"
 #include "velox/exec/Task.h"
 
+#ifdef VELOX_ENABLE_CUDF
+#include <velox/experimental/ucx-exchange/UcxOutputQueueManager.h>
+#include "velox/experimental/cudf/CudfConfig.h"
+#endif
+
 using facebook::velox::common::testutil::TestValue;
 
 namespace facebook::velox::exec {
@@ -207,6 +212,29 @@ std::unordered_map<core::PlanNodeId, SplitsState> buildSplitStates(
 std::string makeUuid() {
   return boost::lexical_cast<std::string>(boost::uuids::random_generator()());
 }
+
+#ifdef VELOX_ENABLE_CUDF
+bool isUcxExchangePlanNode(
+    const core::PlanNode* planNode,
+    const core::PlanNodeId& planNodeId) {
+  if (planNode == nullptr) {
+    return false;
+  }
+  if (planNode->id() == planNodeId) {
+    const auto* exchangeNode =
+        dynamic_cast<const core::ExchangeNode*>(planNode);
+    return exchangeNode != nullptr &&
+        exchangeNode->transportType() ==
+        core::ExchangeNode::TransportType::kUcx;
+  }
+  for (const auto& source : planNode->sources()) {
+    if (isUcxExchangePlanNode(source.get(), planNodeId)) {
+      return true;
+    }
+  }
+  return false;
+}
+#endif
 
 // Returns true if an operator is a hash join operator given 'operatorType'.
 bool isHashJoinOperator(const std::string& operatorType) {
@@ -1330,11 +1358,26 @@ void Task::initializePartitionOutput() {
   if (partitionedOutputNode != nullptr) {
     VELOX_CHECK(hasPartitionedOutput());
     VELOX_CHECK_GT(numOutputDrivers, 0);
+    VLOG(1) << "initializing OutputBufferManager with "
+            << partitionedOutputNode->numPartitions() << " partitions and "
+            << numOutputDrivers << " drivers";
     bufferManager->initializeTask(
         shared_from_this(),
         partitionedOutputNode->kind(),
         partitionedOutputNode->numPartitions(),
         numOutputDrivers);
+#ifdef VELOX_ENABLE_CUDF
+    if (velox::cudf_velox::CudfConfig::getInstance().enabled &&
+        velox::cudf_velox::CudfConfig::getInstance().exchange) {
+      auto queueMgr = facebook::velox::ucx_exchange::UcxOutputQueueManager::
+          getInstanceRef();
+      queueMgr->initializeTask(
+          shared_from_this(),
+          partitionedOutputNode->kind(),
+          partitionedOutputNode->numPartitions(),
+          numOutputDrivers);
+    }
+#endif
   }
 }
 
@@ -2339,7 +2382,17 @@ bool Task::updateOutputBuffers(int numBuffers, bool noMoreBuffers) {
       noMoreOutputBuffers_ = true;
     }
   }
-  return bufferManager->updateOutputBuffers(taskId_, numBuffers, noMoreBuffers);
+  auto result =
+      bufferManager->updateOutputBuffers(taskId_, numBuffers, noMoreBuffers);
+#ifdef VELOX_ENABLE_CUDF
+  if (velox::cudf_velox::CudfConfig::getInstance().enabled &&
+      velox::cudf_velox::CudfConfig::getInstance().exchange) {
+    auto queueMgr =
+        facebook::velox::ucx_exchange::UcxOutputQueueManager::getInstanceRef();
+    queueMgr->updateOutputBuffers(taskId_, numBuffers, noMoreBuffers);
+  }
+#endif
+  return result;
 }
 
 int Task::getOutputPipelineId() const {
@@ -2764,6 +2817,11 @@ ContinueFuture Task::terminate(TaskState terminalState) {
 
       // Process remaining remote splits.
       if (getExchangeClientLocked(nodeId) != nullptr) {
+#ifdef VELOX_ENABLE_CUDF
+        if (isUcxExchangePlanNode(planFragment_.planNode.get(), nodeId)) {
+          continue;
+        }
+#endif
         std::vector<exec::Split> splits;
         for (auto& [groupId, store] : state.groupSplitsStores) {
           if (!store) {
@@ -2836,12 +2894,30 @@ void Task::maybeRemoveFromOutputBufferManager() {
       // Capture output buffer stats before deleting the buffer.
       {
         std::lock_guard<std::timed_mutex> l(mutex_);
-        if (!taskStats_.outputBufferStats.has_value()) {
-          taskStats_.outputBufferStats = bufferManager->stats(taskId_);
+        auto optStats = bufferManager->stats(taskId_);
+        if (!taskStats_.outputBufferStats.has_value() && optStats.has_value()) {
+          taskStats_.outputBufferStats = optStats;
         }
       }
       bufferManager->removeTask(taskId_);
     }
+#ifdef VELOX_ENABLE_CUDF
+    if (velox::cudf_velox::CudfConfig::getInstance().enabled &&
+        velox::cudf_velox::CudfConfig::getInstance().exchange) {
+      // Capture output queue stats before deleting the queue.
+      auto queueMgr = facebook::velox::ucx_exchange::UcxOutputQueueManager::
+          getInstanceRef();
+      // Capture output buffer stats before deleting the buffer.
+      {
+        std::lock_guard<std::timed_mutex> l(mutex_);
+        auto optStats = queueMgr->stats(taskId_);
+        if (optStats.has_value() && optStats.value().totalPagesSent > 0) {
+          taskStats_.outputBufferStats = optStats;
+        }
+      }
+      queueMgr->removeTask(taskId_);
+    }
+#endif
   }
 }
 

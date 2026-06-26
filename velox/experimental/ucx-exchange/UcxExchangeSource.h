@@ -32,8 +32,8 @@
 
 #include <rmm/cuda_stream_pool.hpp>
 #include <rmm/cuda_stream_view.hpp>
+#include <rmm/device_buffer.hpp>
 #include <rmm/mr/cuda_memory_resource.hpp>
-#include <rmm/mr/device_memory_resource.hpp>
 #include <rmm/mr/pool_memory_resource.hpp>
 
 namespace facebook::velox::ucx_exchange {
@@ -70,6 +70,7 @@ class UcxExchangeSource
     WaitingForHandshakeResponse,
     ReadyToReceive,
     WaitingForMetadata,
+    WaitingForReceiveCredit,
     WaitingForData,
     WaitingForIntraNodeData,
     Done,
@@ -115,6 +116,15 @@ class UcxExchangeSource
   // Backpressure thresholds. Public so UcxExchangeClient can use them.
   static constexpr int32_t kBackpressureHighWaterMark = 32;
   static constexpr int32_t kBackpressureLowWaterMark = 16;
+
+  // Aggregate in-flight RECEIVE byte cap (in addition to the count caps above).
+  // Receive buffers are allocated off the operator memory pool (raw cudaMalloc
+  // via a process-global resource), so without a byte bound the per-peer
+  // in-flight buffers (one UcxExchangeSource per producer peer) scale
+  // O(#peers) and collectively exhaust the GPU at 4 peers (OOM at
+  // concurrentGpuTasks=2, deadlock at =1). Read once; env-overridable via
+  // GLUTEN_UCX_MAX_INFLIGHT_RECV_BYTES (default 8 GiB).
+  static int64_t maxInFlightRecvBytes();
 
   // Returns runtime statistics. ExchangeSource is expected to report
   // background CPU time by including a runtime metric named
@@ -173,7 +183,7 @@ class UcxExchangeSource
   std::shared_ptr<UcxExchangeSource> getSelfPtr();
 
   // Put the received data into the exchange queue.
-  void enqueue(PackedTableWithStreamPtr data);
+  void enqueue(PackedTableWithStreamPtr data, int64_t reservedReceiveBytes = 0);
 
   /// @brief Sets the endpoint for this receiver.
   void setEndpoint(std::shared_ptr<EndpointRef> endpointRef);
@@ -194,6 +204,12 @@ class UcxExchangeSource
   /// @param arg the serialized form of the metadata
   void onMetadata(ucs_status_t status, std::shared_ptr<void> arg);
 
+  /// @brief Reserves receive credit and posts the data receive for a metadata
+  /// packet that has already arrived.
+  bool tryStartDataReceive(
+      const std::shared_ptr<DataAndMetadata>& ptr,
+      ReceiverState expectedState);
+
   /// @brief Called by the transport layer when data is available
   /// @param status indication by transport layer of transfer status
   /// @param arg
@@ -213,7 +229,10 @@ class UcxExchangeSource
   /// @brief For intra-node transfer: handles data retrieved from registry.
   /// @param data The packed_columns from registry (nullptr if atEnd or error)
   /// @param atEnd True if this is end-of-stream
-  void onIntraNodeData(std::shared_ptr<cudf::packed_columns> data, bool atEnd);
+  void onIntraNodeData(
+      std::shared_ptr<cudf::packed_columns> data,
+      rmm::cuda_stream_view producerStream,
+      bool atEnd);
 
   /// @brief Sets the new state of this exchange source using
   /// sequential consistency. Logs transitions at VLOG(2).
@@ -234,6 +253,8 @@ class UcxExchangeSource
   /// Returns early without enqueuing if the source was never registered
   /// with the queue (i.e., registered_ is false).
   void deliverEndMarker();
+
+  void releaseReceiveReservation();
 
   /// @brief Sets the state to "desired" if and only if the current
   /// state is "expected".
@@ -283,6 +304,8 @@ class UcxExchangeSource
   // goes dormant. The consumer thread wakes it via resumeFromBackpressure()
   // when the queue drains to kBackpressureLowWaterMark.
   std::atomic<bool> backpressureActive_{false};
+  std::shared_ptr<DataAndMetadata> pendingReceive_;
+  int64_t reservedReceiveBytes_{0};
 
   // Some metrics/counters:
   UcxExchangeMetrics metrics_;

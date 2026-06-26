@@ -15,6 +15,7 @@
  */
 #include "velox/experimental/ucx-exchange/Communicator.h"
 #include <cuda_runtime.h>
+#include <folly/system/ThreadName.h>
 #include <ucxx/api.h>
 #include <ucxx/utils/ucx.h>
 #include <algorithm>
@@ -107,6 +108,9 @@ Communicator::~Communicator() {
 /// All operations of the communicator will be carried out in the thread
 /// that calls run.
 void Communicator::run() {
+  // Name the UCX progress thread so it is identifiable in nsys / thread dumps
+  // (it carries all cross-peer send/recv progress and the rendezvous waits).
+  folly::setThreadName("ucx-progress");
   VLOG(3) << "Using error handling mode: "
           << CudfConfig::getInstance().ucxxErrorHandling << std::endl;
   VLOG(3) << "Using blocking progress mode: "
@@ -199,11 +203,12 @@ void Communicator::run() {
       // this main loop via deferEndpointCleanup().
       while (auto ep = deferredEndpointCleanup_.pop()) {
         VLOG(3) << "Processing deferred endpoint cleanup";
-        // First, close all communicators associated with this endpoint.
-        // This must happen before removeEndpointRef() which may destroy
-        // the endpoint.
+        // Ask all communication elements to close, but don't closeBlocking()
+        // the endpoint yet. Source close() schedules cleanUp() on the work
+        // queue; closing the endpoint first turns those cleanups into
+        // connection resets and hides the original producer-side error.
         ep->closeAndDrainCommunicators();
-        removeEndpointRef(ep);
+        pendingEndpointRemoval_.push_back(std::move(ep));
       }
 
       // Process the work queue. Make sure that communication is progressed
@@ -218,6 +223,13 @@ void Communicator::run() {
         worker_->progress();
       }
 
+      if (!pendingEndpointRemoval_.empty()) {
+        for (auto& ep : pendingEndpointRemoval_) {
+          removeEndpointRef(ep);
+        }
+        pendingEndpointRemoval_.clear();
+      }
+
       // Clean up deferred requests that UCX has fully processed.
       // These are cancelled requests whose GPU buffers needed to stay
       // alive until UCX finished any in-flight operations on them.
@@ -229,7 +241,6 @@ void Communicator::run() {
                 [](const auto& req) { return req->isCompleted(); }),
             deferredRequests_.end());
       }
-
       // All queues are drained. Now wait for UCXX network events.
       // In blocking mode, this will block until a UCXX event arrives
       // or worker_->signal() is called (from addToWorkQueue,
@@ -308,7 +319,8 @@ std::shared_ptr<EndpointRef> Communicator::assocEndpointRef(
       CudfConfig::getInstance().ucxxErrorHandling);
   std::shared_ptr<EndpointRef> epRef = nullptr;
   if (ep != nullptr) {
-    epRef = std::make_shared<EndpointRef>(ep);
+    epRef = std::make_shared<EndpointRef>(
+        ep, hostPort.hostname, std::to_string(hostPort.port));
     epRef->addCommElem(comms);
     if (CudfConfig::getInstance().ucxxErrorHandling) {
       ep->setCloseCallback(EndpointRef::onClose, epRef);
@@ -320,8 +332,11 @@ std::shared_ptr<EndpointRef> Communicator::assocEndpointRef(
 
 void Communicator::removeEndpointRef(std::shared_ptr<EndpointRef> ep) {
   std::lock_guard<std::recursive_mutex> lock(endpointsMutex_);
-  VLOG(3) << "In Communicator::removeEndpointRef for Communicator with port = "
-          << Communicator::getInstance()->port_;
+  VLOG(2) << "[UCX-COMM-REMOVE-ENDPOINT] listenerPort="
+          << Communicator::getInstance()->port_
+          << " peer=" << (ep ? ep->getPeerAddress() : "(unknown)")
+          << " endpointAlive="
+          << (ep && ep->endpoint_ && ep->endpoint_->isAlive());
 
   // Close the endpoint if it's still alive.
   // NOTE: This calls closeBlocking() which progresses the worker internally,
@@ -346,7 +361,9 @@ void Communicator::deferEndpointCleanup(std::shared_ptr<EndpointRef> ep) {
   // This method is safe to call from UCX callbacks because it doesn't
   // call any blocking/progress functions. The actual cleanup happens
   // in the main run() loop.
-  VLOG(3) << "Deferring endpoint cleanup to main loop";
+  VLOG(2) << "[UCX-COMM-DEFER-ENDPOINT-CLEANUP] peer="
+          << (ep ? ep->getPeerAddress() : "(unknown)") << " endpointAlive="
+          << (ep && ep->endpoint_ && ep->endpoint_->isAlive());
   deferredEndpointCleanup_.push(ep);
   signalWorker();
 }
@@ -404,8 +421,9 @@ void Communicator::listenerCallback(ucp_conn_request_h conn_request) {
   // outgoing endpoints are represented using the EndpointRef.
   auto endpoint = listener_->createEndpointFromConnRequest(
       conn_request, CudfConfig::getInstance().ucxxErrorHandling);
-  // Pass the peer's actual IP to EndpointRef for reliable intra-node detection.
-  auto epRef = std::make_shared<EndpointRef>(endpoint, std::string(ip_str));
+  // Pass the peer's actual address to EndpointRef for diagnostics.
+  auto epRef = std::make_shared<EndpointRef>(
+      endpoint, std::string(ip_str), std::string(port_str));
   if (CudfConfig::getInstance().ucxxErrorHandling) {
     endpoint->setCloseCallback(EndpointRef::onClose, epRef);
   }

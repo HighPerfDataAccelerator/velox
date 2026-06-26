@@ -101,12 +101,19 @@ class UcxOutputQueueManager {
       int destination,
       UcxDataAvailableCallback notify);
 
+  void getData(
+      std::string_view taskId,
+      int destination,
+      uint64_t maxBytes,
+      int64_t sequence,
+      UcxDataAvailableCallbackV2 notify);
+
   /// Returns true if the given task can use intra-node transfer.
-  /// Returns false if the task is not yet initialized (placeholder queue
-  /// from early sink connections) or if the task uses broadcast mode
-  /// (broadcast shares packed_columns across destinations — the intra-node
-  /// source's destructive move would corrupt data for other servers).
+  /// Returns false until the task queue is initialized. Initialized broadcast
+  /// queues are safe because shared pages are cloned by UcxExchangeSource.
   bool canUseIntraNode(std::string_view taskId);
+
+  std::string describeQueueForIntraNode(std::string_view taskId);
 
   /// @brief Removes the queue for the given task from the queue manager.
   /// Calls "terminate" on the queue to awake waiting producers.

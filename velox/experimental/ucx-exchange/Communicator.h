@@ -21,6 +21,7 @@
 #include <random>
 #include <string>
 #include <string_view>
+#include <vector>
 #include "velox/common/future/VeloxPromise.h"
 #include "velox/experimental/ucx-exchange/Acceptor.h"
 #include "velox/experimental/ucx-exchange/CommElement.h"
@@ -223,10 +224,15 @@ class Communicator {
   // so they defer cleanup to the main loop via this queue.
   WorkQueue<EndpointRef> deferredEndpointCleanup_;
 
-  // Cancelled UCXX requests whose GPU buffers may still be referenced by
-  // UCX internals. Held alive here until isCompleted() returns true,
-  // ensuring the GPU buffers (owned via the request's arg shared_ptr)
-  // are not freed prematurely.
+  // Endpoints whose communication elements have been asked to close. The
+  // actual closeBlocking()/map removal happens after the work queue has run,
+  // giving sources and servers a chance to cancel/defer UCX requests first.
+  std::vector<std::shared_ptr<EndpointRef>> pendingEndpointRemoval_;
+
+  /// Cancelled UCXX requests whose GPU buffers may still be referenced by
+  /// UCX internals. Held alive here until isCompleted() returns true,
+  /// ensuring the GPU buffers (owned via the request's arg shared_ptr)
+  /// are not freed prematurely.
   std::vector<std::shared_ptr<ucxx::Request>> deferredRequests_;
 
   // Heartbeat state for diagnostic logging.

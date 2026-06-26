@@ -16,6 +16,9 @@
 #pragma once
 
 #include <cudf/contiguous_split.hpp>
+#include <rmm/cuda_stream_view.hpp>
+#include <condition_variable>
+#include <functional>
 #include <future>
 #include <map>
 #include <memory>
@@ -24,6 +27,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_set>
+#include <vector>
 
 namespace facebook::velox::ucx_exchange {
 
@@ -46,6 +50,7 @@ struct IntraNodeTransferKey {
 /// @brief Result from intra-node transfer containing data and end marker.
 struct IntraNodeTransferResult {
   std::shared_ptr<cudf::packed_columns> data;
+  rmm::cuda_stream_view stream{rmm::cuda_stream_default};
   bool atEnd{false}; // True if this is the end-of-stream marker
 };
 
@@ -55,10 +60,21 @@ struct IntraNodeTransferResult {
 /// promise on retrieval.
 struct IntraNodeTransferEntry {
   std::shared_ptr<cudf::packed_columns> data;
+  rmm::cuda_stream_view stream{rmm::cuda_stream_default};
   bool atEnd{false}; // True if this is the end-of-stream marker
   std::promise<void> retrievedPromise; // Server waits on this after publishing
+  std::condition_variable dataAvailable; // Source waits on this for data
   std::mutex entryMutex;
   bool ready{false}; // True when data is ready to retrieve
+  // One-shot wakeups for sources that registered via registerWaiter() before
+  // the data was ready, so a same-process consumer can stay dormant instead of
+  // busy-polling the single-threaded Communicator work queue. Fired and cleared
+  // by publish()/cancelTask(). Guarded by entryMutex.
+  std::vector<std::function<void()>> wakeCallbacks;
+  // One-shot wakeups for producers waiting until the source has retrieved the
+  // published data. Fired and cleared when poll()/waitFor()/retrieve() consumes
+  // the entry, or when cancelTask() completes it as at-end.
+  std::vector<std::function<void()>> retrievedCallbacks;
 };
 
 /// @brief Singleton registry for intra-node data transfers.
@@ -90,7 +106,9 @@ class IntraNodeTransferRegistry {
   [[nodiscard]] std::future<void> publish(
       const IntraNodeTransferKey& key,
       std::shared_ptr<cudf::packed_columns> data,
-      bool atEnd);
+      rmm::cuda_stream_view stream,
+      bool atEnd,
+      std::function<void()> onRetrieved = {});
 
   /// @brief Non-blocking poll for intra-node transfer data.
   /// Returns immediately whether data is available or not.
@@ -98,6 +116,38 @@ class IntraNodeTransferRegistry {
   /// @return nullopt if not ready, or IntraNodeTransferResult if ready.
   ///         Data is nullptr when atEnd is true.
   [[nodiscard]] std::optional<IntraNodeTransferResult> poll(
+      const IntraNodeTransferKey& key);
+
+  /// @brief Register a one-shot wakeup for a same-process consumer that polled
+  /// and found no data, so it can go dormant instead of busy-re-queuing on the
+  /// single-threaded Communicator. @p wake is invoked exactly once when
+  /// publish() (or cancelTask()) makes data available for @p key.
+  /// @param key The unique key identifying this transfer
+  /// @param wake Callback fired once when data becomes available or the task is
+  ///        cancelled; must be safe to call from the Communicator thread.
+  /// @return true if data is ALREADY available (or the task is cancelled) — the
+  ///         caller should re-poll instead of going dormant; false if registered
+  ///         (the caller should go dormant and will be woken via @p wake).
+  [[nodiscard]] bool registerWaiter(
+      const IntraNodeTransferKey& key,
+      std::function<void()> wake);
+
+  /// @brief Wait for and retrieve data from intra-node transfer registry.
+  /// Source calls this - blocks until data is available or timeout.
+  /// WARNING: This can block, use with caution on single-threaded contexts.
+  /// @param key The unique key identifying this transfer
+  /// @param timeout Maximum time to wait for data
+  /// @return IntraNodeTransferResult. Data is nullptr if atEnd or timeout.
+  [[nodiscard]] IntraNodeTransferResult waitFor(
+      const IntraNodeTransferKey& key,
+      std::chrono::milliseconds timeout);
+
+  /// @brief Retrieve data from intra-node transfer registry (legacy method).
+  /// Called by UcxExchangeSource when isIntraNodeTransfer is true.
+  /// The entry is removed from the registry and the promise is fulfilled.
+  /// @param key The unique key identifying this transfer
+  /// @return The shared data, or nullptr if not found
+  std::shared_ptr<cudf::packed_columns> retrieve(
       const IntraNodeTransferKey& key);
 
   /// @brief Cancel all pending transfers for a task.

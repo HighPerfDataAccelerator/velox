@@ -37,13 +37,22 @@ using UcxDataAvailableCallback = std::function<void(
     std::shared_ptr<cudf::packed_columns> data,
     std::vector<int64_t> remainingBytes)>;
 
+using UcxDataAvailableCallbackV2 = std::function<void(
+    std::shared_ptr<cudf::packed_columns> data,
+    int64_t sequence,
+    std::vector<int64_t> remainingBytes)>;
+
 struct UcxDataAvailable {
   UcxDataAvailableCallback callback{nullptr};
+  UcxDataAvailableCallbackV2 callbackV2{nullptr};
   std::shared_ptr<cudf::packed_columns> data;
+  int64_t sequence{0};
   std::vector<int64_t> remainingBytes;
 
   void notify() {
-    if (callback) {
+    if (callbackV2) {
+      callbackV2(std::move(data), sequence, remainingBytes);
+    } else if (callback) {
       callback(std::move(data), remainingBytes);
     }
   }
@@ -82,6 +91,7 @@ class UcxDestinationQueue {
 
   struct Data {
     std::shared_ptr<cudf::packed_columns> data;
+    int64_t sequence{0};
     std::vector<int64_t> remainingBytes;
     /// Whether the result is returned immediately without invoking the `notify'
     /// callback.
@@ -94,8 +104,14 @@ class UcxDestinationQueue {
   /// returned.
   [[nodiscard]] Data getData(UcxDataAvailableCallback notify);
 
-  /// Removes all remaining data from the queue.
-  void deleteResults();
+  [[nodiscard]] Data getData(
+      uint64_t maxBytes,
+      int64_t sequence,
+      UcxDataAvailableCallbackV2 notify);
+
+  /// Removes all remaining data from the queue and returns any pending waiter
+  /// so it can be woken with an end marker.
+  UcxDataAvailable deleteResults();
 
   /// Returns and clears the notify callback, if any, along with arguments for
   /// the callback.
@@ -114,6 +130,10 @@ class UcxDestinationQueue {
 
   std::deque<std::shared_ptr<cudf::packed_columns>> queue_;
   UcxDataAvailableCallback notify_{nullptr};
+  UcxDataAvailableCallbackV2 notifyV2_{nullptr};
+  int64_t sequence_{0};
+  int64_t notifySequence_{0};
+  uint64_t notifyMaxBytes_{0};
   Stats stats_;
 };
 
@@ -195,6 +215,12 @@ class UcxOutputQueue : public std::enable_shared_from_this<UcxOutputQueue> {
   /// there is no data, 'notify' is installed and it will be called when data
   /// becomes available.
   void getData(int destination, UcxDataAvailableCallback notify);
+
+  void getData(
+      int destination,
+      uint64_t maxBytes,
+      int64_t sequence,
+      UcxDataAvailableCallbackV2 notify);
 
   /// @brief Indicates that a driver is done and won't enqueue any more data.
   void noMoreData();
