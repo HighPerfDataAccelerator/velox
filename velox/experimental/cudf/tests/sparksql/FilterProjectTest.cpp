@@ -154,6 +154,39 @@ TEST_F(CudfFilterProjectTest, hashWithSeed) {
   facebook::velox::test::assertEqualVectors(expected, hashResults);
 }
 
+TEST_F(CudfFilterProjectTest, castStringToBoolean) {
+  auto input = makeRowVector({
+      makeNullableFlatVector<std::string>({
+          "true",
+          "FALSE",
+          " 1 ",
+          "0",
+          "yes",
+          " n ",
+          "invalid",
+          std::nullopt,
+      }),
+      makeNullableFlatVector<bool>({
+          false,
+          true,
+          false,
+          true,
+          false,
+          true,
+          true,
+          false,
+      }),
+  });
+
+  for (const auto& expression : {
+           "try_cast(c0 as boolean)",
+           "coalesce(try_cast(c0 as boolean), c1)",
+       }) {
+    SCOPED_TRACE(expression);
+    assertExpressionMatchesCpu(expression, input, input->rowType());
+  }
+}
+
 // TODO: Re-enable after https://github.com/rapidsai/cudf/issues/21720.
 // cuDF's murmurhash3_x86_32 combines columns via hash_combine(h(col0, seed),
 // h(col1, seed)), while Spark instead hashes columns iteratively:

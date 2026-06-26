@@ -29,6 +29,8 @@
 #include "velox/parse/TypeResolver.h"
 #include "velox/type/Time.h"
 
+#include <limits>
+
 using namespace facebook::velox;
 using namespace facebook::velox::exec;
 using namespace facebook::velox::exec::test;
@@ -2056,6 +2058,29 @@ TEST_F(CudfSimpleFilterProjectTest, castToSmallInt) {
   auto tryCast =
       evaluateOnce<int16_t, int32_t>("try_cast(c0 as smallint)", -214);
   EXPECT_EQ(tryCast, -214);
+}
+
+TEST_F(CudfSimpleFilterProjectTest, castNumericToBoolean) {
+  auto input = makeRowVector({
+      makeNullableFlatVector<int64_t>({0, 1, -7, std::nullopt}),
+      makeNullableFlatVector<bool>({true, false, true, false}),
+      makeNullableFlatVector<double>({
+          0.0,
+          0.5,
+          std::numeric_limits<double>::quiet_NaN(),
+          std::nullopt,
+      }),
+  });
+
+  for (const auto& expression : {
+           "cast(c0 as boolean)",
+           "try_cast(c0 as boolean)",
+           "coalesce(try_cast(c0 as boolean), c1)",
+           "try_cast(c2 as boolean)",
+       }) {
+    SCOPED_TRACE(expression);
+    assertExpressionMatchesCpu(expression, input, input->rowType());
+  }
 }
 
 TEST_F(CudfSimpleFilterProjectTest, rowConstructorAndDereference) {

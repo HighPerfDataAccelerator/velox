@@ -56,10 +56,12 @@
 #include <cudf/strings/convert/convert_integers.hpp>
 #include <cudf/strings/find.hpp>
 #include <cudf/strings/replace.hpp>
+#include <cudf/strings/regex/regex_program.hpp>
 #include <cudf/strings/slice.hpp>
 #include <cudf/strings/split/split.hpp>
 #include <cudf/strings/string_view.hpp>
 #include <cudf/strings/strings_column_view.hpp>
+#include <cudf/strings/strip.hpp>
 #include <cudf/structs/structs_column_view.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/transform.hpp>
@@ -325,6 +327,53 @@ void mergeNullSourceNullsIntoResult(
   result.set_null_mask(std::move(nullMask), nullCount);
 }
 
+bool isIntegralNonDecimalVeloxType(const TypePtr& type) {
+  if (type == nullptr || type->isDate()) {
+    return false;
+  }
+  switch (type->kind()) {
+    case TypeKind::TINYINT:
+    case TypeKind::SMALLINT:
+    case TypeKind::INTEGER:
+    case TypeKind::BIGINT:
+      return true;
+    default:
+      return false;
+  }
+}
+
+bool isFloatingPointVeloxType(const TypePtr& type) {
+  if (type == nullptr) {
+    return false;
+  }
+  switch (type->kind()) {
+    case TypeKind::REAL:
+    case TypeKind::DOUBLE:
+      return true;
+    default:
+      return false;
+  }
+}
+
+bool isNumericToBooleanVeloxCast(
+    const TypePtr& srcVelox,
+    const TypePtr& dstVelox) {
+  if (srcVelox == nullptr || dstVelox == nullptr ||
+      dstVelox->kind() != TypeKind::BOOLEAN || srcVelox->isDate()) {
+    return false;
+  }
+  return isIntegralNonDecimalVeloxType(srcVelox) ||
+      isFloatingPointVeloxType(srcVelox) || srcVelox->isDecimal();
+}
+
+bool isStringToBooleanVeloxCast(
+    const TypePtr& srcVelox,
+    const TypePtr& dstVelox) {
+  return srcVelox != nullptr && dstVelox != nullptr &&
+      srcVelox->kind() == TypeKind::VARCHAR &&
+      dstVelox->kind() == TypeKind::BOOLEAN;
+}
+
 } // namespace
 
 class SplitFunction : public CudfFunction {
@@ -364,12 +413,31 @@ class SplitFunction : public CudfFunction {
 
 class CastFunction : public CudfFunction {
  public:
+  enum class CastMode {
+    kCudfCast,
+    kNumericToBool,
+    kStringToBool,
+  };
+
   CastFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
     VELOX_CHECK_EQ(expr->inputs().size(), 1, "cast expects exactly 1 input");
 
+    const auto& sourceVeloxType = expr->inputs()[0]->type();
+    const auto& targetVeloxType = expr->type();
     targetCudfType_ = cudf_velox::veloxToCudfDataType(expr->type());
     auto sourceType =
         cudf_velox::veloxToCudfDataType(expr->inputs()[0]->type());
+    if (isStringToBooleanVeloxCast(sourceVeloxType, targetVeloxType)) {
+      castMode_ = CastMode::kStringToBool;
+      return;
+    }
+    if (isNumericToBooleanVeloxCast(sourceVeloxType, targetVeloxType)) {
+      castMode_ = CastMode::kNumericToBool;
+      numericToBoolSourceIsFloating_ =
+          isFloatingPointVeloxType(sourceVeloxType);
+      return;
+    }
+
     VELOX_CHECK(
         cudf::is_supported_cast(sourceType, targetCudfType_),
         "Cast from {} to {} is not supported",
@@ -382,11 +450,92 @@ class CastFunction : public CudfFunction {
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr) const override {
     auto inputCol = asView(inputColumns[0]);
-    return cudf::cast(inputCol, targetCudfType_, stream, mr);
+    switch (castMode_) {
+      case CastMode::kStringToBool: {
+        cudf::string_scalar stripChars("", true, stream, mr);
+        auto trimmed = cudf::strings::strip(
+            cudf::strings_column_view(inputCol),
+            cudf::strings::side_type::BOTH,
+            stripChars,
+            stream,
+            mr);
+        auto lowered = cudf::strings::to_lower(
+            cudf::strings_column_view(trimmed->view()), stream, mr);
+        trimmed.reset();
+
+        auto trueProgram =
+            cudf::strings::regex_program::create("^(t|true|y|yes|1)$");
+        auto trueMask = cudf::strings::matches_re(
+            cudf::strings_column_view(lowered->view()),
+            *trueProgram,
+            stream,
+            mr);
+        trueProgram.reset();
+
+        auto falseProgram =
+            cudf::strings::regex_program::create("^(f|false|n|no|0)$");
+        auto falseMask = cudf::strings::matches_re(
+            cudf::strings_column_view(lowered->view()),
+            *falseProgram,
+            stream,
+            mr);
+        falseProgram.reset();
+        lowered.reset();
+
+        auto validMask = cudf::binary_operation(
+            trueMask->view(),
+            falseMask->view(),
+            cudf::binary_operator::LOGICAL_OR,
+            targetCudfType_,
+            stream,
+            mr);
+
+        auto trueScalar = cudf::numeric_scalar<bool>(true, true, stream, mr);
+        auto falseScalar = cudf::numeric_scalar<bool>(false, true, stream, mr);
+        auto boolResult = cudf::copy_if_else(
+            trueScalar, falseScalar, trueMask->view(), stream, mr);
+        trueMask.reset();
+        falseMask.reset();
+
+        auto nullScalar = cudf::numeric_scalar<bool>(false, false, stream, mr);
+        return cudf::copy_if_else(
+            boolResult->view(), nullScalar, validMask->view(), stream, mr);
+      }
+      case CastMode::kNumericToBool: {
+        auto zero =
+            cudf::make_default_constructed_scalar(inputCol.type(), stream, mr);
+        auto nonZero = cudf::binary_operation(
+            inputCol,
+            *zero,
+            cudf::binary_operator::NOT_EQUAL,
+            targetCudfType_,
+            stream,
+            mr);
+        if (!numericToBoolSourceIsFloating_) {
+          return nonZero;
+        }
+
+        auto notNan = cudf::is_not_nan(inputCol, stream, mr);
+        auto result = cudf::binary_operation(
+            nonZero->view(),
+            notNan->view(),
+            cudf::binary_operator::NULL_LOGICAL_AND,
+            targetCudfType_,
+            stream,
+            mr);
+        mergeNullSourceNullsIntoResult(*result, inputCol, stream, mr);
+        return result;
+      }
+      case CastMode::kCudfCast:
+        return cudf::cast(inputCol, targetCudfType_, stream, mr);
+    }
+    VELOX_UNREACHABLE();
   }
 
  private:
   cudf::data_type targetCudfType_;
+  CastMode castMode_{CastMode::kCudfCast};
+  bool numericToBoolSourceIsFloating_{false};
 };
 
 class CardinalityFunction : public CudfFunction {
@@ -2773,6 +2922,12 @@ bool FunctionExpression::canEvaluate(std::shared_ptr<velox::exec::Expr> expr) {
     const auto& dstType = expr->type();
     if (srcType == nullptr || dstType == nullptr) {
       return false;
+    }
+    if (isStringToBooleanVeloxCast(srcType, dstType)) {
+      return true;
+    }
+    if (isNumericToBooleanVeloxCast(srcType, dstType)) {
+      return true;
     }
     auto src = cudf_velox::veloxToCudfDataType(srcType);
     auto dst = cudf_velox::veloxToCudfDataType(dstType);
