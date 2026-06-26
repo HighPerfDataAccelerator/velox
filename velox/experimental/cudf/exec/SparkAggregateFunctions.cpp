@@ -78,6 +78,33 @@ void registerSparkAggregateFunctions(const std::string& prefix) {
           .argumentType("real")
           .build());
   // AVG final: row(DOUBLE,BIGINT)->DOUBLE already registered.
+
+  auto collectSetRawSignature = FunctionSignatureBuilder()
+                                    .typeVariable("T")
+                                    .returnType("array(T)")
+                                    .argumentType("T")
+                                    .build();
+  auto collectSetMergeSignature = FunctionSignatureBuilder()
+                                      .typeVariable("T")
+                                      .returnType("array(T)")
+                                      .argumentType("array(T)")
+                                      .build();
+  appendGroupbyAggregationFunctionForStep(
+      prefix + "collect_set",
+      core::AggregationNode::Step::kSingle,
+      collectSetRawSignature);
+  appendGroupbyAggregationFunctionForStep(
+      prefix + "collect_set",
+      core::AggregationNode::Step::kPartial,
+      collectSetRawSignature);
+  appendGroupbyAggregationFunctionForStep(
+      prefix + "collect_set",
+      core::AggregationNode::Step::kIntermediate,
+      collectSetMergeSignature);
+  appendGroupbyAggregationFunctionForStep(
+      prefix + "collect_set",
+      core::AggregationNode::Step::kFinal,
+      collectSetMergeSignature);
 }
 
 } // namespace facebook::velox::cudf_velox

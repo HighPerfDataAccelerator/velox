@@ -30,6 +30,7 @@
 #include "velox/exec/Task.h"
 #include "velox/expression/Expr.h"
 
+#include <cudf/aggregation.hpp>
 #include <cudf/binaryop.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/concatenate.hpp>
@@ -741,6 +742,45 @@ struct GroupbyStddevSampAggregator : GroupbyAggregator {
   uint32_t outputIdx_;
 };
 
+struct GroupbyCollectSetAggregator : GroupbyAggregator {
+  GroupbyCollectSetAggregator(
+      core::AggregationNode::Step step,
+      uint32_t inputIndex,
+      VectorPtr constant,
+      const TypePtr& resultType)
+      : GroupbyAggregator(step, inputIndex, constant, resultType) {}
+
+  void addGroupbyRequest(
+      cudf::table_view const& tbl,
+      std::vector<cudf::groupby::aggregation_request>& requests,
+      rmm::cuda_stream_view stream) override {
+    VELOX_CHECK(
+        constant == nullptr,
+        "GroupbyCollectSetAggregator does not support constant input");
+    auto& request = requests.emplace_back();
+    outputIdx_ = requests.size() - 1;
+    request.values = tbl.column(inputIndex);
+    if (exec::isRawInput(step)) {
+      request.aggregations.push_back(
+          cudf::make_collect_set_aggregation<cudf::groupby_aggregation>(
+              cudf::null_policy::EXCLUDE));
+      return;
+    }
+    request.aggregations.push_back(
+        cudf::make_merge_sets_aggregation<cudf::groupby_aggregation>());
+  }
+
+  std::unique_ptr<cudf::column> makeOutputColumn(
+      std::vector<cudf::groupby::aggregation_result>& results,
+      rmm::cuda_stream_view /*stream*/,
+      rmm::device_async_resource_ref /*mr*/) override {
+    return std::move(results[outputIdx_].results[0]);
+  }
+
+ private:
+  uint32_t outputIdx_{0};
+};
+
 std::unique_ptr<GroupbyAggregator> createGroupbyAggregator(
     const ResolvedAggregateInfo& p) {
   auto const& kind = p.kind;
@@ -775,6 +815,9 @@ std::unique_ptr<GroupbyAggregator> createGroupbyAggregator(
   } else if (kind.rfind(prefix + "stddev", 0) == 0) {
     // stddev is an alias for stddev_samp
     return std::make_unique<GroupbyStddevSampAggregator>(
+        p.companionStep, p.inputIndex, p.constant, p.resultType);
+  } else if (kind.rfind(prefix + "collect_set", 0) == 0) {
+    return std::make_unique<GroupbyCollectSetAggregator>(
         p.companionStep, p.inputIndex, p.constant, p.resultType);
   } else {
     VELOX_NYI("Aggregation not yet supported, kind: {}", kind);
