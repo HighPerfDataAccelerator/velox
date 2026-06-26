@@ -33,6 +33,7 @@
 #include "velox/experimental/cudf/exec/CudfOrderBy.h"
 #include "velox/experimental/cudf/exec/CudfReduce.h"
 #include "velox/experimental/cudf/exec/CudfTopN.h"
+#include "velox/experimental/cudf/exec/CudfTopNRowNumber.h"
 #include "velox/experimental/cudf/exec/CudfWindow.h"
 #include "velox/experimental/cudf/exec/OperatorAdapters.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
@@ -58,6 +59,7 @@
 #include "velox/exec/TableScan.h"
 #include "velox/exec/Task.h"
 #include "velox/exec/TopN.h"
+#include "velox/exec/TopNRowNumber.h"
 #include "velox/exec/Values.h"
 #include "velox/exec/Window.h"
 
@@ -629,6 +631,60 @@ class TopNAdapter : public OperatorAdapter {
   }
 };
 
+/// TopNRowNumberAdapter - Replaces supported TopNRowNumber with
+/// CudfTopNRowNumber.
+class TopNRowNumberAdapter : public OperatorAdapter {
+ public:
+  TopNRowNumberAdapter() : OperatorAdapter("TopNRowNumber") {}
+
+  bool canHandle(const exec::Operator* op) const override {
+    return dynamic_cast<const exec::TopNRowNumber*>(op) != nullptr;
+  }
+
+  bool canRunOnGPU(
+      const exec::Operator* op,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* /*ctx*/) const override {
+    auto topNRowNumberNode =
+        std::dynamic_pointer_cast<const core::TopNRowNumberNode>(planNode);
+    const bool canRun =
+        canHandle(op) && CudfTopNRowNumber::shouldReplace(topNRowNumberNode);
+    if (!canRun) {
+      LOG_FALLBACK(
+          "TopNRowNumberAdapter {}, PlanNode id: {}",
+          !canHandle(op) ? "operator is not TopNRowNumber"
+              : !topNRowNumberNode
+              ? "planNode is not TopNRowNumberNode"
+              : "CudfTopNRowNumber::shouldReplace returned false",
+          planNode->id());
+    }
+    return canRun;
+  }
+
+  bool acceptsGpuInput() const override {
+    return true;
+  }
+
+  bool producesGpuOutput() const override {
+    return true;
+  }
+
+  std::vector<std::unique_ptr<exec::Operator>> createReplacements(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* ctx,
+      int32_t operatorId) const override {
+    auto topNRowNumberNode =
+        std::dynamic_pointer_cast<const core::TopNRowNumberNode>(planNode);
+
+    std::vector<std::unique_ptr<exec::Operator>> result;
+    result.push_back(
+        std::make_unique<CudfTopNRowNumber>(
+            operatorId, ctx, topNRowNumberNode));
+    return result;
+  }
+};
+
 /// WindowAdapter - Replaces supported row_number Window nodes with CudfWindow.
 class WindowAdapter : public OperatorAdapter {
  public:
@@ -1079,6 +1135,7 @@ void registerAllOperatorAdapters() {
   registry.registerAdapter(std::make_unique<NestedLoopJoinProbeAdapter>());
   registry.registerAdapter(std::make_unique<OrderByAdapter>());
   registry.registerAdapter(std::make_unique<TopNAdapter>());
+  registry.registerAdapter(std::make_unique<TopNRowNumberAdapter>());
   registry.registerAdapter(std::make_unique<WindowAdapter>());
   registry.registerAdapter(std::make_unique<LimitAdapter>());
   registry.registerAdapter(std::make_unique<LocalPartitionAdapter>());
