@@ -33,6 +33,7 @@ add_library(
   CudfReduce.cpp
   CudfTopN.cpp
   CudfTopNRowNumber.cpp
+  CudfUnnest.cpp
   CudfValues.cpp
   CudfWindow.cpp
   DebugUtil.cpp

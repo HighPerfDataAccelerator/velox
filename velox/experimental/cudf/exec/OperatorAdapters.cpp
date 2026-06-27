@@ -34,6 +34,7 @@
 #include "velox/experimental/cudf/exec/CudfReduce.h"
 #include "velox/experimental/cudf/exec/CudfTopN.h"
 #include "velox/experimental/cudf/exec/CudfTopNRowNumber.h"
+#include "velox/experimental/cudf/exec/CudfUnnest.h"
 #include "velox/experimental/cudf/exec/CudfValues.h"
 #include "velox/experimental/cudf/exec/CudfWindow.h"
 #include "velox/experimental/cudf/exec/OperatorAdapters.h"
@@ -67,6 +68,7 @@
 #include "velox/exec/Task.h"
 #include "velox/exec/TopN.h"
 #include "velox/exec/TopNRowNumber.h"
+#include "velox/exec/Unnest.h"
 #include "velox/exec/Values.h"
 #include "velox/exec/Window.h"
 
@@ -372,6 +374,58 @@ class AggregationAdapter : public OperatorAdapter {
       result.push_back(
           std::make_unique<CudfGroupby>(operatorId, ctx, aggregationPlanNode));
     }
+    return result;
+  }
+};
+
+class UnnestAdapter : public OperatorAdapter {
+ public:
+  UnnestAdapter() : OperatorAdapter("Unnest") {}
+
+  bool canHandle(const exec::Operator* op) const override {
+    return dynamic_cast<const exec::Unnest*>(op) != nullptr;
+  }
+
+  bool canRunOnGPU(
+      const exec::Operator* op,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* /*ctx*/) const override {
+    if (!canHandle(op)) {
+      LOG_FALLBACK(
+          "UnnestAdapter operator is not Unnest, PlanNode id: {}",
+          planNode->id());
+      return false;
+    }
+
+    auto unnestNode =
+        std::dynamic_pointer_cast<const core::UnnestNode>(planNode);
+    if (!CudfUnnest::canRunOnGPU(unnestNode)) {
+      LOG_FALLBACK(
+          "Unnest shape is not supported by cuDF, PlanNode id: {}",
+          planNode->id());
+      return false;
+    }
+    return true;
+  }
+
+  bool acceptsGpuInput() const override {
+    return true;
+  }
+
+  bool producesGpuOutput() const override {
+    return true;
+  }
+
+  std::vector<std::unique_ptr<exec::Operator>> createReplacements(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* ctx,
+      int32_t operatorId) const override {
+    auto unnestNode =
+        std::dynamic_pointer_cast<const core::UnnestNode>(planNode);
+    std::vector<std::unique_ptr<exec::Operator>> result;
+    result.push_back(
+        std::make_unique<CudfUnnest>(operatorId, ctx, unnestNode));
     return result;
   }
 };
@@ -1416,6 +1470,7 @@ void registerAllOperatorAdapters() {
   registry.registerAdapter(std::make_unique<TableScanAdapter>());
   registry.registerAdapter(std::make_unique<FilterProjectAdapter>());
   registry.registerAdapter(std::make_unique<AggregationAdapter>());
+  registry.registerAdapter(std::make_unique<UnnestAdapter>());
   registry.registerAdapter(std::make_unique<HashJoinBuildAdapter>());
   registry.registerAdapter(std::make_unique<HashJoinProbeAdapter>());
   registry.registerAdapter(std::make_unique<NestedLoopJoinBuildAdapter>());
