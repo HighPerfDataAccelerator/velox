@@ -315,7 +315,8 @@ void CudfFilterProject::initialize() {
   }
   if (hasFilter_) {
     // First expr is Filter, rest are Project
-    filterEvaluator_ = createCudfExpression(expr->exprs()[0], inputType);
+    filterEvaluator_ = createCudfExpression(
+        expr->exprs()[0], inputType, &operatorCtx_->driverCtx()->queryConfig());
   }
 
   const auto firstProjectExprIndex = hasFilter_ ? 1 : 0;
@@ -336,7 +337,8 @@ void CudfFilterProject::initialize() {
       }
     } else {
       resultProjections_.emplace_back(projectEvaluators_.size(), outputChannel);
-      projectEvaluators_.push_back(createCudfExpression(projectExpr, inputType));
+      projectEvaluators_.push_back(createCudfExpression(
+          projectExpr, inputType, &operatorCtx_->driverCtx()->queryConfig()));
     }
   }
 
@@ -436,8 +438,12 @@ std::vector<std::unique_ptr<cudf::column>> CudfFilterProject::project(
   }
   std::vector<ColumnOrView> columns;
   for (auto& projectEvaluator : projectEvaluators_) {
-    columns.push_back(
-        projectEvaluator->eval(inputViews, stream, get_output_mr(), true));
+    columns.push_back(projectEvaluator->eval(
+        inputViews,
+        static_cast<cudf::size_type>(outputSize),
+        stream,
+        get_output_mr(),
+        true));
   }
 
   // Rearrange columns to match outputType_

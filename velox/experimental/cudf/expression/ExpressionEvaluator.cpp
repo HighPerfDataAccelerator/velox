@@ -89,6 +89,23 @@
 namespace facebook::velox::cudf_velox {
 namespace {
 
+thread_local const core::QueryConfig* currentFunctionQueryConfig = nullptr;
+
+class ScopedCudfFunctionQueryConfig {
+ public:
+  explicit ScopedCudfFunctionQueryConfig(const core::QueryConfig* queryConfig)
+      : previous_(currentFunctionQueryConfig) {
+    currentFunctionQueryConfig = queryConfig;
+  }
+
+  ~ScopedCudfFunctionQueryConfig() {
+    currentFunctionQueryConfig = previous_;
+  }
+
+ private:
+  const core::QueryConfig* previous_;
+};
+
 cudf::size_type resolveFieldReferenceIndex(
     velox::exec::FieldReference& fieldExpr,
     const RowTypePtr& parentRowType) {
@@ -250,6 +267,10 @@ static void ensureBuiltinExpressionEvaluatorsRegistered() {
 }
 
 } // namespace
+
+const core::QueryConfig* currentCudfFunctionQueryConfig() {
+  return currentFunctionQueryConfig;
+}
 
 bool registerCudfExpressionEvaluator(
     const std::string& name,
@@ -5006,17 +5027,20 @@ bool shouldEvaluateAsFunctionSubexpression(
 
 std::shared_ptr<FunctionExpression> FunctionExpression::create(
     const std::shared_ptr<velox::exec::Expr>& expr,
-    const RowTypePtr& inputRowSchema) {
+    const RowTypePtr& inputRowSchema,
+    const core::QueryConfig* queryConfig) {
   using velox::exec::FieldReference;
 
   auto node = std::make_shared<FunctionExpression>();
   node->expr_ = expr;
   node->inputRowSchema_ = inputRowSchema;
+  node->queryConfig_ = queryConfig;
 
   auto name = expr->name();
   if (name == "get_struct_field" || name == "spark_get_struct_field") {
     node->function_ = std::make_shared<GetStructFieldFunction>(expr);
   } else {
+    ScopedCudfFunctionQueryConfig scope(queryConfig);
     node->function_ = createCudfFunction(name, expr);
   }
 
@@ -5039,7 +5063,7 @@ std::shared_ptr<FunctionExpression> FunctionExpression::create(
     for (const auto& input : expr->inputs()) {
       if (shouldEvaluateAsFunctionSubexpression(expr, input)) {
         node->subexpressions_.push_back(
-            createCudfExpression(input, inputRowSchema));
+            createCudfExpression(input, inputRowSchema, queryConfig));
       }
     }
   }
@@ -5090,6 +5114,18 @@ ColumnOrView FunctionExpression::eval(
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr,
     bool finalize) {
+  const auto inputRowCount = inputColumnViews.empty()
+      ? cudf::size_type{0}
+      : inputColumnViews.front().size();
+  return eval(std::move(inputColumnViews), inputRowCount, stream, mr, finalize);
+}
+
+ColumnOrView FunctionExpression::eval(
+    std::vector<cudf::column_view> inputColumnViews,
+    cudf::size_type inputRowCount,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr,
+    bool finalize) {
   using velox::exec::FieldReference;
 
   if (auto fieldExpr = std::dynamic_pointer_cast<FieldReference>(expr_)) {
@@ -5124,7 +5160,7 @@ ColumnOrView FunctionExpression::eval(
       subexprResults.push_back(subexpr->eval(inputColumnViews, stream, mr));
     }
 
-    auto result = function_->eval(subexprResults, stream, mr);
+    auto result = function_->eval(subexprResults, inputRowCount, stream, mr);
     if (finalize) {
       const auto requestedType = cudf_velox::veloxToCudfDataType(expr_->type());
       auto resultView = asView(result);
@@ -5304,24 +5340,30 @@ bool canBeEvaluatedByCudf(std::shared_ptr<velox::exec::Expr> expr, bool deep) {
 
 std::shared_ptr<CudfExpression> createCudfExpression(
     std::shared_ptr<velox::exec::Expr> expr,
-    const RowTypePtr& inputRowSchema) {
+    const RowTypePtr& inputRowSchema,
+    const core::QueryConfig* queryConfig) {
   ensureBuiltinExpressionEvaluatorsRegistered();
   const auto& registry = getCudfExpressionEvaluatorRegistry();
 
   const CudfExpressionEvaluatorEntry* best = nullptr;
+  const std::string* bestName = nullptr;
   for (const auto& [name, entry] : registry) {
     if (entry.canEvaluate && entry.canEvaluate(expr)) {
       if (best == nullptr || entry.priority > best->priority) {
         best = &entry;
+        bestName = &name;
       }
     }
   }
 
   if (best != nullptr) {
+    if (bestName != nullptr && *bestName == "function") {
+      return FunctionExpression::create(expr, inputRowSchema, queryConfig);
+    }
     return best->create(expr, inputRowSchema);
   }
 
-  return FunctionExpression::create(expr, inputRowSchema);
+  return FunctionExpression::create(expr, inputRowSchema, queryConfig);
 }
 
 void unregisterFunctions() {

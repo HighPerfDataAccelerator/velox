@@ -49,7 +49,10 @@ class CudfFunctionBaseTest : public velox::functions::test::FunctionBaseTest {
     auto cudfTable = velox::cudf_velox::with_arrow::toCudfTable(
         input, pool_.get(), stream, cudf::get_current_device_resource_ref());
     auto filterEvaluator =
-        createCudfExpression({exprSet.exprs()[0]}, input->rowType());
+        createCudfExpression(
+            {exprSet.exprs()[0]},
+            input->rowType(),
+            &queryCtx_->queryConfig());
     auto ownedColumns = cudfTable->release();
     std::vector<cudf::column_view> inputViews;
     inputViews.reserve(ownedColumns.size());
@@ -57,7 +60,10 @@ class CudfFunctionBaseTest : public velox::functions::test::FunctionBaseTest {
       inputViews.push_back(col->view());
     }
     auto filterColumn = filterEvaluator->eval(
-        inputViews, stream, cudf::get_current_device_resource_ref());
+        inputViews,
+        static_cast<cudf::size_type>(input->size()),
+        stream,
+        cudf::get_current_device_resource_ref());
     auto filterColumnView = asView(filterColumn);
     cudf::table_view resultTable({filterColumnView});
     // Preserve logical Velox output types, e.g. VARBINARY, when converting

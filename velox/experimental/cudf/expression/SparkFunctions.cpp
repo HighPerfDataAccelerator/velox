@@ -27,6 +27,7 @@
 #include "velox/expression/FieldReference.h"
 #include "velox/expression/FunctionSignature.h"
 #include "velox/expression/LambdaExpr.h"
+#include "velox/functions/sparksql/SparkQueryConfig.h"
 #include "velox/vector/BaseVector.h"
 #include "velox/vector/ComplexVector.h"
 
@@ -845,6 +846,52 @@ class FromUnixTimeFunction : public CudfFunction {
   bool needsFormatNames_{false};
 };
 
+class MonotonicallyIncreasingIdFunction : public CudfFunction {
+ public:
+  explicit MonotonicallyIncreasingIdFunction(
+      const std::shared_ptr<velox::exec::Expr>& expr) {
+    VELOX_CHECK_EQ(
+        expr->inputs().size(),
+        0,
+        "monotonically_increasing_id expects no inputs");
+    VELOX_CHECK(
+        expr->type()->kind() == TypeKind::BIGINT,
+        "monotonically_increasing_id output must be BIGINT");
+
+    const auto* queryConfig = currentCudfFunctionQueryConfig();
+    const auto partitionId = queryConfig == nullptr
+        ? 0
+        : functions::sparksql::SparkQueryConfig{*queryConfig}.partitionId();
+    count_ = static_cast<int64_t>(partitionId) << 33;
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    const auto inputRowCount = inputColumns.empty()
+        ? cudf::size_type{0}
+        : asView(inputColumns.front()).size();
+    return eval(inputColumns, inputRowCount, stream, mr);
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      cudf::size_type inputRowCount,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    VELOX_CHECK(inputColumns.empty());
+    cudf::numeric_scalar<int64_t> init(count_, true, stream, mr);
+    cudf::numeric_scalar<int64_t> step(1, true, stream, mr);
+    auto result = cudf::sequence(inputRowCount, init, step, stream, mr);
+    count_ += inputRowCount;
+    return result;
+  }
+
+ private:
+  mutable int64_t count_{0};
+};
+
 class FromJsonRowOfStringsFunction : public CudfFunction {
  public:
   explicit FromJsonRowOfStringsFunction(
@@ -1152,6 +1199,13 @@ void registerSparkFunctions(const std::string& prefix) {
            .argumentType("bigint")
            .constantArgumentType("varchar")
            .build()});
+
+  registerCudfFunction(
+      prefix + "monotonically_increasing_id",
+      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<MonotonicallyIncreasingIdFunction>(expr);
+      },
+      {FunctionSignatureBuilder().returnType("bigint").build()});
 
   registerCudfFunction(
       prefix + "from_json",

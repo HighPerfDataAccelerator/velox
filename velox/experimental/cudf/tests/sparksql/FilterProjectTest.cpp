@@ -28,6 +28,7 @@
 #include "velox/exec/tests/utils/OperatorTestBase.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
 #include "velox/functions/prestosql/ArrayConstructor.h"
+#include "velox/functions/sparksql/SparkQueryConfig.h"
 #include "velox/functions/sparksql/registration/Register.h"
 #include "velox/parse/TypeResolver.h"
 
@@ -162,6 +163,17 @@ TEST_F(CudfFilterProjectTest, hashWithSeed) {
       }),
   });
   facebook::velox::test::assertEqualVectors(expected, hashResults);
+}
+
+TEST_F(CudfFilterProjectTest, monotonicallyIncreasingId) {
+  queryCtx_->testingOverrideConfigUnsafe(
+      {{functions::sparksql::SparkQueryConfig::qualify(
+            functions::sparksql::SparkQueryConfig::kPartitionId),
+        "2"}});
+
+  auto data = makeRowVector({makeFlatVector<int32_t>({10, 20, 30})});
+  assertExpressionMatchesCpu(
+      "monotonically_increasing_id()", data, data->rowType());
 }
 
 TEST_F(CudfFilterProjectTest, castStringToBoolean) {

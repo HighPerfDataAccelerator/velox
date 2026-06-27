@@ -29,6 +29,10 @@
 #include <variant>
 #include <vector>
 
+namespace facebook::velox::core {
+class QueryConfig;
+}
+
 namespace facebook::velox::cudf_velox {
 
 // Holds either a non-owning cudf::column_view (zero-copy) or an owning
@@ -68,6 +72,14 @@ class CudfFunction {
       std::vector<ColumnOrView>& inputColumns,
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr) const = 0;
+
+  virtual ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      cudf::size_type inputRowCount,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const {
+    return eval(inputColumns, stream, mr);
+  }
 };
 
 using CudfFunctionFactory = std::function<std::shared_ptr<CudfFunction>(
@@ -98,6 +110,8 @@ std::shared_ptr<CudfFunction> createCudfFunction(
     const std::string& name,
     const std::shared_ptr<velox::exec::Expr>& expr);
 
+const core::QueryConfig* currentCudfFunctionQueryConfig();
+
 bool registerBuiltinFunctions(const std::string& prefix);
 
 void unregisterFunctions();
@@ -112,6 +126,15 @@ class CudfExpression {
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr,
       bool finalize = false) = 0;
+
+  virtual ColumnOrView eval(
+      std::vector<cudf::column_view> inputColumnViews,
+      cudf::size_type inputRowCount,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr,
+      bool finalize = false) {
+    return eval(std::move(inputColumnViews), stream, mr, finalize);
+  }
 };
 
 using CudfExpressionPtr = std::shared_ptr<CudfExpression>;
@@ -140,13 +163,21 @@ class FunctionExpression : public CudfExpression {
  public:
   static std::shared_ptr<FunctionExpression> create(
       const std::shared_ptr<velox::exec::Expr>& expr,
-      const RowTypePtr& inputRowSchema);
+      const RowTypePtr& inputRowSchema,
+      const core::QueryConfig* queryConfig = nullptr);
 
   // TODO (dm): A storage for keeping results in case this is a multiply
   // referenced subexpression (to do CSE)
 
   ColumnOrView eval(
       std::vector<cudf::column_view> inputColumnViews,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr,
+      bool finalize = false) override;
+
+  ColumnOrView eval(
+      std::vector<cudf::column_view> inputColumnViews,
+      cudf::size_type inputRowCount,
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr,
       bool finalize = false) override;
@@ -171,11 +202,13 @@ class FunctionExpression : public CudfExpression {
   int32_t fieldIndex_{-1};
 
   RowTypePtr inputRowSchema_;
+  const core::QueryConfig* queryConfig_{nullptr};
 };
 
 std::shared_ptr<CudfExpression> createCudfExpression(
     std::shared_ptr<velox::exec::Expr> expr,
-    const RowTypePtr& inputRowSchema);
+    const RowTypePtr& inputRowSchema,
+    const core::QueryConfig* queryConfig = nullptr);
 
 /// Lightweight check if an expression tree is supported by any CUDF evaluator
 /// without initializing CudfExpression objects.
