@@ -221,8 +221,11 @@ bool canBeEvaluatedByCudf(
 
   bool lazyDereference = false;
   std::vector<core::TypedExprPtr> exprsCopy = exprs;
-  std::unique_ptr<exec::ExprSet> exprSet = exec::makeExprSetFromFlag(
-      std::move(exprsCopy), &precompileCtx, lazyDereference);
+  std::unique_ptr<exec::ExprSet> exprSet = std::make_unique<exec::ExprSet>(
+      exprsCopy,
+      &precompileCtx,
+      /*enableConstantFolding=*/false,
+      lazyDereference);
 
   for (const auto& e : exprSet->exprs()) {
     if (!canBeEvaluatedByCudf(e)) {
@@ -299,8 +302,11 @@ void CudfFilterProject::initialize() {
       (dynamic_cast<const core::LazyDereferenceNode*>(project_.get()) !=
        nullptr);
   VELOX_CHECK(!(lazyDereference && filter_));
-  auto expr = exec::makeExprSetFromFlag(
-      std::move(allExprs), operatorCtx_->execCtx(), lazyDereference);
+  auto expr = std::make_unique<exec::ExprSet>(
+      allExprs,
+      operatorCtx_->execCtx(),
+      /*enableConstantFolding=*/false,
+      lazyDereference);
 
   const auto inputType = project_ ? project_->sources()[0]->outputType()
                                   : filter_->sources()[0]->outputType();
