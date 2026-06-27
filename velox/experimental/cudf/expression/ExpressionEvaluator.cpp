@@ -334,6 +334,21 @@ bool hasFunctionNameSuffix(std::string_view name, std::string_view suffix) {
       name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0;
 }
 
+bool isSupportedFromJsonRowOfStringsExpr(
+    const std::shared_ptr<velox::exec::Expr>& expr) {
+  if (expr->inputs().size() != 1 ||
+      expr->inputs()[0]->type()->kind() != TypeKind::VARCHAR ||
+      expr->type()->kind() != TypeKind::ROW) {
+    return false;
+  }
+
+  const auto& rowType = expr->type()->asRow();
+  return std::all_of(
+      rowType.children().begin(),
+      rowType.children().end(),
+      [](const TypePtr& child) { return child->kind() == TypeKind::VARCHAR; });
+}
+
 bool isCudfRegexFunction(std::string_view name) {
   return hasFunctionNameSuffix(name, "regexp_extract") ||
       hasFunctionNameSuffix(name, "regexp_replace") ||
@@ -5167,6 +5182,10 @@ bool FunctionExpression::canEvaluate(std::shared_ptr<velox::exec::Expr> expr) {
     if (!hasSupportedConstantSparkDatetimePattern(expr, 1)) {
       return false;
     }
+  }
+
+  if (hasFunctionNameSuffix(opName, "from_json")) {
+    return isSupportedFromJsonRowOfStringsExpr(expr);
   }
 
   if ((opName == "coalesce" || opName == "row_constructor" ||

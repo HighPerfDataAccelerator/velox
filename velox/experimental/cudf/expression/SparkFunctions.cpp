@@ -33,17 +33,21 @@
 #include <cudf/copying.hpp>
 #include <cudf/datetime.hpp>
 #include <cudf/filling.hpp>
+#include <cudf/json/json.hpp>
 #include <cudf/lists/contains.hpp>
 #include <cudf/lists/stream_compaction.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/replace.hpp>
 #include <cudf/reshape.hpp>
+#include <cudf/scalar/scalar.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
 #include <cudf/strings/convert/convert_datetime.hpp>
+#include <cudf/strings/strings_column_view.hpp>
 #include <cudf/structs/structs_column_view.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
 
+#include <algorithm>
 #include <array>
 #include <optional>
 #include <string_view>
@@ -104,6 +108,33 @@ bool needsDatetimeFormatNames(std::string_view format) {
       format.find("%b") != std::string_view::npos ||
       format.find("%B") != std::string_view::npos ||
       format.find("%p") != std::string_view::npos;
+}
+
+bool isSupportedFromJsonRowOfStrings(
+    const std::shared_ptr<velox::exec::Expr>& expr) {
+  if (expr->inputs().size() != 1 ||
+      expr->inputs()[0]->type()->kind() != TypeKind::VARCHAR ||
+      expr->type()->kind() != TypeKind::ROW) {
+    return false;
+  }
+
+  const auto& rowType = expr->type()->asRow();
+  return std::all_of(
+      rowType.children().begin(),
+      rowType.children().end(),
+      [](const TypePtr& child) { return child->kind() == TypeKind::VARCHAR; });
+}
+
+std::string makeBracketJsonPath(std::string_view fieldName) {
+  std::string path{"$['"};
+  for (const char c : fieldName) {
+    if (c == '\\' || c == '\'') {
+      path.push_back('\\');
+    }
+    path.push_back(c);
+  }
+  path.append("']");
+  return path;
 }
 
 std::unique_ptr<cudf::column> makeAllNullStringColumn(
@@ -446,6 +477,64 @@ class GetTimestampFunction : public CudfFunction {
   bool formatIsNull_{false};
 };
 
+class FromJsonRowOfStringsFunction : public CudfFunction {
+ public:
+  explicit FromJsonRowOfStringsFunction(
+      const std::shared_ptr<velox::exec::Expr>& expr) {
+    VELOX_CHECK(
+        isSupportedFromJsonRowOfStrings(expr),
+        "cuDF from_json currently supports only VARCHAR input to ROW of VARCHAR fields");
+
+    const auto& rowType = expr->type()->asRow();
+    fieldPaths_.reserve(rowType.size());
+    for (const auto& fieldName : rowType.names()) {
+      fieldPaths_.push_back(makeBracketJsonPath(fieldName));
+    }
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    VELOX_CHECK_EQ(
+        inputColumns.size(),
+        1,
+        "from_json expects one non-literal input column");
+    auto inputCol = asView(inputColumns[0]);
+    auto jsonStrings = cudf::strings_column_view(inputCol);
+
+    cudf::get_json_object_options options;
+    options.set_strip_quotes_from_single_strings(true);
+    options.set_missing_fields_as_nulls(true);
+
+    std::vector<std::unique_ptr<cudf::column>> children;
+    children.reserve(fieldPaths_.size());
+    for (const auto& fieldPath : fieldPaths_) {
+      cudf::string_scalar pathScalar(fieldPath, true, stream, mr);
+      children.push_back(
+          cudf::get_json_object(jsonStrings, pathScalar, options, stream, mr));
+    }
+
+    rmm::device_buffer nullMask;
+    cudf::size_type nullCount = 0;
+    if (inputCol.nullable()) {
+      nullMask = cudf::copy_bitmask(inputCol, stream, mr);
+      nullCount = inputCol.null_count();
+    }
+
+    return cudf::make_structs_column(
+        inputCol.size(),
+        std::move(children),
+        nullCount,
+        std::move(nullMask),
+        stream,
+        mr);
+  }
+
+ private:
+  std::vector<std::string> fieldPaths_;
+};
+
 void registerSparkArrayAccessFunctions(const std::string& prefix) {
   using exec::FunctionSignatureBuilder;
 
@@ -567,6 +656,13 @@ void registerSparkFunctions(const std::string& prefix) {
            .argumentType("varchar")
            .constantArgumentType("varchar")
            .build()});
+
+  registerCudfFunction(
+      prefix + "from_json",
+      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<FromJsonRowOfStringsFunction>(expr);
+      },
+      {});
 
   registerSparkArrayAccessFunctions(prefix);
   registerSparkMapFilterFunction(prefix);

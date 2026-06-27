@@ -22,6 +22,7 @@
 #include "velox/experimental/cudf/tests/utils/ExpressionTestUtil.h"
 
 #include "velox/common/base/tests/GTestUtils.h"
+#include "velox/core/Expressions.h"
 #include "velox/dwio/common/tests/utils/BatchMaker.h"
 #include "velox/exec/tests/utils/AssertQueryBuilder.h"
 #include "velox/exec/tests/utils/OperatorTestBase.h"
@@ -54,6 +55,15 @@ class CudfFilterProjectTest : public CudfFunctionBaseTest {
 
   CudfFilterProjectTest() {
     options_.parseIntegerAsBigint = false;
+  }
+
+  void assertTypedExpressionMatchesCpu(
+      const core::TypedExprPtr& expression,
+      const RowVectorPtr& input) {
+    exec::ExprSet exprSet({expression}, &execCtx_);
+    auto expected = functions::test::FunctionBaseTest::evaluate(exprSet, input);
+    auto actual = evaluate(exprSet, input);
+    facebook::velox::test::assertEqualVectors(expected, actual);
   }
 
   template <typename T>
@@ -549,6 +559,27 @@ TEST_F(CudfFilterProjectTest, getJsonObjectConstantPath) {
     SCOPED_TRACE(expression);
     assertExpressionMatchesCpu(expression, data, data->rowType());
   }
+}
+
+TEST_F(CudfFilterProjectTest, fromJsonRowOfStringFields) {
+  auto input = makeNullableFlatVector<std::string>({
+      R"({"id":"10","name":"main","field-name":"v1","payload":"raw"})",
+      R"({"id":7,"payload":[1, 2]})",
+      R"({"name":"secondary","reason":"missing id"})",
+      std::nullopt,
+  });
+  auto data = makeRowVector({input});
+
+  auto outputType = ROW(
+      {"id", "name", "reason", "field-name", "payload"},
+      {VARCHAR(), VARCHAR(), VARCHAR(), VARCHAR(), VARCHAR()});
+  auto expression = std::make_shared<const core::CallTypedExpr>(
+      outputType,
+      std::vector<core::TypedExprPtr>{
+          std::make_shared<core::FieldAccessTypedExpr>(VARCHAR(), "c0")},
+      "from_json");
+
+  assertTypedExpressionMatchesCpu(expression, data);
 }
 
 TEST_F(CudfFilterProjectTest, likeWithEscape) {
