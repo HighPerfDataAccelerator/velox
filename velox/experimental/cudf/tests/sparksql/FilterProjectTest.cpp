@@ -261,7 +261,13 @@ TEST_F(CudfFilterProjectTest, dateintTimestampPatterns) {
       Timestamp(1772323200, 0),
       std::nullopt,
   });
-  auto data = makeRowVector({dateInts, isoDates, timestamps});
+  auto epochSeconds = makeNullableFlatVector<int64_t>({
+      1767225600,
+      1772236800,
+      -59,
+      std::nullopt,
+  });
+  auto data = makeRowVector({dateInts, isoDates, timestamps, epochSeconds});
 
   for (const auto& expression : {
            "date_format(get_timestamp(cast(c0 as varchar), 'yyyyMMdd'), "
@@ -273,9 +279,17 @@ TEST_F(CudfFilterProjectTest, dateintTimestampPatterns) {
            "varchar) as date)), 1) as timestamp), 'yyyyMMdd')",
            "date_format(cast(try_cast(c1 as date) as timestamp), "
            "'yyyyMMdd')",
+           "try_cast(c1 as timestamp)",
            "date_format(cast(coalesce(try_cast(get_timestamp(cast(c2 as "
            "varchar), 'yyyyMMdd') as date), try_cast(cast(c2 as varchar) as "
            "date)) as timestamp), 'yyyyMMdd')",
+           "unix_timestamp(c2)",
+           "to_unix_timestamp(c2)",
+           "from_unixtime(c3, 'yyyy-MM-dd HH:mm:ss')",
+           "unix_timestamp(cast(from_unixtime(c3, 'yyyy-MM-dd HH:mm:ss') as "
+           "timestamp))",
+           "unix_timestamp(coalesce(c2, cast(from_unixtime(c3, 'yyyy-MM-dd "
+           "HH:mm:ss') as timestamp)))",
        }) {
     SCOPED_TRACE(expression);
     assertExpressionMatchesCpu(expression, data, data->rowType());

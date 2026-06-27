@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/expression/AstUtils.h"
 #include "velox/experimental/cudf/expression/CommonFunctions.h"
@@ -117,6 +118,53 @@ bool needsDatetimeFormatNames(std::string_view format) {
       format.find("%b") != std::string_view::npos ||
       format.find("%B") != std::string_view::npos ||
       format.find("%p") != std::string_view::npos;
+}
+
+int64_t timestampTicksPerSecond(cudf::data_type timestampType) {
+  switch (timestampType.id()) {
+    case cudf::type_id::TIMESTAMP_SECONDS:
+      return 1;
+    case cudf::type_id::TIMESTAMP_MILLISECONDS:
+      return 1'000;
+    case cudf::type_id::TIMESTAMP_MICROSECONDS:
+      return 1'000'000;
+    case cudf::type_id::TIMESTAMP_NANOSECONDS:
+      return 1'000'000'000;
+    default:
+      VELOX_UNSUPPORTED(
+          "Unsupported timestamp type {}",
+          static_cast<int32_t>(timestampType.id()));
+  }
+}
+
+std::unique_ptr<cudf::column> timestampToUnixSeconds(
+    cudf::column_view inputCol,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) {
+  const auto int64Type = cudf::data_type{cudf::type_id::INT64};
+  auto ticks = cudf::bit_cast(inputCol, int64Type);
+  const auto ticksPerSecond = timestampTicksPerSecond(inputCol.type());
+  if (ticksPerSecond == 1) {
+    return std::make_unique<cudf::column>(ticks, stream, mr);
+  }
+
+  cudf::numeric_scalar<int64_t> divisor(ticksPerSecond, true, stream, mr);
+  return cudf::binary_operation(
+      ticks, divisor, cudf::binary_operator::FLOOR_DIV, int64Type, stream, mr);
+}
+
+std::unique_ptr<cudf::column> unixSecondsToTimestamp(
+    cudf::column_view inputCol,
+    cudf::data_type timestampType,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) {
+  const auto int64Type = cudf::data_type{cudf::type_id::INT64};
+  cudf::numeric_scalar<int64_t> multiplier(
+      timestampTicksPerSecond(timestampType), true, stream, mr);
+  auto ticks = cudf::binary_operation(
+      inputCol, multiplier, cudf::binary_operator::MUL, int64Type, stream, mr);
+  return std::make_unique<cudf::column>(
+      cudf::bit_cast(ticks->view(), timestampType), stream, mr);
 }
 
 bool isSupportedFromJsonRowOfStrings(
@@ -720,6 +768,83 @@ class GetTimestampFunction : public CudfFunction {
   bool formatIsNull_{false};
 };
 
+class UnixTimestampFunction : public CudfFunction {
+ public:
+  explicit UnixTimestampFunction(
+      const std::shared_ptr<velox::exec::Expr>& expr) {
+    VELOX_CHECK_EQ(
+        expr->inputs().size(), 1, "unix_timestamp expects exactly 1 input");
+    VELOX_CHECK(
+        expr->inputs()[0]->type()->kind() == TypeKind::TIMESTAMP,
+        "unix_timestamp input must be TIMESTAMP");
+    VELOX_CHECK(
+        expr->type()->kind() == TypeKind::BIGINT,
+        "unix_timestamp output must be BIGINT");
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    VELOX_CHECK_EQ(inputColumns.size(), 1);
+    return timestampToUnixSeconds(asView(inputColumns[0]), stream, mr);
+  }
+};
+
+class FromUnixTimeFunction : public CudfFunction {
+ public:
+  explicit FromUnixTimeFunction(
+      const std::shared_ptr<velox::exec::Expr>& expr) {
+    VELOX_CHECK_EQ(
+        expr->inputs().size(), 2, "from_unixtime expects exactly 2 inputs");
+    VELOX_CHECK(
+        expr->inputs()[0]->type()->kind() == TypeKind::BIGINT,
+        "from_unixtime input must be BIGINT");
+    VELOX_CHECK(
+        expr->type()->kind() == TypeKind::VARCHAR,
+        "from_unixtime output must be VARCHAR");
+
+    formatIsNull_ = !readConstantString(expr->inputs()[1]).has_value();
+    if (!formatIsNull_) {
+      format_ = readTranslatedSparkDatetimePattern(expr->inputs()[1]);
+      needsFormatNames_ = needsDatetimeFormatNames(format_);
+    }
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    VELOX_CHECK_EQ(inputColumns.size(), 1);
+    auto inputCol = asView(inputColumns[0]);
+    if (formatIsNull_) {
+      return makeAllNullStringColumn(inputCol.size(), stream, mr);
+    }
+
+    auto timestampCol = unixSecondsToTimestamp(
+        inputCol,
+        cudf::data_type{CudfConfig::getInstance().timestampUnit},
+        stream,
+        mr);
+    if (needsFormatNames_) {
+      auto names = makeEnglishDatetimeFormatNamesColumn(stream, mr);
+      return cudf::strings::from_timestamps(
+          timestampCol->view(),
+          format_,
+          cudf::strings_column_view(names->view()),
+          stream,
+          mr);
+    }
+    return cudf::strings::from_timestamps(
+        timestampCol->view(), format_, cudf::strings_column_view{}, stream, mr);
+  }
+
+ private:
+  std::string format_;
+  bool formatIsNull_{false};
+  bool needsFormatNames_{false};
+};
+
 class FromJsonRowOfStringsFunction : public CudfFunction {
  public:
   explicit FromJsonRowOfStringsFunction(
@@ -1004,6 +1129,27 @@ void registerSparkFunctions(const std::string& prefix) {
       {FunctionSignatureBuilder()
            .returnType("timestamp")
            .argumentType("varchar")
+           .constantArgumentType("varchar")
+           .build()});
+
+  registerCudfFunctions(
+      {prefix + "unix_timestamp", prefix + "to_unix_timestamp"},
+      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<UnixTimestampFunction>(expr);
+      },
+      {FunctionSignatureBuilder()
+           .returnType("bigint")
+           .argumentType("timestamp")
+           .build()});
+
+  registerCudfFunction(
+      prefix + "from_unixtime",
+      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<FromUnixTimeFunction>(expr);
+      },
+      {FunctionSignatureBuilder()
+           .returnType("varchar")
+           .argumentType("bigint")
            .constantArgumentType("varchar")
            .build()});
 

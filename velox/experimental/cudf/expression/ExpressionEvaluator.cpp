@@ -582,6 +582,14 @@ bool isStringToDateVeloxCast(const TypePtr& srcVelox, const TypePtr& dstVelox) {
       srcVelox->kind() == TypeKind::VARCHAR && dstVelox->isDate();
 }
 
+bool isStringToTimestampVeloxCast(
+    const TypePtr& srcVelox,
+    const TypePtr& dstVelox) {
+  return srcVelox != nullptr && dstVelox != nullptr &&
+      srcVelox->kind() == TypeKind::VARCHAR &&
+      dstVelox->kind() == TypeKind::TIMESTAMP;
+}
+
 bool isTimestampToStringVeloxCast(
     const TypePtr& srcVelox,
     const TypePtr& dstVelox) {
@@ -1301,6 +1309,7 @@ class CastFunction : public CudfFunction {
     kStringToFloat,
     kStringToBool,
     kStringToDate,
+    kStringToTimestamp,
     kNumericToTimestamp,
     kNumericToBool
   };
@@ -1342,6 +1351,9 @@ class CastFunction : public CudfFunction {
       castMode_ = CastMode::kStringToBool;
     } else if (isStringToDateVeloxCast(sourceVeloxType, targetVeloxType)) {
       castMode_ = CastMode::kStringToDate;
+    } else if (isStringToTimestampVeloxCast(
+                   sourceVeloxType, targetVeloxType)) {
+      castMode_ = CastMode::kStringToTimestamp;
     } else if (isNumericToTimestampVeloxCast(
                    sourceVeloxType, targetVeloxType)) {
       castMode_ = CastMode::kNumericToTimestamp;
@@ -1455,6 +1467,8 @@ class CastFunction : public CudfFunction {
             boolResult->view(), nullScalar, validMask->view(), stream, mr);
       }
       case CastMode::kStringToDate:
+        return parseSparkStringDateCast(inputCol, targetCudfType_, stream, mr);
+      case CastMode::kStringToTimestamp:
         return parseSparkStringDateCast(inputCol, targetCudfType_, stream, mr);
       case CastMode::kNumericToTimestamp:
         return castNumericSecondsToTimestamp(
@@ -5184,6 +5198,9 @@ bool FunctionExpression::canEvaluate(std::shared_ptr<velox::exec::Expr> expr) {
       return true;
     }
     if (isStringToDateVeloxCast(srcType, dstType)) {
+      return true;
+    }
+    if (isStringToTimestampVeloxCast(srcType, dstType)) {
       return true;
     }
     if (isNumericToTimestampVeloxCast(srcType, dstType)) {
