@@ -37,6 +37,7 @@
 #include <cudf/aggregation.hpp>
 #include <cudf/binaryop.hpp>
 #include <cudf/column/column_factories.hpp>
+#include <cudf/column/column_view.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/datetime.hpp>
 #include <cudf/fixed_point/fixed_point.hpp>
@@ -531,6 +532,15 @@ bool isTimestampToStringVeloxCast(
       dstVelox->kind() == TypeKind::VARCHAR;
 }
 
+bool isNumericToTimestampVeloxCast(
+    const TypePtr& srcVelox,
+    const TypePtr& dstVelox) {
+  return srcVelox != nullptr && dstVelox != nullptr &&
+      dstVelox->kind() == TypeKind::TIMESTAMP &&
+      (isIntegralNonDecimalVeloxType(srcVelox) ||
+       isFloatingPointVeloxType(srcVelox));
+}
+
 bool isSupportedCudfScalarLiteralType(const TypePtr& type) {
   if (type == nullptr) {
     return false;
@@ -714,6 +724,63 @@ std::unique_ptr<cudf::column> parseSparkStringDateCast(
       dateValidNoNulls->view(),
       stream,
       mr);
+}
+
+double timestampUnitFactor(cudf::data_type targetType) {
+  switch (targetType.id()) {
+    case cudf::type_id::TIMESTAMP_SECONDS:
+      return 1.0;
+    case cudf::type_id::TIMESTAMP_MILLISECONDS:
+      return 1000.0;
+    case cudf::type_id::TIMESTAMP_MICROSECONDS:
+      return 1000000.0;
+    case cudf::type_id::TIMESTAMP_NANOSECONDS:
+      return 1000000000.0;
+    default:
+      VELOX_UNSUPPORTED(
+          "Unsupported numeric to timestamp target type {}",
+          static_cast<int32_t>(targetType.id()));
+  }
+}
+
+std::unique_ptr<cudf::column> castNumericSecondsToTimestamp(
+    cudf::column_view inputCol,
+    cudf::data_type targetType,
+    bool sourceIsFloating,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) {
+  std::unique_ptr<cudf::column> secondsOwner;
+  auto secondsView = inputCol;
+  if (inputCol.type().id() != cudf::type_id::FLOAT64) {
+    secondsOwner = cudf::cast(
+        inputCol, cudf::data_type{cudf::type_id::FLOAT64}, stream, mr);
+    secondsView = secondsOwner->view();
+  }
+
+  cudf::numeric_scalar<double> factor(
+      timestampUnitFactor(targetType), true, stream, mr);
+  auto scaled = cudf::binary_operation(
+      secondsView,
+      factor,
+      cudf::binary_operator::MUL,
+      cudf::data_type{cudf::type_id::FLOAT64},
+      stream,
+      mr);
+  secondsOwner.reset();
+
+  auto ticks = cudf::cast(
+      scaled->view(), cudf::data_type{cudf::type_id::INT64}, stream, mr);
+  scaled.reset();
+
+  if (sourceIsFloating) {
+    auto valid = cudf::is_not_nan(inputCol, stream, mr);
+    auto nullScalar = cudf::numeric_scalar<int64_t>(0, false, stream, mr);
+    ticks = cudf::copy_if_else(
+        ticks->view(), nullScalar, valid->view(), stream, mr);
+  }
+
+  return std::make_unique<cudf::column>(
+      cudf::bit_cast(ticks->view(), targetType), stream, mr);
 }
 
 std::unique_ptr<cudf::column> makeEmptyColumnForListScalar(
@@ -1176,6 +1243,7 @@ class CastFunction : public CudfFunction {
     kStringToFloat,
     kStringToBool,
     kStringToDate,
+    kNumericToTimestamp,
     kNumericToBool
   };
 
@@ -1216,6 +1284,11 @@ class CastFunction : public CudfFunction {
       castMode_ = CastMode::kStringToBool;
     } else if (isStringToDateVeloxCast(sourceVeloxType, targetVeloxType)) {
       castMode_ = CastMode::kStringToDate;
+    } else if (isNumericToTimestampVeloxCast(
+                   sourceVeloxType, targetVeloxType)) {
+      castMode_ = CastMode::kNumericToTimestamp;
+      numericToTimestampSourceIsFloating_ =
+          isFloatingPointVeloxType(sourceVeloxType);
     } else if (isNumericToBooleanVeloxCast(sourceVeloxType, targetVeloxType)) {
       castMode_ = CastMode::kNumericToBool;
       numericToBoolSourceIsFloating_ =
@@ -1325,6 +1398,13 @@ class CastFunction : public CudfFunction {
       }
       case CastMode::kStringToDate:
         return parseSparkStringDateCast(inputCol, targetCudfType_, stream, mr);
+      case CastMode::kNumericToTimestamp:
+        return castNumericSecondsToTimestamp(
+            inputCol,
+            targetCudfType_,
+            numericToTimestampSourceIsFloating_,
+            stream,
+            mr);
       case CastMode::kNumericToBool: {
         auto zero =
             cudf::make_default_constructed_scalar(inputCol.type(), stream, mr);
@@ -1360,6 +1440,7 @@ class CastFunction : public CudfFunction {
   cudf::data_type targetCudfType_;
   CastMode castMode_{CastMode::kCudfCast};
   bool numericToBoolSourceIsFloating_{false};
+  bool numericToTimestampSourceIsFloating_{false};
 };
 
 class CardinalityFunction : public CudfFunction {
@@ -5045,6 +5126,9 @@ bool FunctionExpression::canEvaluate(std::shared_ptr<velox::exec::Expr> expr) {
       return true;
     }
     if (isStringToDateVeloxCast(srcType, dstType)) {
+      return true;
+    }
+    if (isNumericToTimestampVeloxCast(srcType, dstType)) {
       return true;
     }
     if (isNumericToBooleanVeloxCast(srcType, dstType)) {

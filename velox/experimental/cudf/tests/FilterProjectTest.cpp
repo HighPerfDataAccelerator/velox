@@ -2160,6 +2160,30 @@ TEST_F(CudfSimpleFilterProjectTest, castNumericToBoolean) {
   }
 }
 
+TEST_F(CudfSimpleFilterProjectTest, castNumericToTimestamp) {
+  auto input = makeRowVector({
+      makeNullableFlatVector<double>({
+          1767225600.0,
+          1767225600.123,
+          std::nullopt,
+      }),
+      makeNullableFlatVector<int64_t>({
+          1767225600000,
+          1767225600123,
+          std::nullopt,
+      }),
+  });
+
+  for (const auto& expression : {
+           "cast(c0 as timestamp)",
+           "try_cast(c0 as timestamp)",
+           "try_cast(divide(try_cast(c1 as double), 1000.0) as timestamp)",
+       }) {
+    SCOPED_TRACE(expression);
+    assertExpressionMatchesCpu(expression, input, input->rowType());
+  }
+}
+
 TEST_F(CudfSimpleFilterProjectTest, castIntegralToVarchar) {
   EXPECT_EQ(
       evaluateOnce<std::string, int32_t>("cast(c0 as varchar)", 12345),
