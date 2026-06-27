@@ -951,6 +951,8 @@ void CudfGroupby::initialize() {
       inputRowSchema,
       groupingKeyInputChannels_);
   aggregationInputChannels_ = std::move(aggregationInput.channels);
+  precomputedInputEvaluators_ = createAggregationInputEvaluators(
+      aggregationInput.precomputedInputs, *operatorCtx_, inputRowSchema);
   aggregators_ = toGroupbyAggregators(
       *aggregationNode_,
       aggregationNode_->step(),
@@ -1008,7 +1010,13 @@ void CudfGroupby::computePartialGroupbyStreaming(CudfVectorPtr tbl) {
   auto inputTableStream = tbl->stream();
   // Use getTableView() to avoid expensive materialization for packed_table.
   // tbl stays alive during this function call, keeping the view valid.
-  auto permutedInputView = tbl->getTableView().select(
+  auto preparedInput = prepareAggregationInput(
+      tbl->getTableView(),
+      static_cast<cudf::size_type>(tbl->size()),
+      precomputedInputEvaluators_,
+      inputTableStream,
+      get_temp_mr());
+  auto permutedInputView = preparedInput.tableView.select(
       aggregationInputChannels_.begin(), aggregationInputChannels_.end());
   auto groupbyOnInput = doGroupByAggregation(
       permutedInputView,
@@ -1049,7 +1057,13 @@ void CudfGroupby::computePartialGroupbyStreaming(CudfVectorPtr tbl) {
 
 void CudfGroupby::computeFinalGroupbyStreaming(CudfVectorPtr tbl) {
   auto inputTableStream = tbl->stream();
-  auto permutedInputView = tbl->getTableView().select(
+  auto preparedInput = prepareAggregationInput(
+      tbl->getTableView(),
+      static_cast<cudf::size_type>(tbl->size()),
+      precomputedInputEvaluators_,
+      inputTableStream,
+      get_temp_mr());
+  auto permutedInputView = preparedInput.tableView.select(
       aggregationInputChannels_.begin(), aggregationInputChannels_.end());
 
   if (!bufferedResult_) {
@@ -1091,7 +1105,13 @@ void CudfGroupby::computeFinalGroupbyStreaming(CudfVectorPtr tbl) {
 
 void CudfGroupby::computeSingleGroupbyStreaming(CudfVectorPtr tbl) {
   auto inputTableStream = tbl->stream();
-  auto permutedInputView = tbl->getTableView().select(
+  auto preparedInput = prepareAggregationInput(
+      tbl->getTableView(),
+      static_cast<cudf::size_type>(tbl->size()),
+      precomputedInputEvaluators_,
+      inputTableStream,
+      get_temp_mr());
+  auto permutedInputView = preparedInput.tableView.select(
       aggregationInputChannels_.begin(), aggregationInputChannels_.end());
   auto groupbyOnInput = doGroupByAggregation(
       permutedInputView,
@@ -1296,7 +1316,13 @@ RowVectorPtr CudfGroupby::doGetOutput() {
 
   VELOX_CHECK_NOT_NULL(tbl);
 
-  auto permutedInputView = tbl->view().select(
+  auto preparedInput = prepareAggregationInput(
+      tbl->view(),
+      tbl->num_rows(),
+      precomputedInputEvaluators_,
+      stream,
+      get_temp_mr());
+  auto permutedInputView = preparedInput.tableView.select(
       aggregationInputChannels_.begin(), aggregationInputChannels_.end());
   return doGroupByAggregation(
       permutedInputView,

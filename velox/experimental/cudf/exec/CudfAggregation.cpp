@@ -169,6 +169,9 @@ AggregationInputChannels buildAggregationInputChannels(
 
   const auto fallbackChannel =
       groupingKeyInputChannels.empty() ? 0 : groupingKeyInputChannels.front();
+  const core::PlanNode* sourceNode = aggregationNode.sources().empty()
+      ? nullptr
+      : aggregationNode.sources()[0].get();
 
   for (auto i = 0; i < aggregationNode.aggregates().size(); ++i) {
     auto const& aggregate = aggregationNode.aggregates()[i];
@@ -183,7 +186,9 @@ AggregationInputChannels buildAggregationInputChannels(
         result.constants[i] = constant->toConstantVector(operatorCtx.pool());
         aggInputs.push_back(fallbackChannel);
       } else {
-        VELOX_NYI("Constants and lambdas not yet supported");
+        aggInputs.push_back(
+            inputRowSchema->size() + result.precomputedInputs.size());
+        result.precomputedInputs.push_back(expandFieldReference(arg, sourceNode));
       }
     }
 
@@ -199,6 +204,55 @@ AggregationInputChannels buildAggregationInputChannels(
     result.channels.push_back(aggInputs[0]);
   }
 
+  return result;
+}
+
+std::vector<CudfExpressionPtr> createAggregationInputEvaluators(
+    const std::vector<core::TypedExprPtr>& precomputedInputs,
+    exec::OperatorCtx const& operatorCtx,
+    RowTypePtr const& inputRowSchema) {
+  if (precomputedInputs.empty()) {
+    return {};
+  }
+
+  bool lazyDereference = false;
+  std::vector<core::TypedExprPtr> exprs = precomputedInputs;
+  auto exprSet = exec::makeExprSetFromFlag(
+      std::move(exprs), operatorCtx.execCtx(), lazyDereference);
+
+  std::vector<CudfExpressionPtr> evaluators;
+  evaluators.reserve(exprSet->exprs().size());
+  for (const auto& expr : exprSet->exprs()) {
+    evaluators.push_back(createCudfExpression(
+        expr, inputRowSchema, &operatorCtx.driverCtx()->queryConfig()));
+  }
+  return evaluators;
+}
+
+PreparedAggregationInput prepareAggregationInput(
+    cudf::table_view input,
+    cudf::size_type inputRowCount,
+    const std::vector<CudfExpressionPtr>& precomputedInputEvaluators,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) {
+  PreparedAggregationInput result;
+  if (precomputedInputEvaluators.empty()) {
+    result.tableView = input;
+    return result;
+  }
+
+  const auto inputViews = tableViewToColumnViews(input);
+  auto allViews = inputViews;
+  allViews.reserve(input.num_columns() + precomputedInputEvaluators.size());
+  result.precomputedColumns.reserve(precomputedInputEvaluators.size());
+
+  for (const auto& evaluator : precomputedInputEvaluators) {
+    result.precomputedColumns.push_back(
+        evaluator->eval(inputViews, inputRowCount, stream, mr, true));
+    allViews.push_back(asView(result.precomputedColumns.back()));
+  }
+
+  result.tableView = cudf::table_view(allViews);
   return result;
 }
 

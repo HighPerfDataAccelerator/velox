@@ -114,6 +114,7 @@ class CudfGroupby : public CudfOperatorBase {
   std::vector<column_index_t> groupingKeyInputChannels_;
   std::vector<column_index_t> groupingKeyOutputChannels_;
   std::vector<column_index_t> aggregationInputChannels_;
+  std::vector<CudfExpressionPtr> precomputedInputEvaluators_;
 
   std::shared_ptr<const core::AggregationNode> aggregationNode_;
   std::vector<std::unique_ptr<GroupbyAggregator>> aggregators_;

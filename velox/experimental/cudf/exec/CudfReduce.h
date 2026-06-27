@@ -99,6 +99,7 @@ class CudfReduce : public CudfOperatorBase {
   std::vector<std::unique_ptr<ReduceAggregator>> aggregators_;
 
   std::vector<column_index_t> aggregationInputChannels_;
+  std::vector<CudfExpressionPtr> precomputedInputEvaluators_;
 
   const bool isPartialOutput_;
   // Number of input rows accumulated since the last output.

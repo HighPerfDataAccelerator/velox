@@ -865,6 +865,8 @@ void CudfReduce::initialize() {
   auto aggregationInput = buildAggregationInputChannels(
       *aggregationNode_, *operatorCtx_, inputRowSchema, emptyKeys);
   aggregationInputChannels_ = std::move(aggregationInput.channels);
+  precomputedInputEvaluators_ = createAggregationInputEvaluators(
+      aggregationInput.precomputedInputs, *operatorCtx_, inputRowSchema);
   aggregators_ = toReduceAggregators(
       *aggregationNode_,
       aggregationNode_->step(),
@@ -936,9 +938,15 @@ RowVectorPtr CudfReduce::doGetOutput() {
 
   VELOX_CHECK_NOT_NULL(tbl);
 
-  auto tableView = tbl->view().num_columns() == 0
-      ? tbl->view()
-      : tbl->view().select(
+  auto preparedInput = prepareAggregationInput(
+      tbl->view(),
+      tbl->num_rows(),
+      precomputedInputEvaluators_,
+      stream,
+      get_temp_mr());
+  auto tableView = preparedInput.tableView.num_columns() == 0
+      ? preparedInput.tableView
+      : preparedInput.tableView.select(
             aggregationInputChannels_.begin(), aggregationInputChannels_.end());
   auto output = doGlobalAggregation(tableView, stream, get_output_mr());
   if (isPartialOutput_ && !noMoreInput_) {
