@@ -349,6 +349,49 @@ bool isSupportedFromJsonRowOfStringsExpr(
       [](const TypePtr& child) { return child->kind() == TypeKind::VARCHAR; });
 }
 
+bool isSupportedDirectJsonLeafType(const TypePtr& type) {
+  if (type->isDate() || type->isDecimal()) {
+    return false;
+  }
+  switch (type->kind()) {
+    case TypeKind::BOOLEAN:
+    case TypeKind::TINYINT:
+    case TypeKind::SMALLINT:
+    case TypeKind::INTEGER:
+    case TypeKind::BIGINT:
+    case TypeKind::REAL:
+    case TypeKind::DOUBLE:
+    case TypeKind::VARCHAR:
+      return true;
+    default:
+      return false;
+  }
+}
+
+bool isSupportedDirectJsonType(const TypePtr& type, bool isRoot) {
+  switch (type->kind()) {
+    case TypeKind::ROW:
+      return std::all_of(
+          type->asRow().children().begin(),
+          type->asRow().children().end(),
+          [](const TypePtr& child) {
+            return isSupportedDirectJsonType(child, false);
+          });
+    case TypeKind::ARRAY:
+      return isSupportedDirectJsonType(type->childAt(0), false);
+    default:
+      return !isRoot && isSupportedDirectJsonLeafType(type);
+  }
+}
+
+bool isSupportedFromJsonExpr(
+    const std::shared_ptr<velox::exec::Expr>& expr) {
+  return isSupportedFromJsonRowOfStringsExpr(expr) ||
+      (expr->inputs().size() == 1 &&
+       expr->inputs()[0]->type()->kind() == TypeKind::VARCHAR &&
+       isSupportedDirectJsonType(expr->type(), true));
+}
+
 bool isCudfRegexFunction(std::string_view name) {
   return hasFunctionNameSuffix(name, "regexp_extract") ||
       hasFunctionNameSuffix(name, "regexp_replace") ||
@@ -5185,7 +5228,7 @@ bool FunctionExpression::canEvaluate(std::shared_ptr<velox::exec::Expr> expr) {
   }
 
   if (hasFunctionNameSuffix(opName, "from_json")) {
-    return isSupportedFromJsonRowOfStringsExpr(expr);
+    return isSupportedFromJsonExpr(expr);
   }
 
   if ((opName == "coalesce" || opName == "row_constructor" ||

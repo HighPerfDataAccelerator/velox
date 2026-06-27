@@ -582,6 +582,50 @@ TEST_F(CudfFilterProjectTest, fromJsonRowOfStringFields) {
   assertTypedExpressionMatchesCpu(expression, data);
 }
 
+TEST_F(CudfFilterProjectTest, fromJsonNestedRow) {
+  auto input = makeNullableFlatVector<std::string>({
+      R"({"ok":true,"count":7,"score":1.25,"name":"main","items":[1,2]})",
+      R"({"ok":false,"count":null,"score":2.5,"name":"secondary","items":[]})",
+      R"({"name":"missing scalar fields"})",
+      "   ",
+      std::nullopt,
+  });
+  auto data = makeRowVector({input});
+
+  auto outputType = ROW(
+      {"ok", "count", "score", "name", "items"},
+      {BOOLEAN(), BIGINT(), DOUBLE(), VARCHAR(), ARRAY(BIGINT())});
+  auto expression = std::make_shared<const core::CallTypedExpr>(
+      outputType,
+      std::vector<core::TypedExprPtr>{
+          std::make_shared<core::FieldAccessTypedExpr>(VARCHAR(), "c0")},
+      "from_json");
+
+  assertTypedExpressionMatchesCpu(expression, data);
+}
+
+TEST_F(CudfFilterProjectTest, fromJsonArrayOfRows) {
+  auto input = makeNullableFlatVector<std::string>({
+      R"([{"bgstart":true,"category":"ui","clienttime":10,"errorcode":"E1","errormsg":"first"},{"bgstart":false,"category":"network","clienttime":20,"errorcode":"E2","errormsg":"second"}])",
+      R"([])",
+      R"([{"category":"missing scalars"}])",
+      "   ",
+      std::nullopt,
+  });
+  auto data = makeRowVector({input});
+
+  auto rowType = ROW(
+      {"bgstart", "category", "clienttime", "errorcode", "errormsg"},
+      {BOOLEAN(), VARCHAR(), BIGINT(), VARCHAR(), VARCHAR()});
+  auto expression = std::make_shared<const core::CallTypedExpr>(
+      ARRAY(rowType),
+      std::vector<core::TypedExprPtr>{
+          std::make_shared<core::FieldAccessTypedExpr>(VARCHAR(), "c0")},
+      "from_json");
+
+  assertTypedExpressionMatchesCpu(expression, data);
+}
+
 TEST_F(CudfFilterProjectTest, likeWithEscape) {
   auto input = makeNullableFlatVector<std::string>(
       {"a_c", "abc", "abc_", "a%c", std::nullopt, ""});

@@ -30,9 +30,11 @@
 #include "velox/vector/ComplexVector.h"
 
 #include <cudf/column/column_factories.hpp>
+#include <cudf/binaryop.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/datetime.hpp>
 #include <cudf/filling.hpp>
+#include <cudf/io/json.hpp>
 #include <cudf/json/json.hpp>
 #include <cudf/lists/contains.hpp>
 #include <cudf/lists/stream_compaction.hpp>
@@ -41,14 +43,21 @@
 #include <cudf/reshape.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
+#include <cudf/strings/contains.hpp>
+#include <cudf/strings/combine.hpp>
 #include <cudf/strings/convert/convert_datetime.hpp>
+#include <cudf/strings/regex/regex_program.hpp>
 #include <cudf/strings/strings_column_view.hpp>
+#include <cudf/strings/strip.hpp>
 #include <cudf/structs/structs_column_view.hpp>
 #include <cudf/table/table_view.hpp>
+#include <cudf/transform.hpp>
 #include <cudf/types.hpp>
+#include <cudf/unary.hpp>
 
 #include <algorithm>
 #include <array>
+#include <map>
 #include <optional>
 #include <string_view>
 #include <vector>
@@ -125,6 +134,53 @@ bool isSupportedFromJsonRowOfStrings(
       [](const TypePtr& child) { return child->kind() == TypeKind::VARCHAR; });
 }
 
+bool isSupportedDirectJsonLeafType(const TypePtr& type) {
+  if (type->isDate() || type->isDecimal()) {
+    return false;
+  }
+  switch (type->kind()) {
+    case TypeKind::BOOLEAN:
+    case TypeKind::TINYINT:
+    case TypeKind::SMALLINT:
+    case TypeKind::INTEGER:
+    case TypeKind::BIGINT:
+    case TypeKind::REAL:
+    case TypeKind::DOUBLE:
+    case TypeKind::VARCHAR:
+      return true;
+    default:
+      return false;
+  }
+}
+
+bool isSupportedDirectJsonType(const TypePtr& type, bool isRoot) {
+  switch (type->kind()) {
+    case TypeKind::ROW:
+      return std::all_of(
+          type->asRow().children().begin(),
+          type->asRow().children().end(),
+          [](const TypePtr& child) {
+            return isSupportedDirectJsonType(child, false);
+          });
+    case TypeKind::ARRAY:
+      return isSupportedDirectJsonType(type->childAt(0), false);
+    default:
+      return !isRoot && isSupportedDirectJsonLeafType(type);
+  }
+}
+
+bool isSupportedFromJsonNested(
+    const std::shared_ptr<velox::exec::Expr>& expr) {
+  return expr->inputs().size() == 1 &&
+      expr->inputs()[0]->type()->kind() == TypeKind::VARCHAR &&
+      isSupportedDirectJsonType(expr->type(), true);
+}
+
+bool isSupportedFromJson(const std::shared_ptr<velox::exec::Expr>& expr) {
+  return isSupportedFromJsonRowOfStrings(expr) ||
+      isSupportedFromJsonNested(expr);
+}
+
 std::string makeBracketJsonPath(std::string_view fieldName) {
   std::string path{"$['"};
   for (const char c : fieldName) {
@@ -165,6 +221,193 @@ std::unique_ptr<cudf::column> makeAllNullFixedWidthColumn(
     rmm::device_async_resource_ref mr) {
   return cudf::make_fixed_width_column(
       type, size, cudf::mask_state::ALL_NULL, stream, mr);
+}
+
+std::unique_ptr<cudf::column> makeZeroOffsetsColumn(
+    cudf::size_type size,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) {
+  std::vector<cudf::size_type> offsets(size + 1, 0);
+  rmm::device_buffer offsetsBuffer(
+      offsets.data(), offsets.size() * sizeof(cudf::size_type), stream, mr);
+  return std::make_unique<cudf::column>(
+      cudf::data_type{cudf::type_id::INT32},
+      static_cast<cudf::size_type>(offsets.size()),
+      std::move(offsetsBuffer),
+      rmm::device_buffer{},
+      0);
+}
+
+std::unique_ptr<cudf::column> makeEmptyColumnForType(
+    const TypePtr& type,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) {
+  switch (type->kind()) {
+    case TypeKind::VARCHAR:
+    case TypeKind::VARBINARY:
+      return cudf::make_strings_column(
+          0,
+          makeZeroOffsetsColumn(0, stream, mr),
+          rmm::device_buffer{},
+          0,
+          rmm::device_buffer{});
+    case TypeKind::ARRAY:
+      return cudf::make_lists_column(
+          0,
+          makeZeroOffsetsColumn(0, stream, mr),
+          makeEmptyColumnForType(type->childAt(0), stream, mr),
+          0,
+          rmm::device_buffer{});
+    case TypeKind::ROW: {
+      std::vector<std::unique_ptr<cudf::column>> children;
+      children.reserve(type->size());
+      for (size_t i = 0; i < type->size(); ++i) {
+        children.push_back(makeEmptyColumnForType(type->childAt(i), stream, mr));
+      }
+      return cudf::make_structs_column(
+          0, std::move(children), 0, rmm::device_buffer{}, stream, mr);
+    }
+    default:
+      return cudf::make_empty_column(cudf_velox::veloxToCudfDataType(type));
+  }
+}
+
+cudf::io::schema_element makeDirectJsonSchema(const TypePtr& type) {
+  switch (type->kind()) {
+    case TypeKind::ARRAY: {
+      std::map<std::string, cudf::io::schema_element> children;
+      children.emplace("element", makeDirectJsonSchema(type->childAt(0)));
+      return cudf::io::schema_element{
+          cudf::data_type{cudf::type_id::LIST}, std::move(children)};
+    }
+    case TypeKind::ROW: {
+      const auto& rowType = type->asRow();
+      std::map<std::string, cudf::io::schema_element> children;
+      std::vector<std::string> order;
+      children.clear();
+      order.reserve(rowType.size());
+      for (size_t i = 0; i < rowType.size(); ++i) {
+        const auto& name = rowType.nameOf(i);
+        children.emplace(name, makeDirectJsonSchema(rowType.childAt(i)));
+        order.push_back(name);
+      }
+      return cudf::io::schema_element{
+          cudf::data_type{cudf::type_id::STRUCT},
+          std::move(children),
+          std::move(order)};
+    }
+    default:
+      return cudf::io::schema_element{cudf_velox::veloxToCudfDataType(type)};
+  }
+}
+
+cudf::io::schema_element makeWrappedArrayJsonSchema(
+    cudf::io::schema_element arraySchema) {
+  std::map<std::string, cudf::io::schema_element> children;
+  children.emplace("element", std::move(arraySchema));
+  std::vector<std::string> order{"element"};
+  return cudf::io::schema_element{
+      cudf::data_type{cudf::type_id::STRUCT},
+      std::move(children),
+      std::move(order)};
+}
+
+struct PreparedJsonInput {
+  rmm::device_buffer data;
+  rmm::device_buffer outputNullMask;
+  cudf::size_type outputNullCount;
+};
+
+PreparedJsonInput prepareJsonInput(
+    const cudf::column_view& inputCol,
+    bool rootIsArray,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) {
+  auto jsonStrings = cudf::strings_column_view(inputCol);
+  const auto replacementText = rootIsArray ? "[]" : "{}";
+  cudf::string_scalar replacement(replacementText, true, stream, mr);
+  cudf::string_scalar delimiter("\n", true, stream, mr);
+
+  auto stripped = cudf::strings::strip(
+      jsonStrings,
+      cudf::strings::side_type::BOTH,
+      cudf::string_scalar("", true, stream, mr),
+      stream,
+      mr);
+  auto emptyPattern = cudf::strings::regex_program::create("^$");
+  auto emptyRows = cudf::strings::contains_re(
+      cudf::strings_column_view(stripped->view()),
+      *emptyPattern,
+      stream,
+      mr);
+
+  auto sanitized =
+      cudf::copy_if_else(replacement, inputCol, emptyRows->view(), stream, mr);
+  if (rootIsArray) {
+    cudf::string_scalar prefix("{\"element\":", true, stream, mr);
+    cudf::string_scalar suffix("}", true, stream, mr);
+    auto prefixCol =
+        cudf::make_column_from_scalar(prefix, inputCol.size(), stream, mr);
+    auto suffixCol =
+        cudf::make_column_from_scalar(suffix, inputCol.size(), stream, mr);
+
+    auto wrapped = cudf::strings::concatenate(
+        cudf::table_view{
+            {prefixCol->view(), sanitized->view(), suffixCol->view()}},
+        cudf::string_scalar("", true, stream, mr),
+        replacement,
+        cudf::strings::separator_on_nulls::YES,
+        stream,
+        mr);
+    sanitized = std::move(wrapped);
+  }
+
+  cudf::string_scalar arrayLineReplacement(
+      "{\"element\":[]}", true, stream, mr);
+  auto joined = cudf::strings::join_strings(
+      cudf::strings_column_view(sanitized->view()),
+      delimiter,
+      rootIsArray ? arrayLineReplacement : replacement,
+      stream,
+      mr);
+  auto joinedContents = joined->release();
+
+  auto inputNulls = cudf::is_null(inputCol, stream, mr);
+  cudf::numeric_scalar<bool> falseScalar(false, true, stream, mr);
+  auto emptyRowsNoNulls =
+      cudf::replace_nulls(emptyRows->view(), falseScalar, stream, mr);
+  auto shouldNull = cudf::binary_operation(
+      inputNulls->view(),
+      emptyRowsNoNulls->view(),
+      cudf::binary_operator::LOGICAL_OR,
+      cudf::data_type{cudf::type_id::BOOL8},
+      stream,
+      mr);
+  auto outputIsValid = cudf::unary_operation(
+      shouldNull->view(), cudf::unary_operator::NOT, stream, mr);
+  auto [outputNullMask, outputNullCount] =
+      cudf::bools_to_mask(outputIsValid->view(), stream, mr);
+
+  return PreparedJsonInput{
+      std::move(*joinedContents.data),
+      std::move(*outputNullMask),
+      outputNullCount};
+}
+
+std::unique_ptr<cudf::column> applyTopLevelNulls(
+    std::unique_ptr<cudf::column> column,
+    rmm::device_buffer nullMask,
+    cudf::size_type nullCount) {
+  const auto type = column->type();
+  const auto size = column->size();
+  auto contents = column->release();
+  return std::make_unique<cudf::column>(
+      type,
+      size,
+      std::move(*contents.data),
+      std::move(nullMask),
+      nullCount,
+      std::move(contents.children));
 }
 
 std::unique_ptr<cudf::column> makeEnglishDatetimeFormatNamesColumn(
@@ -535,6 +778,113 @@ class FromJsonRowOfStringsFunction : public CudfFunction {
   std::vector<std::string> fieldPaths_;
 };
 
+class FromJsonNestedFunction : public CudfFunction {
+ public:
+  explicit FromJsonNestedFunction(
+      const std::shared_ptr<velox::exec::Expr>& expr) {
+    VELOX_CHECK(
+        isSupportedFromJsonNested(expr),
+        "cuDF from_json currently supports only VARCHAR input to ROW or ARRAY with supported nested leaves");
+    outputType_ = expr->type();
+    schema_ = makeDirectJsonSchema(outputType_);
+    rootIsArray_ = outputType_->kind() == TypeKind::ARRAY;
+    if (rootIsArray_) {
+      schema_ = makeWrappedArrayJsonSchema(std::move(schema_));
+    }
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    VELOX_CHECK_EQ(
+        inputColumns.size(),
+        1,
+        "from_json expects one non-literal input column");
+    auto inputCol = asView(inputColumns[0]);
+    if (inputCol.is_empty()) {
+      return makeEmptyColumnForType(outputType_, stream, mr);
+    }
+
+    auto jsonInput = prepareJsonInput(inputCol, rootIsArray_, stream, mr);
+
+    auto options =
+        cudf::io::json_reader_options::builder(
+            cudf::io::source_info{cudf::device_span<std::byte const>{
+                static_cast<std::byte const*>(jsonInput.data.data()),
+                jsonInput.data.size()}})
+            .lines(true)
+            .delimiter('\n')
+            .recovery_mode(cudf::io::json_recovery_mode_t::RECOVER_WITH_NULL)
+            .normalize_whitespace(true)
+            .mixed_types_as_string(true)
+            .experimental(true)
+            .strict_validation(true)
+            .keep_quotes(false)
+            .dtypes(schema_)
+            .prune_columns(true)
+            .build();
+
+    auto parsed = cudf::io::read_json(std::move(options), stream, mr);
+    auto columns = parsed.tbl->release();
+
+    std::unique_ptr<cudf::column> result;
+    if (rootIsArray_) {
+      VELOX_CHECK_EQ(
+          columns.size(),
+          1,
+          "from_json ARRAY schema should produce a single cuDF column");
+      result = std::move(columns[0]);
+    } else {
+      VELOX_CHECK_EQ(
+          columns.size(),
+          outputType_->size(),
+          "from_json ROW schema produced an unexpected number of columns");
+      result = cudf::make_structs_column(
+          inputCol.size(),
+          std::move(columns),
+          0,
+          rmm::device_buffer{},
+          stream,
+          mr);
+    }
+
+    return applyTopLevelNulls(
+        std::move(result),
+        std::move(jsonInput.outputNullMask),
+        jsonInput.outputNullCount);
+  }
+
+ private:
+  TypePtr outputType_;
+  cudf::io::schema_element schema_;
+  bool rootIsArray_{false};
+};
+
+class FromJsonFunction : public CudfFunction {
+ public:
+  explicit FromJsonFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
+    VELOX_CHECK(
+        isSupportedFromJson(expr),
+        "Unsupported cuDF from_json shape");
+    if (isSupportedFromJsonRowOfStrings(expr)) {
+      impl_ = std::make_shared<FromJsonRowOfStringsFunction>(expr);
+    } else {
+      impl_ = std::make_shared<FromJsonNestedFunction>(expr);
+    }
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    return impl_->eval(inputColumns, stream, mr);
+  }
+
+ private:
+  std::shared_ptr<CudfFunction> impl_;
+};
+
 void registerSparkArrayAccessFunctions(const std::string& prefix) {
   using exec::FunctionSignatureBuilder;
 
@@ -660,7 +1010,7 @@ void registerSparkFunctions(const std::string& prefix) {
   registerCudfFunction(
       prefix + "from_json",
       [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
-        return std::make_shared<FromJsonRowOfStringsFunction>(expr);
+        return std::make_shared<FromJsonFunction>(expr);
       },
       {});
 
