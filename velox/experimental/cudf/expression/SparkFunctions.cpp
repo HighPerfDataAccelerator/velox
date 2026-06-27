@@ -15,6 +15,7 @@
  */
 
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
+#include "velox/experimental/cudf/expression/AstUtils.h"
 #include "velox/experimental/cudf/expression/CommonFunctions.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
 #include "velox/experimental/cudf/expression/SparkFunctions.h"
@@ -29,17 +30,170 @@
 #include "velox/vector/ComplexVector.h"
 
 #include <cudf/column/column_factories.hpp>
+#include <cudf/copying.hpp>
+#include <cudf/datetime.hpp>
 #include <cudf/filling.hpp>
 #include <cudf/lists/contains.hpp>
 #include <cudf/lists/stream_compaction.hpp>
 #include <cudf/null_mask.hpp>
+#include <cudf/replace.hpp>
 #include <cudf/reshape.hpp>
+#include <cudf/scalar/scalar_factories.hpp>
+#include <cudf/strings/convert/convert_datetime.hpp>
 #include <cudf/structs/structs_column_view.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
 
+#include <array>
+#include <optional>
+#include <string_view>
+#include <vector>
+
 namespace facebook::velox::cudf_velox {
 namespace {
+
+std::optional<std::string> translateSparkDatetimePattern(
+    std::string_view pattern) {
+  if (pattern == "yyyyMMdd") {
+    return "%Y%m%d";
+  }
+  if (pattern == "yyyy-MM-dd") {
+    return "%Y-%m-%d";
+  }
+  if (pattern == "yyyy/MM/dd") {
+    return "%Y/%m/%d";
+  }
+  if (pattern == "yyyy-MM-dd HH:mm:ss") {
+    return "%Y-%m-%d %H:%M:%S";
+  }
+  if (pattern == "yyyy-MM-dd HH:mm:ss.SSS") {
+    return "%Y-%m-%d %H:%M:%S.%3f";
+  }
+  if (pattern == "MMM-yyyy") {
+    return "%b-%Y";
+  }
+  return std::nullopt;
+}
+
+std::optional<std::string> readConstantString(
+    const std::shared_ptr<velox::exec::Expr>& expr) {
+  auto constant = std::dynamic_pointer_cast<velox::exec::ConstantExpr>(expr);
+  VELOX_CHECK_NOT_NULL(constant, "Expected a constant string argument");
+  VELOX_CHECK_NOT_NULL(constant->value(), "Expected a constant vector");
+  if (constant->value()->isNullAt(0)) {
+    return std::nullopt;
+  }
+  return constant->value()->toString(0);
+}
+
+std::string readTranslatedSparkDatetimePattern(
+    const std::shared_ptr<velox::exec::Expr>& expr) {
+  auto pattern = readConstantString(expr);
+  VELOX_CHECK(pattern.has_value(), "Expected a non-null datetime pattern");
+  auto translated = translateSparkDatetimePattern(*pattern);
+  VELOX_CHECK(
+      translated.has_value(),
+      "Unsupported Spark datetime pattern for cuDF execution: {}",
+      *pattern);
+  return *translated;
+}
+
+bool needsDatetimeFormatNames(std::string_view format) {
+  return format.find("%a") != std::string_view::npos ||
+      format.find("%A") != std::string_view::npos ||
+      format.find("%b") != std::string_view::npos ||
+      format.find("%B") != std::string_view::npos ||
+      format.find("%p") != std::string_view::npos;
+}
+
+std::unique_ptr<cudf::column> makeAllNullStringColumn(
+    cudf::size_type size,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) {
+  std::vector<cudf::size_type> offsets(size + 1, 0);
+  rmm::device_buffer offsetsBuffer(
+      offsets.data(), offsets.size() * sizeof(cudf::size_type), stream, mr);
+  auto offsetsColumn = std::make_unique<cudf::column>(
+      cudf::data_type{cudf::type_id::INT32},
+      static_cast<cudf::size_type>(offsets.size()),
+      std::move(offsetsBuffer),
+      rmm::device_buffer{},
+      0);
+  return cudf::make_strings_column(
+      size,
+      std::move(offsetsColumn),
+      rmm::device_buffer{},
+      size,
+      cudf::create_null_mask(size, cudf::mask_state::ALL_NULL, stream, mr));
+}
+
+std::unique_ptr<cudf::column> makeAllNullFixedWidthColumn(
+    cudf::data_type type,
+    cudf::size_type size,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) {
+  return cudf::make_fixed_width_column(
+      type, size, cudf::mask_state::ALL_NULL, stream, mr);
+}
+
+std::unique_ptr<cudf::column> makeEnglishDatetimeFormatNamesColumn(
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) {
+  static constexpr std::array<std::string_view, 40> kNames{
+      "AM",        "PM",      "Sunday",   "Monday",   "Tuesday", "Wednesday",
+      "Thursday",  "Friday",  "Saturday", "Sun",      "Mon",     "Tue",
+      "Wed",       "Thu",     "Fri",      "Sat",      "January", "February",
+      "March",     "April",   "May",      "June",     "July",    "August",
+      "September", "October", "November", "December", "Jan",     "Feb",
+      "Mar",       "Apr",     "May",      "Jun",      "Jul",     "Aug",
+      "Sep",       "Oct",     "Nov",      "Dec"};
+
+  std::vector<cudf::size_type> offsets;
+  offsets.reserve(kNames.size() + 1);
+  offsets.push_back(0);
+  std::string chars;
+  for (auto name : kNames) {
+    chars.append(name.data(), name.size());
+    offsets.push_back(static_cast<cudf::size_type>(chars.size()));
+  }
+
+  rmm::device_buffer offsetsBuffer(
+      offsets.data(), offsets.size() * sizeof(cudf::size_type), stream, mr);
+  auto offsetsColumn = std::make_unique<cudf::column>(
+      cudf::data_type{cudf::type_id::INT32},
+      static_cast<cudf::size_type>(offsets.size()),
+      std::move(offsetsBuffer),
+      rmm::device_buffer{},
+      0);
+  rmm::device_buffer charsBuffer(chars.data(), chars.size(), stream, mr);
+  return cudf::make_strings_column(
+      static_cast<cudf::size_type>(kNames.size()),
+      std::move(offsetsColumn),
+      std::move(charsBuffer),
+      0,
+      rmm::device_buffer{});
+}
+
+std::unique_ptr<cudf::column> parseTimestampsWithInvalidsAsNulls(
+    cudf::column_view inputCol,
+    cudf::data_type targetType,
+    std::string_view format,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) {
+  auto strings = cudf::strings_column_view(inputCol);
+  auto validMask = cudf::strings::is_timestamp(strings, format, stream, mr);
+  cudf::numeric_scalar<bool> falseScalar(false, true, stream, mr);
+  auto validNoNulls =
+      cudf::replace_nulls(validMask->view(), falseScalar, stream, mr);
+
+  auto parsed =
+      cudf::strings::to_timestamps(strings, targetType, format, stream, mr);
+  auto nullScalar =
+      cudf::make_default_constructed_scalar(targetType, stream, mr);
+  nullScalar->set_valid_async(false, stream);
+  return cudf::copy_if_else(
+      parsed->view(), *nullScalar, validNoNulls->view(), stream, mr);
+}
 
 std::unique_ptr<cudf::column> makeRepeatedArrayColumn(
     const velox::VectorPtr& arrayVector,
@@ -164,10 +318,7 @@ class MapFilterFunction : public CudfFunction {
     auto repeatedKeySet =
         makeRepeatedArrayColumn(keySetVector_, keyChild.size(), stream, mr);
     auto containsMask = cudf::lists::contains(
-        cudf::lists_column_view(repeatedKeySet->view()),
-        keyChild,
-        stream,
-        mr);
+        cudf::lists_column_view(repeatedKeySet->view()), keyChild, stream, mr);
     auto maskLists =
         makeMapAlignedMask(mapView, containsMask->view(), stream, mr);
 
@@ -182,6 +333,117 @@ class MapFilterFunction : public CudfFunction {
  private:
   velox::VectorPtr keySetVector_;
   bool keepMatches_{true};
+};
+
+class AddMonthsFunction : public CudfFunction {
+ public:
+  explicit AddMonthsFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
+    VELOX_CHECK_EQ(
+        expr->inputs().size(),
+        2,
+        "add_months function expects exactly 2 inputs");
+    VELOX_CHECK(
+        expr->inputs()[0]->type()->isDate(),
+        "First argument to add_months must be a date");
+    VELOX_CHECK_NOT_NULL(
+        std::dynamic_pointer_cast<velox::exec::ConstantExpr>(expr->inputs()[1]),
+        "Second argument to add_months must be a constant");
+    months_ = makeScalarFromConstantExpr(expr->inputs()[1]);
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    auto inputCol = asView(inputColumns[0]);
+    return cudf::datetime::add_calendrical_months(
+        inputCol, *months_, stream, mr);
+  }
+
+ private:
+  std::unique_ptr<cudf::scalar> months_;
+};
+
+class DateFormatFunction : public CudfFunction {
+ public:
+  explicit DateFormatFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
+    VELOX_CHECK_EQ(
+        expr->inputs().size(), 2, "date_format expects exactly 2 inputs");
+    VELOX_CHECK(
+        expr->inputs()[0]->type()->kind() == TypeKind::TIMESTAMP,
+        "date_format input must be TIMESTAMP");
+    formatIsNull_ = !readConstantString(expr->inputs()[1]).has_value();
+    if (!formatIsNull_) {
+      format_ = readTranslatedSparkDatetimePattern(expr->inputs()[1]);
+      needsFormatNames_ = needsDatetimeFormatNames(format_);
+    }
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    VELOX_CHECK_EQ(inputColumns.size(), 1);
+    auto inputCol = asView(inputColumns[0]);
+    if (formatIsNull_) {
+      return makeAllNullStringColumn(inputCol.size(), stream, mr);
+    }
+    if (needsFormatNames_) {
+      auto names = makeEnglishDatetimeFormatNamesColumn(stream, mr);
+      return cudf::strings::from_timestamps(
+          inputCol,
+          format_,
+          cudf::strings_column_view(names->view()),
+          stream,
+          mr);
+    }
+    return cudf::strings::from_timestamps(
+        inputCol, format_, cudf::strings_column_view{}, stream, mr);
+  }
+
+ private:
+  std::string format_;
+  bool formatIsNull_{false};
+  bool needsFormatNames_{false};
+};
+
+class GetTimestampFunction : public CudfFunction {
+ public:
+  explicit GetTimestampFunction(
+      const std::shared_ptr<velox::exec::Expr>& expr) {
+    VELOX_CHECK_EQ(
+        expr->inputs().size(), 2, "get_timestamp expects exactly 2 inputs");
+    VELOX_CHECK(
+        expr->inputs()[0]->type()->kind() == TypeKind::VARCHAR,
+        "get_timestamp input must be VARCHAR");
+    VELOX_CHECK(
+        expr->type()->kind() == TypeKind::TIMESTAMP,
+        "get_timestamp output must be TIMESTAMP");
+    targetType_ = cudf_velox::veloxToCudfDataType(expr->type());
+    formatIsNull_ = !readConstantString(expr->inputs()[1]).has_value();
+    if (!formatIsNull_) {
+      format_ = readTranslatedSparkDatetimePattern(expr->inputs()[1]);
+    }
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    VELOX_CHECK_EQ(inputColumns.size(), 1);
+    auto inputCol = asView(inputColumns[0]);
+    if (formatIsNull_) {
+      return makeAllNullFixedWidthColumn(
+          targetType_, inputCol.size(), stream, mr);
+    }
+    return parseTimestampsWithInvalidsAsNulls(
+        inputCol, targetType_, format_, stream, mr);
+  }
+
+ private:
+  cudf::data_type targetType_{cudf::type_id::TIMESTAMP_NANOSECONDS};
+  std::string format_;
+  bool formatIsNull_{false};
 };
 
 void registerSparkArrayAccessFunctions(const std::string& prefix) {
@@ -271,6 +533,39 @@ void registerSparkFunctions(const std::string& prefix) {
            .returnType("date")
            .argumentType("date")
            .constantArgumentType("integer")
+           .build()});
+
+  registerCudfFunction(
+      prefix + "add_months",
+      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<AddMonthsFunction>(expr);
+      },
+      {FunctionSignatureBuilder()
+           .returnType("date")
+           .argumentType("date")
+           .constantArgumentType("integer")
+           .build()});
+
+  registerCudfFunction(
+      prefix + "date_format",
+      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<DateFormatFunction>(expr);
+      },
+      {FunctionSignatureBuilder()
+           .returnType("varchar")
+           .argumentType("timestamp")
+           .constantArgumentType("varchar")
+           .build()});
+
+  registerCudfFunction(
+      prefix + "get_timestamp",
+      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<GetTimestampFunction>(expr);
+      },
+      {FunctionSignatureBuilder()
+           .returnType("timestamp")
+           .argumentType("varchar")
+           .constantArgumentType("varchar")
            .build()});
 
   registerSparkArrayAccessFunctions(prefix);

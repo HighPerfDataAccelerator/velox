@@ -232,6 +232,46 @@ TEST_F(CudfFilterProjectTest, dateAdd) {
   EXPECT_EQ(parseDate("2020-02-29"), dateAdd("2019-01-30", 395));
 }
 
+TEST_F(CudfFilterProjectTest, dateintTimestampPatterns) {
+  auto dateInts = makeNullableFlatVector<int32_t>({
+      20260101,
+      20260228,
+      20260229,
+      std::nullopt,
+  });
+  auto isoDates = makeNullableFlatVector<std::string>({
+      "2026-01-01",
+      "2026-02-28",
+      "not-a-date",
+      std::nullopt,
+  });
+  auto timestamps = makeNullableFlatVector<Timestamp>({
+      Timestamp(1767225600, 0),
+      Timestamp(1772236800, 0),
+      Timestamp(1772323200, 0),
+      std::nullopt,
+  });
+  auto data = makeRowVector({dateInts, isoDates, timestamps});
+
+  for (const auto& expression : {
+           "date_format(get_timestamp(cast(c0 as varchar), 'yyyyMMdd'), "
+           "'yyyyMMdd')",
+           "upper(date_format(get_timestamp(cast(c0 as varchar), "
+           "'yyyyMMdd'), 'MMM-yyyy'))",
+           "date_format(cast(add_months(coalesce(try_cast(get_timestamp("
+           "cast(c0 as varchar), 'yyyyMMdd') as date), try_cast(cast(c0 as "
+           "varchar) as date)), 1) as timestamp), 'yyyyMMdd')",
+           "date_format(cast(try_cast(c1 as date) as timestamp), "
+           "'yyyyMMdd')",
+           "date_format(cast(coalesce(try_cast(get_timestamp(cast(c2 as "
+           "varchar), 'yyyyMMdd') as date), try_cast(cast(c2 as varchar) as "
+           "date)) as timestamp), 'yyyyMMdd')",
+       }) {
+    SCOPED_TRACE(expression);
+    assertExpressionMatchesCpu(expression, data, data->rowType());
+  }
+}
+
 TEST_F(CudfFilterProjectTest, getConstantIndex) {
   auto arrays = makeNullableArrayVector<int32_t>({
       {{10, 20, 30}},
@@ -352,14 +392,12 @@ TEST_F(CudfFilterProjectTest, getSupportedScalarElementTypes) {
 }
 
 TEST_F(CudfFilterProjectTest, decimalComparisonAliases) {
-  auto input = makeRowVector(
-      {
-          makeNullableFlatVector<int64_t>(
-              {120, 150, 100, std::nullopt}, DECIMAL(10, 2)),
-          makeNullableFlatVector<int64_t>(
-              {120, 100, 200, 120}, DECIMAL(10, 2)),
-          makeNullableFlatVector<double>({0.0, 1.25, -1.5, std::nullopt}),
-      });
+  auto input = makeRowVector({
+      makeNullableFlatVector<int64_t>(
+          {120, 150, 100, std::nullopt}, DECIMAL(10, 2)),
+      makeNullableFlatVector<int64_t>({120, 100, 200, 120}, DECIMAL(10, 2)),
+      makeNullableFlatVector<double>({0.0, 1.25, -1.5, std::nullopt}),
+  });
 
   for (const auto& expression : {
            "decimal_equalto(c0, c1)",
