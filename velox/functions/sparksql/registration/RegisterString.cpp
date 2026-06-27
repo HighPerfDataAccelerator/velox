@@ -115,6 +115,8 @@ void registerStringFunctions(const std::string& prefix) {
       {prefix + "find_in_set"});
   registerFunction<sparksql::ChrFunction, Varchar, int64_t>({prefix + "chr"});
   registerFunction<AsciiFunction, int32_t, Varchar>({prefix + "ascii"});
+  registerFunction<DecodeFunction, Varchar, Varbinary, Varchar>(
+      {prefix + "decode"});
   registerFunction<sparksql::LPadFunction, Varchar, Varchar, int32_t, Varchar>(
       {prefix + "lpad"});
   registerFunction<sparksql::RPadFunction, Varchar, Varchar, int32_t, Varchar>(

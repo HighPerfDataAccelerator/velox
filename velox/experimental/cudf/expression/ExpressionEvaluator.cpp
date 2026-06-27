@@ -507,6 +507,36 @@ bool hasSupportedConstantSparkDatetimePattern(
   return isSupportedSparkDatetimePattern(patternExpr->value()->toString(0));
 }
 
+bool isUtf8DecodeCharset(std::string_view charset) {
+  if (charset.size() != 5 && charset.size() != 4) {
+    return false;
+  }
+
+  char normalized[5];
+  for (size_t i = 0; i < charset.size(); ++i) {
+    normalized[i] =
+        static_cast<char>(std::tolower(static_cast<unsigned char>(charset[i])));
+  }
+  return charset.size() == 5
+      ? std::string_view(normalized, 5) == "utf-8"
+      : std::string_view(normalized, 4) == "utf8";
+}
+
+bool hasSupportedConstantDecodeCharset(
+    const std::shared_ptr<velox::exec::Expr>& expr,
+    size_t argumentIndex) {
+  if (expr->inputs().size() <= argumentIndex) {
+    return false;
+  }
+  const auto charsetExpr = std::dynamic_pointer_cast<velox::exec::ConstantExpr>(
+      expr->inputs()[argumentIndex]);
+  if (charsetExpr == nullptr || charsetExpr->value() == nullptr ||
+      charsetExpr->value()->isNullAt(0)) {
+    return false;
+  }
+  return isUtf8DecodeCharset(charsetExpr->value()->toString(0));
+}
+
 void mergeNullSourceNullsIntoResult(
     cudf::column& result,
     cudf::column_view nullSourceColumn,
@@ -5385,6 +5415,21 @@ bool FunctionExpression::canEvaluate(std::shared_ptr<velox::exec::Expr> expr) {
 
   if (hasFunctionNameSuffix(opName, "from_json")) {
     return isSupportedFromJsonExpr(expr);
+  }
+
+  if (hasFunctionNameSuffix(opName, "decode")) {
+    if (expr->inputs().size() != 2 ||
+        expr->inputs()[0]->type()->kind() != TypeKind::VARBINARY ||
+        expr->type()->kind() != TypeKind::VARCHAR) {
+      return false;
+    }
+    if (std::dynamic_pointer_cast<velox::exec::ConstantExpr>(
+            expr->inputs()[0])) {
+      return false;
+    }
+    if (!hasSupportedConstantDecodeCharset(expr, 1)) {
+      return false;
+    }
   }
 
   if ((opName == "coalesce" || opName == "row_constructor" ||

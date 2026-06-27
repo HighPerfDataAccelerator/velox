@@ -62,6 +62,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <limits>
 #include <map>
 #include <optional>
@@ -106,6 +107,21 @@ std::optional<std::string> readConstantString(
     return std::nullopt;
   }
   return constant->value()->toString(0);
+}
+
+bool isUtf8DecodeCharset(std::string_view charset) {
+  if (charset.size() != 5 && charset.size() != 4) {
+    return false;
+  }
+
+  char normalized[5];
+  for (size_t i = 0; i < charset.size(); ++i) {
+    normalized[i] =
+        static_cast<char>(std::tolower(static_cast<unsigned char>(charset[i])));
+  }
+  return charset.size() == 5
+      ? std::string_view(normalized, 5) == "utf-8"
+      : std::string_view(normalized, 4) == "utf8";
 }
 
 std::string readTranslatedSparkDatetimePattern(
@@ -986,6 +1002,39 @@ class FromUnixTimeFunction : public CudfFunction {
   bool needsFormatNames_{false};
 };
 
+class DecodeFunction : public CudfFunction {
+ public:
+  explicit DecodeFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
+    VELOX_CHECK_EQ(expr->inputs().size(), 2, "decode expects two inputs");
+    VELOX_CHECK(
+        expr->inputs()[0]->type()->kind() == TypeKind::VARBINARY,
+        "decode input must be VARBINARY");
+    VELOX_CHECK(
+        expr->type()->kind() == TypeKind::VARCHAR,
+        "decode output must be VARCHAR");
+
+    auto charset = readConstantString(expr->inputs()[1]);
+    VELOX_CHECK(
+        charset.has_value(),
+        "decode requires a non-null constant charset argument");
+    VELOX_CHECK(
+        isUtf8DecodeCharset(*charset),
+        "Unsupported charset for cuDF decode: {}",
+        *charset);
+    VELOX_CHECK_NULL(
+        std::dynamic_pointer_cast<velox::exec::ConstantExpr>(expr->inputs()[0]),
+        "decode on a literal binary input is not supported");
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    VELOX_CHECK_EQ(inputColumns.size(), 1);
+    return asView(inputColumns[0]);
+  }
+};
+
 class MonotonicallyIncreasingIdFunction : public CudfFunction {
  public:
   explicit MonotonicallyIncreasingIdFunction(
@@ -1636,6 +1685,17 @@ void registerSparkFunctions(const std::string& prefix) {
       {FunctionSignatureBuilder()
            .returnType("varchar")
            .argumentType("bigint")
+           .constantArgumentType("varchar")
+           .build()});
+
+  registerCudfFunction(
+      prefix + "decode",
+      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<DecodeFunction>(expr);
+      },
+      {FunctionSignatureBuilder()
+           .returnType("varchar")
+           .argumentType("varbinary")
            .constantArgumentType("varchar")
            .build()});
 
