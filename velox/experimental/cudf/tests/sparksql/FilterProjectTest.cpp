@@ -176,6 +176,60 @@ TEST_F(CudfFilterProjectTest, monotonicallyIncreasingId) {
       "monotonically_increasing_id()", data, data->rowType());
 }
 
+TEST_F(CudfFilterProjectTest, sequence) {
+  auto input = makeRowVector({
+      makeNullableFlatVector<int32_t>({3, 1, 5, std::nullopt}),
+      makeNullableFlatVector<int32_t>({1, 5, -1, std::nullopt}),
+      makeNullableFlatVector<int32_t>({1, 2, -2, std::nullopt}),
+  });
+
+  for (const auto& expression : {
+           "sequence(1, c0)",
+           "sequence(c0, 1)",
+           "sequence(c1, c0, c2)",
+       }) {
+    SCOPED_TRACE(expression);
+    assertExpressionMatchesCpu(expression, input, input->rowType());
+  }
+}
+
+TEST_F(CudfFilterProjectTest, arrayExcept) {
+  auto left = makeNullableArrayVector<int32_t>({
+      {{1, 2, 2, 3}},
+      {{1, std::nullopt, 4}},
+      std::nullopt,
+      {{5, 6}},
+  });
+  auto right = makeNullableArrayVector<int32_t>({
+      {{2, 4}},
+      {{std::nullopt}},
+      {{1}},
+      std::nullopt,
+  });
+  auto input = makeRowVector({left, right});
+
+  assertExpressionMatchesCpu("array_except(c0, c1)", input, input->rowType());
+}
+
+TEST_F(CudfFilterProjectTest, arrayExceptSequence) {
+  auto upper = makeNullableFlatVector<int32_t>({5, 3, 1, std::nullopt});
+  auto values = makeNullableArrayVector<int32_t>({
+      {{2, 4}},
+      {{1}},
+      {{}},
+      {{1}},
+  });
+  auto input = makeRowVector({upper, values});
+
+  assertExpressionMatchesCpu(
+      "array_except(sequence(1, c0 - 1), c1)", input, input->rowType());
+  assertExpressionMatchesCpu(
+      "concat_ws(', ', cast(array_except(sequence(1, c0 - 1), c1) as "
+      "array(varchar)))",
+      input,
+      input->rowType());
+}
+
 TEST_F(CudfFilterProjectTest, castStringToBoolean) {
   auto input = makeRowVector({
       makeNullableFlatVector<std::string>({

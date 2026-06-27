@@ -46,6 +46,7 @@
 #include <cudf/lists/combine.hpp>
 #include <cudf/lists/contains.hpp>
 #include <cudf/lists/count_elements.hpp>
+#include <cudf/lists/set_operations.hpp>
 #include <cudf/lists/sorting.hpp>
 #include <cudf/lists/stream_compaction.hpp>
 #include <cudf/null_mask.hpp>
@@ -628,6 +629,16 @@ bool isNumericToTimestampVeloxCast(
        isFloatingPointVeloxType(srcVelox));
 }
 
+bool isListIntegralToStringVeloxCast(
+    const TypePtr& srcVelox,
+    const TypePtr& dstVelox) {
+  return srcVelox != nullptr && dstVelox != nullptr &&
+      srcVelox->kind() == TypeKind::ARRAY &&
+      dstVelox->kind() == TypeKind::ARRAY &&
+      isIntegralNonDecimalVeloxType(srcVelox->childAt(0)) &&
+      dstVelox->childAt(0)->kind() == TypeKind::VARCHAR;
+}
+
 bool isSupportedCudfScalarLiteralType(const TypePtr& type) {
   if (type == nullptr) {
     return false;
@@ -927,6 +938,26 @@ std::unique_ptr<cudf::column> makeAllNullArrayColumn(
       makeEmptyColumnForListScalar(arrayType->childAt(0), stream, mr),
       size,
       cudf::create_null_mask(size, cudf::mask_state::ALL_NULL, stream, mr));
+}
+
+std::unique_ptr<cudf::column> castListIntegralToString(
+    cudf::column_view inputCol,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) {
+  auto listView = cudf::lists_column_view(inputCol);
+  auto stringElements = cudf::strings::from_integers(
+      listView.get_sliced_child(stream), stream, mr);
+  auto offsets = std::make_unique<cudf::column>(listView.offsets(), stream, mr);
+  rmm::device_buffer nullMask;
+  if (inputCol.nullable()) {
+    nullMask = cudf::copy_bitmask(inputCol, stream, mr);
+  }
+  return cudf::make_lists_column(
+      inputCol.size(),
+      std::move(offsets),
+      std::move(stringElements),
+      inputCol.null_count(),
+      std::move(nullMask));
 }
 
 } // namespace
@@ -1332,7 +1363,8 @@ class CastFunction : public CudfFunction {
     kStringToDate,
     kStringToTimestamp,
     kNumericToTimestamp,
-    kNumericToBool
+    kNumericToBool,
+    kListIntegralToString
   };
 
   CastFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
@@ -1344,7 +1376,9 @@ class CastFunction : public CudfFunction {
     auto sourceType =
         cudf_velox::veloxToCudfDataType(expr->inputs()[0]->type());
 
-    if (sourceType == targetCudfType_) {
+    if (isListIntegralToStringVeloxCast(sourceVeloxType, targetVeloxType)) {
+      castMode_ = CastMode::kListIntegralToString;
+    } else if (sourceType == targetCudfType_) {
       castMode_ = CastMode::kIdentity;
     } else if (
         sourceVeloxType->isDate() &&
@@ -1523,6 +1557,8 @@ class CastFunction : public CudfFunction {
         mergeNullSourceNullsIntoResult(*result, inputCol, stream, mr);
         return result;
       }
+      case CastMode::kListIntegralToString:
+        return castListIntegralToString(inputCol, stream, mr);
       case CastMode::kCudfCast:
         return cudf::cast(inputCol, targetCudfType_, stream, mr);
     }
@@ -1763,6 +1799,41 @@ class ArrayDistinctFunction : public CudfFunction {
         cudf::null_equality::EQUAL,
         cudf::nan_equality::ALL_EQUAL,
         cudf::duplicate_keep_option::KEEP_FIRST,
+        stream,
+        mr);
+  }
+};
+
+class ArrayExceptFunction : public CudfFunction {
+ public:
+  explicit ArrayExceptFunction(
+      const std::shared_ptr<velox::exec::Expr>& expr) {
+    VELOX_CHECK_EQ(
+        expr->inputs().size(), 2, "array_except expects exactly 2 inputs");
+    VELOX_CHECK_EQ(
+        expr->inputs()[0]->type()->kind(),
+        TypeKind::ARRAY,
+        "array_except expects an ARRAY left input");
+    VELOX_CHECK_EQ(
+        expr->inputs()[1]->type()->kind(),
+        TypeKind::ARRAY,
+        "array_except expects an ARRAY right input");
+    VELOX_CHECK(
+        expr->inputs()[0]->type()->childAt(0)->equivalent(
+            *expr->inputs()[1]->type()->childAt(0)),
+        "array_except inputs must have the same element type");
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    VELOX_CHECK_EQ(inputColumns.size(), 2);
+    return cudf::lists::difference_distinct(
+        cudf::lists_column_view(asView(inputColumns[0])),
+        cudf::lists_column_view(asView(inputColumns[1])),
+        cudf::null_equality::EQUAL,
+        cudf::nan_equality::ALL_EQUAL,
         stream,
         mr);
   }
@@ -3555,13 +3626,20 @@ class ConcatWsFunction : public CudfFunction {
 
     literals_.reserve(numInputs_ - 1);
     for (size_t i = 1; i < numInputs_; ++i) {
-      VELOX_CHECK_EQ(
-          expr->inputs()[i]->type()->kind(),
-          TypeKind::VARCHAR,
-          "cuDF concat_ws only supports VARCHAR value inputs");
+      const auto& inputType = expr->inputs()[i]->type();
+      const auto inputKind = inputType->kind();
+      VELOX_CHECK(
+          inputKind == TypeKind::VARCHAR ||
+              (inputKind == TypeKind::ARRAY &&
+               inputType->childAt(0)->kind() == TypeKind::VARCHAR),
+          "cuDF concat_ws only supports VARCHAR or ARRAY<VARCHAR> value inputs");
       auto& literal = literals_.emplace_back();
+      literal.isArray = inputKind == TypeKind::ARRAY;
       if (auto constant =
               std::dynamic_pointer_cast<ConstantExpr>(expr->inputs()[i])) {
+        VELOX_CHECK(
+            !literal.isArray,
+            "cuDF concat_ws does not support literal ARRAY<VARCHAR> inputs yet");
         literal.isLiteral = true;
         auto value = constant->value();
         VELOX_CHECK_NOT_NULL(value, "concat_ws literal value is missing");
@@ -3598,6 +3676,7 @@ class ConcatWsFunction : public CudfFunction {
     }
 
     cudf::string_scalar emptyString("", true, stream, mr);
+    cudf::string_scalar separator(separator_, true, stream, mr);
     if (literals_.empty()) {
       return cudf::make_column_from_scalar(emptyString, outputSize, stream, mr);
     }
@@ -3611,7 +3690,21 @@ class ConcatWsFunction : public CudfFunction {
     for (const auto& literal : literals_) {
       if (!literal.isLiteral) {
         VELOX_CHECK_LT(nextInputColumnIndex, inputColumns.size());
-        columnViews.push_back(asView(inputColumns[nextInputColumnIndex++]));
+        auto inputView = asView(inputColumns[nextInputColumnIndex++]);
+        if (literal.isArray) {
+          auto joined = cudf::strings::join_list_elements(
+              cudf::lists_column_view(inputView),
+              separator,
+              emptyString,
+              cudf::strings::separator_on_nulls::NO,
+              cudf::strings::output_if_empty_list::EMPTY_STRING,
+              stream,
+              mr);
+          columnViews.push_back(joined->view());
+          literalColumns.push_back(std::move(joined));
+        } else {
+          columnViews.push_back(inputView);
+        }
         continue;
       }
 
@@ -3629,7 +3722,6 @@ class ConcatWsFunction : public CudfFunction {
       return cudf::replace_nulls(columnViews[0], emptyString, stream, mr);
     }
 
-    cudf::string_scalar separator(separator_, true, stream, mr);
     return cudf::strings::concatenate(
         cudf::table_view(columnViews),
         separator,
@@ -3643,6 +3735,7 @@ class ConcatWsFunction : public CudfFunction {
   struct LiteralArg {
     bool isLiteral{false};
     bool isNull{false};
+    bool isArray{false};
     std::string value;
   };
 
@@ -4364,6 +4457,18 @@ bool registerBuiltinFunctions(const std::string& prefix) {
       {arrayIdentitySignature});
 
   registerCudfFunction(
+      prefix + "array_except",
+      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<ArrayExceptFunction>(expr);
+      },
+      {FunctionSignatureBuilder()
+           .typeVariable("T")
+           .returnType("array(T)")
+           .argumentType("array(T)")
+           .argumentType("array(T)")
+           .build()});
+
+  registerCudfFunction(
       prefix + "flatten",
       [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
         return std::make_shared<FlattenFunction>(expr);
@@ -4758,12 +4863,7 @@ bool registerBuiltinFunctions(const std::string& prefix) {
       [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
         return std::make_shared<ConcatWsFunction>(expr);
       },
-      {FunctionSignatureBuilder()
-           .returnType("varchar")
-           .constantArgumentType("varchar")
-           .argumentType("varchar")
-           .variableArity("varchar")
-           .build()});
+      {});
 
   // No prefix because switch and if are special form
   registerCudfFunctions(
@@ -5243,6 +5343,9 @@ bool FunctionExpression::canEvaluate(std::shared_ptr<velox::exec::Expr> expr) {
       return true;
     }
     if (isNumericToBooleanVeloxCast(srcType, dstType)) {
+      return true;
+    }
+    if (isListIntegralToStringVeloxCast(srcType, dstType)) {
       return true;
     }
     if (isPlainCudfCastSupported(srcType, dstType)) {

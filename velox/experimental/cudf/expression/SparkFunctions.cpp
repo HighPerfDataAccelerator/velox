@@ -32,6 +32,7 @@
 #include "velox/vector/ComplexVector.h"
 
 #include <cudf/column/column_factories.hpp>
+#include <cudf/aggregation.hpp>
 #include <cudf/binaryop.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/datetime.hpp>
@@ -39,8 +40,10 @@
 #include <cudf/io/json.hpp>
 #include <cudf/json/json.hpp>
 #include <cudf/lists/contains.hpp>
+#include <cudf/lists/filling.hpp>
 #include <cudf/lists/stream_compaction.hpp>
 #include <cudf/null_mask.hpp>
+#include <cudf/reduction.hpp>
 #include <cudf/replace.hpp>
 #include <cudf/reshape.hpp>
 #include <cudf/scalar/scalar.hpp>
@@ -59,6 +62,7 @@
 
 #include <algorithm>
 #include <array>
+#include <limits>
 #include <map>
 #include <optional>
 #include <string_view>
@@ -66,6 +70,9 @@
 
 namespace facebook::velox::cudf_velox {
 namespace {
+
+constexpr cudf::size_type kMaxRoundedArrayLength =
+    std::numeric_limits<int32_t>::max() - 15;
 
 std::optional<std::string> translateSparkDatetimePattern(
     std::string_view pattern) {
@@ -136,6 +143,139 @@ int64_t timestampTicksPerSecond(cudf::data_type timestampType) {
           "Unsupported timestamp type {}",
           static_cast<int32_t>(timestampType.id()));
   }
+}
+
+bool isIntegralSequenceType(const TypePtr& type) {
+  if (type == nullptr) {
+    return false;
+  }
+  switch (type->kind()) {
+    case TypeKind::TINYINT:
+    case TypeKind::SMALLINT:
+    case TypeKind::INTEGER:
+    case TypeKind::BIGINT:
+      return true;
+    default:
+      return false;
+  }
+}
+
+std::unique_ptr<cudf::scalar> makeIntegralScalar(
+    cudf::data_type type,
+    int64_t value,
+    bool valid,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) {
+  switch (type.id()) {
+    case cudf::type_id::INT8:
+      return std::make_unique<cudf::numeric_scalar<int8_t>>(
+          static_cast<int8_t>(value), valid, stream, mr);
+    case cudf::type_id::INT16:
+      return std::make_unique<cudf::numeric_scalar<int16_t>>(
+          static_cast<int16_t>(value), valid, stream, mr);
+    case cudf::type_id::INT32:
+      return std::make_unique<cudf::numeric_scalar<int32_t>>(
+          static_cast<int32_t>(value), valid, stream, mr);
+    case cudf::type_id::INT64:
+      return std::make_unique<cudf::numeric_scalar<int64_t>>(
+          value, valid, stream, mr);
+    default:
+      VELOX_UNSUPPORTED(
+          "Unsupported sequence integral type {}",
+          static_cast<int32_t>(type.id()));
+  }
+}
+
+std::unique_ptr<cudf::column> makeRepeatedScalarColumn(
+    const cudf::scalar& scalar,
+    cudf::size_type size,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) {
+  return cudf::make_column_from_scalar(scalar, size, stream, mr);
+}
+
+std::unique_ptr<cudf::column> makeDefaultSequenceStepColumn(
+    cudf::column_view startCol,
+    cudf::column_view stopCol,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) {
+  auto minusOneScalar =
+      makeIntegralScalar(startCol.type(), -1, true, stream, mr);
+  auto oneScalar = makeIntegralScalar(startCol.type(), 1, true, stream, mr);
+  auto minusOne = cudf::make_column_from_scalar(
+      *minusOneScalar, startCol.size(), stream, mr);
+  auto one =
+      cudf::make_column_from_scalar(*oneScalar, startCol.size(), stream, mr);
+  auto decreasing = cudf::binary_operation(
+      startCol,
+      stopCol,
+      cudf::binary_operator::GREATER,
+      cudf::data_type{cudf::type_id::BOOL8},
+      stream,
+      mr);
+  return cudf::copy_if_else(
+      minusOne->view(), one->view(), decreasing->view(), stream, mr);
+}
+
+bool hasAnyTrue(
+    cudf::column_view boolCol,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) {
+  if (boolCol.is_empty() || boolCol.null_count() == boolCol.size()) {
+    return false;
+  }
+  auto anyAggregation = cudf::make_any_aggregation<cudf::reduce_aggregation>();
+  auto anyScalar = cudf::reduce(
+      boolCol,
+      *anyAggregation,
+      cudf::data_type{cudf::type_id::BOOL8},
+      stream,
+      mr);
+  auto const& boolScalar =
+      static_cast<cudf::numeric_scalar<bool> const&>(*anyScalar);
+  return boolScalar.is_valid(stream) && boolScalar.value(stream);
+}
+
+std::unique_ptr<cudf::column> nullToFalse(
+    cudf::column_view boolCol,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) {
+  if (!boolCol.has_nulls()) {
+    return std::make_unique<cudf::column>(boolCol, stream, mr);
+  }
+  cudf::numeric_scalar<bool> falseScalar(false, true, stream, mr);
+  return cudf::replace_nulls(boolCol, falseScalar, stream, mr);
+}
+
+std::unique_ptr<cudf::column> nullToTrue(
+    cudf::column_view boolCol,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) {
+  if (!boolCol.has_nulls()) {
+    return std::make_unique<cudf::column>(boolCol, stream, mr);
+  }
+  cudf::numeric_scalar<bool> trueScalar(true, true, stream, mr);
+  return cudf::replace_nulls(boolCol, trueScalar, stream, mr);
+}
+
+std::unique_ptr<cudf::column> binaryBoolOp(
+    cudf::column_view left,
+    cudf::column_view right,
+    cudf::binary_operator op,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) {
+  return cudf::binary_operation(
+      left, right, op, cudf::data_type{cudf::type_id::BOOL8}, stream, mr);
+}
+
+std::unique_ptr<cudf::column> binaryInt64Op(
+    cudf::column_view left,
+    cudf::column_view right,
+    cudf::binary_operator op,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) {
+  return cudf::binary_operation(
+      left, right, op, cudf::data_type{cudf::type_id::INT64}, stream, mr);
 }
 
 std::unique_ptr<cudf::column> timestampToUnixSeconds(
@@ -892,6 +1032,305 @@ class MonotonicallyIncreasingIdFunction : public CudfFunction {
   mutable int64_t count_{0};
 };
 
+struct SequenceOperand {
+  std::unique_ptr<cudf::scalar> literal;
+  int32_t inputColumnIndex{-1};
+};
+
+class SequenceFunction : public CudfFunction {
+ public:
+  explicit SequenceFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
+    using velox::exec::ConstantExpr;
+
+    VELOX_CHECK(
+        expr->inputs().size() == 2 || expr->inputs().size() == 3,
+        "sequence expects 2 or 3 inputs");
+    VELOX_CHECK_EQ(
+        expr->type()->kind(), TypeKind::ARRAY, "sequence output must be ARRAY");
+    VELOX_CHECK(
+        isIntegralSequenceType(expr->type()->childAt(0)),
+        "cuDF sequence currently supports integral output arrays only");
+    for (const auto& input : expr->inputs()) {
+      VELOX_CHECK(
+          isIntegralSequenceType(input->type()),
+          "cuDF sequence currently supports integral inputs only");
+    }
+
+    outputElementType_ =
+        cudf_velox::veloxToCudfDataType(expr->type()->childAt(0));
+    operands_.reserve(expr->inputs().size());
+    int32_t nextInputColumnIndex = 0;
+    for (const auto& input : expr->inputs()) {
+      SequenceOperand operand;
+      if (auto constant = std::dynamic_pointer_cast<ConstantExpr>(input)) {
+        operand.literal = makeScalarFromConstantExpr(constant);
+      } else {
+        operand.inputColumnIndex = nextInputColumnIndex++;
+      }
+      operands_.push_back(std::move(operand));
+    }
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    const auto inputRowCount = inputColumns.empty()
+        ? cudf::size_type{0}
+        : asView(inputColumns.front()).size();
+    return eval(inputColumns, inputRowCount, stream, mr);
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      cudf::size_type inputRowCount,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    std::vector<std::unique_ptr<cudf::column>> ownedInputs;
+    ownedInputs.reserve(operands_.size());
+    std::vector<cudf::column_view> inputViews;
+    inputViews.reserve(operands_.size());
+
+    for (const auto& operand : operands_) {
+      if (operand.literal != nullptr) {
+        ownedInputs.push_back(makeRepeatedScalarColumn(
+            *operand.literal, inputRowCount, stream, mr));
+        inputViews.push_back(ownedInputs.back()->view());
+      } else {
+        VELOX_CHECK_GE(operand.inputColumnIndex, 0);
+        VELOX_CHECK_LT(operand.inputColumnIndex, inputColumns.size());
+        inputViews.push_back(asView(inputColumns[operand.inputColumnIndex]));
+      }
+    }
+
+    auto startCol = ensureType(inputViews[0], outputElementType_, stream, mr);
+    auto stopCol = ensureType(inputViews[1], outputElementType_, stream, mr);
+    auto stepCol = operands_.size() == 3
+        ? ensureType(inputViews[2], outputElementType_, stream, mr)
+        : makeDefaultSequenceStepColumn(
+              startCol->view(), stopCol->view(), stream, mr);
+
+    checkSequenceInputs(
+        startCol->view(), stopCol->view(), stepCol->view(), stream, mr);
+    auto sizes = computeSequenceSizes(
+        startCol->view(), stopCol->view(), stepCol->view(), stream, mr);
+
+    const bool hasNulls =
+        startCol->has_nulls() || stopCol->has_nulls() || stepCol->has_nulls();
+    if (!hasNulls) {
+      return cudf::lists::sequences(
+          startCol->view(), stepCol->view(), sizes->view(), stream, mr);
+    }
+
+    cudf::numeric_scalar<int32_t> zeroSize(0, true, stream, mr);
+    auto sizesNoNull = cudf::replace_nulls(sizes->view(), zeroSize, stream, mr);
+    auto startNoNull = withoutNulls(startCol->view());
+    auto stepNoNull = withoutNulls(stepCol->view());
+    auto sequence = cudf::lists::sequences(
+        startNoNull, stepNoNull, sizesNoNull->view(), stream, mr);
+
+    auto [nullMask, nullCount] = cudf::bitmask_and(
+        cudf::table_view{{startCol->view(), stopCol->view(), stepCol->view()}},
+        stream,
+        mr);
+    auto contents = sequence->release();
+    VELOX_CHECK_EQ(contents.children.size(), 2);
+    return cudf::make_lists_column(
+        inputRowCount,
+        std::move(contents.children[0]),
+        std::move(contents.children[1]),
+        nullCount,
+        std::move(nullMask));
+  }
+
+ private:
+  static std::unique_ptr<cudf::column> ensureType(
+      cudf::column_view column,
+      cudf::data_type type,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) {
+    if (column.type() == type) {
+      return std::make_unique<cudf::column>(column, stream, mr);
+    }
+    return cudf::cast(column, type, stream, mr);
+  }
+
+  static cudf::column_view withoutNulls(cudf::column_view column) {
+    return cudf::column_view(
+        column.type(),
+        column.size(),
+        column.head<void>(),
+        nullptr,
+        0,
+        column.offset());
+  }
+
+  static void checkSequenceInputs(
+      cudf::column_view startCol,
+      cudf::column_view stopCol,
+      cudf::column_view stepCol,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) {
+    auto zero = makeIntegralScalar(stepCol.type(), 0, true, stream, mr);
+
+    auto positive = cudf::binary_operation(
+        stepCol,
+        *zero,
+        cudf::binary_operator::GREATER,
+        cudf::data_type{cudf::type_id::BOOL8},
+        stream,
+        mr);
+    auto startGreaterStop = cudf::binary_operation(
+        startCol,
+        stopCol,
+        cudf::binary_operator::GREATER,
+        cudf::data_type{cudf::type_id::BOOL8},
+        stream,
+        mr);
+    auto positiveInvalid = binaryBoolOp(
+        positive->view(),
+        startGreaterStop->view(),
+        cudf::binary_operator::NULL_LOGICAL_AND,
+        stream,
+        mr);
+
+    auto negative = cudf::binary_operation(
+        stepCol,
+        *zero,
+        cudf::binary_operator::LESS,
+        cudf::data_type{cudf::type_id::BOOL8},
+        stream,
+        mr);
+    auto startLessStop = cudf::binary_operation(
+        startCol,
+        stopCol,
+        cudf::binary_operator::LESS,
+        cudf::data_type{cudf::type_id::BOOL8},
+        stream,
+        mr);
+    auto negativeInvalid = binaryBoolOp(
+        negative->view(),
+        startLessStop->view(),
+        cudf::binary_operator::NULL_LOGICAL_AND,
+        stream,
+        mr);
+
+    auto zeroStep = cudf::binary_operation(
+        stepCol,
+        *zero,
+        cudf::binary_operator::EQUAL,
+        cudf::data_type{cudf::type_id::BOOL8},
+        stream,
+        mr);
+    auto startNotEqualStop = cudf::binary_operation(
+        startCol,
+        stopCol,
+        cudf::binary_operator::NOT_EQUAL,
+        cudf::data_type{cudf::type_id::BOOL8},
+        stream,
+        mr);
+    auto zeroInvalid = binaryBoolOp(
+        zeroStep->view(),
+        startNotEqualStop->view(),
+        cudf::binary_operator::NULL_LOGICAL_AND,
+        stream,
+        mr);
+
+    auto invalidEither = binaryBoolOp(
+        positiveInvalid->view(),
+        negativeInvalid->view(),
+        cudf::binary_operator::NULL_LOGICAL_OR,
+        stream,
+        mr);
+    auto invalid = binaryBoolOp(
+        invalidEither->view(),
+        zeroInvalid->view(),
+        cudf::binary_operator::NULL_LOGICAL_OR,
+        stream,
+        mr);
+    auto invalidNoNulls = nullToFalse(invalid->view(), stream, mr);
+    VELOX_USER_CHECK(
+        !hasAnyTrue(invalidNoNulls->view(), stream, mr),
+        "Illegal sequence boundaries");
+  }
+
+  static std::unique_ptr<cudf::column> computeSequenceSizes(
+      cudf::column_view startCol,
+      cudf::column_view stopCol,
+      cudf::column_view stepCol,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) {
+    const auto int64Type = cudf::data_type{cudf::type_id::INT64};
+    auto start64 = cudf::cast(startCol, int64Type, stream, mr);
+    auto stop64 = cudf::cast(stopCol, int64Type, stream, mr);
+    auto step64 = cudf::cast(stepCol, int64Type, stream, mr);
+
+    auto equal = cudf::binary_operation(
+        start64->view(),
+        stop64->view(),
+        cudf::binary_operator::EQUAL,
+        cudf::data_type{cudf::type_id::BOOL8},
+        stream,
+        mr);
+    cudf::numeric_scalar<int64_t> one64(1, true, stream, mr);
+    auto safeStep =
+        cudf::copy_if_else(one64, step64->view(), equal->view(), stream, mr);
+    auto delta = binaryInt64Op(
+        stop64->view(),
+        start64->view(),
+        cudf::binary_operator::SUB,
+        stream,
+        mr);
+    auto quotient = binaryInt64Op(
+        delta->view(),
+        safeStep->view(),
+        cudf::binary_operator::FLOOR_DIV,
+        stream,
+        mr);
+    auto size64 = cudf::binary_operation(
+        quotient->view(),
+        one64,
+        cudf::binary_operator::ADD,
+        int64Type,
+        stream,
+        mr);
+
+    if (size64->size() == 0) {
+      return cudf::cast(
+          size64->view(), cudf::data_type{cudf::type_id::INT32}, stream, mr);
+    }
+
+    cudf::numeric_scalar<int64_t> maxLength(
+        kMaxRoundedArrayLength, true, stream, mr);
+    auto withinLimit = cudf::binary_operation(
+        size64->view(),
+        maxLength,
+        cudf::binary_operator::LESS_EQUAL,
+        cudf::data_type{cudf::type_id::BOOL8},
+        stream,
+        mr);
+    auto withinLimitNoNulls = nullToTrue(withinLimit->view(), stream, mr);
+    auto allAggregation = cudf::make_all_aggregation<cudf::reduce_aggregation>();
+    auto allScalar = cudf::reduce(
+        withinLimitNoNulls->view(),
+        *allAggregation,
+        cudf::data_type{cudf::type_id::BOOL8},
+        stream,
+        mr);
+    auto const& allBool =
+        static_cast<cudf::numeric_scalar<bool> const&>(*allScalar);
+    VELOX_USER_CHECK(
+        allBool.is_valid(stream) && allBool.value(stream),
+        "Too long sequence");
+
+    return cudf::cast(
+        size64->view(), cudf::data_type{cudf::type_id::INT32}, stream, mr);
+  }
+
+  std::vector<SequenceOperand> operands_;
+  cudf::data_type outputElementType_{cudf::type_id::EMPTY};
+};
+
 class FromJsonRowOfStringsFunction : public CudfFunction {
  public:
   explicit FromJsonRowOfStringsFunction(
@@ -1206,6 +1645,25 @@ void registerSparkFunctions(const std::string& prefix) {
         return std::make_shared<MonotonicallyIncreasingIdFunction>(expr);
       },
       {FunctionSignatureBuilder().returnType("bigint").build()});
+
+  registerCudfFunction(
+      prefix + "sequence",
+      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<SequenceFunction>(expr);
+      },
+      {FunctionSignatureBuilder()
+           .typeVariable("T")
+           .returnType("array(T)")
+           .argumentType("T")
+           .argumentType("T")
+           .build(),
+       FunctionSignatureBuilder()
+           .typeVariable("T")
+           .returnType("array(T)")
+           .argumentType("T")
+           .argumentType("T")
+           .argumentType("T")
+           .build()});
 
   registerCudfFunction(
       prefix + "from_json",
