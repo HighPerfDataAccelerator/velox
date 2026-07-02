@@ -109,6 +109,28 @@ TEST_F(CudfExpressionSelectionTest, functionRoot) {
   ASSERT_NE(functionExpr, nullptr);
 }
 
+TEST_F(CudfExpressionSelectionTest, sparkMightContain) {
+  std::vector<core::TypedExprPtr> hashArgs;
+  hashArgs.push_back(std::make_shared<core::ConstantTypedExpr>(
+      BIGINT(), variant(static_cast<int64_t>(42))));
+  hashArgs.push_back(
+      std::make_shared<core::FieldAccessTypedExpr>(BIGINT(), "a"));
+  auto hash = std::make_shared<core::CallTypedExpr>(
+      BIGINT(), std::move(hashArgs), "xxhash64_with_seed");
+
+  std::vector<core::TypedExprPtr> args;
+  args.push_back(std::make_shared<core::ConstantTypedExpr>(
+      VARBINARY(), variant::binary(std::string("serialized-bloom-filter"))));
+  args.push_back(std::move(hash));
+  auto typed = std::make_shared<core::CallTypedExpr>(
+      BOOLEAN(), std::move(args), "might_contain");
+  exec::ExprSet exprSet(
+      {typed}, execCtx_.get(), /*enableConstantFolding=*/false);
+
+  ASSERT_TRUE(canBeEvaluatedByCudf(exprSet.expr(0), /*deep=*/true));
+  ASSERT_NE(createCudfExpression(exprSet.expr(0), rowType_), nullptr);
+}
+
 TEST_F(CudfExpressionSelectionTest, astTopLevelWithFunctionPrecompute) {
   auto prevAst = CudfConfig::getInstance().astExpressionEnabled;
   auto prevJit = CudfConfig::getInstance().jitExpressionEnabled;

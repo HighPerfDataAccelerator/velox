@@ -21,6 +21,7 @@
 #include "velox/experimental/cudf/tests/CudfFunctionBaseTest.h"
 #include "velox/experimental/cudf/tests/utils/ExpressionTestUtil.h"
 
+#include "velox/common/base/BloomFilter.h"
 #include "velox/common/base/tests/GTestUtils.h"
 #include "velox/core/Expressions.h"
 #include "velox/dwio/common/tests/utils/BatchMaker.h"
@@ -163,6 +164,30 @@ TEST_F(CudfFilterProjectTest, hashWithSeed) {
       }),
   });
   facebook::velox::test::assertEqualVectors(expected, hashResults);
+}
+
+TEST_F(CudfFilterProjectTest, mightContain) {
+  constexpr int32_t kSize = 10;
+  BloomFilter bloomFilter;
+  bloomFilter.reset(kSize);
+  for (int64_t value = 0; value < kSize; ++value) {
+    bloomFilter.insert(folly::hasher<int64_t>()(value));
+  }
+  std::string serialized(bloomFilter.serializedSize(), '\0');
+  bloomFilter.serialize(serialized.data());
+
+  auto values = makeNullableFlatVector<int64_t>(
+      {1, 2, 3, 4, 5, std::nullopt, 123451, 23456, 4, 5});
+  auto input = makeRowVector({values});
+  std::vector<core::TypedExprPtr> args;
+  args.push_back(std::make_shared<core::ConstantTypedExpr>(
+      VARBINARY(), variant::binary(serialized)));
+  args.push_back(
+      std::make_shared<core::FieldAccessTypedExpr>(BIGINT(), "c0"));
+  auto expression = std::make_shared<core::CallTypedExpr>(
+      BOOLEAN(), std::move(args), "might_contain");
+
+  assertTypedExpressionMatchesCpu(expression, input);
 }
 
 TEST_F(CudfFilterProjectTest, monotonicallyIncreasingId) {
