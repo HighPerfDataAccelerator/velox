@@ -58,7 +58,8 @@ SourceDriverMock::SourceDriverMock(
             operatorId,
             driverCtxs_.back().get(),
             partitionedOutputNode,
-            false /* eagerFlush */));
+            false /* eagerFlush */,
+            numDrivers));
   }
 }
 
@@ -86,15 +87,20 @@ void SourceDriverMock::sendAllData(UcxPartitionedOutput* partitionedOutput) {
     auto cudfVector = makeCudfVector(
         pool, numRowsPerChunk_, rowType, tableGenerator_, stream);
 
-    // 2. Check isBlocked() - if blocked, wait on future
+    // 2. Resume any pending output and wait until the operator can accept the
+    // next input. A real Velox driver calls getOutput() after a blocked sink is
+    // resumed; mirror that lifecycle here.
     while (true) {
       ContinueFuture future;
       auto blocked = partitionedOutput->isBlocked(&future);
-      if (blocked == exec::BlockingReason::kNotBlocked) {
+      if (blocked != exec::BlockingReason::kNotBlocked) {
+        future.wait();
+        continue;
+      }
+      if (partitionedOutput->needsInput()) {
         break;
       }
-      // Wait for the operator to become unblocked
-      future.wait();
+      partitionedOutput->getOutput();
     }
 
     // 3. Call addInput() now that we're not blocked

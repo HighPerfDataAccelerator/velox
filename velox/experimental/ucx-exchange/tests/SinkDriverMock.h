@@ -45,7 +45,8 @@ class SinkDriverMock {
   SinkDriverMock(
       std::shared_ptr<facebook::velox::exec::Task> task,
       uint32_t numDrivers = 1,
-      std::shared_ptr<BaseTableGenerator> referenceData = nullptr);
+      std::shared_ptr<BaseTableGenerator> referenceData = nullptr,
+      bool verifySequentialChunks = false);
 
   /// @brief Executes the exchange operator until it finishes receiving all data
   /// from the upstream.
@@ -100,6 +101,8 @@ class SinkDriverMock {
   std::atomic<uint64_t> numChunksReceived_{0};
 
   const std::shared_ptr<BaseTableGenerator> referenceData_;
+  const bool verifySequentialChunks_;
+  std::atomic<size_t> nextReferenceRow_{0};
   std::vector<std::thread> threads_;
 };
 

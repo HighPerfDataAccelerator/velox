@@ -29,6 +29,7 @@
 #include <chrono>
 #include <future>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <vector>
 #include "velox/common/memory/MemoryPool.h"
@@ -1376,6 +1377,90 @@ TEST_P(UcxExchangeTest, batchAccumulationTest) {
 
     EXPECT_EQ(sinkDriver->numChunksReceived(), expectedOutputChunks)
         << "Custom threshold should control accumulation granularity";
+
+    queueManager_->removeTask(srcTaskId);
+  }
+
+  // --- Scenario 5: MERGE_SINGLE splits one large ordered input in place ---
+  // Ordinary SINGLE preserves scenario 3's whole-input behavior. Enabling the
+  // explicit merge contract turns the threshold into a maximum wire chunk size
+  // so the receiver can retain one bounded head per producer. A one-byte
+  // output buffer forces the sender to pause and resume between chunks.
+  {
+    const int numChunks = 1;
+    const int numRowsPerChunk = 1'200;
+    const int64_t customThreshold = 500;
+    const int numPartitions = 1;
+    const int numDrivers = 1;
+    const std::string taskPrefix = getUniqueTaskPrefix();
+    const std::string srcTaskId = taskPrefix + "sourceTask0";
+
+    auto rowType = UcxTestData::kTestRowType;
+    auto dataToSend = std::make_shared<UcxTestData>();
+    dataToSend->initialize(numRowsPerChunk);
+
+    std::unordered_map<std::string, std::string> extraConfig{
+        {core::QueryConfig::kUcxPartitionedOutputBatchRows,
+         std::to_string(customThreshold)},
+        {"cudf.merge_single_enabled", "true"}};
+
+    auto srcTask = createPartitionedOutputTask(
+        srcTaskId,
+        pool_,
+        rowType,
+        numPartitions,
+        {},
+        /*kMaxOutputBufferSize=*/1,
+        extraConfig);
+    queueManager_->initializeTask(
+        srcTask,
+        core::PartitionedOutputNode::Kind::kPartitioned,
+        numPartitions,
+        numDrivers);
+
+    auto sourceDriver = std::make_shared<SourceDriverMock>(
+        srcTask, numDrivers, numChunks, numRowsPerChunk, dataToSend);
+
+    const std::string sinkTaskId = taskPrefix + "sinkTask0";
+    core::PlanNodeId exchangeNodeId;
+    auto sinkTask = createExchangeTask(sinkTaskId, rowType, 0, exchangeNodeId);
+    auto sinkDriver = std::make_shared<SinkDriverMock>(
+        sinkTask,
+        numDrivers,
+        dataToSend,
+        /*verifySequentialChunks=*/true);
+
+    std::vector<exec::Split> splits;
+    splits.emplace_back(remoteSplit(srcTaskId, 0));
+    sinkDriver->addSplits(splits);
+
+    // Do not start the sink until the producer reaches backpressure. The
+    // resumable sender must stop after the first wire chunk; the former loop
+    // queued all three chunks before checking capacity.
+    sourceDriver->run();
+    std::optional<exec::OutputBuffer::Stats> preSinkStats;
+    for (int attempt = 0; attempt < 500; ++attempt) {
+      auto stats = queueManager_->stats(srcTaskId);
+      if (stats.has_value() && stats->bufferedPages > 0) {
+        preSinkStats = std::move(stats);
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    sinkDriver->run();
+    sourceDriver->joinThreads();
+    sinkDriver->joinThreads();
+
+    ASSERT_TRUE(preSinkStats.has_value());
+    EXPECT_EQ(preSinkStats->bufferedPages, 1);
+    EXPECT_EQ(preSinkStats->totalPagesSent, 1);
+    EXPECT_EQ(sinkDriver->numRows(), numRowsPerChunk);
+    EXPECT_TRUE(sinkDriver->dataIsValid());
+    EXPECT_EQ(
+        sinkDriver->numChunksReceived(),
+        static_cast<uint64_t>(
+            (numRowsPerChunk + customThreshold - 1) / customThreshold));
 
     queueManager_->removeTask(srcTaskId);
   }

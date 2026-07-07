@@ -33,12 +33,14 @@ constexpr uint32_t kPartitionId = 0; // not used in tests.
 SinkDriverMock::SinkDriverMock(
     std::shared_ptr<facebook::velox::exec::Task> task,
     uint32_t numDrivers,
-    std::shared_ptr<BaseTableGenerator> referenceData)
+    std::shared_ptr<BaseTableGenerator> referenceData,
+    bool verifySequentialChunks)
     : task_{std::move(task)},
       numDrivers_{numDrivers},
       numRows_{0},
       numBytes_{0},
-      referenceData_(referenceData) {
+      referenceData_(referenceData),
+      verifySequentialChunks_(verifySequentialChunks) {
   // Create a UcxExchangeClient shared across all exchange operators.
   exchangeClient_ = std::make_shared<UcxExchangeClient>(
       task_->taskId(), task_->destination(), numDrivers_);
@@ -46,12 +48,10 @@ SinkDriverMock::SinkDriverMock(
   auto planNode = task_->planFragment().planNode;
   // create the set of exchange operators.
   for (uint32_t driverId = 0; driverId < numDrivers; ++driverId) {
-    driverCtxs_.emplace_back(
-        std::make_shared<DriverCtx>(
-            task_, driverId, kPipelineId, kUngroupedGroupId, kPartitionId));
-    hybridExchanges_.emplace_back(
-        std::make_unique<UcxExchange>(
-            operatorId, driverCtxs_.back().get(), planNode, exchangeClient_));
+    driverCtxs_.emplace_back(std::make_shared<DriverCtx>(
+        task_, driverId, kPipelineId, kUngroupedGroupId, kPartitionId));
+    hybridExchanges_.emplace_back(std::make_unique<UcxExchange>(
+        operatorId, driverCtxs_.back().get(), planNode, exchangeClient_));
   }
 }
 
@@ -62,11 +62,13 @@ void SinkDriverMock::updateDataValidity(const cudf::table_view& tab) {
 
   auto stream = rmm::cuda_stream_default;
 
-  // Use the polymorphic verifyTable method
-  // Note: For chunk-based verification, we use startRow=0 since each chunk
-  // contains rows that should match the reference data from the beginning.
-  // This assumes the test sends the same data pattern in each chunk.
-  bool valid = referenceData_->verifyTable(tab, 0, tab.num_rows(), stream);
+  // Most tests send the same data pattern in every chunk. Ordered SINGLE
+  // chunking instead slices one input table into consecutive chunks, so those
+  // tests opt into advancing the reference offset across received chunks.
+  const auto startRow =
+      verifySequentialChunks_ ? nextReferenceRow_.fetch_add(tab.num_rows()) : 0;
+  bool valid =
+      referenceData_->verifyTable(tab, startRow, tab.num_rows(), stream);
 
   if (!valid) {
     dataValidFlag_ = false;

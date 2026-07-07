@@ -17,6 +17,7 @@
 #include <fmt/format.h>
 #include <algorithm>
 #include <cstdlib>
+#include <limits>
 #include "velox/core/PlanNode.h"
 #include "velox/core/QueryConfig.h"
 #include "velox/exec/Driver.h"
@@ -57,7 +58,8 @@ UcxPartitionedOutput::UcxPartitionedOutput(
     int32_t operatorId,
     exec::DriverCtx* ctx,
     const std::shared_ptr<const core::PartitionedOutputNode>& planNode,
-    bool eagerFlush)
+    bool eagerFlush,
+    std::optional<uint32_t> numDriversForTest)
     : Operator(
           ctx,
           planNode->outputType(),
@@ -72,9 +74,16 @@ UcxPartitionedOutput::UcxPartitionedOutput(
       numPartitions_(planNode->numPartitions()),
       pipelineId_(ctx->pipelineId),
       driverId_(ctx->driverId),
-      targetRowsPerChunk_(ctx->queryConfig().ucxPartitionedOutputBatchRows()) {
+      targetRowsPerChunk_(ctx->queryConfig().ucxPartitionedOutputBatchRows()),
+      mergeSingleEnabled_(
+          ctx->queryConfig().get<bool>("cudf.merge_single_enabled", false)) {
   if (driverId_ == 0) {
-    const auto numDrivers = ctx->task->numOutputDrivers();
+    // SourceDriverMock drives operators directly, without starting the Task
+    // and creating its pipeline metadata. Production callers always derive
+    // this count from the Task.
+    const auto numDrivers = numDriversForTest.has_value()
+        ? numDriversForTest.value()
+        : ctx->task->numOutputDrivers();
     sharedQueueManager()->initializeTask(
         ctx->task,
         planNode->kind(),
@@ -84,7 +93,8 @@ UcxPartitionedOutput::UcxPartitionedOutput(
             << ctx->task->taskId() << " destinations=" << numPartitions_
             << " drivers=" << numDrivers
             << " kind=" << core::PartitionedOutputNode::toName(planNode->kind())
-            << " targetRowsPerChunk=" << targetRowsPerChunk_;
+            << " targetRowsPerChunk=" << targetRowsPerChunk_
+            << " mergeSingleEnabled=" << mergeSingleEnabled_;
   }
   this->initPartitionKeys(planNode);
   auto sources = planNode->sources();
@@ -111,6 +121,9 @@ void UcxPartitionedOutput::addInput(RowVectorPtr input) {
   VELOX_CHECK(
       !future_.valid() || future_.hasValue(),
       "addInput with outstanding future!");
+  VELOX_CHECK(
+      !hasPendingSingleChunks(),
+      "addInput while a MERGE_SINGLE batch is still being emitted");
 
   // Record stats per-input (before buffering).
   {
@@ -180,14 +193,20 @@ void UcxPartitionedOutput::flushPending() {
         equalPartition(tableView, stream);
       }
     } else {
-      auto packedCols = cudf::pack(
-          tableView, stream, cudf::get_current_device_resource_ref());
       const auto tableRows = tableView.num_rows();
-      stream.synchronize();
-      auto packedColsPtr = std::make_unique<cudf::packed_columns>(
-          std::move(packedCols.metadata), std::move(packedCols.gpu_data));
-      queueManager->enqueue(
-          this->taskId(), 0, std::move(packedColsPtr), tableRows);
+      if (mergeSingleEnabled_ && targetRowsPerChunk_ > 0 &&
+          tableRows > targetRowsPerChunk_) {
+        startSingleChunkEmission(std::move(mergedTable), tableRows, stream);
+        return;
+      } else {
+        auto packedCols = cudf::pack(
+            tableView, stream, cudf::get_current_device_resource_ref());
+        stream.synchronize();
+        auto packedColsPtr = std::make_unique<cudf::packed_columns>(
+            std::move(packedCols.metadata), std::move(packedCols.gpu_data));
+        queueManager->enqueue(
+            this->taskId(), 0, std::move(packedColsPtr), tableRows);
+      }
     }
 
     // Check backpressure after enqueue.
@@ -206,8 +225,7 @@ void UcxPartitionedOutput::flushPending() {
     VLOG(1)
         << "@" << taskId() << "#" << pipelineId_ << "/" << driverId_
         << " caught memory alloc error, removing all memory in output queues";
-    pendingInputs_.clear();
-    pendingRows_ = 0;
+    resetPendingSingleEmission();
     for (int i = 0; i < numPartitions_; i++) {
       sharedQueueManager()->deleteResults(this->taskId(), i);
     }
@@ -229,8 +247,30 @@ RowVectorPtr UcxPartitionedOutput::getOutput() {
   if (finished_) {
     return nullptr;
   }
+  // A direct caller may invoke getOutput() immediately after addInput(). Do
+  // not bypass a queue future that is still outstanding.
+  if (blockingReason_ != exec::BlockingReason::kNotBlocked) {
+    return nullptr;
+  }
+  if (hasPendingSingleChunks()) {
+    try {
+      emitPendingSingleChunks();
+    } catch (const rmm::bad_alloc& e) {
+      VLOG(1) << "@" << taskId() << "#" << pipelineId_ << "/" << driverId_
+              << " caught memory alloc error while resuming MERGE_SINGLE";
+      resetPendingSingleEmission();
+      sharedQueueManager()->deleteResults(this->taskId(), 0);
+      throw;
+    }
+    if (hasPendingSingleChunks()) {
+      return nullptr;
+    }
+  }
   if (noMoreInput_) {
     flushPending(); // drain any remaining buffered inputs
+    if (hasPendingSingleChunks()) {
+      return nullptr;
+    }
     sharedQueueManager()->noMoreData(this->taskId());
     finished_ = true;
   }
@@ -407,6 +447,106 @@ void UcxPartitionedOutput::splitAndEnqueue(
         std::move(packedColsPtr),
         partitionTable.table.num_rows());
   }
+}
+
+void UcxPartitionedOutput::startSingleChunkEmission(
+    std::unique_ptr<cudf::table> mergedTable,
+    cudf::size_type tableRows,
+    rmm::cuda_stream_view stream) {
+  VELOX_CHECK_EQ(numPartitions_, 1);
+  VELOX_CHECK(mergeSingleEnabled_);
+  VELOX_CHECK_GT(targetRowsPerChunk_, 0);
+  VELOX_CHECK_GT(tableRows, targetRowsPerChunk_);
+  VELOX_CHECK(!hasPendingSingleChunks());
+  VELOX_CHECK_NULL(pendingSingleTable_);
+  VELOX_CHECK(!pendingSingleStream_.has_value());
+  VELOX_CHECK_LE(
+      targetRowsPerChunk_,
+      std::numeric_limits<cudf::size_type>::max(),
+      "MERGE_SINGLE chunk row limit exceeds cuDF size_type");
+
+  if (mergedTable) {
+    VELOX_CHECK(pendingInputs_.empty());
+    VELOX_CHECK_EQ(mergedTable->num_rows(), tableRows);
+  } else {
+    VELOX_CHECK_EQ(pendingInputs_.size(), 1);
+  }
+
+  pendingSingleTable_ = std::move(mergedTable);
+  pendingSingleStream_ = stream;
+  pendingSingleNextRow_ = 0;
+  pendingSingleNumRows_ = tableRows;
+
+  VLOG(2) << "UcxPartitionedOutput ordered single chunking task=" << taskId()
+          << " rows=" << tableRows << " rowsPerChunk=" << targetRowsPerChunk_;
+  emitPendingSingleChunks();
+}
+
+void UcxPartitionedOutput::emitPendingSingleChunks() {
+  VELOX_CHECK(hasPendingSingleChunks());
+  VELOX_CHECK(pendingSingleStream_.has_value());
+  VELOX_CHECK_EQ(blockingReason_, exec::BlockingReason::kNotBlocked);
+
+  auto stream = pendingSingleStream_.value();
+  cudf::table_view tableView;
+  if (pendingSingleTable_) {
+    tableView = pendingSingleTable_->view();
+  } else {
+    VELOX_CHECK_EQ(pendingInputs_.size(), 1);
+    auto& input = pendingInputs_.front();
+    tableView = remap_.empty()
+        ? input->getTableView()
+        : input->getTableView().select(remap_.begin(), remap_.end());
+  }
+  VELOX_CHECK_EQ(tableView.num_rows(), pendingSingleNumRows_);
+
+  const auto rowsPerChunk = std::min<cudf::size_type>(
+      pendingSingleNumRows_, static_cast<cudf::size_type>(targetRowsPerChunk_));
+  auto queueManager = sharedQueueManager();
+
+  while (hasPendingSingleChunks()) {
+    const auto start = pendingSingleNextRow_;
+    const auto end =
+        std::min<cudf::size_type>(pendingSingleNumRows_, start + rowsPerChunk);
+    auto slices = cudf::slice(tableView, {start, end}, stream);
+    VELOX_CHECK_EQ(slices.size(), 1);
+    auto packedCols = cudf::pack(
+        slices.front(), stream, cudf::get_current_device_resource_ref());
+    // UCXX/UCX is not stream-aware. Publish each chunk only after its packed
+    // buffers have been produced; preserving loop order preserves source order.
+    stream.synchronize();
+    auto packedColsPtr = std::make_unique<cudf::packed_columns>(
+        std::move(packedCols.metadata), std::move(packedCols.gpu_data));
+    queueManager->enqueue(
+        this->taskId(), 0, std::move(packedColsPtr), slices.front().num_rows());
+
+    // Advance before exposing the future so this slice is never resent after
+    // the driver resumes.
+    pendingSingleNextRow_ = end;
+    const bool complete = !hasPendingSingleChunks();
+    const bool blocked = queueManager->checkBlocked(this->taskId(), &future_);
+    if (blocked) {
+      blockingReason_ = exec::BlockingReason::kWaitForConsumer;
+      VLOG(3) << "@" << taskId() << "#" << pipelineId_ << "/" << driverId_
+              << " paused MERGE_SINGLE at row " << pendingSingleNextRow_ << "/"
+              << pendingSingleNumRows_;
+      if (complete) {
+        resetPendingSingleEmission();
+      }
+      return;
+    }
+  }
+
+  resetPendingSingleEmission();
+}
+
+void UcxPartitionedOutput::resetPendingSingleEmission() {
+  pendingSingleTable_.reset();
+  pendingSingleStream_.reset();
+  pendingSingleNextRow_ = 0;
+  pendingSingleNumRows_ = 0;
+  pendingInputs_.clear();
+  pendingRows_ = 0;
 }
 
 } // namespace facebook::velox::ucx_exchange

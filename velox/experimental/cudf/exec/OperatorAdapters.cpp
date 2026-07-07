@@ -29,6 +29,7 @@
 #include "velox/experimental/cudf/exec/CudfLimit.h"
 #include "velox/experimental/cudf/exec/CudfLocalPartition.h"
 #include "velox/experimental/cudf/exec/CudfMarkDistinct.h"
+#include "velox/experimental/cudf/exec/CudfMergeExchange.h"
 #include "velox/experimental/cudf/exec/CudfNestedLoopJoin.h"
 #include "velox/experimental/cudf/exec/CudfOrderBy.h"
 #include "velox/experimental/cudf/exec/CudfReduce.h"
@@ -1359,15 +1360,23 @@ class MergeExchangeAdapter : public OperatorAdapter {
     auto mergeExchangeNode =
         std::dynamic_pointer_cast<const core::MergeExchangeNode>(planNode);
     VELOX_CHECK_NOT_NULL(mergeExchangeNode);
-    LOG(WARNING)
-        << "CudfMergeExchangeAdapter: replacing MergeExchange with UcxExchange"
-        << " pipeline=" << ctx->pipelineId << " operatorId=" << operatorId
-        << " node=" << planNode->id();
+    LOG(WARNING) << "CudfMergeExchangeAdapter: replacing MergeExchange"
+                 << " pipeline=" << ctx->pipelineId
+                 << " operatorId=" << operatorId << " node=" << planNode->id();
 
     std::vector<std::unique_ptr<exec::Operator>> result;
-    result.push_back(
-        std::make_unique<ucx_exchange::UcxExchange>(
-            operatorId, ctx, planNode, nullptr));
+    const bool mergeSingleEnabled =
+        ctx->queryConfig().get<bool>("cudf.merge_single_enabled", false);
+    if (mergeSingleEnabled) {
+      result.push_back(std::make_unique<CudfMergeExchange>(
+          operatorId, ctx, mergeExchangeNode));
+      return result;
+    }
+
+    // Preserve the existing blocking full-sort implementation unless the
+    // explicit MERGE_SINGLE contract enables the streaming merge operator.
+    result.push_back(std::make_unique<ucx_exchange::UcxExchange>(
+        operatorId, ctx, planNode, nullptr));
     auto orderByNode = std::make_shared<core::OrderByNode>(
         mergeExchangeNode->id() + "-ucx-order-by",
         mergeExchangeNode->sortingKeys(),

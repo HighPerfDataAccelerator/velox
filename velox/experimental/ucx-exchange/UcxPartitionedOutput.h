@@ -15,6 +15,8 @@
  */
 #pragma once
 
+#include <optional>
+
 #include "velox/exec/Operator.h"
 #include "velox/experimental/cudf/exec/NvtxHelper.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
@@ -38,7 +40,8 @@ class UcxPartitionedOutput : public exec::Operator,
       int32_t operatorId,
       exec::DriverCtx* ctx,
       const std::shared_ptr<const core::PartitionedOutputNode>& planNode,
-      bool eagerFlush);
+      bool eagerFlush,
+      std::optional<uint32_t> numDriversForTest = std::nullopt);
 
   void addInput(RowVectorPtr input) override;
 
@@ -47,14 +50,13 @@ class UcxPartitionedOutput : public exec::Operator,
   /// a non-blocked state, otherwise blocked.
   RowVectorPtr getOutput() override;
 
-  /// always true but the caller will check isBlocked before adding input, hence
-  /// the blocked state does not accumulate input.
+  /// Refuses a new input while an ordered single-destination batch is being
+  /// emitted incrementally after backpressure.
   bool needsInput() const override {
-    return true;
+    return !hasPendingSingleChunks();
   }
 
-  // the operator is blocked if the queues are full, we are ignoring this so
-  // always return kNotBlocked
+  /// Returns a consumer future when the shared output queue is over capacity.
   exec::BlockingReason isBlocked(ContinueFuture* future) override;
 
   // The operaor is finished when the queue manager say the queues have all been
@@ -87,6 +89,23 @@ class UcxPartitionedOutput : public exec::Operator,
       std::vector<cudf::size_type> offsets,
       rmm::cuda_stream_view stream);
 
+  /// Starts resumable emission of a one-destination ordered table. The table
+  /// is owned either by pendingInputs_ or by 'mergedTable'.
+  void startSingleChunkEmission(
+      std::unique_ptr<cudf::table> mergedTable,
+      cudf::size_type tableRows,
+      rmm::cuda_stream_view stream);
+
+  /// Emits ordered chunks until the table is exhausted or the output queue
+  /// reports backpressure.
+  void emitPendingSingleChunks();
+
+  bool hasPendingSingleChunks() const {
+    return pendingSingleNextRow_ < pendingSingleNumRows_;
+  }
+
+  void resetPendingSingleEmission();
+
   const std::weak_ptr<UcxOutputQueueManager> queueManager_;
   std::vector<column_index_t> partitionKeyIndices_;
   const size_t numPartitions_;
@@ -94,7 +113,7 @@ class UcxPartitionedOutput : public exec::Operator,
   const int pipelineId_;
   const int driverId_;
 
-  exec::BlockingReason blockingReason_;
+  exec::BlockingReason blockingReason_{exec::BlockingReason::kNotBlocked};
   ContinueFuture future_;
 
   bool finished_{false};
@@ -113,6 +132,17 @@ class UcxPartitionedOutput : public exec::Operator,
   int64_t pendingRows_{0};
   /// Configured row threshold for flushing (from QueryConfig).
   const int64_t targetRowsPerChunk_;
+
+  /// True only for the explicit MERGE_SINGLE contract. Ordinary SINGLE
+  /// exchanges preserve their existing whole-batch behavior.
+  const bool mergeSingleEnabled_;
+
+  /// Resumable MERGE_SINGLE sender state. A single input remains in
+  /// pendingInputs_; a concatenated input is owned here instead.
+  std::unique_ptr<cudf::table> pendingSingleTable_;
+  std::optional<rmm::cuda_stream_view> pendingSingleStream_;
+  cudf::size_type pendingSingleNextRow_{0};
+  cudf::size_type pendingSingleNumRows_{0};
 };
 
 } // namespace facebook::velox::ucx_exchange
