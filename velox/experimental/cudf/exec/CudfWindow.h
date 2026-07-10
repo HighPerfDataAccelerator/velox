@@ -20,7 +20,11 @@
 
 #include "velox/core/PlanNode.h"
 
+#include <cudf/io/parquet.hpp>
 #include <cudf/types.hpp>
+
+#include <string>
+#include <vector>
 
 namespace facebook::velox::cudf_velox {
 
@@ -31,6 +35,8 @@ bool isSupportedCudfWindowNode(
 /// - row_number() / rank() with the default UNBOUNDED PRECEDING to CURRENT ROW
 ///   frame.
 /// - sum(field) over a full partition ROWS frame.
+/// - sum(field) over a partitioned ordered ROWS UNBOUNDED PRECEDING to
+///   CURRENT ROW frame.
 /// - first(field) / first_value(field) over a partitioned ordered UNBOUNDED
 ///   PRECEDING to CURRENT ROW frame.
 class CudfWindow : public CudfOperatorBase {
@@ -56,6 +62,7 @@ class CudfWindow : public CudfOperatorBase {
   void doAddInput(RowVectorPtr input) override;
   RowVectorPtr doGetOutput() override;
   void doNoMoreInput() override;
+  void doClose() override;
 
  private:
   std::unique_ptr<cudf::column> computeRowNumberColumn(
@@ -77,6 +84,13 @@ class CudfWindow : public CudfOperatorBase {
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr) const;
 
+  std::unique_ptr<cudf::column> computeRunningPartitionSumColumn(
+      cudf::table_view const& sortedInput,
+      const core::WindowNode::Function& function,
+      const TypePtr& expectedType,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const;
+
   std::unique_ptr<cudf::column> computePartitionFirstColumn(
       cudf::table_view const& sortedInput,
       const core::WindowNode::Function& function,
@@ -87,11 +101,41 @@ class CudfWindow : public CudfOperatorBase {
   std::unique_ptr<cudf::table> computeOutputTable(
       std::unique_ptr<cudf::table> input,
       rmm::cuda_stream_view stream,
-      rmm::device_async_resource_ref mr) const;
+      rmm::device_async_resource_ref mr,
+      bool inputAlreadySorted = false) const;
+
+  void spillSortedRun();
+  void initializeSortedRunReaders();
+  std::unique_ptr<cudf::table> mergeNextSortedBatch(
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr,
+      bool& finalBatch);
+  std::unique_ptr<cudf::table> takeCompletePartitions(
+      std::unique_ptr<cudf::table> sorted,
+      bool finalBatch,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr);
+  CudfVectorPtr computeNextSortedOutput();
+  void cleanupSpillFiles();
+
+  struct SortedRun {
+    std::string path;
+    std::unique_ptr<cudf::io::chunked_parquet_reader> reader;
+  };
 
   const std::shared_ptr<const core::WindowNode> windowNode_;
   const RowTypePtr inputType_;
   std::vector<CudfVectorPtr> inputs_;
+  uint64_t bufferedBytes_{0};
+  uint64_t nextDiagnosticBufferedBytes_{512ULL << 20};
+  std::vector<SortedRun> sortedRuns_;
+  std::string spillDirectory_;
+  uint64_t spillFileSequence_{0};
+  std::unique_ptr<cudf::table> mergeCarry_;
+  std::unique_ptr<cudf::table> partitionCarry_;
+  bool readersInitialized_{false};
+  bool mergeFinished_{false};
+  bool spilled_{false};
   bool finished_{false};
 
   std::vector<cudf::size_type> partitionKeyChannels_;

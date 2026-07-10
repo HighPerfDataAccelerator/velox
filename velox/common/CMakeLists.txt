@@ -38,6 +38,9 @@ velox_add_library(velox_enum_declare INTERFACE HEADERS EnumDeclare.h)
 
 velox_add_library(velox_enum_define INTERFACE HEADERS EnumDefine.h)
 
+velox_add_library(velox_enums INTERFACE HEADERS Enums.h)
+velox_link_libraries(velox_enums INTERFACE velox_enum_declare velox_enum_define)
+
 velox_add_library(velox_casts INTERFACE HEADERS Casts.h)
 
 velox_add_library(velox_scoped_registry INTERFACE HEADERS ScopedRegistry.h)

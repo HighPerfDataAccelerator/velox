@@ -51,6 +51,13 @@ std::size_t CudfHiveConfig::maxPassReadLimitSession(
       config_->get<std::size_t>(kMaxPassReadLimit, 0));
 }
 
+bool CudfHiveConfig::parquetFilterPushdownEnabledSession(
+    const config::ConfigBase* session) const {
+  return session->get<bool>(
+      kParquetFilterPushdownEnabledSession,
+      config_->get<bool>(kParquetFilterPushdownEnabled, true));
+}
+
 bool CudfHiveConfig::isConvertStringsToCategories() const {
   return config_->get<bool>(kConvertStringsToCategories, false);
 }

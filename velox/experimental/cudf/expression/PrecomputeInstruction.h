@@ -32,17 +32,22 @@ struct PrecomputeInstruction {
   int new_column_index;
   std::vector<int> nested_dependent_column_indices;
   std::shared_ptr<CudfExpression> cudf_expression;
+  // The AST is compiled from Velox types.  A non-AST child must therefore be
+  // presented to it with exactly the type advertised by that child Expr.
+  std::optional<cudf::data_type> expected_type;
 
   // Constructor to initialize the struct with values
   PrecomputeInstruction(
       int depIndex,
       const std::string& name,
       int newIndex,
-      const std::shared_ptr<CudfExpression>& node = nullptr)
+      const std::shared_ptr<CudfExpression>& node = nullptr,
+      std::optional<cudf::data_type> expectedType = std::nullopt)
       : dependent_column_index(depIndex),
         ins_name(name),
         new_column_index(newIndex),
-        cudf_expression(node) {}
+        cudf_expression(node),
+        expected_type(expectedType) {}
 
   // TODO (dm): This two ctor situation is crazy.
   PrecomputeInstruction(
@@ -50,12 +55,14 @@ struct PrecomputeInstruction {
       const std::string& name,
       int newIndex,
       std::vector<int>&& nestedIndices,
-      const std::shared_ptr<CudfExpression>& node = nullptr)
+      const std::shared_ptr<CudfExpression>& node = nullptr,
+      std::optional<cudf::data_type> expectedType = std::nullopt)
       : dependent_column_index(depIndex),
         ins_name(name),
         new_column_index(newIndex),
         nested_dependent_column_indices(std::move(nestedIndices)),
-        cudf_expression(node) {}
+        cudf_expression(node),
+        expected_type(expectedType) {}
 };
 
 } // namespace facebook::velox::cudf_velox

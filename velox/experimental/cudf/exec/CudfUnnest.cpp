@@ -21,6 +21,7 @@
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
 #include <cudf/binaryop.hpp>
+#include <cudf/copying.hpp>
 #include <cudf/lists/explode.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/unary.hpp>
@@ -28,6 +29,12 @@
 namespace facebook::velox::cudf_velox {
 
 namespace {
+
+// Bound expanding-operator output before it reaches blocking consumers such
+// as OrderBy. This is input rows (not bytes); at a 10x expansion factor it
+// yields batches around a few hundred MiB.
+// Parquet reader chunk/pass limits remain independent and unbounded.
+constexpr cudf::size_type kMaxUnnestInputRowsPerOutput = 262144;
 
 column_index_t fieldChannel(
     const RowTypePtr& inputType,
@@ -110,83 +117,87 @@ CudfUnnest::CudfUnnest(
 void CudfUnnest::doAddInput(RowVectorPtr input) {
   VELOX_CHECK_NULL(input_);
   input_ = std::move(input);
+  inputRowOffset_ = 0;
 }
 
 RowVectorPtr CudfUnnest::doGetOutput() {
-  if (!input_) {
-    return nullptr;
-  }
+  while (input_) {
+    if (input_->size() == 0) {
+      input_.reset();
+      return nullptr;
+    }
 
-  if (input_->size() == 0) {
-    input_.reset();
-    return nullptr;
-  }
+    auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input_);
+    VELOX_CHECK_NOT_NULL(cudfInput);
+    auto stream = cudfInput->stream();
+    auto* inputPool = input_->pool();
+    const auto inputSize = static_cast<cudf::size_type>(input_->size());
+    const auto end =
+        std::min(inputSize, inputRowOffset_ + kMaxUnnestInputRowsPerOutput);
 
-  auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input_);
-  VELOX_CHECK_NOT_NULL(cudfInput);
-  auto stream = cudfInput->stream();
-  auto inputColumns = cudfInput->release()->release();
+    const auto inputView = cudfInput->getTableView();
+    std::vector<cudf::column_view> explodeInputColumns;
+    explodeInputColumns.reserve(replicateChannels_.size() + 1);
+    for (const auto channel : replicateChannels_) {
+      explodeInputColumns.push_back(inputView.column(channel));
+    }
+    explodeInputColumns.push_back(inputView.column(unnestChannel_));
+    auto slices = cudf::slice(
+        cudf::table_view{explodeInputColumns}, {inputRowOffset_, end}, stream);
+    VELOX_CHECK_EQ(slices.size(), 1);
+    inputRowOffset_ = end;
 
-  std::vector<std::unique_ptr<cudf::column>> explodeInputColumns;
-  explodeInputColumns.reserve(replicateChannels_.size() + 1);
-  for (const auto channel : replicateChannels_) {
-    VELOX_CHECK_NOT_NULL(inputColumns[channel]);
-    explodeInputColumns.push_back(std::move(inputColumns[channel]));
-  }
-  VELOX_CHECK_NOT_NULL(inputColumns[unnestChannel_]);
-  explodeInputColumns.push_back(std::move(inputColumns[unnestChannel_]));
+    const auto explodeColumnIdx =
+        static_cast<cudf::size_type>(replicateChannels_.size());
+    auto exploded = hasOrdinality_
+        ? cudf::explode_position(
+              slices.front(), explodeColumnIdx, stream, get_output_mr())
+        : cudf::explode(
+              slices.front(), explodeColumnIdx, stream, get_output_mr());
 
-  auto explodeInput =
-      std::make_unique<cudf::table>(std::move(explodeInputColumns));
-  const auto explodeColumnIdx =
-      static_cast<cudf::size_type>(replicateChannels_.size());
-  auto exploded = hasOrdinality_
-      ? cudf::explode_position(
-            explodeInput->view(), explodeColumnIdx, stream, get_output_mr())
-      : cudf::explode(
-            explodeInput->view(), explodeColumnIdx, stream, get_output_mr());
+    if (inputRowOffset_ >= inputSize) {
+      input_.reset();
+      inputRowOffset_ = 0;
+    }
 
-  const auto outputSize = exploded->num_rows();
-  if (outputSize == 0) {
-    input_.reset();
-    return nullptr;
-  }
+    const auto outputSize = exploded->num_rows();
+    if (outputSize == 0) {
+      continue;
+    }
 
-  auto explodedColumns = exploded->release();
-  if (!hasOrdinality_) {
-    auto output = std::make_shared<CudfVector>(
-        input_->pool(),
+    auto explodedColumns = exploded->release();
+    if (!hasOrdinality_) {
+      return std::make_shared<CudfVector>(
+          inputPool,
+          outputType_,
+          outputSize,
+          std::make_unique<cudf::table>(std::move(explodedColumns)),
+          stream);
+    }
+
+    const auto replicatedColumnCount = replicateChannels_.size();
+    VELOX_CHECK_EQ(explodedColumns.size(), replicatedColumnCount + 2);
+
+    std::vector<std::unique_ptr<cudf::column>> outputColumns;
+    outputColumns.reserve(outputType_->size());
+    for (column_index_t i = 0; i < replicatedColumnCount; ++i) {
+      outputColumns.push_back(std::move(explodedColumns[i]));
+    }
+
+    const auto positionColumn = replicatedColumnCount;
+    const auto valueColumn = replicatedColumnCount + 1;
+    outputColumns.push_back(std::move(explodedColumns[valueColumn]));
+    outputColumns.push_back(makeVeloxOrdinality(
+        explodedColumns[positionColumn]->view(), stream, get_output_mr()));
+
+    return std::make_shared<CudfVector>(
+        inputPool,
         outputType_,
         outputSize,
-        std::make_unique<cudf::table>(std::move(explodedColumns)),
+        std::make_unique<cudf::table>(std::move(outputColumns)),
         stream);
-    input_.reset();
-    return output;
   }
-
-  const auto replicatedColumnCount = replicateChannels_.size();
-  VELOX_CHECK_EQ(explodedColumns.size(), replicatedColumnCount + 2);
-
-  std::vector<std::unique_ptr<cudf::column>> outputColumns;
-  outputColumns.reserve(outputType_->size());
-  for (column_index_t i = 0; i < replicatedColumnCount; ++i) {
-    outputColumns.push_back(std::move(explodedColumns[i]));
-  }
-
-  const auto positionColumn = replicatedColumnCount;
-  const auto valueColumn = replicatedColumnCount + 1;
-  outputColumns.push_back(std::move(explodedColumns[valueColumn]));
-  outputColumns.push_back(makeVeloxOrdinality(
-      explodedColumns[positionColumn]->view(), stream, get_output_mr()));
-
-  auto output = std::make_shared<CudfVector>(
-      input_->pool(),
-      outputType_,
-      outputSize,
-      std::make_unique<cudf::table>(std::move(outputColumns)),
-      stream);
-  input_.reset();
-  return output;
+  return nullptr;
 }
 
 } // namespace facebook::velox::cudf_velox

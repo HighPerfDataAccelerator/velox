@@ -702,7 +702,8 @@ class MapElementAtFunction : public CudfFunction {
       cudf::column_view child,
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr) {
-    auto offsets = std::make_unique<cudf::column>(mapView.offsets(), stream, mr);
+    auto offsets =
+        std::make_unique<cudf::column>(mapView.offsets(), stream, mr);
     auto values = std::make_unique<cudf::column>(child, stream, mr);
     auto nullMask = cudf::copy_bitmask(mapView.parent(), stream, mr);
     return cudf::make_lists_column(
@@ -717,8 +718,7 @@ class MapElementAtFunction : public CudfFunction {
       cudf::column_view positions,
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr) {
-    auto missing =
-        cudf::numeric_scalar<cudf::size_type>(-1, true, stream, mr);
+    auto missing = cudf::numeric_scalar<cudf::size_type>(-1, true, stream, mr);
     auto missingMask = sanitizeBoolMask(
         cudf::binary_operation(
             positions,

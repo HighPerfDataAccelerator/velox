@@ -52,6 +52,7 @@ class CudfUnnest : public CudfOperatorBase {
   std::vector<column_index_t> replicateChannels_;
   column_index_t unnestChannel_;
   bool hasOrdinality_;
+  cudf::size_type inputRowOffset_{0};
 };
 
 } // namespace facebook::velox::cudf_velox

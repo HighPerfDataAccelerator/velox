@@ -106,7 +106,6 @@ void EndpointRef::closeAndDrainCommunicators() {
   // localCopy is destroyed here, releasing all weak_ptrs.
 }
 
-
 bool EndpointRef::operator<(EndpointRef const& other) {
   if (endpoint_ == other.endpoint_) {
     return false; // covers the case where both are nullptr

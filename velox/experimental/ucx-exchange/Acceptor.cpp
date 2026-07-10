@@ -13,8 +13,10 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "velox/experimental/ucx-exchange/Acceptor.h"
+#include <cstring>
+
 #include "velox/experimental/cudf/CudfConfig.h"
+#include "velox/experimental/ucx-exchange/Acceptor.h"
 #include "velox/experimental/ucx-exchange/Communicator.h"
 #include "velox/experimental/ucx-exchange/EndpointRef.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeProtocol.h"
@@ -41,7 +43,19 @@ void Acceptor::cStyleAMCallback(
       "Possible protocol mismatch or truncated message.",
       buffer->getSize(),
       sizeof(HandshakeMsg));
-  HandshakeMsg* handshakePtr = reinterpret_cast<HandshakeMsg*>(buffer->data());
+  // Copy out of UCXX-owned storage before parsing.  This also avoids relying
+  // on the alignment of the active-message receive buffer.
+  HandshakeMsg handshake{};
+  std::memcpy(&handshake, buffer->data(), sizeof(handshake));
+  const auto taskIdEnd = static_cast<const char*>(
+      std::memchr(handshake.taskId, '\0', sizeof(handshake.taskId)));
+  VELOX_CHECK_NOT_NULL(taskIdEnd, "Handshake task id is not NUL terminated");
+  VELOX_CHECK_GT(taskIdEnd, handshake.taskId, "Handshake task id is empty");
+  VELOX_CHECK_LT(
+      handshake.destination,
+      65536,
+      "Handshake destination is invalid: {}",
+      handshake.destination);
 
   // Create a exchangeServer based on the information received in the initial
   // handshake.
@@ -51,7 +65,7 @@ void Acceptor::cStyleAMCallback(
   VELOX_CHECK_NOT_NULL(epRef, "Could not find endpoint reference");
   const std::string peerAddress = epRef->getPeerAddress();
 
-  const PartitionKey key = {handshakePtr->taskId, handshakePtr->destination};
+  const PartitionKey key = {handshake.taskId, handshake.destination};
 
   // Determine if this is an intra-process transfer by comparing the source's
   // workerId with our Communicator's workerId. A match means both source and
@@ -60,7 +74,7 @@ void Acceptor::cStyleAMCallback(
   //
   // Previous approach used IP comparison (getLocalIpAddresses), which fails
   // when multiple Docker containers share the same host IP address.
-  const bool sameWorker = handshakePtr->workerId == communicator->getWorkerId();
+  const bool sameWorker = handshake.workerId == communicator->getWorkerId();
   bool isIntraNodeTransfer =
       cudf_velox::CudfConfig::getInstance().intraNodeExchange && sameWorker;
 
@@ -71,7 +85,7 @@ void Acceptor::cStyleAMCallback(
     const bool canUseIntraNode = queueMgr->canUseIntraNode(key.taskId);
     VLOG(2) << "[UCX-ACCEPTOR-INTRA-CHECK] task=" << key.taskId
             << " destination=" << key.destination << " peer=" << peerAddress
-            << " sourceWorkerId=" << handshakePtr->workerId
+            << " sourceWorkerId=" << handshake.workerId
             << " localWorkerId=" << communicator->getWorkerId()
             << " sameWorker=" << sameWorker
             << " canUseIntraNode=" << canUseIntraNode
@@ -84,7 +98,7 @@ void Acceptor::cStyleAMCallback(
   } else {
     VLOG(2) << "[UCX-ACCEPTOR-REMOTE] task=" << key.taskId
             << " destination=" << key.destination << " peer=" << peerAddress
-            << " sourceWorkerId=" << handshakePtr->workerId
+            << " sourceWorkerId=" << handshake.workerId
             << " localWorkerId=" << communicator->getWorkerId()
             << " sameWorker=" << sameWorker << " intraNodeEnabled="
             << cudf_velox::CudfConfig::getInstance().intraNodeExchange;

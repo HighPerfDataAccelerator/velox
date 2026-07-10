@@ -16,9 +16,10 @@
 
 #pragma once
 
+#include "velox/experimental/cudf/exec/CudfOperator.h"
+
 #include "velox/core/PlanNode.h"
 #include "velox/exec/Operator.h"
-#include "velox/experimental/cudf/exec/CudfOperator.h"
 
 namespace facebook::velox::cudf_velox {
 

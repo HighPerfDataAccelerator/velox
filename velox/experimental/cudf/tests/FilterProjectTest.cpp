@@ -1872,9 +1872,8 @@ TEST_F(CudfFilterProjectTest, substringWithIntegerBounds) {
   auto data = makeRowVector({input});
   auto substrPlan = PlanBuilder()
                         .values({data})
-                        .project({
-                            "substring(c0, cast(1 as integer), "
-                            "cast(2 as integer)) AS c0"})
+                        .project({"substring(c0, cast(1 as integer), "
+                                  "cast(2 as integer)) AS c0"})
                         .planNode();
   auto substrResults = AssertQueryBuilder(substrPlan).copyResults(pool());
 
@@ -2189,8 +2188,7 @@ TEST_F(CudfSimpleFilterProjectTest, castIntegralToVarchar) {
       evaluateOnce<std::string, int32_t>("cast(c0 as varchar)", 12345),
       "12345");
   EXPECT_EQ(
-      evaluateOnce<std::string, int64_t>(
-          "cast(c0 as varchar)", 9876543210LL),
+      evaluateOnce<std::string, int64_t>("cast(c0 as varchar)", 9876543210LL),
       "9876543210");
   EXPECT_EQ(
       evaluateOnce<std::string, int16_t>(
@@ -2208,8 +2206,7 @@ TEST_F(CudfSimpleFilterProjectTest, castIntegralToVarchar) {
 
 TEST_F(CudfSimpleFilterProjectTest, castFloatingPointToVarchar) {
   EXPECT_EQ(
-      evaluateOnce<std::string, double>("cast(c0 as varchar)", 12.5),
-      "12.5");
+      evaluateOnce<std::string, double>("cast(c0 as varchar)", 12.5), "12.5");
   EXPECT_EQ(
       evaluateOnce<std::string, float>(
           "try_cast(c0 as varchar)", static_cast<float>(-7.25)),

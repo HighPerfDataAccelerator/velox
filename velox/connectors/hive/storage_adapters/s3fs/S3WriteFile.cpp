@@ -23,6 +23,7 @@
 
 #include <aws/core/Aws.h>
 #include <aws/s3/S3Client.h>
+#include <aws/s3/model/AbortMultipartUploadRequest.h>
 #include <aws/s3/model/CompleteMultipartUploadRequest.h>
 #include <aws/s3/model/CompletedMultipartUpload.h>
 #include <aws/s3/model/CompletedPart.h>
@@ -190,6 +191,24 @@ class S3WriteFile::Impl {
     currentPart_->clear();
   }
 
+  void abort() {
+    if (closed()) {
+      return;
+    }
+    if (!uploadState_.id.empty()) {
+      Aws::S3::Model::AbortMultipartUploadRequest request;
+      request.SetBucket(awsString(bucket_));
+      request.SetKey(awsString(key_));
+      request.SetUploadId(uploadState_.id);
+      auto outcome = client_->AbortMultipartUpload(request);
+      currentPart_->clear();
+      VELOX_CHECK_AWS_OUTCOME(
+          outcome, "Failed to abort multiple part upload", bucket_, key_);
+      return;
+    }
+    currentPart_->clear();
+  }
+
   // Current file size, i.e. the sum of all previous appends.
   uint64_t size() const {
     return fileSize_;
@@ -294,6 +313,10 @@ void S3WriteFile::flush() {
 
 void S3WriteFile::close() {
   impl_->close();
+}
+
+void S3WriteFile::abort() {
+  impl_->abort();
 }
 
 uint64_t S3WriteFile::size() const {

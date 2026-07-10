@@ -57,7 +57,8 @@ std::vector<std::unique_ptr<GroupbyAggregator>> toGroupbyAggregators(
     core::AggregationNode const& aggregationNode,
     core::AggregationNode::Step step,
     TypePtr const& outputType,
-    std::vector<VectorPtr> const& constants);
+    std::vector<VectorPtr> const& constants,
+    std::optional<core::AggregationNode::Step> forcedStep = std::nullopt);
 
 // Groupby-specific validation
 bool canGroupbyBeEvaluatedByCudf(
@@ -117,6 +118,7 @@ class CudfGroupby : public CudfOperatorBase {
   std::vector<CudfExpressionPtr> precomputedInputEvaluators_;
 
   std::shared_ptr<const core::AggregationNode> aggregationNode_;
+  const core::PlanNodeId diagnosticNodeId_;
   std::vector<std::unique_ptr<GroupbyAggregator>> aggregators_;
   std::vector<std::unique_ptr<GroupbyAggregator>> intermediateAggregators_;
   // Used for kSingle streaming: partial-step aggregators (raw -> intermediate)
@@ -126,7 +128,8 @@ class CudfGroupby : public CudfOperatorBase {
 
   const bool isPartialOutput_;
   const bool isSingleStep_;
-  // Streaming aggregation is disabled if companion aggregates are present.
+  // Companion aggregate names encode the Spark plan step. Internal streaming
+  // compaction overrides that suffix with the intermediate step.
   bool streamingEnabled_{true};
   const int64_t maxPartialAggregationMemoryUsage_;
   int64_t numInputRows_ = 0;

@@ -109,8 +109,21 @@ ColumnOrView ASTExpression::eval(
         LOG(INFO) << cudf::ast::expression_to_string(cudfTree_.back());
         LOG(INFO) << cudf::table_schema_to_string(astInputTableView);
       }
-      return cudf::compute_column(
-          astInputTableView, cudfTree_.back(), stream, mr);
+      try {
+        return cudf::compute_column(
+            astInputTableView, cudfTree_.back(), stream, mr);
+      } catch (...) {
+        // cuDF's AST parser reports only a generic operand-type mismatch.
+        // Preserve the concrete AST and physical input schema at the point of
+        // failure so implicit Spark coercion bugs can be diagnosed without a
+        // second debug build.
+        LOG(ERROR) << "cuDF AST evaluation failed; Velox expression="
+                   << expr_->toString() << "; AST="
+                   << cudf::ast::expression_to_string(cudfTree_.back())
+                   << "; input schema="
+                   << cudf::table_schema_to_string(astInputTableView);
+        throw;
+      }
     }
   }();
   if (finalize) {
@@ -131,6 +144,9 @@ bool ASTExpression::canEvaluate(std::shared_ptr<velox::exec::Expr> expr) {
     }
     return false;
   }
+  // Non-AST children are precomputed by a cuDF expression evaluator and fed
+  // to the AST as temporary columns.  This is still a fully GPU path and is
+  // required for mixed trees such as DOUBLE * coalesce(DOUBLE, DOUBLE).
   return detail::isAstExprSupported(expr);
 }
 

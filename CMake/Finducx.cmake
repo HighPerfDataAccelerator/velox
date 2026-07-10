@@ -19,10 +19,7 @@ find_library(UCX_UCT_LIBRARY NAMES uct libuct)
 find_library(UCX_UCM_LIBRARY NAMES ucm libucm)
 
 include(FindPackageHandleStandardArgs)
-find_package_handle_standard_args(
-  ucx
-  REQUIRED_VARS UCX_INCLUDE_DIR UCX_UCP_LIBRARY UCX_UCS_LIBRARY
-)
+find_package_handle_standard_args(ucx REQUIRED_VARS UCX_INCLUDE_DIR UCX_UCP_LIBRARY UCX_UCS_LIBRARY)
 
 if(ucx_FOUND)
   foreach(component UCP UCS UCT UCM)

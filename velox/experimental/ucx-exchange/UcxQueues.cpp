@@ -15,11 +15,44 @@
  */
 #include "velox/experimental/ucx-exchange/UcxQueues.h"
 
+#include "velox/experimental/cudf/exec/GpuResources.h"
+
 #include <atomic>
 #include <limits>
 #include <sstream>
 
 namespace facebook::velox::ucx_exchange {
+
+namespace {
+std::atomic<int64_t> diagnosticGlobalQueuedBytes{0};
+std::atomic<int64_t> diagnosticGlobalQueuedColumns{0};
+std::atomic<int64_t> diagnosticGlobalQueueGiB{0};
+
+void updateDiagnosticGlobalQueue(
+    int64_t bytes,
+    int64_t columns,
+    const char* event,
+    const std::shared_ptr<exec::Task>& task) {
+  if (!cudf_velox::deviceMemoryDiagnosticsEnabled()) {
+    return;
+  }
+  const auto currentBytes =
+      diagnosticGlobalQueuedBytes.fetch_add(bytes, std::memory_order_relaxed) +
+      bytes;
+  const auto currentColumns = diagnosticGlobalQueuedColumns.fetch_add(
+                                  columns, std::memory_order_relaxed) +
+      columns;
+  const auto gib = currentBytes >> 30;
+  const auto previous =
+      diagnosticGlobalQueueGiB.exchange(gib, std::memory_order_relaxed);
+  if (gib != previous) {
+    LOG(WARNING) << "CUDF_DEVICE_QUEUE_GLOBAL event=" << event
+                 << " task=" << (task ? task->taskId() : "n/a")
+                 << " queuedBytes=" << currentBytes
+                 << " queuedPackedColumns=" << currentColumns;
+  }
+}
+} // namespace
 
 void UcxDestinationQueue::Stats::recordEnqueue(
     const cudf::packed_columns* data) {
@@ -118,16 +151,12 @@ UcxDestinationQueue::Data UcxDestinationQueue::getData(
   const auto resultSequence = sequence_;
   ++sequence_;
 
+  // The current rendezvous protocol does not use the legacy Presto
+  // remaining-bytes credit list (UcxExchangeServer sends an empty list in its
+  // MetadataMsg). Building it here is O(queue size) for every dequeued packet.
+  // A finely chunked shuffle can therefore allocate hundreds of MiB per
+  // packet and do O(N^2) work even though the list is immediately discarded.
   std::vector<int64_t> remainingBytes;
-  remainingBytes.reserve(queue_.size());
-  // fill in the remainingbytes vector.
-  for (std::size_t i = 0; i < queue_.size(); ++i) {
-    if (queue_[i] == nullptr) {
-      VELOX_CHECK_EQ(i, queue_.size() - 1, "null marker found in the middle");
-      break;
-    }
-    remainingBytes.push_back(queue_[i]->gpu_data->size());
-  }
   return {std::move(data), resultSequence, std::move(remainingBytes), true};
 }
 
@@ -714,6 +743,8 @@ void UcxOutputQueue::updateStatsWithEnqueuedLocked(
   totalBytesSent_ += bytes;
   totalRowsSent_ += rows;
   totalPackedColumnsSent_++;
+  updateDiagnosticGlobalQueue(bytes, 1, "enqueue", task_);
+  logDeviceQueueResidencyLocked("enqueue");
 }
 
 void UcxOutputQueue::updateStatsWithFreedLocked(
@@ -727,6 +758,8 @@ void UcxOutputQueue::updateStatsWithFreedLocked(
 
   VELOX_CHECK_GE(queuedBytes_, 0);
   VELOX_CHECK_GE(queuedPackedColumns_, 0);
+  updateDiagnosticGlobalQueue(-bytes, -numPackedCols, "dequeue", task_);
+  logDeviceQueueResidencyLocked("dequeue");
 
   // Check whether queue is below low-water mark and return outstanding
   // promises
@@ -737,6 +770,23 @@ void UcxOutputQueue::updateStatsWithFreedLocked(
             << " continueSize=" << continueSize_;
     promises = std::move(promises_);
   }
+}
+
+void UcxOutputQueue::logDeviceQueueResidencyLocked(const char* event) {
+  if (!cudf_velox::deviceMemoryDiagnosticsEnabled()) {
+    return;
+  }
+  constexpr int64_t kBucketBytes = 256LL << 20;
+  const auto bucket = queuedBytes_ / kBucketBytes;
+  if (bucket == diagnosticQueueBucket_) {
+    return;
+  }
+  diagnosticQueueBucket_ = bucket;
+  LOG(WARNING) << "CUDF_DEVICE_QUEUE event=" << event
+               << " task=" << (task_ ? task_->taskId() : "n/a")
+               << " queuedBytes=" << queuedBytes_
+               << " queuedPackedColumns=" << queuedPackedColumns_
+               << " maxSize=" << maxSize_ << " continueSize=" << continueSize_;
 }
 
 void UcxOutputQueue::updateTotalQueuedBytesMsLocked() {

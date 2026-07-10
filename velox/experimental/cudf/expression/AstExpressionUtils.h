@@ -298,8 +298,7 @@ bool isComparisonOp(const cudf::ast::ast_operator op) {
   }
 }
 
-bool isTopLevelFieldReference(
-    const std::shared_ptr<velox::exec::Expr>& expr) {
+bool isTopLevelFieldReference(const std::shared_ptr<velox::exec::Expr>& expr) {
   using velox::exec::FieldReference;
   auto fieldExpr = std::dynamic_pointer_cast<FieldReference>(expr);
   if (!fieldExpr || !fieldExpr->inputs().empty()) {
@@ -511,7 +510,8 @@ struct AstContext {
       size_t columnIndex,
       std::string const& instruction,
       std::string const& fieldName,
-      const std::shared_ptr<CudfExpression>& node = nullptr);
+      const std::shared_ptr<CudfExpression>& node = nullptr,
+      std::optional<cudf::data_type> expectedType = std::nullopt);
   cudf::ast::expression const& addPrecomputeInstruction(
       std::string const& name,
       std::string const& instruction,
@@ -576,13 +576,14 @@ cudf::ast::expression const& AstContext::addPrecomputeInstructionOnSide(
     size_t columnIndex,
     std::string const& instruction,
     std::string const& fieldName,
-    const std::shared_ptr<CudfExpression>& node) {
+    const std::shared_ptr<CudfExpression>& node,
+    std::optional<cudf::data_type> expectedType) {
   auto newColumnIndex = inputRowSchema[sideIdx].get()->size() +
       precomputeInstructions[sideIdx].get().size();
   if (fieldName.empty()) {
     // This custom op should be added to input columns.
     precomputeInstructions[sideIdx].get().emplace_back(
-        columnIndex, instruction, newColumnIndex, node);
+        columnIndex, instruction, newColumnIndex, node, expectedType);
   } else {
     auto nestedIndices = getNestedColumnIndices(
         inputRowSchema[sideIdx].get()->childAt(columnIndex), fieldName);
@@ -591,7 +592,8 @@ cudf::ast::expression const& AstContext::addPrecomputeInstructionOnSide(
         instruction,
         newColumnIndex,
         std::move(nestedIndices),
-        node);
+        node,
+        expectedType);
   }
   auto side = static_cast<cudf::ast::table_reference>(sideIdx);
   return tree.push(cudf::ast::column_reference(newColumnIndex, side));
@@ -714,7 +716,8 @@ cudf::ast::expression const& AstContext::pushExprToTree(
         sideIdx = 0; // Default to left side if no fields found
       }
       auto node = createCudfExpression(expr, inputRowSchema[sideIdx]);
-      return addPrecomputeInstructionOnSide(sideIdx, 0, name, "", node);
+      return addPrecomputeInstructionOnSide(
+          sideIdx, 0, name, "", node, veloxToCudfDataType(expr->type()));
     }
     VELOX_FAIL("Unsupported expression: {}", name);
   }
@@ -766,8 +769,72 @@ cudf::ast::expression const& AstContext::pushExprToTree(
       auto const& op2 = pushTimestampFieldReferenceToTree(rightField);
       return tree.push(Operation{binaryOps.at(name), op1, op2});
     }
-    auto const& op1 = pushExprToTree(expr->inputs()[0]);
-    auto const& op2 = pushExprToTree(expr->inputs()[1]);
+    // libcudf's AST parser cannot currently type a NULL_EQUAL operand that is
+    // itself an AST operation (e.g. (string_col = 'x') <=> true), even though
+    // that child resolves to BOOL8. Materialize such children as temporary
+    // cuDF columns. This preserves Spark null-safe semantics and remains an
+    // entirely GPU execution path.
+    auto pushNullEqualOperand =
+        [&](const std::shared_ptr<velox::exec::Expr>& input)
+        -> const cudf::ast::expression& {
+      if (binaryOps.at(name) != Op::NULL_EQUAL ||
+          std::dynamic_pointer_cast<FieldReference>(input) ||
+          std::dynamic_pointer_cast<ConstantExpr>(input)) {
+        return pushExprToTree(input);
+      }
+      int sideIdx = findExpressionSide(input);
+      VELOX_CHECK_NE(
+          sideIdx,
+          -2,
+          "NULL_EQUAL child spanning both join sides cannot be precomputed");
+      if (sideIdx < 0) {
+        sideIdx = 0;
+      }
+      auto node = createCudfExpression(input, inputRowSchema[sideIdx]);
+      return addPrecomputeInstructionOnSide(
+          sideIdx,
+          0,
+          "null_equal_child",
+          "",
+          node,
+          veloxToCudfDataType(input->type()));
+    };
+    auto const& op1 = pushNullEqualOperand(expr->inputs()[0]);
+    auto const& op2 = pushNullEqualOperand(expr->inputs()[1]);
+    // libcudf's type inference accepts some mixed numeric signatures, but the
+    // AST parser requires the two operands of arithmetic operations to have
+    // identical physical types. Spark/Velox performs numeric coercion while
+    // resolving the expression (for example DOUBLE / INTEGER -> DOUBLE) and
+    // does not always leave an explicit CastExpr in the converted plan. Mirror
+    // that resolved type in the AST rather than presenting libcudf with the
+    // original mixed operands.
+    const bool isArithmetic = name == "add" || name == "plus" ||
+        name == "subtract" || name == "minus" || name == "multiply" ||
+        name == "divide" || name == "mod";
+    if (isArithmetic) {
+      auto const targetKind = expr->type()->kind();
+      auto castOperand =
+          [&](const cudf::ast::expression& operand,
+              TypeKind inputKind) -> const cudf::ast::expression& {
+        if (inputKind == targetKind) {
+          return operand;
+        }
+        if (targetKind == TypeKind::DOUBLE) {
+          return tree.push(Operation{Op::CAST_TO_FLOAT64, operand});
+        }
+        if (targetKind == TypeKind::BIGINT) {
+          return tree.push(Operation{Op::CAST_TO_INT64, operand});
+        }
+        // INTEGER arithmetic should already have matching INT32 operands;
+        // cuDF AST has no CAST_TO_INT32 operator.
+        return operand;
+      };
+      auto const& coerced1 =
+          castOperand(op1, expr->inputs()[0]->type()->kind());
+      auto const& coerced2 =
+          castOperand(op2, expr->inputs()[1]->type()->kind());
+      return tree.push(Operation{binaryOps.at(name), coerced1, coerced2});
+    }
     return tree.push(Operation{binaryOps.at(name), op1, op2});
   } else if (unaryOps.find(name) != unaryOps.end()) {
     VELOX_CHECK_EQ(len, 1);
@@ -880,13 +947,24 @@ std::vector<ColumnOrView> precomputeSubexpressions(
   std::vector<ColumnOrView> precomputedColumns;
   precomputedColumns.reserve(precomputeInstructions.size());
 
+  auto appendPrecomputed = [&](ColumnOrView result,
+                                   const std::optional<cudf::data_type>&
+                                       expectedType) {
+    if (expectedType && asView(result).type() != *expectedType) {
+      result =
+          cudf::cast(asView(result), *expectedType, stream, get_output_mr());
+    }
+    precomputedColumns.push_back(std::move(result));
+  };
+
   for (const auto& instruction : precomputeInstructions) {
     auto
         [dependent_column_index,
          ins_name,
          new_column_index,
          nested_dependent_column_indices,
-         cudf_expression] = instruction;
+         cudf_expression,
+         expected_type] = instruction;
 
     // If a compiled cudf node is available, evaluate it directly.
     if (cudf_expression) {
@@ -895,7 +973,7 @@ std::vector<ColumnOrView> precomputeSubexpressions(
           stream,
           get_output_mr(),
           /*finalize=*/true);
-      precomputedColumns.push_back(std::move(result));
+      appendPrecomputed(std::move(result), expected_type);
       continue;
     }
     if (ins_name.rfind("fill", 0) == 0) {
@@ -906,21 +984,22 @@ std::vector<ColumnOrView> precomputeSubexpressions(
           inputColumnViews[dependent_column_index].size(),
           stream,
           get_output_mr());
-      precomputedColumns.push_back(std::move(newColumn));
+      appendPrecomputed(std::move(newColumn), expected_type);
     } else if (ins_name == "nested_column") {
       // Nested column already exists in input. Don't materialize.
       auto view = inputColumnViews[dependent_column_index].child(
           nested_dependent_column_indices[0]);
-      precomputedColumns.push_back(view);
+      appendPrecomputed(view, expected_type);
     } else if (ins_name == kTimestampCastInstruction) {
       auto targetType =
           cudf::data_type{CudfConfig::getInstance().timestampUnit};
       auto view = inputColumnViews[dependent_column_index];
       if (view.type() == targetType) {
-        precomputedColumns.push_back(view);
+        appendPrecomputed(view, expected_type);
       } else {
-        precomputedColumns.push_back(
-            cudf::cast(view, targetType, stream, get_output_mr()));
+        appendPrecomputed(
+            cudf::cast(view, targetType, stream, get_output_mr()),
+            expected_type);
       }
     } else {
       VELOX_FAIL("Unsupported precompute operation {}", ins_name);

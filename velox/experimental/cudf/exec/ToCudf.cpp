@@ -86,7 +86,9 @@ RowTypePtr gpuInputBoundaryType(
     const core::PlanNodePtr& planNode) {
   if (dynamic_cast<const exec::HashBuild*>(op) != nullptr) {
     VELOX_CHECK_GT(
-        planNode->sources().size(), 1, "HashBuild requires a build-side source");
+        planNode->sources().size(),
+        1,
+        "HashBuild requires a build-side source");
     return planNode->sources()[1]->outputType();
   }
 
@@ -109,7 +111,8 @@ RowTypePtr gpuInputBoundaryType(
     return topNRowNumber->inputType();
   }
 
-  if (auto window = std::dynamic_pointer_cast<const core::WindowNode>(planNode)) {
+  if (auto window =
+          std::dynamic_pointer_cast<const core::WindowNode>(planNode)) {
     return window->inputType();
   }
 
@@ -274,9 +277,17 @@ bool CompileState::compile(bool allowCpuFallback) {
 
     if (thisOpProps.producesGpuOutput and
         (nextOperatorIsNotGpu or isLastOperatorOfTask) and planNode) {
-      replaceOp.push_back(
-          std::make_unique<CudfToVelox>(
-              id, planNode->outputType(), ctx, planNode->id() + "-to-velox"));
+      const bool keepDeviceOutput = isLastOperatorOfTask &&
+          ctx->queryConfig().get<bool>(
+              CudfConfig::kCudfSkipOutputToVelox, false);
+      if (!keepDeviceOutput) {
+        replaceOp.push_back(
+            std::make_unique<CudfToVelox>(
+                id,
+                planNode->outputType(),
+                ctx,
+                planNode->id() + "-to-velox"));
+      }
     }
 
     if (isPureCpuOperator && isMppFinalOutputBoundary(oper, planNode)) {
@@ -407,13 +418,27 @@ void registerCudf() {
   const std::string mrMode = CudfConfig::getInstance().memoryResource;
   auto mr = cudf_velox::createMemoryResource(
       mrMode, CudfConfig::getInstance().memoryPercent);
-  cudf::set_current_device_resource(mr);
-  mr_ = std::move(mr);
+  if (deviceMemoryDiagnosticsEnabled()) {
+    statistics_mr_.emplace(std::move(mr));
+    mr_ = cuda::mr::any_resource<cuda::mr::device_accessible>{
+        statistics_mr_.value()};
+    LOG(INFO) << "Enabled cuDF RMM statistics for device-memory diagnostics";
+  } else {
+    mr_ = std::move(mr);
+  }
+  cudf::set_current_device_resource(mr_.value());
 
   const auto& outputMrMode = CudfConfig::getInstance().outputMemoryResource;
   if (!outputMrMode.empty() && outputMrMode != mrMode) {
-    output_mr_ = cudf_velox::createMemoryResource(
+    auto outputMr = cudf_velox::createMemoryResource(
         outputMrMode, CudfConfig::getInstance().memoryPercent);
+    if (deviceMemoryDiagnosticsEnabled()) {
+      output_statistics_mr_.emplace(std::move(outputMr));
+      output_mr_ = cuda::mr::any_resource<cuda::mr::device_accessible>{
+          output_statistics_mr_.value()};
+    } else {
+      output_mr_ = std::move(outputMr);
+    }
   } else {
     output_mr_ = mr_;
   }
@@ -440,6 +465,8 @@ void registerCudf() {
 void unregisterCudf() {
   output_mr_.reset();
   mr_.reset();
+  output_statistics_mr_.reset();
+  statistics_mr_.reset();
   exec::DriverFactory::adapters.erase(
       std::remove_if(
           exec::DriverFactory::adapters.begin(),

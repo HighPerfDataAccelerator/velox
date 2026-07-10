@@ -18,18 +18,40 @@
 
 #include <cudf/detail/utilities/stream_pool.hpp>
 
+#include <rmm/mr/statistics_resource_adaptor.hpp>
 #include <rmm/resource_ref.hpp>
 
 #include <cuda/memory_resource>
 
+#include <cstddef>
+#include <cstdint>
 #include <optional>
+#include <string>
 #include <string_view>
 
 namespace facebook::velox::cudf_velox {
 
+struct DeviceMemorySnapshot {
+  bool enabled{false};
+  bool cudaValid{false};
+  int device{-1};
+  std::size_t freeBytes{0};
+  std::size_t totalBytes{0};
+  std::size_t usedBytes{0};
+  int64_t rmmCurrentBytes{0};
+  int64_t rmmPeakBytes{0};
+  int64_t rmmTotalBytes{0};
+  int64_t rmmCurrentAllocations{0};
+  int64_t rmmPeakAllocations{0};
+  int64_t rmmTotalAllocations{0};
+};
+
 extern std::optional<cuda::mr::any_resource<cuda::mr::device_accessible>> mr_;
 extern std::optional<cuda::mr::any_resource<cuda::mr::device_accessible>>
     output_mr_;
+extern std::optional<rmm::mr::statistics_resource_adaptor> statistics_mr_;
+extern std::optional<rmm::mr::statistics_resource_adaptor>
+    output_statistics_mr_;
 
 /// Returns the memory resource designated for output vector allocations.
 rmm::device_async_resource_ref get_output_mr();
@@ -48,5 +70,41 @@ createMemoryResource(std::string_view mode, int percent);
  * @brief Returns the global CUDA stream pool used by cudf.
  */
 [[nodiscard]] cudf::detail::cuda_stream_pool& cudfGlobalStreamPool();
+
+/// Enables low-overhead RMM statistics and operator-level CUDA memory
+/// diagnostics when GLUTEN_CUDF_DEVICE_MEMORY_DIAGNOSTICS is set to a true
+/// value in the executor environment.
+[[nodiscard]] bool deviceMemoryDiagnosticsEnabled();
+
+/// Captures both CUDA device-wide usage and allocations made through the
+/// cuDF RMM resource. Unlike cudaMemGetInfo-only diagnostics, the snapshot
+/// always includes the current CUDA device id.
+[[nodiscard]] DeviceMemorySnapshot captureDeviceMemorySnapshot();
+
+/// Emits a structured CUDF_DEVICE_MEMORY log record for later correlation
+/// with the operator node and method that triggered the sample.
+void logDeviceMemorySnapshot(
+    const std::string& label,
+    const DeviceMemorySnapshot& snapshot);
+
+inline void logDeviceMemorySnapshot(const std::string& label) {
+  if (deviceMemoryDiagnosticsEnabled()) {
+    logDeviceMemorySnapshot(label, captureDeviceMemorySnapshot());
+  }
+}
+
+/// Associates CUDA allocations on the current thread with a native operator
+/// when the optional LD_PRELOAD diagnostic tracer is present.
+class CudaAllocationTraceScope {
+ public:
+  explicit CudaAllocationTraceScope(const std::string& label);
+  ~CudaAllocationTraceScope();
+
+  CudaAllocationTraceScope(const CudaAllocationTraceScope&) = delete;
+  CudaAllocationTraceScope& operator=(const CudaAllocationTraceScope&) = delete;
+
+ private:
+  bool active_{false};
+};
 
 } // namespace facebook::velox::cudf_velox

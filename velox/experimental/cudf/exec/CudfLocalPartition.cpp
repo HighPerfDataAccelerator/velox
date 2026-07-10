@@ -171,8 +171,11 @@ void CudfLocalPartition::enqueuePartition(
   }
 
   ContinueFuture future;
-  auto blockingReason =
-      queues_[partitionIndex]->enqueue(cudfVector, cudfVector->size(), &future);
+  // LocalExchangeMemoryManager accounts bytes, not rows.  Passing size()
+  // under-counts a GPU batch by orders of magnitude and effectively disables
+  // the existing local-exchange backpressure.
+  auto blockingReason = queues_[partitionIndex]->enqueue(
+      cudfVector, cudfVector->estimateFlatSize(), &future);
   if (blockingReason != exec::BlockingReason::kNotBlocked) {
     blockingReasons_.push_back(blockingReason);
     futures_.push_back(std::move(future));
@@ -256,8 +259,11 @@ void CudfLocalPartition::doAddInput(RowVectorPtr input) {
   } else {
     // Single partition case.
     ContinueFuture future;
+    // CudfVector's retainedSize() does not represent the device table payload.
+    // Use the same flat-byte estimate reported by operator statistics so the
+    // LocalExchangeMemoryManager's byte high-water mark can engage.
     auto blockingReason =
-        queues_[0]->enqueue(input, input->retainedSize(), &future);
+        queues_[0]->enqueue(input, input->estimateFlatSize(), &future);
     if (blockingReason != exec::BlockingReason::kNotBlocked) {
       blockingReasons_.push_back(blockingReason);
       futures_.push_back(std::move(future));

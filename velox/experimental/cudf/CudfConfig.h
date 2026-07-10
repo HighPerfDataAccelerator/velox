@@ -54,6 +54,8 @@ struct CudfConfig {
   static constexpr const char* kCudfFunctionEngine{"cudf.function_engine"};
   /// Query session configs for the cuDF Operators.
   static constexpr const char* kCudfTopNBatchSize{"cudf.topk_batch_size"};
+  static constexpr const char* kCudfSkipOutputToVelox{
+      "velox.cudf.skip_output_to_velox"};
 
   static constexpr const char* kUcxExchange{"cudf.exchange"};
   static constexpr const char* kUcxxErrorHandling{"ucxx.error_handling"};

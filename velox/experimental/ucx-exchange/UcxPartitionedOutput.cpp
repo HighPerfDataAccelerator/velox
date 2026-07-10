@@ -21,6 +21,7 @@
 #include "velox/core/QueryConfig.h"
 #include "velox/exec/Driver.h"
 #include "velox/exec/Operator.h"
+#include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
@@ -34,22 +35,51 @@ using namespace facebook::velox::cudf_velox;
 using facebook::velox::exec::Task;
 namespace facebook::velox::ucx_exchange {
 
+namespace {
+int64_t targetRowsPerUcxChunk(const core::QueryConfig& queryConfig) {
+  if (const char* value =
+          std::getenv("GLUTEN_UCX_PARTITIONED_OUTPUT_BATCH_ROWS")) {
+    try {
+      const auto parsed = static_cast<int64_t>(std::stoll(value));
+      if (parsed > 0) {
+        return parsed;
+      }
+    } catch (...) {
+    }
+  }
+  return queryConfig.ucxPartitionedOutputBatchRows();
+}
+} // namespace
+
 // Computes a mapping from names in n2 to names in n1
 // and returns that mapping in remap.
 // Names in n2 must occurs in n1.
 static void getRemapping(
-    const std::vector<std::string>& n1,
-    const std::vector<std::string>& n2,
+    const RowTypePtr& inputType,
+    const RowTypePtr& outputType,
     std::vector<uint32_t>& remap) {
-  std::unordered_map<std::string, uint32_t> lookup;
-  for (uint32_t i = 0; i < n1.size(); ++i) {
-    lookup[n1[i]] = i;
-  }
-
   remap.clear();
-  remap.reserve(n2.size());
-  for (const auto& key : n2) {
-    remap.push_back(lookup.at(key));
+  remap.reserve(outputType->size());
+  std::unordered_map<std::string, size_t> nextOccurrence;
+  for (uint32_t out = 0; out < outputType->size(); ++out) {
+    const auto& name = outputType->nameOf(out);
+    std::vector<uint32_t> matches;
+    for (uint32_t in = 0; in < inputType->size(); ++in) {
+      if (inputType->nameOf(in) == name &&
+          inputType->childAt(in)->equivalent(*outputType->childAt(out))) {
+        matches.push_back(in);
+      }
+    }
+    VELOX_CHECK(
+        !matches.empty(),
+        "UCX output field {}:{} has no name-and-type match in input {}",
+        name,
+        outputType->childAt(out)->toString(),
+        inputType->toString());
+    auto& occurrence = nextOccurrence[name];
+    const auto selected = matches[std::min(occurrence, matches.size() - 1)];
+    ++occurrence;
+    remap.push_back(selected);
   }
 }
 
@@ -72,7 +102,7 @@ UcxPartitionedOutput::UcxPartitionedOutput(
       numPartitions_(planNode->numPartitions()),
       pipelineId_(ctx->pipelineId),
       driverId_(ctx->driverId),
-      targetRowsPerChunk_(ctx->queryConfig().ucxPartitionedOutputBatchRows()) {
+      targetRowsPerChunk_(targetRowsPerUcxChunk(ctx->queryConfig())) {
   if (driverId_ == 0) {
     const auto numDrivers = ctx->task->numOutputDrivers();
     sharedQueueManager()->initializeTask(
@@ -98,11 +128,13 @@ UcxPartitionedOutput::UcxPartitionedOutput(
     outNames.push_back(planNode->outputType()->nameOf(i));
   }
   if (inNames != outNames) {
-    getRemapping(inNames, outNames, remap_);
+    getRemapping(planNode->inputType(), planNode->outputType(), remap_);
   }
 }
 
 void UcxPartitionedOutput::addInput(RowVectorPtr input) {
+  CudaAllocationTraceScope allocationTrace(
+      fmt::format("UcxPartitionedOutput task={} method=addInput", taskId()));
   VLOG(3) << "@" << taskId() << "#" << pipelineId_ << "/" << driverId_
           << " addInput";
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
@@ -127,6 +159,9 @@ void UcxPartitionedOutput::addInput(RowVectorPtr input) {
 }
 
 void UcxPartitionedOutput::flushPending() {
+  CudaAllocationTraceScope allocationTrace(
+      fmt::format(
+          "UcxPartitionedOutput task={} method=flushPending", taskId()));
   if (pendingInputs_.empty()) {
     return;
   }
@@ -180,14 +215,34 @@ void UcxPartitionedOutput::flushPending() {
         equalPartition(tableView, stream);
       }
     } else {
-      auto packedCols = cudf::pack(
-          tableView, stream, cudf::get_current_device_resource_ref());
       const auto tableRows = tableView.num_rows();
-      stream.synchronize();
-      auto packedColsPtr = std::make_unique<cudf::packed_columns>(
-          std::move(packedCols.metadata), std::move(packedCols.gpu_data));
-      queueManager->enqueue(
-          this->taskId(), 0, std::move(packedColsPtr), tableRows);
+      const auto rowsPerChunk = std::max<cudf::size_type>(
+          1,
+          targetRowsPerChunk_ > 0
+              ? std::min<cudf::size_type>(
+                    tableRows,
+                    static_cast<cudf::size_type>(targetRowsPerChunk_))
+              : tableRows);
+      // SINGLE/gather exchanges must obey the same chunk bound as HASH and
+      // RANGE.  Packing the whole input here bypassed splitAndEnqueue and let
+      // a global sort/gather create tens-of-GiB host-staging transfers.
+      for (cudf::size_type start = 0; start < tableRows;
+           start += rowsPerChunk) {
+        const auto end =
+            std::min<cudf::size_type>(tableRows, start + rowsPerChunk);
+        auto slicedTables = cudf::slice(tableView, {start, end});
+        VELOX_CHECK_EQ(slicedTables.size(), 1);
+        auto packedCols = cudf::pack(
+            slicedTables[0], stream, cudf::get_current_device_resource_ref());
+        stream.synchronize();
+        auto packedColsPtr = std::make_unique<cudf::packed_columns>(
+            std::move(packedCols.metadata), std::move(packedCols.gpu_data));
+        queueManager->enqueue(
+            this->taskId(),
+            0,
+            std::move(packedColsPtr),
+            slicedTables[0].num_rows());
+      }
     }
 
     // Check backpressure after enqueue.

@@ -17,6 +17,7 @@
 
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/DebugUtil.h"
+#include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/NvtxHelper.h"
 
 #include "velox/common/base/SpillConfig.h"
@@ -123,35 +124,91 @@ class CudfOperatorBase : public exec::Operator, public NvtxHelper {
             spillConfig),
         NvtxHelper(color, operatorId, fmt::format("[{}]", planNodeId)),
         className_(operatorName),
+        planNodeId_(planNodeId),
+        operatorId_(operatorId),
         nvtxMethods_(nvtxMethods) {}
 
   void addInput(RowVectorPtr input) final {
     VELOX_NVTX_OPERATOR_FUNC_RANGE_IF(
         nvtxMethods_ & NvtxMethodFlag::kAddInput, className_);
-    doAddInput(std::move(input));
-    checkCudaErrorInDebug();
+    CudaAllocationTraceScope allocationTrace(
+        fmt::format("{} node={} method=addInput", className_, planNodeId_));
+    const auto inputRows = input == nullptr ? 0 : input->size();
+    const auto sample = shouldSampleDeviceMemory(false);
+    if (sample) {
+      logDeviceMemory("addInput", "before", inputRows, -1);
+    }
+    try {
+      doAddInput(std::move(input));
+      checkCudaErrorInDebug();
+      if (sample) {
+        logDeviceMemory("addInput", "after", inputRows, -1);
+      }
+    } catch (...) {
+      logDeviceMemory("addInput", "error", inputRows, -1);
+      throw;
+    }
   }
 
   RowVectorPtr getOutput() final {
     VELOX_NVTX_OPERATOR_FUNC_RANGE_IF(
         nvtxMethods_ & NvtxMethodFlag::kGetOutput, className_);
-    auto result = doGetOutput();
-    checkCudaErrorInDebug();
-    return result;
+    CudaAllocationTraceScope allocationTrace(
+        fmt::format("{} node={} method=getOutput", className_, planNodeId_));
+    const auto sample = shouldSampleDeviceMemory(false);
+    if (sample) {
+      logDeviceMemory("getOutput", "before", -1, -1);
+    }
+    try {
+      auto result = doGetOutput();
+      checkCudaErrorInDebug();
+      if (sample) {
+        logDeviceMemory(
+            "getOutput", "after", -1, result == nullptr ? 0 : result->size());
+      }
+      return result;
+    } catch (...) {
+      logDeviceMemory("getOutput", "error", -1, -1);
+      throw;
+    }
   }
 
   void noMoreInput() final {
     VELOX_NVTX_OPERATOR_FUNC_RANGE_IF(
         nvtxMethods_ & NvtxMethodFlag::kNoMoreInput, className_);
-    doNoMoreInput();
-    checkCudaErrorInDebug();
+    const auto sample = shouldSampleDeviceMemory(true);
+    if (sample) {
+      logDeviceMemory("noMoreInput", "before", -1, -1);
+    }
+    try {
+      doNoMoreInput();
+      checkCudaErrorInDebug();
+      if (sample) {
+        logDeviceMemory("noMoreInput", "after", -1, -1);
+      }
+    } catch (...) {
+      logDeviceMemory("noMoreInput", "error", -1, -1);
+      throw;
+    }
   }
 
   void close() final {
     VELOX_NVTX_OPERATOR_FUNC_RANGE_IF(
         nvtxMethods_ & NvtxMethodFlag::kClose, className_);
-    doClose();
-    checkCudaErrorInDebug();
+    const auto sample = shouldSampleDeviceMemory(true);
+    if (sample) {
+      logDeviceMemory("close", "before", -1, -1);
+    }
+    try {
+      doClose();
+      checkCudaErrorInDebug();
+      if (sample) {
+        logDeviceMemory("close", "after", -1, -1);
+      }
+    } catch (...) {
+      logDeviceMemory("close", "error", -1, -1);
+      throw;
+    }
   }
 
  protected:
@@ -168,8 +225,42 @@ class CudfOperatorBase : public exec::Operator, public NvtxHelper {
   }
 
  private:
+  bool shouldSampleDeviceMemory(bool force) {
+    if (!deviceMemoryDiagnosticsEnabled()) {
+      return false;
+    }
+    ++deviceMemoryCallCount_;
+    return force || deviceMemoryCallCount_ == 1 ||
+        deviceMemoryCallCount_ % 64 == 0;
+  }
+
+  void logDeviceMemory(
+      const char* method,
+      const char* phase,
+      int64_t inputRows,
+      int64_t outputRows) const {
+    if (!deviceMemoryDiagnosticsEnabled()) {
+      return;
+    }
+    logDeviceMemorySnapshot(
+        fmt::format(
+            "operator={} node={} operatorId={} method={} phase={} inputRows={} "
+            "outputRows={} call={}",
+            className_,
+            planNodeId_,
+            operatorId_,
+            method,
+            phase,
+            inputRows,
+            outputRows,
+            deviceMemoryCallCount_));
+  }
+
   const std::string className_;
+  const core::PlanNodeId planNodeId_;
+  const int32_t operatorId_;
   const NvtxMethodFlag nvtxMethods_;
+  uint64_t deviceMemoryCallCount_{0};
 };
 
 } // namespace facebook::velox::cudf_velox

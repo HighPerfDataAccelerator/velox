@@ -68,6 +68,9 @@ class S3WriteFile : public WriteFile {
   /// Close the file. Any cleanup (disk flush, etc.) will be done here.
   void close() override;
 
+  /// Discard buffered data and cancel an in-progress multipart upload.
+  void abort();
+
   /// Current file size, i.e. the sum of all previous Appends.
   uint64_t size() const override;
 

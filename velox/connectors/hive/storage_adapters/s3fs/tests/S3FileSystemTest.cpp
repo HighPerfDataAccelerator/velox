@@ -321,6 +321,31 @@ TEST_F(S3FileSystemTest, writeFileAndRead) {
   ASSERT_TRUE(s3fs.exists(s3File));
 }
 
+TEST_F(S3FileSystemTest, abortWrite) {
+  const auto bucketName = "abortwrite";
+  addBucket(bucketName);
+  auto hiveConfig = minioServer_->hiveConfig();
+  filesystems::S3FileSystem s3fs(bucketName, hiveConfig);
+  auto pool = memory::memoryManager()->addLeafPool("S3AbortWriteTest");
+
+  for (const auto& [file, size] :
+       std::vector<std::pair<std::string, size_t>>{
+           {"small.parquet", 1024}, {"multipart.parquet", 11 << 20}}) {
+    const auto s3File = s3URI(bucketName, file);
+    auto writeFile =
+        s3fs.openFileForWrite(s3File, {{}, pool.get(), std::nullopt});
+    auto* s3WriteFile =
+        dynamic_cast<filesystems::S3WriteFile*>(writeFile.get());
+    ASSERT_NE(s3WriteFile, nullptr);
+    std::string data(size, 'x');
+    writeFile->append(data);
+    s3WriteFile->abort();
+
+    ASSERT_FALSE(s3fs.exists(s3File));
+    VELOX_ASSERT_THROW(writeFile->append("x"), "File is closed");
+  }
+}
+
 TEST_F(S3FileSystemTest, invalidConnectionSettings) {
   auto hiveConfig =
       minioServer_->hiveConfig({{"hive.s3.connect-timeout", "400"}});

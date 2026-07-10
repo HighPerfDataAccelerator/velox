@@ -50,8 +50,8 @@ TEST(IntraNodeTransferRegistryTest, registerWaiterWokenByPublish) {
   EXPECT_FALSE(result->atEnd);
 }
 
-// A waiter registered after the data is already published returns true (re-poll,
-// no dormancy) and does not leave a stale wakeup behind.
+// A waiter registered after the data is already published returns true
+// (re-poll, no dormancy) and does not leave a stale wakeup behind.
 TEST(IntraNodeTransferRegistryTest, registerWaiterReadyReturnsTrue) {
   auto registry = IntraNodeTransferRegistry::getInstance();
   const auto key = makeKey("registerWaiterReadyReturnsTrue");
@@ -69,8 +69,8 @@ TEST(IntraNodeTransferRegistryTest, registerWaiterReadyReturnsTrue) {
   EXPECT_TRUE(result->atEnd);
 }
 
-// cancelTask wakes a dormant waiter so it re-polls and observes the atEnd result
-// instead of waiting forever for a producer that will never publish.
+// cancelTask wakes a dormant waiter so it re-polls and observes the atEnd
+// result instead of waiting forever for a producer that will never publish.
 TEST(IntraNodeTransferRegistryTest, registerWaiterWokenByCancel) {
   auto registry = IntraNodeTransferRegistry::getInstance();
   const std::string taskId = "registerWaiterWokenByCancel";

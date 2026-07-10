@@ -650,9 +650,9 @@ TEST_F(CudfFilterProjectTest, fromJsonRowOfStringFields) {
   });
   auto data = makeRowVector({input});
 
-  auto outputType = ROW(
-      {"id", "name", "reason", "field-name", "payload"},
-      {VARCHAR(), VARCHAR(), VARCHAR(), VARCHAR(), VARCHAR()});
+  auto outputType =
+      ROW({"id", "name", "reason", "field-name", "payload"},
+          {VARCHAR(), VARCHAR(), VARCHAR(), VARCHAR(), VARCHAR()});
   auto expression = std::make_shared<const core::CallTypedExpr>(
       outputType,
       std::vector<core::TypedExprPtr>{
@@ -672,9 +672,9 @@ TEST_F(CudfFilterProjectTest, fromJsonNestedRow) {
   });
   auto data = makeRowVector({input});
 
-  auto outputType = ROW(
-      {"ok", "count", "score", "name", "items"},
-      {BOOLEAN(), BIGINT(), DOUBLE(), VARCHAR(), ARRAY(BIGINT())});
+  auto outputType =
+      ROW({"ok", "count", "score", "name", "items"},
+          {BOOLEAN(), BIGINT(), DOUBLE(), VARCHAR(), ARRAY(BIGINT())});
   auto expression = std::make_shared<const core::CallTypedExpr>(
       outputType,
       std::vector<core::TypedExprPtr>{
@@ -694,9 +694,9 @@ TEST_F(CudfFilterProjectTest, fromJsonArrayOfRows) {
   });
   auto data = makeRowVector({input});
 
-  auto rowType = ROW(
-      {"bgstart", "category", "clienttime", "errorcode", "errormsg"},
-      {BOOLEAN(), VARCHAR(), BIGINT(), VARCHAR(), VARCHAR()});
+  auto rowType =
+      ROW({"bgstart", "category", "clienttime", "errorcode", "errormsg"},
+          {BOOLEAN(), VARCHAR(), BIGINT(), VARCHAR(), VARCHAR()});
   auto expression = std::make_shared<const core::CallTypedExpr>(
       ARRAY(rowType),
       std::vector<core::TypedExprPtr>{

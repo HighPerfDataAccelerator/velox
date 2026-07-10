@@ -126,8 +126,9 @@ class IntraNodeTransferRegistry {
   /// @param wake Callback fired once when data becomes available or the task is
   ///        cancelled; must be safe to call from the Communicator thread.
   /// @return true if data is ALREADY available (or the task is cancelled) — the
-  ///         caller should re-poll instead of going dormant; false if registered
-  ///         (the caller should go dormant and will be woken via @p wake).
+  ///         caller should re-poll instead of going dormant; false if
+  ///         registered (the caller should go dormant and will be woken via @p
+  ///         wake).
   [[nodiscard]] bool registerWaiter(
       const IntraNodeTransferKey& key,
       std::function<void()> wake);

@@ -22,7 +22,10 @@
 #include "velox/exec/Operator.h"
 #include "velox/vector/ComplexVector.h"
 
+#include <cudf/io/parquet.hpp>
 #include <cudf/types.hpp>
+
+#include <string>
 
 namespace facebook::velox::cudf_velox {
 
@@ -34,7 +37,7 @@ class CudfOrderBy : public CudfOperatorBase {
       const std::shared_ptr<const core::OrderByNode>& orderByNode);
 
   bool needsInput() const override {
-    return !finished_;
+    return !noMoreInput_;
   }
 
   exec::BlockingReason isBlocked(ContinueFuture* /*future*/) override {
@@ -52,12 +55,31 @@ class CudfOrderBy : public CudfOperatorBase {
   void doClose() override;
 
  private:
+  void spillSortedRun();
+  void initializeSortedRunReaders();
+  std::unique_ptr<cudf::table> mergeNextSortedBatch(
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr);
+  void cleanupSpillFiles();
+
   CudfVectorPtr outputTable_;
   std::shared_ptr<const core::OrderByNode> orderByNode_;
   std::vector<CudfVectorPtr> inputs_;
   std::vector<cudf::size_type> sortKeys_;
   std::vector<cudf::order> columnOrder_;
   std::vector<cudf::null_order> nullOrder_;
+  uint64_t bufferedBytes_{0};
+  struct SortedRun {
+    std::string path;
+    std::unique_ptr<cudf::io::chunked_parquet_reader> reader;
+  };
+  std::vector<SortedRun> sortedRuns_;
+  std::string spillDirectory_;
+  uint64_t spillFileSequence_{0};
+  std::unique_ptr<cudf::table> mergeCarry_;
+  bool readersInitialized_{false};
+  bool mergeFinished_{false};
+  bool spilled_{false};
   bool finished_{false};
 };
 

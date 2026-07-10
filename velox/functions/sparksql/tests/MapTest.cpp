@@ -20,8 +20,8 @@
 #include "velox/functions/sparksql/tests/SparkFunctionBaseTest.h"
 #include "velox/type/Variant.h"
 
-#include <map>
 #include <stdint.h>
+#include <map>
 #include <sstream>
 
 namespace facebook::velox::functions::sparksql::test {

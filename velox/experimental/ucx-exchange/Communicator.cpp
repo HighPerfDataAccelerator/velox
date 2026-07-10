@@ -130,6 +130,11 @@ void Communicator::run() {
   } else {
     context_ = ucxx::createContext({}, UCP_FEATURE_TAG | UCP_FEATURE_AM);
   }
+  LOG(INFO) << "UCX CUDA transport support="
+            << (context_->hasCudaSupport() ? "enabled" : "disabled")
+            << "; remote transfers will use "
+            << (context_->hasCudaSupport() ? "direct device buffers"
+                                           : "host staging");
 
   worker_ = context_->createWorker();
 
@@ -193,6 +198,8 @@ void Communicator::run() {
                 << " workItemsProcessed=" << workItemsProcessed_
                 << " GPU=" << gpuUsedMB << "/" << gpuTotalMB << "MB"
                 << " (free=" << gpuFreeMB << "MB)";
+        VELOX_DCHECK_EQ(
+            numCommElements_.load(std::memory_order_relaxed), elements_.size());
         workItemsProcessed_ = 0;
         lastHeartbeat_ = now;
       }
@@ -246,7 +253,16 @@ void Communicator::run() {
       // or worker_->signal() is called (from addToWorkQueue,
       // deferEndpointCleanup, or stop).
       if (blockingMode) {
-        worker_->progressWorkerEvent(0);
+        // CUDA IPC/copy completions are not guaranteed to signal the UCX
+        // worker event fd. Busy-progress while an exchange or a deferred
+        // request is active; otherwise a rendezvous can sleep until an
+        // unrelated signal arrives and serialize large GPU shuffles. Once the
+        // communicator is idle, retain the indefinite wait to avoid burning a
+        // CPU core per executor.
+        const bool needsBusyProgress =
+            numCommElements_.load(std::memory_order_relaxed) > 0 ||
+            !deferredRequests_.empty();
+        worker_->progressWorkerEvent(needsBusyProgress ? 0 : -1);
       } else {
         worker_->progress();
       }
@@ -266,7 +282,7 @@ void Communicator::stop() {
   // endpoints_ is only accessed from the Communicator thread, so reading
   // it here would be a data race.
   VLOG(3) << "In Communicator::stop "
-          << " elements_.size(): " << elements_.size()
+          << " elements: " << numCommElements_.load(std::memory_order_relaxed)
           << " workQueue_.size(): " << workQueue_.size();
 }
 
@@ -274,6 +290,7 @@ void Communicator::registerCommElement(std::shared_ptr<CommElement> comms) {
   std::lock_guard<std::mutex> lock(elemMutex_);
   auto ret = elements_.insert(comms);
   VELOX_CHECK(ret.second, "CommElement already registered!");
+  numCommElements_.fetch_add(1, std::memory_order_relaxed);
   // Also put the comms element into the work queue.
   workQueue_.push(comms);
   signalWorker();
@@ -299,7 +316,11 @@ void Communicator::unregister(std::shared_ptr<CommElement> comms) {
     return;
   }
   workQueue_.erase(comms);
-  elements_.erase(comms);
+  if (elements_.erase(comms) > 0) {
+    const auto previous =
+        numCommElements_.fetch_sub(1, std::memory_order_relaxed);
+    VELOX_DCHECK_GT(previous, 0);
+  }
 }
 
 std::shared_ptr<EndpointRef> Communicator::assocEndpointRef(

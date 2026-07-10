@@ -202,8 +202,8 @@ std::unique_ptr<cudf::table> toCudfTable(
       .timestampTimeZone = timestampTimeZone,
       .exportVarbinaryAsString = true,
       .useDecimalTypeWidth = true};
-  auto exportVector = std::static_pointer_cast<BaseVector>(
-      std::make_shared<RowVector>(
+  auto exportVector =
+      std::static_pointer_cast<BaseVector>(std::make_shared<RowVector>(
           veloxTable->pool(),
           veloxTable->type(),
           veloxTable->nulls(),

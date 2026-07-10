@@ -15,7 +15,9 @@
  */
 #include "velox/experimental/ucx-exchange/UcxExchangeServer.h"
 #include <glog/logging.h>
+#include <malloc.h>
 #include <rmm/cuda_stream_view.hpp>
+#include <algorithm>
 #include <cstdlib>
 #include <limits>
 #include <string>
@@ -28,6 +30,40 @@
 namespace facebook::velox::ucx_exchange {
 
 namespace {
+void accountFreedHostBytesAndTrim(uint64_t bytes) {
+  constexpr uint64_t kTrimInterval = 64ULL * 1024 * 1024;
+  static std::atomic<uint64_t> freedSinceTrim{0};
+  if (bytes == 0) {
+    return;
+  }
+  const auto accumulated =
+      freedSinceTrim.fetch_add(bytes, std::memory_order_acq_rel) + bytes;
+  if (accumulated >= kTrimInterval) {
+    const auto claimed = freedSinceTrim.exchange(0, std::memory_order_acq_rel);
+    if (claimed >= kTrimInterval) {
+      malloc_trim(0);
+    }
+  }
+}
+
+void retireRequest(
+    std::shared_ptr<ucxx::Request>& current,
+    std::vector<std::shared_ptr<ucxx::Request>>& inFlight) {
+  inFlight.erase(
+      std::remove_if(
+          inFlight.begin(),
+          inFlight.end(),
+          [](const auto& request) {
+            return request == nullptr || request->isCompleted();
+          }),
+      inFlight.end());
+  if (current != nullptr && !current->isCompleted()) {
+    inFlight.push_back(std::move(current));
+  } else {
+    current.reset();
+  }
+}
+
 const folly::F14FastMap<UcxExchangeServer::ServerState, std::string_view>&
 serverStateNames() {
   static const folly::
@@ -76,6 +112,54 @@ int64_t intraNodeProducerPollRequeueLimit() {
   return limit;
 }
 
+int64_t maxInFlightSendHostBytes() {
+  static const int64_t limit = [] {
+    if (const char* value =
+            std::getenv("GLUTEN_UCX_MAX_INFLIGHT_SEND_HOST_BYTES")) {
+      try {
+        const auto parsed = static_cast<int64_t>(std::stoll(value));
+        if (parsed > 0) {
+          return parsed;
+        }
+      } catch (...) {
+      }
+    }
+    return static_cast<int64_t>(2) * 1024 * 1024 * 1024;
+  }();
+  return limit;
+}
+
+std::atomic<int64_t> inFlightSendHostBytes{0};
+
+bool tryReserveSendHostBytes(int64_t bytes) {
+  VELOX_CHECK_GE(bytes, 0);
+  auto current = inFlightSendHostBytes.load(std::memory_order_relaxed);
+  while (true) {
+    // Permit one oversized transfer when no other host staging is active. A
+    // single packed table cannot be split by the current wire protocol, and
+    // rejecting it forever would deadlock the exchange.
+    if (current > 0 && current + bytes > maxInFlightSendHostBytes()) {
+      return false;
+    }
+    if (inFlightSendHostBytes.compare_exchange_weak(
+            current,
+            current + bytes,
+            std::memory_order_acq_rel,
+            std::memory_order_relaxed)) {
+      return true;
+    }
+  }
+}
+
+void releaseSendHostBytes(int64_t bytes) {
+  if (bytes <= 0) {
+    return;
+  }
+  const auto previous =
+      inFlightSendHostBytes.fetch_sub(bytes, std::memory_order_acq_rel);
+  VELOX_CHECK_GE(previous, bytes);
+}
+
 } // namespace
 
 VELOX_DEFINE_EMBEDDED_ENUM_NAME(
@@ -98,6 +182,32 @@ struct MetaSendContext {
 
 struct DataSendContext {
   std::shared_ptr<cudf::packed_columns> data;
+  // The UCX build used by Gluten MPP may not include CUDA memory-type
+  // transports.  In that case handing an rmm device pointer to tagSend makes
+  // the shared-memory transport memcpy from an inaccessible address.  Keep a
+  // host staging buffer alive with the request and let UCX move host memory.
+  std::shared_ptr<std::vector<uint8_t>> hostData;
+  int64_t reservedHostBytes{0};
+
+  ~DataSendContext() {
+    releaseHostReservation();
+  }
+
+  bool reserveHostBytes(int64_t bytes) {
+    VELOX_CHECK_EQ(reservedHostBytes, 0);
+    if (!tryReserveSendHostBytes(bytes)) {
+      return false;
+    }
+    reservedHostBytes = bytes;
+    return true;
+  }
+
+  void releaseHostReservation() {
+    if (reservedHostBytes > 0) {
+      releaseSendHostBytes(reservedHostBytes);
+      reservedHostBytes = 0;
+    }
+  }
 };
 
 void UcxExchangeServer::setState(ServerState newState) {
@@ -389,6 +499,19 @@ void UcxExchangeServer::sendData() {
     }
   } else {
     // REMOTE EXCHANGE PATH: Use UCXX for metadata and data transfer
+    const bool useHostStaging = !communicator_->hasCudaTransport();
+    std::shared_ptr<DataSendContext> dataCtx;
+    if (dataPtr_) {
+      const auto hostBytes = static_cast<int64_t>(dataPtr_->gpu_data->size());
+      dataCtx = std::make_shared<DataSendContext>();
+      if (useHostStaging && !dataCtx->reserveHostBytes(hostBytes)) {
+        // Keep dataPtr_ and state=DataReady.  Completed UCX callbacks release
+        // process-wide credit; requeueing lets this server retry without
+        // dequeuing or staging another packed table.
+        communicator_->addToWorkQueue(getSelfPtr());
+        return;
+      }
+    }
     std::shared_ptr<MetadataMsg> metadataMsg = std::make_shared<MetadataMsg>();
 
     if (dataPtr_) {
@@ -417,9 +540,7 @@ void UcxExchangeServer::sendData() {
     // Use weak_ptr to prevent use-after-free if close() is called during
     // callback
     std::weak_ptr<UcxExchangeServer> weakMeta = weak_from_this();
-    if (metaRequest_) {
-      completedRequests_.push_back(std::move(metaRequest_));
-    }
+    retireRequest(metaRequest_, completedRequests_);
 
     // Wrap the serialized metadata in a context so the callback can release
     // it after the send completes, while the Request (and context shell)
@@ -484,33 +605,60 @@ void UcxExchangeServer::sendData() {
       // Use weak_ptr to prevent use-after-free if close() is called during
       // callback
       std::weak_ptr<UcxExchangeServer> weakData = weak_from_this();
-      if (dataRequest_) {
-        completedRequests_.push_back(std::move(dataRequest_));
-      }
+      retireRequest(dataRequest_, completedRequests_);
 
       // Wrap the GPU data buffer in a context so the callback can release
       // it after the DMA completes, while the Request (and context shell)
       // stays alive for UCP wireup replay.
-      auto dataCtx = std::make_shared<DataSendContext>();
       dataCtx->data = dataPtr_;
+      void* sendBuffer = dataCtx->data->gpu_data->data();
+      if (useHostStaging) {
+        dataCtx->hostData = std::make_shared<std::vector<uint8_t>>(bytes_);
+        const auto producerStream = dataCtx->data->gpu_data->stream();
+        CUDF_CUDA_TRY(cudaStreamSynchronize(producerStream.value()));
+        CUDF_CUDA_TRY(cudaMemcpy(
+            dataCtx->hostData->data(),
+            dataCtx->data->gpu_data->data(),
+            bytes_,
+            cudaMemcpyDeviceToHost));
+        sendBuffer = dataCtx->hostData->data();
+      }
+      VLOG(2) << "@" << partitionKey_.taskId << " posting "
+              << (useHostStaging ? "host-staged" : "direct-device")
+              << " send for " << bytes_ << " bytes";
 
       dataRequest_ = endpointRef_->endpoint_->tagSend(
-          dataCtx->data->gpu_data->data(),
-          dataCtx->data->gpu_data->size(),
+          sendBuffer,
+          static_cast<size_t>(bytes_),
           ucxx::Tag{dataTag},
           false,
           [weakData](ucs_status_t status, std::shared_ptr<void> arg) {
-            // Release the GPU data buffer from the context. The DMA has
-            // completed by the time this callback fires, so the buffer is
-            // safe to free. The context shell stays alive with the Request.
+            // Release both payload buffers from the context. completedRequests_
+            // deliberately retains the UCXX Request (and therefore
+            // callbackData) for wireup replay safety, so leaving hostData in
+            // this context leaks one complete host-staging copy per batch until
+            // the exchange server is destroyed.  Large MPP exchanges otherwise
+            // consume hundreds of GiB even though every send has completed. The
+            // callback means UCX has finished with both payloads; only the
+            // empty context shell must remain alive with the Request.
             auto ctx = std::static_pointer_cast<DataSendContext>(arg);
             auto dataHolder = std::move(ctx->data);
+            auto hostDataHolder = std::move(ctx->hostData);
+            const auto releasedHostBytes = ctx->reservedHostBytes;
+            ctx->releaseHostReservation();
+            hostDataHolder.reset();
+            // The default allocator retains these very large vector arenas in
+            // the executor even after free().  A long exchange therefore has
+            // bounded live staging but unbounded RSS. Return completed large
+            // transfers to the OS instead of waiting for process teardown.
+            accountFreedHostBytesAndTrim(releasedHostBytes);
 
             if (auto self = weakData.lock()) {
               self->sendComplete(status, arg);
             }
-            // dataHolder is destroyed here, releasing the GPU buffer if
-            // sendComplete() already reset the server's dataPtr_.
+            // The holders are destroyed here, releasing the GPU buffer if
+            // sendComplete() already reset the server's dataPtr_, and always
+            // releasing the completed transfer's host staging allocation.
           },
           dataCtx);
     } else {

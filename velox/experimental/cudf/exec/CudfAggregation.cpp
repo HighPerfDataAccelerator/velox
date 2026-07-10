@@ -164,9 +164,8 @@ core::TypedExprPtr normalizeProjectInputReferences(
   const auto& names = projectNode->names();
   reverseMapping.reserve(names.size());
   for (size_t i = 0; i < names.size(); ++i) {
-    auto field =
-        std::dynamic_pointer_cast<const core::FieldAccessTypedExpr>(
-            projections[i]);
+    auto field = std::dynamic_pointer_cast<const core::FieldAccessTypedExpr>(
+        projections[i]);
     if (field && field->inputs().empty()) {
       reverseMapping.emplace(
           field->name(),
@@ -461,10 +460,6 @@ bool canAggregationBeEvaluatedByRegistry(
     return true;
   }
 
-  if (hasOnlyConstantArguments(call)) {
-    return false;
-  }
-
   // Validate against step-specific signatures from registry.
   return matchTypedCallAgainstSignatures(call, stepIt->second);
 }
@@ -483,6 +478,21 @@ bool canBeEvaluatedByCudf(
 
   bool isGlobal = aggregationNode.groupingKeys().empty();
   bool isDistinct = !isGlobal && aggregationNode.aggregates().empty();
+
+  // Grouped aggregation materializes constant inputs on the GPU.  Global reduce
+  // operators still consume a real input channel, so keep non-count constant
+  // reductions on the CPU path until their adapter gains the same
+  // materialization support.
+  if (isGlobal &&
+      std::any_of(
+          aggregationNode.aggregates().begin(),
+          aggregationNode.aggregates().end(),
+          [](const auto& aggregate) {
+            return !isCountFunctionName(aggregate.call->name()) &&
+                hasOnlyConstantArguments(*aggregate.call);
+          })) {
+    return false;
+  }
 
   if (isDistinct) {
     return canGroupingKeysBeEvaluatedByCudf(

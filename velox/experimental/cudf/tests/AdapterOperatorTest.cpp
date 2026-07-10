@@ -86,9 +86,8 @@ TEST_F(AdapterOperatorTest, fullPartitionWindowSumUsesCudfWindow) {
 
   auto plan = PlanBuilder()
                   .values({data})
-                  .window(
-                      {"sum(v) over (partition by k0, k1 rows between "
-                       "unbounded preceding and unbounded following) as s"})
+                  .window({"sum(v) over (partition by k0, k1 rows between "
+                           "unbounded preceding and unbounded following) as s"})
                   .planNode();
 
   auto task = AssertQueryBuilder(duckDbQueryRunner_)
@@ -111,12 +110,12 @@ TEST_F(AdapterOperatorTest, orderedFirstValueUsesCudfWindow) {
        makeNullableFlatVector<int64_t>({100, 50, 10, 1, 1, 1})});
   createDuckDbTable({data});
 
-  auto plan = PlanBuilder()
-                  .values({data})
-                  .window(
-                      {"first_value(v) over (partition by k order by o0 desc "
-                       "nulls last, o1 desc nulls last) as first_v"})
-                  .planNode();
+  auto plan =
+      PlanBuilder()
+          .values({data})
+          .window({"first_value(v) over (partition by k order by o0 desc "
+                   "nulls last, o1 desc nulls last) as first_v"})
+          .planNode();
 
   auto task = AssertQueryBuilder(duckDbQueryRunner_)
                   .config("cudf.enabled", true)

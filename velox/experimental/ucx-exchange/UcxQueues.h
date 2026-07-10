@@ -272,6 +272,10 @@ class UcxOutputQueue : public std::enable_shared_from_this<UcxOutputQueue> {
 
   void updateTotalQueuedBytesMsLocked();
 
+  /// Emits coarse queue-residency diagnostics without changing backpressure.
+  /// Must be called with mutex_ held.
+  void logDeviceQueueResidencyLocked(const char* event);
+
   int64_t getAverageQueueTimeMsLocked() const;
 
   // internal function that is called when all drivers are done.
@@ -340,6 +344,9 @@ class UcxOutputQueue : public std::enable_shared_from_this<UcxOutputQueue> {
   // actual data in 'queues_'
   int64_t queuedBytes_{0};
   int64_t queuedPackedColumns_{0};
+
+  // Last reported 256 MiB bucket. Diagnostic-only; it does not cap the queue.
+  int64_t diagnosticQueueBucket_{0};
 
   // The total number of bytes/rows/packedColumns sent via this output queue.
   int64_t totalBytesSent_{0};

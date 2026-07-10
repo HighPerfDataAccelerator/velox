@@ -205,6 +205,13 @@ static std::unique_ptr<cudf::scalar> createCudfScalar(
       vector->type(), vector->value(), vector->isNullAt(0), toType);
 }
 
+inline std::unique_ptr<cudf::scalar> makeScalarFromConstantVector(
+    const velox::VectorPtr& value,
+    std::optional<cudf::type_id> toType = std::nullopt) {
+  return VELOX_DYNAMIC_SCALAR_TYPE_DISPATCH(
+      createCudfScalar, value->typeKind(), value, toType);
+}
+
 inline std::unique_ptr<cudf::scalar> makeScalarFromConstantExpr(
     const std::shared_ptr<velox::exec::Expr>& expr,
     std::optional<cudf::type_id> toType = std::nullopt) {

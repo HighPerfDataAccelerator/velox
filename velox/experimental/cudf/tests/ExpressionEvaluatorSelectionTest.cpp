@@ -137,8 +137,7 @@ TEST_F(CudfExpressionSelectionTest, decimalPredicateUsesFunctionEvaluator) {
   CudfConfig::getInstance().astExpressionEnabled = true;
   CudfConfig::getInstance().jitExpressionEnabled = true;
 
-  auto decimalRowType =
-      ROW({{"d0", DECIMAL(17, 2)}, {"d1", DECIMAL(17, 2)}});
+  auto decimalRowType = ROW({{"d0", DECIMAL(17, 2)}, {"d1", DECIMAL(17, 2)}});
   auto expr = compileExecExpr(
       "(d0 > CAST(0.0 AS DECIMAL(17, 2))) AND "
       "(d1 > CAST(0.0 AS DECIMAL(17, 2)))",
@@ -358,8 +357,8 @@ TEST_F(CudfExpressionSelectionTest, regexpLookaroundFallsBack) {
 
   auto supportedLeadingZeroLookahead = compileExecExpr(
       "regexp_replace(name, '^0+(?!$)', '')", rowType_, execCtx_.get());
-  ASSERT_TRUE(canBeEvaluatedByCudf(
-      supportedLeadingZeroLookahead, /*deep=*/true));
+  ASSERT_TRUE(
+      canBeEvaluatedByCudf(supportedLeadingZeroLookahead, /*deep=*/true));
 
   auto badLookahead = compileExecExpr(
       "regexp_replace(name, '(?!x)0+', '')", rowType_, execCtx_.get());

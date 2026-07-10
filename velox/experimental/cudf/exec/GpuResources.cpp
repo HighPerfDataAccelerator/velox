@@ -29,11 +29,21 @@
 #include <rmm/mr/managed_memory_resource.hpp>
 #include <rmm/mr/pool_memory_resource.hpp>
 #include <rmm/mr/prefetch_resource_adaptor.hpp>
+#include <rmm/mr/statistics_resource_adaptor.hpp>
+
+#include <cuda_runtime_api.h>
 
 #include <common/base/Exceptions.h>
+#include <dlfcn.h>
+#include <glog/logging.h>
+#include <unistd.h>
 
+#include <algorithm>
+#include <cctype>
 #include <cstdlib>
+#include <string>
 #include <string_view>
+#include <thread>
 
 namespace facebook::velox::cudf_velox {
 
@@ -87,9 +97,113 @@ cudf::detail::cuda_stream_pool& cudfGlobalStreamPool() {
 
 std::optional<cuda::mr::any_resource<cuda::mr::device_accessible>> mr_;
 std::optional<cuda::mr::any_resource<cuda::mr::device_accessible>> output_mr_;
+std::optional<rmm::mr::statistics_resource_adaptor> statistics_mr_;
+std::optional<rmm::mr::statistics_resource_adaptor> output_statistics_mr_;
 
 rmm::device_async_resource_ref get_output_mr() {
   return output_mr_.value();
+}
+
+bool deviceMemoryDiagnosticsEnabled() {
+  static const bool enabled = [] {
+    const auto* value = std::getenv("GLUTEN_CUDF_DEVICE_MEMORY_DIAGNOSTICS");
+    if (value == nullptr) {
+      return false;
+    }
+    std::string normalized{value};
+    std::transform(
+        normalized.begin(),
+        normalized.end(),
+        normalized.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return !normalized.empty() && normalized != "0" && normalized != "false" &&
+        normalized != "off" && normalized != "no";
+  }();
+  return enabled;
+}
+
+DeviceMemorySnapshot captureDeviceMemorySnapshot() {
+  DeviceMemorySnapshot snapshot;
+  snapshot.enabled = deviceMemoryDiagnosticsEnabled();
+  if (!snapshot.enabled) {
+    return snapshot;
+  }
+
+  if (cudaGetDevice(&snapshot.device) == cudaSuccess) {
+    snapshot.cudaValid =
+        cudaMemGetInfo(&snapshot.freeBytes, &snapshot.totalBytes) ==
+        cudaSuccess;
+    if (snapshot.cudaValid) {
+      snapshot.usedBytes = snapshot.totalBytes - snapshot.freeBytes;
+    }
+  }
+
+  const auto addStatistics = [&](const auto& statistics) {
+    if (!statistics.has_value()) {
+      return;
+    }
+    const auto bytes = statistics->get_bytes_counter();
+    const auto allocations = statistics->get_allocations_counter();
+    snapshot.rmmCurrentBytes += bytes.value;
+    snapshot.rmmPeakBytes += bytes.peak;
+    snapshot.rmmTotalBytes += bytes.total;
+    snapshot.rmmCurrentAllocations += allocations.value;
+    snapshot.rmmPeakAllocations += allocations.peak;
+    snapshot.rmmTotalAllocations += allocations.total;
+  };
+  addStatistics(statistics_mr_);
+  addStatistics(output_statistics_mr_);
+  return snapshot;
+}
+
+void logDeviceMemorySnapshot(
+    const std::string& label,
+    const DeviceMemorySnapshot& snapshot) {
+  if (!snapshot.enabled) {
+    return;
+  }
+  const auto* visibleDevices = std::getenv("CUDA_VISIBLE_DEVICES");
+  const auto* executorId = std::getenv("SPARK_EXECUTOR_ID");
+  LOG(WARNING) << "CUDF_DEVICE_MEMORY"
+               << " label={" << label << "}"
+               << " pid=" << static_cast<int64_t>(::getpid())
+               << " thread=" << std::this_thread::get_id()
+               << " executorId=" << (executorId == nullptr ? "" : executorId)
+               << " cudaVisibleDevices="
+               << (visibleDevices == nullptr ? "" : visibleDevices)
+               << " device=" << snapshot.device
+               << " cudaValid=" << snapshot.cudaValid
+               << " freeBytes=" << snapshot.freeBytes
+               << " totalBytes=" << snapshot.totalBytes
+               << " usedBytes=" << snapshot.usedBytes
+               << " rmmCurrentBytes=" << snapshot.rmmCurrentBytes
+               << " rmmPeakBytes=" << snapshot.rmmPeakBytes
+               << " rmmTotalBytes=" << snapshot.rmmTotalBytes
+               << " rmmCurrentAllocations=" << snapshot.rmmCurrentAllocations
+               << " rmmPeakAllocations=" << snapshot.rmmPeakAllocations
+               << " rmmTotalAllocations=" << snapshot.rmmTotalAllocations;
+}
+
+CudaAllocationTraceScope::CudaAllocationTraceScope(const std::string& label) {
+  using Push = void (*)(const char*);
+  static auto push = reinterpret_cast<Push>(
+      dlsym(RTLD_DEFAULT, "cuda_alloc_trace_push_context"));
+  if (push != nullptr) {
+    push(label.c_str());
+    active_ = true;
+  }
+}
+
+CudaAllocationTraceScope::~CudaAllocationTraceScope() {
+  if (!active_) {
+    return;
+  }
+  using Pop = void (*)();
+  static auto pop = reinterpret_cast<Pop>(
+      dlsym(RTLD_DEFAULT, "cuda_alloc_trace_pop_context"));
+  if (pop != nullptr) {
+    pop();
+  }
 }
 
 } // namespace facebook::velox::cudf_velox

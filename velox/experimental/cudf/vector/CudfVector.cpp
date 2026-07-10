@@ -15,6 +15,7 @@
  */
 
 #include "velox/experimental/cudf/CudfNoDefaults.h"
+#include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
 #include "velox/buffer/Buffer.h"
@@ -108,6 +109,30 @@ void logDefaultStreamIfNeeded(
                << process::StackTrace().toString();
 }
 
+void validatePhysicalSchema(const TypePtr& type, cudf::table_view table) {
+  const auto rowType = asRowType(type);
+  VELOX_CHECK_EQ(
+      rowType->size(),
+      table.num_columns(),
+      "CudfVector physical column count does not match RowType");
+  for (size_t i = 0; i < rowType->size(); ++i) {
+    const auto kind = rowType->childAt(i)->kind();
+    if (kind == TypeKind::ARRAY || kind == TypeKind::MAP ||
+        kind == TypeKind::ROW || kind == TypeKind::UNKNOWN) {
+      continue;
+    }
+    const auto expected = veloxToCudfDataType(rowType->childAt(i));
+    VELOX_CHECK(
+        expected == table.column(i).type(),
+        "CudfVector schema mismatch at column {} ({}): Velox {} -> cuDF {}, actual cuDF {}. The producing GPU operator emitted columns in the wrong order.",
+        i,
+        rowType->nameOf(i),
+        rowType->childAt(i)->toString(),
+        static_cast<int>(expected.id()),
+        static_cast<int>(table.column(i).type().id()));
+  }
+}
+
 } // namespace
 
 CudfVector::CudfVector(
@@ -131,6 +156,7 @@ CudfVector::CudfVector(
   flatSize_ = bytes;
   tablePtr = std::move(tableOut);
   tabView_ = tablePtr->view();
+  validatePhysicalSchema(type_, tabView_);
 }
 
 CudfVector::CudfVector(
@@ -152,6 +178,7 @@ CudfVector::CudfVector(
   auto& packedPtr =
       std::get<std::unique_ptr<cudf::packed_table>>(tableStorage_);
   tabView_ = packedPtr->table;
+  validatePhysicalSchema(type_, tabView_);
   // For packed table, flatSize is the size of the GPU data buffer
   flatSize_ = packedPtr->data.gpu_data->size();
 }

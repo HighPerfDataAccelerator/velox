@@ -145,6 +145,14 @@ class Communicator {
     return workerId_;
   }
 
+  /// Returns true when the active UCX context can transfer CUDA memory with
+  /// the configured transports. UCXX derives this from both the UCP-supported
+  /// memory types and UCX_TLS, so callers can safely choose a device receive
+  /// buffer instead of inferring transport support from environment strings.
+  bool hasCudaTransport() const {
+    return context_ != nullptr && context_->hasCudaSupport();
+  }
+
   /// Looks up the EndpointRef associated with a raw UCP endpoint handle.
   /// Used by the Acceptor's active-message callback to resolve the endpoint
   /// that received a handshake request.
@@ -196,6 +204,9 @@ class Communicator {
   // protect elements_ by a mutex. Needs to be mutable if called from a const
   // function.
   std::mutex elemMutex_;
+  // Mirrors elements_.size() without putting a mutex acquisition in the UCX
+  // progress hot loop. Registrations are paired with worker_->signal().
+  std::atomic<size_t> numCommElements_{0};
 
   // The work queue for communication elements that need to do things on
   // the communicator thread.

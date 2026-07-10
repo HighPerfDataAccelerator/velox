@@ -118,11 +118,13 @@ class UcxExchangeSource
   static constexpr int32_t kBackpressureLowWaterMark = 16;
 
   // Aggregate in-flight RECEIVE byte cap (in addition to the count caps above).
-  // Receive buffers are allocated off the operator memory pool (raw cudaMalloc
-  // via a process-global resource), so without a byte bound the per-peer
-  // in-flight buffers (one UcxExchangeSource per producer peer) scale
-  // O(#peers) and collectively exhaust the GPU at 4 peers (OOM at
-  // concurrentGpuTasks=2, deadlock at =1). Read once; env-overridable via
+  // Each source can own a queued device buffer independently of downstream
+  // consumption. Without a byte bound these buffers (one UcxExchangeSource per
+  // producer peer) scale O(#peers) and collectively exhaust the GPU at 4 peers
+  // (OOM at concurrentGpuTasks=2, deadlock at =1). Remote receives use a
+  // dedicated fresh cudaMalloc resource so UCX writes cannot race with
+  // stream-ordered reuse in the cuDF compute pool. Read once; env-overridable
+  // via
   // GLUTEN_UCX_MAX_INFLIGHT_RECV_BYTES (default 8 GiB).
   static int64_t maxInFlightRecvBytes();
 
@@ -155,8 +157,22 @@ class UcxExchangeSource
   struct DataAndMetadata {
     MetadataMsg metadata;
     std::unique_ptr<rmm::device_buffer> dataBuf;
+    std::shared_ptr<std::vector<uint8_t>> hostData;
     rmm::cuda_stream_view stream; // The stream used to allocate dataBuf
   };
+
+  // Metadata receives are strictly serial for a source. Reuse one fixed-size
+  // receive buffer instead of allocating a new 1 MiB mapping per packet.
+  // Some UCXX request internals outlive the user callback, so per-packet
+  // buffers otherwise accumulate until exchange teardown.
+  std::shared_ptr<std::vector<uint8_t>> metadataReceiveBuffer_;
+
+  // Data receives are also strictly serial for a source. Keep one pageable
+  // staging allocation and use synchronous CUDA copies. Explicit pinned
+  // allocations trigger a PCI SERR on this host, while async copies from
+  // pageable per-packet buffers make the CUDA runtime retain implicit pinned
+  // staging mappings.
+  std::shared_ptr<std::vector<uint8_t>> dataReceiveBuffer_;
 
   /// @brief The constructor is private in order to ensure that exchange sources
   /// are always generated through a shared pointer. This ensures that
@@ -306,6 +322,7 @@ class UcxExchangeSource
   std::atomic<bool> backpressureActive_{false};
   std::shared_ptr<DataAndMetadata> pendingReceive_;
   int64_t reservedReceiveBytes_{0};
+  int64_t reservedGlobalHostReceiveBytes_{0};
 
   // Some metrics/counters:
   UcxExchangeMetrics metrics_;
@@ -315,6 +332,13 @@ class UcxExchangeSource
   // NOTE: The request owns/holds a reference to the upcall function
   // and must therefore exist until the upcall is done.
   std::shared_ptr<ucxx::Request> request_{nullptr};
+
+  // Keep the active-message payload alive until the peer acknowledges the
+  // handshake.  UCXX reports local AM completion before the receiver callback
+  // has necessarily copied an eager payload under a large burst of sources.
+  // Releasing this at local completion can therefore let the allocator reuse
+  // the buffer while the peer is still decoding it.
+  std::shared_ptr<HandshakeMsg> handshakeRequestBuffer_{nullptr};
 
   // Completed UCXX requests are kept alive here to prevent use-after-free.
   // UCP's ucp_wireup_replay_pending_requests can fire callbacks on already-

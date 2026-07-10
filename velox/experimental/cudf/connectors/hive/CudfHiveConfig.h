@@ -44,6 +44,14 @@ class CudfHiveConfig {
   static constexpr const char* kMaxPassReadLimitSession =
       "parquet.reader.pass_read_limit";
 
+  // Whether simple filters are passed into libcudf's Parquet statistics
+  // reader.  Disabling this keeps the same filter in the post-scan cuDF
+  // expression path; it does not enable a CPU fallback.
+  static constexpr const char* kParquetFilterPushdownEnabled =
+      "parquet.reader.filter-pushdown-enabled";
+  static constexpr const char* kParquetFilterPushdownEnabledSession =
+      "parquet.reader.filter_pushdown_enabled";
+
   // Whether to store string data as categorical type
   static constexpr const char* kConvertStringsToCategories =
       "parquet.reader.convert-strings-to-categories";
@@ -134,6 +142,9 @@ class CudfHiveConfig {
 
   std::size_t maxPassReadLimit() const;
   std::size_t maxPassReadLimitSession(const config::ConfigBase* session) const;
+
+  bool parquetFilterPushdownEnabledSession(
+      const config::ConfigBase* session) const;
 
   bool isConvertStringsToCategories() const;
   bool isConvertStringsToCategoriesSession(

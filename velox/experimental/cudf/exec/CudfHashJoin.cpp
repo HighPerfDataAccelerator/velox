@@ -1910,9 +1910,9 @@ CudfHashJoinProbe::rightSemiFilterJoin(
       extendedLeftView =
           createExtendedTableView(leftTableView, leftPrecomputed);
     }
-    cudf::table_view extendedRightView =
-        (!rightPrecomputeInstructions_.empty()) ? cachedExtendedRightViews_[0]
-                                                : rightTableView;
+    cudf::table_view extendedRightView = (!rightPrecomputeInstructions_.empty())
+        ? cachedExtendedRightViews_[0]
+        : rightTableView;
     rightJoinIndices = cudf::mixed_left_semi_join(
         rightTableView.select(rightKeyIndices_),
         leftTableView.select(leftKeyIndices_),

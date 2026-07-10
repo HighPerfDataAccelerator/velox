@@ -112,9 +112,8 @@ FOLLY_ALWAYS_INLINE bool isUtf8DecodeCharset(std::string_view charset) {
     normalized[i] =
         static_cast<char>(std::tolower(static_cast<unsigned char>(charset[i])));
   }
-  return charset.size() == 5
-      ? std::string_view(normalized, 5) == "utf-8"
-      : std::string_view(normalized, 4) == "utf8";
+  return charset.size() == 5 ? std::string_view(normalized, 5) == "utf-8"
+                             : std::string_view(normalized, 4) == "utf8";
 }
 
 template <typename T>
@@ -126,7 +125,8 @@ struct DecodeFunction {
       const arg_type<Varbinary>& input,
       const arg_type<Varchar>& charset) {
     VELOX_USER_CHECK(
-        isUtf8DecodeCharset({charset.data(), static_cast<size_t>(charset.size())}),
+        isUtf8DecodeCharset(
+            {charset.data(), static_cast<size_t>(charset.size())}),
         "Unsupported charset for decode: {}",
         charset);
     result.resize(input.size());

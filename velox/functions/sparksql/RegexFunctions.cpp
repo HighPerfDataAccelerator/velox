@@ -109,9 +109,8 @@ struct RegexpReplaceFunction {
         // Only when both the 'replacement' and 'pattern' are constants can they
         // be processed during initialization; otherwise, each row needs to be
         // processed separately.
-        constantReplacement_ =
-            prepareRegexpReplaceReplacement(
-                re_.value(), StringView(replacementText.value()));
+        constantReplacement_ = prepareRegexpReplaceReplacement(
+            re_.value(), StringView(replacementText.value()));
       }
     }
     cache_.setMaxCompiledRegexes(config.exprMaxCompiledRegexes());
@@ -200,9 +199,9 @@ struct RegexpReplaceFunction {
       replacementText = kLeadingZeroPreserveOneJavaReplacement;
     }
 
-    auto& re =
-        patternText.has_value() ? ensurePattern(StringView(patternText.value()))
-                                : ensurePattern(pattern);
+    auto& re = patternText.has_value()
+        ? ensurePattern(StringView(patternText.value()))
+        : ensurePattern(pattern);
     const auto& processedReplacement = constantReplacement_.has_value()
         ? constantReplacement_.value()
         : prepareRegexpReplaceReplacement(
