@@ -518,14 +518,13 @@ TEST_F(UcxOutputQueueManagerTest, basicAsyncFetch) {
 
 TEST_F(UcxOutputQueueManagerTest, lateTaskCreation) {
   const vector_size_t size = 10;
-  const std::string taskId = "t0";
+  // Task IDs are unique in production. Do not reuse "t0" from
+  // basicAsyncFetch: removeTask intentionally retains its tombstone so stale
+  // UCX fetches cannot recreate a removed task.
+  const std::string taskId = "lateTaskCreation";
   int numPartitions = 1;
   bool earlyTermination = false;
   int destination = 0;
-
-  // Clear stale state from prior tests (removeTask on a non-existing queue
-  // clears the removedTasks_ set, allowing getData to create a placeholder).
-  queueManager_->removeTask(taskId);
 
   // Fetch data from a non-existing task.
   struct Response {
