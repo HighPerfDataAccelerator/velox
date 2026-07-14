@@ -105,6 +105,7 @@ class CudfNestedLoopJoinBuild : public CudfOperatorBase {
  private:
   std::shared_ptr<const core::NestedLoopJoinNode> joinNode_;
   std::vector<CudfVectorPtr> inputs_;
+  std::shared_ptr<CudfNestedLoopJoinBridge> buildBridge_;
   uint64_t maxBuildBytes_;
   uint64_t bufferedBuildBytes_{0};
   ContinueFuture future_{ContinueFuture::makeEmpty()};

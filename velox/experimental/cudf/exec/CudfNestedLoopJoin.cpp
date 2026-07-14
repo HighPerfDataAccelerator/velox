@@ -181,17 +181,19 @@ void CudfNestedLoopJoinBuild::doAddInput(RowVectorPtr input) {
     // is the runtime backstop for planner estimates used by replicated MPP
     // Cartesian joins.
     const auto inputBytes = cudfInput->estimateFlatSize();
-    auto joinBridge = operatorCtx_->task()->getCustomJoinBridge(
-        operatorCtx_->driverCtx()->splitGroupId, planNodeId());
-    auto bridge =
-        std::dynamic_pointer_cast<CudfNestedLoopJoinBridge>(joinBridge);
-    VELOX_CHECK_NOT_NULL(bridge);
-    bridge->reserveBuildBytes(inputBytes, maxBuildBytes_);
+    if (!buildBridge_) {
+      auto joinBridge = operatorCtx_->task()->getCustomJoinBridge(
+          operatorCtx_->driverCtx()->splitGroupId, planNodeId());
+      buildBridge_ =
+          std::dynamic_pointer_cast<CudfNestedLoopJoinBridge>(joinBridge);
+      VELOX_CHECK_NOT_NULL(buildBridge_);
+    }
+    buildBridge_->reserveBuildBytes(inputBytes, maxBuildBytes_);
     try {
       inputs_.push_back(std::move(cudfInput)); // Store in GPU memory
       bufferedBuildBytes_ += inputBytes;
     } catch (...) {
-      bridge->releaseBuildBytes(inputBytes);
+      buildBridge_->releaseBuildBytes(inputBytes);
       throw;
     }
   }
@@ -278,6 +280,7 @@ void CudfNestedLoopJoinBuild::doNoMoreInput() {
       operatorCtx_->driverCtx()->splitGroupId, planNodeId());
   auto bridge = std::dynamic_pointer_cast<CudfNestedLoopJoinBridge>(joinBridge);
   VELOX_CHECK_NOT_NULL(bridge);
+  buildBridge_ = bridge;
 
   try {
     auto table = getConcatenatedTable(
@@ -320,15 +323,12 @@ bool CudfNestedLoopJoinBuild::isFinished() {
 
 void CudfNestedLoopJoinBuild::doClose() {
   if (bufferedBuildBytes_ > 0 && !inputs_.empty()) {
-    auto joinBridge = operatorCtx_->task()->getCustomJoinBridge(
-        operatorCtx_->driverCtx()->splitGroupId, planNodeId());
-    auto bridge =
-        std::dynamic_pointer_cast<CudfNestedLoopJoinBridge>(joinBridge);
-    VELOX_CHECK_NOT_NULL(bridge);
-    bridge->releaseBuildBytes(bufferedBuildBytes_);
+    VELOX_CHECK_NOT_NULL(buildBridge_);
+    buildBridge_->releaseBuildBytes(bufferedBuildBytes_);
   }
   inputs_.clear();
   bufferedBuildBytes_ = 0;
+  buildBridge_.reset();
   Operator::close();
 }
 
