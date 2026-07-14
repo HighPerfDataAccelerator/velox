@@ -54,6 +54,10 @@ struct CudfConfig {
   static constexpr const char* kCudfFunctionEngine{"cudf.function_engine"};
   /// Query session configs for the cuDF Operators.
   static constexpr const char* kCudfTopNBatchSize{"cudf.topk_batch_size"};
+  // Maximum retained candidate bytes before CudfTopNRowNumber writes a
+  // sorted run. The default remains 128 MiB.
+  static constexpr const char* kCudfTopNRowNumberCandidateRunBytes{
+      "cudf.topn_row_number.candidate_run_bytes"};
   // Hard limit for the complete build table retained by CudfNestedLoopJoin.
   // The default is intentionally unbounded for non-MPP callers; Gluten MPP
   // supplies a conservative value for replicated Cartesian joins.
