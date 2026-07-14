@@ -39,13 +39,21 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <cctype>
 #include <cstdlib>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <vector>
 
 namespace facebook::velox::cudf_velox {
+
+namespace {
+std::mutex asyncMemoryPoolsMutex;
+std::vector<cudaMemPool_t> asyncMemoryPools;
+} // namespace
 
 cuda::mr::any_resource<cuda::mr::device_accessible> createMemoryResource(
     std::string_view mode,
@@ -57,7 +65,20 @@ cuda::mr::any_resource<cuda::mr::device_accessible> createMemoryResource(
         rmm::mr::cuda_memory_resource{},
         rmm::percent_of_free_device_memory(percent));
   } else if (mode == "async") {
-    return rmm::mr::cuda_async_memory_resource{};
+    // cuda_async_memory_resource otherwise defaults its release threshold to
+    // UINT64_MAX. After a transient large join/partition workspace, the CUDA
+    // pool then retains almost the entire device even when RMM's live bytes
+    // have fallen. UCX receive buffers use a separate cudaMalloc resource and
+    // cannot reuse those cached blocks. Apply memoryPercent as the async
+    // pool's retention threshold so synchronization returns high-watermark
+    // slack while preserving a large cache for steady-state operators.
+    auto resource = rmm::mr::cuda_async_memory_resource(
+        std::nullopt, rmm::percent_of_free_device_memory(percent));
+    {
+      std::lock_guard<std::mutex> lock(asyncMemoryPoolsMutex);
+      asyncMemoryPools.push_back(resource.pool_handle());
+    }
+    return resource;
   } else if (mode == "arena") {
     return rmm::mr::arena_memory_resource(
         rmm::mr::cuda_memory_resource{},
@@ -89,6 +110,70 @@ cuda::mr::any_resource<cuda::mr::device_accessible> createMemoryResource(
       "Unknown memory resource mode: " + std::string(mode) +
       "\nExpecting: cuda, pool, async, arena, managed, prefetch_managed, " +
       "managed_pool, prefetch_managed_pool, managed_async, prefetch_managed_async");
+}
+
+bool trimAsyncMemoryPoolsAtQueryEnd() {
+  const auto* value =
+      std::getenv("GLUTEN_CUDF_ASYNC_QUERY_END_TRIM_BYTES");
+  if (value == nullptr || value[0] == '\0') {
+    return false;
+  }
+
+  char* end = nullptr;
+  errno = 0;
+  const auto parsed = std::strtoull(value, &end, 10);
+  if (errno != 0 || end == value || *end != '\0') {
+    LOG(ERROR) << "Ignoring invalid GLUTEN_CUDF_ASYNC_QUERY_END_TRIM_BYTES='"
+               << value << "'";
+    return false;
+  }
+  return trimAsyncMemoryPoolsAtQueryEnd(static_cast<std::size_t>(parsed));
+}
+
+bool trimAsyncMemoryPoolsAtQueryEnd(std::size_t bytesToKeep) {
+
+  std::vector<cudaMemPool_t> pools;
+  {
+    std::lock_guard<std::mutex> lock(asyncMemoryPoolsMutex);
+    pools = asyncMemoryPools;
+  }
+  if (pools.empty()) {
+    return false;
+  }
+
+  std::size_t freeBefore = 0;
+  std::size_t totalBytes = 0;
+  cudaMemGetInfo(&freeBefore, &totalBytes);
+  const auto syncStatus = cudaDeviceSynchronize();
+  if (syncStatus != cudaSuccess) {
+    LOG(ERROR) << "CUDF_ASYNC_QUERY_END_TRIM cudaDeviceSynchronize failed: "
+               << cudaGetErrorString(syncStatus);
+    return false;
+  }
+
+  for (const auto pool : pools) {
+    const auto trimStatus = cudaMemPoolTrimTo(pool, bytesToKeep);
+    if (trimStatus != cudaSuccess) {
+      LOG(ERROR) << "CUDF_ASYNC_QUERY_END_TRIM cudaMemPoolTrimTo failed: "
+                 << cudaGetErrorString(trimStatus)
+                 << " bytesToKeep=" << bytesToKeep;
+      return false;
+    }
+  }
+
+  std::size_t freeAfter = 0;
+  cudaMemGetInfo(&freeAfter, &totalBytes);
+  LOG(INFO) << "CUDF_ASYNC_QUERY_END_TRIM pools=" << pools.size()
+            << " bytesToKeep=" << bytesToKeep
+            << " freeBefore=" << freeBefore << " freeAfter=" << freeAfter
+            << " released="
+            << (freeAfter >= freeBefore ? freeAfter - freeBefore : 0);
+  return true;
+}
+
+void clearAsyncMemoryPoolHandles() {
+  std::lock_guard<std::mutex> lock(asyncMemoryPoolsMutex);
+  asyncMemoryPools.clear();
 }
 
 cudf::detail::cuda_stream_pool& cudfGlobalStreamPool() {

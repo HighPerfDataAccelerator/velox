@@ -60,11 +60,23 @@ rmm::device_async_resource_ref get_output_mr();
  * @brief Creates a memory resource based on the given mode.
  *
  * @param mode rmm::mr::pool_memory_resource mode.
- * @param percent The initial percent of GPU memory to allocate for memory
- * resource.
+ * @param percent The initial percent of GPU memory to allocate for pool or
+ * arena resources, or the retained-memory release threshold for async.
  */
 [[nodiscard]] cuda::mr::any_resource<cuda::mr::device_accessible>
 createMemoryResource(std::string_view mode, int percent);
+
+/// If GLUTEN_CUDF_ASYNC_QUERY_END_TRIM_BYTES is set, synchronizes the device
+/// and releases unused cudaMallocAsync pool memory down to that retained-byte
+/// target. Returns true when a trim was requested and completed successfully.
+[[nodiscard]] bool trimAsyncMemoryPoolsAtQueryEnd();
+
+/// Explicit query-scoped variant. Unlike the no-argument environment
+/// fallback, a zero value is a valid request to release every unused block.
+[[nodiscard]] bool trimAsyncMemoryPoolsAtQueryEnd(std::size_t bytesToKeep);
+
+/// Drops native pool handles after their owning RMM resources are destroyed.
+void clearAsyncMemoryPoolHandles();
 
 /**
  * @brief Returns the global CUDA stream pool used by cudf.

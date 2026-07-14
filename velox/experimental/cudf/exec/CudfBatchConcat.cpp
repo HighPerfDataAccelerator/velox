@@ -21,6 +21,7 @@
 #include "velox/experimental/cudf/exec/Utilities.h"
 
 #include <cstdlib>
+#include <limits>
 #include <string_view>
 #include <utility>
 
@@ -59,6 +60,25 @@ RowTypePtr getConcatOutputType(
   return planNode->sources()[0]->outputType();
 }
 
+size_t checkedConcatTargetRows(int32_t targetRows) {
+  VELOX_CHECK_GT(
+      targetRows, 0, "CudfBatchConcat target row count must be positive");
+  return static_cast<size_t>(targetRows);
+}
+
+int32_t queryConcatTargetRows(exec::DriverCtx* driverCtx) {
+  const auto targetRows = concatThreshold(
+      driverCtx,
+      CudfConfig::kCudfBatchSizeMinThreshold,
+      "GLUTEN_CUDF_BATCH_SIZE_MIN_THRESHOLD_ROWS",
+      CudfConfig::getInstance().batchSizeMinThreshold);
+  VELOX_CHECK_LE(
+      targetRows,
+      static_cast<uint64_t>(std::numeric_limits<int32_t>::max()),
+      "CudfBatchConcat target row count exceeds INT32_MAX");
+  return static_cast<int32_t>(targetRows);
+}
+
 std::string getAggregationStep(
     const std::shared_ptr<const core::PlanNode>& planNode) {
   const auto aggregation =
@@ -78,10 +98,34 @@ CudfBatchConcat::CudfBatchConcat(
     int32_t operatorId,
     exec::DriverCtx* driverCtx,
     std::shared_ptr<const core::PlanNode> planNode)
+    : CudfBatchConcat(
+          operatorId,
+          driverCtx,
+          planNode,
+          getConcatOutputType(planNode)) {}
+
+CudfBatchConcat::CudfBatchConcat(
+    int32_t operatorId,
+    exec::DriverCtx* driverCtx,
+    std::shared_ptr<const core::PlanNode> planNode,
+    RowTypePtr outputType)
+    : CudfBatchConcat(
+          operatorId,
+          driverCtx,
+          planNode,
+          std::move(outputType),
+          queryConcatTargetRows(driverCtx)) {}
+
+CudfBatchConcat::CudfBatchConcat(
+    int32_t operatorId,
+    exec::DriverCtx* driverCtx,
+    std::shared_ptr<const core::PlanNode> planNode,
+    RowTypePtr outputType,
+    int32_t targetRows)
     : CudfOperatorBase(
           operatorId,
           driverCtx,
-          getConcatOutputType(planNode),
+          std::move(outputType),
           planNode->id(),
           "CudfBatchConcat",
           nvtx3::rgb{211, 211, 211}, /* LightGrey */
@@ -90,11 +134,7 @@ CudfBatchConcat::CudfBatchConcat(
           planNode),
       driverCtx_(driverCtx),
       aggregationStep_(getAggregationStep(planNode)),
-      targetRows_(concatThreshold(
-          driverCtx,
-          CudfConfig::kCudfBatchSizeMinThreshold,
-          "GLUTEN_CUDF_BATCH_SIZE_MIN_THRESHOLD_ROWS",
-          CudfConfig::getInstance().batchSizeMinThreshold)),
+      targetRows_(checkedConcatTargetRows(targetRows)),
       targetBytes_(concatThreshold(
           driverCtx,
           CudfConfig::kCudfBatchSizeMinThresholdBytes,
@@ -169,6 +209,18 @@ RowVectorPtr CudfBatchConcat::doGetOutput() {
       (currentNumRows_ >= targetRows_ ||
        (targetBytes_ != 0 && currentNumBytes_ >= targetBytes_) ||
        noMoreInput_)) {
+    // Preserve the zero-copy Exchange fast path when a single received batch
+    // already satisfies the target (or is the final tail batch). CudfVector
+    // carries its producing stream, so downstream operators can consume it
+    // directly without rebinding allocation ownership to another stream.
+    if (buffer_.size() == 1) {
+      auto output = std::move(buffer_.front());
+      buffer_.clear();
+      currentNumRows_ = 0;
+      currentNumBytes_ = 0;
+      ++outputBatches_;
+      return output;
+    }
     // Use stream from existing buffer vectors
     const auto outputStream = buffer_[0]->stream();
     auto outputVectors = getConcatenatedCudfVectorsBatched(

@@ -34,6 +34,19 @@ class CudfBatchConcat : public CudfOperatorBase {
       exec::DriverCtx* driverCtx,
       std::shared_ptr<const core::PlanNode> planNode);
 
+  CudfBatchConcat(
+      int32_t operatorId,
+      exec::DriverCtx* driverCtx,
+      std::shared_ptr<const core::PlanNode> planNode,
+      RowTypePtr outputType);
+
+  CudfBatchConcat(
+      int32_t operatorId,
+      exec::DriverCtx* driverCtx,
+      std::shared_ptr<const core::PlanNode> planNode,
+      RowTypePtr outputType,
+      int32_t targetRows);
+
   bool needsInput() const override;
 
   exec::BlockingReason isBlocked(ContinueFuture* /*future*/) override {
