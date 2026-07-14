@@ -20,6 +20,7 @@
 #include "velox/experimental/cudf/exec/Utilities.h"
 
 #include "velox/exec/OperatorUtils.h"
+#include "velox/exec/Task.h"
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/concatenate.hpp>
@@ -356,8 +357,13 @@ void CudfTopNRowNumber::spillSortedRun() {
 
   namespace fs = std::filesystem;
   if (!spilled_) {
+    const auto& taskSpillRoot =
+        operatorCtx_->task()->getOrCreateSpillDirectory();
+    VELOX_CHECK(
+        !taskSpillRoot.empty(),
+        "CudfTopNRowNumber requires an explicit Task spill directory");
     const auto sequence = spillDirectorySequence.fetch_add(1);
-    spillDirectory_ = (fs::temp_directory_path() /
+    spillDirectory_ = (fs::path(taskSpillRoot) /
                        fmt::format(
                            "velox-cudf-topn-spill-{}-{}",
                            static_cast<int64_t>(::getpid()),
