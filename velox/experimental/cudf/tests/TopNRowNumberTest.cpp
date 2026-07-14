@@ -17,6 +17,7 @@
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 
+#include "velox/common/file/FileSystems.h"
 #include "velox/common/testutil/TempDirectoryPath.h"
 #include "velox/exec/Cursor.h"
 #include "velox/exec/tests/utils/OperatorTestBase.h"
@@ -105,6 +106,7 @@ class CudfTopNRowNumberTest : public OperatorTestBase {
 
   void SetUp() override {
     OperatorTestBase::SetUp();
+    filesystems::registerLocalFileSystem();
     previousAllowCpuFallback_ =
         cudf_velox::CudfConfig::getInstance().allowCpuFallback;
     cudf_velox::CudfConfig::getInstance().allowCpuFallback = false;
