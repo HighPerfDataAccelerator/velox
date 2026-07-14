@@ -787,6 +787,45 @@ struct GroupbyCollectSetAggregator : GroupbyAggregator {
   uint32_t outputIdx_{0};
 };
 
+struct GroupbyCollectListAggregator : GroupbyAggregator {
+  GroupbyCollectListAggregator(
+      core::AggregationNode::Step step,
+      uint32_t inputIndex,
+      VectorPtr constant,
+      const TypePtr& resultType)
+      : GroupbyAggregator(step, inputIndex, constant, resultType) {}
+
+  void addGroupbyRequest(
+      cudf::table_view const& tbl,
+      std::vector<cudf::groupby::aggregation_request>& requests,
+      rmm::cuda_stream_view /*stream*/) override {
+    VELOX_CHECK(
+        constant == nullptr,
+        "GroupbyCollectListAggregator does not support constant input");
+    auto& request = requests.emplace_back();
+    outputIdx_ = requests.size() - 1;
+    request.values = tbl.column(inputIndex);
+    if (exec::isRawInput(step)) {
+      request.aggregations.push_back(
+          cudf::make_collect_list_aggregation<cudf::groupby_aggregation>(
+              cudf::null_policy::EXCLUDE));
+      return;
+    }
+    request.aggregations.push_back(
+        cudf::make_merge_lists_aggregation<cudf::groupby_aggregation>());
+  }
+
+  std::unique_ptr<cudf::column> makeOutputColumn(
+      std::vector<cudf::groupby::aggregation_result>& results,
+      rmm::cuda_stream_view /*stream*/,
+      rmm::device_async_resource_ref /*mr*/) override {
+    return std::move(results[outputIdx_].results[0]);
+  }
+
+ private:
+  uint32_t outputIdx_{0};
+};
+
 std::unique_ptr<GroupbyAggregator> createGroupbyAggregator(
     const ResolvedAggregateInfo& p) {
   auto const& kind = p.kind;
@@ -824,6 +863,9 @@ std::unique_ptr<GroupbyAggregator> createGroupbyAggregator(
         p.companionStep, p.inputIndex, p.constant, p.resultType);
   } else if (kind.rfind(prefix + "collect_set", 0) == 0) {
     return std::make_unique<GroupbyCollectSetAggregator>(
+        p.companionStep, p.inputIndex, p.constant, p.resultType);
+  } else if (kind.rfind(prefix + "collect_list", 0) == 0) {
+    return std::make_unique<GroupbyCollectListAggregator>(
         p.companionStep, p.inputIndex, p.constant, p.resultType);
   } else {
     VELOX_NYI("Aggregation not yet supported, kind: {}", kind);
