@@ -21,6 +21,7 @@
 #include "velox/exec/Cursor.h"
 #include "velox/exec/tests/utils/OperatorTestBase.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
+#include "velox/exec/tests/utils/QueryAssertions.h"
 
 #include <unistd.h>
 
@@ -100,6 +101,8 @@ bool usedCudfTopNRowNumber(const TaskStats& stats) {
 
 class CudfTopNRowNumberTest : public OperatorTestBase {
  protected:
+  static constexpr vector_size_t kNumRows = 32;
+
   void SetUp() override {
     OperatorTestBase::SetUp();
     previousAllowCpuFallback_ =
@@ -115,38 +118,55 @@ class CudfTopNRowNumberTest : public OperatorTestBase {
     OperatorTestBase::TearDown();
   }
 
+  core::PlanNodePtr makePlan() {
+    auto data = makeRowVector(
+        {"p", "s", "v"},
+        {makeFlatVector<int64_t>(
+             kNumRows, [](vector_size_t row) { return row; }),
+         makeFlatVector<int64_t>(
+             kNumRows, [](vector_size_t row) { return kNumRows - row; }),
+         makeFlatVector<int64_t>(
+             kNumRows, [](vector_size_t row) { return row * 10; })});
+
+    return PlanBuilder()
+        .values({data})
+        .topNRowNumber({"p"}, {"s"}, 1, true)
+        .planNode();
+  }
+
+  RowVectorPtr makeExpectedResult() {
+    return makeRowVector(
+        {"p", "s", "v", "row_number"},
+        {makeFlatVector<int64_t>(
+             kNumRows, [](vector_size_t row) { return row; }),
+         makeFlatVector<int64_t>(
+             kNumRows, [](vector_size_t row) { return kNumRows - row; }),
+         makeFlatVector<int64_t>(
+             kNumRows, [](vector_size_t row) { return row * 10; }),
+         makeFlatVector<int64_t>(
+             kNumRows, [](vector_size_t /*row*/) { return 1; })});
+  }
+
+  std::unique_ptr<TaskCursor> makeSpillingCursor(const std::string& spillRoot) {
+    CursorParameters params;
+    params.planNode = makePlan();
+    params.maxDrivers = 1;
+    params.serialExecution = true;
+    params.spillDirectory = spillRoot;
+    params.queryConfigs = {
+        {cudf_velox::CudfConfig::kCudfEnabled, "true"},
+        {cudf_velox::CudfConfig::kCudfTopNRowNumberCandidateRunBytes, "1"}};
+    return TaskCursor::create(params);
+  }
+
  private:
   bool previousAllowCpuFallback_{true};
 };
 
 TEST_F(CudfTopNRowNumberTest, spillUsesTaskRootAndCleansUp) {
-  constexpr vector_size_t kNumRows = 32;
-  auto data = makeRowVector(
-      {"p", "s", "v"},
-      {makeFlatVector<int64_t>(kNumRows, [](vector_size_t row) { return row; }),
-       makeFlatVector<int64_t>(
-           kNumRows, [](vector_size_t row) { return kNumRows - row; }),
-       makeFlatVector<int64_t>(
-           kNumRows, [](vector_size_t row) { return row * 10; })});
-
-  auto plan = PlanBuilder()
-                  .values({data})
-                  .topNRowNumber({"p"}, {"s"}, 1, true)
-                  .planNode();
-
   const auto spillRoot = TempDirectoryPath::create();
   const auto preexistingTopLevelSpills = findTopLevelProcessSpillDirectories();
-
-  CursorParameters params;
-  params.planNode = plan;
-  params.maxDrivers = 1;
-  params.serialExecution = true;
-  params.spillDirectory = spillRoot->getPath();
-  params.queryConfigs = {
-      {cudf_velox::CudfConfig::kCudfEnabled, "true"},
-      {cudf_velox::CudfConfig::kCudfTopNRowNumberCandidateRunBytes, "1"}};
-
-  auto cursor = TaskCursor::create(params);
+  auto cursor = makeSpillingCursor(spillRoot->getPath());
   ASSERT_TRUE(cursor->moveNext());
 
   const fs::path taskSpillRoot(cursor->task()->spillDirectory());
@@ -160,18 +180,46 @@ TEST_F(CudfTopNRowNumberTest, spillUsesTaskRootAndCleansUp) {
   EXPECT_EQ(findTopLevelProcessSpillDirectories(), preexistingTopLevelSpills)
       << "CudfTopNRowNumber created a spill directory outside the Task root";
 
-  vector_size_t outputRows = cursor->current()->size();
+  std::vector<RowVectorPtr> actualResults{cursor->current()};
   while (cursor->moveNext()) {
-    outputRows += cursor->current()->size();
+    actualResults.push_back(cursor->current());
   }
-  EXPECT_EQ(outputRows, kNumRows);
+  assertEqualResults({makeExpectedResult()}, actualResults);
   EXPECT_TRUE(findSpillDirectories(spillRoot->getPath()).empty());
   EXPECT_EQ(findTopLevelProcessSpillDirectories(), preexistingTopLevelSpills);
 
   auto task = cursor->task();
   EXPECT_TRUE(usedCudfTopNRowNumber(task->taskStats()));
 
+  actualResults.clear();
   cursor.reset();
+  task.reset();
+  EXPECT_FALSE(fs::exists(taskSpillRoot));
+  EXPECT_TRUE(fs::is_empty(spillRoot->getPath()));
+}
+
+TEST_F(CudfTopNRowNumberTest, earlyCloseCleansUp) {
+  const auto spillRoot = TempDirectoryPath::create();
+  const auto preexistingTopLevelSpills = findTopLevelProcessSpillDirectories();
+  auto cursor = makeSpillingCursor(spillRoot->getPath());
+  ASSERT_TRUE(cursor->moveNext());
+
+  auto task = cursor->task();
+  const fs::path taskSpillRoot(task->spillDirectory());
+  EXPECT_EQ(taskSpillRoot.parent_path(), fs::path(spillRoot->getPath()));
+  const auto activeSpillDirectories =
+      findSpillDirectories(spillRoot->getPath());
+  ASSERT_EQ(activeSpillDirectories.size(), 1);
+  EXPECT_EQ(activeSpillDirectories.front().parent_path(), taskSpillRoot);
+  EXPECT_EQ(findTopLevelProcessSpillDirectories(), preexistingTopLevelSpills);
+
+  // SingleThreadedTaskCursor synchronously cancels the Task in its destructor.
+  // The Task closes off-thread Drivers before requestCancel().wait() returns.
+  cursor.reset();
+  EXPECT_TRUE(findSpillDirectories(spillRoot->getPath()).empty());
+  EXPECT_EQ(findTopLevelProcessSpillDirectories(), preexistingTopLevelSpills);
+  EXPECT_TRUE(usedCudfTopNRowNumber(task->taskStats()));
+
   task.reset();
   EXPECT_FALSE(fs::exists(taskSpillRoot));
   EXPECT_TRUE(fs::is_empty(spillRoot->getPath()));

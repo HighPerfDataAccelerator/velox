@@ -54,8 +54,10 @@ struct CudfConfig {
   static constexpr const char* kCudfFunctionEngine{"cudf.function_engine"};
   /// Query session configs for the cuDF Operators.
   static constexpr const char* kCudfTopNBatchSize{"cudf.topk_batch_size"};
-  // Maximum retained candidate bytes before CudfTopNRowNumber writes a
-  // sorted run. The default remains 128 MiB.
+  // Maximum retained candidate bytes before CudfTopNRowNumber writes a sorted
+  // run. The value must be a plain unsigned decimal byte count with no unit
+  // suffix; the default is 134217728 bytes (128 MiB). If this threshold causes
+  // a spill, the Task must be configured with an explicit spill root.
   static constexpr const char* kCudfTopNRowNumberCandidateRunBytes{
       "cudf.topn_row_number.candidate_run_bytes"};
   // Hard limit for the complete build table retained by CudfNestedLoopJoin.

@@ -733,7 +733,12 @@ void CudfTopNRowNumber::cleanupSpillFiles() {
   }
   std::error_code error;
   std::filesystem::remove_all(spillDirectory_, error);
-  spillDirectory_.clear();
+  if (error) {
+    LOG(ERROR) << "Failed to remove CudfTopNRowNumber spill directory '"
+               << spillDirectory_ << "': " << error.message();
+  } else {
+    spillDirectory_.clear();
+  }
   ::malloc_trim(0);
 }
 
