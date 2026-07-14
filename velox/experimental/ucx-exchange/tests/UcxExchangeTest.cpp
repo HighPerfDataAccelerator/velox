@@ -177,9 +177,13 @@ class UcxExchangeTest : public testing::TestWithParam<ExchangeTestParams> {
 
   static void TearDownTestCase() {
     communicator_->stop();
-    communicator_.reset();
     communicatorThread_->join();
     communicatorThread_.reset();
+    Communicator::shutdown();
+    // The explicit finalizer is intentionally idempotent because Spark's
+    // plugin shutdown and JVM shutdown hook can both invoke native teardown.
+    Communicator::shutdown();
+    communicator_.reset();
   }
 
   void SetUp() override {

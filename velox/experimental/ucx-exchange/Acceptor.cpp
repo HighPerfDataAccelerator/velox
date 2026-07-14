@@ -29,124 +29,135 @@ namespace facebook::velox::ucx_exchange {
 void Acceptor::cStyleAMCallback(
     std::shared_ptr<ucxx::Request> request,
     ucp_ep_h ep) {
-  VELOX_CHECK_NOT_NULL(request, "AMCallback called with nullptr request!");
-  VELOX_CHECK(
-      request->isCompleted(), "AMCallback called with incomplete request!");
-  auto buffer =
-      std::dynamic_pointer_cast<ucxx::Buffer>(request->getRecvBuffer());
-  VELOX_CHECK_NOT_NULL(buffer, "AMCallback: failed to get receive buffer.");
-  // Validate buffer size BEFORE casting to prevent reading past buffer bounds.
-  VELOX_CHECK_GE(
-      buffer->getSize(),
-      sizeof(HandshakeMsg),
-      "AMCallback: received buffer size ({}) is smaller than HandshakeMsg ({}). "
-      "Possible protocol mismatch or truncated message.",
-      buffer->getSize(),
-      sizeof(HandshakeMsg));
-  // Copy out of UCXX-owned storage before parsing.  This also avoids relying
-  // on the alignment of the active-message receive buffer.
-  HandshakeMsg handshake{};
-  std::memcpy(&handshake, buffer->data(), sizeof(handshake));
-  const auto taskIdEnd = static_cast<const char*>(
-      std::memchr(handshake.taskId, '\0', sizeof(handshake.taskId)));
-  VELOX_CHECK_NOT_NULL(taskIdEnd, "Handshake task id is not NUL terminated");
-  VELOX_CHECK_GT(taskIdEnd, handshake.taskId, "Handshake task id is empty");
-  VELOX_CHECK_LT(
-      handshake.destination,
-      65536,
-      "Handshake destination is invalid: {}",
-      handshake.destination);
-
-  // Create a exchangeServer based on the information received in the initial
-  // handshake.
-  std::shared_ptr<Communicator> communicator = Communicator::getInstance();
-
-  auto epRef = communicator->findEndpointRefByHandle(ep);
-  VELOX_CHECK_NOT_NULL(epRef, "Could not find endpoint reference");
-  const std::string peerAddress = epRef->getPeerAddress();
-
-  const PartitionKey key = {handshake.taskId, handshake.destination};
-
-  // Determine if this is an intra-process transfer by comparing the source's
-  // workerId with our Communicator's workerId. A match means both source and
-  // server are in the same Communicator singleton (same process), so
-  // IntraNodeTransferRegistry (in-process std::promise/future) can be used.
-  //
-  // Previous approach used IP comparison (getLocalIpAddresses), which fails
-  // when multiple Docker containers share the same host IP address.
-  const bool sameWorker = handshake.workerId == communicator->getWorkerId();
-  bool isIntraNodeTransfer =
-      cudf_velox::CudfConfig::getInstance().intraNodeExchange && sameWorker;
-
-  // Disable intra-node until the task is initialized. Broadcast is safe after
-  // initialization because the intra-node source clones shared pages.
-  if (isIntraNodeTransfer) {
-    auto queueMgr = UcxOutputQueueManager::getInstanceRef();
-    const bool canUseIntraNode = queueMgr->canUseIntraNode(key.taskId);
-    VLOG(2) << "[UCX-ACCEPTOR-INTRA-CHECK] task=" << key.taskId
-            << " destination=" << key.destination << " peer=" << peerAddress
-            << " sourceWorkerId=" << handshake.workerId
-            << " localWorkerId=" << communicator->getWorkerId()
-            << " sameWorker=" << sameWorker
-            << " canUseIntraNode=" << canUseIntraNode
-            << " queue=" << queueMgr->describeQueueForIntraNode(key.taskId);
-    if (!canUseIntraNode) {
-      VLOG(2) << "[ACCEPTOR] Disabling intra-node for task " << key.taskId
-              << " (not initialized or broadcast)";
-      isIntraNodeTransfer = false;
+  try {
+    VELOX_CHECK_NOT_NULL(request, "AMCallback called with nullptr request!");
+    VELOX_CHECK(
+        request->isCompleted(), "AMCallback called with incomplete request!");
+    if (request->getStatus() != UCS_OK) {
+      return;
     }
-  } else {
-    VLOG(2) << "[UCX-ACCEPTOR-REMOTE] task=" << key.taskId
-            << " destination=" << key.destination << " peer=" << peerAddress
-            << " sourceWorkerId=" << handshake.workerId
-            << " localWorkerId=" << communicator->getWorkerId()
-            << " sameWorker=" << sameWorker << " intraNodeEnabled="
-            << cudf_velox::CudfConfig::getInstance().intraNodeExchange;
+    auto communicator = Communicator::tryGetInstance();
+    if (!communicator || communicator->isShuttingDown()) {
+      return;
+    }
+    auto buffer =
+        std::dynamic_pointer_cast<ucxx::Buffer>(request->getRecvBuffer());
+    VELOX_CHECK_NOT_NULL(buffer, "AMCallback: failed to get receive buffer.");
+    // Validate buffer size BEFORE casting to prevent reading past buffer bounds.
+    VELOX_CHECK_GE(
+        buffer->getSize(),
+        sizeof(HandshakeMsg),
+        "AMCallback: received buffer size ({}) is smaller than HandshakeMsg ({}). "
+        "Possible protocol mismatch or truncated message.",
+        buffer->getSize(),
+        sizeof(HandshakeMsg));
+    // Copy out of UCXX-owned storage before parsing.  This also avoids relying
+    // on the alignment of the active-message receive buffer.
+    HandshakeMsg handshake{};
+    std::memcpy(&handshake, buffer->data(), sizeof(handshake));
+    const auto taskIdEnd = static_cast<const char*>(
+        std::memchr(handshake.taskId, '\0', sizeof(handshake.taskId)));
+    VELOX_CHECK_NOT_NULL(taskIdEnd, "Handshake task id is not NUL terminated");
+    VELOX_CHECK_GT(taskIdEnd, handshake.taskId, "Handshake task id is empty");
+    VELOX_CHECK_LT(
+        handshake.destination,
+        65536,
+        "Handshake destination is invalid: {}",
+        handshake.destination);
+
+    // Create a exchangeServer based on the information received in the initial
+    // handshake.
+    auto epRef = communicator->findEndpointRefByHandle(ep);
+    VELOX_CHECK_NOT_NULL(epRef, "Could not find endpoint reference");
+    const std::string peerAddress = epRef->getPeerAddress();
+
+    const PartitionKey key = {handshake.taskId, handshake.destination};
+
+    // Determine if this is an intra-process transfer by comparing the source's
+    // workerId with our Communicator's workerId. A match means both source and
+    // server are in the same Communicator singleton (same process), so
+    // IntraNodeTransferRegistry (in-process std::promise/future) can be used.
+    //
+    // Previous approach used IP comparison (getLocalIpAddresses), which fails
+    // when multiple Docker containers share the same host IP address.
+    const bool sameWorker = handshake.workerId == communicator->getWorkerId();
+    bool isIntraNodeTransfer =
+        cudf_velox::CudfConfig::getInstance().intraNodeExchange && sameWorker;
+
+    // Disable intra-node until the task is initialized. Broadcast is safe after
+    // initialization because the intra-node source clones shared pages.
+    if (isIntraNodeTransfer) {
+      auto queueMgr = UcxOutputQueueManager::getInstanceRef();
+      const bool canUseIntraNode = queueMgr->canUseIntraNode(key.taskId);
+      VLOG(2) << "[UCX-ACCEPTOR-INTRA-CHECK] task=" << key.taskId
+              << " destination=" << key.destination << " peer=" << peerAddress
+              << " sourceWorkerId=" << handshake.workerId
+              << " localWorkerId=" << communicator->getWorkerId()
+              << " sameWorker=" << sameWorker
+              << " canUseIntraNode=" << canUseIntraNode
+              << " queue=" << queueMgr->describeQueueForIntraNode(key.taskId);
+      if (!canUseIntraNode) {
+        VLOG(2) << "[ACCEPTOR] Disabling intra-node for task " << key.taskId
+                << " (not initialized or broadcast)";
+        isIntraNodeTransfer = false;
+      }
+    } else {
+      VLOG(2) << "[UCX-ACCEPTOR-REMOTE] task=" << key.taskId
+              << " destination=" << key.destination << " peer=" << peerAddress
+              << " sourceWorkerId=" << handshake.workerId
+              << " localWorkerId=" << communicator->getWorkerId()
+              << " sameWorker=" << sameWorker << " intraNodeEnabled="
+              << cudf_velox::CudfConfig::getInstance().intraNodeExchange;
+    }
+
+    auto exchangeServer =
+        UcxExchangeServer::create(communicator, epRef, key, isIntraNodeTransfer);
+
+    // Add this exchangeServer to the endpoint reference.
+    epRef->addCommElem(exchangeServer);
+
+    // Register exchangeServer with communicator.
+    communicator->registerCommElement(exchangeServer);
+    VLOG(2) << "[ACCEPTOR] new server: " << exchangeServer->toString()
+            << " peer=" << peerAddress
+            << " isIntraNodeTransfer=" << isIntraNodeTransfer;
+
+    // Send HandshakeResponse back to the source to inform about intra-node
+    // transfer. This allows the source to bypass UCXX for all subsequent data
+    // transfers.
+    auto response = std::make_shared<HandshakeResponse>();
+    response->isIntraNodeTransfer = exchangeServer->isIntraNodeTransfer();
+
+    uint32_t keyHash = fnv1a_32(key.toString());
+    uint64_t responseTag = getHandshakeResponseTag(keyHash);
+
+    VLOG(3) << "Sending HandshakeResponse to " << key.toString()
+            << " peer=" << peerAddress
+            << " isIntraNodeTransfer=" << response->isIntraNodeTransfer
+            << " tag=" << std::hex << responseTag;
+
+    // Fire-and-forget: we don't need to track this request completion
+    epRef->endpoint_->tagSend(
+        response.get(),
+        sizeof(*response),
+        ucxx::Tag{responseTag},
+        false,
+        [response, keyStr = key.toString(), peerAddress](
+            ucs_status_t status, std::shared_ptr<void> arg) {
+          if (status == UCS_OK) {
+            VLOG(3) << "HandshakeResponse sent successfully to " << keyStr
+                    << " peer=" << peerAddress;
+          } else {
+            VLOG(0) << "Failed to send HandshakeResponse to " << keyStr << ": "
+                    << ucs_status_string(status) << " peer=" << peerAddress;
+          }
+        },
+        response);
+  } catch (const std::exception& e) {
+    LOG(ERROR) << "Ignoring UCX active-message callback failure: " << e.what();
+  } catch (...) {
+    LOG(ERROR) << "Ignoring unknown UCX active-message callback failure";
   }
-
-  auto exchangeServer =
-      UcxExchangeServer::create(communicator, epRef, key, isIntraNodeTransfer);
-
-  // Add this exchangeServer to the endpoint reference.
-  epRef->addCommElem(exchangeServer);
-
-  // Register exchangeServer with communicator.
-  communicator->registerCommElement(exchangeServer);
-  VLOG(2) << "[ACCEPTOR] new server: " << exchangeServer->toString()
-          << " peer=" << peerAddress
-          << " isIntraNodeTransfer=" << isIntraNodeTransfer;
-
-  // Send HandshakeResponse back to the source to inform about intra-node
-  // transfer. This allows the source to bypass UCXX for all subsequent data
-  // transfers.
-  auto response = std::make_shared<HandshakeResponse>();
-  response->isIntraNodeTransfer = exchangeServer->isIntraNodeTransfer();
-
-  uint32_t keyHash = fnv1a_32(key.toString());
-  uint64_t responseTag = getHandshakeResponseTag(keyHash);
-
-  VLOG(3) << "Sending HandshakeResponse to " << key.toString()
-          << " peer=" << peerAddress
-          << " isIntraNodeTransfer=" << response->isIntraNodeTransfer
-          << " tag=" << std::hex << responseTag;
-
-  // Fire-and-forget: we don't need to track this request completion
-  epRef->endpoint_->tagSend(
-      response.get(),
-      sizeof(*response),
-      ucxx::Tag{responseTag},
-      false,
-      [response, keyStr = key.toString(), peerAddress](
-          ucs_status_t status, std::shared_ptr<void> arg) {
-        if (status == UCS_OK) {
-          VLOG(3) << "HandshakeResponse sent successfully to " << keyStr
-                  << " peer=" << peerAddress;
-        } else {
-          VLOG(0) << "Failed to send HandshakeResponse to " << keyStr << ": "
-                  << ucs_status_string(status) << " peer=" << peerAddress;
-        }
-      },
-      response);
 }
 
 // Add endpoint reference to ucp_cp -> epRef map.

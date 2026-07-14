@@ -54,6 +54,11 @@ struct CudfConfig {
   static constexpr const char* kCudfFunctionEngine{"cudf.function_engine"};
   /// Query session configs for the cuDF Operators.
   static constexpr const char* kCudfTopNBatchSize{"cudf.topk_batch_size"};
+  // Hard limit for the complete build table retained by CudfNestedLoopJoin.
+  // The default is intentionally unbounded for non-MPP callers; Gluten MPP
+  // supplies a conservative value for replicated Cartesian joins.
+  static constexpr const char* kCudfNestedLoopJoinMaxBuildBytes{
+      "cudf.nested_loop_join.max_build_bytes"};
   static constexpr const char* kCudfSkipOutputToVelox{
       "velox.cudf.skip_output_to_velox"};
 

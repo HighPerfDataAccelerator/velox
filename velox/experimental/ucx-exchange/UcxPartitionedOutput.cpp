@@ -15,6 +15,7 @@
  */
 #include "velox/experimental/ucx-exchange/UcxPartitionedOutput.h"
 #include <fmt/format.h>
+#include <folly/json.h>
 #include <algorithm>
 #include <cstdlib>
 #include "velox/core/PlanNode.h"
@@ -23,13 +24,16 @@
 #include "velox/exec/Operator.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
+#include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
+#include "velox/experimental/ucx-exchange/RangePartitionFunction.h"
 
 #include <cudf/concatenate.hpp>
 #include <cudf/contiguous_split.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/detail/utilities/stream_pool.hpp>
 #include <cudf/partitioning.hpp>
+#include <cudf/search.hpp>
 
 using namespace facebook::velox::cudf_velox;
 using facebook::velox::exec::Task;
@@ -48,6 +52,121 @@ int64_t targetRowsPerUcxChunk(const core::QueryConfig& queryConfig) {
     }
   }
   return queryConfig.ucxPartitionedOutputBatchRows();
+}
+
+RowVectorPtr buildRangeBoundaryVector(
+    const std::string& boundsJson,
+    const RowTypePtr& inputType,
+    const std::vector<column_index_t>& keyChannels,
+    memory::MemoryPool* pool,
+    std::vector<cudf::order>& orders,
+    std::vector<cudf::null_order>& nullOrders) {
+  const auto descriptor = folly::parseJson(boundsJson);
+  VELOX_CHECK_EQ(
+      descriptor["version"].asInt(), 1, "Unsupported RANGE_PID descriptor version");
+  const auto& keys = descriptor["keys"];
+  const auto& bounds = descriptor["bounds"];
+  VELOX_CHECK(keys.isArray(), "RANGE_PID keys must be an array");
+  VELOX_CHECK(bounds.isArray(), "RANGE_PID bounds must be an array");
+  VELOX_CHECK_EQ(
+      keys.size(), keyChannels.size(), "RANGE_PID key metadata/channel mismatch");
+
+  std::vector<std::string> names;
+  std::vector<TypePtr> types;
+  names.reserve(keyChannels.size());
+  types.reserve(keyChannels.size());
+  orders.clear();
+  nullOrders.clear();
+  for (size_t key = 0; key < keyChannels.size(); ++key) {
+    const auto channel = keyChannels[key];
+    VELOX_CHECK_LT(channel, inputType->size(), "RANGE_PID key channel out of bounds");
+    names.push_back(inputType->nameOf(channel));
+    types.push_back(inputType->childAt(channel));
+    orders.push_back(
+        keys[key]["ascending"].asBool() ? cudf::order::ASCENDING
+                                         : cudf::order::DESCENDING);
+    nullOrders.push_back(
+        keys[key]["nullsFirst"].asBool() ? cudf::null_order::BEFORE
+                                          : cudf::null_order::AFTER);
+  }
+
+  auto boundaryType = ROW(std::move(names), std::move(types));
+  auto vector = std::dynamic_pointer_cast<RowVector>(
+      BaseVector::create(boundaryType, bounds.size(), pool));
+  VELOX_CHECK_NOT_NULL(vector);
+
+  for (size_t row = 0; row < bounds.size(); ++row) {
+    VELOX_CHECK(bounds[row].isArray(), "RANGE_PID boundary must be an array");
+    VELOX_CHECK_EQ(
+        bounds[row].size(), keyChannels.size(), "RANGE_PID boundary width mismatch");
+    for (size_t key = 0; key < keyChannels.size(); ++key) {
+      const auto& encoded = bounds[row][key];
+      auto child = vector->childAt(key);
+      if (encoded["isNull"].asBool()) {
+        child->setNull(row, true);
+        continue;
+      }
+
+      const auto& value = encoded["value"];
+      const auto& type = boundaryType->childAt(key);
+      if (type->isDate()) {
+        child->asFlatVector<int32_t>()->set(row, value.asInt());
+      } else if (type->isTimestamp()) {
+        child->asFlatVector<Timestamp>()->set(
+            row, Timestamp::fromMicros(value.asInt()));
+      } else {
+        switch (type->kind()) {
+          case TypeKind::BOOLEAN:
+            child->asFlatVector<bool>()->set(row, value.asBool());
+            break;
+          case TypeKind::TINYINT:
+            child->asFlatVector<int8_t>()->set(row, value.asInt());
+            break;
+          case TypeKind::SMALLINT:
+            child->asFlatVector<int16_t>()->set(row, value.asInt());
+            break;
+          case TypeKind::INTEGER:
+            child->asFlatVector<int32_t>()->set(row, value.asInt());
+            break;
+          case TypeKind::BIGINT:
+            child->asFlatVector<int64_t>()->set(row, value.asInt());
+            break;
+          case TypeKind::REAL:
+            child->asFlatVector<float>()->set(
+                row, static_cast<float>(value.asDouble()));
+            break;
+          case TypeKind::DOUBLE:
+            child->asFlatVector<double>()->set(row, value.asDouble());
+            break;
+          case TypeKind::VARCHAR: {
+            const auto stringValue = value.asString();
+            child->asFlatVector<StringView>()->set(row, StringView(stringValue));
+            break;
+          }
+          default:
+            VELOX_UNSUPPORTED(
+                "RANGE_PID D1 does not support native key type {}",
+                type->toString());
+        }
+      }
+    }
+  }
+  return vector;
+}
+
+void normalizePartitionOffsets(
+    std::vector<cudf::size_type>& offsets,
+    size_t numPartitions) {
+  VELOX_CHECK(
+      offsets.size() == numPartitions || offsets.size() == numPartitions + 1,
+      "Unexpected libcudf partition offset count {} for {} partitions",
+      offsets.size(),
+      numPartitions);
+  VELOX_CHECK_EQ(offsets.front(), 0);
+  offsets.erase(offsets.begin());
+  if (offsets.size() == numPartitions) {
+    offsets.pop_back();
+  }
 }
 } // namespace
 
@@ -196,7 +315,9 @@ void UcxPartitionedOutput::flushPending() {
     // Partition + enqueue (identical to previous addInput logic).
     auto queueManager = sharedQueueManager();
     if (numPartitions_ > 1) {
-      if (partitionKeyIndices_.size() > 0 || spec_ == "gather") {
+      if (!rangeBoundsJson_.empty()) {
+        rangePartition(tableView, stream);
+      } else if (partitionKeyIndices_.size() > 0 || spec_ == "gather") {
         hashPartition(tableView, stream);
       } else {
         equalPartition(tableView, stream);
@@ -310,6 +431,17 @@ void UcxPartitionedOutput::initPartitionKeys(
   // Get partition function specification string
   spec_ = planNode->partitionFunctionSpec().toString();
 
+  if (auto* rangeFunctionSpec =
+          dynamic_cast<const RangePartitionFunctionSpec*>(
+              &planNode->partitionFunctionSpec())) {
+    partitionKeyIndices_ = rangeFunctionSpec->keyChannels();
+    rangeBoundsJson_ = rangeFunctionSpec->boundsJson();
+    VELOX_CHECK(
+        !partitionKeyIndices_.empty() && !rangeBoundsJson_.empty(),
+        "RANGE_PID requires both keys and Spark boundaries");
+    return;
+  }
+
   // Only parse keys if it's a hash function
   if (spec_.find("HASH(") != std::string::npos) {
     // Extract keys between HASH( and )
@@ -370,6 +502,63 @@ void UcxPartitionedOutput::hashPartition(
   partitionOffsets.erase(partitionOffsets.begin());
   partitionOffsets.pop_back();
 
+  splitAndEnqueue(partitionedTable->view(), partitionOffsets, stream);
+}
+
+void UcxPartitionedOutput::rangePartition(
+    cudf::table_view tableView,
+    rmm::cuda_stream_view stream) {
+  VELOX_CHECK(!rangeBoundsJson_.empty(), "RANGE_PID descriptor is missing");
+  VELOX_CHECK(!partitionKeyIndices_.empty(), "RANGE_PID keys are missing");
+
+  if (!rangeBoundaries_) {
+    auto boundaryVector = buildRangeBoundaryVector(
+        rangeBoundsJson_,
+        outputType_,
+        partitionKeyIndices_,
+        pool(),
+        rangeOrders_,
+        rangeNullOrders_);
+    rangeBoundaries_ = cudf_velox::with_arrow::toCudfTable(
+        boundaryVector,
+        pool(),
+        stream,
+        cudf::get_current_device_resource_ref());
+    VELOX_CHECK_LT(
+        rangeBoundaries_->num_rows(),
+        numPartitions_,
+        "RANGE_PID boundary count must be smaller than requested partitions");
+  }
+
+  std::vector<cudf::size_type> rangeKeyIndices;
+  rangeKeyIndices.reserve(partitionKeyIndices_.size());
+  for (const auto index : partitionKeyIndices_) {
+    rangeKeyIndices.push_back(static_cast<cudf::size_type>(index));
+  }
+  const auto keyTable = tableView.select(rangeKeyIndices);
+  auto partitionIds = cudf::lower_bound(
+      rangeBoundaries_->view(),
+      keyTable,
+      rangeOrders_,
+      rangeNullOrders_,
+      stream,
+      cudf::get_current_device_resource_ref());
+  VELOX_CHECK(
+      partitionIds->size() == tableView.num_rows(),
+      "RANGE_PID must produce exactly one id per input row");
+  VELOX_CHECK(
+      partitionIds->type().id() == cudf::type_id::INT32,
+      "RANGE_PID must produce an INT32 partition map");
+
+  // libcudf::partition groups by the explicit INT32 map. No hash function is
+  // involved; the returned table is routed directly to destination queues.
+  auto [partitionedTable, partitionOffsets] = cudf::partition(
+      tableView,
+      partitionIds->view(),
+      numPartitions_,
+      stream,
+      cudf::get_current_device_resource_ref());
+  normalizePartitionOffsets(partitionOffsets, numPartitions_);
   splitAndEnqueue(partitionedTable->view(), partitionOffsets, stream);
 }
 

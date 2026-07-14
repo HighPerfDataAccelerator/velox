@@ -59,9 +59,14 @@ class CudfNestedLoopJoinBridge : public exec::JoinBridge {
 
   std::optional<rmm::cuda_stream_view> getBuildStream();
 
+  void reserveBuildBytes(uint64_t bytes, uint64_t maxBuildBytes);
+
+  void releaseBuildBytes(uint64_t bytes);
+
  private:
   std::optional<build_data_type> data_;
   std::optional<rmm::cuda_stream_view> buildStream_;
+  uint64_t retainedBuildBytes_{0};
 };
 
 /// Accumulates build-side input for nested loop join.
@@ -100,8 +105,20 @@ class CudfNestedLoopJoinBuild : public CudfOperatorBase {
  private:
   std::shared_ptr<const core::NestedLoopJoinNode> joinNode_;
   std::vector<CudfVectorPtr> inputs_;
+  uint64_t maxBuildBytes_;
+  uint64_t bufferedBuildBytes_{0};
   ContinueFuture future_{ContinueFuture::makeEmpty()};
 };
+
+/// Constructs the build operator in the same translation unit that defines
+/// CudfNestedLoopJoinBuild.  Keep external adapters on this factory instead of
+/// inlining make_unique<CudfNestedLoopJoinBuild>: doing so prevents a stale
+/// caller object from baking in an older concrete class size after the build
+/// operator gains or removes private state.
+std::unique_ptr<exec::Operator> makeCudfNestedLoopJoinBuild(
+    int32_t operatorId,
+    exec::DriverCtx* driverCtx,
+    std::shared_ptr<const core::NestedLoopJoinNode> joinNode);
 
 /// Performs nested loop join using cuDF APIs.
 ///

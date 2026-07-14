@@ -88,6 +88,10 @@ class UcxExchangeServer
   /// @return A shared pointer to itself.
   std::shared_ptr<UcxExchangeServer> getSelfPtr();
 
+  /// Re-enqueues this server if the Communicator is still accepting work.
+  /// Safe for UCXX and registry callbacks during shutdown.
+  void wakeCommunicator();
+
   /// @brief Sends metadata and data to the connected receiver.
   void sendData();
 

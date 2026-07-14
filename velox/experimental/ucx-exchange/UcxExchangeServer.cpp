@@ -256,7 +256,7 @@ void UcxExchangeServer::process() {
   switch (state_) {
     case ServerState::Created:
       setState(ServerState::ReadyToTransfer);
-      communicator_->addToWorkQueue(getSelfPtr());
+      wakeCommunicator();
       break;
     case ServerState::ReadyToTransfer:
       // Count-only / rendezvous push (Presto-style): no consumer credit
@@ -264,7 +264,7 @@ void UcxExchangeServer::process() {
       // rendezvous until the source posts its matching tagRecv
       // (getMetadata/getData), which is the sole flow-control mechanism.
       setState(ServerState::DataRequestReady);
-      communicator_->addToWorkQueue(getSelfPtr());
+      wakeCommunicator();
       break;
     case ServerState::DataRequestReady:
       setState(ServerState::WaitingForDataFromQueue);
@@ -311,10 +311,10 @@ void UcxExchangeServer::process() {
                   "Data pointer exists: Illegal state!");
               self->dataPtr_ = std::move(data);
               self->setState(ServerState::DataReady);
-              self->communicator_->addToWorkQueue(self);
+              self->wakeCommunicator();
             });
       }
-      this->communicator_->addToWorkQueue(getSelfPtr());
+      wakeCommunicator();
       break;
     case ServerState::WaitingForDataFromQueue:
       // Waiting for data is handled by an upcall from the data queue. Nothing
@@ -350,7 +350,7 @@ void UcxExchangeServer::process() {
                     << "] still waiting for source retrieval, polls="
                     << intraNodePollCount_;
           }
-          communicator_->addToWorkQueue(getSelfPtr());
+          wakeCommunicator();
         }
       }
       break;
@@ -397,20 +397,23 @@ void UcxExchangeServer::close() {
   // Move all requests to the Communicator's deferred list so the GPU
   // buffers they reference (via their arg shared_ptr) stay alive until
   // UCX has fully processed any in-flight operations.
-  if (communicator_) {
+  auto communicator = communicator_.lock();
+  if (communicator) {
     if (metaRequest_) {
-      communicator_->deferRequestCleanup(std::move(metaRequest_));
+      communicator->deferRequestCleanup(std::move(metaRequest_));
     }
     if (dataRequest_) {
-      communicator_->deferRequestCleanup(std::move(dataRequest_));
+      communicator->deferRequestCleanup(std::move(dataRequest_));
     }
     for (auto& req : completedRequests_) {
-      communicator_->deferRequestCleanup(std::move(req));
+      communicator->deferRequestCleanup(std::move(req));
     }
     completedRequests_.clear();
   }
 
-  communicator_->unregister(getSelfPtr());
+  if (communicator) {
+    communicator->unregister(getSelfPtr());
+  }
 }
 
 std::string UcxExchangeServer::toString() {
@@ -426,7 +429,17 @@ std::shared_ptr<UcxExchangeServer> UcxExchangeServer::getSelfPtr() {
   return shared_from_this();
 }
 
+void UcxExchangeServer::wakeCommunicator() {
+  if (auto communicator = tryCommunicator()) {
+    communicator->addToWorkQueue(getSelfPtr());
+  }
+}
+
 void UcxExchangeServer::sendData() {
+  auto communicator = tryCommunicator();
+  if (!communicator) {
+    return;
+  }
   std::lock_guard<std::recursive_mutex> lock(dataMutex_);
 
   VLOG(2) << (isIntraNodeTransfer_ ? "[INTRA]" : "[REMOTE]") << " [ExSrv "
@@ -468,7 +481,7 @@ void UcxExchangeServer::sendData() {
       // re-enqueues this server.
       setState(ServerState::WaitingForIntraNodeRetrieve);
       if (intraNodeProducerPollRequeueEnabled()) {
-        communicator_->addToWorkQueue(getSelfPtr());
+        wakeCommunicator();
       }
     } else {
       // Data pointer is null, so no more data will be coming.
@@ -494,12 +507,12 @@ void UcxExchangeServer::sendData() {
       // wakeup re-enqueues this server when that happens.
       setState(ServerState::WaitingForIntraNodeRetrieve);
       if (intraNodeProducerPollRequeueEnabled()) {
-        communicator_->addToWorkQueue(getSelfPtr());
+        wakeCommunicator();
       }
     }
   } else {
     // REMOTE EXCHANGE PATH: Use UCXX for metadata and data transfer
-    const bool useHostStaging = !communicator_->hasCudaTransport();
+    const bool useHostStaging = !communicator->hasCudaTransport();
     std::shared_ptr<DataSendContext> dataCtx;
     if (dataPtr_) {
       const auto hostBytes = static_cast<int64_t>(dataPtr_->gpu_data->size());
@@ -508,7 +521,7 @@ void UcxExchangeServer::sendData() {
         // Keep dataPtr_ and state=DataReady.  Completed UCX callbacks release
         // process-wide credit; requeueing lets this server retry without
         // dequeuing or staging another packed table.
-        communicator_->addToWorkQueue(getSelfPtr());
+        wakeCommunicator();
         return;
       }
     }
@@ -581,7 +594,7 @@ void UcxExchangeServer::sendData() {
                     << metadataTag << std::dec
                     << " status=" << ucs_status_string(status);
             self->setState(ServerState::Done);
-            self->communicator_->addToWorkQueue(self);
+            self->wakeCommunicator();
           }
         },
         metaCtx);
@@ -668,7 +681,7 @@ void UcxExchangeServer::sendData() {
               << partitionKey_.toString();
       queueMgr_->deleteResults(partitionKey_.taskId, partitionKey_.destination);
       setState(ServerState::Done);
-      communicator_->addToWorkQueue(getSelfPtr());
+      wakeCommunicator();
     }
   }
 }
@@ -712,14 +725,18 @@ void UcxExchangeServer::sendComplete(
             << " bytes=" << bytes_ << " status=" << ucs_status_string(status);
     setState(ServerState::Done);
   }
-  communicator_->addToWorkQueue(getSelfPtr());
+  wakeCommunicator();
 }
 
 std::function<void()> UcxExchangeServer::makeIntraNodeRetrieveWakeup() {
   std::weak_ptr<CommElement> weakSelf = getSelfPtr();
-  auto communicator = communicator_;
-  return [weakSelf, communicator]() {
-    if (auto server = weakSelf.lock()) {
+  auto weakCommunicator = communicator_;
+  return [weakSelf, weakCommunicator]() {
+    if (auto server = weakSelf.lock(); server) {
+      auto communicator = weakCommunicator.lock();
+      if (!communicator) {
+        return;
+      }
       communicator->addToWorkQueue(server);
     }
   };
@@ -759,7 +776,7 @@ void UcxExchangeServer::onIntraNodeRetrieveComplete() {
     this->sequenceNumber_++;
     setState(ServerState::ReadyToTransfer);
   }
-  communicator_->addToWorkQueue(getSelfPtr());
+  wakeCommunicator();
 }
 
 } // namespace facebook::velox::ucx_exchange

@@ -198,6 +198,10 @@ class UcxExchangeSource
   /// @return A shared pointer to itself.
   std::shared_ptr<UcxExchangeSource> getSelfPtr();
 
+  /// Re-enqueues this source if the Communicator is still accepting work.
+  /// Safe for UCXX and registry callbacks during shutdown.
+  void wakeCommunicator();
+
   // Put the received data into the exchange queue.
   void enqueue(PackedTableWithStreamPtr data, int64_t reservedReceiveBytes = 0);
 
