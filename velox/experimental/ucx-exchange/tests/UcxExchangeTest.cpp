@@ -86,7 +86,7 @@ static std::vector<ExchangeTestParams> generateTestParams() {
       {"MultiPartition", 1, 1, 4, 100, 1000, TableType::NARROW},
       // Test with multiple partitions and multiple drivers
       {"MultiPartitionDrivers", 4, 4, 4, 25, 1000, TableType::NARROW},
-      // Wide table tests with all data types including STRUCT
+      // Wide table tests with numeric types shared by Velox and cuDF.
       // Single partition wide table (no hash partitioning)
       {"WideTableSingle", 1, 1, 1, 100, 1000, TableType::WIDE},
       // Multi-partition wide table (uses hash partitioning)

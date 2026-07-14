@@ -369,10 +369,6 @@ void WideTestTable::initialize(size_t numRows) {
   int16Data_.resize(numRows);
   int32Data_.resize(numRows);
   int64Data_.resize(numRows);
-  uint8Data_.resize(numRows);
-  uint16Data_.resize(numRows);
-  uint32Data_.resize(numRows);
-  uint64Data_.resize(numRows);
   float32Data_.resize(numRows);
   float64Data_.resize(numRows);
   boolData_.resize(numRows);
@@ -385,10 +381,6 @@ void WideTestTable::initialize(size_t numRows) {
     int16Data_[i] = static_cast<int16_t>(randInt % 32768);
     int32Data_[i] = static_cast<int32_t>(randInt);
     int64Data_[i] = randInt;
-    uint8Data_[i] = static_cast<uint8_t>(std::abs(randInt) % 256);
-    uint16Data_[i] = static_cast<uint16_t>(std::abs(randInt) % 65536);
-    uint32Data_[i] = static_cast<uint32_t>(std::abs(randInt));
-    uint64Data_[i] = static_cast<uint64_t>(std::abs(randInt));
     float32Data_[i] = static_cast<float>(randDouble);
     float64Data_[i] = randDouble;
     boolData_[i] = boolDist(gen);
@@ -404,10 +396,6 @@ void WideTestTable::addNumericColumns(
   columns.push_back(makeNumericColumn(int16Data_, stream));
   columns.push_back(makeNumericColumn(int32Data_, stream));
   columns.push_back(makeNumericColumn(int64Data_, stream));
-  columns.push_back(makeNumericColumn(uint8Data_, stream));
-  columns.push_back(makeNumericColumn(uint16Data_, stream));
-  columns.push_back(makeNumericColumn(uint32Data_, stream));
-  columns.push_back(makeNumericColumn(uint64Data_, stream));
   columns.push_back(makeNumericColumn(float32Data_, stream));
   columns.push_back(makeNumericColumn(float64Data_, stream));
   columns.push_back(makeNumericColumn(boolData_, stream));
@@ -425,18 +413,14 @@ bool WideTestTable::verifyNumericColumns(
     size_t startRow,
     size_t numRows,
     rmm::cuda_stream_view stream) {
-  // Verify numeric columns (columns 0-10)
+  // Verify numeric columns (columns 0-6).
   auto rxInt8 = getColVector<int8_t>(table.column(0), numRows, stream);
   auto rxInt16 = getColVector<int16_t>(table.column(1), numRows, stream);
   auto rxInt32 = getColVector<int32_t>(table.column(2), numRows, stream);
   auto rxInt64 = getColVector<int64_t>(table.column(3), numRows, stream);
-  auto rxUint8 = getColVector<uint8_t>(table.column(4), numRows, stream);
-  auto rxUint16 = getColVector<uint16_t>(table.column(5), numRows, stream);
-  auto rxUint32 = getColVector<uint32_t>(table.column(6), numRows, stream);
-  auto rxUint64 = getColVector<uint64_t>(table.column(7), numRows, stream);
-  auto rxFloat32 = getColVector<float>(table.column(8), numRows, stream);
-  auto rxFloat64 = getColVector<double>(table.column(9), numRows, stream);
-  auto rxBool = getColVector<int8_t>(table.column(10), numRows, stream);
+  auto rxFloat32 = getColVector<float>(table.column(4), numRows, stream);
+  auto rxFloat64 = getColVector<double>(table.column(5), numRows, stream);
+  auto rxBool = getColVector<int8_t>(table.column(6), numRows, stream);
 
   // Use modular indexing because batch accumulation in UcxPartitionedOutput
   // may concatenate multiple identical chunks into one larger table, causing
@@ -446,10 +430,6 @@ bool WideTestTable::verifyNumericColumns(
 
     if (rxInt8[i] != int8Data_[srcIdx] || rxInt16[i] != int16Data_[srcIdx] ||
         rxInt32[i] != int32Data_[srcIdx] || rxInt64[i] != int64Data_[srcIdx] ||
-        rxUint8[i] != uint8Data_[srcIdx] ||
-        rxUint16[i] != uint16Data_[srcIdx] ||
-        rxUint32[i] != uint32Data_[srcIdx] ||
-        rxUint64[i] != uint64Data_[srcIdx] ||
         rxFloat32[i] != float32Data_[srcIdx] ||
         rxFloat64[i] != float64Data_[srcIdx] ||
         rxBool[i] != boolData_[srcIdx]) {
@@ -465,8 +445,8 @@ bool WideTestTable::verifyTable(
     size_t startRow,
     size_t numRows,
     rmm::cuda_stream_view stream) {
-  if (table.num_columns() != 11) {
-    VLOG(0) << "WideTestTable::verifyTable: expected 11 columns, got "
+  if (table.num_columns() != 7) {
+    VLOG(0) << "WideTestTable::verifyTable: expected 7 columns, got "
             << table.num_columns();
     return false;
   }
@@ -529,8 +509,8 @@ bool WideComplexTestTable::verifyTable(
     size_t startRow,
     size_t numRows,
     rmm::cuda_stream_view stream) {
-  if (table.num_columns() != 13) {
-    VLOG(0) << "WideComplexTestTable::verifyTable: expected 13 columns, got "
+  if (table.num_columns() != 9) {
+    VLOG(0) << "WideComplexTestTable::verifyTable: expected 9 columns, got "
             << table.num_columns();
     return false;
   }
@@ -540,11 +520,11 @@ bool WideComplexTestTable::verifyTable(
     return false;
   }
 
-  // Verify string column (column 11)
-  auto rxStrings = getStringCol(table.column(11), numRows, stream);
+  // Verify string column (column 7)
+  auto rxStrings = getStringCol(table.column(7), numRows, stream);
 
-  // Verify struct column children (column 12)
-  cudf::structs_column_view structView{table.column(12)};
+  // Verify struct column children (column 8)
+  cudf::structs_column_view structView{table.column(8)};
   auto rxStructField1 =
       getColVector<int64_t>(structView.child(0), numRows, stream);
   auto rxStructField2 =
