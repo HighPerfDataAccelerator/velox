@@ -53,7 +53,7 @@ std::unique_ptr<cudf::column> BaseTableGenerator::makeNumericColumn(
 
   // Allocate a device buffer of the correct size
   rmm::device_buffer data(
-      numRows * sizeof(T), stream, rmm::mr::get_current_device_resource());
+      numRows * sizeof(T), stream, rmm::mr::get_current_device_resource_ref());
 
   // Copy host -> device
   cudaMemcpyAsync(
@@ -135,7 +135,7 @@ std::unique_ptr<cudf::column> BaseTableGenerator::makeStringsColumn(
   rmm::device_buffer charsBuffer(
       totalBytes,
       cudf::get_default_stream(),
-      rmm::mr::get_current_device_resource());
+      rmm::mr::get_current_device_resource_ref());
 
   std::vector<char> hostConcat;
   hostConcat.reserve(totalBytes);
