@@ -906,6 +906,19 @@ bool canGroupbyAggregationBeEvaluatedByCudf(
     core::AggregationNode::Step step,
     const std::vector<TypePtr>& rawInputTypes,
     core::QueryCtx* queryCtx) {
+  const auto prefix = CudfConfig::getInstance().functionNamePrefix;
+  const auto originalName = getOriginalName(call.name());
+  if ((originalName == prefix + "collect_list" ||
+       originalName == prefix + "collect_set") &&
+      std::any_of(
+          call.inputs().begin(), call.inputs().end(), [](const auto& input) {
+            return dynamic_cast<const core::ConstantTypedExpr*>(input.get()) !=
+                nullptr;
+          })) {
+    // Collection aggregators currently consume a physical input column and do
+    // not materialize constants like the simple grouped aggregators do.
+    return false;
+  }
   return canAggregationBeEvaluatedByRegistry(
       getGroupbyAggregationRegistry(), call, step, rawInputTypes, queryCtx);
 }

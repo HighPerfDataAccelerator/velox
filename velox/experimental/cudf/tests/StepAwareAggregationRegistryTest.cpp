@@ -476,6 +476,17 @@ TEST_F(
     EXPECT_FALSE(canReduceAggregationBeEvaluatedByCudf(
         *mergeCall, step, {arrayOfRows}, queryCtx_.get()));
   }
+
+  const auto constantCall = std::make_shared<core::CallTypedExpr>(
+      ARRAY(BIGINT()),
+      std::vector<core::TypedExprPtr>{
+          std::make_shared<core::ConstantTypedExpr>(BIGINT(), variant(7LL))},
+      "collect_list");
+  EXPECT_FALSE(canGroupbyAggregationBeEvaluatedByCudf(
+      *constantCall,
+      core::AggregationNode::Step::kSingle,
+      {BIGINT()},
+      queryCtx_.get()));
 }
 
 TEST_F(

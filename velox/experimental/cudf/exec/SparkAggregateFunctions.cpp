@@ -107,8 +107,8 @@ void registerSparkAggregateFunctions(const std::string& prefix) {
       collectionMergeSignature);
 
   // Spark collect_list ignores null input values and preserves duplicates.
-  // libcudf implements it only for grouped aggregation, so do not advertise
-  // these signatures in the reduce registry.
+  // The Velox-cuDF adapter implements it only for grouped aggregation, so do
+  // not advertise these signatures in the reduce registry.
   appendGroupbyAggregationFunctionForStep(
       prefix + "collect_list",
       core::AggregationNode::Step::kSingle,
