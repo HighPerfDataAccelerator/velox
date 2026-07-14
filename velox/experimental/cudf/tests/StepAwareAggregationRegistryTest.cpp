@@ -448,6 +448,21 @@ TEST_F(
     sparkCollectListSupportsAllGroupbyStepsButNotReduce) {
   registerSparkAggregateFunctions("");
 
+  const auto& groupbyRegistry = getGroupbyAggregationRegistry();
+  const auto& reduceRegistry = getReduceAggregationRegistry();
+  const auto groupbyIt = groupbyRegistry.find("collect_list");
+  ASSERT_NE(groupbyIt, groupbyRegistry.end());
+  EXPECT_EQ(reduceRegistry.find("collect_list"), reduceRegistry.end());
+
+  for (const auto step : {core::AggregationNode::Step::kSingle,
+                          core::AggregationNode::Step::kPartial,
+                          core::AggregationNode::Step::kIntermediate,
+                          core::AggregationNode::Step::kFinal}) {
+    const auto stepIt = groupbyIt->second.find(step);
+    ASSERT_NE(stepIt, groupbyIt->second.end());
+    EXPECT_FALSE(stepIt->second.empty());
+  }
+
   const auto rowType = ROW({BIGINT(), VARCHAR()});
   const auto arrayOfRows = ARRAY(rowType);
   const auto rawCall = std::make_shared<core::CallTypedExpr>(

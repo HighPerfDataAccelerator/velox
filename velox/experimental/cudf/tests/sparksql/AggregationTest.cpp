@@ -72,4 +72,61 @@ TEST_F(AggregationTest, sumReal) {
   assertQuery(plan, expected);
 }
 
+TEST_F(AggregationTest, groupedCollectListOfRow) {
+  const auto makeBatch = [&](std::vector<int32_t> keys,
+                             std::vector<int64_t> ids,
+                             std::vector<std::optional<std::string>> labels,
+                             std::function<bool(vector_size_t)> isRowNull) {
+    auto rows = makeRowVector(
+        {"id", "label"},
+        {makeFlatVector<int64_t>(ids),
+         makeNullableFlatVector<std::string>(labels)},
+        std::move(isRowNull));
+    return makeRowVector(
+        {"k", "s"}, {makeFlatVector<int32_t>(keys), rows});
+  };
+
+  // Null ROW values are ignored, nested field nulls are preserved, and
+  // duplicate non-null ROW values are retained. Key 3 has only null input
+  // ROWs and must therefore produce an empty ARRAY<ROW>.
+  auto batch1 = makeBatch(
+      {1, 1, 2, 2, 3},
+      {10, -1, 20, 20, -1},
+      {"a", "ignored", "x", "x", "ignored"},
+      [](auto row) { return row == 1 || row == 4; });
+  auto batch2 = makeBatch(
+      {1, 2, 3, 3},
+      {11, 21, -1, -1},
+      {std::nullopt, "y", "ignored", "ignored"},
+      [](auto row) { return row == 2 || row == 3; });
+
+  auto expectedRows = makeRowVector(
+      {"id", "label"},
+      {makeFlatVector<int64_t>({10, 11, 20, 20, 21}),
+       makeNullableFlatVector<std::string>(
+           {"a", std::nullopt, "x", "x", "y"})});
+  auto expected = makeRowVector(
+      {"k", "items"},
+      {makeFlatVector<int32_t>({1, 2, 3}),
+       makeArrayVector({0, 2, 5, 5}, expectedRows)});
+
+  auto single = PlanBuilder()
+                    .values({batch1, batch2})
+                    .singleAggregation(
+                        {"k"}, {"collect_list(s) AS items"})
+                    .planNode();
+  assertQuery(single, expected);
+
+  // Keep two input vectors so partial aggregation consumes multiple batches.
+  // Final aggregation must merge its ARRAY<ROW> state without dropping
+  // duplicates, nested nulls, or the empty all-null group.
+  auto partialFinal = PlanBuilder()
+                          .values({batch1, batch2})
+                          .partialAggregation(
+                              {"k"}, {"collect_list(s) AS items"})
+                          .finalAggregation()
+                          .planNode();
+  assertQuery(partialFinal, expected);
+}
+
 } // namespace facebook::velox::exec::sparksql::test
