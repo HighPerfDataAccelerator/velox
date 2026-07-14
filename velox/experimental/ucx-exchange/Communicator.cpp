@@ -32,6 +32,8 @@
 
 using namespace facebook::velox::cudf_velox;
 
+DEFINE_bool(velox_ucx_exchange, false, "Enable Velox UCX exchange.");
+
 namespace facebook::velox::ucx_exchange {
 
 // static
