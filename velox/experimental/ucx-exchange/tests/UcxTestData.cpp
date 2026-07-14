@@ -398,7 +398,18 @@ void WideTestTable::addNumericColumns(
   columns.push_back(makeNumericColumn(int64Data_, stream));
   columns.push_back(makeNumericColumn(float32Data_, stream));
   columns.push_back(makeNumericColumn(float64Data_, stream));
-  columns.push_back(makeNumericColumn(boolData_, stream));
+  auto boolColumn = cudf::make_fixed_width_column(
+      cudf::data_type{cudf::type_id::BOOL8},
+      static_cast<cudf::size_type>(boolData_.size()),
+      cudf::mask_state::UNALLOCATED,
+      stream);
+  cudaMemcpyAsync(
+      boolColumn->mutable_view().data<bool>(),
+      boolData_.data(),
+      boolData_.size() * sizeof(int8_t),
+      cudaMemcpyHostToDevice,
+      stream.value());
+  columns.push_back(std::move(boolColumn));
 }
 
 std::unique_ptr<cudf::table> WideTestTable::makeTable(
