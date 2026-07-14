@@ -340,17 +340,16 @@ class QueryConfig {
       2UL << 20,
       "Minimum bytes to accumulate before unblocking an exchange consumer.")
 
-  /// Minimum number of rows to accumulate in CudfPartitionedOutput before
-  /// flushing. Small inputs are buffered and concatenated into a single merged
-  /// table when this threshold is reached, avoiding pathologically small
-  /// exchange chunks. Set to 0 to disable accumulation.
+  /// Target number of rows in a CudfPartitionedOutput exchange chunk. Small
+  /// inputs are accumulated to this threshold, while larger outputs are split
+  /// into bounded slices. Set to 0 to disable accumulation and slicing.
   VELOX_QUERY_CONFIG(
       kUcxPartitionedOutputBatchRows,
       ucxPartitionedOutputBatchRows,
       "cudf.partitioned_output_batch_rows",
       int64_t,
       10'000,
-      "Minimum rows to accumulate in CudfPartitionedOutput before flushing.")
+      "Target rows per CudfPartitionedOutput exchange chunk.")
 
   VELOX_QUERY_CONFIG(
       kMaxPartialAggregationMemory,

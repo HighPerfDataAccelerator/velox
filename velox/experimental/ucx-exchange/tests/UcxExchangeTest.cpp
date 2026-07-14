@@ -767,9 +767,12 @@ TEST_P(UcxExchangeTest, realPartitionedOutputDataIntegrityTest) {
 
     // Pass the partitioned reference data for this partition (may be nullptr
     // for wide multi-partition)
+    // Ordered row-wise validation requires a single consumer. Multi-consumer
+    // exchange parallelism is covered by the non-order-sensitive tests.
+    const auto sinkDriverCount = canVerifyDataIntegrity ? 1 : p.numDstDrivers;
     auto sinkDriver = std::make_shared<SinkDriverMock>(
         sinkTask,
-        p.numDstDrivers,
+        sinkDriverCount,
         canVerifyDataIntegrity ? partitionedDataToVerify[partitionId]
                                : nullptr);
 
@@ -797,6 +800,9 @@ TEST_P(UcxExchangeTest, realPartitionedOutputDataIntegrityTest) {
   }
   VLOG(3) << "All sink tasks done.";
 
+  // Release the source task even if a following assertion fails.
+  queueManager_->removeTask(srcTaskId);
+
   // Verify total row count
   size_t expectedTotalRows = p.numChunks * p.numRowsPerChunk * numSrcDrivers;
   size_t totalReceivedRows = 0;
@@ -823,9 +829,6 @@ TEST_P(UcxExchangeTest, realPartitionedOutputDataIntegrityTest) {
     VLOG(3)
         << "Data integrity verification skipped for wide table with multi-partition";
   }
-
-  // Cleanup
-  queueManager_->removeTask(srcTaskId);
 
   VLOG(3) << "- UcxExchangeTest::realPartitionedOutputDataIntegrityTest";
 }
@@ -1246,10 +1249,11 @@ TEST_P(UcxExchangeTest, batchAccumulationTest) {
     queueManager_->removeTask(srcTaskId);
   }
 
-  // --- Scenario 3: Large chunks (>= threshold) should NOT be accumulated ---
+  // --- Scenario 3: Large chunks are flushed immediately and bounded ---
   // 5 chunks × 20,000 rows = 100,000 total rows.
   // Each chunk exceeds kTargetRowsPerChunk, so each addInput triggers an
-  // immediate flush via the single-input fast path. Expected: 5 output chunks.
+  // immediate flush. The outbound path still limits every output chunk to the
+  // target row count, so each input becomes two output chunks.
   {
     const int numChunks = 5;
     const int numRowsPerChunk = 20000;
@@ -1297,15 +1301,17 @@ TEST_P(UcxExchangeTest, batchAccumulationTest) {
     EXPECT_TRUE(sinkDriver->dataIsValid())
         << "Large-chunk scenario data must match reference";
 
+    const auto chunksPerInput =
+        (numRowsPerChunk + kTargetRows - 1) / kTargetRows;
+    const auto expectedOutputChunks = numChunks * chunksPerInput;
+
     VLOG(0) << "batchAccumulationTest scenario 3: sent " << numChunks
             << " chunks of " << numRowsPerChunk << " rows, received "
             << sinkDriver->numChunksReceived() << " chunks (expected "
-            << numChunks << ")";
+            << expectedOutputChunks << ")";
 
-    // Large chunks should pass through without accumulation — each addInput
-    // immediately flushes because pendingRows >= kTargetRowsPerChunk.
-    EXPECT_EQ(sinkDriver->numChunksReceived(), static_cast<uint64_t>(numChunks))
-        << "Large chunks should not be accumulated";
+    EXPECT_EQ(sinkDriver->numChunksReceived(), expectedOutputChunks)
+        << "Large inputs should be flushed immediately in bounded slices";
 
     queueManager_->removeTask(srcTaskId);
   }

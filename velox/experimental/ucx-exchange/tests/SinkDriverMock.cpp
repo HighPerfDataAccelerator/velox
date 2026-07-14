@@ -55,18 +55,19 @@ SinkDriverMock::SinkDriverMock(
   }
 }
 
-void SinkDriverMock::updateDataValidity(const cudf::table_view& tab) {
+void SinkDriverMock::updateDataValidity(
+    const cudf::table_view& tab,
+    uint64_t startRow) {
   if (!referenceData_) {
     return; // No reference data to check against
   }
 
   auto stream = rmm::cuda_stream_default;
 
-  // Use the polymorphic verifyTable method
-  // Note: For chunk-based verification, we use startRow=0 since each chunk
-  // contains rows that should match the reference data from the beginning.
-  // This assumes the test sends the same data pattern in each chunk.
-  bool valid = referenceData_->verifyTable(tab, 0, tab.num_rows(), stream);
+  // Output chunks may be bounded slices of a larger input table. Validate each
+  // slice at its logical position in the received stream.
+  bool valid =
+      referenceData_->verifyTable(tab, startRow, tab.num_rows(), stream);
 
   if (!valid) {
     dataValidFlag_ = false;
@@ -95,11 +96,12 @@ void SinkDriverMock::receiveAllData(UcxExchange* hybridExchange) {
             std::dynamic_pointer_cast<facebook::velox::cudf_velox::CudfVector>(
                 res);
         numBytes_.fetch_add(cudfRes->estimateFlatSize());
-        numRows_ += cudfRes->getTableView().num_rows();
+        const auto rows = cudfRes->getTableView().num_rows();
+        const auto startRow = numRows_.fetch_add(rows);
         numChunksReceived_.fetch_add(1);
         // If we have Reference data check the received data is the same
         if (referenceData_)
-          updateDataValidity(cudfRes->getTableView());
+          updateDataValidity(cudfRes->getTableView(), startRow);
       }
     }
     if (hybridExchange->isFinished()) {
