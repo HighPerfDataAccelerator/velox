@@ -107,8 +107,10 @@ bool isSpillSafeType(const TypePtr& type) {
         }
       }
       return true;
-    case TypeKind::VARBINARY:
     case TypeKind::MAP:
+      return type->size() == 2 && isSpillSafeType(type->childAt(0)) &&
+          isSpillSafeType(type->childAt(1));
+    case TypeKind::VARBINARY:
     case TypeKind::UNKNOWN:
     case TypeKind::FUNCTION:
     case TypeKind::OPAQUE:
@@ -125,7 +127,8 @@ bool isSupportedSortKeyType(const TypePtr& type) {
 
   // Nested cuDF sort semantics have not been validated against Velox. Nested
   // values may still be carried as payload when every leaf is spill-safe.
-  return type->kind() != TypeKind::ARRAY && type->kind() != TypeKind::ROW;
+  return type->kind() != TypeKind::ARRAY && type->kind() != TypeKind::MAP &&
+      type->kind() != TypeKind::ROW;
 }
 
 void updateAtomicMax(std::atomic<uint64_t>& target, uint64_t value) {
