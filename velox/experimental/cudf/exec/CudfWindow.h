@@ -21,9 +21,11 @@
 #include "velox/core/PlanNode.h"
 
 #include <cudf/io/parquet.hpp>
+#include <cudf/scalar/scalar.hpp>
 #include <cudf/types.hpp>
 #include <rmm/cuda_stream_view.hpp>
 
+#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -41,6 +43,7 @@ bool isSupportedCudfWindowNode(
 ///   CURRENT ROW frame.
 /// - first(field) / first_value(field) over a partitioned ordered UNBOUNDED
 ///   PRECEDING to CURRENT ROW frame.
+/// - count(non-null constant) over a full partition ROWS frame.
 class CudfWindow : public CudfOperatorBase {
  public:
   CudfWindow(
@@ -48,8 +51,17 @@ class CudfWindow : public CudfOperatorBase {
       exec::DriverCtx* driverCtx,
       const std::shared_ptr<const core::WindowNode>& windowNode);
 
+  static void testingSetStreamingMemoryLimits(
+      uint64_t activeRowsBytes,
+      uint64_t replayChunkBytes);
+  static void testingResetStreamingMemoryLimits();
+  static uint64_t testingStreamingSpillWrites();
+  static uint64_t testingStreamingSpillCleanups();
+
   bool needsInput() const override {
-    return !noMoreInput_ && pendingOutput_ == nullptr;
+    return !noMoreInput_ && pendingOutput_ == nullptr &&
+        (!boundedStreaming_ ||
+         (deferredInput_ == nullptr && streamingReplay_ == nullptr));
   }
 
   exec::BlockingReason isBlocked(ContinueFuture* /*future*/) override {
@@ -106,6 +118,40 @@ class CudfWindow : public CudfOperatorBase {
       rmm::device_async_resource_ref mr,
       bool inputAlreadySorted = false);
 
+  std::unique_ptr<cudf::table> computeFullPartitionCountOutput(
+      std::unique_ptr<cudf::table> input,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const;
+
+  std::unique_ptr<cudf::table> computeRangeRunningSumOutput(
+      std::unique_ptr<cudf::table> input,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr);
+
+  std::vector<cudf::size_type> streamingGroupChannels() const;
+  std::vector<cudf::order> streamingGroupOrders() const;
+  std::vector<cudf::null_order> streamingGroupNullOrders() const;
+  cudf::size_type trailingGroupStart(
+      cudf::table_view input,
+      const std::vector<cudf::size_type>& channels,
+      const std::vector<cudf::order>& orders,
+      const std::vector<cudf::null_order>& nullOrders,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const;
+  void advanceBoundedStreaming();
+  void processDeferredStreamingInput();
+  void startActiveGroup(std::unique_ptr<cudf::table> rows);
+  void appendActiveGroup(std::unique_ptr<cudf::table> rows);
+  void updateActiveRangeSums(cudf::table_view rows);
+  void finalizeActiveGroup();
+  void prepareNextStreamingReplayOutput();
+  void spillActiveRows();
+  uint64_t measureTableBytes(std::unique_ptr<cudf::table>& table);
+  void setPendingOutput(std::unique_ptr<cudf::table> output);
+  std::unique_ptr<cudf::table> appendConstantResults(
+      std::unique_ptr<cudf::table> rows,
+      const std::vector<std::unique_ptr<cudf::scalar>>& results);
+
   std::unique_ptr<cudf::column> fixRankLikeColumn(
       std::unique_ptr<cudf::column> localResult,
       std::string_view functionName,
@@ -141,6 +187,14 @@ class CudfWindow : public CudfOperatorBase {
   CudfVectorPtr computeNextSortedOutput();
   void cleanupSpillFiles();
 
+  struct StreamingReplay {
+    std::vector<std::string> paths;
+    size_t nextPath{0};
+    std::unique_ptr<cudf::io::chunked_parquet_reader> reader;
+    std::unique_ptr<cudf::table> memoryRows;
+    std::vector<std::unique_ptr<cudf::scalar>> results;
+  };
+
   struct SortedRun {
     std::string path;
     std::unique_ptr<cudf::io::chunked_parquet_reader> reader;
@@ -148,10 +202,15 @@ class CudfWindow : public CudfOperatorBase {
 
   const std::shared_ptr<const core::WindowNode> windowNode_;
   const RowTypePtr inputType_;
-  // Only partitioned rank-like windows whose child guarantees ordering use
-  // the bounded cross-batch fixer. Other Window shapes retain legacy behavior.
+  // Only Window shapes whose child guarantees the complete ordering contract
+  // use cross-batch streaming state. Other shapes retain legacy behavior.
   const bool rankLikeStreaming_;
+  const bool fullPartitionCountStreaming_;
+  const bool rangeSumStreaming_;
+  const bool boundedStreaming_;
   const rmm::cuda_stream_view stateStream_;
+  const uint64_t activeRowsLimit_;
+  const uint64_t replayChunkLimit_;
   std::vector<CudfVectorPtr> inputs_;
   CudfVectorPtr pendingOutput_;
   uint64_t bufferedBytes_{0};
@@ -165,6 +224,22 @@ class CudfWindow : public CudfOperatorBase {
   bool mergeFinished_{false};
   bool spilled_{false};
   bool finished_{false};
+  bool streamingSpilled_{false};
+
+  std::unique_ptr<cudf::table> deferredInput_;
+  std::unique_ptr<cudf::table> activeRows_;
+  uint64_t activeRowsBytes_{0};
+  std::vector<std::string> activeSpillPaths_;
+  std::unique_ptr<cudf::table> activeKey_;
+  int64_t activeRowCount_{0};
+  std::vector<std::unique_ptr<cudf::scalar>> activeSums_;
+  std::vector<int64_t> activeValidCounts_;
+
+  std::unique_ptr<cudf::table> cumulativePartitionKey_;
+  std::vector<std::unique_ptr<cudf::scalar>> cumulativeSums_;
+  std::vector<int64_t> cumulativeValidCounts_;
+
+  std::unique_ptr<StreamingReplay> streamingReplay_;
 
   std::vector<cudf::size_type> partitionKeyChannels_;
   std::vector<cudf::size_type> sortKeyChannels_;
