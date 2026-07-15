@@ -316,7 +316,7 @@ bool isSupportedCudfWindowNode(
     } else if (isSupportedRunningSumFunction(function)) {
       hasRunningSum = true;
     } else if (isSupportedRangeRunningSumFunction(function)) {
-      return false;
+      hasRangeRunningSum = true;
     } else if (isSupportedFirstValueFunction(function)) {
       hasFirstValue = true;
     } else {

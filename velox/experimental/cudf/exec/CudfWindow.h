@@ -44,6 +44,8 @@ bool isSupportedCudfWindowNode(
 /// - first(field) / first_value(field) over a partitioned ordered UNBOUNDED
 ///   PRECEDING to CURRENT ROW frame.
 /// - count(non-null constant) over a full partition ROWS frame.
+/// - sum(field) over a partitioned ordered RANGE UNBOUNDED PRECEDING to
+///   CURRENT ROW frame.
 class CudfWindow : public CudfOperatorBase {
  public:
   CudfWindow(
