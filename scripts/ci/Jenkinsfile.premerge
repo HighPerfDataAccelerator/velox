@@ -1,0 +1,257 @@
+#!/usr/local/env groovy
+
+/*
+ * Copyright (c) Facebook, Inc. and its affiliates.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+@Library('blossom-lib') _
+@Library('blossom-github-lib@master')
+import ipp.blossom.*
+
+def githubHelper
+def skipped = false
+
+pipeline {
+    agent {
+        kubernetes {
+            label "velox-premerge-init-${BUILD_TAG}"
+            cloud "${common.CLOUD_NAME}"
+            yaml pod.getCPUYAML('alpine')
+        }
+    }
+
+    options {
+        ansiColor('xterm')
+        buildDiscarder(logRotator(numToKeepStr: '30', daysToKeepStr: '90'))
+        skipDefaultCheckout true
+        timeout(time: 3, unit: 'HOURS')
+    }
+
+    parameters {
+        string(name: 'REF', defaultValue: 'dev',
+            description: 'Velox branch, tag, or full merged-PR SHA to verify.')
+        string(name: 'GITHUB_DATA', defaultValue: '',
+            description: 'GitHub event JSON from the router. Leave empty for manual runs.')
+
+        string(name: 'COLT_REPO_URL',
+            defaultValue: 'https://gitlab-master.nvidia.com/alfxu/colt.git',
+            description: 'Colt repository URL.')
+        string(name: 'COLT_REF', defaultValue: 'main',
+            description: 'Pinned Colt branch or tag.')
+        string(name: 'GLUTEN_REPO_URL',
+            defaultValue: 'https://github.com/NVIDIA/spark-gluten.git',
+            description: 'Baseline Gluten repository required by the Colt source model.')
+        string(name: 'GLUTEN_REF', defaultValue: '2026-q3',
+            description: 'Known-good Gluten baseline ref.')
+
+        choice(name: 'VELOX_TIERS',
+            choices: ['velox-targeted', 'velox-targeted,velox-broad', 'velox-broad'],
+            description: 'Explicit Colt tiers. Targeted runs exact cases; broad runs their binaries.')
+        text(name: 'VELOX_TARGETS',
+            defaultValue: 'velox_cudf_config_test:ConfigTest.CudfConfig',
+            description: 'One BINARY:Suite.test target per line.')
+        booleanParam(name: 'FAIL_ON_UNSTABLE', defaultValue: true,
+            description: 'Make velox-broad UNSTABLE results fail the Jenkins build.')
+
+        text(name: 'PREBUILD_IMAGES',
+            defaultValue: "${common.ARTIFACTORY_NAME}/sw-spark-docker/gluten-builder:latest",
+            description: 'Ordered Colt prebuild candidates, one image per line. A match is required.')
+        string(name: 'CUDA_ARCH', defaultValue: '70',
+            description: 'CUDA architecture matching the selected GPU pool (70 for V100).')
+        string(name: 'GPU_TYPE', defaultValue: 'Tesla_V100_PCIE_32GB_x4',
+            description: 'Blossom lockable GPU resource label.')
+        string(name: 'COLT_RUNNER_IMAGE',
+            defaultValue: "${common.ARTIFACTORY_NAME}/sw-spark-docker/velox-colt-runner:docker25-v1",
+            description: 'Prebuilt Colt control-plane image with Docker CLI, Git, Bash, Python, and gh.')
+        string(name: 'COLT_PARALLEL', defaultValue: '4',
+            description: 'Colt Velox test/build parallelism.')
+        string(name: 'COLT_MEM_LIMIT', defaultValue: '20G',
+            description: 'Child-container memory limit; keep below the DinD sidecar limit.')
+    }
+
+    stages {
+        stage('Initialize') {
+            environment {
+                GITHUB_TOKEN = credentials('github-token')
+            }
+            steps {
+                script {
+                    def requestedRef = params.REF.trim()
+                    if (params.GITHUB_DATA.trim()) {
+                        githubHelper = GithubHelper.getInstance(
+                            "${GITHUB_TOKEN}", params.GITHUB_DATA)
+                        currentBuild.description = githubHelper.getBuildDescription()
+
+                        def title = githubHelper.getIssue().title.toLowerCase()
+                        if (title ==~ /.*\[skip ci\].*/) {
+                            githubHelper.updateCommitStatus(
+                                env.BUILD_URL, 'Skipped', GitHubCommitState.SUCCESS)
+                            currentBuild.result = 'SUCCESS'
+                            skipped = true
+                            return
+                        }
+
+                        def mergedSha = githubHelper.getMergedSHA()?.trim()
+                        if (!mergedSha) {
+                            error('GitHub event did not resolve to a merged PR SHA')
+                        }
+                        if (requestedRef && requestedRef != mergedSha) {
+                            error(
+                                "Router REF does not match GitHub merged SHA: " +
+                                    "${requestedRef} != ${mergedSha}")
+                        }
+                        env.VELOX_SOURCE_REF = mergedSha
+                        githubHelper.updateCommitStatus(
+                            env.BUILD_URL, 'Running', GitHubCommitState.PENDING)
+                    } else {
+                        if (!requestedRef) {
+                            error('REF is required for a manual premerge run')
+                        }
+                        env.VELOX_SOURCE_REF = requestedRef
+                        currentBuild.description = "manual @ ${requestedRef.take(20)}"
+                    }
+
+                    if (!env.VELOX_SOURCE_REF?.trim()) {
+                        error('Unable to determine the Velox source ref')
+                    }
+                    echo "Velox ref: ${env.VELOX_SOURCE_REF}"
+                }
+            }
+        }
+
+        stage('Colt Velox verification') {
+            when {
+                beforeAgent true
+                beforeOptions true
+                expression { !skipped }
+            }
+            options {
+                // Only the GPU-enabled DinD sidecar needs a GPU. The outer
+                // container runs the Colt, Git, and Docker CLIs.
+                lock(label: "${params.GPU_TYPE}", quantity: 1, variable: 'GPU_RESOURCE')
+            }
+            agent {
+                kubernetes {
+                    label "velox-premerge-${BUILD_TAG}"
+                    cloud "${common.CLOUD_NAME}"
+                    yaml pod.getGPUDockerYAML(
+                        "${params.COLT_RUNNER_IMAGE}",
+                        "${env.GPU_RESOURCE}",
+                        '8',
+                        '30Gi',
+                        true,
+                        '0')
+                }
+            }
+            environment {
+                COLT_ROOT = "${WORKSPACE}/colt"
+                VELOX_SOURCE_DIR = "${WORKSPACE}/velox-source"
+                COLT_WORKSPACE = "${WORKSPACE}/colt-workspace"
+                COLT_RUN_DIR = "${WORKSPACE}/colt-results/verify"
+            }
+            stages {
+                stage('Checkout') {
+                    steps {
+                        container('gpu') {
+                            script {
+                                deleteDir()
+
+                                // The downstream job SCM owns the GitHub PR
+                                // merge refspec and resolves params.REF.
+                                dir(env.VELOX_SOURCE_DIR) {
+                                    checkout scm
+                                    env.VELOX_SHA = sh(
+                                        script: 'git rev-parse HEAD',
+                                        returnStdout: true).trim()
+                                }
+                                dir(env.COLT_ROOT) {
+                                    common.checkoutSourceCode(
+                                        this,
+                                        params.COLT_REPO_URL.trim(),
+                                        params.COLT_REF.trim())
+                                }
+                                if (env.VELOX_SOURCE_REF ==~ /[0-9a-fA-F]{40}/ &&
+                                        !env.VELOX_SHA.equalsIgnoreCase(env.VELOX_SOURCE_REF)) {
+                                    error(
+                                        "Job SCM did not check out the requested Velox SHA: " +
+                                            "${env.VELOX_SHA} != ${env.VELOX_SOURCE_REF}")
+                                }
+                                echo "Resolved Velox SHA: ${env.VELOX_SHA}"
+                            }
+                        }
+                    }
+                }
+
+                stage('Verify GTests') {
+                    steps {
+                        container('gpu') {
+                            script {
+                                DockerUtils.loginDockerRepo(this)
+                                withEnv([
+                                    "COLT_ROOT=${env.COLT_ROOT}",
+                                    "VELOX_REPO=${env.VELOX_SOURCE_DIR}",
+                                    "VELOX_SHA=${env.VELOX_SHA}",
+                                    "GLUTEN_REPO=${params.GLUTEN_REPO_URL.trim()}",
+                                    "GLUTEN_REF=${params.GLUTEN_REF.trim()}",
+                                    "PREBUILD_IMAGES=${params.PREBUILD_IMAGES}",
+                                    "VELOX_TARGETS=${params.VELOX_TARGETS}",
+                                    "VELOX_TIERS=${params.VELOX_TIERS}",
+                                    "FAIL_ON_UNSTABLE=${params.FAIL_ON_UNSTABLE}",
+                                    "CUDA_ARCH=${params.CUDA_ARCH.trim()}",
+                                    "COLT_WORKSPACE=${env.COLT_WORKSPACE}",
+                                    "COLT_RUN_DIR=${env.COLT_RUN_DIR}",
+                                    "COLT_RESULT_FILE=${env.COLT_RUN_DIR}/result.json",
+                                    'COLT_GPU_DEVICES=0',
+                                    "COLT_PARALLEL=${params.COLT_PARALLEL.trim()}",
+                                    "COLT_MEM_LIMIT=${params.COLT_MEM_LIMIT.trim()}",
+                                ]) {
+                                    sh "bash '${env.VELOX_SOURCE_DIR}/scripts/ci/run-colt-velox-premerge.sh'"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            post {
+                always {
+                    container('gpu') {
+                        archiveArtifacts(
+                            artifacts: 'colt-results/**',
+                            allowEmptyArchive: true)
+                        junit(
+                            testResults: 'colt-results/verify/junit.xml',
+                            allowEmptyResults: true)
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            script {
+                if (githubHelper != null && !skipped) {
+                    if (currentBuild.currentResult == 'SUCCESS') {
+                        githubHelper.updateCommitStatus(
+                            env.BUILD_URL, 'Success', GitHubCommitState.SUCCESS)
+                    } else if (currentBuild.currentResult != 'ABORTED') {
+                        githubHelper.updateCommitStatus(
+                            env.BUILD_URL, 'Fail', GitHubCommitState.FAILURE)
+                    }
+                }
+            }
+        }
+    }
+}
