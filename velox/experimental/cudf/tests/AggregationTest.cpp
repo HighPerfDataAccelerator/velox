@@ -1019,6 +1019,62 @@ TEST_F(AggregationTest, partialAggregationMemoryLimit) {
           .customStats.count("flushRowCount"));
 }
 
+TEST_F(AggregationTest, partialAggregationUsesBalancedRunMerges) {
+  std::vector<RowVectorPtr> vectors;
+  constexpr int32_t kBatches = 8;
+  constexpr int32_t kRowsPerBatch = 100;
+  for (int32_t batch = 0; batch < kBatches; ++batch) {
+    vectors.push_back(makeRowVector(
+        {makeFlatVector<int64_t>(
+             kRowsPerBatch,
+             [batch](vector_size_t row) {
+               return static_cast<int64_t>(batch) * kRowsPerBatch + row;
+             }),
+         makeFlatVector<int64_t>(
+             kRowsPerBatch, [](vector_size_t row) { return row + 1; })}));
+  }
+  createDuckDbTable(vectors);
+
+  core::PlanNodeId partialAggId;
+  auto task = AssertQueryBuilder(duckDbQueryRunner_)
+                  .maxDrivers(1)
+                  .plan(
+                      PlanBuilder()
+                          .values(vectors)
+                          .partialAggregation({"c0"}, {"sum(c1)"})
+                          .capturePlanNodeId(partialAggId)
+                          .finalAggregation()
+                          .planNode())
+                  .assertResults(
+                      "SELECT c0, sum(c1) FROM tmp GROUP BY c0");
+
+  const auto planStats = toPlanStats(task->taskStats());
+  const auto& stats = planStats.at(partialAggId).customStats;
+  std::string availableStats;
+  for (const auto& [nodeId, nodeStats] : planStats) {
+    for (const auto& [statName, unused] : nodeStats.customStats) {
+      availableStats += nodeId + ":" + statName + ",";
+    }
+  }
+  for (const auto* statName :
+       {"cudfIntermediateAggregationInputRuns",
+        "cudfIntermediateAggregationRunMerges",
+        "cudfIntermediateAggregationMergeRows"}) {
+    ASSERT_EQ(stats.count(statName), 1)
+        << "Missing runtime stat: " << statName
+        << "; available stats: " << availableStats;
+  }
+  EXPECT_EQ(stats.at("cudfIntermediateAggregationInputRuns").sum, kBatches);
+  EXPECT_EQ(
+      stats.at("cudfIntermediateAggregationRunMerges").sum, kBatches - 1);
+  // With disjoint keys, balanced merges process 800 rows at each of the three
+  // levels. Repeatedly merging the complete accumulated state would process
+  // 3,500 rows for the same eight pages.
+  EXPECT_EQ(stats.at("cudfIntermediateAggregationMergeRows").sum, 2400);
+  EXPECT_EQ(
+      stats.count("cudfIntermediateAggregationFinalizeMerges"), 0);
+}
+
 class FinalAggregationStreamingTest : public AggregationTest {
  protected:
   class ScopedStreamingCapacity {
