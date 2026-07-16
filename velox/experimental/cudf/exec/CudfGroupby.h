@@ -20,7 +20,13 @@
 
 #include <cudf/groupby.hpp>
 
+#include <optional>
+
 namespace facebook::velox::cudf_velox {
+
+namespace test {
+class CudfGroupbyTestHelper;
+}
 
 struct GroupbyAggregator {
   core::AggregationNode::Step step;
@@ -32,6 +38,14 @@ struct GroupbyAggregator {
       cudf::table_view const& tbl,
       std::vector<cudf::groupby::aggregation_request>& requests,
       rmm::cuda_stream_view stream) = 0;
+
+  // Releases columns materialized solely to back views in the most recently
+  // built request. This is normally handled when the next request replaces
+  // the state, but an unsupported streaming probe must release it before
+  // switching to levelled aggregation.
+  virtual size_t releaseRequestState() {
+    return 0;
+  }
 
   virtual std::unique_ptr<cudf::column> makeOutputColumn(
       std::vector<cudf::groupby::aggregation_result>& results,
@@ -97,7 +111,20 @@ class CudfGroupby : public CudfOperatorBase {
 
   void doNoMoreInput() override;
 
+  void doClose() override;
+
  private:
+  enum class FinalAggregationMode {
+    kUndecided,
+    kStreaming,
+    kLevelled,
+  };
+
+  struct FinalAggregationRun {
+    CudfVectorPtr data;
+    uint64_t representedRows;
+  };
+
   CudfVectorPtr doGroupByAggregation(
       cudf::table_view tableView,
       std::vector<column_index_t> const& groupByKeys,
@@ -108,9 +135,20 @@ class CudfGroupby : public CudfOperatorBase {
 
   CudfVectorPtr releaseAndResetBufferedResult();
 
+  void prepareInputForStateStream(const CudfVectorPtr& input);
+
   void computePartialGroupbyStreaming(CudfVectorPtr tbl);
   void computeFinalGroupbyStreaming(CudfVectorPtr tbl);
   void computeSingleGroupbyStreaming(CudfVectorPtr tbl);
+
+  void addFinalAggregationRun(FinalAggregationRun run);
+  FinalAggregationRun mergeFinalAggregationRuns(
+      FinalAggregationRun left,
+      FinalAggregationRun right,
+      size_t outputLevel,
+      bool finalizing);
+  CudfVectorPtr drainFinalAggregationRuns();
+  CudfVectorPtr finalizeStreamingFinalAggregation();
 
   std::vector<column_index_t> groupingKeyInputChannels_;
   std::vector<column_index_t> groupingKeyOutputChannels_;
@@ -119,6 +157,10 @@ class CudfGroupby : public CudfOperatorBase {
 
   std::shared_ptr<const core::AggregationNode> aggregationNode_;
   const core::PlanNodeId diagnosticNodeId_;
+  // Aggregation state outlives an individual addInput() call. Keep all state
+  // production, compaction, and finalization on one stream so dependencies are
+  // not lost when successive exchange pages arrive on different streams.
+  const rmm::cuda_stream_view stateStream_;
   std::vector<std::unique_ptr<GroupbyAggregator>> aggregators_;
   std::vector<std::unique_ptr<GroupbyAggregator>> intermediateAggregators_;
   // Used for kSingle streaming: partial-step aggregators (raw -> intermediate)
@@ -142,6 +184,25 @@ class CudfGroupby : public CudfOperatorBase {
   TypePtr inputType_;
   RowTypePtr bufferedResultType_;
   CudfVectorPtr bufferedResult_;
+
+  // Supported FINAL aggregates use cuDF's persistent hash state directly
+  // across exchange pages. The choice is made from the first page and is never
+  // changed after state has been accumulated. Unsupported aggregate kinds keep
+  // using the all-GPU levelled-run implementation below.
+  FinalAggregationMode finalAggregationMode_{FinalAggregationMode::kUndecided};
+  std::unique_ptr<cudf::groupby::streaming_groupby> finalStreamingGroupby_;
+  std::vector<size_t> finalStreamingRequestAggregationCounts_;
+  cudf::size_type finalStreamingMaxDistinctKeys_{0};
+  uint64_t finalStreamingBatchCount_{0};
+
+  // One independently aggregated FINAL run per binary size level. A new run is
+  // merged only with a peer at the same level, preventing the previous
+  // state-plus-every-batch quadratic re-aggregation pattern.
+  std::vector<std::optional<FinalAggregationRun>> finalRunLevels_;
+  uint64_t finalInputRunCount_{0};
+  uint64_t finalRunMergeCount_{0};
+
+  friend class test::CudfGroupbyTestHelper;
 };
 
 } // namespace facebook::velox::cudf_velox
