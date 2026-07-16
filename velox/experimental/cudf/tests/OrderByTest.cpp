@@ -29,6 +29,8 @@
 
 #include <fmt/format.h>
 
+#include <limits>
+
 using namespace facebook::velox;
 using namespace facebook::velox::exec;
 using namespace facebook::velox::exec::test;
@@ -563,6 +565,31 @@ TEST_F(OrderByTest, boundedExternalSortMapPayload) {
   EXPECT_GE(OrderByTestHelper::sourceChunks(), kNumRuns);
   EXPECT_GT(OrderByTestHelper::mergeOutputBatches(), 0);
   EXPECT_EQ(OrderByTestHelper::spillCleanups(), 1);
+}
+
+TEST_F(OrderByTest, inMemoryResultMovesWithoutChunkCopies) {
+  constexpr uint64_t kLargeByteLimit = 1ULL << 40;
+  OrderByTestHelper::setMemoryLimits(
+      kLargeByteLimit,
+      4096,
+      kLargeByteLimit,
+      std::numeric_limits<cudf::size_type>::max());
+
+  std::vector<RowVectorPtr> vectors;
+  for (int32_t batch = 0; batch < 4; ++batch) {
+    vectors.push_back(makeRowVector({makeFlatVector<int64_t>(
+        1024, [batch](vector_size_t row) { return 4096 - batch * 1024 - row; })}));
+  }
+  createDuckDbTable(vectors);
+
+  auto plan = PlanBuilder()
+                  .values(vectors)
+                  .orderBy({"c0 ASC NULLS LAST"}, false)
+                  .planNode();
+  assertQueryOrdered(plan, "SELECT * FROM tmp ORDER BY c0", {0});
+
+  EXPECT_EQ(OrderByTestHelper::emittedChunks(), 1);
+  EXPECT_EQ(OrderByTestHelper::spillCleanups(), 0);
 }
 
 /// Verifies output batch rows of OrderBy
