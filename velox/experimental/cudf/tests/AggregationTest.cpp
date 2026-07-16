@@ -1027,13 +1027,13 @@ class FinalAggregationStreamingTest : public AggregationTest {
         : previousCapacity_(
               cudf_velox::CudfConfig::getInstance()
                   .groupbyStreamingMaxDistinctKeys) {
-      cudf_velox::CudfConfig::getInstance()
-          .groupbyStreamingMaxDistinctKeys = capacity;
+      cudf_velox::CudfConfig::getInstance().groupbyStreamingMaxDistinctKeys =
+          capacity;
     }
 
     ~ScopedStreamingCapacity() {
-      cudf_velox::CudfConfig::getInstance()
-          .groupbyStreamingMaxDistinctKeys = previousCapacity_;
+      cudf_velox::CudfConfig::getInstance().groupbyStreamingMaxDistinctKeys =
+          previousCapacity_;
     }
 
    private:
@@ -1060,15 +1060,13 @@ TEST_F(
     FinalAggregationStreamingTest,
     finalAggregationRebindsPackedInputWithMatchingLogicalStream) {
   auto rawInput = makeRowVector(
-      {makeFlatVector<int64_t>({1, 2}),
-       makeFlatVector<int64_t>({10, 20})});
+      {makeFlatVector<int64_t>({1, 2}), makeFlatVector<int64_t>({10, 20})});
   auto plan = PlanBuilder()
                   .values({rawInput})
                   .partialAggregation({"c0"}, {"count(c1)"})
                   .finalAggregation()
                   .planNode();
-  auto finalNode =
-      std::dynamic_pointer_cast<const core::AggregationNode>(plan);
+  auto finalNode = std::dynamic_pointer_cast<const core::AggregationNode>(plan);
   ASSERT_NE(finalNode, nullptr);
 
   auto task = Task::create(
@@ -1087,8 +1085,7 @@ TEST_F(
   const auto inputType = finalNode->sources()[0]->outputType();
   auto intermediateInput = makeRowVector(
       inputType->names(),
-      {makeFlatVector<int64_t>({1, 2}),
-       makeFlatVector<int64_t>({3, 4})});
+      {makeFlatVector<int64_t>({1, 2}), makeFlatVector<int64_t>({3, 4})});
   auto table = cudf_velox::with_arrow::toCudfTable(
       intermediateInput,
       pool(),

@@ -14,9 +14,8 @@
  * limitations under the License.
  */
 
-#include "velox/experimental/cudf/vector/CudfVector.h"
-
 #include "velox/experimental/cudf/tests/utils/CudfStreamTestUtils.h"
+#include "velox/experimental/cudf/vector/CudfVector.h"
 
 #include "velox/common/base/Exceptions.h"
 #include "velox/vector/tests/utils/VectorTestBase.h"

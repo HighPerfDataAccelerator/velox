@@ -737,9 +737,7 @@ TEST_F(CudfDecimalTest, decimalSumPartialFinalVarbinary) {
       .assertResults("SELECT k, sum(d) AS s FROM tmp GROUP BY k");
 }
 
-TEST_F(
-    CudfDecimalTest,
-    decimalFinalStreamingProbeReleasesMaterializedColumns) {
+TEST_F(CudfDecimalTest, decimalFinalStreamingProbeReleasesMaterializedColumns) {
   ScopedGroupbyStreamingCapacity streamingCapacity(4096);
   auto input1 = makeRowVector(
       {"k", "d"},
@@ -777,8 +775,7 @@ TEST_F(
   core::PlanNodeId finalAggId;
   auto plan = exec::test::PlanBuilder()
                   .values(vectors)
-                  .partialAggregation(
-                      {"k"}, {"sum(d) AS s", "avg(d) AS a"})
+                  .partialAggregation({"k"}, {"sum(d) AS s", "avg(d) AS a"})
                   .capturePlanNodeId(partialAggId)
                   .finalAggregation()
                   .capturePlanNodeId(finalAggId)
@@ -788,15 +785,10 @@ TEST_F(
                   .assertResults(expected);
 
   const auto planStats = exec::toPlanStats(task->taskStats());
-  EXPECT_GT(
-      planStats.at(partialAggId)
-          .customStats.at("flushRowCount")
-          .sum,
-      0);
+  EXPECT_GT(planStats.at(partialAggId).customStats.at("flushRowCount").sum, 0);
   const auto& finalStats = planStats.at(finalAggId).customStats;
   EXPECT_EQ(
-      finalStats.at("cudfFinalStreamingFallbackProbeColumnsReleased").sum,
-      3);
+      finalStats.at("cudfFinalStreamingFallbackProbeColumnsReleased").sum, 3);
   EXPECT_GT(finalStats.at("cudfFinalAggregationInputRuns").sum, 1);
   EXPECT_EQ(finalStats.count("cudfFinalStreamingBatches"), 0);
 }
