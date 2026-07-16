@@ -150,11 +150,6 @@ void CudfIcebergSplitReader::prepareSplit(
   // Get a stream
   stream_ = cudfGlobalStreamPool().get_stream();
 
-  // Sub-splits are not yet supported.
-  if (split_->start != 0) {
-    VELOX_NYI("cuDF Iceberg reader does not yet support sub-splits");
-  }
-
   // Read file metadata and cache schema information
   cacheSchemaFromMetadata();
 
@@ -173,6 +168,10 @@ void CudfIcebergSplitReader::prepareSplit(
 
   // Determine if there are no columns to read.
   noColumnsToRead_ = readColumnNames_.empty();
+  VELOX_CHECK(
+      not noColumnsToRead_ or split_->start == 0,
+      "Iceberg byte-range splits with injected-only projections are not yet "
+      "supported");
 
   // Defer subfield filter when it cannot evaluate on the physical parquet
   // table, or when positional deletes are present.

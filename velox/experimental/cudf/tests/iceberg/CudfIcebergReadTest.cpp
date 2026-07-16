@@ -504,6 +504,33 @@ TEST_F(CudfIcebergReadTest, multipleSplits) {
   assertQuery(plan, allSplits, "SELECT * FROM tmp", 0);
 }
 
+/// Read multiple byte-range splits from the same data file.
+TEST_F(CudfIcebergReadTest, byteRangeSplits) {
+  auto rowType = ROW({"c0"}, {BIGINT()});
+  std::vector<RowVectorPtr> data;
+  for (int64_t i = 0; i < 4; ++i) {
+    data.push_back(makeRowVector({makeFlatVector<int64_t>(
+        makeContinuousIncreasingValues(i * 10'000, (i + 1) * 10'000))}));
+  }
+
+  auto filePath = TempFilePath::create();
+  writeToFile(filePath->getPath(), data);
+  createDuckDbTable(data);
+
+  auto plan = PlanBuilder()
+                  .startTableScan()
+                  .connectorId(kCudfIcebergConnectorId)
+                  .outputType(rowType)
+                  .endTableScan()
+                  .planNode();
+
+  assertQuery(
+      plan,
+      makeIcebergSplits(filePath->getPath(), {}, {}, 4),
+      "SELECT * FROM tmp",
+      0);
+}
+
 /// All  missing (schema evolution) columns
 TEST_F(CudfIcebergReadTest, allSchemaEvolutionColumns) {
   auto dataVector = makeRowVector(
