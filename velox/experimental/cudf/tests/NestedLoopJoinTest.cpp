@@ -100,9 +100,7 @@ TEST_F(CudfNestedLoopJoinTest, buildByteLimitAndCleanup) {
   VELOX_ASSERT_THROW(
       AssertQueryBuilder(plan)
           .config(
-              cudf_velox::CudfConfig::
-                  kCudfNestedLoopJoinMaxBuildBytes,
-              "16")
+              cudf_velox::CudfConfig::kCudfNestedLoopJoinMaxBuildBytes, "16")
           .copyResults(pool()),
       "CudfNestedLoopJoin build exceeds configured device-memory limit");
 

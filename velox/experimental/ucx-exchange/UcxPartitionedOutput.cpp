@@ -63,13 +63,17 @@ RowVectorPtr buildRangeBoundaryVector(
     std::vector<cudf::null_order>& nullOrders) {
   const auto descriptor = folly::parseJson(boundsJson);
   VELOX_CHECK_EQ(
-      descriptor["version"].asInt(), 1, "Unsupported RANGE_PID descriptor version");
+      descriptor["version"].asInt(),
+      1,
+      "Unsupported RANGE_PID descriptor version");
   const auto& keys = descriptor["keys"];
   const auto& bounds = descriptor["bounds"];
   VELOX_CHECK(keys.isArray(), "RANGE_PID keys must be an array");
   VELOX_CHECK(bounds.isArray(), "RANGE_PID bounds must be an array");
   VELOX_CHECK_EQ(
-      keys.size(), keyChannels.size(), "RANGE_PID key metadata/channel mismatch");
+      keys.size(),
+      keyChannels.size(),
+      "RANGE_PID key metadata/channel mismatch");
 
   std::vector<std::string> names;
   std::vector<TypePtr> types;
@@ -79,15 +83,16 @@ RowVectorPtr buildRangeBoundaryVector(
   nullOrders.clear();
   for (size_t key = 0; key < keyChannels.size(); ++key) {
     const auto channel = keyChannels[key];
-    VELOX_CHECK_LT(channel, inputType->size(), "RANGE_PID key channel out of bounds");
+    VELOX_CHECK_LT(
+        channel, inputType->size(), "RANGE_PID key channel out of bounds");
     names.push_back(inputType->nameOf(channel));
     types.push_back(inputType->childAt(channel));
     orders.push_back(
         keys[key]["ascending"].asBool() ? cudf::order::ASCENDING
-                                         : cudf::order::DESCENDING);
+                                        : cudf::order::DESCENDING);
     nullOrders.push_back(
         keys[key]["nullsFirst"].asBool() ? cudf::null_order::BEFORE
-                                          : cudf::null_order::AFTER);
+                                         : cudf::null_order::AFTER);
   }
 
   auto boundaryType = ROW(std::move(names), std::move(types));
@@ -98,7 +103,9 @@ RowVectorPtr buildRangeBoundaryVector(
   for (size_t row = 0; row < bounds.size(); ++row) {
     VELOX_CHECK(bounds[row].isArray(), "RANGE_PID boundary must be an array");
     VELOX_CHECK_EQ(
-        bounds[row].size(), keyChannels.size(), "RANGE_PID boundary width mismatch");
+        bounds[row].size(),
+        keyChannels.size(),
+        "RANGE_PID boundary width mismatch");
     for (size_t key = 0; key < keyChannels.size(); ++key) {
       const auto& encoded = bounds[row][key];
       auto child = vector->childAt(key);
@@ -140,7 +147,8 @@ RowVectorPtr buildRangeBoundaryVector(
             break;
           case TypeKind::VARCHAR: {
             const auto stringValue = value.asString();
-            child->asFlatVector<StringView>()->set(row, StringView(stringValue));
+            child->asFlatVector<StringView>()->set(
+                row, StringView(stringValue));
             break;
           }
           default:
@@ -431,9 +439,8 @@ void UcxPartitionedOutput::initPartitionKeys(
   // Get partition function specification string
   spec_ = planNode->partitionFunctionSpec().toString();
 
-  if (auto* rangeFunctionSpec =
-          dynamic_cast<const RangePartitionFunctionSpec*>(
-              &planNode->partitionFunctionSpec())) {
+  if (auto* rangeFunctionSpec = dynamic_cast<const RangePartitionFunctionSpec*>(
+          &planNode->partitionFunctionSpec())) {
     partitionKeyIndices_ = rangeFunctionSpec->keyChannels();
     rangeBoundsJson_ = rangeFunctionSpec->boundsJson();
     VELOX_CHECK(

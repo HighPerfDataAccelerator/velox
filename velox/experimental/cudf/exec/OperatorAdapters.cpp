@@ -1351,9 +1351,8 @@ class MergeExchangeAdapter : public OperatorAdapter {
         mergeExchangeNode->transportType() ==
             core::ExchangeNode::TransportType::kUcx;
     const bool orderBySupported = mergeExchangeNode &&
-        CudfOrderBy::isSupported(
-            mergeExchangeNode->outputType(),
-            mergeExchangeNode->sortingKeys());
+        CudfOrderBy::isSupported(mergeExchangeNode->outputType(),
+                                 mergeExchangeNode->sortingKeys());
     LOG(WARNING) << "CudfMergeExchangeAdapter: canRunOnGPU node="
                  << (mergeExchangeNode ? mergeExchangeNode->id() : "<null>")
                  << " isUcx=" << isUcx

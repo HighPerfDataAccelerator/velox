@@ -36,7 +36,8 @@ TEST(RangePartitionFunctionSpecTest, explicitPidIdentityAndSerde) {
   EXPECT_EQ(spec->keyChannels(), std::vector<column_index_t>({0}));
   EXPECT_EQ(spec->boundsJson(), kBounds);
 
-  auto copy = RangePartitionFunctionSpec::deserialize(spec->serialize(), nullptr);
+  auto copy =
+      RangePartitionFunctionSpec::deserialize(spec->serialize(), nullptr);
   EXPECT_EQ(copy->toString(), "RANGE_PID(k)");
 }
 

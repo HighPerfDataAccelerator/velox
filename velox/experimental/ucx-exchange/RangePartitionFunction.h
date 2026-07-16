@@ -38,7 +38,8 @@ class RangePartitionFunctionSpec final : public core::PartitionFunctionSpec {
         keyChannels_(std::move(keyChannels)),
         boundsJson_(std::move(boundsJson)) {
     VELOX_CHECK(!keyChannels_.empty(), "RANGE_PID requires sort-key channels");
-    VELOX_CHECK(!boundsJson_.empty(), "RANGE_PID requires serialized boundaries");
+    VELOX_CHECK(
+        !boundsJson_.empty(), "RANGE_PID requires serialized boundaries");
   }
 
   std::unique_ptr<core::PartitionFunction> create(

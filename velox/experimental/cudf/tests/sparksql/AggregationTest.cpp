@@ -82,8 +82,7 @@ TEST_F(AggregationTest, groupedCollectListOfRow) {
         {makeFlatVector<int64_t>(ids),
          makeNullableFlatVector<std::string>(labels)},
         std::move(isRowNull));
-    return makeRowVector(
-        {"k", "s"}, {makeFlatVector<int32_t>(keys), rows});
+    return makeRowVector({"k", "s"}, {makeFlatVector<int32_t>(keys), rows});
   };
 
   // Null ROW values are ignored, nested field nulls are preserved, and
@@ -112,20 +111,19 @@ TEST_F(AggregationTest, groupedCollectListOfRow) {
 
   auto single = PlanBuilder()
                     .values({batch1, batch2})
-                    .singleAggregation(
-                        {"k"}, {"collect_list(s) AS items"})
+                    .singleAggregation({"k"}, {"collect_list(s) AS items"})
                     .planNode();
   assertQuery(single, expected);
 
   // Keep two input vectors so partial aggregation consumes multiple batches.
   // Final aggregation must merge its ARRAY<ROW> state without dropping
   // duplicates, nested nulls, or the empty all-null group.
-  auto partialFinal = PlanBuilder()
-                          .values({batch1, batch2})
-                          .partialAggregation(
-                              {"k"}, {"collect_list(s) AS items"})
-                          .finalAggregation()
-                          .planNode();
+  auto partialFinal =
+      PlanBuilder()
+          .values({batch1, batch2})
+          .partialAggregation({"k"}, {"collect_list(s) AS items"})
+          .finalAggregation()
+          .planNode();
   assertQuery(partialFinal, expected);
 }
 

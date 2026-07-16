@@ -22,9 +22,8 @@ namespace {
 
 class UcxOnlyRangePartitionFunction final : public core::PartitionFunction {
  public:
-  std::optional<uint32_t> partition(
-      const RowVector&,
-      std::vector<uint32_t>&) override {
+  std::optional<uint32_t> partition(const RowVector&, std::vector<uint32_t>&)
+      override {
     VELOX_FAIL(
         "RANGE_PID is supported only by UcxPartitionedOutput; refusing to "
         "silently substitute hash or round-robin partitioning");

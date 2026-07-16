@@ -17,7 +17,6 @@
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/exec/CudfNestedLoopJoin.h"
-
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
@@ -157,7 +156,7 @@ CudfNestedLoopJoinBuild::CudfNestedLoopJoinBuild(
           nvtx3::rgb{65, 105, 225}, // Royal Blue
           NvtxMethodFlag::kNoMoreInput,
           std::nullopt,
-      joinNode),
+          joinNode),
       joinNode_(joinNode),
       maxBuildBytes_(driverCtx->queryConfig().get<uint64_t>(
           CudfConfig::kCudfNestedLoopJoinMaxBuildBytes,
