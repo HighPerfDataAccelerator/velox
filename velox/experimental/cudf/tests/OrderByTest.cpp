@@ -266,8 +266,7 @@ TEST_F(OrderByTest, externalSpillSchemaEligibility) {
       std::dynamic_pointer_cast<const core::OrderByNode>(
           PlanBuilder()
               .tableScan(ROW(
-                  {"key", "payload"},
-                  {INTEGER(), MAP(VARCHAR(), VARCHAR())}))
+                  {"key", "payload"}, {INTEGER(), MAP(VARCHAR(), VARCHAR())}))
               .orderBy({"key ASC NULLS LAST"}, false)
               .planNode());
   ASSERT_NE(safeMapPayload, nullptr);
@@ -277,8 +276,7 @@ TEST_F(OrderByTest, externalSpillSchemaEligibility) {
       std::dynamic_pointer_cast<const core::OrderByNode>(
           PlanBuilder()
               .tableScan(ROW(
-                  {"key", "payload"},
-                  {MAP(VARCHAR(), VARCHAR()), INTEGER()}))
+                  {"key", "payload"}, {MAP(VARCHAR(), VARCHAR()), INTEGER()}))
               .orderBy({"key ASC NULLS LAST"}, false)
               .planNode());
   ASSERT_NE(unsupportedMapKey, nullptr);
@@ -537,9 +535,9 @@ TEST_F(OrderByTest, boundedExternalSortMapPayload) {
   std::vector<RowVectorPtr> vectors;
   vectors.reserve(kNumRuns);
   for (int32_t run = 0; run < kNumRuns; ++run) {
-    auto key = makeFlatVector<int64_t>(
-        kRowsPerRun,
-        [run](vector_size_t row) { return run * kRowsPerRun + row; });
+    auto key = makeFlatVector<int64_t>(kRowsPerRun, [run](vector_size_t row) {
+      return run * kRowsPerRun + row;
+    });
     auto map = makeMapVector<std::string, std::string>(
         kRowsPerRun,
         [](vector_size_t row) { return row % 4; },
