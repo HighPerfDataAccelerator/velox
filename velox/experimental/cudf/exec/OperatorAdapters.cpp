@@ -807,7 +807,7 @@ class TopNRowNumberAdapter : public OperatorAdapter {
   }
 };
 
-/// WindowAdapter - Replaces supported row_number Window nodes with CudfWindow.
+/// WindowAdapter - Replaces with CudfWindow.
 class WindowAdapter : public OperatorAdapter {
  public:
   WindowAdapter() : OperatorAdapter("Window") {}
@@ -817,21 +817,23 @@ class WindowAdapter : public OperatorAdapter {
   }
 
   bool canRunOnGPU(
-      const exec::Operator* op,
+      const exec::Operator* /*op*/,
       const core::PlanNodePtr& planNode,
       exec::DriverCtx* /*ctx*/) const override {
     auto windowNode =
         std::dynamic_pointer_cast<const core::WindowNode>(planNode);
-    const bool canRun = canHandle(op) && isSupportedCudfWindowNode(windowNode);
-    if (!canRun) {
-      LOG_FALLBACK(
-          "WindowAdapter {}, PlanNode id: {}",
-          !canHandle(op)    ? "operator is not Window"
-              : !windowNode ? "planNode is not WindowNode"
-                            : "isSupportedCudfWindowNode returned false",
-          planNode->id());
+    if (!windowNode) {
+      return false;
     }
-    return canRun;
+    std::string reason;
+    if (!CudfWindow::canRunOnGPU(*windowNode, &reason)) {
+      LOG_FALLBACK(
+          "{}, PlanNode id: {}",
+          reason.empty() ? "unknown" : reason,
+          planNode->id());
+      return false;
+    }
+    return true;
   }
 
   bool acceptsGpuInput() const override {
@@ -847,11 +849,12 @@ class WindowAdapter : public OperatorAdapter {
       const core::PlanNodePtr& planNode,
       exec::DriverCtx* ctx,
       int32_t operatorId) const override {
-    auto windowNode =
+    auto windowPlanNode =
         std::dynamic_pointer_cast<const core::WindowNode>(planNode);
 
     std::vector<std::unique_ptr<exec::Operator>> result;
-    result.push_back(std::make_unique<CudfWindow>(operatorId, ctx, windowNode));
+    result.push_back(
+        std::make_unique<CudfWindow>(operatorId, ctx, windowPlanNode));
     return result;
   }
 };
@@ -1200,6 +1203,58 @@ class CallbackSinkAdapter : public OperatorAdapter {
 
   bool keepOperator() const override {
     return true;
+  }
+};
+
+// WindowAdapter - Replaces with CudfWindow
+class WindowAdapter : public OperatorAdapter {
+ public:
+  WindowAdapter() : OperatorAdapter("Window") {}
+
+  bool canHandle(const exec::Operator* op) const override {
+    return dynamic_cast<const exec::Window*>(op) != nullptr;
+  }
+
+  bool canRunOnGPU(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* /*ctx*/) const override {
+    auto windowNode =
+        std::dynamic_pointer_cast<const core::WindowNode>(planNode);
+    if (!windowNode) {
+      return false;
+    }
+    std::string reason;
+    if (!CudfWindow::canRunOnGPU(*windowNode, &reason)) {
+      LOG_FALLBACK(
+          "{}, PlanNode id: {}",
+          reason.empty() ? "unknown" : reason,
+          planNode->id());
+      return false;
+    }
+    return true;
+  }
+
+  bool acceptsGpuInput() const override {
+    return true;
+  }
+
+  bool producesGpuOutput() const override {
+    return true;
+  }
+
+  std::vector<std::unique_ptr<exec::Operator>> createReplacements(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* ctx,
+      int32_t operatorId) const override {
+    auto windowPlanNode =
+        std::dynamic_pointer_cast<const core::WindowNode>(planNode);
+
+    std::vector<std::unique_ptr<exec::Operator>> result;
+    result.push_back(
+        std::make_unique<CudfWindow>(operatorId, ctx, windowPlanNode));
+    return result;
   }
 };
 

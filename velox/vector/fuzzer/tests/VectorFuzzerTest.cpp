@@ -586,6 +586,47 @@ TEST_F(VectorFuzzerTest, verifyEmptyContainersGenerated) {
   EXPECT_GT(emptyMaps, 0);
 }
 
+TEST_F(VectorFuzzerTest, nonContiguousElements) {
+  constexpr vector_size_t kSize = 200;
+
+  // With the option on, some containers start after the end of the previous one
+  // (a gap of unreferenced elements), and the vector still passes validate().
+  {
+    VectorFuzzer::Options opts;
+    opts.nullRatio = 0.0;
+    opts.fuzzNonContiguousElements = true;
+    VectorFuzzer fuzzer(opts, pool(), /*seed=*/12345);
+
+    auto array = fuzzer.fuzzArray(fuzzer.fuzzFlat(BIGINT(), kSize), kSize);
+    ASSERT_NO_THROW(array->validate({}));
+    auto* arrayVector = array->as<ArrayVector>();
+    bool foundGap = false;
+    for (vector_size_t i = 1; i < kSize; ++i) {
+      if (arrayVector->offsetAt(i) >
+          arrayVector->offsetAt(i - 1) + arrayVector->sizeAt(i - 1)) {
+        foundGap = true;
+        break;
+      }
+    }
+    EXPECT_TRUE(foundGap);
+  }
+
+  // With the option off (default), containers are laid out contiguously.
+  {
+    VectorFuzzer::Options opts;
+    opts.nullRatio = 0.0;
+    VectorFuzzer fuzzer(opts, pool(), /*seed=*/12345);
+
+    auto array = fuzzer.fuzzArray(fuzzer.fuzzFlat(BIGINT(), kSize), kSize);
+    auto* arrayVector = array->as<ArrayVector>();
+    for (vector_size_t i = 1; i < kSize; ++i) {
+      EXPECT_LE(
+          arrayVector->offsetAt(i),
+          arrayVector->offsetAt(i - 1) + arrayVector->sizeAt(i - 1));
+    }
+  }
+}
+
 TEST_F(VectorFuzzerTest, map) {
   VectorFuzzer::Options opts;
   opts.containerVariableLength = false;
@@ -637,6 +678,32 @@ TEST_F(VectorFuzzerTest, mapKeys) {
       assertMapKeys(vector->as<MapVector>());
     }
   }
+}
+
+// Regression test: normalizeMapKeys must read keys through decoding so non-flat
+// encodings work. A dictionary wrapping an unloaded lazy vector has no value
+// accessor until decoded; hashing it directly used to deref null.
+TEST_F(VectorFuzzerTest, normalizeMapKeysEncodedKeys) {
+  VectorFuzzer::Options opts;
+  opts.nullRatio = 0;
+  opts.dictionaryHasNulls = false;
+  opts.normalizeMapKeys = true;
+  VectorFuzzer fuzzer(opts, pool());
+
+  // Build DICTIONARY(LAZY(FLAT)) non-null keys, left unloaded.
+  auto keys = fuzzer.fuzzDictionary(
+      VectorFuzzer::wrapInLazyVector(fuzzer.fuzzFlat(BIGINT(), 1000)));
+  ASSERT_TRUE(VectorEncoding::isDictionary(keys->encoding()));
+  ASSERT_TRUE(isLazyNotLoaded(*keys->valueVector()));
+
+  VectorPtr vector;
+  ASSERT_NO_THROW(
+      vector = fuzzer.fuzzMap(keys, fuzzer.fuzzFlat(BIGINT(), 1000), 10));
+
+  // Materialize the lazy layer so the uniqueness check can read key values,
+  // then verify normalization actually deduplicated keys.
+  vector->as<MapVector>()->mapKeys()->loadedVector();
+  assertMapKeys(vector->as<MapVector>());
 }
 
 TEST_F(VectorFuzzerTest, row) {
