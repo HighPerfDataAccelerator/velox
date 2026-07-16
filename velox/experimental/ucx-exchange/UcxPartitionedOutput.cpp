@@ -231,7 +231,6 @@ bool partialAggregationBehindProjects(
   }
   return false;
 }
-
 uint64_t targetBytesPerUcxChunk(const core::QueryConfig& queryConfig) {
   if (const char* value =
           std::getenv("GLUTEN_UCX_PARTITIONED_OUTPUT_BATCH_BYTES")) {
@@ -1108,4 +1107,3 @@ void UcxPartitionedOutput::splitAndEnqueue(
 }
 
 } // namespace facebook::velox::ucx_exchange
-
