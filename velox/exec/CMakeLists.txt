@@ -259,6 +259,18 @@ velox_link_libraries(
   velox_vector
 )
 
+if(VELOX_ENABLE_CUDF)
+  # Task.cpp owns the UCX output-queue lifecycle when cuDF exchange is enabled.
+  # The CMake option does not automatically define a C++ preprocessor macro;
+  # without this definition the guarded initialize/update/remove paths are
+  # silently omitted from production builds.
+  velox_compile_definitions(velox_exec PRIVATE VELOX_ENABLE_CUDF)
+  # Task.cpp includes the cuDF-backed queue manager under the same guard.
+  # Propagate cuDF's CCCL include directories (including <cuda/version>) to
+  # this target without exposing them to velox_exec consumers.
+  velox_link_libraries(velox_exec PRIVATE cudf::cudf)
+endif()
+
 if(VELOX_ENABLE_GEO)
   velox_compile_definitions(velox_exec PRIVATE VELOX_ENABLE_GEO)
   velox_link_libraries(velox_exec velox_common_geospatial_serde)
