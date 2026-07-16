@@ -119,8 +119,12 @@ class UcxPartitionedOutput : public exec::Operator,
   std::vector<cudf_velox::CudfVectorPtr> pendingInputs_;
   /// Total rows across pendingInputs_.
   int64_t pendingRows_{0};
+  /// Estimated bytes across pendingInputs_.
+  uint64_t pendingBytes_{0};
   /// Configured row threshold for flushing (from QueryConfig).
   const int64_t targetRowsPerChunk_;
+  /// Configured byte threshold for flushing and destination chunking.
+  const uint64_t targetBytesPerChunk_;
 };
 
 } // namespace facebook::velox::ucx_exchange

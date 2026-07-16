@@ -18,6 +18,7 @@
 #include <folly/json.h>
 #include <algorithm>
 #include <cstdlib>
+#include <limits>
 #include "velox/core/PlanNode.h"
 #include "velox/core/QueryConfig.h"
 #include "velox/exec/Driver.h"
@@ -176,6 +177,38 @@ void normalizePartitionOffsets(
     offsets.pop_back();
   }
 }
+
+uint64_t targetBytesPerUcxChunk(const core::QueryConfig& queryConfig) {
+  if (const char* value =
+          std::getenv("GLUTEN_UCX_PARTITIONED_OUTPUT_BATCH_BYTES")) {
+    try {
+      return std::stoull(value);
+    } catch (...) {
+    }
+  }
+  return queryConfig.ucxPartitionedOutputBatchBytes();
+}
+
+cudf::size_type rowsPerUcxChunk(
+    cudf::size_type rows,
+    uint64_t bytes,
+    int64_t targetRows,
+    uint64_t targetBytes) {
+  auto rowsPerChunk = rows;
+  if (targetRows > 0) {
+    rowsPerChunk = std::min<cudf::size_type>(rowsPerChunk, targetRows);
+  }
+  if (targetBytes > 0 && bytes > targetBytes && rows > 0) {
+    const auto byteLimitedRows = std::max<uint64_t>(
+        1, static_cast<uint64_t>(rows) * targetBytes / bytes);
+    rowsPerChunk = std::min<cudf::size_type>(
+        rowsPerChunk,
+        static_cast<cudf::size_type>(std::min<uint64_t>(
+            byteLimitedRows,
+            std::numeric_limits<cudf::size_type>::max())));
+  }
+  return std::max<cudf::size_type>(1, rowsPerChunk);
+}
 } // namespace
 
 // Computes a mapping from names in n2 to names in n1
@@ -229,7 +262,8 @@ UcxPartitionedOutput::UcxPartitionedOutput(
       numPartitions_(planNode->numPartitions()),
       pipelineId_(ctx->pipelineId),
       driverId_(ctx->driverId),
-      targetRowsPerChunk_(targetRowsPerUcxChunk(ctx->queryConfig())) {
+      targetRowsPerChunk_(targetRowsPerUcxChunk(ctx->queryConfig())),
+      targetBytesPerChunk_(targetBytesPerUcxChunk(ctx->queryConfig())) {
   this->initPartitionKeys(planNode);
   auto sources = planNode->sources();
   std::vector<std::string> inNames, outNames;
@@ -265,9 +299,12 @@ void UcxPartitionedOutput::addInput(RowVectorPtr input) {
   }
 
   pendingRows_ += cudfVector->getTableView().num_rows();
+  pendingBytes_ += cudfVector->estimateFlatSize();
   pendingInputs_.push_back(std::move(cudfVector));
 
-  if (targetRowsPerChunk_ <= 0 || pendingRows_ >= targetRowsPerChunk_) {
+  if ((targetRowsPerChunk_ <= 0 && targetBytesPerChunk_ == 0) ||
+      (targetRowsPerChunk_ > 0 && pendingRows_ >= targetRowsPerChunk_) ||
+      (targetBytesPerChunk_ > 0 && pendingBytes_ >= targetBytesPerChunk_)) {
     flushPending();
   }
 }
@@ -281,6 +318,7 @@ void UcxPartitionedOutput::flushPending() {
   }
 
   try {
+    const auto pendingBytes = pendingBytes_;
     cudf::table_view tableView;
     rmm::cuda_stream_view stream = pendingInputs_.back()->stream();
     // Keeps the merged table alive while tableView references it.
@@ -332,13 +370,11 @@ void UcxPartitionedOutput::flushPending() {
       }
     } else {
       const auto tableRows = tableView.num_rows();
-      const auto rowsPerChunk = std::max<cudf::size_type>(
-          1,
-          targetRowsPerChunk_ > 0
-              ? std::min<cudf::size_type>(
-                    tableRows,
-                    static_cast<cudf::size_type>(targetRowsPerChunk_))
-              : tableRows);
+      const auto rowsPerChunk = rowsPerUcxChunk(
+          tableRows,
+          pendingBytes,
+          targetRowsPerChunk_,
+          targetBytesPerChunk_);
       // SINGLE/gather exchanges must obey the same chunk bound as HASH and
       // RANGE.  Packing the whole input here bypassed splitAndEnqueue and let
       // a global sort/gather create tens-of-GiB host-staging transfers.
@@ -372,6 +408,7 @@ void UcxPartitionedOutput::flushPending() {
 
     pendingInputs_.clear();
     pendingRows_ = 0;
+    pendingBytes_ = 0;
 
   } catch (const rmm::bad_alloc& e) {
     VLOG(1)
@@ -379,6 +416,7 @@ void UcxPartitionedOutput::flushPending() {
         << " caught memory alloc error, removing all memory in output queues";
     pendingInputs_.clear();
     pendingRows_ = 0;
+    pendingBytes_ = 0;
     for (int i = 0; i < numPartitions_; i++) {
       sharedQueueManager()->deleteResults(this->taskId(), i);
     }
@@ -606,20 +644,28 @@ void UcxPartitionedOutput::splitAndEnqueue(
       continue;
     }
 
-    const bool rowChunkingNeeded =
-        targetRowsPerChunk_ > 0 && partitionRows > targetRowsPerChunk_;
-    if (rowChunkingNeeded) {
-      cudf::size_type rowsPerChunk = std::min<cudf::size_type>(
-          partitionRows, static_cast<cudf::size_type>(targetRowsPerChunk_));
+    const auto partitionBytes = partitionTable.data.gpu_data->size();
+    const auto rowsPerChunk = rowsPerUcxChunk(
+        partitionRows,
+        partitionBytes,
+        targetRowsPerChunk_,
+        targetBytesPerChunk_);
+    if (rowsPerChunk < partitionRows) {
       VLOG(2) << "UcxPartitionedOutput chunking task=" << taskId()
               << " destination=" << i << " rows=" << partitionRows
+              << " bytes=" << partitionBytes
               << " rowsPerChunk=" << rowsPerChunk
-              << " targetRowsPerChunk=" << targetRowsPerChunk_;
+              << " targetRowsPerChunk=" << targetRowsPerChunk_
+              << " targetBytesPerChunk=" << targetBytesPerChunk_;
       for (cudf::size_type start = 0; start < partitionRows;
            start += rowsPerChunk) {
         const auto end =
             std::min<cudf::size_type>(partitionRows, start + rowsPerChunk);
-        auto slicedTables = cudf::slice(partitionTable.table, {start, end});
+        auto slicedTables = cudf::slice(
+            partitionTable.table,
+            {static_cast<cudf::size_type>(start),
+             static_cast<cudf::size_type>(end)},
+            stream);
         VELOX_CHECK_EQ(slicedTables.size(), 1);
         auto packedCols = cudf::pack(slicedTables[0], stream);
         stream.synchronize();
