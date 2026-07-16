@@ -535,35 +535,6 @@ bool hasSupportedConstantDecodeCharset(
   return isUtf8DecodeCharset(charsetExpr->value()->toString(0));
 }
 
-void mergeNullSourceNullsIntoResult(
-    cudf::column& result,
-    cudf::column_view nullSourceColumn,
-    rmm::cuda_stream_view stream,
-    rmm::device_async_resource_ref mr) {
-  // Merge null-source nulls back only when present to preserve Velox CPU
-  // null propagation semantics without extra mask work unless it is required.
-  VELOX_DCHECK_EQ(result.size(), nullSourceColumn.size());
-  if (!nullSourceColumn.has_nulls()) {
-    return;
-  }
-
-  if (!result.nullable()) {
-    result.set_null_mask(
-        cudf::copy_bitmask(nullSourceColumn, stream, mr),
-        nullSourceColumn.null_count());
-    return;
-  }
-
-  std::vector<cudf::bitmask_type const*> masks{
-      result.view().null_mask(),
-      nullSourceColumn.null_mask(),
-  };
-  std::vector<cudf::size_type> beginBits{0, nullSourceColumn.offset()};
-  auto [nullMask, nullCount] =
-      cudf::bitmask_and(masks, beginBits, result.size(), stream, mr);
-  result.set_null_mask(std::move(nullMask), nullCount);
-}
-
 bool isIntegralNonDecimalVeloxType(const TypePtr& type) {
   if (type == nullptr || type->isDate()) {
     return false;

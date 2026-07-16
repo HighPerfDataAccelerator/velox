@@ -162,6 +162,9 @@ class CudfIcebergSplitReader : public CudfSplitReader {
 
   std::shared_ptr<const velox_iceberg::HiveIcebergSplit> icebergSplit_;
   std::shared_ptr<const velox_hive::HiveConfig> hiveConfig_;
+  // Top-level physical columns in the assembled table, before ROW projections
+  // are expanded into nested parquet selector paths.
+  std::vector<std::string> logicalReadColumnNames_;
   std::vector<std::string> outputReadColumnNames_;
 
   // cuDF-accelerated reader for Iceberg V3 deletion vector (Puffin-encoded

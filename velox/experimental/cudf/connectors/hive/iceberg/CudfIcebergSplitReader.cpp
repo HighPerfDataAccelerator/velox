@@ -110,6 +110,7 @@ CudfIcebergSplitReader::CudfIcebergSplitReader(
           subfieldFilterExpr),
       icebergSplit_(std::move(icebergSplit)),
       hiveConfig_(hiveConfig),
+      logicalReadColumnNames_(readColumnNames),
       outputReadColumnNames_(outputReadColumnNames) {
   // Selecting only a top-level struct name makes libcudf return every child
   // in the Parquet file's physical order. Iceberg/Spark may prune and reorder
@@ -637,23 +638,29 @@ void CudfIcebergSplitReader::cacheSchemaFromMetadata() {
 }
 
 void CudfIcebergSplitReader::adaptColumns() {
-  // Skip trailing equality-delete keys and classify output + filter-only
-  // columns only.
-  VELOX_CHECK_GE(
-      readColumnNames_.size(),
-      extraEqualityColumns_.size(),
-      "Column projection must at least include the equality delete keys");
+  // Classify output and filter-only columns using the original top-level
+  // projection. readColumnNames_ may contain multiple nested parquet selector
+  // paths for one ROW column, so its indices are not assembled-table indices.
   std::unordered_set<std::string> injectedNames;
-  for (size_t i = 0; i < outputType_->size(); ++i) {
-    const auto& fieldName = outputType_->nameOf(i);
+  for (size_t i = 0; i < logicalReadColumnNames_.size(); ++i) {
     const auto& readName = i < outputReadColumnNames_.size()
         ? outputReadColumnNames_[i]
-        : fieldName;
+        : logicalReadColumnNames_[i];
+    const TypePtr veloxType = [&]() -> TypePtr {
+      if (i < outputType_->size()) {
+        return outputType_->childAt(i);
+      }
+      const auto& dataColumns = tableHandle_->dataColumns();
+      VELOX_CHECK(
+          dataColumns and dataColumns->containsChild(readName),
+          "Filter-only column missing from table schema: {}",
+          readName);
+      return dataColumns->findChild(readName);
+    }();
 
     if (auto iter = split_->infoColumns.find(readName);
         iter != split_->infoColumns.end()) {
-      injectedColumns_.push_back(
-          {i, readName, iter->second, outputType_->childAt(i)});
+      injectedColumns_.push_back({i, readName, iter->second, veloxType});
       injectedNames.insert(readName);
     } else if (auto it = icebergSplit_->partitionKeys.find(readName);
                it != icebergSplit_->partitionKeys.end()) {
@@ -661,52 +668,28 @@ void CudfIcebergSplitReader::adaptColumns() {
       // files, partition column values are stored in partition metadata
       // rather than in the data file itself, following Hive's
       // partitioning convention.
-      injectedColumns_.push_back(
-          {i, readName, it->second, outputType_->childAt(i)});
+      injectedColumns_.push_back({i, readName, it->second, veloxType});
       injectedNames.insert(readName);
-    }
-  }
-
-  // Detect schema-evolution missing columns by reading the parquet
-  // footer. Only needed if there are output columns not yet accounted for.
-  if (injectedNames.size() < outputType_->size()) {
-    setupCudfDataSource();
-    VELOX_CHECK_NOT_NULL(
-        dataSource_,
-        "CudfIcebergSplitReader failed to setup a cuDF datasource");
-    auto meta = cudf::io::read_parquet_metadata(
-        cudf::io::source_info{dataSource_.get()});
-    const auto& rootSchema = meta.schema().root();
-    std::unordered_set<std::string> fileColumns;
-    fileColumns.reserve(rootSchema.num_children());
-    std::transform(
-        rootSchema.children().begin(),
-        rootSchema.children().end(),
-        std::inserter(fileColumns, fileColumns.end()),
-        [](const auto& col) { return col.name(); });
-
-    for (size_t i = 0; i < outputType_->size(); ++i) {
-      const auto& fieldName = outputType_->nameOf(i);
-      const auto& readName = i < outputReadColumnNames_.size()
-          ? outputReadColumnNames_[i]
-          : fieldName;
-      if (injectedNames.contains(readName)) {
-        continue;
-      }
-      if (not fileColumns.contains(readName)) {
-        // Schema evolution: Column was added after the data file was written
-        // and doesn't exist in older data files.
-        injectedColumns_.push_back(
-            {i, readName, std::nullopt, outputType_->childAt(i)});
-        injectedNames.insert(readName);
-      }
+    } else if (not fileColumnNames_.contains(readName)) {
+      // Schema evolution: Column was added after the data file was written
+      // and doesn't exist in older data files.
+      injectedColumns_.push_back({i, readName, std::nullopt, veloxType});
+      injectedNames.insert(readName);
     }
   }
 
   // Remove all injected columns from readColumnNames_
   if (not injectedColumns_.empty()) {
     std::erase_if(readColumnNames_, [&injectedNames](const auto& name) {
-      return injectedNames.contains(name);
+      return std::any_of(
+          injectedNames.begin(),
+          injectedNames.end(),
+          [&](const auto& injected) {
+            return name == injected or
+                (name.size() > injected.size() and
+                 name.compare(0, injected.size(), injected) == 0 and
+                 name[injected.size()] == '.');
+          });
     });
     // Sort injected columns by assembled-table index once here
     std::sort(
