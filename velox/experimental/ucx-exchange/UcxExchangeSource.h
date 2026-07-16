@@ -100,6 +100,11 @@ class UcxExchangeSource
   /// once it received enough data.
   void close();
 
+  /// Fails a live source because its transport endpoint closed unexpectedly,
+  /// then schedules the ordinary source cleanup. Unlike close(), this records
+  /// an exchange error so a rejected handshake cannot look like an empty input.
+  void closeWithError(std::string error);
+
   /// @brief Marks this source as registered with the exchange queue.
   /// Must be called after addSourceLocked() increments numSources_ for this
   /// source. Without this, deliverEndMarker() will not enqueue the nullptr

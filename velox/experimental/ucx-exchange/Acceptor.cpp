@@ -13,6 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <fmt/format.h>
 #include <cstring>
 
 #include "velox/experimental/cudf/CudfConfig.h"
@@ -24,6 +25,35 @@
 #include "velox/experimental/ucx-exchange/UcxOutputQueueManager.h"
 
 namespace facebook::velox::ucx_exchange {
+namespace {
+
+// Active-message callbacks run on the UCX progress thread and must not throw or
+// call closeBlocking(). Defer endpoint teardown so the peer's outstanding
+// HandshakeResponse receive completes with an error instead of waiting forever.
+void rejectHandshake(ucp_ep_h ep, const std::string& reason) noexcept {
+  LOG(ERROR) << "Rejecting UCX exchange handshake: " << reason;
+  try {
+    auto communicator = Communicator::tryGetInstance();
+    if (!communicator || communicator->isShuttingDown()) {
+      return;
+    }
+    auto epRef = communicator->findEndpointRefByHandle(ep);
+    if (!epRef) {
+      LOG(ERROR) << "Cannot close rejected UCX handshake endpoint: endpoint "
+                    "reference is unavailable";
+      return;
+    }
+    communicator->deferEndpointCleanup(std::move(epRef));
+  } catch (const std::exception& e) {
+    LOG(ERROR) << "Failed to defer rejected UCX handshake cleanup: "
+               << e.what();
+  } catch (...) {
+    LOG(ERROR)
+        << "Failed to defer rejected UCX handshake cleanup: unknown error";
+  }
+}
+
+} // namespace
 
 /*static*/
 void Acceptor::cStyleAMCallback(
@@ -34,6 +64,11 @@ void Acceptor::cStyleAMCallback(
     VELOX_CHECK(
         request->isCompleted(), "AMCallback called with incomplete request!");
     if (request->getStatus() != UCS_OK) {
+      rejectHandshake(
+          ep,
+          fmt::format(
+              "active-message receive failed: {}",
+              ucs_status_string(request->getStatus())));
       return;
     }
     auto communicator = Communicator::tryGetInstance();
@@ -43,7 +78,8 @@ void Acceptor::cStyleAMCallback(
     auto buffer =
         std::dynamic_pointer_cast<ucxx::Buffer>(request->getRecvBuffer());
     VELOX_CHECK_NOT_NULL(buffer, "AMCallback: failed to get receive buffer.");
-    // Validate buffer size BEFORE casting to prevent reading past buffer bounds.
+    // Validate buffer size BEFORE casting to prevent reading past buffer
+    // bounds.
     VELOX_CHECK_GE(
         buffer->getSize(),
         sizeof(HandshakeMsg),
@@ -110,8 +146,8 @@ void Acceptor::cStyleAMCallback(
               << cudf_velox::CudfConfig::getInstance().intraNodeExchange;
     }
 
-    auto exchangeServer =
-        UcxExchangeServer::create(communicator, epRef, key, isIntraNodeTransfer);
+    auto exchangeServer = UcxExchangeServer::create(
+        communicator, epRef, key, isIntraNodeTransfer);
 
     // Add this exchangeServer to the endpoint reference.
     epRef->addCommElem(exchangeServer);
@@ -154,9 +190,9 @@ void Acceptor::cStyleAMCallback(
         },
         response);
   } catch (const std::exception& e) {
-    LOG(ERROR) << "Ignoring UCX active-message callback failure: " << e.what();
+    rejectHandshake(ep, e.what());
   } catch (...) {
-    LOG(ERROR) << "Ignoring unknown UCX active-message callback failure";
+    rejectHandshake(ep, "unknown active-message callback failure");
   }
 }
 

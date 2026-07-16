@@ -419,6 +419,14 @@ void UcxExchangeSource::close() {
   wakeCommunicator();
 }
 
+void UcxExchangeSource::closeWithError(std::string error) {
+  if (!closed_.load(std::memory_order_acquire) &&
+      getState() != ReceiverState::Done && !atEnd_) {
+    queue_->setError(std::move(error));
+  }
+  close();
+}
+
 void UcxExchangeSource::resumeFromBackpressure() {
   bool expected = true;
   if (backpressureActive_.compare_exchange_strong(

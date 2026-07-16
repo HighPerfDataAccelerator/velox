@@ -99,7 +99,11 @@ void EndpointRef::closeAndDrainCommunicators() {
   }
   for (auto& weakElem : localCopy) {
     if (std::shared_ptr<CommElement> spt = weakElem.lock()) {
-      if (dynamic_cast<UcxExchangeServer*>(spt.get()) == nullptr) {
+      if (auto* source = dynamic_cast<UcxExchangeSource*>(spt.get())) {
+        source->closeWithError(
+            "UCX endpoint closed before exchange completed: peer=" +
+            getPeerAddress());
+      } else if (dynamic_cast<UcxExchangeServer*>(spt.get()) == nullptr) {
         spt->close();
       }
     }

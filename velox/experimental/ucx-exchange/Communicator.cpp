@@ -529,8 +529,7 @@ std::shared_ptr<EndpointRef> Communicator::assocEndpointRef(
 
 void Communicator::removeEndpointRef(std::shared_ptr<EndpointRef> ep) {
   std::lock_guard<std::recursive_mutex> lock(endpointsMutex_);
-  VLOG(2) << "[UCX-COMM-REMOVE-ENDPOINT] listenerPort="
-          << port_
+  VLOG(2) << "[UCX-COMM-REMOVE-ENDPOINT] listenerPort=" << port_
           << " peer=" << (ep ? ep->getPeerAddress() : "(unknown)")
           << " endpointAlive="
           << (ep && ep->endpoint_ && ep->endpoint_->isAlive());
@@ -547,6 +546,14 @@ void Communicator::removeEndpointRef(std::shared_ptr<EndpointRef> ep) {
   for (auto it = endpoints_.begin(); it != endpoints_.end();) {
     if (it->second == ep) {
       it = endpoints_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  for (auto it = acceptor_.handleToEndpointRef_.begin();
+       it != acceptor_.handleToEndpointRef_.end();) {
+    if (it->second == ep) {
+      it = acceptor_.handleToEndpointRef_.erase(it);
     } else {
       ++it;
     }
