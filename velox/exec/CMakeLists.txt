@@ -11,6 +11,22 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+if(VELOX_ENABLE_CUDF)
+  # Task owns output-queue initialization. Without this definition the cuDF
+  # UcxPartitionedOutput operator runs without a registered output queue.
+  set_source_files_properties(
+    Task.cpp TARGET_DIRECTORY velox PROPERTIES COMPILE_DEFINITIONS VELOX_ENABLE_CUDF)
+  set_property(
+    SOURCE Task.cpp
+    TARGET_DIRECTORY velox
+    APPEND
+    PROPERTY INCLUDE_DIRECTORIES
+             "${CMAKE_BINARY_DIR}/_deps/cccl-src/libcudacxx/include"
+             "${CMAKE_BINARY_DIR}/_deps/cccl-src/thrust"
+             "${CMAKE_BINARY_DIR}/_deps/cccl-src/cub"
+             "${CUDAToolkit_INCLUDE_DIRS}")
+endif()
+
 velox_add_library(
   velox_exec
   AddressableNonNullValueList.cpp
