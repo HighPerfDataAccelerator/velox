@@ -19,8 +19,6 @@
 #include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/tests/CudfFunctionBaseTest.h"
 
-#include <folly/ScopeGuard.h>
-
 #include "velox/exec/PlanNodeStats.h"
 #include "velox/exec/tests/utils/AssertQueryBuilder.h"
 #include "velox/exec/tests/utils/OperatorTestBase.h"
@@ -29,6 +27,8 @@
 #include "velox/functions/prestosql/registration/RegistrationFunctions.h"
 #include "velox/functions/prestosql/window/WindowFunctionsRegistration.h"
 #include "velox/functions/sparksql/window/WindowFunctionsRegistration.h"
+
+#include <folly/ScopeGuard.h>
 
 using namespace facebook::velox;
 using namespace facebook::velox::exec;
@@ -176,12 +176,10 @@ TEST_F(
   std::vector<RowVectorPtr> data{
       makeRowVector(
           {"k", "payload"},
-          {makeFlatVector<int64_t>({1, 1}),
-           makeFlatVector<int64_t>({0, 1})}),
+          {makeFlatVector<int64_t>({1, 1}), makeFlatVector<int64_t>({0, 1})}),
       makeRowVector(
           {"k", "payload"},
-          {makeFlatVector<int64_t>({1, 2}),
-           makeFlatVector<int64_t>({2, 3})})};
+          {makeFlatVector<int64_t>({1, 2}), makeFlatVector<int64_t>({2, 3})})};
   auto plan = withRowsFrame(
       PlanBuilder()
           .values(data)
@@ -189,8 +187,7 @@ TEST_F(
               {"count(1) over (partition by k rows between unbounded preceding "
                "and unbounded following) as c"})
           .planNode());
-  auto windowNode =
-      std::dynamic_pointer_cast<const core::WindowNode>(plan);
+  auto windowNode = std::dynamic_pointer_cast<const core::WindowNode>(plan);
   ASSERT_NE(windowNode, nullptr);
   auto valuesNode = std::dynamic_pointer_cast<const core::ValuesNode>(
       windowNode->sources()[0]);
@@ -202,8 +199,8 @@ TEST_F(
       0,
       core::QueryCtx::create(driverExecutor_.get()),
       Task::ExecutionMode::kParallel);
-  auto driver = Driver::testingCreate(std::make_unique<DriverCtx>(
-      task, 0, 0, kUngroupedGroupId, 0));
+  auto driver = Driver::testingCreate(
+      std::make_unique<DriverCtx>(task, 0, 0, kUngroupedGroupId, 0));
   cudf_velox::CudfValues values(0, driver->driverCtx(), valuesNode);
   cudf_velox::CudfWindow window(1, driver->driverCtx(), windowNode);
   values.initialize();
@@ -244,16 +241,13 @@ TEST_F(AdapterOperatorTest, streamingFullPartitionCountSpillsActivePartition) {
   std::vector<RowVectorPtr> data{
       makeRowVector(
           {"k", "payload"},
-          {makeFlatVector<int64_t>({1, 1}),
-           makeFlatVector<int64_t>({0, 1})}),
+          {makeFlatVector<int64_t>({1, 1}), makeFlatVector<int64_t>({0, 1})}),
       makeRowVector(
           {"k", "payload"},
-          {makeFlatVector<int64_t>({1, 1}),
-           makeFlatVector<int64_t>({2, 3})}),
+          {makeFlatVector<int64_t>({1, 1}), makeFlatVector<int64_t>({2, 3})}),
       makeRowVector(
           {"k", "payload"},
-          {makeFlatVector<int64_t>({2, 2}),
-           makeFlatVector<int64_t>({4, 5})})};
+          {makeFlatVector<int64_t>({2, 2}), makeFlatVector<int64_t>({4, 5})})};
   auto plan = withRowsFrame(
       PlanBuilder()
           .values(data)
@@ -314,9 +308,8 @@ TEST_F(AdapterOperatorTest, streamingWindowFeatureGapsFailClosed) {
   auto unsortedRange = std::dynamic_pointer_cast<const core::WindowNode>(
       PlanBuilder()
           .values({data})
-          .window(
-              {"sum(v) over (partition by k order by o range between "
-               "unbounded preceding and current row) as s"})
+          .window({"sum(v) over (partition by k order by o range between "
+                   "unbounded preceding and current row) as s"})
           .planNode());
   ASSERT_NE(unsortedRange, nullptr);
   EXPECT_FALSE(cudf_velox::isSupportedCudfWindowNode(unsortedRange));
@@ -326,8 +319,7 @@ TEST_F(AdapterOperatorTest, streamingRowNumberCrossesInputBatches) {
   std::vector<RowVectorPtr> data{
       makeRowVector(
           {"k", "o", "payload"},
-          {makeNullableFlatVector<int64_t>(
-               {std::nullopt, std::nullopt, 1, 1}),
+          {makeNullableFlatVector<int64_t>({std::nullopt, std::nullopt, 1, 1}),
            makeNullableFlatVector<int64_t>({std::nullopt, 0, 0, 1}),
            makeFlatVector<int64_t>({0, 1, 2, 3})}),
       makeRowVector(
@@ -359,8 +351,7 @@ TEST_F(AdapterOperatorTest, streamingRankFixesContinuedTieAndLaterPeer) {
       makeRowVector(
           {"k", "o", "payload"},
           {makeFlatVector<int64_t>({1, 1, 1, 1}),
-           makeNullableFlatVector<int64_t>(
-               {std::nullopt, std::nullopt, 1, 1}),
+           makeNullableFlatVector<int64_t>({std::nullopt, std::nullopt, 1, 1}),
            makeFlatVector<int64_t>({0, 1, 2, 3})}),
       makeRowVector(
           {"k", "o", "payload"},
@@ -398,21 +389,17 @@ TEST_F(AdapterOperatorTest, streamingRankProducesOutputBeforeNoMoreInput) {
   std::vector<RowVectorPtr> data{
       makeRowVector(
           {"k", "o"},
-          {makeFlatVector<int64_t>({1, 1}),
-           makeFlatVector<int64_t>({0, 1})}),
+          {makeFlatVector<int64_t>({1, 1}), makeFlatVector<int64_t>({0, 1})}),
       makeRowVector(
           {"k", "o"},
-          {makeFlatVector<int64_t>({1, 1}),
-           makeFlatVector<int64_t>({2, 3})})};
+          {makeFlatVector<int64_t>({1, 1}), makeFlatVector<int64_t>({2, 3})})};
 
   auto plan =
       PlanBuilder()
           .values(data)
-          .streamingWindow(
-              {"rank() over (partition by k order by o) as rnk"})
+          .streamingWindow({"rank() over (partition by k order by o) as rnk"})
           .planNode();
-  auto windowNode =
-      std::dynamic_pointer_cast<const core::WindowNode>(plan);
+  auto windowNode = std::dynamic_pointer_cast<const core::WindowNode>(plan);
   ASSERT_NE(windowNode, nullptr);
   auto valuesNode = std::dynamic_pointer_cast<const core::ValuesNode>(
       windowNode->sources()[0]);
@@ -424,8 +411,8 @@ TEST_F(AdapterOperatorTest, streamingRankProducesOutputBeforeNoMoreInput) {
       0,
       core::QueryCtx::create(driverExecutor_.get()),
       Task::ExecutionMode::kParallel);
-  auto driver = Driver::testingCreate(std::make_unique<DriverCtx>(
-      task, 0, 0, kUngroupedGroupId, 0));
+  auto driver = Driver::testingCreate(
+      std::make_unique<DriverCtx>(task, 0, 0, kUngroupedGroupId, 0));
   cudf_velox::CudfValues values(0, driver->driverCtx(), valuesNode);
   cudf_velox::CudfWindow window(1, driver->driverCtx(), windowNode);
   values.initialize();
@@ -525,18 +512,16 @@ TEST_F(AdapterOperatorTest, streamingRankDoesNotRetainGiantPartition) {
         {"k", "o"},
         {makeFlatVector<int64_t>(
              kRowsPerBatch, [](vector_size_t) { return 7; }),
-         makeFlatVector<int64_t>(
-             kRowsPerBatch, [batch](vector_size_t row) {
-               return static_cast<int64_t>(batch) * kRowsPerBatch + row;
-             })}));
+         makeFlatVector<int64_t>(kRowsPerBatch, [batch](vector_size_t row) {
+           return static_cast<int64_t>(batch) * kRowsPerBatch + row;
+         })}));
   }
   createDuckDbTable(data);
 
   auto plan =
       PlanBuilder()
           .values(data)
-          .streamingWindow(
-              {"rank() over (partition by k order by o) as rnk"})
+          .streamingWindow({"rank() over (partition by k order by o) as rnk"})
           .planNode();
   auto task = assertQueryOrdered(
       plan,
@@ -592,9 +577,7 @@ TEST_F(AdapterOperatorTest, streamingMultiKeyRangeSumCrossesPeersAndNulls) {
   EXPECT_TRUE(wasCudfWindowUsed(task));
 }
 
-TEST_F(
-    AdapterOperatorTest,
-    streamingRangeSumProducesOutputBeforeNoMoreInput) {
+TEST_F(AdapterOperatorTest, streamingRangeSumProducesOutputBeforeNoMoreInput) {
   std::vector<RowVectorPtr> data{
       makeRowVector(
           {"k", "a", "b", "v"},
@@ -616,8 +599,7 @@ TEST_F(
                "nulls first range between unbounded preceding and current row) "
                "as s"})
           .planNode();
-  auto windowNode =
-      std::dynamic_pointer_cast<const core::WindowNode>(plan);
+  auto windowNode = std::dynamic_pointer_cast<const core::WindowNode>(plan);
   ASSERT_NE(windowNode, nullptr);
   auto valuesNode = std::dynamic_pointer_cast<const core::ValuesNode>(
       windowNode->sources()[0]);
@@ -629,8 +611,8 @@ TEST_F(
       0,
       core::QueryCtx::create(driverExecutor_.get()),
       Task::ExecutionMode::kParallel);
-  auto driver = Driver::testingCreate(std::make_unique<DriverCtx>(
-      task, 0, 0, kUngroupedGroupId, 0));
+  auto driver = Driver::testingCreate(
+      std::make_unique<DriverCtx>(task, 0, 0, kUngroupedGroupId, 0));
   cudf_velox::CudfValues values(0, driver->driverCtx(), valuesNode);
   cudf_velox::CudfWindow window(1, driver->driverCtx(), windowNode);
   values.initialize();
