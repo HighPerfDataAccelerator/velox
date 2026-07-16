@@ -44,8 +44,9 @@ void EndpointRef::onClose(ucs_status_t status, std::shared_ptr<void> arg) {
   // The main loop will:
   //   1. Close all communicators registered with this endpoint
   //   2. Clean up the endpoint itself (closeBlocking, etc.)
-  auto c = Communicator::getInstance();
-  c->deferEndpointCleanup(ep);
+  if (auto c = Communicator::tryGetInstance()) {
+    c->deferEndpointCleanup(ep);
+  }
 }
 
 bool EndpointRef::addCommElem(std::shared_ptr<CommElement> commElem) {
@@ -98,7 +99,11 @@ void EndpointRef::closeAndDrainCommunicators() {
   }
   for (auto& weakElem : localCopy) {
     if (std::shared_ptr<CommElement> spt = weakElem.lock()) {
-      if (dynamic_cast<UcxExchangeServer*>(spt.get()) == nullptr) {
+      if (auto* source = dynamic_cast<UcxExchangeSource*>(spt.get())) {
+        source->closeWithError(
+            "UCX endpoint closed before exchange completed: peer=" +
+            getPeerAddress());
+      } else if (dynamic_cast<UcxExchangeServer*>(spt.get()) == nullptr) {
         spt->close();
       }
     }

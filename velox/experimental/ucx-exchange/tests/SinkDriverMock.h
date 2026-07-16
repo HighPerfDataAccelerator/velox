@@ -86,7 +86,8 @@ class SinkDriverMock {
   /// @brief checks if the received table corresponds to that sent, sets
   /// dataValidFlag_=false if not
   /// @param tab
-  void updateDataValidity(const cudf::table_view& tab);
+  /// @param startRow the logical row offset in the received stream
+  void updateDataValidity(const cudf::table_view& tab, uint64_t startRow);
 
   std::atomic<bool> dataValidFlag_{true};
   std::shared_ptr<facebook::velox::exec::Task> task_;

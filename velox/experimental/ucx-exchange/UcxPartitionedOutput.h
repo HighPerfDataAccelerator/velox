@@ -74,6 +74,10 @@ class UcxPartitionedOutput : public exec::Operator,
   // function using the given stream.
   void hashPartition(cudf::table_view tableView, rmm::cuda_stream_view stream);
 
+  // Computes a Spark-compatible INT32 partition id from serialized range
+  // boundaries, then routes rows by that explicit id.
+  void rangePartition(cudf::table_view tableView, rmm::cuda_stream_view stream);
+
   // Splits the cudf table view into equal sizes. This is used when
   // RoundRobin partitioning is requested but round robin on a
   // row-by-row basis is not meaningful for UCX exchange.
@@ -89,6 +93,10 @@ class UcxPartitionedOutput : public exec::Operator,
 
   const std::weak_ptr<UcxOutputQueueManager> queueManager_;
   std::vector<column_index_t> partitionKeyIndices_;
+  std::string rangeBoundsJson_;
+  std::unique_ptr<cudf::table> rangeBoundaries_;
+  std::vector<cudf::order> rangeOrders_;
+  std::vector<cudf::null_order> rangeNullOrders_;
   const size_t numPartitions_;
 
   const int pipelineId_;

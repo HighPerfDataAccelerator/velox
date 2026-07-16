@@ -445,6 +445,70 @@ TEST_F(
 
 TEST_F(
     StepAwareAggregationRegistryTest,
+    sparkCollectListSupportsAllGroupbyStepsButNotReduce) {
+  registerSparkAggregateFunctions("");
+
+  const auto& groupbyRegistry = getGroupbyAggregationRegistry();
+  const auto& reduceRegistry = getReduceAggregationRegistry();
+  const auto groupbyIt = groupbyRegistry.find("collect_list");
+  ASSERT_NE(groupbyIt, groupbyRegistry.end());
+  EXPECT_EQ(reduceRegistry.find("collect_list"), reduceRegistry.end());
+
+  for (const auto step :
+       {core::AggregationNode::Step::kSingle,
+        core::AggregationNode::Step::kPartial,
+        core::AggregationNode::Step::kIntermediate,
+        core::AggregationNode::Step::kFinal}) {
+    const auto stepIt = groupbyIt->second.find(step);
+    ASSERT_NE(stepIt, groupbyIt->second.end());
+    EXPECT_FALSE(stepIt->second.empty());
+  }
+
+  const auto rowType = ROW({BIGINT(), VARCHAR()});
+  const auto arrayOfRows = ARRAY(rowType);
+  const auto rawCall = std::make_shared<core::CallTypedExpr>(
+      arrayOfRows,
+      std::vector<core::TypedExprPtr>{
+          std::make_shared<core::FieldAccessTypedExpr>(rowType, "input")},
+      "collect_list");
+  const auto mergeCall = std::make_shared<core::CallTypedExpr>(
+      arrayOfRows,
+      std::vector<core::TypedExprPtr>{
+          std::make_shared<core::FieldAccessTypedExpr>(
+              arrayOfRows, "intermediate")},
+      "collect_list");
+
+  for (const auto step :
+       {core::AggregationNode::Step::kSingle,
+        core::AggregationNode::Step::kPartial}) {
+    EXPECT_TRUE(canGroupbyAggregationBeEvaluatedByCudf(
+        *rawCall, step, {rowType}, queryCtx_.get()));
+    EXPECT_FALSE(canReduceAggregationBeEvaluatedByCudf(
+        *rawCall, step, {rowType}, queryCtx_.get()));
+  }
+  for (const auto step :
+       {core::AggregationNode::Step::kIntermediate,
+        core::AggregationNode::Step::kFinal}) {
+    EXPECT_TRUE(canGroupbyAggregationBeEvaluatedByCudf(
+        *mergeCall, step, {arrayOfRows}, queryCtx_.get()));
+    EXPECT_FALSE(canReduceAggregationBeEvaluatedByCudf(
+        *mergeCall, step, {arrayOfRows}, queryCtx_.get()));
+  }
+
+  const auto constantCall = std::make_shared<core::CallTypedExpr>(
+      ARRAY(BIGINT()),
+      std::vector<core::TypedExprPtr>{
+          std::make_shared<core::ConstantTypedExpr>(BIGINT(), variant(7LL))},
+      "collect_list");
+  EXPECT_FALSE(canGroupbyAggregationBeEvaluatedByCudf(
+      *constantCall,
+      core::AggregationNode::Step::kSingle,
+      {BIGINT()},
+      queryCtx_.get()));
+}
+
+TEST_F(
+    StepAwareAggregationRegistryTest,
     appendGroupbySignatureOnlyAffectsGroupbyRegistryAndValidation) {
   unregisterAggregateFunctions();
 

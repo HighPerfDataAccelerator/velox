@@ -630,8 +630,7 @@ class NestedLoopJoinBuildAdapter : public CudfNestedLoopJoinBaseAdapter {
 
     std::vector<std::unique_ptr<exec::Operator>> result;
     result.push_back(
-        std::make_unique<CudfNestedLoopJoinBuild>(
-            operatorId, ctx, joinPlanNode));
+        makeCudfNestedLoopJoinBuild(operatorId, ctx, std::move(joinPlanNode)));
     return result;
   }
 };
@@ -1352,9 +1351,8 @@ class MergeExchangeAdapter : public OperatorAdapter {
         mergeExchangeNode->transportType() ==
             core::ExchangeNode::TransportType::kUcx;
     const bool orderBySupported = mergeExchangeNode &&
-        CudfOrderBy::isSupported(
-            mergeExchangeNode->outputType(),
-            mergeExchangeNode->sortingKeys());
+        CudfOrderBy::isSupported(mergeExchangeNode->outputType(),
+                                 mergeExchangeNode->sortingKeys());
     LOG(WARNING) << "CudfMergeExchangeAdapter: canRunOnGPU node="
                  << (mergeExchangeNode ? mergeExchangeNode->id() : "<null>")
                  << " isUcx=" << isUcx

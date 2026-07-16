@@ -250,6 +250,11 @@ std::shared_ptr<UcxExchangeSource> UcxExchangeSource::create(
 }
 
 void UcxExchangeSource::process() {
+  auto communicator = tryCommunicator();
+  if (!communicator) {
+    deliverEndMarker();
+    return;
+  }
   if (closed_) {
     // Driver thread called closed
     cleanUp();
@@ -261,7 +266,7 @@ void UcxExchangeSource::process() {
       // Get the endpoint.
       HostPort hp{host_, port_};
       std::shared_ptr<UcxExchangeSource> selfPtr = getSelfPtr();
-      auto epRef = communicator_->assocEndpointRef(selfPtr, hp);
+      auto epRef = communicator->assocEndpointRef(selfPtr, hp);
       if (epRef) {
         setEndpoint(epRef);
         setStateIf(
@@ -274,7 +279,7 @@ void UcxExchangeSource::process() {
         deliverEndMarker();
         setState(ReceiverState::Done);
       }
-      communicator_->addToWorkQueue(getSelfPtr());
+      wakeCommunicator();
     } break;
     case ReceiverState::WaitingForHandshakeComplete:
       // Waiting for handshake send completion is handled by callback.
@@ -368,12 +373,13 @@ void UcxExchangeSource::cleanUp() {
   // Move all requests to the Communicator's deferred list so the GPU
   // buffers they reference (via their arg shared_ptr) stay alive until
   // UCX has fully processed any in-flight operations.
-  if (communicator_) {
+  auto communicator = communicator_.lock();
+  if (communicator) {
     if (request_) {
-      communicator_->deferRequestCleanup(std::move(request_));
+      communicator->deferRequestCleanup(std::move(request_));
     }
     for (auto& req : completedRequests_) {
-      communicator_->deferRequestCleanup(std::move(req));
+      communicator->deferRequestCleanup(std::move(req));
     }
     completedRequests_.clear();
   }
@@ -382,8 +388,8 @@ void UcxExchangeSource::cleanUp() {
     endpointRef_->removeCommElem(getSelfPtr());
     endpointRef_ = nullptr;
   }
-  if (communicator_) {
-    communicator_->unregister(getSelfPtr());
+  if (communicator) {
+    communicator->unregister(getSelfPtr());
   }
 }
 
@@ -410,7 +416,15 @@ void UcxExchangeSource::close() {
 
   // Let the Communicator progress thread do the actual clean-up.
   setState(ReceiverState::Done);
-  communicator_->addToWorkQueue(getSelfPtr());
+  wakeCommunicator();
+}
+
+void UcxExchangeSource::closeWithError(std::string error) {
+  if (!closed_.load(std::memory_order_acquire) &&
+      getState() != ReceiverState::Done && !atEnd_) {
+    queue_->setError(std::move(error));
+  }
+  close();
 }
 
 void UcxExchangeSource::resumeFromBackpressure() {
@@ -419,7 +433,7 @@ void UcxExchangeSource::resumeFromBackpressure() {
           expected, false, std::memory_order_acq_rel)) {
     VLOG(1) << "[BACKPRESSURE] [ExSrc " << toString()
             << "] resumed by consumer, queueSize=" << queue_->size();
-    communicator_->addToWorkQueue(getSelfPtr());
+    wakeCommunicator();
   }
 }
 
@@ -470,6 +484,12 @@ std::shared_ptr<UcxExchangeSource> UcxExchangeSource::getSelfPtr() {
   return ptr;
 }
 
+void UcxExchangeSource::wakeCommunicator() {
+  if (auto communicator = tryCommunicator()) {
+    communicator->addToWorkQueue(getSelfPtr());
+  }
+}
+
 void UcxExchangeSource::enqueue(
     PackedTableWithStreamPtr data,
     int64_t reservedReceiveBytes) {
@@ -517,6 +537,11 @@ void UcxExchangeSource::setEndpoint(std::shared_ptr<EndpointRef> endpointRef) {
 }
 
 void UcxExchangeSource::sendHandshake() {
+  auto communicator = tryCommunicator();
+  if (!communicator) {
+    deliverEndMarker();
+    return;
+  }
   handshakeRequestBuffer_ = std::make_shared<HandshakeMsg>();
   auto& handshakeReq = handshakeRequestBuffer_;
   handshakeReq->destination = partitionKey_.destination;
@@ -527,7 +552,7 @@ void UcxExchangeSource::sendHandshake() {
       partitionKey_.taskId.c_str(),
       sizeof(handshakeReq->taskId) - 1);
   handshakeReq->taskId[sizeof(handshakeReq->taskId) - 1] = '\0';
-  handshakeReq->workerId = communicator_->getWorkerId();
+  handshakeReq->workerId = communicator->getWorkerId();
 
   VLOG(2) << "[UCX-SOURCE-HANDSHAKE-SEND] localTask=" << taskId_
           << " remoteTask=" << partitionKey_.taskId
@@ -536,7 +561,7 @@ void UcxExchangeSource::sendHandshake() {
 
   // Create the handshake which will register client's existence with the server
   ucxx::AmReceiverCallbackInfo info(
-      communicator_->kAmCallbackOwner, communicator_->kAmCallbackId);
+      communicator->kAmCallbackOwner, communicator->kAmCallbackId);
   // Use weak_ptr to prevent use-after-free if close() is called during callback
   std::weak_ptr<UcxExchangeSource> weak = weak_from_this();
   retireRequest(request_, completedRequests_);
@@ -588,7 +613,7 @@ void UcxExchangeSource::onHandshake(
     queue_->setError(errorMsg);
     deliverEndMarker();
     setState(ReceiverState::Done);
-    communicator_->addToWorkQueue(getSelfPtr());
+    wakeCommunicator();
   } else {
     VLOG(3) << toString() << "+ onHandshake " << ucs_status_string(status)
             << " peer=" << host_ << ":" << port_;
@@ -664,7 +689,7 @@ void UcxExchangeSource::onMetadata(
     queue_->setError(errorMsg);
     deliverEndMarker();
     setState(ReceiverState::Done);
-    communicator_->addToWorkQueue(getSelfPtr());
+    wakeCommunicator();
   } else {
     VELOX_CHECK_NOT_NULL(arg, "Didn't get metadata");
 
@@ -687,7 +712,7 @@ void UcxExchangeSource::onMetadata(
       VLOG(3) << "There is no more data to transfer for " << toString();
       deliverEndMarker();
       setStateIf(ReceiverState::WaitingForMetadata, ReceiverState::Done);
-      communicator_->addToWorkQueue(getSelfPtr());
+      wakeCommunicator();
       // jump out of this function.
       return;
     }
@@ -701,6 +726,10 @@ bool UcxExchangeSource::tryStartDataReceive(
     const std::shared_ptr<DataAndMetadata>& ptr,
     ReceiverState expectedState) {
   if (ptr == nullptr) {
+    return false;
+  }
+  auto communicator = tryCommunicator();
+  if (!communicator) {
     return false;
   }
 
@@ -722,7 +751,7 @@ bool UcxExchangeSource::tryStartDataReceive(
   }
   reservedReceiveBytes_ = ptr->metadata.dataSizeBytes;
 
-  const bool useHostStaging = !communicator_->hasCudaTransport();
+  const bool useHostStaging = !communicator->hasCudaTransport();
   if (useHostStaging && !tryReserveRecvHostBytes(ptr->metadata.dataSizeBytes)) {
     queue_->releaseReservedReceive(reservedReceiveBytes_);
     reservedReceiveBytes_ = 0;
@@ -732,7 +761,7 @@ bool UcxExchangeSource::tryStartDataReceive(
     // Global credit is shared across otherwise unrelated ExchangeQueues, so
     // a dequeue from this queue cannot wake us. Retry from the communicator
     // work loop; completed receives release the process-wide credit below.
-    communicator_->addToWorkQueue(getSelfPtr());
+    wakeCommunicator();
     return false;
   }
   if (useHostStaging) {
@@ -746,7 +775,7 @@ bool UcxExchangeSource::tryStartDataReceive(
     }
     // A different ExchangeQueue may release the process-wide credit. Retry
     // from the communicator loop instead of waiting on this queue's promise.
-    communicator_->addToWorkQueue(getSelfPtr());
+    wakeCommunicator();
     return false;
   }
 
@@ -814,7 +843,7 @@ bool UcxExchangeSource::tryStartDataReceive(
     queue_->setError("Failed to alloc GPU memory");
     deliverEndMarker();
     setState(ReceiverState::Done);
-    communicator_->addToWorkQueue(getSelfPtr());
+    wakeCommunicator();
     return false;
   }
 
@@ -945,7 +974,7 @@ void UcxExchangeSource::onData(ucs_status_t status, std::shared_ptr<void> arg) {
     reservedReceiveBytes_ = 0;
     setStateIf(ReceiverState::WaitingForData, ReceiverState::ReadyToReceive);
   }
-  communicator_->addToWorkQueue(getSelfPtr());
+  wakeCommunicator();
 }
 
 void UcxExchangeSource::receiveHandshakeResponse() {
@@ -1004,7 +1033,7 @@ void UcxExchangeSource::onHandshakeResponse(
     queue_->setError(errorMsg);
     deliverEndMarker();
     setState(ReceiverState::Done);
-    communicator_->addToWorkQueue(getSelfPtr());
+    wakeCommunicator();
     return;
   }
 
@@ -1021,7 +1050,7 @@ void UcxExchangeSource::onHandshakeResponse(
   setStateIf(
       ReceiverState::WaitingForHandshakeResponse,
       ReceiverState::ReadyToReceive);
-  communicator_->addToWorkQueue(getSelfPtr());
+  wakeCommunicator();
 }
 
 void UcxExchangeSource::waitForIntraNodeData() {
@@ -1044,22 +1073,27 @@ void UcxExchangeSource::waitForIntraNodeData() {
     // needs that same thread), livelocking the intra-node transfer. Instead
     // register a one-shot wakeup and go dormant; publish()/cancelTask()
     // re-enqueues this source exactly once when data is available. The weak_ptr
-    // keeps the wakeup safe if the source is destroyed first; the Communicator
-    // outlives its sources, so capturing it by shared_ptr is safe.
+    // keeps the wakeup safe if the source is destroyed first. Capture the
+    // Communicator weakly as well so a dormant waiter cannot extend the
+    // singleton lifetime during executor shutdown.
     auto self = getSelfPtr();
     std::weak_ptr<CommElement> weakSelf = self;
-    auto communicator = communicator_;
+    auto weakCommunicator = communicator_;
     const bool readyNow =
         IntraNodeTransferRegistry::getInstance()->registerWaiter(
-            key, [weakSelf, communicator]() {
-              if (auto source = weakSelf.lock()) {
+            key, [weakSelf, weakCommunicator]() {
+              if (auto source = weakSelf.lock(); source) {
+                auto communicator = weakCommunicator.lock();
+                if (!communicator) {
+                  return;
+                }
                 communicator->addToWorkQueue(source);
               }
             });
     if (readyNow) {
       // Data landed (or the task was cancelled) between poll and register —
       // re-poll once instead of going dormant.
-      communicator_->addToWorkQueue(self);
+      wakeCommunicator();
     }
     return;
   }
@@ -1086,7 +1120,7 @@ void UcxExchangeSource::onIntraNodeData(
     deliverEndMarker();
     setState(ReceiverState::Done);
 
-    communicator_->addToWorkQueue(getSelfPtr());
+    wakeCommunicator();
     return;
   }
 
@@ -1101,7 +1135,7 @@ void UcxExchangeSource::onIntraNodeData(
     queue_->setError(errorMsg);
     deliverEndMarker();
     setState(ReceiverState::Done);
-    communicator_->addToWorkQueue(getSelfPtr());
+    wakeCommunicator();
     return;
   }
 
@@ -1147,7 +1181,7 @@ void UcxExchangeSource::onIntraNodeData(
   this->sequenceNumber_++;
   setStateIf(
       ReceiverState::WaitingForIntraNodeData, ReceiverState::ReadyToReceive);
-  communicator_->addToWorkQueue(getSelfPtr());
+  wakeCommunicator();
 }
 
 bool UcxExchangeSource::setStateIf(

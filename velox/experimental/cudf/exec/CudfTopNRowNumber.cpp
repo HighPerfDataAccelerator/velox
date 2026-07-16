@@ -14,12 +14,14 @@
  * limitations under the License.
  */
 
+#include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/exec/CudfTopNRowNumber.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 
 #include "velox/exec/OperatorUtils.h"
+#include "velox/exec/Task.h"
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/concatenate.hpp>
@@ -46,7 +48,7 @@ namespace facebook::velox::cudf_velox {
 namespace {
 
 constexpr uint64_t kSortedRunBytes = 3ULL << 30;
-constexpr uint64_t kCandidateRunBytes = 128ULL << 20;
+constexpr uint64_t kDefaultCandidateRunBytes = 128ULL << 20;
 constexpr uint64_t kMergeChunkBytes = 32ULL << 20;
 constexpr size_t kMergeFanIn = 4;
 constexpr cudf::size_type kMaxCompleteOutputRows = 262144;
@@ -143,8 +145,15 @@ CudfTopNRowNumber::CudfTopNRowNumber(
       rankFunction_(node->rankFunction()),
       generateRowNumber_(node->generateRowNumber()),
       inputType_(node->inputType()),
-      diagnosticNodeId_(node->id()) {
+      diagnosticNodeId_(node->id()),
+      candidateRunBytes_(driverCtx->queryConfig().get<uint64_t>(
+          CudfConfig::kCudfTopNRowNumberCandidateRunBytes,
+          kDefaultCandidateRunBytes)) {
   VELOX_CHECK_EQ(limit_, 1, "CudfTopNRowNumber only supports limit=1");
+  VELOX_CHECK_GT(
+      candidateRunBytes_,
+      0,
+      "CudfTopNRowNumber candidate run bytes must be greater than zero");
   VELOX_CHECK(
       rankFunction_ == core::TopNRowNumberNode::RankFunction::kRowNumber ||
           rankFunction_ == core::TopNRowNumberNode::RankFunction::kRank ||
@@ -259,7 +268,7 @@ void CudfTopNRowNumber::doAddInput(RowVectorPtr input) {
       std::move(candidates_),
       stream);
   const auto candidateBytes = candidateVector->estimateFlatSize();
-  if (candidateBytes >= kCandidateRunBytes) {
+  if (candidateBytes >= candidateRunBytes_) {
     inputs_.push_back(std::move(candidateVector));
     bufferedBytes_ = candidateBytes;
     spillSortedRun();
@@ -356,8 +365,13 @@ void CudfTopNRowNumber::spillSortedRun() {
 
   namespace fs = std::filesystem;
   if (!spilled_) {
+    const auto& taskSpillRoot =
+        operatorCtx_->task()->getOrCreateSpillDirectory();
+    VELOX_CHECK(
+        !taskSpillRoot.empty(),
+        "CudfTopNRowNumber requires an explicit Task spill directory");
     const auto sequence = spillDirectorySequence.fetch_add(1);
-    spillDirectory_ = (fs::temp_directory_path() /
+    spillDirectory_ = (fs::path(taskSpillRoot) /
                        fmt::format(
                            "velox-cudf-topn-spill-{}-{}",
                            static_cast<int64_t>(::getpid()),
@@ -719,7 +733,12 @@ void CudfTopNRowNumber::cleanupSpillFiles() {
   }
   std::error_code error;
   std::filesystem::remove_all(spillDirectory_, error);
-  spillDirectory_.clear();
+  if (error) {
+    LOG(ERROR) << "Failed to remove CudfTopNRowNumber spill directory '"
+               << spillDirectory_ << "': " << error.message();
+  } else {
+    spillDirectory_.clear();
+  }
   ::malloc_trim(0);
 }
 

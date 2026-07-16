@@ -79,12 +79,12 @@ void registerSparkAggregateFunctions(const std::string& prefix) {
           .build());
   // AVG final: row(DOUBLE,BIGINT)->DOUBLE already registered.
 
-  auto collectSetRawSignature = FunctionSignatureBuilder()
+  auto collectionRawSignature = FunctionSignatureBuilder()
                                     .typeVariable("T")
                                     .returnType("array(T)")
                                     .argumentType("T")
                                     .build();
-  auto collectSetMergeSignature = FunctionSignatureBuilder()
+  auto collectionMergeSignature = FunctionSignatureBuilder()
                                       .typeVariable("T")
                                       .returnType("array(T)")
                                       .argumentType("array(T)")
@@ -92,19 +92,39 @@ void registerSparkAggregateFunctions(const std::string& prefix) {
   appendGroupbyAggregationFunctionForStep(
       prefix + "collect_set",
       core::AggregationNode::Step::kSingle,
-      collectSetRawSignature);
+      collectionRawSignature);
   appendGroupbyAggregationFunctionForStep(
       prefix + "collect_set",
       core::AggregationNode::Step::kPartial,
-      collectSetRawSignature);
+      collectionRawSignature);
   appendGroupbyAggregationFunctionForStep(
       prefix + "collect_set",
       core::AggregationNode::Step::kIntermediate,
-      collectSetMergeSignature);
+      collectionMergeSignature);
   appendGroupbyAggregationFunctionForStep(
       prefix + "collect_set",
       core::AggregationNode::Step::kFinal,
-      collectSetMergeSignature);
+      collectionMergeSignature);
+
+  // Spark collect_list ignores null input values and preserves duplicates.
+  // The Velox-cuDF adapter implements it only for grouped aggregation, so do
+  // not advertise these signatures in the reduce registry.
+  appendGroupbyAggregationFunctionForStep(
+      prefix + "collect_list",
+      core::AggregationNode::Step::kSingle,
+      collectionRawSignature);
+  appendGroupbyAggregationFunctionForStep(
+      prefix + "collect_list",
+      core::AggregationNode::Step::kPartial,
+      collectionRawSignature);
+  appendGroupbyAggregationFunctionForStep(
+      prefix + "collect_list",
+      core::AggregationNode::Step::kIntermediate,
+      collectionMergeSignature);
+  appendGroupbyAggregationFunctionForStep(
+      prefix + "collect_list",
+      core::AggregationNode::Step::kFinal,
+      collectionMergeSignature);
 }
 
 } // namespace facebook::velox::cudf_velox

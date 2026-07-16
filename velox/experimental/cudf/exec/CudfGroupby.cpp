@@ -68,8 +68,7 @@ constexpr const char* kFinalAggregationMergeBytes =
 constexpr const char* kFinalAggregationMaxLevel =
     "cudfFinalAggregationMaxLevel";
 constexpr const char* kFinalStreamingBatches = "cudfFinalStreamingBatches";
-constexpr const char* kFinalStreamingInputRows =
-    "cudfFinalStreamingInputRows";
+constexpr const char* kFinalStreamingInputRows = "cudfFinalStreamingInputRows";
 constexpr const char* kFinalStreamingDistinctKeys =
     "cudfFinalStreamingDistinctKeys";
 constexpr const char* kFinalStreamingOutputRows =
@@ -851,6 +850,45 @@ struct GroupbyCollectSetAggregator : GroupbyAggregator {
   uint32_t outputIdx_{0};
 };
 
+struct GroupbyCollectListAggregator : GroupbyAggregator {
+  GroupbyCollectListAggregator(
+      core::AggregationNode::Step step,
+      uint32_t inputIndex,
+      VectorPtr constant,
+      const TypePtr& resultType)
+      : GroupbyAggregator(step, inputIndex, constant, resultType) {}
+
+  void addGroupbyRequest(
+      cudf::table_view const& tbl,
+      std::vector<cudf::groupby::aggregation_request>& requests,
+      rmm::cuda_stream_view /*stream*/) override {
+    VELOX_CHECK(
+        constant == nullptr,
+        "GroupbyCollectListAggregator does not support constant input");
+    auto& request = requests.emplace_back();
+    outputIdx_ = requests.size() - 1;
+    request.values = tbl.column(inputIndex);
+    if (exec::isRawInput(step)) {
+      request.aggregations.push_back(
+          cudf::make_collect_list_aggregation<cudf::groupby_aggregation>(
+              cudf::null_policy::EXCLUDE));
+      return;
+    }
+    request.aggregations.push_back(
+        cudf::make_merge_lists_aggregation<cudf::groupby_aggregation>());
+  }
+
+  std::unique_ptr<cudf::column> makeOutputColumn(
+      std::vector<cudf::groupby::aggregation_result>& results,
+      rmm::cuda_stream_view /*stream*/,
+      rmm::device_async_resource_ref /*mr*/) override {
+    return std::move(results[outputIdx_].results[0]);
+  }
+
+ private:
+  uint32_t outputIdx_{0};
+};
+
 std::unique_ptr<GroupbyAggregator> createGroupbyAggregator(
     const ResolvedAggregateInfo& p) {
   auto const& kind = p.kind;
@@ -888,6 +926,9 @@ std::unique_ptr<GroupbyAggregator> createGroupbyAggregator(
         p.companionStep, p.inputIndex, p.constant, p.resultType);
   } else if (kind.rfind(prefix + "collect_set", 0) == 0) {
     return std::make_unique<GroupbyCollectSetAggregator>(
+        p.companionStep, p.inputIndex, p.constant, p.resultType);
+  } else if (kind.rfind(prefix + "collect_list", 0) == 0) {
+    return std::make_unique<GroupbyCollectListAggregator>(
         p.companionStep, p.inputIndex, p.constant, p.resultType);
   } else {
     VELOX_NYI("Aggregation not yet supported, kind: {}", kind);
@@ -928,6 +969,19 @@ bool canGroupbyAggregationBeEvaluatedByCudf(
     core::AggregationNode::Step step,
     const std::vector<TypePtr>& rawInputTypes,
     core::QueryCtx* queryCtx) {
+  const auto prefix = CudfConfig::getInstance().functionNamePrefix;
+  const auto originalName = getOriginalName(call.name());
+  if ((originalName == prefix + "collect_list" ||
+       originalName == prefix + "collect_set") &&
+      std::any_of(
+          call.inputs().begin(), call.inputs().end(), [](const auto& input) {
+            return dynamic_cast<const core::ConstantTypedExpr*>(input.get()) !=
+                nullptr;
+          })) {
+    // Collection aggregators currently consume a physical input column and do
+    // not materialize constants like the simple grouped aggregators do.
+    return false;
+  }
   return canAggregationBeEvaluatedByRegistry(
       getGroupbyAggregationRegistry(), call, step, rawInputTypes, queryCtx);
 }
@@ -1228,14 +1282,12 @@ void CudfGroupby::computeFinalGroupbyStreaming(CudfVectorPtr tbl) {
   bool allRequestsSupported = !regularRequests.empty();
   std::vector<size_t> requestAggregationCounts;
   requestAggregationCounts.reserve(regularRequests.size());
-  std::vector<cudf::groupby::streaming_aggregation_request>
-      streamingRequests;
+  std::vector<cudf::groupby::streaming_aggregation_request> streamingRequests;
   for (auto& request : regularRequests) {
     VELOX_CHECK_LT(
         packedColumns.size(),
         static_cast<size_t>(std::numeric_limits<cudf::size_type>::max()));
-    const auto valueIndex =
-        static_cast<cudf::size_type>(packedColumns.size());
+    const auto valueIndex = static_cast<cudf::size_type>(packedColumns.size());
     packedColumns.push_back(request.values);
     requestAggregationCounts.push_back(request.aggregations.size());
     for (auto& aggregation : request.aggregations) {
@@ -1273,21 +1325,19 @@ void CudfGroupby::computeFinalGroupbyStreaming(CudfVectorPtr tbl) {
       return;
     }
     finalStreamingRequestAggregationCounts_ = requestAggregationCounts;
-    finalStreamingGroupby_ =
-        std::make_unique<cudf::groupby::streaming_groupby>(
-            keyIndices,
-            streamingRequests,
-            finalStreamingMaxDistinctKeys_,
-            ignoreNullKeys_ ? cudf::null_policy::EXCLUDE
-                            : cudf::null_policy::INCLUDE);
+    finalStreamingGroupby_ = std::make_unique<cudf::groupby::streaming_groupby>(
+        keyIndices,
+        streamingRequests,
+        finalStreamingMaxDistinctKeys_,
+        ignoreNullKeys_ ? cudf::null_policy::EXCLUDE
+                        : cudf::null_policy::INCLUDE);
     finalAggregationMode_ = FinalAggregationMode::kStreaming;
     LOG(INFO) << "CUDF_GROUPBY_STREAMING node=" << diagnosticNodeId_
               << " state=selected maxDistinctKeys="
-              << finalStreamingMaxDistinctKeys_ << " keys="
-              << keyIndices.size() << " requests=" << streamingRequests.size();
+              << finalStreamingMaxDistinctKeys_ << " keys=" << keyIndices.size()
+              << " requests=" << streamingRequests.size();
   } else {
-    VELOX_CHECK(
-        finalAggregationMode_ == FinalAggregationMode::kStreaming);
+    VELOX_CHECK(finalAggregationMode_ == FinalAggregationMode::kStreaming);
     VELOX_CHECK(
         allRequestsSupported,
         "CudfGroupby FINAL request support changed after streaming state "
@@ -1329,16 +1379,16 @@ void CudfGroupby::computeFinalGroupbyStreaming(CudfVectorPtr tbl) {
         RuntimeCounter(static_cast<int64_t>(representedRows)));
   }
   if (deviceMemoryDiagnosticsEnabled() &&
-      (finalStreamingBatchCount_ == 1 ||
-       finalStreamingBatchCount_ % 64 == 0)) {
-    logDeviceMemorySnapshot(fmt::format(
-        "operator=CudfGroupby node={} state=final_streaming.aggregate "
-        "batch={} inputRows={} distinctKeys={} maxDistinctKeys={}",
-        diagnosticNodeId_,
-        finalStreamingBatchCount_,
-        representedRows,
-        distinctKeys,
-        finalStreamingMaxDistinctKeys_));
+      (finalStreamingBatchCount_ == 1 || finalStreamingBatchCount_ % 64 == 0)) {
+    logDeviceMemorySnapshot(
+        fmt::format(
+            "operator=CudfGroupby node={} state=final_streaming.aggregate "
+            "batch={} inputRows={} distinctKeys={} maxDistinctKeys={}",
+            diagnosticNodeId_,
+            finalStreamingBatchCount_,
+            representedRows,
+            distinctKeys,
+            finalStreamingMaxDistinctKeys_));
   }
 }
 
@@ -1350,11 +1400,9 @@ void CudfGroupby::addFinalAggregationRun(FinalAggregationRun run) {
   auto level = aggregationRunLevel(run.representedRows);
   {
     auto lockedStats = stats_.wlock();
+    lockedStats->addRuntimeStat(kFinalAggregationInputRuns, RuntimeCounter(1));
     lockedStats->addRuntimeStat(
-        kFinalAggregationInputRuns, RuntimeCounter(1));
-    lockedStats->addRuntimeStat(
-        kFinalAggregationMaxLevel,
-        RuntimeCounter(static_cast<int64_t>(level)));
+        kFinalAggregationMaxLevel, RuntimeCounter(static_cast<int64_t>(level)));
   }
 
   for (;;) {
@@ -1393,11 +1441,10 @@ CudfGroupby::FinalAggregationRun CudfGroupby::mergeFinalAggregationRuns(
 
   const auto inputRows = static_cast<int64_t>(left.data->size()) +
       static_cast<int64_t>(right.data->size());
-  const auto inputBytes = left.data->estimateFlatSize() +
-      right.data->estimateFlatSize();
+  const auto inputBytes =
+      left.data->estimateFlatSize() + right.data->estimateFlatSize();
   VELOX_CHECK_LE(
-      inputBytes,
-      static_cast<uint64_t>(std::numeric_limits<int64_t>::max()));
+      inputBytes, static_cast<uint64_t>(std::numeric_limits<int64_t>::max()));
   const auto representedRows =
       addRepresentedRows(left.representedRows, right.representedRows);
 
@@ -1419,8 +1466,7 @@ CudfGroupby::FinalAggregationRun CudfGroupby::mergeFinalAggregationRuns(
   ++finalRunMergeCount_;
   {
     auto lockedStats = stats_.wlock();
-    lockedStats->addRuntimeStat(
-        kFinalAggregationRunMerges, RuntimeCounter(1));
+    lockedStats->addRuntimeStat(kFinalAggregationRunMerges, RuntimeCounter(1));
     if (finalizing) {
       lockedStats->addRuntimeStat(
           kFinalAggregationFinalizeMerges, RuntimeCounter(1));
@@ -1438,19 +1484,20 @@ CudfGroupby::FinalAggregationRun CudfGroupby::mergeFinalAggregationRuns(
   if (deviceMemoryDiagnosticsEnabled() &&
       (finalizing || finalRunMergeCount_ == 1 ||
        finalRunMergeCount_ % 64 == 0)) {
-    logDeviceMemorySnapshot(fmt::format(
-        "operator=CudfGroupby node={} state=final_run.merge phase={} "
-        "level={} merge={} inputRows={} inputBytes={} outputRows={} "
-        "outputBytes={} representedRows={}",
-        diagnosticNodeId_,
-        finalizing ? "finalize" : "online",
-        outputLevel,
-        finalRunMergeCount_,
-        inputRows,
-        inputBytes,
-        output->size(),
-        output->estimateFlatSize(),
-        representedRows));
+    logDeviceMemorySnapshot(
+        fmt::format(
+            "operator=CudfGroupby node={} state=final_run.merge phase={} "
+            "level={} merge={} inputRows={} inputBytes={} outputRows={} "
+            "outputBytes={} representedRows={}",
+            diagnosticNodeId_,
+            finalizing ? "finalize" : "online",
+            outputLevel,
+            finalRunMergeCount_,
+            inputRows,
+            inputBytes,
+            output->size(),
+            output->estimateFlatSize(),
+            representedRows));
   }
 
   return FinalAggregationRun{std::move(output), representedRows};
@@ -1468,16 +1515,17 @@ CudfVectorPtr CudfGroupby::drainFinalAggregationRuns() {
     }
   }
   if (deviceMemoryDiagnosticsEnabled()) {
-    logDeviceMemorySnapshot(fmt::format(
-        "operator=CudfGroupby node={} state=final_runs.drain.begin "
-        "inputRuns={} retainedRuns={} retainedRows={} retainedBytes={} "
-        "onlineMerges={}",
-        diagnosticNodeId_,
-        finalInputRunCount_,
-        retainedRuns,
-        retainedRows,
-        retainedBytes,
-        finalRunMergeCount_));
+    logDeviceMemorySnapshot(
+        fmt::format(
+            "operator=CudfGroupby node={} state=final_runs.drain.begin "
+            "inputRuns={} retainedRuns={} retainedRows={} retainedBytes={} "
+            "onlineMerges={}",
+            diagnosticNodeId_,
+            finalInputRunCount_,
+            retainedRuns,
+            retainedRows,
+            retainedBytes,
+            finalRunMergeCount_));
   }
 
   std::optional<FinalAggregationRun> carry;
@@ -1510,13 +1558,14 @@ CudfVectorPtr CudfGroupby::finalizeStreamingFinalAggregation() {
   VELOX_CHECK_NOT_NULL(finalStreamingGroupby_);
 
   const auto distinctKeys = finalStreamingGroupby_->distinct_keys();
-  logDeviceMemorySnapshot(fmt::format(
-      "operator=CudfGroupby node={} state=final_streaming.finalize.begin "
-      "batches={} distinctKeys={} maxDistinctKeys={}",
-      diagnosticNodeId_,
-      finalStreamingBatchCount_,
-      distinctKeys,
-      finalStreamingMaxDistinctKeys_));
+  logDeviceMemorySnapshot(
+      fmt::format(
+          "operator=CudfGroupby node={} state=final_streaming.finalize.begin "
+          "batches={} distinctKeys={} maxDistinctKeys={}",
+          diagnosticNodeId_,
+          finalStreamingBatchCount_,
+          distinctKeys,
+          finalStreamingMaxDistinctKeys_));
 
   auto [groupKeys, flatResults] =
       finalStreamingGroupby_->finalize(stateStream_, get_output_mr());
@@ -1530,8 +1579,7 @@ CudfVectorPtr CudfGroupby::finalizeStreamingFinalAggregation() {
   std::vector<cudf::groupby::aggregation_result> regularResults;
   regularResults.reserve(finalStreamingRequestAggregationCounts_.size());
   size_t flatResultIndex = 0;
-  for (const auto aggregationCount :
-       finalStreamingRequestAggregationCounts_) {
+  for (const auto aggregationCount : finalStreamingRequestAggregationCounts_) {
     auto& regularResult = regularResults.emplace_back();
     regularResult.results.reserve(aggregationCount);
     for (size_t i = 0; i < aggregationCount; ++i) {
@@ -1563,13 +1611,14 @@ CudfVectorPtr CudfGroupby::finalizeStreamingFinalAggregation() {
   // Complete it before destroying that state. Both state and output use the
   // configured async resources; no pool resource or release threshold is used.
   stateStream_.synchronize();
-  logDeviceMemorySnapshot(fmt::format(
-      "operator=CudfGroupby node={} state=final_streaming.finalize.end "
-      "batches={} distinctKeys={} outputRows={}",
-      diagnosticNodeId_,
-      finalStreamingBatchCount_,
-      distinctKeys,
-      outputRows));
+  logDeviceMemorySnapshot(
+      fmt::format(
+          "operator=CudfGroupby node={} state=final_streaming.finalize.end "
+          "batches={} distinctKeys={} outputRows={}",
+          diagnosticNodeId_,
+          finalStreamingBatchCount_,
+          distinctKeys,
+          outputRows));
   finalStreamingGroupby_.reset();
 
   if (outputRows == 0) {
@@ -1865,8 +1914,7 @@ void CudfGroupby::doClose() {
   try {
     stateStream_.synchronize();
   } catch (const std::exception& error) {
-    LOG(WARNING) << "CudfGroupby state stream cleanup failed: "
-                 << error.what();
+    LOG(WARNING) << "CudfGroupby state stream cleanup failed: " << error.what();
   }
   finalStreamingGroupby_.reset();
   finalStreamingRequestAggregationCounts_.clear();
