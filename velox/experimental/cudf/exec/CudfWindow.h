@@ -23,6 +23,7 @@
 #include "velox/type/Type.h"
 
 #include <cudf/groupby.hpp>
+#include <cudf/io/parquet.hpp>
 #include <cudf/rolling.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
@@ -38,9 +39,10 @@ namespace facebook::velox::cudf_velox {
 
 /// GPU-accelerated Window operator using cuDF.
 ///
-/// Incoming GPU batches are stored in addInput(). When noMoreInput() is called,
-/// batches are concatenated and sorted. getOutput() then evaluates window
-/// functions and returns one output batch.
+/// Incoming GPU batches are stored in addInput(). Small inputs are concatenated
+/// and sorted when noMoreInput() is called. Large, unsorted, partitioned inputs
+/// are written as sorted runs and merged into complete-partition batches before
+/// window evaluation.
 ///
 /// inputsSorted fast path: when WindowNode::inputsSorted() is true, this
 /// operator skips stable_sorted_order and the full-table gather (see
@@ -100,6 +102,21 @@ class CudfWindow : public CudfOperatorBase {
   void doClose() override;
 
  private:
+  struct SortedRun {
+    std::string path;
+    std::unique_ptr<cudf::io::chunked_parquet_reader> reader;
+  };
+
+  void spillSortedRun();
+  void initializeSortedRunReaders();
+  std::unique_ptr<cudf::table> mergeNextSortedBatch(bool& finalBatch);
+  std::unique_ptr<cudf::table> takeCompletePartitions(
+      std::unique_ptr<cudf::table> sorted,
+      bool finalBatch);
+  RowVectorPtr computeNextSortedOutput();
+  RowVectorPtr computeOutput();
+  void cleanupSpillFiles() noexcept;
+
   // Compute row_number/rank/dense_rank via cudf::groupby::scan or cudf::scan.
   void computeRankColumnsBatch(
       const cudf::table_view& sortedInput,
@@ -158,6 +175,16 @@ class CudfWindow : public CudfOperatorBase {
   std::vector<cudf::null_order> nullOrders_;
 
   std::vector<CudfVectorPtr> inputBatches_;
+  const uint64_t sortedRunBytes_;
+  uint64_t bufferedBytes_{0};
+  std::vector<SortedRun> sortedRuns_;
+  std::string spillDirectory_;
+  uint64_t spillFileSequence_{0};
+  std::unique_ptr<cudf::table> mergeCarry_;
+  std::unique_ptr<cudf::table> partitionCarry_;
+  bool readersInitialized_{false};
+  bool mergeFinished_{false};
+  bool spilled_{false};
 
   // Sorted and concatenated input data, prepared in doNoMoreInput().
   std::unique_ptr<cudf::table> sortedData_;

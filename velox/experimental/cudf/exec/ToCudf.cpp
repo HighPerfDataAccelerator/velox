@@ -43,14 +43,13 @@
 #include "velox/exec/PartitionedOutput.h"
 #include "velox/exec/Values.h"
 
-#include <limits>
-
 #include <cudf/detail/nvtx/ranges.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 
 #include <cuda.h>
 
 #include <iostream>
+#include <limits>
 
 static const std::string kCudfAdapterName = "cuDF";
 
@@ -285,10 +284,7 @@ bool CompileState::compile(bool allowCpuFallback) {
       if (!keepDeviceOutput) {
         replaceOp.push_back(
             std::make_unique<CudfToVelox>(
-                id,
-                planNode->outputType(),
-                ctx,
-                planNode->id() + "-to-velox"));
+                id, planNode->outputType(), ctx, planNode->id() + "-to-velox"));
       }
     }
 
@@ -533,8 +529,7 @@ void CudfConfig::initialize(
     groupbyStreamingMaxDistinctKeys = static_cast<int32_t>(value);
   }
   if (config.find(kCudfOrderBySortedRunBytes) != config.end()) {
-    const auto value =
-        folly::to<int64_t>(config[kCudfOrderBySortedRunBytes]);
+    const auto value = folly::to<int64_t>(config[kCudfOrderBySortedRunBytes]);
     VELOX_USER_CHECK_GT(
         value, 0, "{} must be positive", kCudfOrderBySortedRunBytes);
     orderBySortedRunBytes = static_cast<uint64_t>(value);
@@ -546,6 +541,12 @@ void CudfConfig::initialize(
     VELOX_USER_CHECK_LE(
         value, 64, "{} must be between 2 and 64", kCudfOrderByMergeFanIn);
     orderByMergeFanIn = value;
+  }
+  if (config.find(kCudfWindowSortedRunBytes) != config.end()) {
+    const auto value = folly::to<int64_t>(config[kCudfWindowSortedRunBytes]);
+    VELOX_USER_CHECK_GT(
+        value, 0, "{} must be positive", kCudfWindowSortedRunBytes);
+    windowSortedRunBytes = static_cast<uint64_t>(value);
   }
   if (config.find(kCudfFunctionNamePrefix) != config.end()) {
     functionNamePrefix = config[kCudfFunctionNamePrefix];

@@ -55,6 +55,8 @@ struct CudfConfig {
       "cudf.order_by_sorted_run_bytes"};
   static constexpr const char* kCudfOrderByMergeFanIn{
       "cudf.order_by_merge_fan_in"};
+  static constexpr const char* kCudfWindowSortedRunBytes{
+      "cudf.window.sorted_run_bytes"};
   static constexpr const char* kCudfTimestampUnit{"cudf.timestamp_unit"};
   // The value could be either spark or presto.
   static constexpr const char* kCudfFunctionEngine{"cudf.function_engine"};
@@ -158,6 +160,10 @@ struct CudfConfig {
 
   /// Number of sorted runs compacted by one OrderBy merge group.
   int32_t orderByMergeFanIn{8};
+
+  /// Approximate bytes buffered before a partitioned Window writes an
+  /// independently sorted run.
+  uint64_t windowSortedRunBytes{3ULL << 30};
 
   /// Minimum rows to accumulate before GPU-side concatenation in
   /// `CudfBatchConcat` (default 100k).

@@ -24,19 +24,24 @@
 #include "velox/common/base/Exceptions.h"
 #include "velox/core/Expressions.h"
 #include "velox/exec/Operator.h"
+#include "velox/exec/Task.h"
 #include "velox/type/Type.h"
 
 #include <cudf/aggregation.hpp>
 #include <cudf/column/column_factories.hpp>
+#include <cudf/concatenate.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/filling.hpp>
 #include <cudf/groupby.hpp>
+#include <cudf/io/parquet.hpp>
+#include <cudf/merge.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/replace.hpp>
 #include <cudf/rolling.hpp>
 #include <cudf/rolling/range_window_bounds.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
+#include <cudf/search.hpp>
 #include <cudf/sorting.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
@@ -45,7 +50,11 @@
 #include <nvtx3/nvtx3.hpp>
 
 #include <fmt/format.h>
+#include <malloc.h>
+#include <unistd.h>
 
+#include <atomic>
+#include <filesystem>
 #include <limits>
 #include <optional>
 #include <unordered_set>
@@ -54,6 +63,36 @@
 namespace facebook::velox::cudf_velox {
 
 namespace {
+
+constexpr uint64_t kWindowMergeChunkBytes = 256ULL << 20;
+std::atomic<uint64_t> windowSpillDirectorySequence{0};
+
+std::unique_ptr<cudf::table> copyTableSlice(
+    cudf::table_view input,
+    cudf::size_type begin,
+    cudf::size_type end,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) {
+  VELOX_CHECK_LE(begin, end);
+  auto slices = cudf::slice(input, {begin, end}, stream);
+  VELOX_CHECK_EQ(slices.size(), 1);
+  return std::make_unique<cudf::table>(slices.front(), stream, mr);
+}
+
+cudf::size_type firstSearchPosition(
+    cudf::column_view positions,
+    rmm::cuda_stream_view stream) {
+  VELOX_CHECK_EQ(positions.size(), 1);
+  cudf::size_type result{0};
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+      &result,
+      positions.data<cudf::size_type>(),
+      sizeof(result),
+      cudaMemcpyDeviceToHost,
+      stream.value()));
+  stream.synchronize();
+  return result;
+}
 
 // Returns true when the window function's value argument is a cast expression.
 // The CPU Window operator only accepts field-access or constant arguments
@@ -712,7 +751,8 @@ CudfWindow::CudfWindow(
           nvtx3::rgb{255, 165, 0},
           NvtxMethodFlag::kAddInput | NvtxMethodFlag::kGetOutput),
       windowNode_(windowNode),
-      inputRowType_(asRowType(windowNode->inputType())) {
+      inputRowType_(asRowType(windowNode->inputType())),
+      sortedRunBytes_(CudfConfig::getInstance().windowSortedRunBytes) {
   const auto& inputType = windowNode->inputType();
 
   for (const auto& key : windowNode->partitionKeys()) {
@@ -735,12 +775,228 @@ CudfWindow::CudfWindow(
 }
 
 void CudfWindow::doAddInput(RowVectorPtr input) {
-  // Queue inputs, process all at once.
-  if (input->size() > 0) {
-    auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input);
-    VELOX_CHECK_NOT_NULL(cudfInput, "CudfWindow expects CudfVector input");
-    inputBatches_.push_back(std::move(cudfInput));
+  if (input->size() == 0) {
+    return;
   }
+
+  auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input);
+  VELOX_CHECK_NOT_NULL(cudfInput, "CudfWindow expects CudfVector input");
+  bufferedBytes_ += cudfInput->estimateFlatSize();
+  inputBatches_.push_back(std::move(cudfInput));
+
+  // A complete partition must remain in one output batch because window
+  // frames can reference any row in that partition. Build independently
+  // sorted runs only for partitioned, unsorted input; after noMoreInput() the
+  // runs are order-merged and emitted one or more complete partitions at a
+  // time.
+  if (!windowNode_->inputsSorted() && !partitionKeyIndices_.empty() &&
+      bufferedBytes_ >= sortedRunBytes_) {
+    spillSortedRun();
+  }
+}
+
+void CudfWindow::spillSortedRun() {
+  if (inputBatches_.empty()) {
+    return;
+  }
+  VELOX_CHECK(
+      !partitionKeyIndices_.empty(),
+      "CudfWindow external sort requires partition keys");
+
+  namespace fs = std::filesystem;
+  if (!spilled_) {
+    const auto& taskSpillRoot =
+        operatorCtx_->task()->getOrCreateSpillDirectory();
+    VELOX_CHECK(
+        !taskSpillRoot.empty(),
+        "CudfWindow requires an explicit Task spill directory");
+    const auto sequence = windowSpillDirectorySequence.fetch_add(1);
+    spillDirectory_ = (fs::path(taskSpillRoot) /
+                       fmt::format(
+                           "velox-cudf-window-spill-{}-{}",
+                           static_cast<int64_t>(::getpid()),
+                           sequence))
+                          .string();
+    fs::create_directories(spillDirectory_);
+    spilled_ = true;
+  }
+
+  if (!streamAcquired_) {
+    stream_ = cudfGlobalStreamPool().get_stream();
+    streamAcquired_ = true;
+  }
+  auto mr = get_output_mr();
+  auto input = getConcatenatedTable(
+      std::exchange(inputBatches_, {}), inputRowType_, stream_, mr);
+  bufferedBytes_ = 0;
+
+  std::vector<cudf::size_type> sortKeys = partitionKeyIndices_;
+  sortKeys.insert(
+      sortKeys.end(), sortKeyIndices_.begin(), sortKeyIndices_.end());
+  std::vector<cudf::order> orders(
+      partitionKeyIndices_.size(), cudf::order::ASCENDING);
+  orders.insert(orders.end(), sortOrders_.begin(), sortOrders_.end());
+  std::vector<cudf::null_order> nullOrders(
+      partitionKeyIndices_.size(), cudf::null_order::BEFORE);
+  nullOrders.insert(nullOrders.end(), nullOrders_.begin(), nullOrders_.end());
+
+  auto sorted = cudf::stable_sort_by_key(
+      input->view(),
+      input->view().select(sortKeys),
+      orders,
+      nullOrders,
+      stream_,
+      mr);
+  auto path = fmt::format(
+      "{}/run-{:06}.parquet", spillDirectory_, spillFileSequence_++);
+  auto options = cudf::io::parquet_writer_options::builder(
+                     cudf::io::sink_info{path}, sorted->view())
+                     .build();
+  cudf::io::write_parquet(options, stream_);
+  sortedRuns_.push_back({std::move(path), nullptr});
+  ::malloc_trim(0);
+}
+
+void CudfWindow::initializeSortedRunReaders() {
+  if (readersInitialized_) {
+    return;
+  }
+  auto mr = get_output_mr();
+  for (auto& run : sortedRuns_) {
+    auto options = cudf::io::parquet_reader_options::builder(
+                       cudf::io::source_info{run.path})
+                       .build();
+    run.reader = std::make_unique<cudf::io::chunked_parquet_reader>(
+        kWindowMergeChunkBytes, 0, options, stream_, mr);
+  }
+  readersInitialized_ = true;
+}
+
+std::unique_ptr<cudf::table> CudfWindow::mergeNextSortedBatch(
+    bool& finalBatch) {
+  finalBatch = false;
+  auto mr = get_output_mr();
+  while (!mergeFinished_) {
+    std::vector<std::unique_ptr<cudf::table>> chunks;
+    std::vector<cudf::table_view> mergeViews;
+    std::vector<cudf::table_view> boundaryRows;
+    chunks.reserve(sortedRuns_.size());
+    mergeViews.reserve(sortedRuns_.size() + (mergeCarry_ ? 1 : 0));
+    boundaryRows.reserve(sortedRuns_.size());
+
+    if (mergeCarry_ && mergeCarry_->num_rows() > 0) {
+      mergeViews.push_back(mergeCarry_->view());
+    }
+
+    for (auto& run : sortedRuns_) {
+      if (!run.reader || !run.reader->has_next()) {
+        continue;
+      }
+      auto chunk = run.reader->read_chunk();
+      if (chunk.tbl->num_rows() == 0) {
+        continue;
+      }
+      chunks.push_back(std::move(chunk.tbl));
+      mergeViews.push_back(chunks.back()->view());
+      if (run.reader->has_next()) {
+        auto last = cudf::slice(
+            chunks.back()->view(),
+            {chunks.back()->num_rows() - 1, chunks.back()->num_rows()},
+            stream_);
+        boundaryRows.push_back(last.front());
+      }
+    }
+
+    if (mergeViews.empty()) {
+      mergeFinished_ = true;
+      finalBatch = true;
+      return std::exchange(mergeCarry_, nullptr);
+    }
+
+    std::vector<cudf::size_type> sortKeys = partitionKeyIndices_;
+    sortKeys.insert(
+        sortKeys.end(), sortKeyIndices_.begin(), sortKeyIndices_.end());
+    std::vector<cudf::order> orders(
+        partitionKeyIndices_.size(), cudf::order::ASCENDING);
+    orders.insert(orders.end(), sortOrders_.begin(), sortOrders_.end());
+    std::vector<cudf::null_order> nullOrders(
+        partitionKeyIndices_.size(), cudf::null_order::BEFORE);
+    nullOrders.insert(nullOrders.end(), nullOrders_.begin(), nullOrders_.end());
+
+    std::unique_ptr<cudf::table> merged;
+    if (mergeViews.size() == 1) {
+      merged = std::make_unique<cudf::table>(mergeViews.front(), stream_, mr);
+    } else {
+      merged =
+          cudf::merge(mergeViews, sortKeys, orders, nullOrders, stream_, mr);
+    }
+    mergeCarry_.reset();
+
+    if (boundaryRows.empty()) {
+      mergeFinished_ = true;
+      finalBatch = true;
+      return merged;
+    }
+
+    auto boundaryCandidates = cudf::concatenate(boundaryRows, stream_, mr);
+    auto sortedBoundaries = cudf::stable_sort_by_key(
+        boundaryCandidates->view(),
+        boundaryCandidates->view().select(sortKeys),
+        orders,
+        nullOrders,
+        stream_,
+        mr);
+    auto boundary = cudf::slice(sortedBoundaries->view(), {0, 1}, stream_);
+    auto positions = cudf::upper_bound(
+        merged->view().select(sortKeys),
+        boundary.front().select(sortKeys),
+        orders,
+        nullOrders,
+        stream_,
+        mr);
+    const auto safeEnd = firstSearchPosition(positions->view(), stream_);
+    mergeCarry_ = copyTableSlice(
+        merged->view(), safeEnd, merged->num_rows(), stream_, mr);
+    if (safeEnd > 0) {
+      return copyTableSlice(merged->view(), 0, safeEnd, stream_, mr);
+    }
+  }
+  return nullptr;
+}
+
+std::unique_ptr<cudf::table> CudfWindow::takeCompletePartitions(
+    std::unique_ptr<cudf::table> sorted,
+    bool finalBatch) {
+  auto mr = get_output_mr();
+  if (!sorted || sorted->num_rows() == 0) {
+    return nullptr;
+  }
+  if (partitionCarry_ && partitionCarry_->num_rows() > 0) {
+    std::vector<cudf::table_view> pieces{
+        partitionCarry_->view(), sorted->view()};
+    sorted = cudf::concatenate(pieces, stream_, mr);
+    partitionCarry_.reset();
+  }
+  if (finalBatch) {
+    return sorted;
+  }
+
+  auto partitionColumns = sorted->view().select(partitionKeyIndices_);
+  auto lastPartition = cudf::slice(
+      partitionColumns, {sorted->num_rows() - 1, sorted->num_rows()}, stream_);
+  std::vector<cudf::order> orders(
+      partitionKeyIndices_.size(), cudf::order::ASCENDING);
+  std::vector<cudf::null_order> nullOrders(
+      partitionKeyIndices_.size(), cudf::null_order::BEFORE);
+  auto positions = cudf::lower_bound(
+      partitionColumns, lastPartition.front(), orders, nullOrders, stream_, mr);
+  const auto completeEnd = firstSearchPosition(positions->view(), stream_);
+  partitionCarry_ = copyTableSlice(
+      sorted->view(), completeEnd, sorted->num_rows(), stream_, mr);
+  if (completeEnd == 0) {
+    return nullptr;
+  }
+  return copyTableSlice(sorted->view(), 0, completeEnd, stream_, mr);
 }
 
 void CudfWindow::computeRankColumnsBatch(
@@ -962,6 +1218,18 @@ std::unique_ptr<cudf::column> CudfWindow::computeAggregateColumn(
 
 void CudfWindow::doNoMoreInput() {
   Operator::noMoreInput();
+
+  if (spilled_) {
+    if (!inputBatches_.empty()) {
+      spillSortedRun();
+    }
+    initializeSortedRunReaders();
+    if (sortedRuns_.empty()) {
+      finished_ = true;
+    }
+    return;
+  }
+
   if (inputBatches_.empty()) {
     finished_ = true;
     stream_ = cudfGlobalStreamPool().get_stream();
@@ -988,6 +1256,7 @@ void CudfWindow::doNoMoreInput() {
   // Concatenate all input batches into one table with proper stream sync.
   auto allData = getConcatenatedTable(
       std::exchange(inputBatches_, {}), inputRowType_, stream_, mr);
+  bufferedBytes_ = 0;
 
   // Sort by partition keys + sort keys if the plan is not already sorted.
   if (!windowNode_->inputsSorted()) {
@@ -1024,15 +1293,8 @@ bool CudfWindow::isFinished() {
   return finished_;
 }
 
-RowVectorPtr CudfWindow::doGetOutput() {
-  if (finished_ || !noMoreInput_) {
-    return nullptr;
-  }
-  if (!sortedData_) {
-    finished_ = true;
-    return nullptr;
-  }
-
+RowVectorPtr CudfWindow::computeOutput() {
+  VELOX_CHECK_NOT_NULL(sortedData_);
   auto mr = get_output_mr();
   auto sortedView = sortedData_->view();
   ColumnOrView countStarColOwner;
@@ -1251,19 +1513,107 @@ RowVectorPtr CudfWindow::doGetOutput() {
     resultSize = logicalRowCount_;
   }
 
-  finished_ = true;
   return std::make_shared<CudfVector>(
       pool(), outputType_, resultSize, std::move(resultTable), stream_);
 }
 
+RowVectorPtr CudfWindow::computeNextSortedOutput() {
+  while (!mergeFinished_ || mergeCarry_ || partitionCarry_) {
+    bool finalBatch = false;
+    auto sorted = mergeNextSortedBatch(finalBatch);
+    if (finalBatch && partitionCarry_) {
+      if (sorted && sorted->num_rows() > 0) {
+        std::vector<cudf::table_view> pieces{
+            partitionCarry_->view(), sorted->view()};
+        sorted = cudf::concatenate(pieces, stream_, get_output_mr());
+      } else {
+        sorted = std::exchange(partitionCarry_, nullptr);
+      }
+      partitionCarry_.reset();
+    } else {
+      sorted = takeCompletePartitions(std::move(sorted), finalBatch);
+    }
+
+    if (!sorted || sorted->num_rows() == 0) {
+      if (finalBatch) {
+        return nullptr;
+      }
+      continue;
+    }
+
+    logicalRowCount_ = sorted->num_rows();
+    sortedData_ = std::move(sorted);
+    return computeOutput();
+  }
+  return nullptr;
+}
+
+RowVectorPtr CudfWindow::doGetOutput() {
+  if (finished_ || !noMoreInput_) {
+    return nullptr;
+  }
+
+  if (spilled_) {
+    auto output = computeNextSortedOutput();
+    if (output) {
+      return output;
+    }
+    finished_ = true;
+    stream_.synchronize();
+    cleanupSpillFiles();
+    return nullptr;
+  }
+
+  if (!sortedData_) {
+    finished_ = true;
+    return nullptr;
+  }
+
+  auto output = computeOutput();
+  finished_ = true;
+  return output;
+}
+
+void CudfWindow::cleanupSpillFiles() noexcept {
+  sortedRuns_.clear();
+  mergeCarry_.reset();
+  partitionCarry_.reset();
+  if (spillDirectory_.empty()) {
+    return;
+  }
+  std::error_code error;
+  std::filesystem::remove_all(spillDirectory_, error);
+  if (error) {
+    LOG(WARNING) << "CudfWindow failed to remove spill directory path="
+                 << spillDirectory_ << " error=" << error.message();
+  } else {
+    spillDirectory_.clear();
+  }
+  ::malloc_trim(0);
+}
+
 void CudfWindow::doClose() {
-  Operator::close();
   // Release GPU allocations only after pending work on stream_ completes.
   if (streamAcquired_) {
-    stream_.synchronize();
+    try {
+      stream_.synchronize();
+    } catch (const std::exception& error) {
+      LOG(WARNING) << "CudfWindow cleanup synchronization failed: "
+                   << error.what();
+    }
   }
   inputBatches_.clear();
   sortedData_.reset();
+  cleanupSpillFiles();
+  if (streamAcquired_) {
+    try {
+      stream_.synchronize();
+    } catch (const std::exception& error) {
+      LOG(WARNING) << "CudfWindow post-cleanup synchronization failed: "
+                   << error.what();
+    }
+  }
+  Operator::close();
 }
 
 } // namespace facebook::velox::cudf_velox
