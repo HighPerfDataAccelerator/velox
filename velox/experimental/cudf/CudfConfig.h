@@ -45,6 +45,8 @@ struct CudfConfig {
   static constexpr const char* kCudfLogFallback{"cudf.log_fallback"};
   static constexpr const char* kCudfBatchSizeMinThreshold{
       "cudf.batch_size_min_threshold"};
+  static constexpr const char* kCudfBatchSizeMinThresholdBytes{
+      "cudf.batch_size_min_threshold_bytes"};
   static constexpr const char* kCudfBatchSizeMaxThreshold{
       "cudf.batch_size_max_threshold"};
   static constexpr const char* kCudfConcatOptimizationEnabled{
@@ -168,6 +170,11 @@ struct CudfConfig {
   /// Minimum rows to accumulate before GPU-side concatenation in
   /// `CudfBatchConcat` (default 100k).
   int32_t batchSizeMinThreshold{100000};
+
+  /// Target bytes to accumulate before GPU-side concatenation. Zero disables
+  /// the byte threshold. When both row and byte thresholds are configured,
+  /// reaching either one flushes the batch.
+  uint64_t batchSizeMinThresholdBytes{0};
 
   /// Maximum rows allowed in a concatenated batch (user configurable).
   /// When not set, cuDF's own `size_type::max()` is used.
