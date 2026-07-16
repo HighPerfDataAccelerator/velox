@@ -1154,6 +1154,84 @@ TEST_F(FinalAggregationStreamingTest, finalAggregationStreamsOnAddInput) {
   assertStreamingFinalStats(planStats.at(finalAggId).customStats);
 }
 
+TEST_F(FinalAggregationStreamingTest, finalAggregationLevelledRuns) {
+  ScopedStreamingCapacity levelledCapacity{0};
+  auto vectors = {
+      makeRowVector({makeFlatVector<int32_t>(
+          100, [](auto row) { return row % 17; })}),
+      makeRowVector({makeFlatVector<int32_t>(
+          110, [](auto row) { return (row + 7) % 17; })}),
+      makeRowVector({makeFlatVector<int32_t>(
+          90, [](auto row) { return (row + 13) % 17; })}),
+  };
+  createDuckDbTable(vectors);
+
+  core::PlanNodeId finalAggId;
+  auto task = AssertQueryBuilder(duckDbQueryRunner_)
+                  .config(QueryConfig::kMaxPartialAggregationMemory, 1)
+                  .plan(
+                      PlanBuilder()
+                          .values(vectors)
+                          .partialAggregation({"c0"}, {"sum(c0)"})
+                          .finalAggregation()
+                          .capturePlanNodeId(finalAggId)
+                          .planNode())
+                  .assertResults("SELECT c0, sum(c0) FROM tmp GROUP BY c0");
+
+  const auto planStats = toPlanStats(task->taskStats());
+  const auto finalStatsIt = std::find_if(
+      planStats.begin(), planStats.end(), [](const auto& entry) {
+        return entry.second.customStats.contains(
+            "cudfFinalAggregationInputRuns");
+      });
+  ASSERT_NE(finalStatsIt, planStats.end());
+  const auto& finalStats = finalStatsIt->second.customStats;
+  ASSERT_TRUE(finalStats.contains("cudfFinalAggregationRunMerges"));
+  EXPECT_GT(finalStats.at("cudfFinalAggregationInputRuns").sum, 1);
+  EXPECT_GT(finalStats.at("cudfFinalAggregationRunMerges").sum, 0);
+  EXPECT_EQ(finalStats.count("cudfFinalStreamingBatches"), 0);
+}
+
+TEST_F(
+    FinalAggregationStreamingTest,
+    companionFinalAggregationUsesLevelledRuns) {
+  ScopedStreamingCapacity levelledCapacity{0};
+  auto vectors = {
+      makeRowVector(
+          {makeFlatVector<int64_t>(100, [](auto row) { return row % 17; }),
+           makeFlatVector<int64_t>(100, [](auto row) { return row + 1; })}),
+      makeRowVector(
+          {makeFlatVector<int64_t>(110, [](auto row) { return row % 17; }),
+           makeFlatVector<int64_t>(110, [](auto row) { return row + 101; })}),
+      makeRowVector(
+          {makeFlatVector<int64_t>(90, [](auto row) { return row % 17; }),
+           makeFlatVector<int64_t>(90, [](auto row) { return row + 211; })}),
+  };
+  createDuckDbTable(vectors);
+
+  core::PlanNodeId finalAggId;
+  auto task =
+      AssertQueryBuilder(duckDbQueryRunner_)
+          .config(QueryConfig::kMaxPartialAggregationMemory, 1)
+          .plan(
+              PlanBuilder()
+                  .values(vectors)
+                  .partialAggregation({"c0"}, {"sum_partial(c1)"})
+                  .finalAggregation(
+                      {"c0"},
+                      {"sum_merge_extract_BIGINT(a0)"},
+                      {{BIGINT()}})
+                  .capturePlanNodeId(finalAggId)
+                  .planNode())
+          .assertResults("SELECT c0, sum(c1) FROM tmp GROUP BY c0");
+
+  const auto planStats = toPlanStats(task->taskStats());
+  const auto& finalStats = planStats.at(finalAggId).customStats;
+  EXPECT_GT(finalStats.at("cudfFinalAggregationInputRuns").sum, 1);
+  EXPECT_GT(finalStats.at("cudfFinalAggregationRunMerges").sum, 0);
+  EXPECT_EQ(finalStats.count("cudfFinalStreamingBatches"), 0);
+}
+
 TEST_F(FinalAggregationStreamingTest, finalAggregationStreamingMixedAggs) {
   auto vectors = makeVectors(rowType_, 10, 100);
   createDuckDbTable(vectors);
