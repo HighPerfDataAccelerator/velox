@@ -243,9 +243,10 @@ TEST_F(OrderByTest, externalSpillSchemaEligibility) {
   config.timestampUnit = cudf::type_id::TIMESTAMP_SECONDS;
   EXPECT_FALSE(cudf_velox::CudfOrderBy::isSupported(timestampOrderBy));
 
-  for (const auto unit : {cudf::type_id::TIMESTAMP_MILLISECONDS,
-                          cudf::type_id::TIMESTAMP_MICROSECONDS,
-                          cudf::type_id::TIMESTAMP_NANOSECONDS}) {
+  for (const auto unit :
+       {cudf::type_id::TIMESTAMP_MILLISECONDS,
+        cudf::type_id::TIMESTAMP_MICROSECONDS,
+        cudf::type_id::TIMESTAMP_NANOSECONDS}) {
     config.timestampUnit = unit;
     EXPECT_TRUE(cudf_velox::CudfOrderBy::isSupported(timestampOrderBy));
   }
@@ -253,9 +254,9 @@ TEST_F(OrderByTest, externalSpillSchemaEligibility) {
   const auto safeNestedPayload =
       std::dynamic_pointer_cast<const core::OrderByNode>(
           PlanBuilder()
-              .tableScan(ROW(
-                  {"key", "payload"},
-                  {INTEGER(), ARRAY(ROW({BIGINT(), VARCHAR()}))}))
+              .tableScan(
+                  ROW({"key", "payload"},
+                      {INTEGER(), ARRAY(ROW({BIGINT(), VARCHAR()}))}))
               .orderBy({"key ASC NULLS LAST"}, false)
               .planNode());
   ASSERT_NE(safeNestedPayload, nullptr);
@@ -265,8 +266,7 @@ TEST_F(OrderByTest, externalSpillSchemaEligibility) {
       std::dynamic_pointer_cast<const core::OrderByNode>(
           PlanBuilder()
               .tableScan(ROW(
-                  {"key", "payload"},
-                  {INTEGER(), MAP(VARCHAR(), VARCHAR())}))
+                  {"key", "payload"}, {INTEGER(), MAP(VARCHAR(), VARCHAR())}))
               .orderBy({"key ASC NULLS LAST"}, false)
               .planNode());
   ASSERT_NE(safeMapPayload, nullptr);
@@ -276,8 +276,7 @@ TEST_F(OrderByTest, externalSpillSchemaEligibility) {
       std::dynamic_pointer_cast<const core::OrderByNode>(
           PlanBuilder()
               .tableScan(ROW(
-                  {"key", "payload"},
-                  {MAP(VARCHAR(), VARCHAR()), INTEGER()}))
+                  {"key", "payload"}, {MAP(VARCHAR(), VARCHAR()), INTEGER()}))
               .orderBy({"key ASC NULLS LAST"}, false)
               .planNode());
   ASSERT_NE(unsupportedMapKey, nullptr);
@@ -286,13 +285,11 @@ TEST_F(OrderByTest, externalSpillSchemaEligibility) {
   const auto unsupportedBinaryPayload =
       std::dynamic_pointer_cast<const core::OrderByNode>(
           PlanBuilder()
-              .tableScan(
-                  ROW({"key", "payload"}, {INTEGER(), VARBINARY()}))
+              .tableScan(ROW({"key", "payload"}, {INTEGER(), VARBINARY()}))
               .orderBy({"key ASC NULLS LAST"}, false)
               .planNode());
   ASSERT_NE(unsupportedBinaryPayload, nullptr);
-  EXPECT_FALSE(
-      cudf_velox::CudfOrderBy::isSupported(unsupportedBinaryPayload));
+  EXPECT_FALSE(cudf_velox::CudfOrderBy::isSupported(unsupportedBinaryPayload));
 }
 
 TEST_F(OrderByTest, externalSpillConstructorDefense) {
@@ -496,11 +493,11 @@ TEST_F(OrderByTest, boundedExternalSortManyRuns) {
         nullEvery(29, (run * 2) % 29));
     // A unique final key makes the expected global order deterministic even
     // though SQL does not define insertion order for complete sort-key ties.
-    auto c2 = makeFlatVector<int64_t>(
-        kRowsPerRun,
-        [run](vector_size_t row) { return run * kRowsPerRun + row; });
-    auto payload = makeFlatVector<std::string>(
-        kRowsPerRun, [run](vector_size_t row) {
+    auto c2 = makeFlatVector<int64_t>(kRowsPerRun, [run](vector_size_t row) {
+      return run * kRowsPerRun + row;
+    });
+    auto payload =
+        makeFlatVector<std::string>(kRowsPerRun, [run](vector_size_t row) {
           return fmt::format("run={};row={};", run, row) +
               std::string(512, static_cast<char>('a' + run % 26));
         });
@@ -508,14 +505,13 @@ TEST_F(OrderByTest, boundedExternalSortManyRuns) {
   }
   createDuckDbTable(vectors);
 
-  auto plan = PlanBuilder()
-                  .values(vectors)
-                  .orderBy(
-                      {"c0 ASC NULLS FIRST",
-                       "c1 DESC NULLS LAST",
-                       "c2 ASC NULLS LAST"},
-                      false)
-                  .planNode();
+  auto plan =
+      PlanBuilder()
+          .values(vectors)
+          .orderBy(
+              {"c0 ASC NULLS FIRST", "c1 DESC NULLS LAST", "c2 ASC NULLS LAST"},
+              false)
+          .planNode();
   assertQueryOrdered(
       plan,
       "SELECT * FROM tmp ORDER BY c0 ASC NULLS FIRST, "
@@ -539,9 +535,9 @@ TEST_F(OrderByTest, boundedExternalSortMapPayload) {
   std::vector<RowVectorPtr> vectors;
   vectors.reserve(kNumRuns);
   for (int32_t run = 0; run < kNumRuns; ++run) {
-    auto key = makeFlatVector<int64_t>(
-        kRowsPerRun,
-        [run](vector_size_t row) { return run * kRowsPerRun + row; });
+    auto key = makeFlatVector<int64_t>(kRowsPerRun, [run](vector_size_t row) {
+      return run * kRowsPerRun + row;
+    });
     auto map = makeMapVector<std::string, std::string>(
         kRowsPerRun,
         [](vector_size_t row) { return row % 4; },
