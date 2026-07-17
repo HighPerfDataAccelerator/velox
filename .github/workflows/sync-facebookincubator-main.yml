@@ -1,0 +1,31 @@
+name: Sync facebookincubator main
+
+on:
+  schedule:
+    # Run daily at 03:17 UTC (12:17 JST). Avoid the top of the hour,
+    # when scheduled workflows are more likely to be delayed.
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: sync-facebookincubator-main
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Fast-forward main from upstream
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Sync main from facebookincubator/velox
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api \
+            --method POST \
+            "repos/${{ github.repository }}/merge-upstream" \
+            -f branch=main
