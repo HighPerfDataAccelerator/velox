@@ -1483,6 +1483,63 @@ TEST_P(UcxExchangeTest, batchAccumulationTest) {
 
     queueManager_->removeTask(srcTaskId);
   }
+
+  // --- Scenario 5: Byte-only threshold via QueryConfig ---
+  {
+    const int numChunks = 20;
+    // Use a one-row repeated pattern so validation remains independent of
+    // byte-based output slice boundaries.
+    const int numRowsPerChunk = 1;
+    const int numPartitions = 1;
+    const int numDrivers = 1;
+    const std::string taskPrefix = getUniqueTaskPrefix();
+    const std::string srcTaskId = taskPrefix + "sourceTask0";
+
+    auto dataToSend = std::make_shared<UcxTestData>();
+    dataToSend->initialize(numRowsPerChunk);
+
+    std::unordered_map<std::string, std::string> extraConfig{
+        {core::QueryConfig::kUcxPartitionedOutputBatchRows, "0"},
+        {core::QueryConfig::kUcxPartitionedOutputBatchBytes, "256"}};
+    auto srcTask = createPartitionedOutputTask(
+        srcTaskId,
+        pool_,
+        UcxTestData::kTestRowType,
+        numPartitions,
+        {},
+        FOUR_GBYTES,
+        extraConfig);
+    queueManager_->initializeTask(
+        srcTask,
+        core::PartitionedOutputNode::Kind::kPartitioned,
+        numPartitions,
+        numDrivers);
+
+    auto sourceDriver = std::make_shared<SourceDriverMock>(
+        srcTask, numDrivers, numChunks, numRowsPerChunk, dataToSend);
+    const std::string sinkTaskId = taskPrefix + "sinkTask0";
+    core::PlanNodeId exchangeNodeId;
+    auto sinkTask = createExchangeTask(
+        sinkTaskId, UcxTestData::kTestRowType, 0, exchangeNodeId);
+    auto sinkDriver =
+        std::make_shared<SinkDriverMock>(sinkTask, numDrivers, dataToSend);
+    std::vector<exec::Split> splits{remoteSplit(srcTaskId, 0)};
+    sinkDriver->addSplits(splits);
+
+    sourceDriver->run();
+    sinkDriver->run();
+    sourceDriver->joinThreads();
+    sinkDriver->joinThreads();
+
+    EXPECT_EQ(
+        sinkDriver->numRows(),
+        static_cast<size_t>(numChunks) * numRowsPerChunk);
+    EXPECT_TRUE(sinkDriver->dataIsValid());
+    EXPECT_GT(sinkDriver->numChunksReceived(), 1);
+    EXPECT_LT(
+        sinkDriver->numChunksReceived(), static_cast<uint64_t>(numChunks));
+    queueManager_->removeTask(srcTaskId);
+  }
 }
 
 // Regression test: aborting a source task while UCXX tagRecv requests are
