@@ -868,9 +868,7 @@ TEST_P(MultiThreadedHashJoinTest, rightSemiJoinFilter) {
       .run();
 }
 
-TEST_P(
-    MultiThreadedHashJoinTest,
-    rightSemiJoinFilterWithAsymmetricSchemas) {
+TEST_P(MultiThreadedHashJoinTest, rightSemiJoinFilterWithAsymmetricSchemas) {
   auto probeVectors = makeBatches(3, [&](int32_t batch) {
     return makeRowVector(
         {"t0", "t1", "t2"},
@@ -904,8 +902,7 @@ TEST_P(
 }
 
 TEST_P(MultiThreadedHashJoinTest, rightSemiJoinFilterWithEmptyProbe) {
-  auto probeType = ROW(
-      {{"t0", INTEGER()}, {"t1", BIGINT()}, {"t2", DOUBLE()}});
+  auto probeType = ROW({{"t0", INTEGER()}, {"t1", BIGINT()}, {"t2", DOUBLE()}});
   auto buildVectors = makeBatches(2, [&](int32_t batch) {
     return makeRowVector(
         {"u0", "u1"},

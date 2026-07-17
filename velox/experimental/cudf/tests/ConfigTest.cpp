@@ -32,7 +32,8 @@ TEST(ConfigTest, CudfConfig) {
       {CudfConfig::kCudfAllowCpuFallback, "false"},
       {CudfConfig::kCudfGroupbyStreamingMaxDistinctKeys, "16777216"},
       {CudfConfig::kCudfOrderBySortedRunBytes, "67108864"},
-      {CudfConfig::kCudfOrderByMergeFanIn, "7"}};
+      {CudfConfig::kCudfOrderByMergeFanIn, "7"},
+      {CudfConfig::kCudfWindowSortedRunBytes, "134217728"}};
 
   CudfConfig config;
   config.initialize(std::move(options));
@@ -45,6 +46,16 @@ TEST(ConfigTest, CudfConfig) {
   ASSERT_EQ(config.groupbyStreamingMaxDistinctKeys, 16777216);
   ASSERT_EQ(config.orderBySortedRunBytes, 67108864);
   ASSERT_EQ(config.orderByMergeFanIn, 7);
+  ASSERT_EQ(config.windowSortedRunBytes, 134217728);
+}
+
+TEST(ConfigTest, WindowBounds) {
+  CudfConfig defaultConfig;
+  EXPECT_EQ(defaultConfig.windowSortedRunBytes, 3ULL << 30);
+
+  CudfConfig zeroRunBytes;
+  EXPECT_ANY_THROW(
+      zeroRunBytes.initialize({{CudfConfig::kCudfWindowSortedRunBytes, "0"}}));
 }
 
 TEST(ConfigTest, OrderByBounds) {
@@ -53,16 +64,16 @@ TEST(ConfigTest, OrderByBounds) {
   EXPECT_EQ(defaultConfig.orderByMergeFanIn, 8);
 
   CudfConfig zeroRunBytes;
-  EXPECT_ANY_THROW(zeroRunBytes.initialize(
-      {{CudfConfig::kCudfOrderBySortedRunBytes, "0"}}));
+  EXPECT_ANY_THROW(
+      zeroRunBytes.initialize({{CudfConfig::kCudfOrderBySortedRunBytes, "0"}}));
 
   CudfConfig lowFanIn;
-  EXPECT_ANY_THROW(lowFanIn.initialize(
-      {{CudfConfig::kCudfOrderByMergeFanIn, "1"}}));
+  EXPECT_ANY_THROW(
+      lowFanIn.initialize({{CudfConfig::kCudfOrderByMergeFanIn, "1"}}));
 
   CudfConfig highFanIn;
-  EXPECT_ANY_THROW(highFanIn.initialize(
-      {{CudfConfig::kCudfOrderByMergeFanIn, "65"}}));
+  EXPECT_ANY_THROW(
+      highFanIn.initialize({{CudfConfig::kCudfOrderByMergeFanIn, "65"}}));
 }
 
 TEST(ConfigTest, GroupbyStreamingMaxDistinctKeysRange) {
@@ -70,9 +81,9 @@ TEST(ConfigTest, GroupbyStreamingMaxDistinctKeysRange) {
   ASSERT_EQ(defaultConfig.groupbyStreamingMaxDistinctKeys, 0);
 
   CudfConfig maxConfig;
-  maxConfig.initialize({
-      {CudfConfig::kCudfGroupbyStreamingMaxDistinctKeys,
-       std::to_string(std::numeric_limits<int32_t>::max())}});
+  maxConfig.initialize(
+      {{CudfConfig::kCudfGroupbyStreamingMaxDistinctKeys,
+        std::to_string(std::numeric_limits<int32_t>::max())}});
   ASSERT_EQ(
       maxConfig.groupbyStreamingMaxDistinctKeys,
       std::numeric_limits<int32_t>::max());

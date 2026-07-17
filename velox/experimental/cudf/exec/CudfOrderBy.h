@@ -24,6 +24,7 @@
 
 #include <cudf/io/parquet.hpp>
 #include <cudf/types.hpp>
+
 #include <rmm/cuda_stream_view.hpp>
 
 #include <cstdint>

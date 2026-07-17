@@ -32,7 +32,7 @@
 
 namespace facebook::velox::exec {
 
-class OutputBufferManager;
+class DefaultOutputBufferManager;
 class Task;
 
 /// Extension point for non-default partitioned-output transports. A Task
@@ -841,7 +841,7 @@ class Task : public std::enable_shared_from_this<Task> {
   /// folder could not be created.
   const std::string& getOrCreateSpillDirectory();
 
-  /// True if produces output via OutputBufferManager.
+  /// True if produces output via DefaultOutputBufferManager.
   bool hasPartitionedOutput() const {
     return numDriversInPartitionedOutput_ > 0;
   }
@@ -1316,7 +1316,7 @@ class Task : public std::enable_shared_from_this<Task> {
   // default hierarchy is unchanged.
   std::vector<std::shared_ptr<memory::MemoryPool>> customChildPools_;
 
-  // Set to true by OutputBufferManager when all output is
+  // Set to true by DefaultOutputBufferManager when all output is
   // acknowledged. If this happens before Drivers are at end, the last
   // Driver to finish will set state_ to kFinished. If Drivers have
   // finished then setting this to true will also set state_ to
@@ -1512,7 +1512,7 @@ class Task : public std::enable_shared_from_this<Task> {
   // ungrouped execution we use the [0] entry in this vector.
   std::unordered_map<uint32_t, SplitGroupState> splitGroupStates_;
 
-  std::weak_ptr<OutputBufferManager> bufferManager_;
+  std::weak_ptr<DefaultOutputBufferManager> bufferManager_;
 
   // Boolean indicating that we have already received no-more-output-buffers
   // message. Subsequent messages will be ignored.
