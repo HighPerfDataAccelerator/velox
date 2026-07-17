@@ -28,6 +28,8 @@
 #include "velox/functions/prestosql/window/WindowFunctionsRegistration.h"
 #include "velox/functions/sparksql/window/WindowFunctionsRegistration.h"
 
+#include <folly/ScopeGuard.h>
+
 using namespace facebook::velox;
 using namespace facebook::velox::exec;
 using namespace facebook::velox::exec::test;
@@ -59,6 +61,19 @@ class AdapterOperatorTest : public OperatorTestBase {
       }
     }
     return false;
+  }
+
+  std::shared_ptr<const core::WindowNode> withRowsFrame(
+      const core::PlanNodePtr& plan) {
+    auto window = std::dynamic_pointer_cast<const core::WindowNode>(plan);
+    VELOX_CHECK_NOT_NULL(window);
+    auto functions = window->windowFunctions();
+    for (auto& function : functions) {
+      function.frame.type = core::WindowNode::WindowType::kRows;
+    }
+    return core::WindowNode::Builder(*window)
+        .windowFunctions(std::move(functions))
+        .build();
   }
 };
 
@@ -122,12 +137,189 @@ TEST_F(AdapterOperatorTest, fullPartitionWindowSumUsesCudfWindow) {
   EXPECT_TRUE(wasCudfWindowUsed(task));
 }
 
+TEST_F(AdapterOperatorTest, streamingFullPartitionCountCrossesInputBatches) {
+  std::vector<RowVectorPtr> data{
+      makeRowVector(
+          {"k", "payload"},
+          {makeNullableFlatVector<int64_t>({std::nullopt, std::nullopt, 1}),
+           makeFlatVector<int64_t>({0, 1, 2})}),
+      makeRowVector(
+          {"k", "payload"},
+          {makeNullableFlatVector<int64_t>({1, 1, 2}),
+           makeFlatVector<int64_t>({3, 4, 5})}),
+      makeRowVector(
+          {"k", "payload"},
+          {makeNullableFlatVector<int64_t>({2, 2, 3}),
+           makeFlatVector<int64_t>({6, 7, 8})})};
+  createDuckDbTable(data);
+
+  auto plan = withRowsFrame(
+      PlanBuilder()
+          .values(data)
+          .streamingWindow(
+              {"count(1) over (partition by k rows between unbounded preceding "
+               "and unbounded following) as c"})
+          .planNode());
+  auto task = AssertQueryBuilder(duckDbQueryRunner_)
+                  .config("cudf.enabled", true)
+                  .plan(plan)
+                  .assertResults(
+                      "SELECT k, payload, count(1) over (partition by k rows "
+                      "between unbounded preceding and unbounded following) "
+                      "FROM tmp");
+  EXPECT_TRUE(wasCudfWindowUsed(task));
+}
+
+TEST_F(
+    AdapterOperatorTest,
+    streamingFullPartitionCountProducesOutputBeforeNoMoreInput) {
+  std::vector<RowVectorPtr> data{
+      makeRowVector(
+          {"k", "payload"},
+          {makeFlatVector<int64_t>({1, 1}), makeFlatVector<int64_t>({0, 1})}),
+      makeRowVector(
+          {"k", "payload"},
+          {makeFlatVector<int64_t>({1, 2}), makeFlatVector<int64_t>({2, 3})})};
+  auto plan = withRowsFrame(
+      PlanBuilder()
+          .values(data)
+          .streamingWindow(
+              {"count(1) over (partition by k rows between unbounded preceding "
+               "and unbounded following) as c"})
+          .planNode());
+  auto windowNode = std::dynamic_pointer_cast<const core::WindowNode>(plan);
+  ASSERT_NE(windowNode, nullptr);
+  auto valuesNode = std::dynamic_pointer_cast<const core::ValuesNode>(
+      windowNode->sources()[0]);
+  ASSERT_NE(valuesNode, nullptr);
+
+  auto task = Task::create(
+      "streaming-count-produces-output-before-no-more-input",
+      core::PlanFragment{plan},
+      0,
+      core::QueryCtx::create(driverExecutor_.get()),
+      Task::ExecutionMode::kParallel);
+  auto driver = Driver::testingCreate(
+      std::make_unique<DriverCtx>(task, 0, 0, kUngroupedGroupId, 0));
+  cudf_velox::CudfValues values(0, driver->driverCtx(), valuesNode);
+  cudf_velox::CudfWindow window(1, driver->driverCtx(), windowNode);
+  values.initialize();
+  window.initialize();
+
+  auto first = values.getOutput();
+  ASSERT_NE(first, nullptr);
+  window.addInput(std::move(first));
+  EXPECT_TRUE(window.needsInput());
+  EXPECT_EQ(window.getOutput(), nullptr);
+
+  auto second = values.getOutput();
+  ASSERT_NE(second, nullptr);
+  window.addInput(std::move(second));
+  EXPECT_FALSE(window.needsInput());
+  auto completedPartition = window.getOutput();
+  ASSERT_NE(completedPartition, nullptr);
+  EXPECT_EQ(completedPartition->size(), 3);
+  EXPECT_EQ(window.getOutput(), nullptr);
+  EXPECT_TRUE(window.needsInput());
+
+  window.noMoreInput();
+  auto finalPartition = window.getOutput();
+  ASSERT_NE(finalPartition, nullptr);
+  EXPECT_EQ(finalPartition->size(), 1);
+  EXPECT_TRUE(window.isFinished());
+  EXPECT_EQ(window.getOutput(), nullptr);
+  window.close();
+  values.close();
+}
+
+TEST_F(AdapterOperatorTest, streamingFullPartitionCountSpillsActivePartition) {
+  cudf_velox::CudfWindow::testingSetStreamingMemoryLimits(1, 1);
+  SCOPE_EXIT {
+    cudf_velox::CudfWindow::testingResetStreamingMemoryLimits();
+  };
+
+  std::vector<RowVectorPtr> data{
+      makeRowVector(
+          {"k", "payload"},
+          {makeFlatVector<int64_t>({1, 1}), makeFlatVector<int64_t>({0, 1})}),
+      makeRowVector(
+          {"k", "payload"},
+          {makeFlatVector<int64_t>({1, 1}), makeFlatVector<int64_t>({2, 3})}),
+      makeRowVector(
+          {"k", "payload"},
+          {makeFlatVector<int64_t>({2, 2}), makeFlatVector<int64_t>({4, 5})})};
+  auto plan = withRowsFrame(
+      PlanBuilder()
+          .values(data)
+          .streamingWindow(
+              {"count(1) over (partition by k rows between unbounded preceding "
+               "and unbounded following) as c"})
+          .planNode());
+  auto expected = makeRowVector(
+      {"k", "payload", "c"},
+      {makeFlatVector<int64_t>({1, 1, 1, 1, 2, 2}),
+       makeFlatVector<int64_t>({0, 1, 2, 3, 4, 5}),
+       makeFlatVector<int64_t>({4, 4, 4, 4, 2, 2})});
+
+  auto task = AssertQueryBuilder(plan).maxDrivers(1).assertResults(expected);
+  EXPECT_TRUE(wasCudfWindowUsed(task));
+  EXPECT_GE(cudf_velox::CudfWindow::testingStreamingSpillWrites(), 3);
+  EXPECT_EQ(cudf_velox::CudfWindow::testingStreamingSpillCleanups(), 1);
+}
+
+TEST_F(AdapterOperatorTest, streamingWindowFeatureGapsFailClosed) {
+  auto data = makeRowVector(
+      {"k", "o", "v"},
+      {makeFlatVector<int64_t>({1, 1}),
+       makeFlatVector<int64_t>({0, 1}),
+       makeNullableFlatVector<int64_t>({std::nullopt, 2})});
+
+  auto nullableCount = withRowsFrame(
+      PlanBuilder()
+          .values({data})
+          .streamingWindow(
+              {"count(v) over (partition by k rows between unbounded preceding "
+               "and unbounded following) as c"})
+          .planNode());
+  EXPECT_FALSE(cudf_velox::isSupportedCudfWindowNode(nullableCount));
+
+  auto boundedRange = std::dynamic_pointer_cast<const core::WindowNode>(
+      PlanBuilder()
+          .values({data})
+          .streamingWindow(
+              {"sum(v) over (partition by k order by o range between 1 "
+               "preceding and current row) as s"})
+          .planNode());
+  ASSERT_NE(boundedRange, nullptr);
+  EXPECT_FALSE(cudf_velox::isSupportedCudfWindowNode(boundedRange));
+
+  auto mixedFrames = std::dynamic_pointer_cast<const core::WindowNode>(
+      PlanBuilder()
+          .values({data})
+          .streamingWindow(
+              {"sum(v) over (partition by k order by o range between "
+               "unbounded preceding and current row) as range_s",
+               "sum(v) over (partition by k order by o rows between "
+               "unbounded preceding and current row) as rows_s"})
+          .planNode());
+  ASSERT_NE(mixedFrames, nullptr);
+  EXPECT_FALSE(cudf_velox::isSupportedCudfWindowNode(mixedFrames));
+
+  auto unsortedRange = std::dynamic_pointer_cast<const core::WindowNode>(
+      PlanBuilder()
+          .values({data})
+          .window({"sum(v) over (partition by k order by o range between "
+                   "unbounded preceding and current row) as s"})
+          .planNode());
+  ASSERT_NE(unsortedRange, nullptr);
+  EXPECT_FALSE(cudf_velox::isSupportedCudfWindowNode(unsortedRange));
+}
+
 TEST_F(AdapterOperatorTest, streamingRowNumberCrossesInputBatches) {
   std::vector<RowVectorPtr> data{
       makeRowVector(
           {"k", "o", "payload"},
-          {makeNullableFlatVector<int64_t>(
-               {std::nullopt, std::nullopt, 1, 1}),
+          {makeNullableFlatVector<int64_t>({std::nullopt, std::nullopt, 1, 1}),
            makeNullableFlatVector<int64_t>({std::nullopt, 0, 0, 1}),
            makeFlatVector<int64_t>({0, 1, 2, 3})}),
       makeRowVector(
@@ -159,8 +351,7 @@ TEST_F(AdapterOperatorTest, streamingRankFixesContinuedTieAndLaterPeer) {
       makeRowVector(
           {"k", "o", "payload"},
           {makeFlatVector<int64_t>({1, 1, 1, 1}),
-           makeNullableFlatVector<int64_t>(
-               {std::nullopt, std::nullopt, 1, 1}),
+           makeNullableFlatVector<int64_t>({std::nullopt, std::nullopt, 1, 1}),
            makeFlatVector<int64_t>({0, 1, 2, 3})}),
       makeRowVector(
           {"k", "o", "payload"},
@@ -198,21 +389,17 @@ TEST_F(AdapterOperatorTest, streamingRankProducesOutputBeforeNoMoreInput) {
   std::vector<RowVectorPtr> data{
       makeRowVector(
           {"k", "o"},
-          {makeFlatVector<int64_t>({1, 1}),
-           makeFlatVector<int64_t>({0, 1})}),
+          {makeFlatVector<int64_t>({1, 1}), makeFlatVector<int64_t>({0, 1})}),
       makeRowVector(
           {"k", "o"},
-          {makeFlatVector<int64_t>({1, 1}),
-           makeFlatVector<int64_t>({2, 3})})};
+          {makeFlatVector<int64_t>({1, 1}), makeFlatVector<int64_t>({2, 3})})};
 
   auto plan =
       PlanBuilder()
           .values(data)
-          .streamingWindow(
-              {"rank() over (partition by k order by o) as rnk"})
+          .streamingWindow({"rank() over (partition by k order by o) as rnk"})
           .planNode();
-  auto windowNode =
-      std::dynamic_pointer_cast<const core::WindowNode>(plan);
+  auto windowNode = std::dynamic_pointer_cast<const core::WindowNode>(plan);
   ASSERT_NE(windowNode, nullptr);
   auto valuesNode = std::dynamic_pointer_cast<const core::ValuesNode>(
       windowNode->sources()[0]);
@@ -224,8 +411,8 @@ TEST_F(AdapterOperatorTest, streamingRankProducesOutputBeforeNoMoreInput) {
       0,
       core::QueryCtx::create(driverExecutor_.get()),
       Task::ExecutionMode::kParallel);
-  auto driver = Driver::testingCreate(std::make_unique<DriverCtx>(
-      task, 0, 0, kUngroupedGroupId, 0));
+  auto driver = Driver::testingCreate(
+      std::make_unique<DriverCtx>(task, 0, 0, kUngroupedGroupId, 0));
   cudf_velox::CudfValues values(0, driver->driverCtx(), valuesNode);
   cudf_velox::CudfWindow window(1, driver->driverCtx(), windowNode);
   values.initialize();
@@ -325,18 +512,16 @@ TEST_F(AdapterOperatorTest, streamingRankDoesNotRetainGiantPartition) {
         {"k", "o"},
         {makeFlatVector<int64_t>(
              kRowsPerBatch, [](vector_size_t) { return 7; }),
-         makeFlatVector<int64_t>(
-             kRowsPerBatch, [batch](vector_size_t row) {
-               return static_cast<int64_t>(batch) * kRowsPerBatch + row;
-             })}));
+         makeFlatVector<int64_t>(kRowsPerBatch, [batch](vector_size_t row) {
+           return static_cast<int64_t>(batch) * kRowsPerBatch + row;
+         })}));
   }
   createDuckDbTable(data);
 
   auto plan =
       PlanBuilder()
           .values(data)
-          .streamingWindow(
-              {"rank() over (partition by k order by o) as rnk"})
+          .streamingWindow({"rank() over (partition by k order by o) as rnk"})
           .planNode();
   auto task = assertQueryOrdered(
       plan,
@@ -344,6 +529,169 @@ TEST_F(AdapterOperatorTest, streamingRankDoesNotRetainGiantPartition) {
       "FROM tmp ORDER BY k, o",
       {0, 1});
   EXPECT_TRUE(wasCudfWindowUsed(task));
+}
+
+TEST_F(AdapterOperatorTest, streamingMultiKeyRangeSumCrossesPeersAndNulls) {
+  std::vector<RowVectorPtr> data{
+      makeRowVector(
+          {"k", "a", "b", "v", "payload"},
+          {makeFlatVector<int64_t>({1, 1}),
+           makeNullableFlatVector<int64_t>({3, 3}),
+           makeNullableFlatVector<int64_t>({std::nullopt, std::nullopt}),
+           makeNullableFlatVector<int64_t>({std::nullopt, 5}),
+           makeFlatVector<int64_t>({0, 1})}),
+      makeRowVector(
+          {"k", "a", "b", "v", "payload"},
+          {makeFlatVector<int64_t>({1, 1, 1, 2}),
+           makeNullableFlatVector<int64_t>({3, 3, 2, 5}),
+           makeNullableFlatVector<int64_t>({std::nullopt, 1, 0, 1}),
+           makeNullableFlatVector<int64_t>({7, std::nullopt, 2, std::nullopt}),
+           makeFlatVector<int64_t>({2, 3, 4, 5})}),
+      makeRowVector(
+          {"k", "a", "b", "v", "payload"},
+          {makeFlatVector<int64_t>({2, 2, 2, 2, 3, 3}),
+           makeNullableFlatVector<int64_t>(
+               {5, 4, 4, 4, std::nullopt, std::nullopt}),
+           makeNullableFlatVector<int64_t>(
+               {1, std::nullopt, std::nullopt, 2, std::nullopt, 1}),
+           makeNullableFlatVector<int64_t>(
+               {4, std::nullopt, 6, -1, std::nullopt, 8}),
+           makeFlatVector<int64_t>({6, 7, 8, 9, 10, 11})})};
+  createDuckDbTable(data);
+
+  auto plan =
+      PlanBuilder()
+          .values(data)
+          .streamingWindow(
+              {"sum(v) over (partition by k order by a desc nulls last, b asc "
+               "nulls first range between unbounded preceding and current row) "
+               "as s"})
+          .planNode();
+  auto task = AssertQueryBuilder(duckDbQueryRunner_)
+                  .config("cudf.enabled", true)
+                  .plan(plan)
+                  .assertResults(
+                      "SELECT k, a, b, v, payload, sum(v) over (partition by k "
+                      "order by a desc nulls last, b asc nulls first range "
+                      "between unbounded preceding and current row) FROM tmp");
+  EXPECT_TRUE(wasCudfWindowUsed(task));
+}
+
+TEST_F(AdapterOperatorTest, streamingRangeSumProducesOutputBeforeNoMoreInput) {
+  std::vector<RowVectorPtr> data{
+      makeRowVector(
+          {"k", "a", "b", "v"},
+          {makeFlatVector<int64_t>({1, 1}),
+           makeFlatVector<int64_t>({3, 3}),
+           makeNullableFlatVector<int64_t>({std::nullopt, std::nullopt}),
+           makeNullableFlatVector<int64_t>({std::nullopt, 5})}),
+      makeRowVector(
+          {"k", "a", "b", "v"},
+          {makeFlatVector<int64_t>({1, 1}),
+           makeFlatVector<int64_t>({3, 2}),
+           makeNullableFlatVector<int64_t>({std::nullopt, 0}),
+           makeNullableFlatVector<int64_t>({7, 2})})};
+  auto plan =
+      PlanBuilder()
+          .values(data)
+          .streamingWindow(
+              {"sum(v) over (partition by k order by a desc nulls last, b asc "
+               "nulls first range between unbounded preceding and current row) "
+               "as s"})
+          .planNode();
+  auto windowNode = std::dynamic_pointer_cast<const core::WindowNode>(plan);
+  ASSERT_NE(windowNode, nullptr);
+  auto valuesNode = std::dynamic_pointer_cast<const core::ValuesNode>(
+      windowNode->sources()[0]);
+  ASSERT_NE(valuesNode, nullptr);
+
+  auto task = Task::create(
+      "streaming-range-sum-produces-output-before-no-more-input",
+      core::PlanFragment{plan},
+      0,
+      core::QueryCtx::create(driverExecutor_.get()),
+      Task::ExecutionMode::kParallel);
+  auto driver = Driver::testingCreate(
+      std::make_unique<DriverCtx>(task, 0, 0, kUngroupedGroupId, 0));
+  cudf_velox::CudfValues values(0, driver->driverCtx(), valuesNode);
+  cudf_velox::CudfWindow window(1, driver->driverCtx(), windowNode);
+  values.initialize();
+  window.initialize();
+
+  auto first = values.getOutput();
+  ASSERT_NE(first, nullptr);
+  window.addInput(std::move(first));
+  EXPECT_TRUE(window.needsInput());
+  EXPECT_EQ(window.getOutput(), nullptr);
+
+  auto second = values.getOutput();
+  ASSERT_NE(second, nullptr);
+  window.addInput(std::move(second));
+  EXPECT_FALSE(window.needsInput());
+  auto completedPeer = window.getOutput();
+  ASSERT_NE(completedPeer, nullptr);
+  EXPECT_EQ(completedPeer->size(), 3);
+  EXPECT_EQ(window.getOutput(), nullptr);
+  EXPECT_TRUE(window.needsInput());
+
+  window.noMoreInput();
+  auto finalPeer = window.getOutput();
+  ASSERT_NE(finalPeer, nullptr);
+  EXPECT_EQ(finalPeer->size(), 1);
+  EXPECT_TRUE(window.isFinished());
+  EXPECT_EQ(window.getOutput(), nullptr);
+  window.close();
+  values.close();
+}
+
+TEST_F(AdapterOperatorTest, streamingRangeSumSpillsActivePeer) {
+  cudf_velox::CudfWindow::testingSetStreamingMemoryLimits(1, 1);
+  SCOPE_EXIT {
+    cudf_velox::CudfWindow::testingResetStreamingMemoryLimits();
+  };
+
+  std::vector<RowVectorPtr> data{
+      makeRowVector(
+          {"k", "a", "b", "v", "payload"},
+          {makeFlatVector<int64_t>({1, 1}),
+           makeFlatVector<int64_t>({10, 10}),
+           makeFlatVector<int64_t>({5, 5}),
+           makeNullableFlatVector<int64_t>({1, 2}),
+           makeFlatVector<int64_t>({0, 1})}),
+      makeRowVector(
+          {"k", "a", "b", "v", "payload"},
+          {makeFlatVector<int64_t>({1, 1}),
+           makeFlatVector<int64_t>({10, 10}),
+           makeFlatVector<int64_t>({5, 5}),
+           makeNullableFlatVector<int64_t>({std::nullopt, 3}),
+           makeFlatVector<int64_t>({2, 3})}),
+      makeRowVector(
+          {"k", "a", "b", "v", "payload"},
+          {makeFlatVector<int64_t>({1}),
+           makeFlatVector<int64_t>({9}),
+           makeFlatVector<int64_t>({0}),
+           makeNullableFlatVector<int64_t>({4}),
+           makeFlatVector<int64_t>({4})})};
+  auto plan =
+      PlanBuilder()
+          .values(data)
+          .streamingWindow(
+              {"sum(v) over (partition by k order by a desc, b desc range "
+               "between unbounded preceding and current row) as s"})
+          .planNode();
+  auto expected = makeRowVector(
+      {"k", "a", "b", "v", "payload", "s"},
+      {makeFlatVector<int64_t>({1, 1, 1, 1, 1}),
+       makeFlatVector<int64_t>({10, 10, 10, 10, 9}),
+       makeFlatVector<int64_t>({5, 5, 5, 5, 0}),
+       makeNullableFlatVector<int64_t>({1, 2, std::nullopt, 3, 4}),
+       makeFlatVector<int64_t>({0, 1, 2, 3, 4}),
+       makeFlatVector<int64_t>({6, 6, 6, 6, 10})});
+
+  auto task = AssertQueryBuilder(plan).maxDrivers(1).assertResults(expected);
+  EXPECT_TRUE(wasCudfWindowUsed(task));
+  EXPECT_GE(cudf_velox::CudfWindow::testingStreamingSpillWrites(), 3);
+  EXPECT_EQ(cudf_velox::CudfWindow::testingStreamingSpillCleanups(), 1);
 }
 
 TEST_F(AdapterOperatorTest, orderedFirstValueUsesCudfWindow) {
