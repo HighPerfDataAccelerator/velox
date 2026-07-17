@@ -351,6 +351,17 @@ class QueryConfig {
       10'000,
       "Target rows per CudfPartitionedOutput exchange chunk.")
 
+  /// Target bytes to accumulate before flushing CudfPartitionedOutput and the
+  /// maximum approximate payload bytes per destination chunk. Set to 0 to
+  /// disable byte-based accumulation and chunking.
+  VELOX_QUERY_CONFIG(
+      kUcxPartitionedOutputBatchBytes,
+      ucxPartitionedOutputBatchBytes,
+      "cudf.partitioned_output_batch_bytes",
+      uint64_t,
+      0,
+      "Target bytes per CudfPartitionedOutput exchange chunk.")
+
   VELOX_QUERY_CONFIG(
       kMaxPartialAggregationMemory,
       maxPartialAggregationMemoryUsage,

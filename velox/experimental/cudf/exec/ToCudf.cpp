@@ -503,6 +503,10 @@ void CudfConfig::initialize(
     batchSizeMinThreshold =
         folly::to<int32_t>(config[kCudfBatchSizeMinThreshold]);
   }
+  if (config.find(kCudfBatchSizeMinThresholdBytes) != config.end()) {
+    batchSizeMinThresholdBytes =
+        folly::to<uint64_t>(config[kCudfBatchSizeMinThresholdBytes]);
+  }
   if (config.find(kCudfBatchSizeMaxThreshold) != config.end()) {
     batchSizeMaxThreshold =
         folly::to<int32_t>(config[kCudfBatchSizeMaxThreshold]);

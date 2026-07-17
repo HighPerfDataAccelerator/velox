@@ -93,6 +93,7 @@ const std::vector<config::ConfigProperty>& QueryConfig::registeredProperties() {
     VELOX_REGISTER_QUERY_CONFIG(kMaxPartitionedOutputBufferSize);
     VELOX_REGISTER_QUERY_CONFIG(kMaxOutputBufferSize);
     VELOX_REGISTER_QUERY_CONFIG(kUcxPartitionedOutputBatchRows);
+    VELOX_REGISTER_QUERY_CONFIG(kUcxPartitionedOutputBatchBytes);
 
     // Output batch.
     VELOX_REGISTER_QUERY_CONFIG(kPreferredOutputBatchBytes);

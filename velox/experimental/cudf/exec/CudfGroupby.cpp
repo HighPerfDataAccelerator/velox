@@ -1093,13 +1093,23 @@ void CudfGroupby::initialize() {
       aggregationNode_->step(),
       outputType_,
       aggregationInput.constants);
-  // The old blanket companion-aggregate guard forced every input batch into
-  // inputs_ until noMoreInput(). Large MPP final aggregates consequently
-  // retained several GiB of materialized exchange pages per
-  // executor. Companion suffixes describe the external Spark plan step; for
-  // streaming compaction we explicitly force the internal intermediate step
-  // below, so these aggregates can be compacted incrementally as well.
-  streamingEnabled_ = true;
+  // Companion names encode their effective aggregation step. Streaming is
+  // safe when that step agrees with the plan node: each input batch can then
+  // be compacted using the intermediate aggregators and finalized normally.
+  // Mixed companion plans intentionally keep the legacy path because forcing
+  // e.g. count_partial in a single-step node through an intermediate merge
+  // would count partial rows instead of merging their states. Empty grouping
+  // keys also keep the legacy path because cuDF's groupby primitive requires
+  // a key column; global aggregation is handled correctly by the old path.
+  streamingEnabled_ = !aggregationNode_->groupingKeys().empty() &&
+      std::all_of(
+          aggregationNode_->aggregates().begin(),
+          aggregationNode_->aggregates().end(),
+          [&](const auto& aggregate) {
+            return getCompanionStep(
+                       aggregate.call->name(), aggregationNode_->step()) ==
+                aggregationNode_->step();
+          });
 
   if (deviceMemoryDiagnosticsEnabled()) {
     for (const auto& aggregate : aggregationNode_->aggregates()) {
@@ -1178,6 +1188,12 @@ void CudfGroupby::computePartialGroupbyStreaming(CudfVectorPtr tbl) {
       bufferedResultType_,
       inputTableStream,
       get_output_mr());
+
+  // An all-null key batch with ignoreNullKeys enabled has no partial state to
+  // merge. Preserve any state accumulated from earlier batches.
+  if (!groupbyOnInput) {
+    return;
+  }
 
   // If we already have partial output, concatenate the new results with it.
   if (bufferedResult_) {
@@ -1645,6 +1661,12 @@ void CudfGroupby::computeSingleGroupbyStreaming(CudfVectorPtr tbl) {
       bufferedResultType_,
       inputTableStream,
       get_output_mr());
+
+  // An all-null key batch with ignoreNullKeys enabled has no partial state to
+  // merge. Preserve any state accumulated from earlier batches.
+  if (!groupbyOnInput) {
+    return;
+  }
 
   if (bufferedResult_) {
     auto partialOutputStream = bufferedResult_->stream();
