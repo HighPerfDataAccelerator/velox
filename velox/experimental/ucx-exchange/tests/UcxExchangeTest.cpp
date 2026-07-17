@@ -23,6 +23,7 @@
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
 #include <folly/Executor.h>
+#include <folly/ScopeGuard.h>
 #include <folly/synchronization/EventCount.h>
 #include <gtest/gtest-param-test.h>
 #include <gtest/gtest.h>
@@ -849,6 +850,16 @@ TEST_P(UcxExchangeTest, sharedClientSurvivesOneExchangeClose) {
     GTEST_SKIP() << "sharedClientSurvivesOneExchangeClose: runs only once";
   }
 
+  // This test isolates ownership of a client shared by two operators. Avoid
+  // coupling that contract to loopback UCX TCP behavior by using the
+  // same-process transfer registry for the data path.
+  auto& config = cudf_velox::CudfConfig::getInstance();
+  const bool origIntraNode = config.intraNodeExchange;
+  config.intraNodeExchange = true;
+  SCOPE_EXIT {
+    config.intraNodeExchange = origIntraNode;
+  };
+
   const std::string taskPrefix = getUniqueTaskPrefix();
   const std::string srcTaskId = taskPrefix + "sharedClientSrc";
   const std::string sinkTaskId = taskPrefix + "sharedClientSink";
@@ -1556,6 +1567,16 @@ TEST_P(UcxExchangeTest, hashWindowBackpressureIsResumable) {
       p.tableType != TableType::NARROW) {
     GTEST_SKIP() << "hashWindowBackpressureIsResumable: runs only once";
   }
+
+  // The behavior under test is producer-side queue backpressure and cursor
+  // resumption. Use the deterministic same-process transport so loopback UCX
+  // TCP failures cannot mask that contract.
+  auto& config = cudf_velox::CudfConfig::getInstance();
+  const bool origIntraNode = config.intraNodeExchange;
+  config.intraNodeExchange = true;
+  SCOPE_EXIT {
+    config.intraNodeExchange = origIntraNode;
+  };
 
   const auto headroom = cudf_velox::captureDeviceAllocationHeadroom();
   ASSERT_TRUE(headroom.cudaValid);
