@@ -78,13 +78,16 @@ CudfIcebergTestBase::makeIcebergSplits(
   splits.reserve(splitCount);
 
   for (uint32_t i = 0; i < splitCount; ++i) {
+    const auto splitStart = i * splitSize;
+    const auto splitLength =
+        i + 1 == splitCount ? fileSize - splitStart : splitSize;
     splits.emplace_back(
         std::make_shared<HiveIcebergSplit>(
             kCudfIcebergConnectorId,
             dataFilePath,
             dwio::common::FileFormat::PARQUET,
-            i * splitSize,
-            splitSize,
+            splitStart,
+            splitLength,
             partitionKeys,
             std::nullopt,
             std::unordered_map<std::string, std::string>{},

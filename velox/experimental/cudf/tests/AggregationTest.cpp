@@ -1027,13 +1027,13 @@ class FinalAggregationStreamingTest : public AggregationTest {
         : previousCapacity_(
               cudf_velox::CudfConfig::getInstance()
                   .groupbyStreamingMaxDistinctKeys) {
-      cudf_velox::CudfConfig::getInstance()
-          .groupbyStreamingMaxDistinctKeys = capacity;
+      cudf_velox::CudfConfig::getInstance().groupbyStreamingMaxDistinctKeys =
+          capacity;
     }
 
     ~ScopedStreamingCapacity() {
-      cudf_velox::CudfConfig::getInstance()
-          .groupbyStreamingMaxDistinctKeys = previousCapacity_;
+      cudf_velox::CudfConfig::getInstance().groupbyStreamingMaxDistinctKeys =
+          previousCapacity_;
     }
 
    private:
@@ -1060,15 +1060,13 @@ TEST_F(
     FinalAggregationStreamingTest,
     finalAggregationRebindsPackedInputWithMatchingLogicalStream) {
   auto rawInput = makeRowVector(
-      {makeFlatVector<int64_t>({1, 2}),
-       makeFlatVector<int64_t>({10, 20})});
+      {makeFlatVector<int64_t>({1, 2}), makeFlatVector<int64_t>({10, 20})});
   auto plan = PlanBuilder()
                   .values({rawInput})
                   .partialAggregation({"c0"}, {"count(c1)"})
                   .finalAggregation()
                   .planNode();
-  auto finalNode =
-      std::dynamic_pointer_cast<const core::AggregationNode>(plan);
+  auto finalNode = std::dynamic_pointer_cast<const core::AggregationNode>(plan);
   ASSERT_NE(finalNode, nullptr);
 
   auto task = Task::create(
@@ -1087,8 +1085,7 @@ TEST_F(
   const auto inputType = finalNode->sources()[0]->outputType();
   auto intermediateInput = makeRowVector(
       inputType->names(),
-      {makeFlatVector<int64_t>({1, 2}),
-       makeFlatVector<int64_t>({3, 4})});
+      {makeFlatVector<int64_t>({1, 2}), makeFlatVector<int64_t>({3, 4})});
   auto table = cudf_velox::with_arrow::toCudfTable(
       intermediateInput,
       pool(),
@@ -1835,6 +1832,32 @@ TEST_F(AggregationTest, stddevSampAllNulls) {
                  .planNode();
 
   assertQuery(op2, "SELECT c0, stddev_samp(c2) FROM tmp GROUP BY c0");
+}
+
+// Test that zero-column rows flow correctly through CudfFromVelox.
+// project({}) produces zero-column output; localPartitionRoundRobin is a CPU
+// operator that forces CudfFromVelox insertion before the GPU aggregation.
+// Without the zero-column fix in CudfFromVelox, this crashes with:
+//   "Operator::getOutput() must return nullptr or a non-empty vector"
+// because toCudfTable loses the row count for zero-column tables.
+TEST_F(AggregationTest, zeroColumnThroughCudfFromVelox) {
+  auto data = makeRowVector({
+      makeFlatVector<int64_t>({1, 2, 3, 4}),
+  });
+  createDuckDbTable({data});
+
+  auto plan = PlanBuilder()
+                  .values({data})
+                  .filter("c0 > 0")
+                  .project({})
+                  .localPartitionRoundRobin()
+                  .singleAggregation({}, {"count(*)"})
+                  .planNode();
+
+  AssertQueryBuilder(duckDbQueryRunner_)
+      .config(core::QueryConfig::kMaxLocalExchangePartitionCount, "2")
+      .plan(plan)
+      .assertResults("SELECT count(*) FROM tmp WHERE c0 > 0");
 }
 
 } // namespace facebook::velox::exec::test
