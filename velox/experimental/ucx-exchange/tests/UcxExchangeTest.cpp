@@ -1210,6 +1210,16 @@ TEST_P(UcxExchangeTest, batchAccumulationTest) {
     }
   }
 
+  // This test exercises accumulation and chunk-boundary semantics, not the
+  // UCX TCP transport. Use the same-process registry so loopback transport
+  // failures cannot mask row-count, integrity, or chunk-count regressions.
+  auto& config = cudf_velox::CudfConfig::getInstance();
+  const bool origIntraNode = config.intraNodeExchange;
+  config.intraNodeExchange = true;
+  SCOPE_EXIT {
+    config.intraNodeExchange = origIntraNode;
+  };
+
   const int kTargetRows = UcxPartitionedOutput::kDefaultTargetRowsPerChunk;
 
   // --- Scenario 1: Small chunks that SHOULD be accumulated ---
