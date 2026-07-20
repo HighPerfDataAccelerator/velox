@@ -38,5 +38,6 @@ int main(int argc, char** argv) {
   facebook::velox::Type::registerSerDe();
   facebook::velox::cudf_velox::CudfConfig::getInstance().exchangeLogLevel =
       FLAGS_exchange_log_level;
+  facebook::velox::cudf_velox::CudfConfig::getInstance().exchange = true;
   return RUN_ALL_TESTS();
 }
