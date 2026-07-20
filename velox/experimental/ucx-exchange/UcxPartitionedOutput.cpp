@@ -47,6 +47,11 @@ namespace {
 // explicit per-query limits remain authoritative and may be smaller.
 constexpr int64_t kDefaultMaxRowsPerHashPartitionCall = 128'000'000;
 
+// Admission is cooperative and can lose a race to another output driver.
+// When no reservation can be obtained, cap this driver's estimated transient
+// hash-partition peak so concurrent unadmitted fallbacks remain bounded.
+constexpr uint64_t kMaxUnadmittedHashPartitionPeakBytes = uint64_t{1} << 30;
+
 int64_t targetRowsPerUcxChunk(const core::QueryConfig& queryConfig) {
   if (const char* value =
           std::getenv("GLUTEN_UCX_PARTITIONED_OUTPUT_BATCH_ROWS")) {
@@ -605,11 +610,45 @@ void UcxPartitionedOutput::advanceActiveFlush() {
     auto selectedPeakBytes = estimatePeakBytes(selectedRows);
     memoryAdmission = cudf_velox::tryAcquireDeviceMemoryAdmission(
         headroom.device, selectedPeakBytes, admissionCapacity);
-    if (!memoryAdmission && selectedRows == candidateRows &&
-        fallbackRows < candidateRows) {
+    bool admissionRetried = false;
+    if (!memoryAdmission && fallbackRows < selectedRows) {
+      // The initial size used a non-atomic reservation snapshot. Another
+      // driver may have acquired capacity before this atomic attempt, so
+      // shrink to the proven queue-sized fallback and retry the reservation.
       selectedRows = fallbackRows;
       selectedPeakBytes = estimatePeakBytes(selectedRows);
+      memoryAdmission = cudf_velox::tryAcquireDeviceMemoryAdmission(
+          headroom.device, selectedPeakBytes, admissionCapacity);
+      admissionRetried = true;
     }
+    if (!memoryAdmission &&
+        selectedPeakBytes > kMaxUnadmittedHashPartitionPeakBytes) {
+      // Admission can still be unavailable when every byte is temporarily
+      // reserved, or when CUDA headroom could not be sampled. A driver must
+      // not then execute the original large window unaccounted. Find the
+      // largest row count whose estimated peak is at most the explicit 1 GiB
+      // fallback bound, and give that smaller window one final admission try.
+      uint64_t lower = 1;
+      uint64_t upper = selectedRows;
+      if (estimatePeakBytes(lower) <=
+          kMaxUnadmittedHashPartitionPeakBytes) {
+        while (lower < upper) {
+          const auto middle = lower + (upper - lower + 1) / 2;
+          if (estimatePeakBytes(middle) <=
+              kMaxUnadmittedHashPartitionPeakBytes) {
+            lower = middle;
+          } else {
+            upper = middle - 1;
+          }
+        }
+      }
+      selectedRows = lower;
+      selectedPeakBytes = estimatePeakBytes(selectedRows);
+      memoryAdmission = cudf_velox::tryAcquireDeviceMemoryAdmission(
+          headroom.device, selectedPeakBytes, admissionCapacity);
+      admissionRetried = true;
+    }
+    const bool unadmittedFallback = !memoryAdmission;
     rowsThisWindow = static_cast<cudf::size_type>(selectedRows);
     VLOG(2) << "UcxPartitionedOutput pressure-aware hash window task="
             << taskId() << " sourceRows=" << tableRows
@@ -622,7 +661,9 @@ void UcxPartitionedOutput::advanceActiveFlush() {
             << " poolReusableBytes=" << headroom.reusablePoolBytes()
             << " admissionCapacityBytes=" << admissionCapacity
             << " alreadyReservedBytes=" << alreadyReserved
-            << " admitted=" << memoryAdmission.has_value();
+            << " admissionRetried=" << admissionRetried
+            << " admitted=" << memoryAdmission.has_value()
+            << " unadmittedFallback=" << unadmittedFallback;
   }
 
   const auto end = activeNextRow_ + rowsThisWindow;
