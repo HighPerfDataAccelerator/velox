@@ -266,8 +266,7 @@ RowVectorPtr CudfBatchConcat::doGetOutput() {
 }
 
 bool CudfBatchConcat::isFinished() {
-  const bool finished =
-      noMoreInput_ && buffer_.empty() && outputQueue_.empty();
+  const bool finished = noMoreInput_ && buffer_.empty() && outputQueue_.empty();
   if (finished && !summaryLogged_ && logConcatConfig()) {
     summaryLogged_ = true;
     LOG(WARNING) << "CudfBatchConcat summary planNode=" << planNodeId()

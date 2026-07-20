@@ -399,9 +399,7 @@ void UcxExchangeServer::close() {
           << " hasDataRequest=" << (dataRequest_ != nullptr)
           << " hasDataPtr=" << (dataPtr_ != nullptr);
 
-  if (
-      queueMgr_ &&
-      !skipQueueDeleteOnClose_.load(std::memory_order_acquire)) {
+  if (queueMgr_ && !skipQueueDeleteOnClose_.load(std::memory_order_acquire)) {
     queueMgr_->deleteResults(partitionKey_.taskId, partitionKey_.destination);
   }
 

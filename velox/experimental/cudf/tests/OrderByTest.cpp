@@ -577,8 +577,10 @@ TEST_F(OrderByTest, inMemoryResultMovesWithoutChunkCopies) {
 
   std::vector<RowVectorPtr> vectors;
   for (int32_t batch = 0; batch < 4; ++batch) {
-    vectors.push_back(makeRowVector({makeFlatVector<int64_t>(
-        1024, [batch](vector_size_t row) { return 4096 - batch * 1024 - row; })}));
+    vectors.push_back(makeRowVector(
+        {makeFlatVector<int64_t>(1024, [batch](vector_size_t row) {
+          return 4096 - batch * 1024 - row;
+        })}));
   }
   createDuckDbTable(vectors);
 

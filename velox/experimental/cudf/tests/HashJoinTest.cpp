@@ -1644,7 +1644,8 @@ TEST_P(MultiThreadedHashJoinTest, antiJoin) {
       .run();
 
   std::vector<std::string> filters({
-      "u1 > t1", "u1 * t1 > 0",
+      "u1 > t1",
+      "u1 * t1 > 0",
       // This filter is true on rows without a match. It should not prevent
       // the row from being returned.
       // Disabling this because coalesce is not supported in cudf.

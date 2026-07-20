@@ -1045,8 +1045,7 @@ TEST_F(AggregationTest, partialAggregationUsesBalancedRunMerges) {
                           .capturePlanNodeId(partialAggId)
                           .finalAggregation()
                           .planNode())
-                  .assertResults(
-                      "SELECT c0, sum(c1) FROM tmp GROUP BY c0");
+                  .assertResults("SELECT c0, sum(c1) FROM tmp GROUP BY c0");
 
   const auto planStats = toPlanStats(task->taskStats());
   const auto& stats = planStats.at(partialAggId).customStats;
@@ -1065,14 +1064,12 @@ TEST_F(AggregationTest, partialAggregationUsesBalancedRunMerges) {
         << "; available stats: " << availableStats;
   }
   EXPECT_EQ(stats.at("cudfIntermediateAggregationInputRuns").sum, kBatches);
-  EXPECT_EQ(
-      stats.at("cudfIntermediateAggregationRunMerges").sum, kBatches - 1);
+  EXPECT_EQ(stats.at("cudfIntermediateAggregationRunMerges").sum, kBatches - 1);
   // With disjoint keys, balanced merges process 800 rows at each of the three
   // levels. Repeatedly merging the complete accumulated state would process
   // 3,500 rows for the same eight pages.
   EXPECT_EQ(stats.at("cudfIntermediateAggregationMergeRows").sum, 2400);
-  EXPECT_EQ(
-      stats.count("cudfIntermediateAggregationFinalizeMerges"), 0);
+  EXPECT_EQ(stats.count("cudfIntermediateAggregationFinalizeMerges"), 0);
 }
 
 class FinalAggregationStreamingTest : public AggregationTest {
@@ -1213,8 +1210,8 @@ TEST_F(FinalAggregationStreamingTest, finalAggregationStreamsOnAddInput) {
 TEST_F(FinalAggregationStreamingTest, finalAggregationLevelledRuns) {
   ScopedStreamingCapacity levelledCapacity{0};
   auto vectors = {
-      makeRowVector({makeFlatVector<int32_t>(
-          100, [](auto row) { return row % 17; })}),
+      makeRowVector(
+          {makeFlatVector<int32_t>(100, [](auto row) { return row % 17; })}),
       makeRowVector({makeFlatVector<int32_t>(
           110, [](auto row) { return (row + 7) % 17; })}),
       makeRowVector({makeFlatVector<int32_t>(
@@ -1235,8 +1232,8 @@ TEST_F(FinalAggregationStreamingTest, finalAggregationLevelledRuns) {
                   .assertResults("SELECT c0, sum(c0) FROM tmp GROUP BY c0");
 
   const auto planStats = toPlanStats(task->taskStats());
-  const auto finalStatsIt = std::find_if(
-      planStats.begin(), planStats.end(), [](const auto& entry) {
+  const auto finalStatsIt =
+      std::find_if(planStats.begin(), planStats.end(), [](const auto& entry) {
         return entry.second.customStats.contains(
             "cudfFinalAggregationInputRuns");
       });
@@ -1274,9 +1271,7 @@ TEST_F(
                   .values(vectors)
                   .partialAggregation({"c0"}, {"sum_partial(c1)"})
                   .finalAggregation(
-                      {"c0"},
-                      {"sum_merge_extract_BIGINT(a0)"},
-                      {{BIGINT()}})
+                      {"c0"}, {"sum_merge_extract_BIGINT(a0)"}, {{BIGINT()}})
                   .capturePlanNodeId(finalAggId)
                   .planNode())
           .assertResults("SELECT c0, sum(c1) FROM tmp GROUP BY c0");

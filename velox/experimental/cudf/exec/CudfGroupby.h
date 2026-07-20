@@ -203,8 +203,7 @@ class CudfGroupby : public CudfOperatorBase {
   // of comparable weight. This avoids regrouping the complete accumulated
   // state for every page while retaining the configured partial-memory flush
   // boundary.
-  std::vector<std::optional<IntermediateAggregationRun>>
-      intermediateRunLevels_;
+  std::vector<std::optional<IntermediateAggregationRun>> intermediateRunLevels_;
   uint64_t intermediateBufferedBytes_{0};
   uint64_t intermediateInputRunCount_{0};
   uint64_t intermediateRunMergeCount_{0};

@@ -722,8 +722,8 @@ TEST_F(TableScanTest, splitOffsetAndLengthWithChunkedOutput) {
           cudf_velox::connector::hive::CudfHiveConfig::
               kMaxChunkReadLimitSession,
           "1024")
-      .splits({Split(makeCudfHiveConnectorSplit(
-          filePath->getPath(), 0, halfFileSize))})
+      .splits({Split(
+          makeCudfHiveConnectorSplit(filePath->getPath(), 0, halfFileSize))})
       .assertResults("SELECT * FROM tmp OFFSET 0 LIMIT 6000");
 
   AssertQueryBuilder(plan, duckDbQueryRunner_)
@@ -732,8 +732,8 @@ TEST_F(TableScanTest, splitOffsetAndLengthWithChunkedOutput) {
           cudf_velox::connector::hive::CudfHiveConfig::
               kMaxChunkReadLimitSession,
           "1024")
-      .splits({Split(makeCudfHiveConnectorSplit(
-          filePath->getPath(), halfFileSize))})
+      .splits({Split(
+          makeCudfHiveConnectorSplit(filePath->getPath(), halfFileSize))})
       .assertResults("SELECT * FROM tmp OFFSET 6000 LIMIT 4000");
 }
 

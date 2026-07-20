@@ -262,8 +262,7 @@ cudf::size_type rowsPerUcxChunk(
     rowsPerChunk = std::min<cudf::size_type>(
         rowsPerChunk,
         static_cast<cudf::size_type>(std::min<uint64_t>(
-            byteLimitedRows,
-            std::numeric_limits<cudf::size_type>::max())));
+            byteLimitedRows, std::numeric_limits<cudf::size_type>::max())));
   }
   return std::max<cudf::size_type>(1, rowsPerChunk);
 }
@@ -371,8 +370,7 @@ void UcxPartitionedOutput::addInput(RowVectorPtr input) {
 
   if ((targetRowsPerChunk_ <= 0 && targetBytesPerChunk_ == 0) ||
       (targetRowsPerChunk_ > 0 && pendingRows_ >= targetRowsPerChunk_) ||
-      (targetBytesPerChunk_ > 0 &&
-       pendingFlatBytes_ >= targetBytesPerChunk_)) {
+      (targetBytesPerChunk_ > 0 && pendingFlatBytes_ >= targetBytesPerChunk_)) {
     flushPending();
   }
 }
@@ -551,8 +549,7 @@ void UcxPartitionedOutput::advanceActiveFlush() {
       activeRowsPerWindow_, tableRows - activeNextRow_);
   std::optional<cudf_velox::DeviceMemoryAdmissionReservation> memoryAdmission;
 
-  if (numPartitions_ > 1 &&
-      rangeBoundsJson_.empty() &&
+  if (numPartitions_ > 1 && rangeBoundsJson_.empty() &&
       (partitionKeyIndices_.size() > 0 || spec_ == "gather") &&
       hashPartitionInputBatchRows_ > 0 && rowsThisWindow > 0 &&
       activeSourceFlatBytes_ > 0 && tableRows > 0) {
@@ -630,8 +627,7 @@ void UcxPartitionedOutput::advanceActiveFlush() {
       // fallback bound, and give that smaller window one final admission try.
       uint64_t lower = 1;
       uint64_t upper = selectedRows;
-      if (estimatePeakBytes(lower) <=
-          kMaxUnadmittedHashPartitionPeakBytes) {
+      if (estimatePeakBytes(lower) <= kMaxUnadmittedHashPartitionPeakBytes) {
         while (lower < upper) {
           const auto middle = lower + (upper - lower + 1) / 2;
           if (estimatePeakBytes(middle) <=
@@ -1107,8 +1103,7 @@ void UcxPartitionedOutput::splitAndEnqueue(
     if (rowsPerChunk < partitionRows) {
       VLOG(2) << "UcxPartitionedOutput chunking task=" << taskId()
               << " destination=" << i << " rows=" << partitionRows
-              << " bytes=" << partitionBytes
-              << " rowsPerChunk=" << rowsPerChunk
+              << " bytes=" << partitionBytes << " rowsPerChunk=" << rowsPerChunk
               << " targetRowsPerChunk=" << targetRowsPerChunk_
               << " targetBytesPerChunk=" << targetBytesPerChunk_;
       for (cudf::size_type start = 0; start < partitionRows;

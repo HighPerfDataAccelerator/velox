@@ -18,8 +18,8 @@ on:
   schedule:
     # Run daily at 03:17 UTC (12:17 JST). Avoid the top of the hour,
     # when scheduled workflows are more likely to be delayed.
-    - cron: '17 3 * * *'
-  workflow_dispatch:
+    - cron: 17 3 * * *
+  workflow_dispatch: {}
 
 permissions: {}
 

@@ -854,8 +854,7 @@ CudfVectorPtr CudfOrderBy::takePendingOutput() {
   VELOX_CHECK_LT(pendingOutputOffset_, totalRows);
   const auto remainingRows = totalRows - pendingOutputOffset_;
   const auto byteLimit = outputChunkBytes_;
-  cudf::size_type targetRows =
-      std::min(remainingRows, maxOutputRows_);
+  cudf::size_type targetRows = std::min(remainingRows, maxOutputRows_);
   if (pendingOutputBytes_ > byteLimit) {
     const auto proportionalRows =
         static_cast<cudf::size_type>(std::max<uint64_t>(

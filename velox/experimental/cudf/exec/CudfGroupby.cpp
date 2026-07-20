@@ -1240,8 +1240,7 @@ void CudfGroupby::computePartialGroupbyStreaming(CudfVectorPtr tbl) {
 
   if (groupbyOnInput) {
     addIntermediateAggregationRun(
-        IntermediateAggregationRun{
-            std::move(groupbyOnInput), representedRows});
+        IntermediateAggregationRun{std::move(groupbyOnInput), representedRows});
   }
 }
 
@@ -1686,8 +1685,7 @@ void CudfGroupby::computeSingleGroupbyStreaming(CudfVectorPtr tbl) {
 
   if (groupbyOnInput) {
     addIntermediateAggregationRun(
-        IntermediateAggregationRun{
-            std::move(groupbyOnInput), representedRows});
+        IntermediateAggregationRun{std::move(groupbyOnInput), representedRows});
   }
 }
 
@@ -1762,8 +1760,8 @@ CudfGroupby::mergeIntermediateAggregationRuns(
       inputBytes >= largeIntermediateAggregationSerializeBytes();
   std::unique_lock<std::mutex> largeMergeLock;
   if (serializeLargeMerge) {
-    largeMergeLock = std::unique_lock<std::mutex>{
-        largeIntermediateAggregationMutex()};
+    largeMergeLock =
+        std::unique_lock<std::mutex>{largeIntermediateAggregationMutex()};
     stateStream_.synchronize();
   }
 

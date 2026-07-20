@@ -814,8 +814,8 @@ bool UcxExchangeSource::tryStartDataReceive(
         LOG(WARNING)
             << toString()
             << " recovered UCX receive allocation after device synchronize: "
-            << ptr->metadata.dataSizeBytes << " bytes; first error: "
-            << firstError.what();
+            << ptr->metadata.dataSizeBytes
+            << " bytes; first error: " << firstError.what();
       } catch (const rmm::bad_alloc& retryError) {
         VLOG(0) << toString() << " *** RMM failed to allocate "
                 << ptr->metadata.dataSizeBytes

@@ -622,8 +622,7 @@ void CudfConfig::initialize(
     windowSortedRunBytes = static_cast<uint64_t>(value);
   }
   if (config.find(kCudfOrderByOutputChunkBytes) != config.end()) {
-    const auto value =
-        folly::to<int64_t>(config[kCudfOrderByOutputChunkBytes]);
+    const auto value = folly::to<int64_t>(config[kCudfOrderByOutputChunkBytes]);
     VELOX_USER_CHECK_GT(
         value, 0, "{} must be positive", kCudfOrderByOutputChunkBytes);
     orderByOutputChunkBytes = static_cast<uint64_t>(value);

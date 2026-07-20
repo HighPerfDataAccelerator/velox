@@ -126,8 +126,7 @@ CudfLocalPartition::CudfLocalPartition(
     if (hashSeed_ != cudf::DEFAULT_HASH_SEED) {
       LOG(WARNING) << "CudfLocalPartition: decorrelated keyed-FINAL hash "
                    << "planNode=" << planNode->id()
-                   << " partitions=" << numPartitions_
-                   << " seed=" << hashSeed_;
+                   << " partitions=" << numPartitions_ << " seed=" << hashSeed_;
     }
   } else if (
       dynamic_cast<const exec::RoundRobinPartitionFunctionSpec*>(

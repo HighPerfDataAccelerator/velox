@@ -137,8 +137,8 @@ UcxDestinationQueue::Data UcxDestinationQueue::getData(
     // the active server's waiter.  Return a deliberately different sequence
     // so the duplicate UcxExchangeServer follows its stale-connection close
     // path while the original callback remains installed.
-    LOG(WARNING) << "Ignoring duplicate UCX queue waiter: sequence="
-                 << sequence << " acknowledgedSequence=" << sequence_;
+    LOG(WARNING) << "Ignoring duplicate UCX queue waiter: sequence=" << sequence
+                 << " acknowledgedSequence=" << sequence_;
     return {nullptr, sequence_ + 1, {}, true};
   }
   VELOX_CHECK(
