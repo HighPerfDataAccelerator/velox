@@ -529,6 +529,7 @@ void unregisterCudf() {
   mr_.reset();
   output_statistics_mr_.reset();
   statistics_mr_.reset();
+  clearAsyncMemoryPoolHandles();
   exec::DriverFactory::adapters.erase(
       std::remove_if(
           exec::DriverFactory::adapters.begin(),
@@ -570,6 +571,10 @@ void CudfConfig::initialize(
   if (config.find(kCudfBatchSizeMinThresholdBytes) != config.end()) {
     batchSizeMinThresholdBytes =
         folly::to<uint64_t>(config[kCudfBatchSizeMinThresholdBytes]);
+  }
+  if (config.find(kCudfExchangeBatchSizeMinThreshold) != config.end()) {
+    exchangeBatchSizeMinThreshold =
+        folly::to<int32_t>(config[kCudfExchangeBatchSizeMinThreshold]);
   }
   if (config.find(kCudfBatchSizeMaxThreshold) != config.end()) {
     batchSizeMaxThreshold =
@@ -615,6 +620,28 @@ void CudfConfig::initialize(
     VELOX_USER_CHECK_GT(
         value, 0, "{} must be positive", kCudfWindowSortedRunBytes);
     windowSortedRunBytes = static_cast<uint64_t>(value);
+  }
+  if (config.find(kCudfOrderByOutputChunkBytes) != config.end()) {
+    const auto value = folly::to<int64_t>(config[kCudfOrderByOutputChunkBytes]);
+    VELOX_USER_CHECK_GT(
+        value, 0, "{} must be positive", kCudfOrderByOutputChunkBytes);
+    orderByOutputChunkBytes = static_cast<uint64_t>(value);
+  }
+  if (config.find(kCudfOrderByMaxOutputRows) != config.end()) {
+    const auto value = folly::to<int64_t>(config[kCudfOrderByMaxOutputRows]);
+    VELOX_USER_CHECK_GT(
+        value, 0, "{} must be positive", kCudfOrderByMaxOutputRows);
+    VELOX_USER_CHECK_LE(
+        value,
+        std::numeric_limits<int32_t>::max(),
+        "{} must not exceed {}",
+        kCudfOrderByMaxOutputRows,
+        std::numeric_limits<int32_t>::max());
+    orderByMaxOutputRows = static_cast<int32_t>(value);
+  }
+  if (config.find(kCudfExchangeConcatOptimizationEnabled) != config.end()) {
+    exchangeConcatOptimizationEnabled =
+        folly::to<bool>(config[kCudfExchangeConcatOptimizationEnabled]);
   }
   if (config.find(kCudfFunctionNamePrefix) != config.end()) {
     functionNamePrefix = config[kCudfFunctionNamePrefix];

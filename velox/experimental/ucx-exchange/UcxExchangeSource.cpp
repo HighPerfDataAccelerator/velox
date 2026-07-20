@@ -792,14 +792,44 @@ bool UcxExchangeSource::tryStartDataReceive(
   // allocation stream before exposing the pointer to UCX. Receive completion
   // transfers ownership to a packed table that retains the same stream, so
   // downstream work and eventual deallocation remain stream ordered.
-  try {
-    auto& recvMemoryResource = receiveDeviceMemoryResource();
+  auto& recvMemoryResource = receiveDeviceMemoryResource();
+  const auto allocateReceiveBuffer = [&]() {
     ptr->dataBuf = std::make_unique<rmm::device_buffer>(
         ptr->metadata.dataSizeBytes,
         stream,
         cuda::mr::any_resource<cuda::mr::device_accessible>{
             recvMemoryResource});
     CUDF_CUDA_TRY(cudaStreamSynchronize(stream.value()));
+  };
+  try {
+    allocateReceiveBuffer();
+  } catch (const rmm::bad_alloc& firstError) {
+    // On the allocation-failure slow path, wait for stream-ordered frees and
+    // let the shared async pool reclaim completed blocks, then retry once.
+    cudaGetLastError();
+    const auto syncStatus = cudaDeviceSynchronize();
+    if (syncStatus == cudaSuccess) {
+      try {
+        allocateReceiveBuffer();
+        LOG(WARNING)
+            << toString()
+            << " recovered UCX receive allocation after device synchronize: "
+            << ptr->metadata.dataSizeBytes
+            << " bytes; first error: " << firstError.what();
+      } catch (const rmm::bad_alloc& retryError) {
+        VLOG(0) << toString() << " *** RMM failed to allocate "
+                << ptr->metadata.dataSizeBytes
+                << " bytes after device synchronize retry: "
+                << retryError.what();
+      }
+    } else {
+      VLOG(0) << toString()
+              << " *** cudaDeviceSynchronize failed while recovering "
+                 "receive allocation: "
+              << cudaGetErrorString(syncStatus);
+    }
+  }
+  if (ptr->dataBuf != nullptr) {
     if (facebook::velox::cudf_velox::deviceMemoryDiagnosticsEnabled()) {
       constexpr int64_t kReportStep = 512LL << 20;
       const auto bytes = recvMemoryResource.get_bytes_counter();
@@ -837,10 +867,8 @@ bool UcxExchangeSource::tryStartDataReceive(
                 maxInFlightRecvBytes()));
       }
     }
-  } catch (const rmm::bad_alloc& e) {
+  } else {
     releaseReceiveReservation();
-    VLOG(0) << toString() << " *** RMM failed to allocate "
-            << ptr->metadata.dataSizeBytes << " bytes: " << e.what();
     queue_->setError("Failed to alloc GPU memory");
     deliverEndMarker();
     setState(ReceiverState::Done);

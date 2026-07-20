@@ -67,7 +67,6 @@ class CudfBatchConcatTest : public OperatorTestBase {
     }
     return PlanBuilder(generator).localPartitionRoundRobin(sources).planNode();
   }
-
 };
 
 // Verifies that CudfBatchConcat is inserted before aggregation and reduces
