@@ -33,6 +33,7 @@
 #include "velox/vector/BaseVector.h"
 
 #include <folly/ScopeGuard.h>
+#include <cudf/column/column_factories.hpp>
 #include <gtest/gtest.h>
 
 #include <string>
@@ -183,6 +184,24 @@ TEST_F(
   auto leadingNullField = compileExecExpr(
       "row_constructor(cast(null as bigint), b).c1", rowType_, execCtx_.get());
   ASSERT_TRUE(canBeEvaluatedByCudf(leadingNullField, /*deep=*/true));
+
+  auto untypedNullRow =
+      compileExecExpr("row_constructor(a, null)", rowType_, execCtx_.get());
+  ASSERT_EQ(untypedNullRow->type()->childAt(1)->kind(), TypeKind::UNKNOWN);
+  ASSERT_TRUE(canBeEvaluatedByCudf(untypedNullRow, /*deep=*/true));
+
+  auto cudfExpr = createCudfExpression(untypedNullRow, rowType_);
+  auto input = cudf::make_fixed_width_column(
+      cudf::data_type{cudf::type_id::INT64}, 3);
+  auto result = cudfExpr->eval(
+      {input->view()},
+      cudf::get_default_stream(),
+      cudf::get_current_device_resource_ref());
+  auto resultView = asView(result);
+  ASSERT_EQ(resultView.type().id(), cudf::type_id::STRUCT);
+  ASSERT_EQ(resultView.num_children(), 2);
+  EXPECT_EQ(resultView.child(1).type().id(), cudf::type_id::INT8);
+  EXPECT_EQ(resultView.child(1).null_count(), 3);
 
   auto nestedField = compileExecExpr(
       "row_constructor(row_constructor(a, cast(null as bigint)), b).c1.c2",
