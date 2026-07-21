@@ -365,13 +365,22 @@ void UcxPartitionedOutput::preparePendingFlush() {
                                    : hashPartitionInputBatchRows_);
     const auto configuredRows = static_cast<uint64_t>(
         std::max<int64_t>(hashPartitionInputBatchRows_, configuredWindowRows));
+    // Source residency and destination message size are different bounds.
+    // A hash window is distributed across all destinations, so callers with
+    // sufficient receive credit may explicitly use a larger source window
+    // without increasing the per-destination chunk limit below.
+    const auto configuredWindowBytes = positiveEnvironmentOverride(
+        "GLUTEN_UCX_HASH_PARTITION_WINDOW_BYTES");
+    const auto sourceWindowBytes = configuredWindowBytes > 0
+        ? static_cast<uint64_t>(configuredWindowBytes)
+        : targetBytesPerChunk_;
     activeRowsPerWindow_ = rowsPerUcxChunk(
         tableRows,
         activeSourceFlatBytes_,
         static_cast<int64_t>(std::min<uint64_t>(
             configuredRows,
             static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))),
-        targetBytesPerChunk_);
+        sourceWindowBytes);
   } else if (numPartitions_ == 1) {
     // SINGLE/gather exchanges yield after each output-sized chunk as well.
     activeRowsPerWindow_ = rowsPerUcxChunk(
@@ -473,105 +482,118 @@ void UcxPartitionedOutput::advanceActiveFlush() {
       const auto sourceBytes = averageRowBytes * rows;
       const auto scratchBytes = rows * uint64_t{12} +
           static_cast<uint64_t>(numPartitions_) * uint64_t{4096};
-      const auto workingBytes =
-          std::max(sourceBytes + scratchBytes, sourceBytes * uint64_t{2});
+      // activeTableView() already owns the source and headroom excludes that
+      // live allocation. Admission reserves only the new partitioned output,
+      // hash scratch, and allocator headroom.
+      const auto workingBytes = sourceBytes + scratchBytes;
       return workingBytes + workingBytes / uint64_t{4};
     };
-    const auto fallbackRows = maxOutputBufferSize_ == 0
-        ? candidateRows
-        : std::max<uint64_t>(
-              1,
-              std::min(candidateRows, maxOutputBufferSize_ / averageRowBytes));
-    const auto headroom = cudf_velox::captureDeviceAllocationHeadroom();
-    const auto allocatableBytes = headroom.allocatableBytes();
-    const auto reserveBytes = headroom.totalBytes == 0
-        ? uint64_t{1} << 30
-        : std::max<uint64_t>(
-              uint64_t{1} << 30,
-              static_cast<uint64_t>(headroom.totalBytes) / uint64_t{50});
-    const auto admissionCapacity = allocatableBytes > reserveBytes
-        ? allocatableBytes - reserveBytes
-        : allocatableBytes / uint64_t{2};
-    const auto alreadyReserved =
-        cudf_velox::deviceMemoryAdmissionReservedBytes(headroom.device);
-    const auto availableCapacity = admissionCapacity > alreadyReserved
-        ? admissionCapacity - alreadyReserved
-        : uint64_t{0};
     const auto candidatePeakBytes = estimatePeakBytes(candidateRows);
-
-    uint64_t selectedRows = candidateRows;
-    if (!headroom.cudaValid || candidatePeakBytes > availableCapacity) {
-      const auto pressureRows = candidatePeakBytes == 0
+    // The unadmitted fallback below already proves that at most 1 GiB of new
+    // hash workspace is safe. Avoid a global CUDA/RMM headroom snapshot for
+    // windows inside that bound; sampling every normal batch serializes the
+    // producer pipeline and caused a measurable exchange regression.
+    if (candidatePeakBytes <= kMaxUnadmittedHashPartitionPeakBytes) {
+      VLOG(2) << "UcxPartitionedOutput bounded hash fast path task="
+              << taskId() << " sourceRows=" << tableRows
+              << " sourceFlatBytes=" << activeSourceFlatBytes_
+              << " selectedRows=" << candidateRows
+              << " estimatedPeakBytes=" << candidatePeakBytes;
+    } else {
+      const auto fallbackRows = maxOutputBufferSize_ == 0
           ? candidateRows
           : std::max<uint64_t>(
                 1,
-                static_cast<uint64_t>(
-                    static_cast<long double>(candidateRows) *
-                    static_cast<long double>(availableCapacity) /
-                    static_cast<long double>(candidatePeakBytes)));
-      // The 1GiB queue-derived bound is no longer the normal workspace cap.
-      // It is retained as the proven emergency floor when a snapshot is
-      // unavailable or severely pressured; Q10 passed 10/10 at this size.
-      selectedRows =
-          std::min(candidateRows, std::max(fallbackRows, pressureRows));
-    }
+                std::min(candidateRows, maxOutputBufferSize_ / averageRowBytes));
+      const auto headroom = cudf_velox::captureDeviceAllocationHeadroom();
+      const auto allocatableBytes = headroom.allocatableBytes();
+      const auto reserveBytes = headroom.totalBytes == 0
+          ? uint64_t{1} << 30
+          : std::max<uint64_t>(
+                uint64_t{1} << 30,
+                static_cast<uint64_t>(headroom.totalBytes) / uint64_t{50});
+      const auto admissionCapacity = allocatableBytes > reserveBytes
+          ? allocatableBytes - reserveBytes
+          : allocatableBytes / uint64_t{2};
+      const auto alreadyReserved =
+          cudf_velox::deviceMemoryAdmissionReservedBytes(headroom.device);
+      const auto availableCapacity = admissionCapacity > alreadyReserved
+          ? admissionCapacity - alreadyReserved
+          : uint64_t{0};
+      uint64_t selectedRows = candidateRows;
+      if (!headroom.cudaValid || candidatePeakBytes > availableCapacity) {
+        const auto pressureRows = candidatePeakBytes == 0
+            ? candidateRows
+            : std::max<uint64_t>(
+                  1,
+                  static_cast<uint64_t>(
+                      static_cast<long double>(candidateRows) *
+                      static_cast<long double>(availableCapacity) /
+                      static_cast<long double>(candidatePeakBytes)));
+        // The 1GiB queue-derived bound is no longer the normal workspace cap.
+        // It is retained as the proven emergency floor when a snapshot is
+        // unavailable or severely pressured; Q10 passed 10/10 at this size.
+        selectedRows =
+            std::min(candidateRows, std::max(fallbackRows, pressureRows));
+      }
 
-    auto selectedPeakBytes = estimatePeakBytes(selectedRows);
-    memoryAdmission = cudf_velox::tryAcquireDeviceMemoryAdmission(
-        headroom.device, selectedPeakBytes, admissionCapacity);
-    bool admissionRetried = false;
-    if (!memoryAdmission && fallbackRows < selectedRows) {
-      // The initial size used a non-atomic reservation snapshot. Another
-      // driver may have acquired capacity before this atomic attempt, so
-      // shrink to the proven queue-sized fallback and retry the reservation.
-      selectedRows = fallbackRows;
-      selectedPeakBytes = estimatePeakBytes(selectedRows);
+      auto selectedPeakBytes = estimatePeakBytes(selectedRows);
       memoryAdmission = cudf_velox::tryAcquireDeviceMemoryAdmission(
           headroom.device, selectedPeakBytes, admissionCapacity);
-      admissionRetried = true;
-    }
-    if (!memoryAdmission &&
-        selectedPeakBytes > kMaxUnadmittedHashPartitionPeakBytes) {
-      // Admission can still be unavailable when every byte is temporarily
-      // reserved, or when CUDA headroom could not be sampled. A driver must
-      // not then execute the original large window unaccounted. Find the
-      // largest row count whose estimated peak is at most the explicit 1 GiB
-      // fallback bound, and give that smaller window one final admission try.
-      uint64_t lower = 1;
-      uint64_t upper = selectedRows;
-      if (estimatePeakBytes(lower) <= kMaxUnadmittedHashPartitionPeakBytes) {
-        while (lower < upper) {
-          const auto middle = lower + (upper - lower + 1) / 2;
-          if (estimatePeakBytes(middle) <=
-              kMaxUnadmittedHashPartitionPeakBytes) {
-            lower = middle;
-          } else {
-            upper = middle - 1;
+      bool admissionRetried = false;
+      if (!memoryAdmission && fallbackRows < selectedRows) {
+        // The initial size used a non-atomic reservation snapshot. Another
+        // driver may have acquired capacity before this atomic attempt, so
+        // shrink to the proven queue-sized fallback and retry the reservation.
+        selectedRows = fallbackRows;
+        selectedPeakBytes = estimatePeakBytes(selectedRows);
+        memoryAdmission = cudf_velox::tryAcquireDeviceMemoryAdmission(
+            headroom.device, selectedPeakBytes, admissionCapacity);
+        admissionRetried = true;
+      }
+      if (!memoryAdmission &&
+          selectedPeakBytes > kMaxUnadmittedHashPartitionPeakBytes) {
+        // Admission can still be unavailable when every byte is temporarily
+        // reserved, or when CUDA headroom could not be sampled. A driver must
+        // not then execute the original large window unaccounted. Find the
+        // largest row count whose estimated peak is at most the explicit 1 GiB
+        // fallback bound, and give that smaller window one final admission try.
+        uint64_t lower = 1;
+        uint64_t upper = selectedRows;
+        if (estimatePeakBytes(lower) <= kMaxUnadmittedHashPartitionPeakBytes) {
+          while (lower < upper) {
+            const auto middle = lower + (upper - lower + 1) / 2;
+            if (estimatePeakBytes(middle) <=
+                kMaxUnadmittedHashPartitionPeakBytes) {
+              lower = middle;
+            } else {
+              upper = middle - 1;
+            }
           }
         }
+        selectedRows = lower;
+        selectedPeakBytes = estimatePeakBytes(selectedRows);
+        memoryAdmission = cudf_velox::tryAcquireDeviceMemoryAdmission(
+            headroom.device, selectedPeakBytes, admissionCapacity);
+        admissionRetried = true;
       }
-      selectedRows = lower;
-      selectedPeakBytes = estimatePeakBytes(selectedRows);
-      memoryAdmission = cudf_velox::tryAcquireDeviceMemoryAdmission(
-          headroom.device, selectedPeakBytes, admissionCapacity);
-      admissionRetried = true;
+      const bool unadmittedFallback = !memoryAdmission;
+      rowsThisWindow = static_cast<cudf::size_type>(selectedRows);
+      VLOG(2) << "UcxPartitionedOutput pressure-aware hash window task="
+              << taskId() << " sourceRows=" << tableRows
+              << " sourceFlatBytes=" << activeSourceFlatBytes_
+              << " averageRowBytes=" << averageRowBytes
+              << " candidateRows=" << candidateRows
+              << " selectedRows=" << selectedRows
+              << " estimatedPeakBytes=" << selectedPeakBytes
+              << " cudaFreeBytes=" << headroom.freeBytes
+              << " poolReusableBytes=" << headroom.reusablePoolBytes()
+              << " admissionCapacityBytes=" << admissionCapacity
+              << " alreadyReservedBytes=" << alreadyReserved
+              << " admissionRetried=" << admissionRetried
+              << " admitted=" << memoryAdmission.has_value()
+              << " unadmittedFallback=" << unadmittedFallback;
     }
-    const bool unadmittedFallback = !memoryAdmission;
-    rowsThisWindow = static_cast<cudf::size_type>(selectedRows);
-    VLOG(2) << "UcxPartitionedOutput pressure-aware hash window task="
-            << taskId() << " sourceRows=" << tableRows
-            << " sourceFlatBytes=" << activeSourceFlatBytes_
-            << " averageRowBytes=" << averageRowBytes
-            << " candidateRows=" << candidateRows
-            << " selectedRows=" << selectedRows
-            << " estimatedPeakBytes=" << selectedPeakBytes
-            << " cudaFreeBytes=" << headroom.freeBytes
-            << " poolReusableBytes=" << headroom.reusablePoolBytes()
-            << " admissionCapacityBytes=" << admissionCapacity
-            << " alreadyReservedBytes=" << alreadyReserved
-            << " admissionRetried=" << admissionRetried
-            << " admitted=" << memoryAdmission.has_value()
-            << " unadmittedFallback=" << unadmittedFallback;
   }
 
   const auto end = activeNextRow_ + rowsThisWindow;
