@@ -52,6 +52,27 @@ constexpr int64_t kDefaultMaxRowsPerHashPartitionCall = 128'000'000;
 // hash-partition peak so concurrent unadmitted fallbacks remain bounded.
 constexpr uint64_t kMaxUnadmittedHashPartitionPeakBytes = uint64_t{1} << 30;
 
+bool containsStructColumn(const cudf::column_view& column) {
+  if (column.type().id() == cudf::type_id::STRUCT) {
+    return true;
+  }
+  for (cudf::size_type child = 0; child < column.num_children(); ++child) {
+    if (containsStructColumn(column.child(child))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool containsStructColumn(const cudf::table_view& table) {
+  for (cudf::size_type column = 0; column < table.num_columns(); ++column) {
+    if (containsStructColumn(table.column(column))) {
+      return true;
+    }
+  }
+  return false;
+}
+
 int64_t targetRowsPerUcxChunk(const core::QueryConfig& queryConfig) {
   if (const char* value =
           std::getenv("GLUTEN_UCX_PARTITIONED_OUTPUT_BATCH_ROWS")) {
@@ -666,15 +687,25 @@ void UcxPartitionedOutput::advanceActiveFlush() {
   auto slices = cudf::slice(tableView, {activeNextRow_, end}, stream);
   VELOX_CHECK_EQ(slices.size(), 1);
 
+  auto partitionInput = slices[0];
+  std::unique_ptr<cudf::table> materializedPartitionInput;
+  if (numPartitions_ > 1 && containsStructColumn(partitionInput)) {
+    // libcudf partition requires STRUCT children to align with their sliced
+    // parent. Materialize this bounded window to normalize nested offsets.
+    materializedPartitionInput = std::make_unique<cudf::table>(
+        partitionInput, stream, cudf::get_current_device_resource_ref());
+    partitionInput = materializedPartitionInput->view();
+  }
+
   if (numPartitions_ > 1) {
     if (!rangeBoundsJson_.empty()) {
-      rangePartition(slices[0], stream);
+      rangePartition(partitionInput, stream);
     } else if (partitionKeyIndices_.size() > 0 || spec_ == "gather") {
       // hashPartition() may internally split this residency window into safe
       // libcudf call-size chunks, but it cannot cross into the next window.
-      hashPartition(slices[0], stream);
+      hashPartition(partitionInput, stream);
     } else {
-      equalPartition(slices[0], stream);
+      equalPartition(partitionInput, stream);
     }
   } else {
     auto packedCols =
