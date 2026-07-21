@@ -234,6 +234,14 @@ class CudfWindow : public CudfOperatorBase {
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr) const;
 
+  // Compute a RESPECT NULLS first/first_value whose frame starts at the first
+  // row of its partition. This path supports ordering by multiple columns.
+  std::unique_ptr<cudf::column> computePartitionFirstColumn(
+      const cudf::table_view& sortedInput,
+      const core::WindowNode::Function& func,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const;
+
   // Compute first_value or last_value via cudf rolling window APIs.
   std::unique_ptr<cudf::column> computeNthValueColumn(
       const cudf::table_view& partKeys,

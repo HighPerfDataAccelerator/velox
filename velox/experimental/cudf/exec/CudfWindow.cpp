@@ -402,6 +402,27 @@ bool isStreamingRangeSumWindow(const core::WindowNode& windowNode) {
              functions.begin(), functions.end(), isStreamingRangeSumFunction);
 }
 
+bool isPartitionFirstFunction(const core::WindowNode::Function& function) {
+  const auto& prefix = CudfConfig::getInstance().functionNamePrefix;
+  const auto baseName =
+      stripFunctionPrefix(function.functionCall->name(), prefix);
+  return (baseName == "first" || baseName == "first_value") &&
+      function.functionCall->inputs().size() == 1 && !function.ignoreNulls &&
+      function.frame.type == core::WindowNode::WindowType::kRange &&
+      function.frame.startType ==
+      core::WindowNode::BoundType::kUnboundedPreceding &&
+      function.frame.endType == core::WindowNode::BoundType::kCurrentRow &&
+      function.frame.startValue == nullptr &&
+      function.frame.endValue == nullptr;
+}
+
+bool isPartitionFirstWindow(const core::WindowNode& windowNode) {
+  const auto& functions = windowNode.windowFunctions();
+  return !windowNode.partitionKeys().empty() &&
+      !windowNode.sortingKeys().empty() && !functions.empty() &&
+      std::all_of(functions.begin(), functions.end(), isPartitionFirstFunction);
+}
+
 std::unique_ptr<cudf::column> makeConstantOnesColumn(
     cudf::size_type numRows,
     rmm::cuda_stream_view stream,
@@ -613,6 +634,7 @@ bool CudfWindow::isSupportedWindowFunction(
       "row_number",
       "rank",
       "dense_rank",
+      "first",
       "first_value",
       "last_value",
       "sum",
@@ -665,7 +687,8 @@ bool CudfWindow::canRunOnGPU(
   const bool fullPartitionCountStreaming =
       isStreamingFullPartitionCountWindow(windowNode);
   if (windowNode.sortingKeys().size() > 1 &&
-      !isStreamingRankWindow(windowNode)) {
+      !isStreamingRankWindow(windowNode) &&
+      !isPartitionFirstWindow(windowNode)) {
     const auto hasUnsupportedRank = std::any_of(
         windowNode.windowFunctions().begin(),
         windowNode.windowFunctions().end(),
@@ -715,6 +738,20 @@ bool CudfWindow::canRunOnGPU(
       if (reason) {
         *reason = fmt::format(
             "Unsupported window function: {}", func.functionCall->name());
+      }
+      return false;
+    }
+
+    // Spark serializes its FIRST window aggregate as "first". Only admit the
+    // semantics implemented by computePartitionFirstColumn: RESPECT NULLS and
+    // RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW.
+    if (baseName == "first" &&
+        (!isPartitionFirstFunction(func) ||
+         windowNode.partitionKeys().empty() ||
+         windowNode.sortingKeys().empty())) {
+      if (reason) {
+        *reason =
+            "first is only supported for an ordered partition-first RANGE frame";
       }
       return false;
     }
@@ -837,7 +874,7 @@ bool CudfWindow::canRunOnGPU(
       return false;
     }
 
-    const bool usesFrame = baseName == "first_value" ||
+    const bool usesFrame = baseName == "first" || baseName == "first_value" ||
         baseName == "last_value" || baseName == "sum" || baseName == "min" ||
         baseName == "max" || baseName == "count" || baseName == "avg";
 
@@ -2431,6 +2468,81 @@ std::unique_ptr<cudf::column> CudfWindow::computeNthValueColumn(
       partKeys, inputCol, func, std::move(agg), isFullPartition, stream, mr);
 }
 
+std::unique_ptr<cudf::column> CudfWindow::computePartitionFirstColumn(
+    const cudf::table_view& sortedInput,
+    const core::WindowNode::Function& func,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) const {
+  VELOX_CHECK(!partitionKeyIndices_.empty());
+  VELOX_CHECK(!sortKeyIndices_.empty());
+  VELOX_CHECK(isPartitionFirstFunction(func));
+
+  const auto valueChannel = resolveInputChannel(func, inputRowType_);
+  VELOX_CHECK(
+      valueChannel.has_value() && *valueChannel != kConstantChannel,
+      "Window first input must be a column");
+
+  auto partitionColumns = selectColumns(sortedInput, partitionKeyIndices_);
+  cudf::groupby::groupby grouper(
+      cudf::table_view(partitionColumns),
+      cudf::null_policy::INCLUDE,
+      cudf::sorted::YES,
+      std::vector<cudf::order>(
+          partitionKeyIndices_.size(), cudf::order::ASCENDING),
+      std::vector<cudf::null_order>(
+          partitionKeyIndices_.size(), cudf::null_order::BEFORE));
+
+  std::vector<cudf::groupby::aggregation_request> requests(1);
+  requests[0].values = sortedInput.column(*valueChannel);
+  requests[0].aggregations.push_back(
+      cudf::make_nth_element_aggregation<cudf::groupby_aggregation>(
+          0, cudf::null_policy::INCLUDE));
+
+  auto [groupKeys, results] = grouper.aggregate(requests, stream, mr);
+  VELOX_CHECK_EQ(results.size(), 1);
+  VELOX_CHECK_EQ(results[0].results.size(), 1);
+  auto firstByGroup = std::move(results[0].results[0]);
+
+  cudf::hash_join lookup(
+      groupKeys->view(),
+      cudf::nullable_join::YES,
+      cudf::null_equality::EQUAL,
+      0.5,
+      stream);
+  auto [leftJoinIndices, rightJoinIndices] = lookup.left_join(
+      cudf::table_view(partitionColumns),
+      static_cast<std::size_t>(sortedInput.num_rows()),
+      stream,
+      mr);
+  auto leftIndicesCol = cudf::column_view{
+      cudf::device_span<cudf::size_type const>{*leftJoinIndices}};
+  auto rightIndicesCol = cudf::column_view{
+      cudf::device_span<cudf::size_type const>{*rightJoinIndices}};
+
+  auto gatheredFirstValues = cudf::gather(
+      cudf::table_view{{firstByGroup->view()}},
+      rightIndicesCol,
+      cudf::out_of_bounds_policy::NULLIFY,
+      stream,
+      mr);
+  auto gatheredColumns = gatheredFirstValues->release();
+  VELOX_CHECK_EQ(gatheredColumns.size(), 1);
+
+  auto target = cudf::allocate_like(
+      gatheredColumns[0]->view(),
+      sortedInput.num_rows(),
+      cudf::mask_allocation_policy::RETAIN,
+      stream,
+      mr);
+  auto scattered = cudf::scatter(
+      cudf::table_view{{gatheredColumns[0]->view()}},
+      leftIndicesCol,
+      cudf::table_view{{target->view()}},
+      stream,
+      mr);
+  return std::move(scattered->release()[0]);
+}
+
 std::unique_ptr<cudf::column> CudfWindow::computeAggregateColumn(
     const cudf::table_view& partKeys,
     cudf::column_view inputCol,
@@ -2667,13 +2779,21 @@ RowVectorPtr CudfWindow::computeOutput() {
       auto inputCol = sortedView.column(*inputColIdx);
       windowResultCols[funcIndex] =
           computeLeadLagColumn(partKeys, inputCol, func, baseName, stream_, mr);
-    } else if (baseName == "first_value" || baseName == "last_value") {
+    } else if (
+        baseName == "first" || baseName == "first_value" ||
+        baseName == "last_value") {
       auto inputColIdx = resolveInputChannel(func, inputRowType_);
       VELOX_CHECK(
           inputColIdx.has_value(),
           "Window function {} requires an input column",
           baseName);
       auto inputCol = sortedView.column(*inputColIdx);
+      if (isPartitionFirstFunction(func) &&
+          (baseName == "first" || sortKeyIndices_.size() > 1)) {
+        windowResultCols[funcIndex] =
+            computePartitionFirstColumn(sortedView, func, stream_, mr);
+        continue;
+      }
       const bool isFullPartition =
           isFullPartitionFrame(func, !sortKeyIndices_.empty());
       if (auto rangeTypes = toBatchRangeWindowTypes(func, isFullPartition)) {
