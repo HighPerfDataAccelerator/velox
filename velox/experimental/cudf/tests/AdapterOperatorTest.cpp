@@ -20,6 +20,7 @@
 #include "velox/experimental/cudf/tests/CudfFunctionBaseTest.h"
 
 #include "velox/exec/PlanNodeStats.h"
+#include "velox/exec/WindowFunction.h"
 #include "velox/exec/tests/utils/AssertQueryBuilder.h"
 #include "velox/exec/tests/utils/OperatorTestBase.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
@@ -396,6 +397,37 @@ TEST_F(AdapterOperatorTest, orderedFirstValueUsesCudfWindow) {
                   .assertResults(
                       "SELECT k, v, o0, o1, first_value(v) over (partition by "
                       "k order by o0 desc nulls last, o1 desc nulls last) "
+                      "FROM tmp");
+
+  EXPECT_TRUE(wasCudfWindowUsed(task));
+}
+
+TEST_F(AdapterOperatorTest, orderedSparkFirstUsesCudfWindow) {
+  // Spark's Substrait conversion emits the aggregate-window alias "first".
+  // Reuse first_value's CPU registration so PlanBuilder can construct the
+  // same WindowNode shape that the Spark integration sends to the adapter.
+  exec::windowFunctions()["first"] = exec::windowFunctions().at("first_value");
+
+  auto data = makeRowVector(
+      {"k", "v", "o0", "o1"},
+      {makeFlatVector<int64_t>({1, 1, 1, 2, 2, 2}),
+       makeNullableFlatVector<int64_t>({10, 20, 40, 7, std::nullopt, 9}),
+       makeNullableFlatVector<int64_t>({5, 7, 9, 1, 3, 2}),
+       makeNullableFlatVector<int64_t>({100, 50, 10, 1, 1, 1})});
+  createDuckDbTable({data});
+
+  auto plan = PlanBuilder()
+                  .values({data})
+                  .window({"first(v) over (partition by k order by o0 desc "
+                           "nulls last, o1 desc nulls last) as first_v"})
+                  .planNode();
+
+  auto task = AssertQueryBuilder(duckDbQueryRunner_)
+                  .config("cudf.enabled", true)
+                  .plan(plan)
+                  .assertResults(
+                      "SELECT k, v, o0, o1, first(v) over (partition by k "
+                      "order by o0 desc nulls last, o1 desc nulls last) "
                       "FROM tmp");
 
   EXPECT_TRUE(wasCudfWindowUsed(task));
