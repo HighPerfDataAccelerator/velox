@@ -30,6 +30,7 @@
 #include "velox/exec/PlanNodeStats.h"
 #include "velox/exec/tests/utils/AssertQueryBuilder.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
+#include "velox/experimental/cudf/connectors/hive/CudfSplitReaderHelpers.h"
 #include "velox/type/Timestamp.h"
 #include "velox/type/TimestampConversion.h"
 
@@ -543,6 +544,17 @@ TEST_F(CudfIcebergReadTest, coalescedMultipleFiles) {
                   .planNode();
 
   assertQuery(plan, splits, "SELECT * FROM tmp", 0);
+}
+
+TEST_F(CudfIcebergReadTest, multiFileChunkReadLimit) {
+  using connector::hive::kDefaultMultiFileChunkReadLimit;
+  using connector::hive::multiFileChunkReadLimit;
+
+  EXPECT_EQ(
+      multiFileChunkReadLimit(0, 8UL << 20),
+      kDefaultMultiFileChunkReadLimit);
+  EXPECT_EQ(multiFileChunkReadLimit(0, 512UL << 20), 512UL << 20);
+  EXPECT_EQ(multiFileChunkReadLimit(64UL << 20, 8UL << 20), 64UL << 20);
 }
 
 /// Read multiple byte-range splits from the same data file.

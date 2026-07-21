@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/connectors/hive/CudfSplitReader.h"
 #include "velox/experimental/cudf/connectors/hive/CudfSplitReaderHelpers.h"
@@ -45,6 +46,24 @@
 #include <memory>
 
 namespace facebook::velox::cudf_velox::connector::hive {
+
+namespace {
+
+std::size_t multiFileChunkReadLimit(
+    std::size_t configuredLimit,
+    const config::ConfigBase* session) {
+  const auto batchTarget = session->get<uint64_t>(
+      CudfConfig::kCudfBatchSizeMinThresholdBytes,
+      CudfConfig::getInstance().batchSizeMinThresholdBytes);
+  // The compute batch threshold is commonly 8 MiB. Reusing it directly for
+  // scans turns a split containing thousands of small files into hundreds of
+  // tiny decode calls. Keep the safety bound, but do not shrink the reader
+  // below its 256 MiB multi-file default.
+  return facebook::velox::cudf_velox::connector::hive::
+      multiFileChunkReadLimit(configuredLimit, batchTarget);
+}
+
+} // namespace
 
 using namespace facebook::velox::connector;
 using namespace facebook::velox::connector::hive;
@@ -409,10 +428,20 @@ void CudfSplitReader::createCudfReader() {
 
   auto sources = makeDataSourceViews();
 
+  auto chunkReadLimit = cudfHiveConfig_->maxChunkReadLimitSession(
+      connectorQueryCtx_->sessionProperties());
+  if (!split_->coalescedFiles.empty()) {
+    // An unbounded reader is safe for one physical file, but a coalesced split
+    // can contain many files. Decoding all of them into one table bypasses the
+    // downstream byte thresholds and makes a single scan batch consume most
+    // of the GPU before aggregation can apply backpressure.
+    chunkReadLimit = multiFileChunkReadLimit(
+        chunkReadLimit, connectorQueryCtx_->sessionProperties());
+  }
+
   // Create a parquet reader
   splitReader_ = std::make_unique<cudf::io::chunked_parquet_reader>(
-      cudfHiveConfig_->maxChunkReadLimitSession(
-          connectorQueryCtx_->sessionProperties()),
+      chunkReadLimit,
       cudfHiveConfig_->maxPassReadLimitSession(
           connectorQueryCtx_->sessionProperties()),
       std::move(sources),
