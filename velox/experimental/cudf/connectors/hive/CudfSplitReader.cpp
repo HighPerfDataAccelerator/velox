@@ -59,8 +59,8 @@ std::size_t multiFileChunkReadLimit(
   // scans turns a split containing thousands of small files into hundreds of
   // tiny decode calls. Keep the safety bound, but do not shrink the reader
   // below its 256 MiB multi-file default.
-  return facebook::velox::cudf_velox::connector::hive::
-      multiFileChunkReadLimit(configuredLimit, batchTarget);
+  return facebook::velox::cudf_velox::connector::hive::multiFileChunkReadLimit(
+      configuredLimit, batchTarget);
 }
 
 } // namespace
@@ -260,7 +260,6 @@ void CudfSplitReader::setupCudfDataSource() {
 
 std::shared_ptr<cudf::io::datasource> CudfSplitReader::createCudfDataSource(
     const std::string& filePath) {
-
   const auto useBufferedInput = cudfHiveConfig_->useBufferedInputSession(
       connectorQueryCtx_->sessionProperties());
 
@@ -275,8 +274,7 @@ std::shared_ptr<cudf::io::datasource> CudfSplitReader::createCudfDataSource(
 
   // Use KvikIO data source if we don't want to use the BufferedInput source
   if (not useBufferedInput) {
-    VLOG(1) << fmt::format(
-        "Using KvikIO data source for file: {}", filePath);
+    VLOG(1) << fmt::format("Using KvikIO data source for file: {}", filePath);
     return std::move(
         cudf::io::make_datasources(cudf::io::source_info{filePath}).front());
   }

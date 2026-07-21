@@ -384,8 +384,7 @@ std::unordered_map<std::string, RuntimeMetric>
 CudfHiveDataSource::getRuntimeStats() {
   auto result = runtimeStats_.toRuntimeMetricMap();
   if (numFilesCoalesced_ > 0) {
-    result.emplace(
-        "numFilesCoalesced", RuntimeMetric(numFilesCoalesced_));
+    result.emplace("numFilesCoalesced", RuntimeMetric(numFilesCoalesced_));
   }
   result.insert({
       {std::string(connector::hive::HiveDataSource::kTotalScanTime),

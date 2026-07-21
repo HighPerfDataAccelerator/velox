@@ -369,8 +369,8 @@ void UcxPartitionedOutput::preparePendingFlush() {
     // A hash window is distributed across all destinations, so callers with
     // sufficient receive credit may explicitly use a larger source window
     // without increasing the per-destination chunk limit below.
-    const auto configuredWindowBytes = positiveEnvironmentOverride(
-        "GLUTEN_UCX_HASH_PARTITION_WINDOW_BYTES");
+    const auto configuredWindowBytes =
+        positiveEnvironmentOverride("GLUTEN_UCX_HASH_PARTITION_WINDOW_BYTES");
     const auto sourceWindowBytes = configuredWindowBytes > 0
         ? static_cast<uint64_t>(configuredWindowBytes)
         : targetBytesPerChunk_;
@@ -494,8 +494,8 @@ void UcxPartitionedOutput::advanceActiveFlush() {
     // windows inside that bound; sampling every normal batch serializes the
     // producer pipeline and caused a measurable exchange regression.
     if (candidatePeakBytes <= kMaxUnadmittedHashPartitionPeakBytes) {
-      VLOG(2) << "UcxPartitionedOutput bounded hash fast path task="
-              << taskId() << " sourceRows=" << tableRows
+      VLOG(2) << "UcxPartitionedOutput bounded hash fast path task=" << taskId()
+              << " sourceRows=" << tableRows
               << " sourceFlatBytes=" << activeSourceFlatBytes_
               << " selectedRows=" << candidateRows
               << " estimatedPeakBytes=" << candidatePeakBytes;
@@ -504,7 +504,8 @@ void UcxPartitionedOutput::advanceActiveFlush() {
           ? candidateRows
           : std::max<uint64_t>(
                 1,
-                std::min(candidateRows, maxOutputBufferSize_ / averageRowBytes));
+                std::min(
+                    candidateRows, maxOutputBufferSize_ / averageRowBytes));
       const auto headroom = cudf_velox::captureDeviceAllocationHeadroom();
       const auto allocatableBytes = headroom.allocatableBytes();
       const auto reserveBytes = headroom.totalBytes == 0

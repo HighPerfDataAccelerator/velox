@@ -18,6 +18,7 @@
 /// Deletion vector and equality delete tests live in their own files
 /// (CudfDeletionVectorReaderTest.cpp and CudfEqualityDeleteFileReaderTest.cpp).
 
+#include "velox/experimental/cudf/connectors/hive/CudfSplitReaderHelpers.h"
 #include "velox/experimental/cudf/tests/iceberg/CudfIcebergTestBase.h"
 
 #include "velox/common/base/tests/GTestUtils.h"
@@ -30,7 +31,6 @@
 #include "velox/exec/PlanNodeStats.h"
 #include "velox/exec/tests/utils/AssertQueryBuilder.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
-#include "velox/experimental/cudf/connectors/hive/CudfSplitReaderHelpers.h"
 #include "velox/type/Timestamp.h"
 #include "velox/type/TimestampConversion.h"
 
@@ -551,8 +551,7 @@ TEST_F(CudfIcebergReadTest, multiFileChunkReadLimit) {
   using connector::hive::multiFileChunkReadLimit;
 
   EXPECT_EQ(
-      multiFileChunkReadLimit(0, 8UL << 20),
-      kDefaultMultiFileChunkReadLimit);
+      multiFileChunkReadLimit(0, 8UL << 20), kDefaultMultiFileChunkReadLimit);
   EXPECT_EQ(multiFileChunkReadLimit(0, 512UL << 20), 512UL << 20);
   EXPECT_EQ(multiFileChunkReadLimit(64UL << 20, 8UL << 20), 64UL << 20);
 }

@@ -432,8 +432,7 @@ void LocalWriteFile::append(std::unique_ptr<folly::IOBuf> data) {
   uint64_t totalBytesWritten{0};
   for (auto rangeIter = data->begin(); rangeIter != data->end(); ++rangeIter) {
     const auto bytesToWrite = rangeIter->size();
-    const auto bytesWritten =
-        writeFully(fd_, rangeIter->data(), bytesToWrite);
+    const auto bytesWritten = writeFully(fd_, rangeIter->data(), bytesToWrite);
     totalBytesWritten += bytesWritten;
   }
   const auto totalBytesToWrite = data->computeChainDataLength();
