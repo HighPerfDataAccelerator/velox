@@ -703,8 +703,7 @@ bool isNonNullEmptyArrayConstantLiteral(
 
 bool hasUnsupportedComplexConstantLiteral(
     const std::shared_ptr<velox::exec::Expr>& expr) {
-  const bool isRowConstructor =
-      expr->name() == "row_constructor" ||
+  const bool isRowConstructor = expr->name() == "row_constructor" ||
       expr->name() == "row_constructor_with_null" ||
       expr->name() == "row_constructor_with_all_null";
   for (const auto& input : expr->inputs()) {
@@ -3933,12 +3932,13 @@ class RowConstructorFunction : public CudfFunction {
         // Velox UNKNOWN is the logical type of an untyped NULL literal and
         // has no cuDF physical type. Keep the logical UNKNOWN in the row
         // schema and use an all-null byte column as its inert physical child.
-        children.push_back(cudf::make_fixed_width_column(
-            cudf::data_type{cudf::type_id::INT8},
-            outputSize,
-            cudf::mask_state::ALL_NULL,
-            stream,
-            mr));
+        children.push_back(
+            cudf::make_fixed_width_column(
+                cudf::data_type{cudf::type_id::INT8},
+                outputSize,
+                cudf::mask_state::ALL_NULL,
+                stream,
+                mr));
       } else {
         VELOX_CHECK_LT(nextInputColumnIndex, inputColumns.size());
         children.push_back(

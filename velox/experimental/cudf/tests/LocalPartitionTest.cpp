@@ -166,8 +166,7 @@ TEST_F(LocalPartitionTest, rangePartition) {
   auto data = makeRowVector({makeNullableFlatVector<int32_t>(
       {std::nullopt, -5, 0, 1, 9, 10, 11, 20, 21})});
   auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
-  auto source =
-      PlanBuilder(planNodeIdGenerator).values({data}).planNode();
+  auto source = PlanBuilder(planNodeIdGenerator).values({data}).planNode();
   constexpr auto kBounds = R"json({
     "version": 1,
     "keys": [{"sparkType":"int","ascending":true,"nullsFirst":true}],

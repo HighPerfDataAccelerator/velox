@@ -32,8 +32,9 @@
 #include "velox/type/Type.h"
 #include "velox/vector/BaseVector.h"
 
-#include <folly/ScopeGuard.h>
 #include <cudf/column/column_factories.hpp>
+
+#include <folly/ScopeGuard.h>
 #include <gtest/gtest.h>
 
 #include <string>
@@ -191,8 +192,8 @@ TEST_F(
   ASSERT_TRUE(canBeEvaluatedByCudf(untypedNullRow, /*deep=*/true));
 
   auto cudfExpr = createCudfExpression(untypedNullRow, rowType_);
-  auto input = cudf::make_fixed_width_column(
-      cudf::data_type{cudf::type_id::INT64}, 3);
+  auto input =
+      cudf::make_fixed_width_column(cudf::data_type{cudf::type_id::INT64}, 3);
   auto result = cudfExpr->eval(
       {input->view()},
       cudf::get_default_stream(),

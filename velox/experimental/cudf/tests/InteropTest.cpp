@@ -14,8 +14,8 @@
  * limitations under the License.
  */
 
-#include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
+#include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 
 #include "velox/vector/tests/utils/VectorTestBase.h"
 
@@ -229,9 +229,8 @@ TEST_F(InteropTest, emptyDouble) {
 TEST_F(InteropTest, emptyStructWithUntypedNullField) {
   auto stream = cudf::get_default_stream();
   auto mr = cudf::get_current_device_resource_ref();
-  auto type = ROW(
-      {"payload"},
-      {ROW({"value", "missing"}, {BIGINT(), UNKNOWN()})});
+  auto type =
+      ROW({"payload"}, {ROW({"value", "missing"}, {BIGINT(), UNKNOWN()})});
   std::vector<CudfVectorPtr> inputs;
 
   auto table = getConcatenatedTable(std::move(inputs), type, stream, mr);
@@ -255,9 +254,8 @@ TEST_F(InteropTest, restoresNestedUntypedNullAfterCudfRoundTrip) {
           {makeFlatVector<int64_t>({11, 22, 33}),
            makeNullableFlatVector<int8_t>(
                {std::nullopt, std::nullopt, std::nullopt})})});
-  auto logicalType = ROW(
-      {"payload"},
-      {ROW({"value", "missing"}, {BIGINT(), UNKNOWN()})});
+  auto logicalType =
+      ROW({"payload"}, {ROW({"value", "missing"}, {BIGINT(), UNKNOWN()})});
 
   auto table = cudf_velox::with_arrow::toCudfTable(
       physicalInput, pool_.get(), stream, mr);
@@ -280,8 +278,7 @@ TEST_F(InteropTest, restoresNestedUntypedNullAfterCudfRoundTrip) {
 TEST_F(InteropTest, transportsNestedUntypedNullThroughCudfGather) {
   auto stream = cudf::get_default_stream();
   auto mr = cudf::get_current_device_resource_ref();
-  auto payloadType =
-      ROW({"value", "missing"}, {BIGINT(), UNKNOWN()});
+  auto payloadType = ROW({"value", "missing"}, {BIGINT(), UNKNOWN()});
   auto payload = std::make_shared<RowVector>(
       pool_.get(),
       payloadType,
@@ -292,8 +289,8 @@ TEST_F(InteropTest, transportsNestedUntypedNullThroughCudfGather) {
           BaseVector::createNullConstant(UNKNOWN(), 3, pool_.get())});
   auto input = makeRowVector({"payload"}, {payload});
 
-  auto table = cudf_velox::with_arrow::toCudfTable(
-      input, pool_.get(), stream, mr);
+  auto table =
+      cudf_velox::with_arrow::toCudfTable(input, pool_.get(), stream, mr);
   const auto payloadView = table->view().column(0);
   ASSERT_EQ(payloadView.type().id(), cudf::type_id::STRUCT);
   ASSERT_EQ(payloadView.num_children(), 2);
@@ -326,9 +323,8 @@ TEST_F(InteropTest, restoresTypedNullAfterUntypedTransport) {
           {makeFlatVector<int64_t>({11, 22, 33}),
            makeNullableFlatVector<int8_t>(
                {std::nullopt, std::nullopt, std::nullopt})})});
-  auto logicalType = ROW(
-      {"payload"},
-      {ROW({"value", "missing"}, {BIGINT(), VARCHAR()})});
+  auto logicalType =
+      ROW({"payload"}, {ROW({"value", "missing"}, {BIGINT(), VARCHAR()})});
 
   auto table = cudf_velox::with_arrow::toCudfTable(
       physicalInput, pool_.get(), stream, mr);
