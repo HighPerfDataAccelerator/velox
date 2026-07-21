@@ -194,6 +194,9 @@ void CudfIcebergSplitReader::prepareSplit(
 
   // Create the cuDF reader
   if (useExperimentalCudfReader()) {
+    VELOX_CHECK(
+        split_->coalescedFiles.empty(),
+        "Iceberg multi-file scan is not supported by the experimental cuDF reader");
     createExperimentalReader();
   } else {
     createCudfReader();
@@ -617,12 +620,20 @@ void CudfIcebergSplitReader::cacheSchemaFromMetadata() {
 
   VELOX_CHECK_EQ(
       fileMetaData_.size(),
-      1,
-      "Expected a single parquet footer for Iceberg data file");
+      1 + split_->coalescedFiles.size(),
+      "Expected one parquet footer per Iceberg data file");
   const auto& meta = fileMetaData_.front();
   VELOX_CHECK(not meta.schema.empty(), "Parquet footer schema is empty");
   VELOX_CHECK_GE(meta.num_rows, 0, "Parquet footer reports negative row count");
-  fileRowCount_ = static_cast<std::size_t>(meta.num_rows);
+  fileRowCount_ = 0;
+  for (const auto& fileMeta : fileMetaData_) {
+    VELOX_CHECK_GE(
+        fileMeta.num_rows, 0, "Parquet footer reports negative row count");
+    VELOX_CHECK(
+        fileMeta.schema == meta.schema,
+        "Iceberg multi-file scan requires identical physical Parquet schemas");
+    fileRowCount_ += static_cast<std::size_t>(fileMeta.num_rows);
+  }
 
   const auto& root = meta.schema.front();
   fileColumnNames_.clear();
