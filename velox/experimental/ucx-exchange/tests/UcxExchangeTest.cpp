@@ -40,6 +40,7 @@
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/ucx-exchange/Communicator.h"
+#include "velox/experimental/ucx-exchange/RangePartitionFunction.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeProtocol.h"
 #include "velox/experimental/ucx-exchange/UcxOutputQueueManager.h"
 #include "velox/experimental/ucx-exchange/tests/SinkDriverMock.h"
@@ -1563,6 +1564,83 @@ TEST_P(UcxExchangeTest, batchAccumulationTest) {
         sinkDriver->numChunksReceived(), static_cast<uint64_t>(numChunks));
     queueManager_->removeTask(srcTaskId);
   }
+}
+
+TEST_P(UcxExchangeTest, rangePartitionSupportsSlicedStructs) {
+  const auto p = GetParam();
+  if (p.numSrcDrivers != 1 || p.numDstDrivers != 1 || p.numPartitions != 1 ||
+      p.numChunks != 100 || p.numUpstreamTasks != 1 ||
+      p.tableType != TableType::NARROW) {
+    GTEST_SKIP() << "rangePartitionSupportsSlicedStructs: runs only once";
+  }
+
+  auto& config = cudf_velox::CudfConfig::getInstance();
+  const bool originalIntraNode = config.intraNodeExchange;
+  config.intraNodeExchange = true;
+  SCOPE_EXIT {
+    config.intraNodeExchange = originalIntraNode;
+  };
+
+  constexpr int kRows = 20'000;
+  constexpr int kWindowRows = 10'000;
+  constexpr int kNumPartitions = 2;
+  const std::string taskPrefix = getUniqueTaskPrefix();
+  const std::string sourceTaskId = taskPrefix + "sourceTask0";
+
+  auto data = std::make_shared<WideComplexTestTable>();
+  data->initialize(kRows);
+  auto rowType = data->getRowType();
+  auto rangeSpec = std::make_shared<RangePartitionFunctionSpec>(
+      rowType,
+      std::vector<column_index_t>{2},
+      R"({"version":1,"keys":[{"ascending":true,"nullsFirst":true}],"bounds":[[{"isNull":false,"value":0}]]})");
+  std::unordered_map<std::string, std::string> extraConfig{
+      {core::QueryConfig::kUcxPartitionedOutputBatchRows,
+       std::to_string(kWindowRows)}};
+  auto sourceTask = createPartitionedOutputTask(
+      sourceTaskId,
+      pool_,
+      rowType,
+      kNumPartitions,
+      {"int32_col"},
+      FOUR_GBYTES,
+      extraConfig,
+      rangeSpec);
+  queueManager_->initializeTask(
+      sourceTask,
+      core::PartitionedOutputNode::Kind::kPartitioned,
+      kNumPartitions,
+      1);
+
+  auto source =
+      std::make_shared<SourceDriverMock>(sourceTask, 1, 1, kRows, data);
+  std::vector<std::shared_ptr<SinkDriverMock>> sinks;
+  for (int partition = 0; partition < kNumPartitions; ++partition) {
+    core::PlanNodeId exchangeNodeId;
+    auto sinkTask = createExchangeTask(
+        taskPrefix + "sinkTask" + std::to_string(partition),
+        rowType,
+        partition,
+        exchangeNodeId);
+    auto sink = std::make_shared<SinkDriverMock>(sinkTask, 1, nullptr);
+    std::vector<exec::Split> splits{remoteSplit(sourceTaskId, partition)};
+    sink->addSplits(splits);
+    sinks.push_back(std::move(sink));
+  }
+
+  for (auto& sink : sinks) {
+    sink->run();
+  }
+  source->run();
+  source->joinThreads();
+  uint64_t totalRows = 0;
+  for (auto& sink : sinks) {
+    sink->joinThreads();
+    totalRows += sink->numRows();
+  }
+
+  EXPECT_EQ(totalRows, kRows);
+  queueManager_->removeTask(sourceTaskId);
 }
 
 // Regression test for resumable hash output. With no consumer, each producer

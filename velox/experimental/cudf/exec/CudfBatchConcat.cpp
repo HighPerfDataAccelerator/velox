@@ -122,6 +122,25 @@ CudfBatchConcat::CudfBatchConcat(
     std::shared_ptr<const core::PlanNode> planNode,
     RowTypePtr outputType,
     int32_t targetRows)
+    : CudfBatchConcat(
+          operatorId,
+          driverCtx,
+          std::move(planNode),
+          std::move(outputType),
+          targetRows,
+          concatThreshold(
+              driverCtx,
+              CudfConfig::kCudfBatchSizeMinThresholdBytes,
+              "GLUTEN_CUDF_BATCH_SIZE_MIN_THRESHOLD_BYTES",
+              CudfConfig::getInstance().batchSizeMinThresholdBytes)) {}
+
+CudfBatchConcat::CudfBatchConcat(
+    int32_t operatorId,
+    exec::DriverCtx* driverCtx,
+    std::shared_ptr<const core::PlanNode> planNode,
+    RowTypePtr outputType,
+    int32_t targetRows,
+    uint64_t targetBytes)
     : CudfOperatorBase(
           operatorId,
           driverCtx,
@@ -135,11 +154,7 @@ CudfBatchConcat::CudfBatchConcat(
       driverCtx_(driverCtx),
       aggregationStep_(getAggregationStep(planNode)),
       targetRows_(checkedConcatTargetRows(targetRows)),
-      targetBytes_(concatThreshold(
-          driverCtx,
-          CudfConfig::kCudfBatchSizeMinThresholdBytes,
-          "GLUTEN_CUDF_BATCH_SIZE_MIN_THRESHOLD_BYTES",
-          CudfConfig::getInstance().batchSizeMinThresholdBytes)) {
+      targetBytes_(targetBytes) {
   if (logConcatConfig()) {
     LOG(WARNING) << "CudfBatchConcat configured targetRows=" << targetRows_
                  << ", targetBytes=" << targetBytes_;

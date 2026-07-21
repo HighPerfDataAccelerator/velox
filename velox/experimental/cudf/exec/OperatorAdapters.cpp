@@ -1333,7 +1333,11 @@ class ExchangeAdapter : public OperatorAdapter {
               ctx,
               planNode,
               planNode->outputType(),
-              CudfConfig::getInstance().exchangeBatchSizeMinThreshold));
+              CudfConfig::getInstance().exchangeBatchSizeMinThreshold,
+              ctx->queryConfig().get<uint64_t>(
+                  CudfConfig::kCudfExchangeBatchSizeMinThresholdBytes,
+                  CudfConfig::getInstance()
+                      .exchangeBatchSizeMinThresholdBytes)));
     }
     return result;
   }

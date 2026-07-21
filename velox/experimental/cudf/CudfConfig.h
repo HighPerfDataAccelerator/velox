@@ -47,6 +47,8 @@ struct CudfConfig {
       "cudf.batch_size_min_threshold"};
   static constexpr const char* kCudfExchangeBatchSizeMinThreshold{
       "cudf.exchange_batch_size_min_threshold"};
+  static constexpr const char* kCudfExchangeBatchSizeMinThresholdBytes{
+      "cudf.exchange_batch_size_min_threshold_bytes"};
   static constexpr const char* kCudfBatchSizeMinThresholdBytes{
       "cudf.batch_size_min_threshold_bytes"};
   static constexpr const char* kCudfBatchSizeMaxThreshold{
@@ -186,6 +188,10 @@ struct CudfConfig {
   /// this below the aggregation target because a fragment can buffer several
   /// inbound exchanges concurrently while its join builds are still live.
   int32_t exchangeBatchSizeMinThreshold{32000000};
+
+  /// Target bytes to accumulate immediately after a UCX Exchange. Zero
+  /// disables the exchange-specific byte threshold.
+  uint64_t exchangeBatchSizeMinThresholdBytes{0};
 
   /// Target bytes to accumulate before GPU-side concatenation. Zero disables
   /// the byte threshold. When both row and byte thresholds are configured,

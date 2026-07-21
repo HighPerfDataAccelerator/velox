@@ -25,6 +25,7 @@
 #include <cudf/groupby.hpp>
 #include <cudf/io/parquet.hpp>
 #include <cudf/rolling.hpp>
+#include <cudf/scalar/scalar.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
 
@@ -85,8 +86,17 @@ class CudfWindow : public CudfOperatorBase {
       const std::string& baseName,
       size_t numArgs);
 
+  static void testingSetStreamingMemoryLimits(
+      uint64_t activeRowsBytes,
+      uint64_t replayChunkBytes);
+  static void testingResetStreamingMemoryLimits();
+  static uint64_t testingStreamingSpillWrites();
+  static uint64_t testingStreamingSpillCleanups();
+
   bool needsInput() const override {
-    return !noMoreInput_ && pendingOutput_ == nullptr;
+    return !noMoreInput_ && pendingOutput_ == nullptr &&
+        (!boundedStreaming_ ||
+         (deferredInput_ == nullptr && streamingReplay_ == nullptr));
   }
 
   exec::BlockingReason isBlocked(ContinueFuture* /*future*/) override {
@@ -105,6 +115,14 @@ class CudfWindow : public CudfOperatorBase {
   void doClose() override;
 
  private:
+  struct StreamingReplay {
+    std::vector<std::string> paths;
+    size_t nextPath{0};
+    std::unique_ptr<cudf::io::chunked_parquet_reader> reader;
+    std::unique_ptr<cudf::table> memoryRows;
+    std::vector<std::unique_ptr<cudf::scalar>> results;
+  };
+
   struct SortedRun {
     std::string path;
     std::unique_ptr<cudf::io::chunked_parquet_reader> reader;
@@ -119,6 +137,52 @@ class CudfWindow : public CudfOperatorBase {
   RowVectorPtr computeNextSortedOutput();
   RowVectorPtr computeOutput();
   void cleanupSpillFiles() noexcept;
+
+  std::unique_ptr<cudf::table> computeFullPartitionCountOutput(
+      std::unique_ptr<cudf::table> input,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const;
+
+  std::unique_ptr<cudf::table> computeRangeRunningSumOutput(
+      std::unique_ptr<cudf::table> input,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr);
+
+  std::unique_ptr<cudf::column> computeRunningPartitionSumColumn(
+      const cudf::table_view& sortedInput,
+      const core::WindowNode::Function& function,
+      const TypePtr& expectedType,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const;
+
+  std::unique_ptr<cudf::column> makeRangePeerOrdinalColumn(
+      const cudf::table_view& sortedInput,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const;
+
+  std::vector<cudf::size_type> streamingGroupIndices() const;
+  std::vector<cudf::order> streamingGroupOrders() const;
+  std::vector<cudf::null_order> streamingGroupNullOrders() const;
+  cudf::size_type trailingGroupStart(
+      cudf::table_view input,
+      const std::vector<cudf::size_type>& indices,
+      const std::vector<cudf::order>& orders,
+      const std::vector<cudf::null_order>& nullOrders,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const;
+  void advanceBoundedStreaming();
+  void processDeferredStreamingInput();
+  void startActiveGroup(std::unique_ptr<cudf::table> rows);
+  void appendActiveGroup(std::unique_ptr<cudf::table> rows);
+  void updateActiveRangeSums(cudf::table_view rows);
+  void finalizeActiveGroup();
+  void prepareNextStreamingReplayOutput();
+  void spillActiveRows();
+  uint64_t measureTableBytes(std::unique_ptr<cudf::table>& table);
+  void setPendingOutput(std::unique_ptr<cudf::table> output);
+  std::unique_ptr<cudf::table> appendConstantResults(
+      std::unique_ptr<cudf::table> rows,
+      const std::vector<std::unique_ptr<cudf::scalar>>& results);
 
   std::unique_ptr<cudf::column> computeStreamingRowNumberColumn(
       const cudf::table_view& sortedInput,
@@ -213,6 +277,9 @@ class CudfWindow : public CudfOperatorBase {
   std::shared_ptr<const core::WindowNode> windowNode_;
   const RowTypePtr inputRowType_;
   const bool rankLikeStreaming_;
+  const bool fullPartitionCountStreaming_;
+  const bool rangeSumStreaming_;
+  const bool boundedStreaming_;
   const rmm::cuda_stream_view stateStream_;
 
   std::vector<cudf::size_type> partitionKeyIndices_;
@@ -222,6 +289,8 @@ class CudfWindow : public CudfOperatorBase {
 
   std::vector<CudfVectorPtr> inputBatches_;
   RowVectorPtr pendingOutput_;
+  const uint64_t activeRowsLimit_;
+  const uint64_t replayChunkLimit_;
   const uint64_t sortedRunBytes_;
   uint64_t bufferedBytes_{0};
   std::vector<SortedRun> sortedRuns_;
@@ -232,12 +301,28 @@ class CudfWindow : public CudfOperatorBase {
   bool readersInitialized_{false};
   bool mergeFinished_{false};
   bool spilled_{false};
+  bool streamingSpilled_{false};
 
   // Sorted and concatenated input data, prepared in doNoMoreInput().
   std::unique_ptr<cudf::table> sortedData_;
   cudf::size_type logicalRowCount_{0};
   rmm::cuda_stream_view stream_{};
   bool streamAcquired_{false};
+
+  std::unique_ptr<cudf::table> deferredInput_;
+  std::unique_ptr<cudf::table> activeRows_;
+  uint64_t activeRowsBytes_{0};
+  std::vector<std::string> activeSpillPaths_;
+  std::unique_ptr<cudf::table> activeKey_;
+  int64_t activeRowCount_{0};
+  std::vector<std::unique_ptr<cudf::scalar>> activeSums_;
+  std::vector<int64_t> activeValidCounts_;
+
+  std::unique_ptr<cudf::table> cumulativePartitionKey_;
+  std::vector<std::unique_ptr<cudf::scalar>> cumulativeSums_;
+  std::vector<int64_t> cumulativeValidCounts_;
+
+  std::unique_ptr<StreamingReplay> streamingReplay_;
 
   bool hasRankLikeState_{false};
   std::unique_ptr<cudf::table> previousPartitionKey_;

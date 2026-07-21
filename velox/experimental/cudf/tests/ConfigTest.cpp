@@ -28,6 +28,7 @@ TEST(ConfigTest, CudfConfig) {
   EXPECT_TRUE(defaults.exchangeConcatOptimizationEnabled);
   EXPECT_EQ(defaults.batchSizeMinThreshold, 100000);
   EXPECT_EQ(defaults.exchangeBatchSizeMinThreshold, 32000000);
+  EXPECT_EQ(defaults.exchangeBatchSizeMinThresholdBytes, 0);
 
   std::unordered_map<std::string, std::string> options = {
       {CudfConfig::kCudfEnabled, "false"},
@@ -41,6 +42,7 @@ TEST(ConfigTest, CudfConfig) {
       {CudfConfig::kCudfOrderByOutputChunkBytes, "134217728"},
       {CudfConfig::kCudfOrderByMaxOutputRows, "1048576"},
       {CudfConfig::kCudfExchangeConcatOptimizationEnabled, "false"},
+      {CudfConfig::kCudfExchangeBatchSizeMinThresholdBytes, "8388608"},
       {CudfConfig::kCudfOrderByMergeFanIn, "7"},
       {CudfConfig::kCudfWindowSortedRunBytes, "134217728"}};
 
@@ -52,6 +54,7 @@ TEST(ConfigTest, CudfConfig) {
   ASSERT_EQ(config.memoryPercent, 25);
   ASSERT_EQ(config.functionNamePrefix, "presto");
   ASSERT_EQ(config.exchangeConcatOptimizationEnabled, false);
+  ASSERT_EQ(config.exchangeBatchSizeMinThresholdBytes, 8388608);
   ASSERT_EQ(config.allowCpuFallback, false);
   ASSERT_EQ(config.groupbyStreamingMaxDistinctKeys, 16777216);
   ASSERT_EQ(config.orderBySortedRunBytes, 67108864);
