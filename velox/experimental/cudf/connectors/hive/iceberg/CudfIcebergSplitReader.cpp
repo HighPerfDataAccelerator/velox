@@ -163,21 +163,23 @@ void CudfIcebergSplitReader::prepareSplit(
     if (!schemasMatch) {
       VLOG(1) << "Falling back to single-file cuDF readers for an Iceberg "
                  "multi-file split with schema evolution";
-      fallbackSplits_.push_back(std::make_shared<CudfHiveConnectorSplit>(
-          split_->connectorId,
-          split_->filePath,
-          split_->start,
-          split_->length,
-          split_->splitWeight,
-          split_->infoColumns));
+      fallbackSplits_.push_back(
+          std::make_shared<CudfHiveConnectorSplit>(
+              split_->connectorId,
+              split_->filePath,
+              split_->start,
+              split_->length,
+              split_->splitWeight,
+              split_->infoColumns));
       for (const auto& file : split_->coalescedFiles) {
-        fallbackSplits_.push_back(std::make_shared<CudfHiveConnectorSplit>(
-            split_->connectorId,
-            file.filePath,
-            0,
-            file.length,
-            split_->splitWeight,
-            split_->infoColumns));
+        fallbackSplits_.push_back(
+            std::make_shared<CudfHiveConnectorSplit>(
+                split_->connectorId,
+                file.filePath,
+                0,
+                file.length,
+                split_->splitWeight,
+                split_->infoColumns));
       }
       split_ = fallbackSplits_.front();
       fallbackSplits_.pop_front();

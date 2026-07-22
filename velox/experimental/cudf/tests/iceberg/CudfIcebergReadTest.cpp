@@ -549,12 +549,10 @@ TEST_F(CudfIcebergReadTest, coalescedMultipleFiles) {
 /// Fall back to per-file readers when a coalesced split contains physical
 /// schemas from different Iceberg schema versions.
 TEST_F(CudfIcebergReadTest, coalescedSchemaEvolution) {
-  auto oldData = makeRowVector(
-      {"c0"}, {makeFlatVector<int64_t>({1, 2})});
+  auto oldData = makeRowVector({"c0"}, {makeFlatVector<int64_t>({1, 2})});
   auto newData = makeRowVector(
       {"c0", "c1"},
-      {makeFlatVector<int64_t>({3, 4}),
-       makeFlatVector<int64_t>({30, 40})});
+      {makeFlatVector<int64_t>({3, 4}), makeFlatVector<int64_t>({30, 40})});
 
   auto oldFile = TempFilePath::create();
   auto newFile = TempFilePath::create();
