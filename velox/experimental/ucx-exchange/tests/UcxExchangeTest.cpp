@@ -1734,24 +1734,54 @@ TEST_P(UcxExchangeTest, hashWindowBackpressureIsResumable) {
       srcTask, kNumDrivers, 1, kRowsPerDriver, tableGenerator);
   sourceDriver->run();
 
-  // Do not start a consumer yet. Once the first adaptive window reaches the
-  // byte cap, SourceDriverMock must be waiting on the shared queue future.
-  bool sawFirstWindow = false;
+  // Do not start a consumer yet. With nothing draining the shared queue, the
+  // producers fill it until every driver is backpressured, after which
+  // totalRowsSent freezes. The exact frozen value is timing dependent: the
+  // producer drivers run concurrently, so they may settle anywhere between the
+  // ideal lock-step bound (each driver stops right after its first window,
+  // kNumDrivers * kWindowRows) and the widest race, where one driver drains its
+  // whole source before another lands its first window. Either way each driver
+  // overshoots by at most one residency window, so the invariant under test is
+  // that the producers never drain every window from a single addInput() -- the
+  // property that keeps the bounded hash output resumable. Assert that band
+  // rather than a single exact count, which is inherently racy.
+  constexpr int64_t kMinBackpressuredRows =
+      static_cast<int64_t>(kNumDrivers) * kWindowRows;
+  constexpr int64_t kFullyDrainedRows =
+      static_cast<int64_t>(kNumDrivers) * kRowsPerDriver;
   std::optional<exec::OutputBuffer::Stats> blockedStats;
+  int64_t previousRows = 0;
+  bool havePrevious = false;
+  int stableReads = 0;
   for (int attempt = 0; attempt < 200; ++attempt) {
     blockedStats = queueManager_->stats(srcTaskId);
-    if (blockedStats &&
-        blockedStats->totalRowsSent == kNumDrivers * kWindowRows) {
-      sawFirstWindow = true;
-      break;
+    const int64_t rows =
+        blockedStats ? blockedStats->totalRowsSent : int64_t{0};
+    // Treat the queue as settled once totalRowsSent stops advancing while at
+    // least one residency window per driver has been admitted. Requiring the
+    // count to hold steady avoids latching onto a transient value while a
+    // regression that ignores backpressure is still draining toward the full
+    // source.
+    if (blockedStats && havePrevious && rows == previousRows &&
+        rows >= kMinBackpressuredRows) {
+      if (++stableReads >= 5) {
+        break;
+      }
+    } else {
+      stableReads = 0;
     }
+    previousRows = rows;
+    havePrevious = true;
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
   }
-  EXPECT_TRUE(sawFirstWindow);
-  if (blockedStats) {
-    EXPECT_EQ(blockedStats->totalRowsSent, kNumDrivers * kWindowRows)
-        << "producers crossed the one-window-per-driver backpressure bound";
-  }
+  ASSERT_TRUE(blockedStats.has_value());
+  // Backpressure must engage only after at least one residency window per
+  // driver is admitted (otherwise producers stalled below the window bound)...
+  EXPECT_GE(blockedStats->totalRowsSent, kMinBackpressuredRows);
+  // ...and must stop the producers before any single addInput() drains every
+  // remaining window from a driver.
+  EXPECT_LT(blockedStats->totalRowsSent, kFullyDrainedRows)
+      << "producers crossed the one-window-per-driver backpressure bound";
 
   std::vector<std::shared_ptr<SinkDriverMock>> sinkDrivers;
   for (int partition = 0; partition < kNumPartitions; ++partition) {
