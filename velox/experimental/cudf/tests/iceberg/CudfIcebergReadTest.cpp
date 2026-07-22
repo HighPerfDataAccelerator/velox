@@ -546,6 +546,56 @@ TEST_F(CudfIcebergReadTest, coalescedMultipleFiles) {
   assertQuery(plan, splits, "SELECT * FROM tmp", 0);
 }
 
+/// Fall back to per-file readers when a coalesced split contains physical
+/// schemas from different Iceberg schema versions.
+TEST_F(CudfIcebergReadTest, coalescedSchemaEvolution) {
+  auto oldData = makeRowVector(
+      {"c0"}, {makeFlatVector<int64_t>({1, 2})});
+  auto newData = makeRowVector(
+      {"c0", "c1"},
+      {makeFlatVector<int64_t>({3, 4}),
+       makeFlatVector<int64_t>({30, 40})});
+
+  auto oldFile = TempFilePath::create();
+  auto newFile = TempFilePath::create();
+  writeToFile(oldFile->getPath(), oldData);
+  writeToFile(newFile->getPath(), newData);
+
+  std::vector<std::shared_ptr<facebook::velox::connector::ConnectorSplit>>
+      splits{std::make_shared<HiveIcebergSplit>(
+          kCudfIcebergConnectorId,
+          oldFile->getPath(),
+          dwio::common::FileFormat::PARQUET,
+          0,
+          getFileSize(oldFile->getPath()),
+          std::unordered_map<std::string, std::optional<std::string>>{},
+          std::nullopt,
+          std::unordered_map<std::string, std::string>{},
+          nullptr,
+          /*cacheable=*/true,
+          std::vector<IcebergDeleteFile>{},
+          std::unordered_map<std::string, std::string>{},
+          std::nullopt,
+          /*dataSequenceNumber=*/0,
+          std::vector<IcebergCoalescedFile>{
+              {newFile->getPath(), getFileSize(newFile->getPath())}})};
+
+  auto outputType = ROW({"c0", "c1"}, {BIGINT(), BIGINT()});
+  auto plan = PlanBuilder()
+                  .startTableScan()
+                  .connectorId(kCudfIcebergConnectorId)
+                  .outputType(outputType)
+                  .dataColumns(outputType)
+                  .endTableScan()
+                  .planNode();
+  auto expected = makeRowVector(
+      {"c0", "c1"},
+      {makeFlatVector<int64_t>({1, 2, 3, 4}),
+       makeNullableFlatVector<int64_t>({std::nullopt, std::nullopt, 30, 40})});
+
+  AssertQueryBuilder(plan).splits(splits).assertResults({expected});
+}
+
 TEST_F(CudfIcebergReadTest, multiFileChunkReadLimit) {
   using connector::hive::kDefaultMultiFileChunkReadLimit;
   using connector::hive::multiFileChunkReadLimit;
