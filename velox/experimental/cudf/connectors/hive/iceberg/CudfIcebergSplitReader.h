@@ -202,6 +202,10 @@ class CudfIcebergSplitReader : public CudfSplitReader {
 
   // Whether every projected column is injected
   bool noColumnsToRead_{false};
+  // Injected-only byte-range splits still need one physical column so cuDF
+  // can select the row groups belonging to this split. The anchor column is
+  // removed before the injected output table is assembled.
+  bool hasRowCountAnchor_{false};
   bool syntheticTableProduced_{false};
 
   // Whether the subfield filter is deferred to post table read

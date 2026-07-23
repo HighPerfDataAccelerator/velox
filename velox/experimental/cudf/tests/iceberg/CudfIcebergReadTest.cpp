@@ -831,6 +831,13 @@ TEST_F(CudfIcebergReadTest, partitionOnlyProjection) {
       .splits(makeIcebergSplits(dataFile->getPath(), {}, partitionKeys))
       .assertResults({expected});
 
+  // Every byte-range split must synthesize only the rows from its own row
+  // groups. Using the whole-file footer count for each split would duplicate
+  // the injected partition value once per split.
+  AssertQueryBuilder(plan)
+      .splits(makeIcebergSplits(dataFile->getPath(), {}, partitionKeys, 4))
+      .assertResults({expected});
+
   // Filter `country = 'CA'` excludes the partition value 'US', so the output is
   // an empty table. Reader is bypassed due to no physical columns to read.
   auto filteredNoMatchPlan = PlanBuilder()

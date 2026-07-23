@@ -211,10 +211,17 @@ void CudfIcebergSplitReader::prepareCurrentSplit(
 
   // Determine if there are no columns to read.
   noColumnsToRead_ = readColumnNames_.empty();
-  VELOX_CHECK(
-      not noColumnsToRead_ or split_->start == 0,
-      "Iceberg byte-range splits with injected-only projections are not yet "
-      "supported");
+  if (noColumnsToRead_ and split_->start != 0) {
+    VELOX_CHECK(
+        icebergSplit_->deleteFiles.empty(),
+        "Iceberg byte-range splits with injected-only projections and delete "
+        "files are not yet supported");
+    VELOX_CHECK(
+        not fileColumnNames_.empty(),
+        "Cannot select a row-count anchor from an empty parquet schema");
+    readColumnNames_.push_back(*fileColumnNames_.begin());
+    hasRowCountAnchor_ = true;
+  }
 
   // Defer subfield filter when it cannot evaluate on the physical parquet
   // table, or when positional deletes are present.
@@ -232,8 +239,10 @@ void CudfIcebergSplitReader::prepareCurrentSplit(
     runtimeStats.processedSplits++;
   }
 
-  // No need to create a cuDF reader for injected-only projection.
-  if (noColumnsToRead_) {
+  // A whole-file injected-only projection can use the footer row count. A
+  // byte-range split uses an anchor column so cuDF selects only this split's
+  // row groups.
+  if (noColumnsToRead_ and not hasRowCountAnchor_) {
     return;
   }
 
@@ -272,6 +281,7 @@ void CudfIcebergSplitReader::resetSplit() {
   fileColumnNames_.clear();
   fileRowCount_ = 0;
   noColumnsToRead_ = false;
+  hasRowCountAnchor_ = false;
   syntheticTableProduced_ = false;
   deferSubfieldFilter_ = false;
   baseReadOffset_ = 0;
@@ -296,7 +306,7 @@ std::optional<std::unique_ptr<cudf::table>>
 CudfIcebergSplitReader::readNextChunk() {
   std::unique_ptr<cudf::table> cudfTable;
   while (!cudfTable) {
-    if (noColumnsToRead_) {
+    if (noColumnsToRead_ and not hasRowCountAnchor_) {
       if (!syntheticTableProduced_) {
         VELOX_CHECK_LE(
             fileRowCount_,
@@ -321,7 +331,7 @@ CudfIcebergSplitReader::readNextChunk() {
   }
 
   // Number of table rows before deletes.
-  const auto numRows = noColumnsToRead_
+  const auto numRows = noColumnsToRead_ and not hasRowCountAnchor_
       ? static_cast<cudf::size_type>(fileRowCount_)
       : cudfTable->num_rows();
 
@@ -383,6 +393,15 @@ CudfIcebergSplitReader::readNextChunk() {
       cudfTable = cudf::apply_deletion_mask(
           cudfTable->view(), deleteMaskView_, stream_, deleteMr);
     }
+  }
+
+  // The anchor exists only to make cuDF apply this split's byte range and
+  // determine its row count. It is not part of the requested projection.
+  if (hasRowCountAnchor_) {
+    auto columns = cudfTable->release();
+    VELOX_CHECK_EQ(columns.size(), 1, "Unexpected row-count anchor layout");
+    columns.clear();
+    cudfTable = std::make_unique<cudf::table>(std::move(columns));
   }
 
   // Compute the row count override if there are no remaining physical columns.
