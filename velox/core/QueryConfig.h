@@ -340,17 +340,63 @@ class QueryConfig {
       2UL << 20,
       "Minimum bytes to accumulate before unblocking an exchange consumer.")
 
-  /// Minimum number of rows to accumulate in CudfPartitionedOutput before
-  /// flushing. Small inputs are buffered and concatenated into a single merged
-  /// table when this threshold is reached, avoiding pathologically small
-  /// exchange chunks. Set to 0 to disable accumulation.
+  /// Target number of rows in a CudfPartitionedOutput exchange chunk. Small
+  /// inputs are accumulated to this threshold, while larger outputs are split
+  /// into bounded slices. Set to 0 to disable accumulation and slicing.
   VELOX_QUERY_CONFIG(
       kUcxPartitionedOutputBatchRows,
       ucxPartitionedOutputBatchRows,
       "cudf.partitioned_output_batch_rows",
       int64_t,
       10'000,
-      "Minimum rows to accumulate in CudfPartitionedOutput before flushing.")
+      "Target rows per CudfPartitionedOutput exchange chunk.")
+
+  /// Maximum input rows for one libcudf hash_partition call in UCX output.
+  /// Zero keeps the normal single-call path. This is query-scoped so a query
+  /// that needs the libcudf safety bound does not regress every other query.
+  VELOX_QUERY_CONFIG(
+      kUcxHashPartitionInputBatchRows,
+      ucxHashPartitionInputBatchRows,
+      "cudf.hash_partition_input_batch_rows",
+      int64_t,
+      0,
+      "Maximum input rows per UCX hash_partition call; 0 disables slicing.")
+
+  /// Maximum source rows whose safely sliced hash results are recombined at
+  /// once. Zero derives the window from cudf.partitioned_output_batch_rows.
+  VELOX_QUERY_CONFIG(
+      kUcxHashPartitionWindowRows,
+      ucxHashPartitionWindowRows,
+      "cudf.hash_partition_window_rows",
+      int64_t,
+      0,
+      "Maximum source rows per sliced UCX hash recombination window; 0 uses "
+      "the partitioned-output batch row setting.")
+
+  /// Query-boundary cudaMallocAsync trim policy. Values >= 0 trim unused pool
+  /// memory to the requested retained bytes; -1 explicitly disables trim for
+  /// this query; -2 preserves the executor-environment fallback. This allows
+  /// benchmark hot iterations to reuse the pool while retaining deterministic
+  /// release before a following high-peak query.
+  VELOX_QUERY_CONFIG(
+      kCudfAsyncQueryEndTrimBytes,
+      cudfAsyncQueryEndTrimBytes,
+      "cudf.async_query_end_trim_bytes",
+      int64_t,
+      -2,
+      "cudaMallocAsync bytes to retain at query end; -1 disables and -2 uses "
+      "the executor environment fallback.")
+
+  /// Target bytes to accumulate before flushing CudfPartitionedOutput and the
+  /// maximum approximate payload bytes per destination chunk. Set to 0 to
+  /// disable byte-based accumulation and chunking.
+  VELOX_QUERY_CONFIG(
+      kUcxPartitionedOutputBatchBytes,
+      ucxPartitionedOutputBatchBytes,
+      "cudf.partitioned_output_batch_bytes",
+      uint64_t,
+      0,
+      "Target bytes per CudfPartitionedOutput exchange chunk.")
 
   VELOX_QUERY_CONFIG(
       kMaxPartialAggregationMemory,
@@ -1473,6 +1519,74 @@ class QueryConfig {
       "Multiplier on the RPC congestion window's sqrt(window) additive-increase "
       "headroom. Default 1.0 (plain sqrt headroom); lower converges tighter. "
       "Clamped to >= 0 by the controller.")
+
+  /// Ceiling for the per-driver RPC congestion window.
+  VELOX_QUERY_CONFIG(
+      kRpcCongestionMaxWindow,
+      rpcCongestionMaxWindow,
+      "rpc.congestion.max_window",
+      int64_t,
+      0,
+      "Ceiling for the per-driver RPC congestion window (and, for PER_ROW, its "
+      "starting value). 0 (default) keeps the per-mode built-in ceiling "
+      "(PER_ROW 100, BATCH 256). Raise it so a high-latency backend can run at "
+      "high concurrency for throughput (Little's law) while the gradient / "
+      "adaptive limiter shrinks concurrency only under overload. With "
+      "admission-controlled dispatch this ceiling now actually bounds in-flight "
+      "rows, so it must be sized for the backend's healthy concurrency.")
+
+  /// Enables the adaptive per-tier RPC rate limiter (RPCRateLimiter).
+  VELOX_QUERY_CONFIG(
+      kRpcRateLimiterAdaptiveEnabled,
+      rpcRateLimiterAdaptiveEnabled,
+      "rpc.ratelimiter.adaptive_enabled",
+      bool,
+      true,
+      "When true (default), the process-global per-tier RPC rate limiter adapts "
+      "its max-pending cap via AIMD driven by the backend overload signal "
+      "(rate-limit/timeout): multiplicative-decrease on an overload-classified "
+      "drain, additive-increase on a clean drain. On by default because it is "
+      "the protective behavior for shared, rate-limited inference backends; set "
+      "false to keep a static cap. Unlike the per-driver congestion window, this "
+      "coordinates all drivers on the worker and reacts to the rate-limit signal "
+      "directly, not to RTT.")
+
+  /// Floor for the adaptive per-tier RPC rate limiter's max-pending cap.
+  VELOX_QUERY_CONFIG(
+      kRpcRateLimiterMinLimit,
+      rpcRateLimiterMinLimit,
+      "rpc.ratelimiter.min_limit",
+      int64_t,
+      50,
+      "Floor the adaptive RPC rate limiter's per-tier max-pending cap may "
+      "shrink to under sustained overload. Default 50 (a floor of 1 can stall a "
+      "workload under sustained throttling). Only used when "
+      "rpc.ratelimiter.adaptive_enabled is true.")
+
+  /// Multiplicative-decrease factor for the adaptive RPC rate limiter.
+  VELOX_QUERY_CONFIG(
+      kRpcRateLimiterDecreaseFactor,
+      rpcRateLimiterDecreaseFactor,
+      "rpc.ratelimiter.decrease_factor",
+      double,
+      0.5,
+      "Factor applied to the adaptive RPC rate limiter's per-tier max-pending "
+      "cap on each overload-classified drain. Default 0.5 (halve). Clamped to "
+      "(0, 1). Only used when rpc.ratelimiter.adaptive_enabled is true.")
+
+  /// Ceiling for the per-tier RPC rate-limiter max-pending cap.
+  VELOX_QUERY_CONFIG(
+      kRpcRateLimiterMaxLimit,
+      rpcRateLimiterMaxLimit,
+      "rpc.ratelimiter.max_limit",
+      int64_t,
+      200,
+      "Ceiling (and, with adaptive enabled, the starting value) for the "
+      "process-global per-tier RPC rate-limiter max-pending cap. Default 200 "
+      "(validated for LLM-inference backends); 0 falls back to the built-in 20. "
+      "With admission-controlled dispatch this cap actually bounds process-wide "
+      "in-flight rows per tier; the adaptive limiter shrinks from here toward "
+      "rpc.ratelimiter.min_limit under overload.")
 
   // --- Hand-written accessors for properties that need custom logic ---
 

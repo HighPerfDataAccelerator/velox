@@ -31,9 +31,21 @@
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/resource_ref.hpp>
 
+#include <algorithm>
 #include <vector>
 
 namespace facebook::velox::cudf_velox::connector::hive {
+
+constexpr std::size_t kDefaultMultiFileChunkReadLimit = 256UL << 20;
+
+inline std::size_t multiFileChunkReadLimit(
+    std::size_t configuredLimit,
+    std::size_t batchTarget) {
+  if (configuredLimit > 0) {
+    return configuredLimit;
+  }
+  return std::max(batchTarget, kDefaultMultiFileChunkReadLimit);
+}
 
 // ---------------- Internal helper ----------------
 // A cudf::io::datasource that serves bytes via Velox BufferedInput so that
@@ -94,27 +106,6 @@ struct HybridScanState {
   std::vector<cudf::device_span<const uint8_t>> columnChunkData_;
   std::unique_ptr<std::once_flag> isHybridScanSetup_;
 };
-
-/**
- * @brief Fetches a host buffer of Parquet footer bytes from the input data
- * source
- *
- * @param dataSource Input data source
- * @return Host buffer containing footer bytes
- */
-std::unique_ptr<cudf::io::datasource::buffer> fetchFooterBytes(
-    std::shared_ptr<cudf::io::datasource> dataSource);
-
-/**
- * @brief Fetches a host buffer of Parquet page index from the input data source
- *
- * @param dataSource Input datasource
- * @param pageIndexBytes Byte range of page index
- * @return Host buffer containing page index bytes
- */
-std::unique_ptr<cudf::io::datasource::buffer> fetchPageIndexBytes(
-    std::shared_ptr<cudf::io::datasource> dataSource,
-    const cudf::io::text::byte_range_info pageIndexBytes);
 
 /**
  * @brief Fetches a list of byte ranges from a host buffer into device buffers

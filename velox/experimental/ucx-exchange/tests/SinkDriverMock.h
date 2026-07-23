@@ -34,7 +34,7 @@ class SinkDriverMock {
   /// @brief Mocks the driver to execute a pipeline with a single exchange
   /// operator. One or more of these drivers may be used to driver multiple
   /// exchange operator instances in the same task. The driver will create the
-  /// exchange operator instance and drive it until is is finished or an error
+  /// exchange operator instance and drive it until is finished or an error
   /// occurs.
   /// @param task A pointer to the sink task.
   /// @param numDrivers The number of drivers used in running the exchange
@@ -86,7 +86,8 @@ class SinkDriverMock {
   /// @brief checks if the received table corresponds to that sent, sets
   /// dataValidFlag_=false if not
   /// @param tab
-  void updateDataValidity(const cudf::table_view& tab);
+  /// @param startRow the logical row offset in the received stream
+  void updateDataValidity(const cudf::table_view& tab, uint64_t startRow);
 
   std::atomic<bool> dataValidFlag_{true};
   std::shared_ptr<facebook::velox::exec::Task> task_;

@@ -13,6 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include "velox/experimental/ucx-exchange/UcxExchange.h"
 #include <cudf/column/column_factories.hpp>
 #include <cudf/contiguous_split.hpp>
 #include <cudf/copying.hpp>
@@ -22,6 +23,7 @@
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
 #include <folly/Executor.h>
+#include <folly/ScopeGuard.h>
 #include <folly/synchronization/EventCount.h>
 #include <gtest/gtest-param-test.h>
 #include <gtest/gtest.h>
@@ -29,13 +31,16 @@
 #include <chrono>
 #include <future>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <vector>
 #include "velox/common/memory/MemoryPool.h"
 #include "velox/core/QueryConfig.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
 #include "velox/experimental/cudf/CudfConfig.h"
+#include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/ucx-exchange/Communicator.h"
+#include "velox/experimental/ucx-exchange/RangePartitionFunction.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeProtocol.h"
 #include "velox/experimental/ucx-exchange/UcxOutputQueueManager.h"
 #include "velox/experimental/ucx-exchange/tests/SinkDriverMock.h"
@@ -58,6 +63,8 @@ struct ExchangeTestParams {
   int numRowsPerChunk;
   int numUpstreamTasks;
   TableType tableType = TableType::NARROW; // Default to narrow table
+
+  bool operator==(const ExchangeTestParams&) const = default;
 };
 
 // Helper function to generate test parameters with different numUpstreamTasks
@@ -86,7 +93,7 @@ static std::vector<ExchangeTestParams> generateTestParams() {
       {"MultiPartition", 1, 1, 4, 100, 1000, TableType::NARROW},
       // Test with multiple partitions and multiple drivers
       {"MultiPartitionDrivers", 4, 4, 4, 25, 1000, TableType::NARROW},
-      // Wide table tests with all data types including STRUCT
+      // Wide table tests with numeric types shared by Velox and cuDF.
       // Single partition wide table (no hash partitioning)
       {"WideTableSingle", 1, 1, 1, 100, 1000, TableType::WIDE},
       // Multi-partition wide table (uses hash partitioning)
@@ -177,9 +184,13 @@ class UcxExchangeTest : public testing::TestWithParam<ExchangeTestParams> {
 
   static void TearDownTestCase() {
     communicator_->stop();
-    communicator_.reset();
     communicatorThread_->join();
     communicatorThread_.reset();
+    Communicator::shutdown();
+    // The explicit finalizer is intentionally idempotent because Spark's
+    // plugin shutdown and JVM shutdown hook can both invoke native teardown.
+    Communicator::shutdown();
+    communicator_.reset();
   }
 
   void SetUp() override {
@@ -763,9 +774,12 @@ TEST_P(UcxExchangeTest, realPartitionedOutputDataIntegrityTest) {
 
     // Pass the partitioned reference data for this partition (may be nullptr
     // for wide multi-partition)
+    // Ordered row-wise validation requires a single consumer. Multi-consumer
+    // exchange parallelism is covered by the non-order-sensitive tests.
+    const auto sinkDriverCount = canVerifyDataIntegrity ? 1 : p.numDstDrivers;
     auto sinkDriver = std::make_shared<SinkDriverMock>(
         sinkTask,
-        p.numDstDrivers,
+        sinkDriverCount,
         canVerifyDataIntegrity ? partitionedDataToVerify[partitionId]
                                : nullptr);
 
@@ -792,6 +806,9 @@ TEST_P(UcxExchangeTest, realPartitionedOutputDataIntegrityTest) {
     sinkDriver->joinThreads();
   }
   VLOG(3) << "All sink tasks done.";
+
+  // Release the source task even if a following assertion fails.
+  queueManager_->removeTask(srcTaskId);
 
   // Verify total row count
   size_t expectedTotalRows = p.numChunks * p.numRowsPerChunk * numSrcDrivers;
@@ -820,10 +837,108 @@ TEST_P(UcxExchangeTest, realPartitionedOutputDataIntegrityTest) {
         << "Data integrity verification skipped for wide table with multi-partition";
   }
 
-  // Cleanup
-  queueManager_->removeTask(srcTaskId);
-
   VLOG(3) << "- UcxExchangeTest::realPartitionedOutputDataIntegrityTest";
+}
+
+// Focused regression test for shared UcxExchangeClient ownership. This
+// intentionally creates and seeds the client directly, bypassing the normal
+// task-split path, to isolate close behavior after the client is populated.
+// Closing one operator must not close the shared client while another operator
+// still needs to drain data.
+TEST_P(UcxExchangeTest, sharedClientSurvivesOneExchangeClose) {
+  // This test doesn't use parameters - run only for the first param set.
+  if (GetParam() != generateTestParams().front()) {
+    GTEST_SKIP() << "sharedClientSurvivesOneExchangeClose: runs only once";
+  }
+
+  // This test isolates ownership of a client shared by two operators. Avoid
+  // coupling that contract to loopback UCX TCP behavior by using the
+  // same-process transfer registry for the data path.
+  auto& config = cudf_velox::CudfConfig::getInstance();
+  const bool origIntraNode = config.intraNodeExchange;
+  config.intraNodeExchange = true;
+  SCOPE_EXIT {
+    config.intraNodeExchange = origIntraNode;
+  };
+
+  const std::string taskPrefix = getUniqueTaskPrefix();
+  const std::string srcTaskId = taskPrefix + "sharedClientSrc";
+  const std::string sinkTaskId = taskPrefix + "sharedClientSink";
+  const int numPartitions = 1;
+  const int partitionId = 0;
+  const int numSourceDrivers = 1;
+  const int numSinkDrivers = 2;
+  const int numChunks = 5;
+  const int numRowsPerChunk = 1000;
+
+  auto rowType = UcxTestData::kTestRowType;
+  auto srcTask = createSourceTask(srcTaskId, pool_, rowType);
+  queueManager_->initializeTask(
+      srcTask,
+      core::PartitionedOutputNode::Kind::kPartitioned,
+      numPartitions,
+      numSourceDrivers);
+
+  auto sourceMock = std::make_shared<UcxPartitionedOutputMock>(
+      srcTaskId, numSourceDrivers, numPartitions, numChunks, numRowsPerChunk);
+  sourceMock->run();
+  sourceMock->joinThreads();
+
+  core::PlanNodeId exchangeNodeId;
+  auto sinkTask =
+      createExchangeTask(sinkTaskId, rowType, partitionId, exchangeNodeId);
+  auto exchangeClient = std::make_shared<UcxExchangeClient>(
+      sinkTask->taskId(), sinkTask->destination(), numSinkDrivers);
+
+  auto split = remoteSplit(srcTaskId, partitionId);
+  auto remoteConnectorSplit =
+      std::dynamic_pointer_cast<exec::RemoteConnectorSplit>(
+          split.connectorSplit);
+  ASSERT_NE(remoteConnectorSplit, nullptr);
+  exchangeClient->addRemoteTaskId(remoteConnectorSplit->taskId);
+  exchangeClient->noMoreRemoteTasks();
+
+  const uint32_t pipelineId = 0;
+  const uint32_t partition = 0;
+  auto planNode = sinkTask->planFragment().planNode;
+  auto closingDriverCtx = std::make_shared<DriverCtx>(
+      sinkTask, 0, pipelineId, kUngroupedGroupId, partition);
+  auto drainingDriverCtx = std::make_shared<DriverCtx>(
+      sinkTask, 1, pipelineId, kUngroupedGroupId, partition);
+
+  UcxExchange closingExchange(
+      0, closingDriverCtx.get(), planNode, exchangeClient);
+  UcxExchange drainingExchange(
+      1, drainingDriverCtx.get(), planNode, exchangeClient);
+
+  closingExchange.close();
+
+  uint64_t rowsReceived = 0;
+  while (true) {
+    ContinueFuture future;
+    auto blocked = drainingExchange.isBlocked(&future);
+    if (blocked != BlockingReason::kNotBlocked) {
+      future.wait();
+      continue;
+    }
+
+    RowVectorPtr result = drainingExchange.getOutput();
+    if (result) {
+      auto cudfResult =
+          std::dynamic_pointer_cast<cudf_velox::CudfVector>(result);
+      ASSERT_NE(cudfResult, nullptr);
+      rowsReceived += cudfResult->getTableView().num_rows();
+    }
+
+    if (drainingExchange.isFinished()) {
+      break;
+    }
+  }
+  drainingExchange.close();
+
+  EXPECT_EQ(rowsReceived, static_cast<uint64_t>(numChunks) * numRowsPerChunk);
+
+  queueManager_->removeTask(srcTaskId);
 }
 
 // Test that verifies intra-node exchange does not livelock when a producing
@@ -1096,6 +1211,16 @@ TEST_P(UcxExchangeTest, batchAccumulationTest) {
     }
   }
 
+  // This test exercises accumulation and chunk-boundary semantics, not the
+  // UCX TCP transport. Use the same-process registry so loopback transport
+  // failures cannot mask row-count, integrity, or chunk-count regressions.
+  auto& config = cudf_velox::CudfConfig::getInstance();
+  const bool origIntraNode = config.intraNodeExchange;
+  config.intraNodeExchange = true;
+  SCOPE_EXIT {
+    config.intraNodeExchange = origIntraNode;
+  };
+
   const int kTargetRows = UcxPartitionedOutput::kDefaultTargetRowsPerChunk;
 
   // --- Scenario 1: Small chunks that SHOULD be accumulated ---
@@ -1242,10 +1367,11 @@ TEST_P(UcxExchangeTest, batchAccumulationTest) {
     queueManager_->removeTask(srcTaskId);
   }
 
-  // --- Scenario 3: Large chunks (>= threshold) should NOT be accumulated ---
+  // --- Scenario 3: Large chunks are flushed immediately and bounded ---
   // 5 chunks × 20,000 rows = 100,000 total rows.
   // Each chunk exceeds kTargetRowsPerChunk, so each addInput triggers an
-  // immediate flush via the single-input fast path. Expected: 5 output chunks.
+  // immediate flush. The outbound path still limits every output chunk to the
+  // target row count, so each input becomes two output chunks.
   {
     const int numChunks = 5;
     const int numRowsPerChunk = 20000;
@@ -1293,15 +1419,17 @@ TEST_P(UcxExchangeTest, batchAccumulationTest) {
     EXPECT_TRUE(sinkDriver->dataIsValid())
         << "Large-chunk scenario data must match reference";
 
+    const auto chunksPerInput =
+        (numRowsPerChunk + kTargetRows - 1) / kTargetRows;
+    const auto expectedOutputChunks = numChunks * chunksPerInput;
+
     VLOG(0) << "batchAccumulationTest scenario 3: sent " << numChunks
             << " chunks of " << numRowsPerChunk << " rows, received "
             << sinkDriver->numChunksReceived() << " chunks (expected "
-            << numChunks << ")";
+            << expectedOutputChunks << ")";
 
-    // Large chunks should pass through without accumulation — each addInput
-    // immediately flushes because pendingRows >= kTargetRowsPerChunk.
-    EXPECT_EQ(sinkDriver->numChunksReceived(), static_cast<uint64_t>(numChunks))
-        << "Large chunks should not be accumulated";
+    EXPECT_EQ(sinkDriver->numChunksReceived(), expectedOutputChunks)
+        << "Large inputs should be flushed immediately in bounded slices";
 
     queueManager_->removeTask(srcTaskId);
   }
@@ -1379,6 +1507,311 @@ TEST_P(UcxExchangeTest, batchAccumulationTest) {
 
     queueManager_->removeTask(srcTaskId);
   }
+
+  // --- Scenario 5: Byte-only threshold via QueryConfig ---
+  {
+    const int numChunks = 20;
+    // Use a one-row repeated pattern so validation remains independent of
+    // byte-based output slice boundaries.
+    const int numRowsPerChunk = 1;
+    const int numPartitions = 1;
+    const int numDrivers = 1;
+    const std::string taskPrefix = getUniqueTaskPrefix();
+    const std::string srcTaskId = taskPrefix + "sourceTask0";
+
+    auto dataToSend = std::make_shared<UcxTestData>();
+    dataToSend->initialize(numRowsPerChunk);
+
+    std::unordered_map<std::string, std::string> extraConfig{
+        {core::QueryConfig::kUcxPartitionedOutputBatchRows, "0"},
+        {core::QueryConfig::kUcxPartitionedOutputBatchBytes, "256"}};
+    auto srcTask = createPartitionedOutputTask(
+        srcTaskId,
+        pool_,
+        UcxTestData::kTestRowType,
+        numPartitions,
+        {},
+        FOUR_GBYTES,
+        extraConfig);
+    queueManager_->initializeTask(
+        srcTask,
+        core::PartitionedOutputNode::Kind::kPartitioned,
+        numPartitions,
+        numDrivers);
+
+    auto sourceDriver = std::make_shared<SourceDriverMock>(
+        srcTask, numDrivers, numChunks, numRowsPerChunk, dataToSend);
+    const std::string sinkTaskId = taskPrefix + "sinkTask0";
+    core::PlanNodeId exchangeNodeId;
+    auto sinkTask = createExchangeTask(
+        sinkTaskId, UcxTestData::kTestRowType, 0, exchangeNodeId);
+    auto sinkDriver =
+        std::make_shared<SinkDriverMock>(sinkTask, numDrivers, dataToSend);
+    std::vector<exec::Split> splits{remoteSplit(srcTaskId, 0)};
+    sinkDriver->addSplits(splits);
+
+    sourceDriver->run();
+    sinkDriver->run();
+    sourceDriver->joinThreads();
+    sinkDriver->joinThreads();
+
+    EXPECT_EQ(
+        sinkDriver->numRows(),
+        static_cast<size_t>(numChunks) * numRowsPerChunk);
+    EXPECT_TRUE(sinkDriver->dataIsValid());
+    EXPECT_GT(sinkDriver->numChunksReceived(), 1);
+    EXPECT_LT(
+        sinkDriver->numChunksReceived(), static_cast<uint64_t>(numChunks));
+    queueManager_->removeTask(srcTaskId);
+  }
+}
+
+TEST_P(UcxExchangeTest, rangePartitionSupportsSlicedStructs) {
+  const auto p = GetParam();
+  if (p.numSrcDrivers != 1 || p.numDstDrivers != 1 || p.numPartitions != 1 ||
+      p.numChunks != 100 || p.numUpstreamTasks != 1 ||
+      p.tableType != TableType::NARROW) {
+    GTEST_SKIP() << "rangePartitionSupportsSlicedStructs: runs only once";
+  }
+
+  auto& config = cudf_velox::CudfConfig::getInstance();
+  const bool originalIntraNode = config.intraNodeExchange;
+  config.intraNodeExchange = true;
+  SCOPE_EXIT {
+    config.intraNodeExchange = originalIntraNode;
+  };
+
+  constexpr int kRows = 20'000;
+  constexpr int kWindowRows = 10'000;
+  constexpr int kNumPartitions = 2;
+  const std::string taskPrefix = getUniqueTaskPrefix();
+  const std::string sourceTaskId = taskPrefix + "sourceTask0";
+
+  auto data = std::make_shared<WideComplexTestTable>();
+  data->initialize(kRows);
+  auto rowType = data->getRowType();
+  auto rangeSpec = std::make_shared<RangePartitionFunctionSpec>(
+      rowType,
+      std::vector<column_index_t>{2},
+      R"({"version":1,"keys":[{"ascending":true,"nullsFirst":true}],"bounds":[[{"isNull":false,"value":0}]]})");
+  std::unordered_map<std::string, std::string> extraConfig{
+      {core::QueryConfig::kUcxPartitionedOutputBatchRows,
+       std::to_string(kWindowRows)}};
+  auto sourceTask = createPartitionedOutputTask(
+      sourceTaskId,
+      pool_,
+      rowType,
+      kNumPartitions,
+      {"int32_col"},
+      FOUR_GBYTES,
+      extraConfig,
+      rangeSpec);
+  queueManager_->initializeTask(
+      sourceTask,
+      core::PartitionedOutputNode::Kind::kPartitioned,
+      kNumPartitions,
+      1);
+
+  auto source =
+      std::make_shared<SourceDriverMock>(sourceTask, 1, 1, kRows, data);
+  std::vector<std::shared_ptr<SinkDriverMock>> sinks;
+  for (int partition = 0; partition < kNumPartitions; ++partition) {
+    core::PlanNodeId exchangeNodeId;
+    auto sinkTask = createExchangeTask(
+        taskPrefix + "sinkTask" + std::to_string(partition),
+        rowType,
+        partition,
+        exchangeNodeId);
+    auto sink = std::make_shared<SinkDriverMock>(sinkTask, 1, nullptr);
+    std::vector<exec::Split> splits{remoteSplit(sourceTaskId, partition)};
+    sink->addSplits(splits);
+    sinks.push_back(std::move(sink));
+  }
+
+  for (auto& sink : sinks) {
+    sink->run();
+  }
+  source->run();
+  source->joinThreads();
+  uint64_t totalRows = 0;
+  for (auto& sink : sinks) {
+    sink->joinThreads();
+    totalRows += sink->numRows();
+  }
+
+  EXPECT_EQ(totalRows, kRows);
+  queueManager_->removeTask(sourceTaskId);
+}
+
+// Regression test for resumable hash output. With no consumer, each producer
+// must stop after its first configured residency window instead of enqueueing
+// every remaining window from a single addInput(). Starting the consumers then
+// verifies that saved cursors resume and EOS is delivered. Pressure-aware
+// sizing keeps this full window while device headroom is healthy.
+TEST_P(UcxExchangeTest, hashWindowBackpressureIsResumable) {
+  ExchangeTestParams p = GetParam();
+  if (p.numSrcDrivers != 1 || p.numDstDrivers != 1 || p.numPartitions != 1 ||
+      p.numChunks != 100 || p.numUpstreamTasks != 1 ||
+      p.tableType != TableType::NARROW) {
+    GTEST_SKIP() << "hashWindowBackpressureIsResumable: runs only once";
+  }
+
+  // The behavior under test is producer-side queue backpressure and cursor
+  // resumption. Use the deterministic same-process transport so loopback UCX
+  // TCP failures cannot mask that contract.
+  auto& config = cudf_velox::CudfConfig::getInstance();
+  const bool origIntraNode = config.intraNodeExchange;
+  config.intraNodeExchange = true;
+  SCOPE_EXIT {
+    config.intraNodeExchange = origIntraNode;
+  };
+
+  const auto headroom = cudf_velox::captureDeviceAllocationHeadroom();
+  ASSERT_TRUE(headroom.cudaValid);
+  auto admission =
+      cudf_velox::tryAcquireDeviceMemoryAdmission(headroom.device, 96, 128);
+  ASSERT_TRUE(admission.has_value());
+  EXPECT_EQ(
+      cudf_velox::deviceMemoryAdmissionReservedBytes(headroom.device), 96);
+  EXPECT_FALSE(
+      cudf_velox::tryAcquireDeviceMemoryAdmission(headroom.device, 64, 128));
+  admission.reset();
+  EXPECT_EQ(cudf_velox::deviceMemoryAdmissionReservedBytes(headroom.device), 0);
+
+  constexpr int kRowsPerDriver = 300;
+  constexpr int kWindowRows = 200;
+  constexpr int kHashCallRows = 20;
+  constexpr int kNumPartitions = 2;
+  constexpr int kNumDrivers = 2;
+  // One source fits in the queue cap, but the first window from both drivers
+  // exceeds it. This exercises the ordinary resumable path; oversized
+  // multi-window sources intentionally drain before observing backpressure.
+  constexpr uint64_t kQueueCapacityRows = kRowsPerDriver;
+  const std::string taskPrefix = getUniqueTaskPrefix();
+  const std::string srcTaskId = taskPrefix + "sourceTask0";
+  auto rowType = WideTestTable::kRowType;
+  auto tableGenerator = std::make_shared<WideTestTable>();
+  tableGenerator->initialize(kRowsPerDriver);
+
+  uint64_t averageRowBytes;
+  {
+    auto sizingVector = makeCudfVector(
+        pool_.get(),
+        kRowsPerDriver,
+        rowType,
+        tableGenerator,
+        cudf::get_default_stream());
+    const auto flatBytes = sizingVector->estimateFlatSize();
+    averageRowBytes = flatBytes / kRowsPerDriver +
+        static_cast<uint64_t>(flatBytes % kRowsPerDriver != 0);
+  }
+  cudf::get_default_stream().synchronize();
+  ASSERT_GT(averageRowBytes, 0);
+  const auto maxOutputBufferBytes = averageRowBytes * kQueueCapacityRows;
+
+  std::unordered_map<std::string, std::string> extraConfig{
+      {core::QueryConfig::kUcxPartitionedOutputBatchRows,
+       std::to_string(kRowsPerDriver)},
+      {core::QueryConfig::kUcxHashPartitionInputBatchRows,
+       std::to_string(kHashCallRows)},
+      {core::QueryConfig::kUcxHashPartitionWindowRows,
+       std::to_string(kWindowRows)}};
+  auto srcTask = createPartitionedOutputTask(
+      srcTaskId,
+      pool_,
+      rowType,
+      kNumPartitions,
+      {"int32_col"},
+      maxOutputBufferBytes,
+      extraConfig);
+  queueManager_->initializeTask(
+      srcTask,
+      core::PartitionedOutputNode::Kind::kPartitioned,
+      kNumPartitions,
+      kNumDrivers);
+
+  auto sourceDriver = std::make_shared<SourceDriverMock>(
+      srcTask, kNumDrivers, 1, kRowsPerDriver, tableGenerator);
+  sourceDriver->run();
+
+  // Do not start a consumer yet. With nothing draining the shared queue, the
+  // producers fill it until every driver is backpressured, after which
+  // totalRowsSent freezes. The exact frozen value is timing dependent: the
+  // producer drivers run concurrently, so they may settle anywhere between the
+  // ideal lock-step bound (each driver stops right after its first window,
+  // kNumDrivers * kWindowRows) and the widest race, where one driver drains its
+  // whole source before another lands its first window. Either way each driver
+  // overshoots by at most one residency window, so the invariant under test is
+  // that the producers never drain every window from a single addInput() -- the
+  // property that keeps the bounded hash output resumable. Assert that band
+  // rather than a single exact count, which is inherently racy.
+  constexpr int64_t kMinBackpressuredRows =
+      static_cast<int64_t>(kNumDrivers) * kWindowRows;
+  constexpr int64_t kFullyDrainedRows =
+      static_cast<int64_t>(kNumDrivers) * kRowsPerDriver;
+  std::optional<exec::OutputBuffer::Stats> blockedStats;
+  int64_t previousRows = 0;
+  bool havePrevious = false;
+  int stableReads = 0;
+  for (int attempt = 0; attempt < 200; ++attempt) {
+    blockedStats = queueManager_->stats(srcTaskId);
+    const int64_t rows =
+        blockedStats ? blockedStats->totalRowsSent : int64_t{0};
+    // Treat the queue as settled once totalRowsSent stops advancing while at
+    // least one residency window per driver has been admitted. Requiring the
+    // count to hold steady avoids latching onto a transient value while a
+    // regression that ignores backpressure is still draining toward the full
+    // source.
+    if (blockedStats && havePrevious && rows == previousRows &&
+        rows >= kMinBackpressuredRows) {
+      if (++stableReads >= 5) {
+        break;
+      }
+    } else {
+      stableReads = 0;
+    }
+    previousRows = rows;
+    havePrevious = true;
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  ASSERT_TRUE(blockedStats.has_value());
+  // Backpressure must engage only after at least one residency window per
+  // driver is admitted (otherwise producers stalled below the window bound)...
+  EXPECT_GE(blockedStats->totalRowsSent, kMinBackpressuredRows);
+  // ...and must stop the producers before any single addInput() drains every
+  // remaining window from a driver.
+  EXPECT_LT(blockedStats->totalRowsSent, kFullyDrainedRows)
+      << "producers crossed the one-window-per-driver backpressure bound";
+
+  std::vector<std::shared_ptr<SinkDriverMock>> sinkDrivers;
+  for (int partition = 0; partition < kNumPartitions; ++partition) {
+    core::PlanNodeId exchangeNodeId;
+    auto sinkTask = createExchangeTask(
+        taskPrefix + "sinkTask" + std::to_string(partition),
+        rowType,
+        partition,
+        exchangeNodeId);
+    auto sinkDriver = std::make_shared<SinkDriverMock>(sinkTask, 1);
+    std::vector<exec::Split> splits;
+    splits.push_back(remoteSplit(srcTaskId, partition));
+    sinkDriver->addSplits(splits);
+    sinkDriver->run();
+    sinkDrivers.push_back(std::move(sinkDriver));
+  }
+
+  sourceDriver->joinThreads();
+  uint64_t receivedRows = 0;
+  for (auto& sinkDriver : sinkDrivers) {
+    sinkDriver->joinThreads();
+    receivedRows += sinkDriver->numRows();
+  }
+  EXPECT_EQ(receivedRows, kNumDrivers * kRowsPerDriver);
+
+  auto finalStats = queueManager_->stats(srcTaskId);
+  ASSERT_TRUE(finalStats.has_value());
+  EXPECT_TRUE(finalStats->noMoreData);
+  EXPECT_EQ(finalStats->totalRowsSent, kNumDrivers * kRowsPerDriver);
+  queueManager_->removeTask(srcTaskId);
 }
 
 // Regression test: aborting a source task while UCXX tagRecv requests are

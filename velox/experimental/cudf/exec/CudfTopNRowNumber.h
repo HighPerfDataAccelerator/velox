@@ -97,6 +97,7 @@ class CudfTopNRowNumber : public CudfOperatorBase {
   const bool generateRowNumber_;
   const RowTypePtr inputType_;
   const core::PlanNodeId diagnosticNodeId_;
+  const uint64_t candidateRunBytes_;
 
   std::vector<cudf::size_type> partitionKeys_;
   std::vector<cudf::size_type> sortKeys_;

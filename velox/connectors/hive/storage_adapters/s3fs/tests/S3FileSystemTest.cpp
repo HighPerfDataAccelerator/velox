@@ -328,8 +328,7 @@ TEST_F(S3FileSystemTest, abortWrite) {
   filesystems::S3FileSystem s3fs(bucketName, hiveConfig);
   auto pool = memory::memoryManager()->addLeafPool("S3AbortWriteTest");
 
-  for (const auto& [file, size] :
-       std::vector<std::pair<std::string, size_t>>{
+  for (const auto& [file, size] : std::vector<std::pair<std::string, size_t>>{
            {"small.parquet", 1024}, {"multipart.parquet", 11 << 20}}) {
     const auto s3File = s3URI(bucketName, file);
     auto writeFile =

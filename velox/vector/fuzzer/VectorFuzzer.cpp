@@ -718,6 +718,18 @@ void VectorFuzzer::fuzzOffsetsAndSizes(
       continue;
     }
 
+    // Optionally leave a gap of unreferenced elements before this container so
+    // the layout is non-contiguous. The skipped elements keep their (random)
+    // values, so code that ignores offsets is exercised. The gap is capped so a
+    // single container does not exhaust the elements vector. Rows whose offset
+    // ends up past the elements vector get size 0 below and are skipped by
+    // validate.
+    if (opts_.fuzzNonContiguousElements && childSize < elementsSize &&
+        coinToss(0.3)) {
+      const size_t maxGap = std::min(containerAvgLength, size_t{10});
+      childSize += 1 + rand<uint32_t>(rng_) % maxGap;
+    }
+
     rawOffsets[i] = childSize;
 
     // If variable length, generate a random number between zero and 2 *
@@ -782,6 +794,10 @@ VectorPtr VectorFuzzer::normalizeMapKeys(
   auto rawOffsets = offsets->as<vector_size_t>();
   auto rawSizes = sizes->asMutable<vector_size_t>();
 
+  // Keys may be dictionary/constant/lazy encoded; decode so values can be read
+  // regardless of encoding.
+  DecodedVector decodedKeys(*keys);
+
   // Looks for duplicate key values.
   std::unordered_set<uint64_t> set;
   for (size_t i = 0; i < mapSize; ++i) {
@@ -795,7 +811,7 @@ VectorPtr VectorFuzzer::normalizeMapKeys(
 
     for (size_t j = 0; j < rawSizes[i]; ++j) {
       vector_size_t idx = rawOffsets[i] + j;
-      uint64_t hash = keys->hashValueAt(idx);
+      uint64_t hash = decodedKeys.base()->hashValueAt(decodedKeys.index(idx));
 
       // If we find the same hash (either same key value or hash colision), we
       // cut it short by reducing this element's map size. This should not

@@ -41,6 +41,8 @@
 #include <cudf/stream_compaction.hpp>
 #include <cudf/unary.hpp>
 
+#include <limits>
+
 namespace facebook::velox::cudf_velox {
 
 namespace {
@@ -105,6 +107,36 @@ CudfNestedLoopJoinBridge::getBuildStream() {
   return buildStream_;
 }
 
+void CudfNestedLoopJoinBridge::reserveBuildBytes(
+    uint64_t bytes,
+    uint64_t maxBuildBytes) {
+  std::lock_guard<std::mutex> l(mutex_);
+  VELOX_USER_CHECK_LE(
+      retainedBuildBytes_,
+      maxBuildBytes,
+      "CudfNestedLoopJoin build byte accounting exceeded configured limit: "
+      "retained={} limit={} config={}",
+      retainedBuildBytes_,
+      maxBuildBytes,
+      CudfConfig::kCudfNestedLoopJoinMaxBuildBytes);
+  VELOX_USER_CHECK_LE(
+      bytes,
+      maxBuildBytes - retainedBuildBytes_,
+      "CudfNestedLoopJoin build exceeds configured device-memory limit "
+      "before retaining next batch: retained={} next={} limit={} config={}",
+      retainedBuildBytes_,
+      bytes,
+      maxBuildBytes,
+      CudfConfig::kCudfNestedLoopJoinMaxBuildBytes);
+  retainedBuildBytes_ += bytes;
+}
+
+void CudfNestedLoopJoinBridge::releaseBuildBytes(uint64_t bytes) {
+  std::lock_guard<std::mutex> l(mutex_);
+  VELOX_CHECK_GE(retainedBuildBytes_, bytes);
+  retainedBuildBytes_ -= bytes;
+}
+
 // ============================================================================
 // Build Operator Implementation
 // ============================================================================
@@ -125,7 +157,18 @@ CudfNestedLoopJoinBuild::CudfNestedLoopJoinBuild(
           NvtxMethodFlag::kNoMoreInput,
           std::nullopt,
           joinNode),
-      joinNode_(joinNode) {}
+      joinNode_(joinNode),
+      maxBuildBytes_(driverCtx->queryConfig().get<uint64_t>(
+          CudfConfig::kCudfNestedLoopJoinMaxBuildBytes,
+          std::numeric_limits<uint64_t>::max())) {}
+
+std::unique_ptr<exec::Operator> makeCudfNestedLoopJoinBuild(
+    int32_t operatorId,
+    exec::DriverCtx* driverCtx,
+    std::shared_ptr<const core::NestedLoopJoinNode> joinNode) {
+  return std::make_unique<CudfNestedLoopJoinBuild>(
+      operatorId, driverCtx, std::move(joinNode));
+}
 
 // Accumulates input batches in memory.
 // All batches are kept as CudfVectors (GPU memory) until join completes.
@@ -133,7 +176,25 @@ void CudfNestedLoopJoinBuild::doAddInput(RowVectorPtr input) {
   if (input->size() > 0) {
     auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input);
     VELOX_CHECK_NOT_NULL(cudfInput);
-    inputs_.push_back(std::move(cudfInput)); // Store in GPU memory
+    // Enforce the exact device payload before retaining the next batch. This
+    // is the runtime backstop for planner estimates used by replicated MPP
+    // Cartesian joins.
+    const auto inputBytes = cudfInput->estimateFlatSize();
+    if (!buildBridge_) {
+      auto joinBridge = operatorCtx_->task()->getCustomJoinBridge(
+          operatorCtx_->driverCtx()->splitGroupId, planNodeId());
+      buildBridge_ =
+          std::dynamic_pointer_cast<CudfNestedLoopJoinBridge>(joinBridge);
+      VELOX_CHECK_NOT_NULL(buildBridge_);
+    }
+    buildBridge_->reserveBuildBytes(inputBytes, maxBuildBytes_);
+    try {
+      inputs_.push_back(std::move(cudfInput)); // Store in GPU memory
+      bufferedBuildBytes_ += inputBytes;
+    } catch (...) {
+      buildBridge_->releaseBuildBytes(inputBytes);
+      throw;
+    }
   }
 }
 
@@ -166,24 +227,46 @@ void CudfNestedLoopJoinBuild::doNoMoreInput() {
     return; // Not the last driver - just wait
   }
 
-  // This driver was chosen to collect data from all peers
-  for (auto& peer : peers) {
-    auto op = peer->findOperator(planNodeId());
-    auto* build = dynamic_cast<CudfNestedLoopJoinBuild*>(op);
-    VELOX_CHECK_NOT_NULL(build);
-    inputs_.insert(
-        inputs_.end(),
-        std::make_move_iterator(build->inputs_.begin()),
-        std::make_move_iterator(build->inputs_.end()));
-  }
-
-  // Wake up peer build operators when we finish transferring data
+  // Always wake the waiting build peers, including when host-vector growth or
+  // build concatenation throws. Leaving this guard after the peer merge would
+  // strand the other drivers on an allocation failure.
   SCOPE_EXIT {
     peers.clear();
     for (auto& promise : promises) {
       promise.setValue(); // Unblock other build operators
     }
   };
+
+  std::vector<CudfNestedLoopJoinBuild*> peerBuilds;
+  peerBuilds.reserve(peers.size());
+  auto mergedInputCount = inputs_.size();
+  for (auto& peer : peers) {
+    auto op = peer->findOperator(planNodeId());
+    auto* build = dynamic_cast<CudfNestedLoopJoinBuild*>(op);
+    VELOX_CHECK_NOT_NULL(build);
+    VELOX_CHECK_LE(
+        build->inputs_.size(),
+        inputs_.max_size() - mergedInputCount,
+        "CudfNestedLoopJoin build input vector exceeds host size limit");
+    mergedInputCount += build->inputs_.size();
+    peerBuilds.push_back(build);
+  }
+
+  // Allocate once before moving peer-owned vectors and byte-accounting
+  // ownership. With sufficient capacity, shared_ptr moves below are noexcept.
+  inputs_.reserve(mergedInputCount);
+
+  // This driver was chosen to collect data from all peers
+  for (auto* build : peerBuilds) {
+    // The shared join bridge reserved these bytes before each peer retained
+    // its batches, so transferring ownership does not need another reserve.
+    inputs_.insert(
+        inputs_.end(),
+        std::make_move_iterator(build->inputs_.begin()),
+        std::make_move_iterator(build->inputs_.end()));
+    bufferedBuildBytes_ += build->bufferedBuildBytes_;
+    build->bufferedBuildBytes_ = 0;
+  }
 
   // Concatenate all input batches into a single cuDF table.
   // getConcatenatedTable throws if the total row count exceeds cudf::size_type
@@ -192,23 +275,36 @@ void CudfNestedLoopJoinBuild::doNoMoreInput() {
   // join output is probe_rows × build_rows regardless of how the build is
   // split.
   auto stream = cudfGlobalStreamPool().get_stream();
-  auto table = getConcatenatedTable(
-      std::exchange(inputs_, {}),
-      joinNode_->sources()[1]->outputType(),
-      stream,
-      get_output_mr());
-
-  // Transfer build data to bridge - this will unblock probe operators.
-  // No stream sync is required: the probe side uses syncBuildStream() via a
-  // CUDA event to ensure the build table is ready before reading it.
   auto joinBridge = operatorCtx_->task()->getCustomJoinBridge(
       operatorCtx_->driverCtx()->splitGroupId, planNodeId());
   auto bridge = std::dynamic_pointer_cast<CudfNestedLoopJoinBridge>(joinBridge);
+  VELOX_CHECK_NOT_NULL(bridge);
+  buildBridge_ = bridge;
 
-  bridge->setBuildStream(stream); // Pass stream for CUDA synchronization
-  bridge->setData(
-      std::make_optional(
-          std::shared_ptr<cudf::table>(std::move(table)))); // Wake probes
+  try {
+    auto table = getConcatenatedTable(
+        std::exchange(inputs_, {}),
+        joinNode_->sources()[1]->outputType(),
+        stream,
+        get_output_mr());
+
+    // Transfer build data to bridge - this will unblock probe operators.
+    // No stream sync is required: the probe side uses syncBuildStream() via a
+    // CUDA event to ensure the build table is ready before reading it.
+    bridge->setBuildStream(stream); // Pass stream for CUDA synchronization
+    bridge->setData(
+        std::make_optional(
+            std::shared_ptr<cudf::table>(std::move(table)))); // Wake probes
+    // The bridge now owns the complete build. Keep its global accounting until
+    // bridge destruction, but disarm this operator's close-time release.
+    bufferedBuildBytes_ = 0;
+  } catch (...) {
+    // std::exchange empties inputs_ before concatenation. Release accounting
+    // here because doClose() can no longer observe those retained vectors.
+    bridge->releaseBuildBytes(bufferedBuildBytes_);
+    bufferedBuildBytes_ = 0;
+    throw;
+  }
 }
 
 exec::BlockingReason CudfNestedLoopJoinBuild::isBlocked(
@@ -225,7 +321,13 @@ bool CudfNestedLoopJoinBuild::isFinished() {
 }
 
 void CudfNestedLoopJoinBuild::doClose() {
+  if (bufferedBuildBytes_ > 0 && !inputs_.empty()) {
+    VELOX_CHECK_NOT_NULL(buildBridge_);
+    buildBridge_->releaseBuildBytes(bufferedBuildBytes_);
+  }
   inputs_.clear();
+  bufferedBuildBytes_ = 0;
+  buildBridge_.reset();
   Operator::close();
 }
 
@@ -1020,8 +1122,7 @@ exec::OperatorSupplier CudfNestedLoopJoinBridgeTranslator::toOperatorSupplier(
   if (auto joinNode =
           std::dynamic_pointer_cast<const core::NestedLoopJoinNode>(node)) {
     return [joinNode](int32_t operatorId, exec::DriverCtx* ctx) {
-      return std::make_unique<CudfNestedLoopJoinBuild>(
-          operatorId, ctx, joinNode);
+      return makeCudfNestedLoopJoinBuild(operatorId, ctx, joinNode);
     };
   }
   return nullptr;

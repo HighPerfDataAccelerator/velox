@@ -93,6 +93,10 @@ const std::vector<config::ConfigProperty>& QueryConfig::registeredProperties() {
     VELOX_REGISTER_QUERY_CONFIG(kMaxPartitionedOutputBufferSize);
     VELOX_REGISTER_QUERY_CONFIG(kMaxOutputBufferSize);
     VELOX_REGISTER_QUERY_CONFIG(kUcxPartitionedOutputBatchRows);
+    VELOX_REGISTER_QUERY_CONFIG(kUcxHashPartitionInputBatchRows);
+    VELOX_REGISTER_QUERY_CONFIG(kUcxHashPartitionWindowRows);
+    VELOX_REGISTER_QUERY_CONFIG(kCudfAsyncQueryEndTrimBytes);
+    VELOX_REGISTER_QUERY_CONFIG(kUcxPartitionedOutputBatchBytes);
 
     // Output batch.
     VELOX_REGISTER_QUERY_CONFIG(kPreferredOutputBatchBytes);
@@ -260,6 +264,13 @@ const std::vector<config::ConfigProperty>& QueryConfig::registeredProperties() {
     // RPC congestion.
     VELOX_REGISTER_QUERY_CONFIG(kRpcCongestionMinWindow);
     VELOX_REGISTER_QUERY_CONFIG(kRpcCongestionStepCoef);
+    VELOX_REGISTER_QUERY_CONFIG(kRpcCongestionMaxWindow);
+
+    // RPC adaptive rate limiter.
+    VELOX_REGISTER_QUERY_CONFIG(kRpcRateLimiterAdaptiveEnabled);
+    VELOX_REGISTER_QUERY_CONFIG(kRpcRateLimiterMinLimit);
+    VELOX_REGISTER_QUERY_CONFIG(kRpcRateLimiterDecreaseFactor);
+    VELOX_REGISTER_QUERY_CONFIG(kRpcRateLimiterMaxLimit);
 
 #undef VELOX_REGISTER_QUERY_CONFIG
 

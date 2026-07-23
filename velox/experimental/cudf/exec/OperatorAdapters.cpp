@@ -630,8 +630,7 @@ class NestedLoopJoinBuildAdapter : public CudfNestedLoopJoinBaseAdapter {
 
     std::vector<std::unique_ptr<exec::Operator>> result;
     result.push_back(
-        std::make_unique<CudfNestedLoopJoinBuild>(
-            operatorId, ctx, joinPlanNode));
+        makeCudfNestedLoopJoinBuild(operatorId, ctx, std::move(joinPlanNode)));
     return result;
   }
 };
@@ -804,55 +803,6 @@ class TopNRowNumberAdapter : public OperatorAdapter {
     result.push_back(
         std::make_unique<CudfTopNRowNumber>(
             operatorId, ctx, topNRowNumberNode));
-    return result;
-  }
-};
-
-/// WindowAdapter - Replaces supported row_number Window nodes with CudfWindow.
-class WindowAdapter : public OperatorAdapter {
- public:
-  WindowAdapter() : OperatorAdapter("Window") {}
-
-  bool canHandle(const exec::Operator* op) const override {
-    return dynamic_cast<const exec::Window*>(op) != nullptr;
-  }
-
-  bool canRunOnGPU(
-      const exec::Operator* op,
-      const core::PlanNodePtr& planNode,
-      exec::DriverCtx* /*ctx*/) const override {
-    auto windowNode =
-        std::dynamic_pointer_cast<const core::WindowNode>(planNode);
-    const bool canRun = canHandle(op) && isSupportedCudfWindowNode(windowNode);
-    if (!canRun) {
-      LOG_FALLBACK(
-          "WindowAdapter {}, PlanNode id: {}",
-          !canHandle(op)    ? "operator is not Window"
-              : !windowNode ? "planNode is not WindowNode"
-                            : "isSupportedCudfWindowNode returned false",
-          planNode->id());
-    }
-    return canRun;
-  }
-
-  bool acceptsGpuInput() const override {
-    return true;
-  }
-
-  bool producesGpuOutput() const override {
-    return true;
-  }
-
-  std::vector<std::unique_ptr<exec::Operator>> createReplacements(
-      const exec::Operator* /*op*/,
-      const core::PlanNodePtr& planNode,
-      exec::DriverCtx* ctx,
-      int32_t operatorId) const override {
-    auto windowNode =
-        std::dynamic_pointer_cast<const core::WindowNode>(planNode);
-
-    std::vector<std::unique_ptr<exec::Operator>> result;
-    result.push_back(std::make_unique<CudfWindow>(operatorId, ctx, windowNode));
     return result;
   }
 };
@@ -1204,6 +1154,58 @@ class CallbackSinkAdapter : public OperatorAdapter {
   }
 };
 
+// WindowAdapter - Replaces with CudfWindow
+class WindowAdapter : public OperatorAdapter {
+ public:
+  WindowAdapter() : OperatorAdapter("Window") {}
+
+  bool canHandle(const exec::Operator* op) const override {
+    return dynamic_cast<const exec::Window*>(op) != nullptr;
+  }
+
+  bool canRunOnGPU(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* /*ctx*/) const override {
+    auto windowNode =
+        std::dynamic_pointer_cast<const core::WindowNode>(planNode);
+    if (!windowNode) {
+      return false;
+    }
+    std::string reason;
+    if (!CudfWindow::canRunOnGPU(*windowNode, &reason)) {
+      LOG_FALLBACK(
+          "{}, PlanNode id: {}",
+          reason.empty() ? "unknown" : reason,
+          planNode->id());
+      return false;
+    }
+    return true;
+  }
+
+  bool acceptsGpuInput() const override {
+    return true;
+  }
+
+  bool producesGpuOutput() const override {
+    return true;
+  }
+
+  std::vector<std::unique_ptr<exec::Operator>> createReplacements(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* ctx,
+      int32_t operatorId) const override {
+    auto windowPlanNode =
+        std::dynamic_pointer_cast<const core::WindowNode>(planNode);
+
+    std::vector<std::unique_ptr<exec::Operator>> result;
+    result.push_back(
+        std::make_unique<CudfWindow>(operatorId, ctx, windowPlanNode));
+    return result;
+  }
+};
+
 /// GroupIdAdapter - Replaces with CudfGroupId
 class GroupIdAdapter : public OperatorAdapter {
  public:
@@ -1323,6 +1325,20 @@ class ExchangeAdapter : public OperatorAdapter {
     result.push_back(
         std::make_unique<ucx_exchange::UcxExchange>(
             operatorId, ctx, planNode, client));
+    if (CudfConfig::getInstance().concatOptimizationEnabled &&
+        CudfConfig::getInstance().exchangeConcatOptimizationEnabled) {
+      result.push_back(
+          std::make_unique<CudfBatchConcat>(
+              operatorId,
+              ctx,
+              planNode,
+              planNode->outputType(),
+              CudfConfig::getInstance().exchangeBatchSizeMinThreshold,
+              ctx->queryConfig().get<uint64_t>(
+                  CudfConfig::kCudfExchangeBatchSizeMinThresholdBytes,
+                  CudfConfig::getInstance()
+                      .exchangeBatchSizeMinThresholdBytes)));
+    }
     return result;
   }
 
@@ -1352,9 +1368,8 @@ class MergeExchangeAdapter : public OperatorAdapter {
         mergeExchangeNode->transportType() ==
             core::ExchangeNode::TransportType::kUcx;
     const bool orderBySupported = mergeExchangeNode &&
-        CudfOrderBy::isSupported(
-            mergeExchangeNode->outputType(),
-            mergeExchangeNode->sortingKeys());
+        CudfOrderBy::isSupported(mergeExchangeNode->outputType(),
+                                 mergeExchangeNode->sortingKeys());
     LOG(WARNING) << "CudfMergeExchangeAdapter: canRunOnGPU node="
                  << (mergeExchangeNode ? mergeExchangeNode->id() : "<null>")
                  << " isUcx=" << isUcx

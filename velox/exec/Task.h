@@ -32,7 +32,46 @@
 
 namespace facebook::velox::exec {
 
-class OutputBufferManager;
+class DefaultOutputBufferManager;
+class Task;
+
+/// Extension point for non-default partitioned-output transports. A Task
+/// selects one registered manager at output initialization and retains it for
+/// the lifetime of that output.
+class PartitionedOutputBufferManager {
+ public:
+  virtual ~PartitionedOutputBufferManager() = default;
+
+  virtual bool supports(
+      const core::PartitionedOutputNode& node,
+      const core::QueryConfig& queryConfig) const = 0;
+
+  virtual void initializeTask(
+      std::shared_ptr<Task> task,
+      core::PartitionedOutputNode::Kind kind,
+      int numPartitions,
+      int numOutputDrivers) = 0;
+
+  virtual void updateOutputBuffers(
+      const std::string& taskId,
+      int numBuffers,
+      bool noMoreBuffers) = 0;
+
+  virtual void updateNumDrivers(
+      const std::string& taskId,
+      uint32_t numOutputDrivers) = 0;
+
+  virtual std::optional<OutputBuffer::Stats> stats(
+      const std::string& taskId) = 0;
+
+  virtual void removeTask(const std::string& taskId) = 0;
+};
+
+bool registerPartitionedOutputBufferManager(
+    const std::shared_ptr<PartitionedOutputBufferManager>& manager);
+
+bool unregisterPartitionedOutputBufferManager(
+    const std::shared_ptr<PartitionedOutputBufferManager>& manager);
 
 class HashJoinBridge;
 class IndexLookupJoinBridge;
@@ -802,7 +841,7 @@ class Task : public std::enable_shared_from_this<Task> {
   /// folder could not be created.
   const std::string& getOrCreateSpillDirectory();
 
-  /// True if produces output via OutputBufferManager.
+  /// True if produces output via DefaultOutputBufferManager.
   bool hasPartitionedOutput() const {
     return numDriversInPartitionedOutput_ > 0;
   }
@@ -1079,7 +1118,8 @@ class Task : public std::enable_shared_from_this<Task> {
   // kRunning state, but no more split groups are commit and all drivers
   // finished processing and all output has been consumed. In other words,
   // returns true if task should transition to kFinished state.
-  bool checkNoMoreSplitGroupsLocked();
+  bool checkNoMoreSplitGroupsLocked(
+      std::optional<uint32_t>& numPartitionedOutputDrivers);
 
   // Notifies listeners that the task is now complete.
   void onTaskCompletion();
@@ -1276,7 +1316,7 @@ class Task : public std::enable_shared_from_this<Task> {
   // default hierarchy is unchanged.
   std::vector<std::shared_ptr<memory::MemoryPool>> customChildPools_;
 
-  // Set to true by OutputBufferManager when all output is
+  // Set to true by DefaultOutputBufferManager when all output is
   // acknowledged. If this happens before Drivers are at end, the last
   // Driver to finish will set state_ to kFinished. If Drivers have
   // finished then setting this to true will also set state_ to
@@ -1401,6 +1441,8 @@ class Task : public std::enable_shared_from_this<Task> {
   // Execution mode. In this case we will need to update the number of output
   // drivers in the end. False otherwise.
   bool groupedPartitionedOutput_{false};
+  std::shared_ptr<PartitionedOutputBufferManager>
+      partitionedOutputBufferManager_;
   // The number of splits groups we run concurrently.
   uint32_t concurrentSplitGroups_{1};
 
@@ -1470,7 +1512,7 @@ class Task : public std::enable_shared_from_this<Task> {
   // ungrouped execution we use the [0] entry in this vector.
   std::unordered_map<uint32_t, SplitGroupState> splitGroupStates_;
 
-  std::weak_ptr<OutputBufferManager> bufferManager_;
+  std::weak_ptr<DefaultOutputBufferManager> bufferManager_;
 
   // Boolean indicating that we have already received no-more-output-buffers
   // message. Subsequent messages will be ignored.

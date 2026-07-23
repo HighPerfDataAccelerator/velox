@@ -105,7 +105,8 @@ std::shared_ptr<Task> createPartitionedOutputTask(
     int numPartitions,
     const std::vector<std::string>& partitionKeys,
     uint64_t kMaxOutputBufferSize,
-    const std::unordered_map<std::string, std::string>& extraConfig) {
+    const std::unordered_map<std::string, std::string>& extraConfig,
+    core::PartitionFunctionSpecPtr partitionFunctionSpec) {
   VLOG(3) << "Creating PartitionedOutput task with " << numPartitions
           << " partitions";
 
@@ -127,6 +128,15 @@ std::shared_ptr<Task> createPartitionedOutputTask(
                           .values({rowVector})
                           .partitionedOutput(partitionKeys, numPartitions)
                           .planFragment();
+  if (partitionFunctionSpec) {
+    auto output = std::dynamic_pointer_cast<const core::PartitionedOutputNode>(
+        planFragment.planNode);
+    VELOX_CHECK_NOT_NULL(output);
+    planFragment.planNode =
+        core::PartitionedOutputNode::Builder(*output)
+            .partitionFunctionSpec(std::move(partitionFunctionSpec))
+            .build();
+  }
 
   std::shared_ptr<folly::Executor> executor(
       std::make_shared<folly::CPUThreadPoolExecutor>(
@@ -180,8 +190,8 @@ template <typename T>
 std::unique_ptr<cudf::column> make_numeric_column_from_vector(
     const std::vector<T>& host_values,
     rmm::cuda_stream_view stream = cudf::get_default_stream(),
-    rmm::mr::device_memory_resource* mr =
-        rmm::mr::get_current_device_resource()) {
+    rmm::device_async_resource_ref mr =
+        rmm::mr::get_current_device_resource_ref()) {
   size_t num_rows = host_values.size();
 
   // Allocate a device buffer of the correct size
@@ -208,8 +218,8 @@ std::unique_ptr<cudf::column> make_numeric_column_from_vector(
 rmm::device_buffer make_chars_buffer_from_host(
     const std::vector<std::string>& host_strings,
     rmm::cuda_stream_view stream = cudf::get_default_stream(),
-    rmm::mr::device_memory_resource* mr =
-        rmm::mr::get_current_device_resource()) {
+    rmm::device_async_resource_ref mr =
+        rmm::mr::get_current_device_resource_ref()) {
   // Compute total bytes needed
   size_t total_bytes = 0;
   for (auto const& s : host_strings)

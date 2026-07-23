@@ -947,15 +947,15 @@ std::vector<ColumnOrView> precomputeSubexpressions(
   std::vector<ColumnOrView> precomputedColumns;
   precomputedColumns.reserve(precomputeInstructions.size());
 
-  auto appendPrecomputed = [&](ColumnOrView result,
-                                   const std::optional<cudf::data_type>&
-                                       expectedType) {
-    if (expectedType && asView(result).type() != *expectedType) {
-      result =
-          cudf::cast(asView(result), *expectedType, stream, get_output_mr());
-    }
-    precomputedColumns.push_back(std::move(result));
-  };
+  auto appendPrecomputed =
+      [&](ColumnOrView result,
+          const std::optional<cudf::data_type>& expectedType) {
+        if (expectedType && asView(result).type() != *expectedType) {
+          result = cudf::cast(
+              asView(result), *expectedType, stream, get_output_mr());
+        }
+        precomputedColumns.push_back(std::move(result));
+      };
 
   for (const auto& instruction : precomputeInstructions) {
     auto

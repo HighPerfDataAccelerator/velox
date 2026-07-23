@@ -27,10 +27,6 @@
 #include "velox/experimental/ucx-exchange/CommElement.h"
 #include "velox/experimental/ucx-exchange/WorkQueue.h"
 
-#include <gflags/gflags.h>
-
-DECLARE_bool(velox_ucx_exchange);
-
 namespace facebook::velox::ucx_exchange {
 
 struct HostPort {
@@ -68,6 +64,15 @@ class Communicator {
 
   /// @brief Method to get the Communicator reference
   static std::shared_ptr<Communicator> getInstance();
+
+  /// Returns the singleton if it is still live. Callback teardown paths use
+  /// this instead of throwing after shutdown has begun.
+  static std::shared_ptr<Communicator> tryGetInstance();
+
+  /// Releases the singleton after run() has returned and its owner has joined
+  /// the progress thread. This operation is idempotent and cannot be followed
+  /// by reinitialization in the same process.
+  static void shutdown();
 
   /// @brief Destructor.
   ~Communicator();
@@ -145,6 +150,10 @@ class Communicator {
     return workerId_;
   }
 
+  bool isShuttingDown() const {
+    return shuttingDown_.load(std::memory_order_acquire);
+  }
+
   /// Returns true when the active UCX context can transfer CUDA memory with
   /// the configured transports. UCXX derives this from both the UCP-supported
   /// memory types and UCX_TLS, so callers can safely choose a device receive
@@ -176,14 +185,21 @@ class Communicator {
       void* arg);
 
   static std::once_flag onceFlag; // Flag for thread-safe initialization
+  static std::mutex instanceMutex_;
+  static std::mutex shutdownMutex_;
   static std::shared_ptr<Communicator> instancePtr_;
+
+  // Called by shutdown() only after the progress thread has returned.
+  bool releaseResourcesAfterRun();
 
   std::shared_ptr<ucxx::Context> context_;
   std::shared_ptr<ucxx::Worker> worker_;
   std::shared_ptr<ucxx::Listener> listener_;
   uint16_t port_;
   std::string coordinatorURL_;
-  std::atomic<bool> running_;
+  std::atomic<bool> running_{false};
+  std::atomic<bool> shuttingDown_{false};
+  std::atomic<bool> resourcesReleased_{false};
   Acceptor acceptor_;
   ContinuePromise promise_{"Communicator::run"};
 

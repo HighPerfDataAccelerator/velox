@@ -116,6 +116,14 @@ std::unique_ptr<cudf::column> makeEmptyColumnForType(
         0);
   };
   switch (type->kind()) {
+    case TypeKind::UNKNOWN:
+      // Velox uses UNKNOWN for an untyped NULL literal. cuDF has no physical
+      // UNKNOWN type, but an empty column carries no values whose type could
+      // be observed. Keep the same INT8 placeholder used by the row
+      // constructor for all-null UNKNOWN fields. This is required when an
+      // empty hash-join build side contains such a field and must synthesize
+      // its physical schema in noMoreInput().
+      return cudf::make_empty_column(cudf::data_type{cudf::type_id::INT8});
     case TypeKind::VARCHAR:
     case TypeKind::VARBINARY:
       return cudf::make_strings_column(
@@ -359,6 +367,21 @@ const CudaEvent& CudaEvent::recordFrom(rmm::cuda_stream_view stream) const {
 const CudaEvent& CudaEvent::waitOn(rmm::cuda_stream_view stream) const {
   CUDF_CUDA_TRY(cudaStreamWaitEvent(stream.value(), event_, 0));
   return *this;
+}
+
+std::string getBaseFunctionName(const std::string& fullName) {
+  auto pos = fullName.rfind('.');
+  return pos == std::string::npos ? fullName : fullName.substr(pos + 1);
+}
+
+std::string stripFunctionPrefix(
+    const std::string& name,
+    const std::string& prefix) {
+  auto base = getBaseFunctionName(name);
+  if (!prefix.empty() && base.find(prefix) == 0) {
+    return base.substr(prefix.size());
+  }
+  return base;
 }
 
 void orderCudfVectorDeallocationsAfterStream(

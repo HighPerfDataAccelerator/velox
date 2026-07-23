@@ -27,6 +27,7 @@
 #include "velox/common/memory/CustomMemoryResourceRegistry.h"
 #include "velox/common/testutil/TestValue.h"
 #include "velox/common/time/Timer.h"
+#include "velox/exec/DefaultOutputBufferManager.h"
 #include "velox/exec/Exchange.h"
 #include "velox/exec/HashJoinBridge.h"
 #include "velox/exec/IndexLookupJoinBridge.h"
@@ -36,16 +37,10 @@
 #include "velox/exec/OperatorTraceCtx.h"
 #include "velox/exec/OperatorType.h"
 #include "velox/exec/OperatorUtils.h"
-#include "velox/exec/OutputBufferManager.h"
 #include "velox/exec/PlanNodeStats.h"
 #include "velox/exec/SpatialJoinBuild.h"
 #include "velox/exec/TableScan.h"
 #include "velox/exec/Task.h"
-
-#ifdef VELOX_ENABLE_CUDF
-#include <velox/experimental/ucx-exchange/UcxOutputQueueManager.h>
-#include "velox/experimental/cudf/CudfConfig.h"
-#endif
 
 using facebook::velox::common::testutil::TestValue;
 
@@ -107,6 +102,24 @@ splitListenerFactories() {
   static folly::Synchronized<std::vector<std::shared_ptr<SplitListenerFactory>>>
       kListenerFactories;
   return kListenerFactories;
+}
+
+folly::Synchronized<std::shared_ptr<PartitionedOutputBufferManager>>&
+partitionedOutputBufferManagerRegistry() {
+  static folly::Synchronized<std::shared_ptr<PartitionedOutputBufferManager>>
+      kManager;
+  return kManager;
+}
+
+std::shared_ptr<PartitionedOutputBufferManager>
+getRegisteredPartitionedOutputBufferManager(
+    const core::PartitionedOutputNode& node,
+    const core::QueryConfig& queryConfig) {
+  auto manager = partitionedOutputBufferManagerRegistry().withRLock(
+      [](const auto& registered) { return registered; });
+  return manager != nullptr && manager->supports(node, queryConfig)
+      ? std::move(manager)
+      : nullptr;
 }
 
 std::string errorMessageImpl(const std::exception_ptr& exception) {
@@ -213,7 +226,6 @@ std::string makeUuid() {
   return boost::lexical_cast<std::string>(boost::uuids::random_generator()());
 }
 
-#ifdef VELOX_ENABLE_CUDF
 bool isUcxExchangePlanNode(
     const core::PlanNode* planNode,
     const core::PlanNodeId& planNodeId) {
@@ -234,7 +246,6 @@ bool isUcxExchangePlanNode(
   }
   return false;
 }
-#endif
 
 // Returns true if an operator is a hash join operator given 'operatorType'.
 bool isHashJoinOperator(const std::string& operatorType) {
@@ -307,6 +318,31 @@ void noMoreSplitsForStore(
 }
 
 } // namespace
+
+bool registerPartitionedOutputBufferManager(
+    const std::shared_ptr<PartitionedOutputBufferManager>& manager) {
+  VELOX_CHECK_NOT_NULL(manager);
+  return partitionedOutputBufferManagerRegistry().withWLock(
+      [&](auto& registered) {
+        if (registered != nullptr) {
+          return false;
+        }
+        registered = manager;
+        return true;
+      });
+}
+
+bool unregisterPartitionedOutputBufferManager(
+    const std::shared_ptr<PartitionedOutputBufferManager>& manager) {
+  return partitionedOutputBufferManagerRegistry().withWLock(
+      [&](auto& registered) {
+        if (registered != manager) {
+          return false;
+        }
+        registered.reset();
+        return true;
+      });
+}
 
 std::string executionModeString(Task::ExecutionMode mode) {
   switch (mode) {
@@ -467,7 +503,7 @@ Task::Task(
       consumerSupplier_(std::move(consumerSupplier)),
       onError_(std::move(onError)),
       splitsStates_(buildSplitStates(planFragment_.planNode)),
-      bufferManager_(OutputBufferManager::getInstanceRef()) {
+      bufferManager_(DefaultOutputBufferManager::getInstanceRef()) {
   ++numCreatedTasks_;
   // Validate that any per-node transport type annotations refer to the right
   // kind of plan node before they are used to select exchange transports.
@@ -1304,11 +1340,14 @@ void Task::createAndStartDrivers(uint32_t concurrentSplitGroups) {
 }
 
 void Task::initializePartitionOutput() {
-  VELOX_CHECK(
-      isRunningLocked(),
-      "Task {} has already been terminated before start: {}",
-      taskId_,
-      errorMessageLocked());
+  {
+    std::lock_guard<std::timed_mutex> l(mutex_);
+    VELOX_CHECK(
+        isRunningLocked(),
+        "Task {} has already been terminated before start: {}",
+        taskId_,
+        errorMessageLocked());
+  }
 
   auto bufferManager = bufferManager_.lock();
   VELOX_CHECK_NOT_NULL(
@@ -1317,6 +1356,8 @@ void Task::initializePartitionOutput() {
       "PartitionedOutputBufferManager was already destructed");
   std::shared_ptr<const core::PartitionedOutputNode> partitionedOutputNode{
       nullptr};
+  std::shared_ptr<PartitionedOutputBufferManager>
+      partitionedOutputBufferManager;
   int numOutputDrivers{0};
   {
     std::unique_lock<std::timed_mutex> l(mutex_);
@@ -1337,6 +1378,9 @@ void Task::initializePartitionOutput() {
         if (partitionedOutputNode != nullptr) {
           numDriversInPartitionedOutput_ = factory->numDrivers;
           groupedPartitionedOutput_ = factory->groupedExecution;
+          partitionedOutputBufferManager =
+              getRegisteredPartitionedOutputBufferManager(
+                  *partitionedOutputNode, queryCtx_->queryConfig());
           numOutputDrivers = factory->groupedExecution
               ? factory->numDrivers * planFragment_.numSplitGroups
               : factory->numDrivers;
@@ -1366,18 +1410,36 @@ void Task::initializePartitionOutput() {
         partitionedOutputNode->kind(),
         partitionedOutputNode->numPartitions(),
         numOutputDrivers);
-#ifdef VELOX_ENABLE_CUDF
-    if (velox::cudf_velox::CudfConfig::getInstance().enabled &&
-        velox::cudf_velox::CudfConfig::getInstance().exchange) {
-      auto queueMgr = facebook::velox::ucx_exchange::UcxOutputQueueManager::
-          getInstanceRef();
-      queueMgr->initializeTask(
-          shared_from_this(),
-          partitionedOutputNode->kind(),
-          partitionedOutputNode->numPartitions(),
-          numOutputDrivers);
+    if (partitionedOutputBufferManager != nullptr) {
+      try {
+        partitionedOutputBufferManager->initializeTask(
+            shared_from_this(),
+            partitionedOutputNode->kind(),
+            partitionedOutputNode->numPartitions(),
+            numOutputDrivers);
+      } catch (...) {
+        try {
+          partitionedOutputBufferManager->removeTask(taskId_);
+        } catch (...) {
+          LOG(ERROR) << "Failed to clean up partitioned output after "
+                        "initialization failed for task "
+                     << taskId_;
+        }
+        throw;
+      }
+
+      bool keepManager{false};
+      {
+        std::lock_guard<std::timed_mutex> l(mutex_);
+        if (isRunningLocked()) {
+          partitionedOutputBufferManager_ = partitionedOutputBufferManager;
+          keepManager = true;
+        }
+      }
+      if (!keepManager) {
+        partitionedOutputBufferManager->removeTask(taskId_);
+      }
     }
-#endif
   }
 }
 
@@ -1906,6 +1968,9 @@ void Task::noMoreSplits(const core::PlanNodeId& planNodeId) {
   std::vector<ContinuePromise> splitPromises;
   bool allFinished;
   std::shared_ptr<ExchangeClient> exchangeClient;
+  std::shared_ptr<PartitionedOutputBufferManager>
+      partitionedOutputBufferManager;
+  std::optional<uint32_t> numPartitionedOutputDrivers;
   {
     std::lock_guard<std::timed_mutex> l(mutex_);
 
@@ -1946,11 +2011,20 @@ void Task::noMoreSplits(const core::PlanNodeId& planNodeId) {
       }
     }
 
-    allFinished = checkNoMoreSplitGroupsLocked();
+    allFinished = checkNoMoreSplitGroupsLocked(numPartitionedOutputDrivers);
+
+    if (numPartitionedOutputDrivers.has_value()) {
+      partitionedOutputBufferManager = partitionedOutputBufferManager_;
+    }
 
     if (!isRunningLocked()) {
       exchangeClient = getExchangeClientLocked(planNodeId);
     }
+  }
+
+  if (partitionedOutputBufferManager != nullptr) {
+    partitionedOutputBufferManager->updateNumDrivers(
+        taskId_, numPartitionedOutputDrivers.value());
   }
 
   for (auto& promise : splitPromises) {
@@ -2160,7 +2234,8 @@ void Task::dropInputLocked(
   }
 }
 
-bool Task::checkNoMoreSplitGroupsLocked() {
+bool Task::checkNoMoreSplitGroupsLocked(
+    std::optional<uint32_t>& numPartitionedOutputDrivers) {
   if (isUngroupedExecution()) {
     return false;
   }
@@ -2178,9 +2253,11 @@ bool Task::checkNoMoreSplitGroupsLocked() {
     numTotalDrivers_ = seenSplitGroups_.size() * numDriversPerSplitGroup_ +
         numDriversUngrouped_;
     if (groupedPartitionedOutput_) {
+      const auto numOutputDrivers =
+          numDriversInPartitionedOutput_ * seenSplitGroups_.size();
       auto bufferManager = bufferManager_.lock();
-      bufferManager->updateNumDrivers(
-          taskId(), numDriversInPartitionedOutput_ * seenSplitGroups_.size());
+      bufferManager->updateNumDrivers(taskId(), numOutputDrivers);
+      numPartitionedOutputDrivers = numOutputDrivers;
     }
 
     return checkIfFinishedLocked();
@@ -2207,13 +2284,27 @@ BlockingReason Task::getSplitOrFuture(
     const ConnectorSplitPreloadFunc& preload,
     exec::Split& split,
     ContinueFuture& future) {
-  std::lock_guard<std::timed_mutex> l(mutex_);
-  auto& splitsState = getPlanNodeSplitsStateLocked(planNodeId);
-  auto* splitsStore = getOrCreateSplitsStoreLocked(splitsState, splitGroupId);
-  return splitsStore->nextSplit(
-             driverId, maxPreloadSplits, preload, split, future)
-      ? BlockingReason::kNotBlocked
-      : BlockingReason::kWaitForSplit;
+  EventCompletionNotifier stateChangeNotifier;
+  bool notBlocked{false};
+  {
+    std::lock_guard<std::timed_mutex> l(mutex_);
+    auto& splitsState = getPlanNodeSplitsStateLocked(planNodeId);
+    auto* splitsStore = getOrCreateSplitsStoreLocked(splitsState, splitGroupId);
+    const auto numQueuedBefore = taskStats_.numQueuedTableScanSplits;
+    notBlocked = splitsStore->nextSplit(
+        driverId, maxPreloadSplits, preload, split, future);
+    // Wake status waiters when the scan split queue drains while more splits
+    // may still arrive, so a coordinator can refill before the task starves.
+    // Once noMoreSplits has been signaled there is nothing left to refill, so
+    // the drain carries no actionable signal and is skipped.
+    if (numQueuedBefore > 0 && taskStats_.numQueuedTableScanSplits == 0 &&
+        !splitsState.noMoreSplits) {
+      stateChangeNotifier.activate(std::move(stateChangePromises_));
+    }
+  }
+  stateChangeNotifier.notify();
+  return notBlocked ? BlockingReason::kNotBlocked
+                    : BlockingReason::kWaitForSplit;
 }
 
 bool Task::testingHasDriverWaitForSplit() const {
@@ -2371,7 +2462,9 @@ bool Task::updateOutputBuffers(int numBuffers, bool noMoreBuffers) {
   VELOX_CHECK_NOT_NULL(
       bufferManager,
       "Unable to initialize task. "
-      "OutputBufferManager was already destructed");
+      "DefaultOutputBufferManager was already destructed");
+  std::shared_ptr<PartitionedOutputBufferManager>
+      partitionedOutputBufferManager;
   {
     std::lock_guard<std::timed_mutex> l(mutex_);
     if (noMoreOutputBuffers_) {
@@ -2381,17 +2474,14 @@ bool Task::updateOutputBuffers(int numBuffers, bool noMoreBuffers) {
     if (noMoreBuffers) {
       noMoreOutputBuffers_ = true;
     }
+    partitionedOutputBufferManager = partitionedOutputBufferManager_;
   }
   auto result =
       bufferManager->updateOutputBuffers(taskId_, numBuffers, noMoreBuffers);
-#ifdef VELOX_ENABLE_CUDF
-  if (velox::cudf_velox::CudfConfig::getInstance().enabled &&
-      velox::cudf_velox::CudfConfig::getInstance().exchange) {
-    auto queueMgr =
-        facebook::velox::ucx_exchange::UcxOutputQueueManager::getInstanceRef();
-    queueMgr->updateOutputBuffers(taskId_, numBuffers, noMoreBuffers);
+  if (partitionedOutputBufferManager != nullptr) {
+    partitionedOutputBufferManager->updateOutputBuffers(
+        taskId_, numBuffers, noMoreBuffers);
   }
-#endif
   return result;
 }
 
@@ -2817,11 +2907,9 @@ ContinueFuture Task::terminate(TaskState terminalState) {
 
       // Process remaining remote splits.
       if (getExchangeClientLocked(nodeId) != nullptr) {
-#ifdef VELOX_ENABLE_CUDF
         if (isUcxExchangePlanNode(planFragment_.planNode.get(), nodeId)) {
           continue;
         }
-#endif
         std::vector<exec::Split> splits;
         for (auto& [groupId, store] : state.groupSplitsStores) {
           if (!store) {
@@ -2890,6 +2978,13 @@ ContinueFuture Task::terminate(TaskState terminalState) {
 
 void Task::maybeRemoveFromOutputBufferManager() {
   if (hasPartitionedOutput()) {
+    std::shared_ptr<PartitionedOutputBufferManager>
+        partitionedOutputBufferManager;
+    {
+      std::lock_guard<std::timed_mutex> l(mutex_);
+      partitionedOutputBufferManager =
+          std::move(partitionedOutputBufferManager_);
+    }
     if (auto bufferManager = bufferManager_.lock()) {
       // Capture output buffer stats before deleting the buffer.
       {
@@ -2901,23 +2996,30 @@ void Task::maybeRemoveFromOutputBufferManager() {
       }
       bufferManager->removeTask(taskId_);
     }
-#ifdef VELOX_ENABLE_CUDF
-    if (velox::cudf_velox::CudfConfig::getInstance().enabled &&
-        velox::cudf_velox::CudfConfig::getInstance().exchange) {
-      // Capture output queue stats before deleting the queue.
-      auto queueMgr = facebook::velox::ucx_exchange::UcxOutputQueueManager::
-          getInstanceRef();
-      // Capture output buffer stats before deleting the buffer.
-      {
-        std::lock_guard<std::timed_mutex> l(mutex_);
-        auto optStats = queueMgr->stats(taskId_);
+    if (partitionedOutputBufferManager != nullptr) {
+      try {
+        auto optStats = partitionedOutputBufferManager->stats(taskId_);
         if (optStats.has_value() && optStats.value().totalPagesSent > 0) {
+          std::lock_guard<std::timed_mutex> l(mutex_);
           taskStats_.outputBufferStats = optStats;
         }
+      } catch (const std::exception& e) {
+        LOG(ERROR) << "Failed to collect partitioned output stats for task "
+                   << taskId_ << ": " << e.what();
+      } catch (...) {
+        LOG(ERROR) << "Failed to collect partitioned output stats for task "
+                   << taskId_ << ": unknown exception";
       }
-      queueMgr->removeTask(taskId_);
+      try {
+        partitionedOutputBufferManager->removeTask(taskId_);
+      } catch (const std::exception& e) {
+        LOG(ERROR) << "Failed to remove partitioned output for task " << taskId_
+                   << ": " << e.what();
+      } catch (...) {
+        LOG(ERROR) << "Failed to remove partitioned output for task " << taskId_
+                   << ": unknown exception";
+      }
     }
-#endif
   }
 }
 
