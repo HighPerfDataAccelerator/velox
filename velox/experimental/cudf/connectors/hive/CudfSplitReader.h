@@ -95,6 +95,10 @@ class CudfSplitReader : public NvtxHelper {
   // Setup the cuDF data source
   void setupCudfDataSource();
 
+  // Return the size of the primary physical file after its data source has
+  // been initialized.
+  uint64_t primaryDataSourceSize() const;
+
   // Create a data source for one physical file.
   std::shared_ptr<cudf::io::datasource> createCudfDataSource(
       const std::string& filePath);

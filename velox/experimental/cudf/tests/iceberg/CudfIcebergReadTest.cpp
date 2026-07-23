@@ -789,14 +789,9 @@ TEST_F(CudfIcebergReadTest, nullPartitionColumn) {
 /// to no columns being read from the data file and the output is synthesized
 /// from the injected columns only
 TEST_F(CudfIcebergReadTest, partitionOnlyProjection) {
-  auto data = makeRowVector(
-      {"c0"},
-      {
-          makeFlatVector<int64_t>({1, 2, 3}),
-      });
-
+  auto rowGroups = makeVectors(ROW({"c0"}, {BIGINT()}), 4, 3);
   auto dataFile = TempFilePath::create();
-  writeToFile(dataFile->getPath(), data);
+  writeToFile(dataFile->getPath(), rowGroups);
 
   auto tableType = ROW({"c0", "country"}, {BIGINT(), VARCHAR()});
   auto outputType = ROW({"country"}, {VARCHAR()});
@@ -824,11 +819,18 @@ TEST_F(CudfIcebergReadTest, partitionOnlyProjection) {
   auto expected = makeRowVector(
       {"country"},
       {
-          makeFlatVector<std::string>({"US", "US", "US"}),
+          makeFlatVector<std::string>(12, [](vector_size_t) { return "US"; }),
       });
 
   AssertQueryBuilder(plan)
       .splits(makeIcebergSplits(dataFile->getPath(), {}, partitionKeys))
+      .assertResults({expected});
+
+  // Every byte-range split must synthesize only the rows from its own row
+  // groups. Using the whole-file footer count for each split would duplicate
+  // the injected partition value once per split.
+  AssertQueryBuilder(plan)
+      .splits(makeIcebergSplits(dataFile->getPath(), {}, partitionKeys, 4))
       .assertResults({expected});
 
   // Filter `country = 'CA'` excludes the partition value 'US', so the output is
