@@ -211,7 +211,9 @@ void CudfIcebergSplitReader::prepareCurrentSplit(
 
   // Determine if there are no columns to read.
   noColumnsToRead_ = readColumnNames_.empty();
-  if (noColumnsToRead_ and split_->start != 0) {
+  const bool coversWholeFile =
+      split_->start == 0 and split_->length >= primaryDataSourceSize();
+  if (noColumnsToRead_ and not coversWholeFile) {
     VELOX_CHECK(
         icebergSplit_->deleteFiles.empty(),
         "Iceberg byte-range splits with injected-only projections and delete "

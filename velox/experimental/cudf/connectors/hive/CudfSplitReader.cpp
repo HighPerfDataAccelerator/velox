@@ -258,6 +258,13 @@ void CudfSplitReader::setupCudfDataSource() {
   }
 }
 
+uint64_t CudfSplitReader::primaryDataSourceSize() const {
+  VELOX_CHECK_NOT_NULL(
+      dataSource_,
+      "CudfSplitReader does not have a datasource. Call setupCudfDataSource() first");
+  return dataSource_->size();
+}
+
 std::shared_ptr<cudf::io::datasource> CudfSplitReader::createCudfDataSource(
     const std::string& filePath) {
   const auto useBufferedInput = cudfHiveConfig_->useBufferedInputSession(
