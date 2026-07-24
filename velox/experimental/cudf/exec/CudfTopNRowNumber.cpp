@@ -64,6 +64,10 @@ constexpr uint64_t kDeviceHeadroomReserveBytes = 1ULL << 30;
 constexpr uint64_t kMaxUnadmittedCandidateWorkspaceBytes = 1ULL << 30;
 constexpr uint64_t kCandidatePartitionWorkspaceMultiplier = 2;
 constexpr uint64_t kCandidatePartitionWorkspaceOverhead = 16ULL << 20;
+constexpr cudf::size_type kPartialSelectivityMinSampleRows = 4096;
+constexpr cudf::size_type kPartialSelectivityMaxSampleRows = 65536;
+constexpr uint64_t kPartialBypassRetentionNumerator = 9;
+constexpr uint64_t kPartialBypassRetentionDenominator = 10;
 constexpr std::string_view kConditionalTopNMarker = "__gluten_mpp_topn_active";
 std::atomic<uint64_t> spillDirectorySequence{0};
 
@@ -217,6 +221,7 @@ CudfTopNRowNumber::CudfTopNRowNumber(
       limit_(node->limit()),
       rankFunction_(node->rankFunction()),
       generateRowNumber_(node->generateRowNumber()),
+      isPartial_(node->isPartial()),
       inputType_(node->inputType()),
       diagnosticNodeId_(node->id()),
       candidateRunBytes_(driverCtx->queryConfig().get<uint64_t>(
@@ -233,6 +238,9 @@ CudfTopNRowNumber::CudfTopNRowNumber(
           rankFunction_ == core::TopNRowNumberNode::RankFunction::kRank ||
           rankFunction_ == core::TopNRowNumberNode::RankFunction::kDenseRank,
       "CudfTopNRowNumber only supports row_number, rank, or dense_rank");
+  VELOX_CHECK(
+      !isPartial_ || !generateRowNumber_,
+      "Partial TopNRowNumber cannot generate a globally valid rank column");
 
   for (const auto& key : node->partitionKeys()) {
     const auto channel = exec::exprToChannel(key.get(), inputType_);
@@ -304,7 +312,7 @@ void CudfTopNRowNumber::doAddInput(RowVectorPtr input) {
     auto inactive = cudf::apply_boolean_mask(
         inputView, inactiveMask->view(), stream, get_output_mr());
     if (inactive->num_rows() > 0) {
-      passthroughOutputs_.push_back(
+      pendingOutputs_.push_back(
           std::make_shared<CudfVector>(
               pool(),
               inputType_,
@@ -326,6 +334,68 @@ void CudfTopNRowNumber::doAddInput(RowVectorPtr input) {
   auto mr = get_output_mr();
   const auto inputView = cudfInput->getTableView();
   const auto inputFlatBytes = cudfInput->estimateFlatSize();
+  if (isPartial_) {
+    if (!partialStrategyDecided_ &&
+        inputView.num_rows() >= kPartialSelectivityMinSampleRows) {
+      const auto sampleRows = std::min(
+          inputView.num_rows(), kPartialSelectivityMaxSampleRows);
+      auto sampleViews = cudf::slice(inputView, {0, sampleRows}, stream);
+      VELOX_CHECK_EQ(sampleViews.size(), 1);
+      const auto sampleFlatBytes =
+          inputFlatBytes * static_cast<uint64_t>(sampleRows) /
+          static_cast<uint64_t>(inputView.num_rows());
+      auto sampleCandidates = reduceToCandidates(
+          sampleViews.front(),
+          stream,
+          mr,
+          sampleFlatBytes,
+          ReductionSource::kSelectivitySample);
+      partialSampleRows_ = sampleRows;
+      partialSampleCandidateRows_ = sampleCandidates.table->num_rows();
+      partialBypass_ =
+          partialSampleCandidateRows_ *
+              kPartialBypassRetentionDenominator >=
+          partialSampleRows_ * kPartialBypassRetentionNumerator;
+      partialStrategyDecided_ = true;
+      addRuntimeStat(
+          "topNRowNumberPartialSampleRows",
+          RuntimeCounter(saturateCast(partialSampleRows_)));
+      addRuntimeStat(
+          "topNRowNumberPartialSampleCandidateRows",
+          RuntimeCounter(saturateCast(partialSampleCandidateRows_)));
+      if (partialBypass_) {
+        addRuntimeStat(
+            "topNRowNumberPartialBypassPath", RuntimeCounter(int64_t{1}));
+      }
+    }
+
+    if (partialBypass_) {
+      ++partialBypassBatches_;
+      partialBypassRows_ =
+          saturatingAdd(partialBypassRows_, inputView.num_rows());
+      pendingOutputs_.push_back(std::move(cudfInput));
+      return;
+    }
+
+    auto batchCandidates = reduceToCandidates(
+        inputView, stream, mr, inputFlatBytes, ReductionSource::kInput);
+    if (batchCandidates.table->num_rows() > 0) {
+      const auto outputRows = batchCandidates.table->num_rows();
+      addRuntimeStat(
+          "topNRowNumberPartialOutputBatches", RuntimeCounter(int64_t{1}));
+      addRuntimeStat(
+          "topNRowNumberPartialOutputRows",
+          RuntimeCounter(static_cast<int64_t>(outputRows)));
+      pendingOutputs_.push_back(std::make_shared<CudfVector>(
+          pool(),
+          inputType_,
+          outputRows,
+          std::move(batchCandidates.table),
+          stream));
+    }
+    return;
+  }
+
   if (supportsHostCandidateBuckets() && inputFlatBytes >= candidateRunBytes_) {
     auto inputAdmission = acquireCandidateWorkspaceAdmission(inputFlatBytes);
     addRuntimeStat(
@@ -787,6 +857,15 @@ CudfVectorPtr CudfTopNRowNumber::computeNextHostCandidateOutput() {
 
 void CudfTopNRowNumber::doNoMoreInput() {
   Operator::noMoreInput();
+  if (isPartial_) {
+    addRuntimeStat(
+        "topNRowNumberBoundedPartialPath", RuntimeCounter(int64_t{1}));
+    if (pendingOutputs_.empty()) {
+      finished_ = true;
+      logCandidateObservations();
+    }
+    return;
+  }
   if (spilled_ && candidates_) {
     spillCandidates();
   }
@@ -799,7 +878,7 @@ void CudfTopNRowNumber::doNoMoreInput() {
   } else {
     addRuntimeStat("topNRowNumberNoSpillFastPath", RuntimeCounter(int64_t{1}));
   }
-  if (!candidates_ && !hostCandidateMode_ && passthroughOutputs_.empty()) {
+  if (!candidates_ && !hostCandidateMode_ && pendingOutputs_.empty()) {
     finished_ = !spilled_;
     if (finished_) {
       logCandidateObservations();
@@ -808,9 +887,9 @@ void CudfTopNRowNumber::doNoMoreInput() {
 }
 
 RowVectorPtr CudfTopNRowNumber::doGetOutput() {
-  if (!passthroughOutputs_.empty()) {
-    auto output = std::move(passthroughOutputs_.front());
-    passthroughOutputs_.pop_front();
+  if (!pendingOutputs_.empty()) {
+    auto output = std::move(pendingOutputs_.front());
+    pendingOutputs_.pop_front();
     return output;
   }
 
@@ -896,7 +975,7 @@ CudfTopNRowNumber::CandidateTable CudfTopNRowNumber::reduceToCandidates(
     maxInputCandidateRows_ =
         std::max<uint64_t>(maxInputCandidateRows_, numRows);
     maxInputCandidateBytes_ = std::max(maxInputCandidateBytes_, flatBytes);
-  } else {
+  } else if (source == ReductionSource::kCandidateMerge) {
     candidateMergeRows_ = saturatingAdd(candidateMergeRows_, input.num_rows());
     candidateMergeBytes_ = saturatingAdd(candidateMergeBytes_, inputFlatBytes);
   }
@@ -1315,7 +1394,7 @@ void CudfTopNRowNumber::doClose() {
   hostCandidateCodec_.reset();
   nextCandidatePartition_ = 0;
   hostCandidateMode_ = false;
-  passthroughOutputs_.clear();
+  pendingOutputs_.clear();
   sortedRuns_.clear();
   partitionCarry_.reset();
   try {
@@ -1389,8 +1468,14 @@ void CudfTopNRowNumber::logCandidateObservations() {
   addRuntimeStat(
       "topNRowNumberHostOutputBucketCount",
       RuntimeCounter(saturateCast(hostOutputBuckets_)));
+  addRuntimeStat(
+      "topNRowNumberPartialBypassRows",
+      RuntimeCounter(saturateCast(partialBypassRows_)));
+  addRuntimeStat(
+      "topNRowNumberPartialBypassBatches",
+      RuntimeCounter(saturateCast(partialBypassBatches_)));
 
-  if (inputReductionBytes_ >= candidateRunBytes_ || spilled_) {
+  if (inputReductionBytes_ >= candidateRunBytes_ || partialBypass_ || spilled_) {
     LOG(WARNING) << "CudfTopNRowNumber candidate observations node="
                  << diagnosticNodeId_ << " inputRows=" << inputReductionRows_
                  << " inputFlatBytes=" << inputReductionBytes_
@@ -1409,6 +1494,11 @@ void CudfTopNRowNumber::logCandidateObservations() {
                  << maxHostCandidateUncompressedBytes_
                  << " hostCandidateBatches=" << hostCandidateBatches_
                  << " hostOutputBuckets=" << hostOutputBuckets_
+                 << " partialSampleRows=" << partialSampleRows_
+                 << " partialSampleCandidateRows="
+                 << partialSampleCandidateRows_
+                 << " partialBypassRows=" << partialBypassRows_
+                 << " partialBypassBatches=" << partialBypassBatches_
                  << " finalCandidateRows=" << finalCandidateRows_
                  << " finalCandidateFlatBytes=" << finalCandidateBytes_
                  << " spillRuns=" << spillRuns_;

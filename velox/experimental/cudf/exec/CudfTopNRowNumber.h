@@ -44,7 +44,7 @@ class CudfTopNRowNumber : public CudfOperatorBase {
       const std::shared_ptr<const core::TopNRowNumberNode>& node);
 
   bool needsInput() const override {
-    return !noMoreInput_ && passthroughOutputs_.empty();
+    return !noMoreInput_ && pendingOutputs_.empty();
   }
 
   exec::BlockingReason isBlocked(ContinueFuture* /*future*/) override {
@@ -52,7 +52,7 @@ class CudfTopNRowNumber : public CudfOperatorBase {
   }
 
   bool isFinished() override {
-    return finished_ && passthroughOutputs_.empty();
+    return finished_ && pendingOutputs_.empty();
   }
 
   static bool shouldReplace(
@@ -68,6 +68,7 @@ class CudfTopNRowNumber : public CudfOperatorBase {
   enum class ReductionSource {
     kInput,
     kCandidateMerge,
+    kSelectivitySample,
   };
 
   struct CandidateTable {
@@ -135,6 +136,7 @@ class CudfTopNRowNumber : public CudfOperatorBase {
   const int32_t limit_;
   const core::TopNRowNumberNode::RankFunction rankFunction_;
   const bool generateRowNumber_;
+  const bool isPartial_;
   const RowTypePtr inputType_;
   const core::PlanNodeId diagnosticNodeId_;
   const uint64_t candidateRunBytes_;
@@ -151,7 +153,7 @@ class CudfTopNRowNumber : public CudfOperatorBase {
   // can be emitted immediately; only true rows enter rank state.  This keeps
   // one input scan while avoiding state for high-volume unaffected rows.
   std::optional<cudf::size_type> passthroughKey_;
-  std::deque<CudfVectorPtr> passthroughOutputs_;
+  std::deque<CudfVectorPtr> pendingOutputs_;
 
   std::vector<CudfVectorPtr> inputs_;
   // Incremental per-partition Top-1 state. Every input batch is reduced first,
@@ -203,6 +205,12 @@ class CudfTopNRowNumber : public CudfOperatorBase {
   uint64_t hostCandidateRows_{0};
   uint64_t hostCandidateBatches_{0};
   uint64_t hostOutputBuckets_{0};
+  uint64_t partialSampleRows_{0};
+  uint64_t partialSampleCandidateRows_{0};
+  uint64_t partialBypassRows_{0};
+  uint64_t partialBypassBatches_{0};
+  bool partialStrategyDecided_{false};
+  bool partialBypass_{false};
   bool candidateObservationsLogged_{false};
 };
 

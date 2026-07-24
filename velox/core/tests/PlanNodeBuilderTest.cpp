@@ -1180,6 +1180,7 @@ TEST_F(PlanNodeBuilderTest, rowNumberNode) {
     EXPECT_EQ(node->id(), id);
     EXPECT_EQ(node->partitionKeys(), partitionKeys);
     EXPECT_EQ(node->limit(), limit);
+    EXPECT_TRUE(node->isPartial());
     EXPECT_TRUE(node->generateRowNumber());
     EXPECT_EQ(node->outputType()->names().back(), rowNumberColumnName);
     EXPECT_EQ(node->sources()[0], source_);
@@ -1190,6 +1191,7 @@ TEST_F(PlanNodeBuilderTest, rowNumberNode) {
                         .partitionKeys(partitionKeys)
                         .rowNumberColumnName(rowNumberColumnName)
                         .limit(limit)
+                        .isPartial(true)
                         .source(source_)
                         .build();
   verify(node);
