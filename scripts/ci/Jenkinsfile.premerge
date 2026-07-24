@@ -168,11 +168,20 @@ pipeline {
                                         returnStdout: true).trim()
                                 }
                                 dir(env.COLT_ROOT) {
-                                    withEnv(['GIT_LFS_SKIP_SMUDGE=1']) {
-                                        common.checkoutSourceCode(
-                                            this,
-                                            params.COLT_REPO_URL.trim(),
-                                            params.COLT_REF.trim())
+                                    retry(3) {
+                                        deleteDir()
+                                        withCredentials([gitUsernamePassword(
+                                            credentialsId: 'blossom-gitlab',
+                                            gitToolName: 'git-tool')]) {
+                                            sh '''
+                                                set -eu
+                                                git init .
+                                                git remote add origin "$COLT_REPO_URL"
+                                                git fetch --depth=10 --tags origin "$COLT_REF"
+                                                GIT_LFS_SKIP_SMUDGE=1 \
+                                                    git checkout --force --detach FETCH_HEAD
+                                            '''
+                                        }
                                     }
                                 }
                                 echo "Resolved Velox SHA: ${env.VELOX_SHA}"
