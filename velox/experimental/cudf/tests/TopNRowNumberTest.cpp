@@ -100,6 +100,30 @@ bool usedCudfTopNRowNumber(const TaskStats& stats) {
   return false;
 }
 
+int64_t topNRuntimeStat(const TaskStats& stats, std::string_view name) {
+  int64_t sum = 0;
+  for (const auto& pipelineStats : stats.pipelineStats) {
+    for (const auto& operatorStats : pipelineStats.operatorStats) {
+      if (operatorStats.operatorType != "CudfTopNRowNumber") {
+        continue;
+      }
+      const auto it = operatorStats.runtimeStats.find(std::string(name));
+      if (it != operatorStats.runtimeStats.end()) {
+        sum += it->second.sum;
+      }
+    }
+  }
+  return sum;
+}
+
+std::vector<RowVectorPtr> readAll(TaskCursor& cursor) {
+  std::vector<RowVectorPtr> results;
+  while (cursor.moveNext()) {
+    results.push_back(cursor.current());
+  }
+  return results;
+}
+
 class CudfTopNRowNumberTest : public OperatorTestBase {
  protected:
   static constexpr vector_size_t kNumRows = 32;
@@ -149,16 +173,24 @@ class CudfTopNRowNumberTest : public OperatorTestBase {
              kNumRows, [](vector_size_t /*row*/) { return 1; })});
   }
 
-  std::unique_ptr<TaskCursor> makeSpillingCursor(const std::string& spillRoot) {
+  std::unique_ptr<TaskCursor> makeCursor(
+      core::PlanNodePtr plan,
+      const std::string& spillRoot,
+      uint64_t candidateRunBytes) {
     CursorParameters params;
-    params.planNode = makePlan();
+    params.planNode = std::move(plan);
     params.maxDrivers = 1;
     params.serialExecution = true;
     params.spillDirectory = spillRoot;
     params.queryConfigs = {
         {cudf_velox::CudfConfig::kCudfEnabled, "true"},
-        {cudf_velox::CudfConfig::kCudfTopNRowNumberCandidateRunBytes, "1"}};
+        {cudf_velox::CudfConfig::kCudfTopNRowNumberCandidateRunBytes,
+         std::to_string(candidateRunBytes)}};
     return TaskCursor::create(params);
+  }
+
+  std::unique_ptr<TaskCursor> makeSpillingCursor(const std::string& spillRoot) {
+    return makeCursor(makePlan(), spillRoot, 1);
   }
 
  private:
@@ -225,6 +257,89 @@ TEST_F(CudfTopNRowNumberTest, earlyCloseCleansUp) {
   task.reset();
   EXPECT_FALSE(fs::exists(taskSpillRoot));
   EXPECT_TRUE(fs::is_empty(spillRoot->getPath()));
+}
+
+TEST_F(CudfTopNRowNumberTest, boundedPartialReturnsBatchLocalRankCandidates) {
+  std::vector<RowVectorPtr> data{
+      makeRowVector(
+          {"p", "s", "v"},
+          {makeFlatVector<int64_t>({1, 1, 2}),
+           makeFlatVector<int64_t>({10, 9, 5}),
+           makeFlatVector<int64_t>({101, 102, 201})}),
+      makeRowVector(
+          {"p", "s", "v"},
+          {makeFlatVector<int64_t>({1, 1, 2}),
+           makeFlatVector<int64_t>({20, 20, 7}),
+           makeFlatVector<int64_t>({103, 104, 202})})};
+  auto exactPlan = PlanBuilder()
+                       .values(data)
+                       .topNRank("rank", {"p"}, {"s DESC"}, 1, false)
+                       .planNode();
+  auto exactNode =
+      std::dynamic_pointer_cast<const core::TopNRowNumberNode>(exactPlan);
+  ASSERT_NE(exactNode, nullptr);
+  auto partialPlan =
+      core::TopNRowNumberNode::Builder(*exactNode).isPartial(true).build();
+  auto expected = makeRowVector(
+      {"p", "s", "v"},
+      {makeFlatVector<int64_t>({1, 2, 1, 1, 2}),
+       makeFlatVector<int64_t>({10, 5, 20, 20, 7}),
+       makeFlatVector<int64_t>({101, 201, 103, 104, 202})});
+
+  const auto spillRoot = TempDirectoryPath::create();
+  auto cursor = makeCursor(partialPlan, spillRoot->getPath(), 1);
+  auto actual = readAll(*cursor);
+  auto task = cursor->task();
+
+  assertEqualResults({expected}, actual);
+  EXPECT_EQ(
+      topNRuntimeStat(task->taskStats(), "topNRowNumberBoundedPartialPath"),
+      1);
+  EXPECT_EQ(
+      topNRuntimeStat(task->taskStats(), "topNRowNumberPartialOutputBatches"),
+      2);
+  EXPECT_EQ(
+      topNRuntimeStat(task->taskStats(), "topNRowNumberPartialOutputRows"), 5);
+  EXPECT_EQ(
+      topNRuntimeStat(task->taskStats(), "topNRowNumberPartialBypassRows"), 0);
+  EXPECT_TRUE(findSpillDirectories(spillRoot->getPath()).empty());
+}
+
+TEST_F(CudfTopNRowNumberTest, boundedPartialBypassesIneffectivePruning) {
+  constexpr vector_size_t kRows = 5000;
+  auto data = makeRowVector(
+      {"p", "s", "v"},
+      {makeFlatVector<int64_t>(kRows, [](auto row) { return row; }),
+       makeFlatVector<int64_t>(
+           kRows, [](auto row) { return static_cast<int64_t>(kRows - row); }),
+       makeFlatVector<int64_t>(kRows, [](auto row) { return row * 2; })});
+  auto exactPlan = PlanBuilder()
+                       .values({data})
+                       .topNRank("rank", {"p"}, {"s DESC"}, 1, false)
+                       .planNode();
+  auto exactNode =
+      std::dynamic_pointer_cast<const core::TopNRowNumberNode>(exactPlan);
+  ASSERT_NE(exactNode, nullptr);
+  auto partialPlan =
+      core::TopNRowNumberNode::Builder(*exactNode).isPartial(true).build();
+
+  const auto spillRoot = TempDirectoryPath::create();
+  auto cursor = makeCursor(partialPlan, spillRoot->getPath(), 1);
+  auto actual = readAll(*cursor);
+  auto task = cursor->task();
+
+  assertEqualResults({data}, actual);
+  EXPECT_EQ(
+      topNRuntimeStat(task->taskStats(), "topNRowNumberPartialBypassPath"), 1);
+  EXPECT_EQ(
+      topNRuntimeStat(task->taskStats(), "topNRowNumberPartialBypassBatches"),
+      1);
+  EXPECT_EQ(
+      topNRuntimeStat(task->taskStats(), "topNRowNumberPartialBypassRows"),
+      kRows);
+  EXPECT_EQ(
+      topNRuntimeStat(task->taskStats(), "topNRowNumberPartialOutputRows"), 0);
+  EXPECT_TRUE(findSpillDirectories(spillRoot->getPath()).empty());
 }
 
 } // namespace

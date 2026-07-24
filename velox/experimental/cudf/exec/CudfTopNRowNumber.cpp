@@ -52,6 +52,10 @@ constexpr uint64_t kDefaultCandidateRunBytes = 128ULL << 20;
 constexpr uint64_t kMergeChunkBytes = 32ULL << 20;
 constexpr size_t kMergeFanIn = 4;
 constexpr cudf::size_type kMaxCompleteOutputRows = 262144;
+constexpr cudf::size_type kPartialSelectivityMinSampleRows = 4096;
+constexpr cudf::size_type kPartialSelectivityMaxSampleRows = 65536;
+constexpr uint64_t kPartialBypassRetentionNumerator = 9;
+constexpr uint64_t kPartialBypassRetentionDenominator = 10;
 constexpr std::string_view kConditionalTopNMarker = "__gluten_mpp_topn_active";
 std::atomic<uint64_t> spillDirectorySequence{0};
 
@@ -144,6 +148,7 @@ CudfTopNRowNumber::CudfTopNRowNumber(
       limit_(node->limit()),
       rankFunction_(node->rankFunction()),
       generateRowNumber_(node->generateRowNumber()),
+      isPartial_(node->isPartial()),
       inputType_(node->inputType()),
       diagnosticNodeId_(node->id()),
       candidateRunBytes_(driverCtx->queryConfig().get<uint64_t>(
@@ -159,6 +164,9 @@ CudfTopNRowNumber::CudfTopNRowNumber(
           rankFunction_ == core::TopNRowNumberNode::RankFunction::kRank ||
           rankFunction_ == core::TopNRowNumberNode::RankFunction::kDenseRank,
       "CudfTopNRowNumber only supports row_number, rank, or dense_rank");
+  VELOX_CHECK(
+      !isPartial_ || !generateRowNumber_,
+      "Partial TopNRowNumber cannot generate a globally valid rank column");
 
   for (const auto& key : node->partitionKeys()) {
     const auto channel = exec::exprToChannel(key.get(), inputType_);
@@ -230,7 +238,7 @@ void CudfTopNRowNumber::doAddInput(RowVectorPtr input) {
     auto inactive = cudf::apply_boolean_mask(
         inputView, inactiveMask->view(), stream, get_output_mr());
     if (inactive->num_rows() > 0) {
-      passthroughOutputs_.push_back(
+      pendingOutputs_.push_back(
           std::make_shared<CudfVector>(
               pool(),
               inputType_,
@@ -250,8 +258,58 @@ void CudfTopNRowNumber::doAddInput(RowVectorPtr input) {
 
   auto stream = cudfInput->stream();
   auto mr = get_output_mr();
+  const auto inputView = cudfInput->getTableView();
+  if (isPartial_) {
+    if (!partialStrategyDecided_ &&
+        inputView.num_rows() >= kPartialSelectivityMinSampleRows) {
+      const auto sampleRows = std::min(
+          inputView.num_rows(), kPartialSelectivityMaxSampleRows);
+      auto sample = copyTableSlice(inputView, 0, sampleRows, stream, mr);
+      auto sampleCandidates =
+          reduceToCandidates(sample->view(), stream, mr);
+      partialSampleRows_ = sampleRows;
+      partialSampleCandidateRows_ = sampleCandidates->num_rows();
+      partialBypass_ =
+          partialSampleCandidateRows_ * kPartialBypassRetentionDenominator >=
+          partialSampleRows_ * kPartialBypassRetentionNumerator;
+      partialStrategyDecided_ = true;
+      addRuntimeStat(
+          "topNRowNumberPartialSampleRows",
+          RuntimeCounter(partialSampleRows_));
+      addRuntimeStat(
+          "topNRowNumberPartialSampleCandidateRows",
+          RuntimeCounter(partialSampleCandidateRows_));
+      if (partialBypass_) {
+        addRuntimeStat("topNRowNumberPartialBypassPath", RuntimeCounter(1));
+      }
+    }
+
+    if (partialBypass_) {
+      partialBypassRows_ += inputView.num_rows();
+      ++partialBypassBatches_;
+      pendingOutputs_.push_back(std::move(cudfInput));
+      return;
+    }
+
+    auto batchCandidates = reduceToCandidates(inputView, stream, mr);
+    partialOutputRows_ += batchCandidates->num_rows();
+    ++partialOutputBatches_;
+    addRuntimeStat(
+        "topNRowNumberPartialOutputRows",
+        RuntimeCounter(batchCandidates->num_rows()));
+    addRuntimeStat(
+        "topNRowNumberPartialOutputBatches", RuntimeCounter(1));
+    pendingOutputs_.push_back(std::make_shared<CudfVector>(
+        pool(),
+        inputType_,
+        batchCandidates->num_rows(),
+        std::move(batchCandidates),
+        stream));
+    return;
+  }
+
   auto batchCandidates =
-      reduceToCandidates(cudfInput->getTableView(), stream, mr);
+      reduceToCandidates(inputView, stream, mr);
   if (candidates_ && candidates_->num_rows() > 0) {
     std::vector<cudf::table_view> pieces{
         candidates_->view(), batchCandidates->view()};
@@ -279,6 +337,31 @@ void CudfTopNRowNumber::doAddInput(RowVectorPtr input) {
 
 void CudfTopNRowNumber::doNoMoreInput() {
   Operator::noMoreInput();
+  if (isPartial_) {
+    addRuntimeStat(
+        "topNRowNumberBoundedPartialPath", RuntimeCounter(1));
+    addRuntimeStat(
+        "topNRowNumberPartialBypassRows",
+        RuntimeCounter(partialBypassRows_));
+    addRuntimeStat(
+        "topNRowNumberPartialBypassBatches",
+        RuntimeCounter(partialBypassBatches_));
+    LOG(INFO) << fmt::format(
+        "CudfTopNRowNumber node={} bounded partial observations: "
+        "sampleRows={} sampleCandidateRows={} bypass={} bypassBatches={} "
+        "bypassRows={} outputBatches={} outputRows={}",
+        diagnosticNodeId_,
+        partialSampleRows_,
+        partialSampleCandidateRows_,
+        partialBypass_,
+        partialBypassBatches_,
+        partialBypassRows_,
+        partialOutputBatches_,
+        partialOutputRows_);
+    finished_ = pendingOutputs_.empty();
+    return;
+  }
+
   if (spilled_ && candidates_) {
     auto stream = cudfGlobalStreamPool().get_stream();
     auto candidateVector = std::make_shared<CudfVector>(
@@ -295,15 +378,18 @@ void CudfTopNRowNumber::doNoMoreInput() {
     compactSortedRunsForMerge();
     initializeSortedRunReaders();
   }
-  if (!candidates_ && passthroughOutputs_.empty()) {
+  if (!candidates_ && pendingOutputs_.empty()) {
     finished_ = !spilled_;
   }
 }
 
 RowVectorPtr CudfTopNRowNumber::doGetOutput() {
-  if (!passthroughOutputs_.empty()) {
-    auto output = std::move(passthroughOutputs_.front());
-    passthroughOutputs_.pop_front();
+  if (!pendingOutputs_.empty()) {
+    auto output = std::move(pendingOutputs_.front());
+    pendingOutputs_.pop_front();
+    if (isPartial_ && noMoreInput_ && pendingOutputs_.empty()) {
+      finished_ = true;
+    }
     return output;
   }
 
@@ -745,7 +831,7 @@ void CudfTopNRowNumber::cleanupSpillFiles() {
 void CudfTopNRowNumber::doClose() {
   inputs_.clear();
   candidates_.reset();
-  passthroughOutputs_.clear();
+  pendingOutputs_.clear();
   cleanupSpillFiles();
   Operator::close();
 }

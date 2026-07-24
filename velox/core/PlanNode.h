@@ -5916,6 +5916,9 @@ class TopNRowNumberNode : public PlanNode {
   /// @param limit Per-partition limit. The number of
   /// rows produced by this node will not exceed this value for any given
   /// partition. Extra rows will be dropped.
+  /// @param isPartial If true, computes an independently valid Top-N
+  /// candidate superset for each input batch. A downstream exact
+  /// TopNRowNumber or Window plus filter must finalize the result.
   TopNRowNumberNode(
       PlanNodeId id,
       RankFunction function,
@@ -5924,7 +5927,8 @@ class TopNRowNumberNode : public PlanNode {
       std::vector<SortOrder> sortingOrders,
       const std::optional<std::string>& rowNumberColumnName,
       int32_t limit,
-      PlanNodePtr source);
+      PlanNodePtr source,
+      bool isPartial = false);
 
   class Builder {
    public:
@@ -5939,6 +5943,7 @@ class TopNRowNumberNode : public PlanNode {
           ? std::make_optional(other.outputType()->names().back())
           : std::nullopt;
       limit_ = other.limit();
+      isPartial_ = other.isPartial();
       VELOX_CHECK_EQ(other.sources().size(), 1);
       source_ = other.sources()[0];
       function_ = other.rankFunction();
@@ -5980,6 +5985,11 @@ class TopNRowNumberNode : public PlanNode {
       return *this;
     }
 
+    Builder& isPartial(bool isPartial) {
+      isPartial_ = isPartial;
+      return *this;
+    }
+
     Builder& source(PlanNodePtr source) {
       source_ = std::move(source);
       return *this;
@@ -6011,7 +6021,8 @@ class TopNRowNumberNode : public PlanNode {
           sortingOrders_.value(),
           rowNumberColumnName_.value(),
           limit_.value(),
-          source_.value());
+          source_.value(),
+          isPartial_.value_or(false));
     }
 
    private:
@@ -6022,6 +6033,7 @@ class TopNRowNumberNode : public PlanNode {
     std::optional<std::vector<SortOrder>> sortingOrders_;
     std::optional<std::optional<std::string>> rowNumberColumnName_;
     std::optional<int32_t> limit_;
+    std::optional<bool> isPartial_;
     std::optional<PlanNodePtr> source_;
   };
 
@@ -6064,6 +6076,10 @@ class TopNRowNumberNode : public PlanNode {
     return function_;
   }
 
+  bool isPartial() const {
+    return isPartial_;
+  }
+
   bool generateRowNumber() const {
     return outputType_->size() > sources_[0]->outputType()->size();
   }
@@ -6087,6 +6103,7 @@ class TopNRowNumberNode : public PlanNode {
   const std::vector<SortOrder> sortingOrders_;
 
   const int32_t limit_;
+  const bool isPartial_;
 
   const std::vector<PlanNodePtr> sources_;
 

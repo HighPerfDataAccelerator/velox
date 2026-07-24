@@ -2932,13 +2932,15 @@ TopNRowNumberNode::TopNRowNumberNode(
     std::vector<SortOrder> sortingOrders,
     const std::optional<std::string>& rowNumberColumnName,
     int32_t limit,
-    PlanNodePtr source)
+    PlanNodePtr source,
+    bool isPartial)
     : PlanNode(std::move(id)),
       function_(function),
       partitionKeys_{std::move(partitionKeys)},
       sortingKeys_{std::move(sortingKeys)},
       sortingOrders_{std::move(sortingOrders)},
       limit_{limit},
+      isPartial_{isPartial},
       sources_{std::move(source)},
       outputType_{getOptionalRowNumberOutputType(
           sources_[0]->outputType(),
@@ -2985,6 +2987,9 @@ void TopNRowNumberNode::addDetails(std::stringstream& stream) const {
   stream << ") ";
 
   stream << "limit " << limit_;
+  if (isPartial_) {
+    stream << " partial";
+  }
 }
 
 folly::dynamic TopNRowNumberNode::serialize() const {
@@ -2997,6 +3002,7 @@ folly::dynamic TopNRowNumberNode::serialize() const {
     obj["rowNumberColumnName"] = outputType_->names().back();
   }
   obj["limit"] = limit_;
+  obj["partial"] = isPartial_;
   return obj;
 }
 
@@ -3030,7 +3036,8 @@ PlanNodePtr TopNRowNumberNode::create(
       sortingOrders,
       rowNumberColumnName,
       obj["limit"].asInt(),
-      source);
+      source,
+      obj.getDefault("partial", false).asBool());
 }
 
 void LocalMergeNode::addDetails(std::stringstream& stream) const {
