@@ -65,13 +65,6 @@ class CudfTopNRowNumber : public CudfOperatorBase {
   void doClose() override;
 
  private:
-  enum class SpillReason {
-    kThreshold,
-    kPressure,
-    kInputPressure,
-    kFinal,
-  };
-
   enum class ReductionSource {
     kInput,
     kCandidateMerge,
@@ -92,8 +85,8 @@ class CudfTopNRowNumber : public CudfOperatorBase {
 
   struct SortedRun;
 
-  void spillSortedRun(SpillReason reason);
-  void spillCandidates(SpillReason reason);
+  void spillSortedRun();
+  void spillCandidates();
   void compactSortedRunsForMerge();
   void initializeSortedRunReaders();
   bool loadPausedChunk(SortedRun& run);
@@ -135,7 +128,6 @@ class CudfTopNRowNumber : public CudfOperatorBase {
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr);
   bool tryRetainCurrentCandidatesOnHost(rmm::device_async_resource_ref mr);
-  void spillHostCandidateBatches(SpillReason reason);
   CudfVectorPtr computeNextHostCandidateOutput();
   void recordFinalCandidateOutput(const CudfVectorPtr& output);
   void logCandidateObservations();

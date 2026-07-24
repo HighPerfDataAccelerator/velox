@@ -326,17 +326,16 @@ void CudfTopNRowNumber::doAddInput(RowVectorPtr input) {
   auto mr = get_output_mr();
   const auto inputView = cudfInput->getTableView();
   const auto inputFlatBytes = cudfInput->estimateFlatSize();
-  if (inputFlatBytes >= candidateRunBytes_) {
+  if (supportsHostCandidateBuckets() &&
+      inputFlatBytes >= candidateRunBytes_) {
     auto inputAdmission = acquireCandidateWorkspaceAdmission(inputFlatBytes);
     addRuntimeStat(
         "topNRowNumberInputPressureChecks", RuntimeCounter(int64_t{1}));
     if (!inputAdmission.reservation) {
-      bool retainOnHost = !spilled_ && supportsHostCandidateBuckets();
-      if (candidates_ && retainOnHost) {
-        retainOnHost = tryRetainCurrentCandidatesOnHost(mr);
-      }
       if (candidates_) {
-        spillCandidates(SpillReason::kPressure);
+        VELOX_CHECK(
+            tryRetainCurrentCandidatesOnHost(mr),
+            "Unable to move retained TopN candidates to bounded host state");
       }
 
       const auto maxCandidateBytes = (kMaxUnadmittedCandidateWorkspaceBytes -
@@ -392,18 +391,9 @@ void CudfTopNRowNumber::doAddInput(RowVectorPtr input) {
         auto batchCandidates = reduceToCandidates(
             slices[0], stream, mr, chunkFlatBytes, ReductionSource::kInput);
         chunkAdmission.reservation.reset();
-        if (retainOnHost &&
-            tryRetainHostCandidateBatch(batchCandidates, stream, mr)) {
-          continue;
-        }
-        if (retainOnHost) {
-          spillHostCandidateBatches(SpillReason::kInputPressure);
-          retainOnHost = false;
-        }
-        candidates_ = std::move(batchCandidates.table);
-        candidateBytes_ = batchCandidates.flatBytes;
-        candidateStream_ = stream;
-        spillCandidates(SpillReason::kInputPressure);
+        VELOX_CHECK(
+            tryRetainHostCandidateBatch(batchCandidates, stream, mr),
+            "Unable to retain a bounded TopN input chunk in host state");
       }
       return;
     }
@@ -427,23 +417,18 @@ void CudfTopNRowNumber::addBatchCandidates(
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr) {
   if (hostCandidateMode_) {
-    if (tryRetainHostCandidateBatch(batchCandidates, stream, mr)) {
-      return;
-    }
-    spillHostCandidateBatches(SpillReason::kPressure);
-    candidates_ = std::move(batchCandidates.table);
-    candidateBytes_ = batchCandidates.flatBytes;
-    candidateStream_ = stream;
-    spillCandidates(SpillReason::kPressure);
+    VELOX_CHECK(
+        tryRetainHostCandidateBatch(batchCandidates, stream, mr),
+        "Unable to retain TopN candidates in bounded host state");
     return;
   }
 
   if (candidates_ && candidates_->num_rows() > 0) {
-    bool pressureSpilled = false;
     const auto projectedCandidateBytes =
         saturatingAdd(candidateBytes_, batchCandidates.flatBytes);
     std::optional<DeviceMemoryAdmissionReservation> memoryAdmission;
-    if (projectedCandidateBytes >= candidateRunBytes_) {
+    if (supportsHostCandidateBuckets() &&
+        projectedCandidateBytes >= candidateRunBytes_) {
       auto admission =
           acquireCandidateWorkspaceAdmission(projectedCandidateBytes);
       memoryAdmission = std::move(admission.reservation);
@@ -461,65 +446,40 @@ void CudfTopNRowNumber::addBatchCandidates(
               << " alreadyReservedBytes=" << admission.alreadyReservedBytes
               << " admitted=" << memoryAdmission.has_value();
       if (!memoryAdmission) {
-        if (!spilled_ && supportsHostCandidateBuckets() &&
+        VELOX_CHECK(
             tryRetainCurrentCandidatesOnHost(mr) &&
-            tryRetainHostCandidateBatch(batchCandidates, stream, mr)) {
-          addRuntimeStat(
-              "topNRowNumberHostPressureTransitions",
-              RuntimeCounter(int64_t{1}));
-          return;
-        }
-        if (hostCandidateMode_) {
-          spillHostCandidateBatches(SpillReason::kPressure);
-          candidates_ = std::move(batchCandidates.table);
-          candidateBytes_ = batchCandidates.flatBytes;
-          candidateStream_ = stream;
-          spillCandidates(SpillReason::kPressure);
-          return;
-        }
-        LOG(INFO)
-            << "CudfTopNRowNumber spilling retained candidates before merge "
-               "under pressure node="
-            << diagnosticNodeId_
-            << " retainedCandidateBytes=" << candidateBytes_
-            << " batchCandidateBytes=" << batchCandidates.flatBytes
-            << " projectedCandidateBytes=" << projectedCandidateBytes
-            << " estimatedWorkspaceBytes=" << admission.estimatedWorkspaceBytes
-            << " cudaFreeBytes=" << admission.headroom.freeBytes
-            << " poolReusableBytes=" << admission.headroom.reusablePoolBytes();
-        spillCandidates(SpillReason::kPressure);
-        candidates_ = std::move(batchCandidates.table);
-        candidateBytes_ = batchCandidates.flatBytes;
-        candidateStream_ = stream;
-        pressureSpilled = true;
+                tryRetainHostCandidateBatch(batchCandidates, stream, mr),
+            "Unable to move TopN candidates to bounded host state");
+        addRuntimeStat(
+            "topNRowNumberHostPressureTransitions",
+            RuntimeCounter(int64_t{1}));
+        return;
       }
     }
 
-    if (!pressureSpilled) {
-      if (candidateStream_->value() != stream.value()) {
-        std::vector<rmm::cuda_stream_view> candidateStreams{*candidateStream_};
-        cudf::detail::join_streams(candidateStreams, stream);
-        auto columns = candidates_->release();
-        for (auto& column : columns) {
-          column = cudf::rebind_stream(std::move(*column), stream);
-        }
-        candidates_ = std::make_unique<cudf::table>(std::move(columns));
+    if (candidateStream_->value() != stream.value()) {
+      std::vector<rmm::cuda_stream_view> candidateStreams{*candidateStream_};
+      cudf::detail::join_streams(candidateStreams, stream);
+      auto columns = candidates_->release();
+      for (auto& column : columns) {
+        column = cudf::rebind_stream(std::move(*column), stream);
       }
-      std::vector<cudf::table_view> pieces{
-          candidates_->view(), batchCandidates.table->view()};
-      auto merged = cudf::concatenate(pieces, stream, mr);
-      auto reduced = reduceToCandidates(
-          merged->view(),
-          stream,
-          mr,
-          projectedCandidateBytes,
-          ReductionSource::kCandidateMerge);
-      candidates_ = std::move(reduced.table);
-      candidateBytes_ = reduced.flatBytes;
-      candidateStream_ = stream;
-      addRuntimeStat(
-          "topNRowNumberCandidateMerges", RuntimeCounter(int64_t{1}));
+      candidates_ = std::make_unique<cudf::table>(std::move(columns));
     }
+    std::vector<cudf::table_view> pieces{
+        candidates_->view(), batchCandidates.table->view()};
+    auto merged = cudf::concatenate(pieces, stream, mr);
+    auto reduced = reduceToCandidates(
+        merged->view(),
+        stream,
+        mr,
+        projectedCandidateBytes,
+        ReductionSource::kCandidateMerge);
+    candidates_ = std::move(reduced.table);
+    candidateBytes_ = reduced.flatBytes;
+    candidateStream_ = stream;
+    addRuntimeStat(
+        "topNRowNumberCandidateMerges", RuntimeCounter(int64_t{1}));
   } else {
     candidates_ = std::move(batchCandidates.table);
     candidateBytes_ = batchCandidates.flatBytes;
@@ -527,13 +487,15 @@ void CudfTopNRowNumber::addBatchCandidates(
   }
 
   if (candidateBytes_ >= candidateRunBytes_) {
-    if (!spilled_ && supportsHostCandidateBuckets() &&
-        tryRetainCurrentCandidatesOnHost(mr)) {
+    if (supportsHostCandidateBuckets()) {
+      VELOX_CHECK(
+          tryRetainCurrentCandidatesOnHost(mr),
+          "Unable to move TopN candidates to bounded host state");
       addRuntimeStat(
           "topNRowNumberHostThresholdTransitions", RuntimeCounter(int64_t{1}));
       return;
     }
-    spillCandidates(SpillReason::kThreshold);
+    spillCandidates();
   }
 }
 
@@ -722,31 +684,6 @@ bool CudfTopNRowNumber::tryRetainCurrentCandidatesOnHost(
   return false;
 }
 
-void CudfTopNRowNumber::spillHostCandidateBatches(SpillReason reason) {
-  if (hostCandidateBuckets_.empty()) {
-    hostCandidateMode_ = false;
-    hostCandidateBytes_ = 0;
-    hostCandidatePayloadBytes_ = 0;
-    hostCandidateUncompressedBytes_ = 0;
-    nextCandidatePartition_ = 0;
-    return;
-  }
-
-  addRuntimeStat("topNRowNumberHostFallbackSpills", RuntimeCounter(int64_t{1}));
-  while (auto output = computeNextHostCandidateOutput()) {
-    candidateBytes_ = output->estimateFlatSize();
-    candidates_ = output->release();
-    candidateStream_ = output->stream();
-    spillCandidates(reason);
-  }
-  hostCandidateBuckets_.clear();
-  hostCandidateBytes_ = 0;
-  hostCandidatePayloadBytes_ = 0;
-  hostCandidateUncompressedBytes_ = 0;
-  nextCandidatePartition_ = 0;
-  hostCandidateMode_ = false;
-}
-
 CudfVectorPtr CudfTopNRowNumber::computeNextHostCandidateOutput() {
   auto stream = spillStream_;
   auto mr = get_output_mr();
@@ -854,7 +791,7 @@ CudfVectorPtr CudfTopNRowNumber::computeNextHostCandidateOutput() {
 void CudfTopNRowNumber::doNoMoreInput() {
   Operator::noMoreInput();
   if (spilled_ && candidates_) {
-    spillCandidates(SpillReason::kFinal);
+    spillCandidates();
   }
   if (spilled_) {
     compactSortedRunsForMerge();
@@ -969,7 +906,7 @@ CudfTopNRowNumber::CandidateTable CudfTopNRowNumber::reduceToCandidates(
   return {std::move(table), flatBytes};
 }
 
-void CudfTopNRowNumber::spillCandidates(SpillReason reason) {
+void CudfTopNRowNumber::spillCandidates() {
   VELOX_CHECK_NOT_NULL(candidates_);
   VELOX_CHECK(candidateStream_.has_value());
   spilledCandidateRows_ =
@@ -984,15 +921,13 @@ void CudfTopNRowNumber::spillCandidates(SpillReason reason) {
   bufferedBytes_ = candidateBytes_;
   candidateBytes_ = 0;
   candidateStream_.reset();
-  spillSortedRun(reason);
+  spillSortedRun();
 }
 
-void CudfTopNRowNumber::spillSortedRun(SpillReason reason) {
+void CudfTopNRowNumber::spillSortedRun() {
   if (inputs_.empty()) {
     return;
   }
-  const auto runBytes = bufferedBytes_;
-
   namespace fs = std::filesystem;
   if (!spilled_) {
     const auto& taskSpillRoot =
@@ -1051,34 +986,6 @@ void CudfTopNRowNumber::spillSortedRun(SpillReason reason) {
   sortedRuns_.push_back({std::move(path), nullptr});
   ++spillRuns_;
   addRuntimeStat("topNRowNumberSpillRuns", RuntimeCounter(int64_t{1}));
-  addRuntimeStat(
-      "topNRowNumberSpilledCandidateBytes",
-      RuntimeCounter(saturateCast(runBytes), RuntimeCounter::Unit::kBytes));
-  switch (reason) {
-    case SpillReason::kThreshold:
-      addRuntimeStat(
-          "topNRowNumberThresholdSpills", RuntimeCounter(int64_t{1}));
-      break;
-    case SpillReason::kPressure:
-      addRuntimeStat("topNRowNumberPressureSpills", RuntimeCounter(int64_t{1}));
-      break;
-    case SpillReason::kInputPressure:
-      addRuntimeStat(
-          "topNRowNumberInputPressureSpills", RuntimeCounter(int64_t{1}));
-      break;
-    case SpillReason::kFinal:
-      addRuntimeStat("topNRowNumberFinalSpills", RuntimeCounter(int64_t{1}));
-      break;
-  }
-  VLOG(1) << "CudfTopNRowNumber wrote candidate run node=" << diagnosticNodeId_
-          << " reason="
-          << (reason == SpillReason::kThreshold           ? "threshold"
-                  : reason == SpillReason::kPressure      ? "pressure"
-                  : reason == SpillReason::kInputPressure ? "input-pressure"
-                                                          : "final")
-          << " rows=" << input->num_rows() << " candidateBytes=" << runBytes
-          << " totalRuns=" << sortedRuns_.size();
-  bufferedBytes_ = 0;
   ::malloc_trim(0);
 }
 

@@ -362,8 +362,6 @@ TEST_F(CudfTopNRowNumberTest, rankTiesAcrossHostCandidateBucketsMatchCpu) {
           task->taskStats(), "topNRowNumberHostCandidateUncompressedBytes"),
       0);
   EXPECT_EQ(
-      topNRuntimeStat(task->taskStats(), "topNRowNumberPressureSpills"), 0);
-  EXPECT_EQ(
       topNRuntimeStat(task->taskStats(), "topNRowNumberThresholdSpills"), 0);
   EXPECT_EQ(topNRuntimeStat(task->taskStats(), "topNRowNumberSpillRuns"), 0);
   EXPECT_TRUE(findSpillDirectories(spillRoot->getPath()).empty());
@@ -400,103 +398,6 @@ TEST_F(CudfTopNRowNumberTest, earlyCloseReleasesHostCandidateState) {
   EXPECT_TRUE(findSpillDirectories(spillRoot->getPath()).empty());
   task.reset();
   EXPECT_TRUE(fs::is_empty(spillRoot->getPath()));
-}
-
-TEST_F(CudfTopNRowNumberTest, pressurePreMergeSpillIsExercised) {
-  std::vector<RowVectorPtr> data{
-      makeRowVector(
-          {"p", "s", "v"},
-          {makeFlatVector<int64_t>({1, 2}),
-           makeFlatVector<int64_t>({10, 5}),
-           makeFlatVector<int64_t>({101, 201})}),
-      makeRowVector(
-          {"p", "s", "v"},
-          {makeFlatVector<int64_t>({1, 2}),
-           makeFlatVector<int64_t>({20, 7}),
-           makeFlatVector<int64_t>({102, 202})})};
-  auto plan = PlanBuilder()
-                  .values(data)
-                  .topNRank("row_number", {"p"}, {"s DESC"}, 1, true)
-                  .planNode();
-  auto expected = makeRowVector(
-      {"p", "s", "v", "row_number"},
-      {makeFlatVector<int64_t>({1, 2}),
-       makeFlatVector<int64_t>({20, 7}),
-       makeFlatVector<int64_t>({102, 202}),
-       makeFlatVector<int64_t>({1, 1})});
-
-  const auto headroom = cudf_velox::captureDeviceAllocationHeadroom();
-  ASSERT_TRUE(headroom.cudaValid);
-  ASSERT_GT(headroom.allocatableBytes(), 0);
-  auto admissionBlocker = cudf_velox::tryAcquireDeviceMemoryAdmission(
-      headroom.device,
-      headroom.allocatableBytes(),
-      std::numeric_limits<size_t>::max());
-  ASSERT_TRUE(admissionBlocker.has_value());
-
-  const auto spillRoot = TempDirectoryPath::create();
-  auto cursor = makeCursor(plan, spillRoot->getPath(), 72);
-  auto actual = readAll(*cursor);
-  auto task = cursor->task();
-
-  assertEqualResults({expected}, actual);
-  EXPECT_EQ(
-      topNRuntimeStat(task->taskStats(), "topNRowNumberPressureChecks"), 1);
-  EXPECT_EQ(
-      topNRuntimeStat(task->taskStats(), "topNRowNumberPressureSpills"), 1);
-  EXPECT_EQ(
-      topNRuntimeStat(task->taskStats(), "topNRowNumberThresholdSpills"), 0);
-  EXPECT_EQ(topNRuntimeStat(task->taskStats(), "topNRowNumberSpillRuns"), 2);
-  EXPECT_TRUE(findSpillDirectories(spillRoot->getPath()).empty());
-}
-
-TEST_F(CudfTopNRowNumberTest, pressureSplitsOversizedInputBeforeReduction) {
-  std::vector<RowVectorPtr> data{makeRowVector(
-      {"p", "s", "v"},
-      {makeFlatVector<int64_t>({1, 2, 1, 2}),
-       makeFlatVector<int64_t>({10, 5, 20, 7}),
-       makeFlatVector<int64_t>({101, 201, 102, 202})})};
-  auto plan = PlanBuilder()
-                  .values(data)
-                  .topNRank("row_number", {"p"}, {"s DESC"}, 1, true)
-                  .planNode();
-  auto expected = makeRowVector(
-      {"p", "s", "v", "row_number"},
-      {makeFlatVector<int64_t>({1, 2}),
-       makeFlatVector<int64_t>({20, 7}),
-       makeFlatVector<int64_t>({102, 202}),
-       makeFlatVector<int64_t>({1, 1})});
-
-  const auto headroom = cudf_velox::captureDeviceAllocationHeadroom();
-  ASSERT_TRUE(headroom.cudaValid);
-  ASSERT_GT(headroom.allocatableBytes(), 0);
-  auto admissionBlocker = cudf_velox::tryAcquireDeviceMemoryAdmission(
-      headroom.device,
-      headroom.allocatableBytes(),
-      std::numeric_limits<size_t>::max());
-  ASSERT_TRUE(admissionBlocker.has_value());
-
-  const auto spillRoot = TempDirectoryPath::create();
-  auto cursor = makeCursor(plan, spillRoot->getPath(), 72);
-  auto actual = readAll(*cursor);
-  auto task = cursor->task();
-
-  assertEqualResults({expected}, actual);
-  EXPECT_EQ(
-      topNRuntimeStat(task->taskStats(), "topNRowNumberInputPressureChecks"),
-      1);
-  EXPECT_EQ(
-      topNRuntimeStat(task->taskStats(), "topNRowNumberInputPressureSplits"),
-      1);
-  EXPECT_EQ(
-      topNRuntimeStat(task->taskStats(), "topNRowNumberInputPressureChunks"),
-      2);
-  EXPECT_EQ(
-      topNRuntimeStat(task->taskStats(), "topNRowNumberInputPressureSpills"),
-      2);
-  EXPECT_EQ(
-      topNRuntimeStat(task->taskStats(), "topNRowNumberThresholdSpills"), 0);
-  EXPECT_TRUE(findSpillDirectories(spillRoot->getPath()).empty());
 }
 
 TEST_F(CudfTopNRowNumberTest, pressureSplitsRankInputIntoHostCandidateBuckets) {
@@ -549,9 +450,6 @@ TEST_F(CudfTopNRowNumberTest, pressureSplitsRankInputIntoHostCandidateBuckets) {
       2);
   EXPECT_EQ(
       topNRuntimeStat(task->taskStats(), "topNRowNumberHostCandidatePath"), 1);
-  EXPECT_EQ(
-      topNRuntimeStat(task->taskStats(), "topNRowNumberInputPressureSpills"),
-      0);
   EXPECT_EQ(topNRuntimeStat(task->taskStats(), "topNRowNumberSpillRuns"), 0);
   EXPECT_TRUE(findSpillDirectories(spillRoot->getPath()).empty());
 }
