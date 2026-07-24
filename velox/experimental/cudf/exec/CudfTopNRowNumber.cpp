@@ -326,8 +326,7 @@ void CudfTopNRowNumber::doAddInput(RowVectorPtr input) {
   auto mr = get_output_mr();
   const auto inputView = cudfInput->getTableView();
   const auto inputFlatBytes = cudfInput->estimateFlatSize();
-  if (supportsHostCandidateBuckets() &&
-      inputFlatBytes >= candidateRunBytes_) {
+  if (supportsHostCandidateBuckets() && inputFlatBytes >= candidateRunBytes_) {
     auto inputAdmission = acquireCandidateWorkspaceAdmission(inputFlatBytes);
     addRuntimeStat(
         "topNRowNumberInputPressureChecks", RuntimeCounter(int64_t{1}));
@@ -451,8 +450,7 @@ void CudfTopNRowNumber::addBatchCandidates(
                 tryRetainHostCandidateBatch(batchCandidates, stream, mr),
             "Unable to move TopN candidates to bounded host state");
         addRuntimeStat(
-            "topNRowNumberHostPressureTransitions",
-            RuntimeCounter(int64_t{1}));
+            "topNRowNumberHostPressureTransitions", RuntimeCounter(int64_t{1}));
         return;
       }
     }
@@ -478,8 +476,7 @@ void CudfTopNRowNumber::addBatchCandidates(
     candidates_ = std::move(reduced.table);
     candidateBytes_ = reduced.flatBytes;
     candidateStream_ = stream;
-    addRuntimeStat(
-        "topNRowNumberCandidateMerges", RuntimeCounter(int64_t{1}));
+    addRuntimeStat("topNRowNumberCandidateMerges", RuntimeCounter(int64_t{1}));
   } else {
     candidates_ = std::move(batchCandidates.table);
     candidateBytes_ = batchCandidates.flatBytes;
