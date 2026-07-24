@@ -11,14 +11,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-name: Run Checks
+name: Velox Phase 0
 
 on:
   pull_request:
+    branches:
+      - dev
     types:
       - opened
       - reopened
       - edited
+      - ready_for_review
       - synchronize
 
 permissions:
@@ -29,8 +32,10 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  pre-commit:
+  hygiene:
+    name: Velox Phase 0 / Hygiene
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
@@ -38,9 +43,25 @@ jobs:
       - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
       - uses: pre-commit/action@2c7b3805fd2a0fd8c1884dcaebf91fc102a13ecd # v3.0.1
 
-  title-check:
-    name: PR Title Format
+  self-tests:
+    name: Velox Phase 0 / Unit and Contract Tests
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+      - name: Run Phase 0 tests
+        run: |
+          python3 -m unittest discover \
+            -s .github/scripts \
+            -p 'test_*.py'
+
+  title-check:
+    name: Velox Phase 0 / PR Title Format
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - shell: python
         env:
@@ -57,3 +78,72 @@ jobs:
             exit(1)
           else:
             exit(0)
+
+  classify:
+    name: Velox Phase 0 / Change Classification
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      classification: ${{ steps.classify.outputs.classification }}
+      native_required: ${{ steps.classify.outputs.native_required }}
+      spark_mpp: ${{ steps.classify.outputs.spark_mpp }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Collect changed files
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          git diff --name-only --diff-filter=ACMRD \
+            "$BASE_SHA...$HEAD_SHA" > "$RUNNER_TEMP/phase0-changed-files.txt"
+
+          if [[ ! -s "$RUNNER_TEMP/phase0-changed-files.txt" ]]; then
+            echo "::error::The pull request change set is empty."
+            exit 1
+          fi
+
+      - name: Classify change
+        id: classify
+        run: |
+          python3 .github/scripts/classify_phase0_changes.py \
+            --changed-files "$RUNNER_TEMP/phase0-changed-files.txt"
+
+  gate:
+    name: Velox Phase 0 / Gate
+    if: always()
+    needs:
+      - hygiene
+      - self-tests
+      - title-check
+      - classify
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Report Phase 0 result
+        env:
+          CLASSIFY_RESULT: ${{ needs.classify.result }}
+          HYGIENE_RESULT: ${{ needs.hygiene.result }}
+          SELF_TESTS_RESULT: ${{ needs.self-tests.result }}
+          TITLE_RESULT: ${{ needs.title-check.result }}
+        run: |
+          failed=false
+          for result in \
+            "$HYGIENE_RESULT" \
+            "$SELF_TESTS_RESULT" \
+            "$TITLE_RESULT" \
+            "$CLASSIFY_RESULT"; do
+            if [[ "$result" != "success" ]]; then
+              failed=true
+            fi
+          done
+
+          if [[ "$failed" == "true" ]]; then
+            echo "::error::One or more Velox Phase 0 checks failed."
+            exit 1
+          fi
+
+          echo "Phase 0 lightweight checks passed."

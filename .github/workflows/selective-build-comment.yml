@@ -20,10 +20,7 @@ name: Selective Build Comment
 # is uploaded by either decide-mode or prepare-slow inside
 # selective-build-plan.yml.
 on:
-  workflow_run:
-    workflows: [Linux Build using GCC]
-    types:
-      - completed
+  workflow_dispatch: {}
 
 permissions:
   pull-requests: write
@@ -32,13 +29,11 @@ permissions:
 
 jobs:
   post-comment:
+    # Suspended during Phase 0 while the inherited Linux PR build is disabled.
+    if: false
     # Post on PR-related runs (not push). Trigger on both success and
     # failure — when any build job fails, reviewers most need to see what
     # was supposed to be built.
-    if: >
-      github.event.workflow_run.event == 'pull_request' &&
-      (github.event.workflow_run.conclusion == 'success' ||
-       github.event.workflow_run.conclusion == 'failure')
     runs-on: ubuntu-latest
     steps:
       # workflow_run-triggered jobs start with an empty workspace; check

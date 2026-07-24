@@ -1,5 +1,63 @@
 # CI Workflows
 
+## HighPerfDataAccelerator Phase 0.5
+
+The `HighPerfDataAccelerator/velox` fork temporarily uses a lightweight
+pull-request gate alongside the authorized Blossom/Jenkins native pipeline.
+`.github/workflows/preliminary_checks.yml` runs for every pull request targeting
+`dev`; a path-selected CPU Breeze build also runs when Breeze, Perfetto, CMake,
+or its setup inputs change, and documentation validation runs for documentation
+changes. The real Blossom workflow is started separately by an authorized
+`build` comment.
+
+The visible lightweight checks are:
+
+| Check | Purpose |
+|-------|---------|
+| `Velox Phase 0 / Hygiene` | Existing pre-commit formatting, license, lint, and workflow-security checks |
+| `Velox Phase 0 / Unit and Contract Tests` | Exercise change classification and assert the fork's workflow invariants |
+| `Velox Phase 0 / PR Title Format` | Existing conventional pull-request title check |
+| `Velox Phase 0 / Change Classification` | Classify documentation, workflow, native CPU, Spark-MPP cuDF, Spark-MPP UCX, and dependency changes |
+| `Velox Phase 0 / Gate` | Stable aggregate check for the four lightweight jobs above |
+
+Every Phase 0 job has a five-minute timeout. The current live timings are under
+one minute.
+
+`Velox Phase 0 / Gate` does not claim native success. Authorized maintainers can
+comment `build` on a pull request to run the real `.github/workflows/blossom-ci.yml`
+pipeline. Keep that privileged, default-branch workflow separate from the
+pull-request-authored lightweight gate.
+
+The Blossom workflow also provides a side-effect-free `runner-smoke` manual
+mode. It verifies that the protected `blossom` runner is assigned to the
+repository and has the `blossom-ci` command installed before attempting
+authorization, vulnerability scanning, or native dispatch.
+
+### Next-boundary checks
+
+The CPU `Ubuntu debug` job in `.github/workflows/breeze.yml` is enabled for
+relevant pull requests targeting `dev` and for manual dispatch in
+`HighPerfDataAccelerator/velox`. It is an original Velox sanitizer
+build-and-test lane that runs on the standard GitHub-hosted `ubuntu-22.04`
+runner with a five-minute timeout. Its canary completed in 3m11s. The GPU Breeze
+job remains restricted to upstream because its custom GPU runner is not
+available in the fork.
+
+The original documentation build is also enabled for documentation pull
+requests. The fork substitutes `ubuntu-latest` for the unavailable
+`16-core-ubuntu` runner, uses read-only repository permissions, and enforces the
+same five-minute timeout. Documentation publishing remains outside the
+pull-request path.
+
+The remaining general build, test, fuzzer, packaging, and selective-build
+workflows stay in the repository for later restoration, but their automatic
+pull-request triggers are suspended. Their manual, scheduled, or upstream
+`main`-push entry points are retained where applicable. Branch protection for
+`dev` is an external repository setting and should be enabled only after these
+checks have completed their burn-in period.
+
+## Retained upstream workflows
+
 Velox CI validates builds and tests across Linux (GCC and optionally Clang) and macOS (Apple Clang). Linux workflows run full unit test suites in Docker containers on 32-core runners; macOS workflows verify compilation only. Fuzzer workflows stress-test functions and operators with randomized inputs.
 
 ### Why Docker containers?
@@ -18,25 +76,26 @@ For current build times and performance trends, see the [CI performance metrics]
 
 | Workflow | File | Triggers | Purpose |
 |----------|------|----------|---------|
-| Linux Build using GCC | `linux-build.yml` + `linux-build-base.yml` | push to main, PRs | Main build & test (3 configs); selective by default, full on push / sticky-approval |
-| Detect Force-Full Trigger | `detect-force-full.yml` | PR approving review | Step 1 of the approval-path chain: trivial trigger for the workflow_run hand-off (needed because fork PR reviews get a read-only token) |
-| Rerun Linux Build on Force-Full Trigger | `rerun-on-force-full.yml` | workflow_run (after Detect Force-Full Trigger) | Step 2 of the approval-path chain: BASE-context, dedups, calls the `rerun-linux-build` composite action |
-| Force-Full Build on /full-build Comment | `force-full-on-comment.yml` | PR comment containing `/full-build` | Direct (no workflow_run hop): dedups, calls the `rerun-linux-build` composite action |
-| Selective Build Comment | `selective-build-comment.yml` | workflow_run (after Linux Build) | Post selective build plan as PR comment |
-| macOS Build | `macos.yml` | push, PRs | Compilation check (debug + release) |
-| Breeze Linux Build | `breeze.yml` | push to main, PRs | Tracing module with sanitizers |
-| Fuzzer Jobs | `scheduled.yml` | PRs, push to main, daily cron, manual | Randomized correctness testing |
-| Run Checks | `preliminary_checks.yml` | PRs | Formatting, linting, PR title |
-| Dependency Graph | `dependency-graph.yml` | push to main | Cache CMake dependency graph artifact |
+| Linux Build using GCC | `linux-build.yml` + `linux-build-base.yml` | manual, push to upstream main | Main build & test (3 configs); selective PR entry point suspended |
+| Detect Force-Full Trigger | `detect-force-full.yml` | manual, suspended job | Retained approval-path definition |
+| Rerun Linux Build on Force-Full Trigger | `rerun-on-force-full.yml` | manual, suspended job | Retained full-build rerun definition |
+| Force-Full Build on /full-build Comment | `force-full-on-comment.yml` | manual, suspended job | Retained comment escalation definition |
+| Selective Build Comment | `selective-build-comment.yml` | manual, suspended job | Retained selective-build comment definition |
+| macOS Build | `macos.yml` | manual, push to upstream main | Compilation check (debug + release) |
+| Breeze Linux Build | `breeze.yml` | path-selected PRs to dev, manual, push to upstream main | CPU tracing module build and tests with sanitizers |
+| Fuzzer Jobs | `scheduled.yml` | push to upstream main, daily cron, manual | Randomized correctness testing |
+| Velox Phase 0 | `preliminary_checks.yml` | PRs targeting dev | Formatting, self-tests, title, classification, aggregate lightweight gate |
+| Blossom CI | `blossom-ci.yml` | Authorized `build` PR comment, manual | Runner smoke, internal vulnerability scan, and native CI dispatch |
+| Dependency Graph | `dependency-graph.yml` | manual | Cache CMake dependency graph artifact |
 | Selective Build Plan | `selective-build-plan.yml` (reusable) | called by Linux Build using GCC | Decide full vs targeted build per PR; uploads plan-comment artifact consumed by Selective Build Comment |
 | CI Failure Comment | `ci-failure-comment.yml` | workflow_run (on Linux Build using GCC / Fuzzer failure) | AI-powered failure analysis on PRs |
 | Claude PR Assistants | `claude.yml` + `claude-review.yml` | PR comments (`@claude`) | AI code review |
 | Build Pyvelox Wheels | `build_pyvelox.yml` | manual | Python wheel packaging |
-| Docker Images | `docker.yml` | push to main, manual | Multi-arch Docker images |
+| Docker Images | `docker.yml` | push to upstream main, manual | Multi-arch Docker images |
 | Weekly Date Tag | `tag.yml` | weekly cron, manual | Version tagging |
-| Update Documentation | `docs.yml` | push (docs changes), PRs | Sphinx docs + GitHub Pages |
-| Collect Build Metrics | `build-metrics.yml` | PRs, daily, manual | Binary size tracking (disabled) |
-| Ubuntu Bundled Deps | `ubuntu-bundled-deps.yml` | nightly, manual, PRs (dep scripts) | Build-from-source validation |
+| Update Documentation | `docs.yml` | docs PRs to dev, push to dev, manual | Sphinx documentation validation |
+| Collect Build Metrics | `build-metrics.yml` | daily, manual | Binary size tracking (disabled) |
+| Ubuntu Bundled Deps | `ubuntu-bundled-deps.yml` | nightly, manual | Build-from-source validation |
 
 ## Core Build & Test
 

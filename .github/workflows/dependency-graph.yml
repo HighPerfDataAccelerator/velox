@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Generates and uploads the dependency-graph artifact for every push to main.
+# Generates and uploads the dependency-graph artifact on manual request.
 # The artifact (`dependency-graph`) is consumed by the selective-build-plan
 # reusable workflow (called from linux-build.yml) to compute
 # targeted-build target lists for PRs.
@@ -22,17 +22,7 @@
 name: Dependency Graph
 
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - velox/**
-      - CMakeLists.txt
-      - CMake/**
-      - .github/workflows/dependency-graph.yml
-      - .github/scripts/generate-dependency-graph.py
-      - .github/actions/generate-dependency-graph/action.yml
-      - .github/scripts/cmake-flags.sh
+  workflow_dispatch: {}
 
 permissions:
   contents: read
