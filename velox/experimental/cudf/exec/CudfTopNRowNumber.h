@@ -18,7 +18,6 @@
 #include "velox/experimental/cudf/exec/CudfOperator.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
-#include "velox/common/compression/Compression.h"
 #include "velox/core/PlanNode.h"
 
 #include <cudf/io/parquet.hpp>
@@ -65,38 +64,13 @@ class CudfTopNRowNumber : public CudfOperatorBase {
   void doClose() override;
 
  private:
-  enum class ReductionSource {
-    kInput,
-    kCandidateMerge,
-    kSelectivitySample,
-  };
-
-  struct CandidateTable {
-    std::unique_ptr<cudf::table> table;
-    uint64_t flatBytes;
-  };
-
-  struct HostCandidateChunk {
-    std::unique_ptr<std::vector<uint8_t>> metadata;
-    BufferPtr data;
-    uint64_t uncompressedBytes;
-    cudf::size_type rows;
-    uint64_t flatBytes;
-  };
-
-  struct SortedRun;
-
   void spillSortedRun();
-  void spillCandidates();
   void compactSortedRunsForMerge();
   void initializeSortedRunReaders();
-  bool loadPausedChunk(SortedRun& run);
-  std::unique_ptr<cudf::table> mergeNextPausedBatch(
-      std::vector<SortedRun*>& runs,
+  std::unique_ptr<cudf::table> mergeNextSortedBatch(
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr,
-      bool& finished);
-  std::unique_ptr<cudf::table> mergeNextSortedBatch(bool& finalBatch);
+      bool& finalBatch);
   std::unique_ptr<cudf::table> takeCompletePartitions(
       std::unique_ptr<cudf::table> sorted,
       bool finalBatch,
@@ -113,25 +87,10 @@ class CudfTopNRowNumber : public CudfOperatorBase {
       cudf::table_view input,
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr);
-  CandidateTable reduceToCandidates(
+  std::unique_ptr<cudf::table> reduceToCandidates(
       cudf::table_view input,
       rmm::cuda_stream_view stream,
-      rmm::device_async_resource_ref mr,
-      uint64_t inputFlatBytes,
-      ReductionSource source);
-  void addBatchCandidates(
-      CandidateTable batchCandidates,
-      rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr);
-  bool supportsHostCandidateBuckets() const;
-  bool tryRetainHostCandidateBatch(
-      CandidateTable& batchCandidates,
-      rmm::cuda_stream_view stream,
-      rmm::device_async_resource_ref mr);
-  bool tryRetainCurrentCandidatesOnHost(rmm::device_async_resource_ref mr);
-  CudfVectorPtr computeNextHostCandidateOutput();
-  void recordFinalCandidateOutput(const CudfVectorPtr& output);
-  void logCandidateObservations();
 
   const int32_t limit_;
   const core::TopNRowNumberNode::RankFunction rankFunction_;
@@ -140,7 +99,6 @@ class CudfTopNRowNumber : public CudfOperatorBase {
   const RowTypePtr inputType_;
   const core::PlanNodeId diagnosticNodeId_;
   const uint64_t candidateRunBytes_;
-  const rmm::cuda_stream_view spillStream_;
 
   std::vector<cudf::size_type> partitionKeys_;
   std::vector<cudf::size_type> sortKeys_;
@@ -162,56 +120,29 @@ class CudfTopNRowNumber : public CudfOperatorBase {
   // only ties for the current best sort key. Device residency therefore
   // depends on candidate cardinality, not total input rows.
   std::unique_ptr<cudf::table> candidates_;
-  uint64_t candidateBytes_{0};
-  std::optional<rmm::cuda_stream_view> candidateStream_;
-  std::vector<std::vector<HostCandidateChunk>> hostCandidateBuckets_;
-  uint64_t hostCandidateBytes_{0};
-  uint64_t maxHostCandidateBytes_{0};
-  uint64_t hostCandidatePayloadBytes_{0};
-  uint64_t maxHostCandidatePayloadBytes_{0};
-  uint64_t hostCandidateUncompressedBytes_{0};
-  uint64_t maxHostCandidateUncompressedBytes_{0};
-  std::unique_ptr<common::Codec> hostCandidateCodec_;
-  size_t nextCandidatePartition_{0};
-  bool hostCandidateMode_{false};
   uint64_t bufferedBytes_{0};
   uint64_t nextDiagnosticBufferedBytes_{512ULL << 20};
   struct SortedRun {
     std::string path;
     std::unique_ptr<cudf::io::chunked_parquet_reader> reader;
-    std::unique_ptr<cudf::table> chunk;
-    cudf::size_type chunkOffset{0};
   };
   std::vector<SortedRun> sortedRuns_;
   std::string spillDirectory_;
   uint64_t spillFileSequence_{0};
+  std::unique_ptr<cudf::table> mergeCarry_;
   std::unique_ptr<cudf::table> partitionCarry_;
   bool readersInitialized_{false};
   bool mergeFinished_{false};
   bool spilled_{false};
   bool finished_{false};
-  uint64_t inputReductionRows_{0};
-  uint64_t inputReductionBytes_{0};
-  uint64_t inputCandidateRows_{0};
-  uint64_t inputCandidateBytes_{0};
-  uint64_t maxInputCandidateRows_{0};
-  uint64_t maxInputCandidateBytes_{0};
-  uint64_t candidateMergeRows_{0};
-  uint64_t candidateMergeBytes_{0};
-  uint64_t finalCandidateRows_{0};
-  uint64_t finalCandidateBytes_{0};
-  uint64_t spilledCandidateRows_{0};
-  uint64_t spillRuns_{0};
-  uint64_t hostCandidateRows_{0};
-  uint64_t hostCandidateBatches_{0};
-  uint64_t hostOutputBuckets_{0};
   uint64_t partialSampleRows_{0};
   uint64_t partialSampleCandidateRows_{0};
   uint64_t partialBypassRows_{0};
   uint64_t partialBypassBatches_{0};
+  uint64_t partialOutputRows_{0};
+  uint64_t partialOutputBatches_{0};
   bool partialStrategyDecided_{false};
   bool partialBypass_{false};
-  bool candidateObservationsLogged_{false};
 };
 
 } // namespace facebook::velox::cudf_velox
