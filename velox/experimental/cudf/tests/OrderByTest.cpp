@@ -15,7 +15,6 @@
  */
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/CudfConversion.h"
-#include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/CudfOrderBy.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 
@@ -81,22 +80,6 @@ namespace {
 
 using OrderByTestHelper =
     facebook::velox::cudf_velox::test::CudfOrderByTestHelper;
-
-int64_t orderByRuntimeStat(const TaskStats& stats, std::string_view name) {
-  int64_t sum = 0;
-  for (const auto& pipelineStats : stats.pipelineStats) {
-    for (const auto& operatorStats : pipelineStats.operatorStats) {
-      if (operatorStats.operatorType != "CudfOrderBy") {
-        continue;
-      }
-      const auto it = operatorStats.runtimeStats.find(std::string(name));
-      if (it != operatorStats.runtimeStats.end()) {
-        sum += it->second.sum;
-      }
-    }
-  }
-  return sum;
-}
 
 class OrderByTest : public OperatorTestBase {
  protected:
@@ -605,57 +588,10 @@ TEST_F(OrderByTest, inMemoryResultMovesWithoutChunkCopies) {
                   .values(vectors)
                   .orderBy({"c0 ASC NULLS LAST"}, false)
                   .planNode();
-  auto task = assertQueryOrdered(plan, "SELECT * FROM tmp ORDER BY c0", {0});
+  assertQueryOrdered(plan, "SELECT * FROM tmp ORDER BY c0", {0});
 
   EXPECT_EQ(OrderByTestHelper::emittedChunks(), 1);
   EXPECT_EQ(OrderByTestHelper::spillCleanups(), 0);
-  EXPECT_EQ(orderByRuntimeStat(task->taskStats(), "orderByPressureChecks"), 0);
-  EXPECT_EQ(orderByRuntimeStat(task->taskStats(), "orderBySpillRuns"), 0);
-  EXPECT_EQ(
-      orderByRuntimeStat(task->taskStats(), "orderByNoSpillFastPath"), 1);
-}
-
-TEST_F(OrderByTest, pressureSplitsBufferedInputsBeforeSort) {
-  constexpr uint64_t kRunBytes = 1024;
-  OrderByTestHelper::setMemoryLimits(kRunBytes, 4096, 4096, 31);
-
-  std::vector<RowVectorPtr> vectors;
-  for (int32_t batch = 0; batch < 4; ++batch) {
-    vectors.push_back(makeRowVector(
-        {makeFlatVector<int64_t>(128, [batch](vector_size_t row) {
-           return 512 - batch * 128 - row;
-         }),
-         makeFlatVector<std::string>(128, [batch](vector_size_t row) {
-           return fmt::format("batch={};row={};", batch, row) +
-               std::string(32, static_cast<char>('a' + batch));
-         })}));
-  }
-  createDuckDbTable(vectors);
-
-  const auto headroom = cudf_velox::captureDeviceAllocationHeadroom();
-  ASSERT_TRUE(headroom.cudaValid);
-  ASSERT_GT(headroom.allocatableBytes(), 0);
-  auto admissionBlocker = cudf_velox::tryAcquireDeviceMemoryAdmission(
-      headroom.device,
-      headroom.allocatableBytes(),
-      std::numeric_limits<size_t>::max());
-  ASSERT_TRUE(admissionBlocker.has_value());
-
-  auto plan = PlanBuilder()
-                  .values(vectors)
-                  .orderBy({"c0 ASC NULLS LAST"}, false)
-                  .planNode();
-  auto task =
-      assertQueryOrdered(plan, "SELECT * FROM tmp ORDER BY c0", {0});
-
-  EXPECT_GT(
-      orderByRuntimeStat(task->taskStats(), "orderByPressureChecks"), 0);
-  EXPECT_GE(
-      orderByRuntimeStat(task->taskStats(), "orderByPressureSpills"), 4);
-  EXPECT_EQ(
-      orderByRuntimeStat(task->taskStats(), "orderByThresholdSpills"), 0);
-  EXPECT_GE(orderByRuntimeStat(task->taskStats(), "orderBySpillRuns"), 4);
-  EXPECT_EQ(OrderByTestHelper::spillCleanups(), 1);
 }
 
 /// Verifies output batch rows of OrderBy

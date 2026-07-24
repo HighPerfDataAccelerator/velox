@@ -34,7 +34,6 @@
 #include <algorithm>
 #include <atomic>
 #include <filesystem>
-#include <limits>
 #include <utility>
 
 namespace facebook::velox::cudf_velox {
@@ -44,11 +43,6 @@ constexpr uint64_t kMergeChunkBytes = 32ULL << 20;
 constexpr uint64_t kMergePassBytes = 128ULL << 20;
 constexpr uint64_t kSpillRowGroupBytes = 64ULL << 20;
 constexpr size_t kFinalMergeRuns = 2;
-constexpr uint64_t kPressureCheckBytes = 1ULL << 30;
-constexpr uint64_t kSortWorkspaceMultiplier = 4;
-constexpr uint64_t kSortWorkspaceOverhead = 64ULL << 20;
-constexpr uint64_t kDeviceHeadroomReserveBytes = 1ULL << 30;
-constexpr uint64_t kMaxUnadmittedSortWorkspaceBytes = 2ULL << 30;
 
 std::atomic<uint64_t> orderBySpillDirectorySequence{0};
 std::atomic<uint64_t> testingSortedRunBytes{0};
@@ -64,79 +58,6 @@ std::atomic<uint64_t> observedSourceChunks{0};
 std::atomic<uint64_t> observedMergeOutputBatches{0};
 std::atomic<uint64_t> observedEmittedChunks{0};
 std::atomic<uint64_t> observedSpillCleanups{0};
-
-uint64_t saturatingAdd(uint64_t left, uint64_t right) {
-  if (right > std::numeric_limits<uint64_t>::max() - left) {
-    return std::numeric_limits<uint64_t>::max();
-  }
-  return left + right;
-}
-
-uint64_t saturatingMultiply(uint64_t value, uint64_t multiplier) {
-  if (value > std::numeric_limits<uint64_t>::max() / multiplier) {
-    return std::numeric_limits<uint64_t>::max();
-  }
-  return value * multiplier;
-}
-
-struct SortWorkspaceAdmission {
-  std::optional<DeviceMemoryAdmissionReservation> reservation;
-  DeviceAllocationHeadroom headroom;
-  uint64_t estimatedWorkspaceBytes;
-  uint64_t admissionCapacityBytes;
-  uint64_t alreadyReservedBytes;
-
-  [[nodiscard]] uint64_t availableCapacityBytes() const {
-    return admissionCapacityBytes > alreadyReservedBytes
-        ? admissionCapacityBytes - alreadyReservedBytes
-        : 0;
-  }
-};
-
-SortWorkspaceAdmission acquireSortWorkspaceAdmission(uint64_t inputBytes) {
-  const auto estimatedWorkspaceBytes = saturatingAdd(
-      saturatingMultiply(inputBytes, kSortWorkspaceMultiplier),
-      kSortWorkspaceOverhead);
-  auto headroom = captureDeviceAllocationHeadroom();
-  const auto allocatableBytes =
-      static_cast<uint64_t>(headroom.allocatableBytes());
-  const auto reserveBytes = headroom.totalBytes == 0
-      ? kDeviceHeadroomReserveBytes
-      : std::max<uint64_t>(
-            kDeviceHeadroomReserveBytes,
-            static_cast<uint64_t>(headroom.totalBytes) / uint64_t{50});
-  const auto admissionCapacity = allocatableBytes > reserveBytes
-      ? allocatableBytes - reserveBytes
-      : allocatableBytes / uint64_t{2};
-  const auto alreadyReserved =
-      deviceMemoryAdmissionReservedBytes(headroom.device);
-  std::optional<DeviceMemoryAdmissionReservation> reservation;
-  if (headroom.cudaValid) {
-    reservation = tryAcquireDeviceMemoryAdmission(
-        headroom.device, estimatedWorkspaceBytes, admissionCapacity);
-  }
-  return {
-      std::move(reservation),
-      std::move(headroom),
-      estimatedWorkspaceBytes,
-      admissionCapacity,
-      alreadyReserved};
-}
-
-uint64_t pressureRunBytes(const SortWorkspaceAdmission& admission) {
-  const auto emergencyRunBytes =
-      (kMaxUnadmittedSortWorkspaceBytes - kSortWorkspaceOverhead) /
-      kSortWorkspaceMultiplier;
-  auto targetBytes = emergencyRunBytes;
-  const auto availableCapacity = admission.availableCapacityBytes();
-  if (availableCapacity > kSortWorkspaceOverhead) {
-    targetBytes = std::max(
-        targetBytes,
-        (availableCapacity - kSortWorkspaceOverhead) /
-            kSortWorkspaceMultiplier);
-  }
-  return std::max<uint64_t>(1, targetBytes);
-}
 
 bool isSpillSafeType(const TypePtr& type) {
   if (type == nullptr || type->providesCustomComparison()) {
@@ -398,43 +319,10 @@ void CudfOrderBy::doAddInput(RowVectorPtr input) {
         cudfInput->rebindStream(stateStream_),
         "CudfOrderBy cannot rebind its input to the state stream");
 
-    const auto inputBytes = cudfInput->estimateFlatSize();
-    const auto projectedBytes = saturatingAdd(bufferedBytes_, inputBytes);
-    std::optional<SortWorkspaceAdmission> workspaceAdmission;
-    if (projectedBytes >= std::min(sortedRunBytes_, kPressureCheckBytes)) {
-      workspaceAdmission.emplace(
-          acquireSortWorkspaceAdmission(projectedBytes));
-      addRuntimeStat(
-          "orderByPressureChecks", RuntimeCounter(int64_t{1}));
-      if (!workspaceAdmission->reservation) {
-        LOG(INFO) << "CudfOrderBy splitting buffered inputs before sort under "
-                     "pressure node="
-                  << orderByNode_->id()
-                  << " bufferedBytes=" << bufferedBytes_
-                  << " inputBytes=" << inputBytes
-                  << " projectedBytes=" << projectedBytes
-                  << " estimatedWorkspaceBytes="
-                  << workspaceAdmission->estimatedWorkspaceBytes
-                  << " cudaFreeBytes="
-                  << workspaceAdmission->headroom.freeBytes
-                  << " poolReusableBytes="
-                  << workspaceAdmission->headroom.reusablePoolBytes()
-                  << " admissionCapacityBytes="
-                  << workspaceAdmission->admissionCapacityBytes
-                  << " alreadyReservedBytes="
-                  << workspaceAdmission->alreadyReservedBytes;
-        bufferedBytes_ = projectedBytes;
-        inputs_.push_back(std::move(cudfInput));
-        spillBufferedRunsUnderPressure(std::min(
-            sortedRunBytes_, pressureRunBytes(*workspaceAdmission)));
-        return;
-      }
-    }
-
-    bufferedBytes_ = projectedBytes;
+    bufferedBytes_ += cudfInput->estimateFlatSize();
     inputs_.push_back(std::move(cudfInput));
     if (bufferedBytes_ >= sortedRunBytes_) {
-      spillSortedRun(SpillReason::kThreshold);
+      spillSortedRun();
     }
   } catch (...) {
     cleanupSpillStateAfterFailure("addInput");
@@ -447,20 +335,7 @@ void CudfOrderBy::doNoMoreInput() {
 
   try {
     if (spilled_ && !inputs_.empty()) {
-      std::optional<SortWorkspaceAdmission> workspaceAdmission;
-      if (bufferedBytes_ >=
-          std::min(sortedRunBytes_, kPressureCheckBytes)) {
-        workspaceAdmission.emplace(
-            acquireSortWorkspaceAdmission(bufferedBytes_));
-        addRuntimeStat(
-            "orderByPressureChecks", RuntimeCounter(int64_t{1}));
-      }
-      if (workspaceAdmission && !workspaceAdmission->reservation) {
-        spillBufferedRunsUnderPressure(std::min(
-            sortedRunBytes_, pressureRunBytes(*workspaceAdmission)));
-      } else {
-        spillSortedRun(SpillReason::kFinal);
-      }
+      spillSortedRun();
     }
     if (spilled_) {
       prepareSpilledOutput();
@@ -470,27 +345,6 @@ void CudfOrderBy::doNoMoreInput() {
     if (inputs_.empty()) {
       finished_ = true;
       return;
-    }
-
-    std::optional<SortWorkspaceAdmission> workspaceAdmission;
-    if (bufferedBytes_ >= std::min(sortedRunBytes_, kPressureCheckBytes)) {
-      workspaceAdmission.emplace(acquireSortWorkspaceAdmission(bufferedBytes_));
-      addRuntimeStat("orderByPressureChecks", RuntimeCounter(int64_t{1}));
-      if (!workspaceAdmission->reservation) {
-        LOG(INFO)
-            << "CudfOrderBy switching final in-memory sort to bounded runs "
-               "under pressure node="
-            << orderByNode_->id() << " bufferedBytes=" << bufferedBytes_
-            << " estimatedWorkspaceBytes="
-            << workspaceAdmission->estimatedWorkspaceBytes
-            << " cudaFreeBytes=" << workspaceAdmission->headroom.freeBytes
-            << " poolReusableBytes="
-            << workspaceAdmission->headroom.reusablePoolBytes();
-        spillBufferedRunsUnderPressure(std::min(
-            sortedRunBytes_, pressureRunBytes(*workspaceAdmission)));
-        prepareSpilledOutput();
-        return;
-      }
     }
 
     auto input = getConcatenatedTable(
@@ -506,8 +360,6 @@ void CudfOrderBy::doNoMoreInput() {
         stateStream_,
         get_output_mr());
     setPendingOutput(std::move(sorted));
-    addRuntimeStat(
-        "orderByNoSpillFastPath", RuntimeCounter(int64_t{1}));
   } catch (...) {
     cleanupSpillStateAfterFailure("noMoreInput");
     throw;
@@ -545,53 +397,10 @@ RowVectorPtr CudfOrderBy::doGetOutput() {
   }
 }
 
-void CudfOrderBy::spillBufferedRunsUnderPressure(uint64_t targetRunBytes) {
-  VELOX_CHECK_GT(targetRunBytes, 0);
-  auto pendingInputs = std::exchange(inputs_, {});
-  bufferedBytes_ = 0;
-
-  std::vector<CudfVectorPtr> runInputs;
-  uint64_t runBytes{0};
-  const auto flushRun = [&]() {
-    if (runInputs.empty()) {
-      return;
-    }
-    inputs_ = std::move(runInputs);
-    bufferedBytes_ = runBytes;
-    auto runAdmission = acquireSortWorkspaceAdmission(runBytes);
-    spillSortedRun(SpillReason::kPressure);
-    runInputs.clear();
-    runBytes = 0;
-  };
-
-  for (auto& pendingInput : pendingInputs) {
-    const auto inputBytes = pendingInput->estimateFlatSize();
-    if (!runInputs.empty() &&
-        saturatingAdd(runBytes, inputBytes) > targetRunBytes) {
-      flushRun();
-    }
-    if (inputBytes > targetRunBytes) {
-      addRuntimeStat(
-          "orderByPressureOversizedInputs", RuntimeCounter(int64_t{1}));
-      LOG(WARNING) << "CudfOrderBy pressure run contains one indivisible input "
-                      "larger than its target node="
-                   << orderByNode_->id() << " inputBytes=" << inputBytes
-                   << " targetRunBytes=" << targetRunBytes;
-    }
-    runBytes = saturatingAdd(runBytes, inputBytes);
-    runInputs.push_back(std::move(pendingInput));
-    if (runBytes >= targetRunBytes) {
-      flushRun();
-    }
-  }
-  flushRun();
-}
-
-void CudfOrderBy::spillSortedRun(SpillReason reason) {
+void CudfOrderBy::spillSortedRun() {
   if (inputs_.empty()) {
     return;
   }
-  const auto runBytes = bufferedBytes_;
 
   namespace fs = std::filesystem;
   if (!spilled_) {
@@ -662,33 +471,6 @@ void CudfOrderBy::spillSortedRun(SpillReason reason) {
   SortedRun run;
   run.path = std::move(path);
   sortedRuns_.push_back(std::move(run));
-  addRuntimeStat("orderBySpillRuns", RuntimeCounter(int64_t{1}));
-  addRuntimeStat(
-      "orderBySpilledBytes",
-      RuntimeCounter(
-          static_cast<int64_t>(std::min<uint64_t>(
-              runBytes, std::numeric_limits<int64_t>::max())),
-          RuntimeCounter::Unit::kBytes));
-  switch (reason) {
-    case SpillReason::kThreshold:
-      addRuntimeStat(
-          "orderByThresholdSpills", RuntimeCounter(int64_t{1}));
-      break;
-    case SpillReason::kPressure:
-      addRuntimeStat(
-          "orderByPressureSpills", RuntimeCounter(int64_t{1}));
-      break;
-    case SpillReason::kFinal:
-      addRuntimeStat("orderByFinalSpills", RuntimeCounter(int64_t{1}));
-      break;
-  }
-  VLOG(1) << "CudfOrderBy wrote sorted run node=" << orderByNode_->id()
-          << " reason="
-          << (reason == SpillReason::kThreshold
-                  ? "threshold"
-                  : reason == SpillReason::kPressure ? "pressure" : "final")
-          << " rows=" << sorted->num_rows() << " runBytes=" << runBytes
-          << " totalRuns=" << sortedRuns_.size();
   logDeviceMemorySnapshot(
       fmt::format(
           "operator=CudfOrderBy node={} state=sortRun.write.end rows={} runs={} "

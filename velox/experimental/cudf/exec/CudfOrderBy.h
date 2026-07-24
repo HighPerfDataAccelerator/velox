@@ -73,12 +73,6 @@ class CudfOrderBy : public CudfOperatorBase {
   void doClose() override;
 
  private:
-  enum class SpillReason {
-    kThreshold,
-    kPressure,
-    kFinal,
-  };
-
   struct MergeStats {
     uint64_t sourceChunks{0};
     uint64_t sourceRows{0};
@@ -116,8 +110,7 @@ class CudfOrderBy : public CudfOperatorBase {
   static uint64_t testingEmittedChunks();
   static uint64_t testingSpillCleanups();
 
-  void spillSortedRun(SpillReason reason);
-  void spillBufferedRunsUnderPressure(uint64_t targetRunBytes);
+  void spillSortedRun();
   void compactSortedRunsForMerge();
   void initializeSortedRunReaders();
   void prepareSpilledOutput();

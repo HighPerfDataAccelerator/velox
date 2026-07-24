@@ -46,8 +46,7 @@ namespace facebook::velox::cudf_velox {
 /// partition/order boundary state. Other windows store incoming GPU batches in
 /// addInput(). Small inputs are concatenated and sorted when noMoreInput() is
 /// called. Large, unsorted, partitioned inputs are written as sorted runs and
-/// merged incrementally. Rank-like windows evaluate bounded merge batches;
-/// other windows assemble complete partitions before evaluation.
+/// merged into complete-partition batches before window evaluation.
 ///
 /// inputsSorted fast path: when WindowNode::inputsSorted() is true, this
 /// operator skips stable_sorted_order and the full-table gather (see
@@ -127,13 +126,10 @@ class CudfWindow : public CudfOperatorBase {
   struct SortedRun {
     std::string path;
     std::unique_ptr<cudf::io::chunked_parquet_reader> reader;
-    std::unique_ptr<cudf::table> chunk;
-    cudf::size_type chunkOffset{0};
   };
 
   void spillSortedRun();
   void initializeSortedRunReaders();
-  bool loadPausedChunk(SortedRun& run);
   std::unique_ptr<cudf::table> mergeNextSortedBatch(bool& finalBatch);
   std::unique_ptr<cudf::table> takeCompletePartitions(
       std::unique_ptr<cudf::table> sorted,
@@ -280,7 +276,6 @@ class CudfWindow : public CudfOperatorBase {
 
   std::shared_ptr<const core::WindowNode> windowNode_;
   const RowTypePtr inputRowType_;
-  const bool rankLikeFunctions_;
   const bool rankLikeStreaming_;
   const bool fullPartitionCountStreaming_;
   const bool rangeSumStreaming_;
@@ -301,6 +296,7 @@ class CudfWindow : public CudfOperatorBase {
   std::vector<SortedRun> sortedRuns_;
   std::string spillDirectory_;
   uint64_t spillFileSequence_{0};
+  std::unique_ptr<cudf::table> mergeCarry_;
   std::unique_ptr<cudf::table> partitionCarry_;
   bool readersInitialized_{false};
   bool mergeFinished_{false};
