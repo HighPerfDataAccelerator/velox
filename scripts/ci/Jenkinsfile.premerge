@@ -168,10 +168,12 @@ pipeline {
                                         returnStdout: true).trim()
                                 }
                                 dir(env.COLT_ROOT) {
-                                    common.checkoutSourceCode(
-                                        this,
-                                        params.COLT_REPO_URL.trim(),
-                                        params.COLT_REF.trim())
+                                    withEnv(['GIT_LFS_SKIP_SMUDGE=1']) {
+                                        common.checkoutSourceCode(
+                                            this,
+                                            params.COLT_REPO_URL.trim(),
+                                            params.COLT_REF.trim())
+                                    }
                                 }
                                 echo "Resolved Velox SHA: ${env.VELOX_SHA}"
                             }
