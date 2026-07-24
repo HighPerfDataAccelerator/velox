@@ -19,12 +19,25 @@ on:
     types: [created]
   workflow_dispatch:
     inputs:
+      mode:
+        description: Operation to exercise.
+        required: true
+        default: post-processing
+        type: choice
+        options:
+          - post-processing
+          - runner-smoke
       platform:
-        description: 'runs-on argument'
+        description: runs-on argument
         required: false
       args:
-        description: 'argument'
+        description: argument
         required: false
+
+permissions:
+  contents: read
+  pull-requests: read
+
 jobs:
   Authorization:
     name: Authorization
@@ -56,7 +69,7 @@ jobs:
       - name: Check if comment is issued by authorized person
         run: blossom-ci
         env:
-          OPERATION: 'AUTH'
+          OPERATION: AUTH
           REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO_KEY_DATA: ${{ secrets.BLOSSOM_KEY }}
 
@@ -66,15 +79,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: NVIDIA/spark-rapids-common/checkout@main
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
           repository: ${{ fromJson(needs.Authorization.outputs.args).repo }}
           ref: ${{ fromJson(needs.Authorization.outputs.args).ref }}
           lfs: 'true'
+          persist-credentials: false
 
       # repo specific steps
       - name: Setup java
-        uses: actions/setup-java@v5
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5
         with:
           distribution: adopt
           java-version: 8
@@ -87,7 +101,7 @@ jobs:
           echo detect.maven.included.scopes=compile >> application.properties
 
       - name: Run blossom action
-        uses: NVIDIA/blossom-action@main
+        uses: NVIDIA/blossom-action@2b0c950b993808dc31f80a1ccc32615902e39032 # main
         env:
           REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO_KEY_DATA: ${{ secrets.BLOSSOM_KEY }}
@@ -104,18 +118,32 @@ jobs:
       - name: Start ci job
         run: blossom-ci
         env:
-          OPERATION: 'START-CI-JOB'
+          OPERATION: START-CI-JOB
           CI_SERVER: ${{ secrets.CI_SERVER }}
           REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  Runner-smoke:
+    name: Blossom runner smoke
+    runs-on: blossom
+    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'runner-smoke'
+    timeout-minutes: 5
+    steps:
+      - name: Verify Blossom CLI
+        run: |
+          if ! blossom_path="$(command -v blossom-ci)"; then
+            echo "::error::The blossom-ci command is not installed on this runner."
+            exit 1
+          fi
+          echo "Blossom CLI is available at $blossom_path"
 
   Upload-Log:
     name: Upload log
     runs-on: blossom
-    if : github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'post-processing'
     steps:
       - name: Jenkins log for pull request ${{ fromJson(github.event.inputs.args).pr }} (click here)
         run: blossom-ci
         env:
-          OPERATION: 'POST-PROCESSING'
+          OPERATION: POST-PROCESSING
           CI_SERVER: ${{ secrets.CI_SERVER }}
           REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}

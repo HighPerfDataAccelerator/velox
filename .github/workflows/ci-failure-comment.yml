@@ -15,10 +15,8 @@
 name: CI Failure Comment
 
 # This workflow runs in the context of the base repo (not the fork) and has
-# write access to post PR comments. It is triggered when the Linux Build or
-# Fuzzer Jobs workflow completes with a failure and uses Claude to analyze
-# failure logs, correlate with the PR diff and open issues, and post a rich
-# diagnostic comment.
+# write access to post PR comments. During Phase 0 it is manual-only because
+# the inherited Linux and fuzzer pull-request workflows are suspended.
 #
 # Security: This workflow never checks out or executes PR code. It reads
 # failure metadata from artifacts uploaded by our own status jobs, then uses
@@ -34,11 +32,6 @@ on:
       pr_number:
         description: PR number to comment on
         required: true
-  workflow_run:
-    workflows: [Linux Build using GCC, Fuzzer Jobs]
-    types:
-      - completed
-
 permissions:
   contents: read
   pull-requests: write

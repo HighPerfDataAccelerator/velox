@@ -42,14 +42,15 @@ name: Detect Force-Full Trigger
 # only secret-touching action runs in the chained workflow.
 
 on:
-  pull_request_review:
-    types: [submitted]
+  workflow_dispatch: {}
 
 permissions:
   contents: read
 
 jobs:
   detect:
+    # Suspended during Phase 0 while the inherited Linux PR build is disabled.
+    if: false
     # Restrict to approvals from people with a prior relationship to
     # the repo to cap CI-minutes exposure from drive-by approvals on
     # fork PRs. CONTRIBUTOR is included because GitHub reports many
@@ -60,10 +61,6 @@ jobs:
     # workflow_run.id and applies the same filter to its dedup count
     # so approvals outside this allowlist on the same SHA don't bump
     # the counter and dedup away an eligible reviewer's first approval.
-    if: >
-      github.event.review.state == 'approved' &&
-      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR","CONTRIBUTOR"]'),
-               github.event.review.author_association)
     runs-on: ubuntu-latest
     steps:
       - name: Log trigger (no PR-controlled output)
