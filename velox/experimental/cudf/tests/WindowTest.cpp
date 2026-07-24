@@ -2202,7 +2202,7 @@ TEST_F(CudfWindowTest, castInWindowArgFallsBack) {
   }
 }
 
-TEST_F(CudfWindowTest, externalSortKeepsPartitionsComplete) {
+TEST_F(CudfWindowTest, externalSortStreamsRankAcrossRuns) {
   filesystems::registerLocalFileSystem();
   const auto spillRoot =
       facebook::velox::common::testutil::TempDirectoryPath::create();
@@ -2219,7 +2219,7 @@ TEST_F(CudfWindowTest, externalSortKeepsPartitionsComplete) {
       makeRowVector(
           {"id", "val"},
           {makeFlatVector<int32_t>({2, 1, 2}),
-           makeFlatVector<int64_t>({30, 20, 10})}),
+           makeFlatVector<int64_t>({30, 10, 10})}),
       makeRowVector(
           {"id", "val"},
           {makeFlatVector<int32_t>({1, 2, 1}),
@@ -2227,13 +2227,13 @@ TEST_F(CudfWindowTest, externalSortKeepsPartitionsComplete) {
 
   auto plan = PlanBuilder()
                   .values(input)
-                  .window({"row_number() over (partition by id order by val)"})
+                  .window({"rank() over (partition by id order by val)"})
                   .planNode();
   auto expected = makeRowVector(
       {"id", "val", "w0"},
       {makeFlatVector<int32_t>({1, 1, 1, 2, 2, 2}),
-       makeFlatVector<int64_t>({10, 20, 30, 10, 20, 30}),
-       makeFlatVector<int64_t>({1, 2, 3, 1, 2, 3})});
+       makeFlatVector<int64_t>({10, 10, 30, 10, 20, 30}),
+       makeFlatVector<int64_t>({1, 1, 3, 1, 2, 3})});
 
   AssertQueryBuilder(plan)
       .spillDirectory(spillRoot->getPath())

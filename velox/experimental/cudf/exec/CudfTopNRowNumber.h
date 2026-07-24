@@ -64,13 +64,31 @@ class CudfTopNRowNumber : public CudfOperatorBase {
   void doClose() override;
 
  private:
-  void spillSortedRun();
+  enum class SpillReason {
+    kThreshold,
+    kPressure,
+    kInputPressure,
+    kFinal,
+  };
+
+  struct CandidateTable {
+    std::unique_ptr<cudf::table> table;
+    uint64_t flatBytes;
+  };
+
+  struct SortedRun;
+
+  void spillSortedRun(SpillReason reason);
+  void spillCandidates(SpillReason reason);
   void compactSortedRunsForMerge();
   void initializeSortedRunReaders();
-  std::unique_ptr<cudf::table> mergeNextSortedBatch(
+  bool loadPausedChunk(SortedRun& run);
+  std::unique_ptr<cudf::table> mergeNextPausedBatch(
+      std::vector<SortedRun*>& runs,
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr,
-      bool& finalBatch);
+      bool& finished);
+  std::unique_ptr<cudf::table> mergeNextSortedBatch(bool& finalBatch);
   std::unique_ptr<cudf::table> takeCompletePartitions(
       std::unique_ptr<cudf::table> sorted,
       bool finalBatch,
@@ -87,8 +105,12 @@ class CudfTopNRowNumber : public CudfOperatorBase {
       cudf::table_view input,
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr);
-  std::unique_ptr<cudf::table> reduceToCandidates(
+  CandidateTable reduceToCandidates(
       cudf::table_view input,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr);
+  void addBatchCandidates(
+      CandidateTable batchCandidates,
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr);
 
@@ -98,6 +120,7 @@ class CudfTopNRowNumber : public CudfOperatorBase {
   const RowTypePtr inputType_;
   const core::PlanNodeId diagnosticNodeId_;
   const uint64_t candidateRunBytes_;
+  const rmm::cuda_stream_view spillStream_;
 
   std::vector<cudf::size_type> partitionKeys_;
   std::vector<cudf::size_type> sortKeys_;
@@ -119,16 +142,19 @@ class CudfTopNRowNumber : public CudfOperatorBase {
   // only ties for the current best sort key. Device residency therefore
   // depends on candidate cardinality, not total input rows.
   std::unique_ptr<cudf::table> candidates_;
+  uint64_t candidateBytes_{0};
+  std::optional<rmm::cuda_stream_view> candidateStream_;
   uint64_t bufferedBytes_{0};
   uint64_t nextDiagnosticBufferedBytes_{512ULL << 20};
   struct SortedRun {
     std::string path;
     std::unique_ptr<cudf::io::chunked_parquet_reader> reader;
+    std::unique_ptr<cudf::table> chunk;
+    cudf::size_type chunkOffset{0};
   };
   std::vector<SortedRun> sortedRuns_;
   std::string spillDirectory_;
   uint64_t spillFileSequence_{0};
-  std::unique_ptr<cudf::table> mergeCarry_;
   std::unique_ptr<cudf::table> partitionCarry_;
   bool readersInitialized_{false};
   bool mergeFinished_{false};
