@@ -65,6 +65,7 @@ constexpr uint64_t kMaxUnadmittedCandidateWorkspaceBytes = 1ULL << 30;
 constexpr uint64_t kCandidatePartitionWorkspaceMultiplier = 2;
 constexpr uint64_t kCandidatePartitionWorkspaceOverhead = 16ULL << 20;
 constexpr uint64_t kMinimumHostPressureTrimTriggerBytes = 2ULL << 30;
+constexpr uint64_t kHostPressureTrimInterval = 4;
 constexpr std::string_view kConditionalTopNMarker = "__gluten_mpp_topn_active";
 std::atomic<uint64_t> spillDirectorySequence{0};
 
@@ -732,7 +733,9 @@ void CudfTopNRowNumber::maybeTrimDeviceCacheUnderHostPressure() {
   const auto triggerBytes = std::max<uint64_t>(
       kMinimumHostPressureTrimTriggerBytes,
       static_cast<uint64_t>(headroom.totalBytes) / uint64_t{8});
-  if (headroom.freeBytes >= triggerBytes) {
+  const bool periodicTrim =
+      hostCandidateBatches_ % kHostPressureTrimInterval == 0;
+  if (!periodicTrim && headroom.freeBytes >= triggerBytes) {
     return;
   }
 
