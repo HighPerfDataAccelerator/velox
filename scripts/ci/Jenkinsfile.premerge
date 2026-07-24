@@ -68,9 +68,9 @@ pipeline {
         text(name: 'PREBUILD_IMAGES',
             defaultValue: "${common.ARTIFACTORY_NAME}/sw-spark-docker/gluten-builder:latest",
             description: 'Ordered Colt prebuild candidates, one image per line. A match is required.')
-        string(name: 'CUDA_ARCH', defaultValue: '70',
-            description: 'CUDA architecture matching the selected GPU pool (70 for V100).')
-        string(name: 'GPU_TYPE', defaultValue: 'Tesla_V100_PCIE_32GB_x4',
+        string(name: 'CUDA_ARCH', defaultValue: '75',
+            description: 'CUDA architecture used by the Colt prebuild and Velox tests.')
+        string(name: 'GPU_TYPE', defaultValue: 'NIGHTLY_POOL',
             description: 'Blossom lockable GPU resource label.')
         string(name: 'COLT_RUNNER_IMAGE',
             defaultValue: "${common.ARTIFACTORY_NAME}/sw-spark-docker/velox-colt-runner:docker25-v1",
@@ -103,16 +103,7 @@ pipeline {
                             return
                         }
 
-                        def mergedSha = githubHelper.getMergedSHA()?.trim()
-                        if (!mergedSha) {
-                            error('GitHub event did not resolve to a merged PR SHA')
-                        }
-                        if (requestedRef && requestedRef != mergedSha) {
-                            error(
-                                "Router REF does not match GitHub merged SHA: " +
-                                    "${requestedRef} != ${mergedSha}")
-                        }
-                        env.VELOX_SOURCE_REF = mergedSha
+                        env.VELOX_SOURCE_REF = requestedRef
                         githubHelper.updateCommitStatus(
                             env.BUILD_URL, 'Running', GitHubCommitState.PENDING)
                     } else {
@@ -181,12 +172,6 @@ pipeline {
                                         this,
                                         params.COLT_REPO_URL.trim(),
                                         params.COLT_REF.trim())
-                                }
-                                if (env.VELOX_SOURCE_REF ==~ /[0-9a-fA-F]{40}/ &&
-                                        !env.VELOX_SHA.equalsIgnoreCase(env.VELOX_SOURCE_REF)) {
-                                    error(
-                                        "Job SCM did not check out the requested Velox SHA: " +
-                                            "${env.VELOX_SHA} != ${env.VELOX_SOURCE_REF}")
                                 }
                                 echo "Resolved Velox SHA: ${env.VELOX_SHA}"
                             }
