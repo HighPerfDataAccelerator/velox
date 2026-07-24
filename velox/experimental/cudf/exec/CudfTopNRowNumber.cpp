@@ -64,6 +64,7 @@ constexpr uint64_t kDeviceHeadroomReserveBytes = 1ULL << 30;
 constexpr uint64_t kMaxUnadmittedCandidateWorkspaceBytes = 1ULL << 30;
 constexpr uint64_t kCandidatePartitionWorkspaceMultiplier = 2;
 constexpr uint64_t kCandidatePartitionWorkspaceOverhead = 16ULL << 20;
+constexpr uint64_t kMinimumHostPressureTrimTriggerBytes = 2ULL << 30;
 constexpr std::string_view kConditionalTopNMarker = "__gluten_mpp_topn_active";
 std::atomic<uint64_t> spillDirectorySequence{0};
 
@@ -641,6 +642,7 @@ bool CudfTopNRowNumber::tryRetainHostCandidateBatch(
   partitioned.reset();
   batchCandidates.table.reset();
   admission.reservation.reset();
+  maybeTrimDeviceCacheUnderHostPressure();
 
   uint64_t compressedBatchBytes = 0;
   for (auto& pending : pendingChunks) {
@@ -720,6 +722,28 @@ bool CudfTopNRowNumber::tryRetainCurrentCandidatesOnHost(
   candidateBytes_ = retained.flatBytes;
   candidateStream_ = retainedStream;
   return false;
+}
+
+void CudfTopNRowNumber::maybeTrimDeviceCacheUnderHostPressure() {
+  const auto headroom = captureDeviceAllocationHeadroom();
+  if (!headroom.cudaValid) {
+    return;
+  }
+  const auto triggerBytes = std::max<uint64_t>(
+      kMinimumHostPressureTrimTriggerBytes,
+      static_cast<uint64_t>(headroom.totalBytes) / uint64_t{8});
+  if (headroom.freeBytes >= triggerBytes) {
+    return;
+  }
+
+  addRuntimeStat(
+      "topNRowNumberHostDeviceTrimChecks", RuntimeCounter(int64_t{1}));
+  if (!trimAsyncMemoryPools(0)) {
+    return;
+  }
+  ++hostDeviceCacheTrims_;
+  addRuntimeStat(
+      "topNRowNumberHostDeviceCacheTrims", RuntimeCounter(int64_t{1}));
 }
 
 void CudfTopNRowNumber::spillHostCandidateBatches(SpillReason reason) {
@@ -1505,6 +1529,7 @@ void CudfTopNRowNumber::logCandidateObservations() {
                  << maxHostCandidateUncompressedBytes_
                  << " hostCandidateBatches=" << hostCandidateBatches_
                  << " hostOutputBuckets=" << hostOutputBuckets_
+                 << " hostDeviceCacheTrims=" << hostDeviceCacheTrims_
                  << " finalCandidateRows=" << finalCandidateRows_
                  << " finalCandidateFlatBytes=" << finalCandidateBytes_
                  << " spillRuns=" << spillRuns_;

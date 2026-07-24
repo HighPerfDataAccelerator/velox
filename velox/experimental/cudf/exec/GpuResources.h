@@ -138,6 +138,10 @@ createMemoryResource(std::string_view mode, int percent);
 /// fallback, a zero value is a valid request to release every unused block.
 [[nodiscard]] bool trimAsyncMemoryPoolsAtQueryEnd(std::size_t bytesToKeep);
 
+/// Synchronizes the device and releases unused cudaMallocAsync pool memory
+/// down to the requested retained-byte target.
+[[nodiscard]] bool trimAsyncMemoryPools(std::size_t bytesToKeep);
+
 /// Drops native pool handles after their owning RMM resources are destroyed.
 void clearAsyncMemoryPoolHandles();
 

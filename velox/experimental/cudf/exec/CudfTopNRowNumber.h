@@ -135,6 +135,7 @@ class CudfTopNRowNumber : public CudfOperatorBase {
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr);
   bool tryRetainCurrentCandidatesOnHost(rmm::device_async_resource_ref mr);
+  void maybeTrimDeviceCacheUnderHostPressure();
   void spillHostCandidateBatches(SpillReason reason);
   CudfVectorPtr computeNextHostCandidateOutput();
   void recordFinalCandidateOutput(const CudfVectorPtr& output);
@@ -211,6 +212,7 @@ class CudfTopNRowNumber : public CudfOperatorBase {
   uint64_t hostCandidateRows_{0};
   uint64_t hostCandidateBatches_{0};
   uint64_t hostOutputBuckets_{0};
+  uint64_t hostDeviceCacheTrims_{0};
   bool candidateObservationsLogged_{false};
 };
 

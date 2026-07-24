@@ -175,10 +175,14 @@ bool trimAsyncMemoryPoolsAtQueryEnd() {
                << value << "'";
     return false;
   }
-  return trimAsyncMemoryPoolsAtQueryEnd(static_cast<std::size_t>(parsed));
+  return trimAsyncMemoryPools(static_cast<std::size_t>(parsed));
 }
 
 bool trimAsyncMemoryPoolsAtQueryEnd(std::size_t bytesToKeep) {
+  return trimAsyncMemoryPools(bytesToKeep);
+}
+
+bool trimAsyncMemoryPools(std::size_t bytesToKeep) {
   std::vector<cudaMemPool_t> pools;
   {
     std::lock_guard<std::mutex> lock(asyncMemoryPoolsMutex);
@@ -193,7 +197,7 @@ bool trimAsyncMemoryPoolsAtQueryEnd(std::size_t bytesToKeep) {
   cudaMemGetInfo(&freeBefore, &totalBytes);
   const auto syncStatus = cudaDeviceSynchronize();
   if (syncStatus != cudaSuccess) {
-    LOG(ERROR) << "CUDF_ASYNC_QUERY_END_TRIM cudaDeviceSynchronize failed: "
+    LOG(ERROR) << "CUDF_ASYNC_POOL_TRIM cudaDeviceSynchronize failed: "
                << cudaGetErrorString(syncStatus);
     return false;
   }
@@ -201,7 +205,7 @@ bool trimAsyncMemoryPoolsAtQueryEnd(std::size_t bytesToKeep) {
   for (const auto pool : pools) {
     const auto trimStatus = cudaMemPoolTrimTo(pool, bytesToKeep);
     if (trimStatus != cudaSuccess) {
-      LOG(ERROR) << "CUDF_ASYNC_QUERY_END_TRIM cudaMemPoolTrimTo failed: "
+      LOG(ERROR) << "CUDF_ASYNC_POOL_TRIM cudaMemPoolTrimTo failed: "
                  << cudaGetErrorString(trimStatus)
                  << " bytesToKeep=" << bytesToKeep;
       return false;
@@ -210,7 +214,7 @@ bool trimAsyncMemoryPoolsAtQueryEnd(std::size_t bytesToKeep) {
 
   std::size_t freeAfter = 0;
   cudaMemGetInfo(&freeAfter, &totalBytes);
-  LOG(INFO) << "CUDF_ASYNC_QUERY_END_TRIM pools=" << pools.size()
+  LOG(INFO) << "CUDF_ASYNC_POOL_TRIM pools=" << pools.size()
             << " bytesToKeep=" << bytesToKeep << " freeBefore=" << freeBefore
             << " freeAfter=" << freeAfter << " released="
             << (freeAfter >= freeBefore ? freeAfter - freeBefore : 0);
