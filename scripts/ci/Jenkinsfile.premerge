@@ -53,7 +53,7 @@ pipeline {
         string(name: 'GLUTEN_REPO_URL',
             defaultValue: 'https://github.com/NVIDIA/spark-gluten.git',
             description: 'Baseline Gluten repository required by the Colt source model.')
-        string(name: 'GLUTEN_REF', defaultValue: '2026-q3',
+        string(name: 'GLUTEN_REF', defaultValue: 'dev',
             description: 'Known-good Gluten baseline ref.')
 
         choice(name: 'VELOX_TIERS',
