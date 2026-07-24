@@ -195,25 +195,29 @@ pipeline {
                         container('gpu') {
                             script {
                                 DockerUtils.loginDockerRepo(this)
-                                withEnv([
-                                    "COLT_ROOT=${env.COLT_ROOT}",
-                                    "VELOX_REPO=${env.VELOX_SOURCE_DIR}",
-                                    "VELOX_SHA=${env.VELOX_SHA}",
-                                    "GLUTEN_REPO=${params.GLUTEN_REPO_URL.trim()}",
-                                    "GLUTEN_REF=${params.GLUTEN_REF.trim()}",
-                                    "PREBUILD_IMAGES=${params.PREBUILD_IMAGES}",
-                                    "VELOX_TARGETS=${params.VELOX_TARGETS}",
-                                    "VELOX_TIERS=${params.VELOX_TIERS}",
-                                    "FAIL_ON_UNSTABLE=${params.FAIL_ON_UNSTABLE}",
-                                    "CUDA_ARCH=${params.CUDA_ARCH.trim()}",
-                                    "COLT_WORKSPACE=${env.COLT_WORKSPACE}",
-                                    "COLT_RUN_DIR=${env.COLT_RUN_DIR}",
-                                    "COLT_RESULT_FILE=${env.COLT_RUN_DIR}/result.json",
-                                    'COLT_GPU_DEVICES=0',
-                                    "COLT_PARALLEL=${params.COLT_PARALLEL.trim()}",
-                                    "COLT_MEM_LIMIT=${params.COLT_MEM_LIMIT.trim()}",
-                                ]) {
-                                    sh "bash '${env.VELOX_SOURCE_DIR}/scripts/ci/run-colt-velox-premerge.sh'"
+                                withCredentials([gitUsernamePassword(
+                                    credentialsId: 'blossom-github',
+                                    gitToolName: 'git-tool')]) {
+                                    withEnv([
+                                        "COLT_ROOT=${env.COLT_ROOT}",
+                                        "VELOX_REPO=${env.VELOX_SOURCE_DIR}",
+                                        "VELOX_SHA=${env.VELOX_SHA}",
+                                        "GLUTEN_REPO=${params.GLUTEN_REPO_URL.trim()}",
+                                        "GLUTEN_REF=${params.GLUTEN_REF.trim()}",
+                                        "PREBUILD_IMAGES=${params.PREBUILD_IMAGES}",
+                                        "VELOX_TARGETS=${params.VELOX_TARGETS}",
+                                        "VELOX_TIERS=${params.VELOX_TIERS}",
+                                        "FAIL_ON_UNSTABLE=${params.FAIL_ON_UNSTABLE}",
+                                        "CUDA_ARCH=${params.CUDA_ARCH.trim()}",
+                                        "COLT_WORKSPACE=${env.COLT_WORKSPACE}",
+                                        "COLT_RUN_DIR=${env.COLT_RUN_DIR}",
+                                        "COLT_RESULT_FILE=${env.COLT_RUN_DIR}/result.json",
+                                        'COLT_GPU_DEVICES=0',
+                                        "COLT_PARALLEL=${params.COLT_PARALLEL.trim()}",
+                                        "COLT_MEM_LIMIT=${params.COLT_MEM_LIMIT.trim()}",
+                                    ]) {
+                                        sh "bash '${env.VELOX_SOURCE_DIR}/scripts/ci/run-colt-velox-premerge.sh'"
+                                    }
                                 }
                             }
                         }
