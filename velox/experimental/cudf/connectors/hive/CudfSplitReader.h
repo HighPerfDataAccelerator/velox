@@ -19,6 +19,8 @@
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConfig.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConnectorSplit.h"
 #include "velox/experimental/cudf/connectors/hive/CudfSplitReaderHelpers.h"
+#include "velox/experimental/cudf/connectors/hive/ExecutorSplitPrefetch.h"
+#include "velox/experimental/cudf/connectors/hive/PinnedHostBuffer.h"
 #include "velox/experimental/cudf/exec/NvtxHelper.h"
 
 #include "velox/common/io/IoStatistics.h"
@@ -69,6 +71,13 @@ class CudfSplitReader : public NvtxHelper {
   /// @param runtimeStats Reference to the DataSource's runtime statistics
   virtual void prepareSplit(dwio::common::RuntimeStatistics& runtimeStats);
 
+  /// Rebind state owned by the DataSource after an asynchronously prepared
+  /// reader is moved to the driver thread.
+  virtual void setDataSourceContext(
+      const ConnectorQueryCtx* connectorQueryCtx,
+      dwio::common::RuntimeStatistics& runtimeStats,
+      cudf::ast::expression const* subfieldFilterExpr);
+
   /// Read the next raw cudf table chunk. Returns nullopt when done.
   virtual std::optional<std::unique_ptr<cudf::table>> next(uint64_t size);
 
@@ -95,13 +104,19 @@ class CudfSplitReader : public NvtxHelper {
   // Setup the cuDF data source
   void setupCudfDataSource();
 
+  // Replaces grouped file-backed sources with complete pinned-host Parquet
+  // buffers. All files in the group are submitted before waiting, and cuDF
+  // applies the final projection while decoding them.
+  void setupSelectivePreloadDataSources();
+
   // Return the size of the primary physical file after its data source has
   // been initialized.
   uint64_t primaryDataSourceSize() const;
 
   // Create a data source for one physical file.
   std::shared_ptr<cudf::io::datasource> createCudfDataSource(
-      const std::string& filePath);
+      const std::string& filePath,
+      std::optional<std::size_t> fileSize = std::nullopt);
 
   // Return non-owning wrappers for every source in this split.
   std::vector<std::unique_ptr<cudf::io::datasource>> makeDataSourceViews();
@@ -147,6 +162,8 @@ class CudfSplitReader : public NvtxHelper {
   // cuDF split reader stuff.
   std::shared_ptr<cudf::io::datasource> dataSource_;
   std::vector<std::shared_ptr<cudf::io::datasource>> coalescedDataSources_;
+  std::vector<std::shared_ptr<PinnedHostBuffer>> selectivePreloadBuffers_;
+  std::shared_ptr<SplitPrefetchResult> selectivePreloadResult_;
   cudf::io::parquet_reader_options readerOptions_;
   CudfParquetReaderPtr splitReader_;
   CudfHybridScanReaderPtr exptSplitReader_;

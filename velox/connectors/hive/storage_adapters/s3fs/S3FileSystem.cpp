@@ -27,6 +27,7 @@
 
 #include <fmt/format.h>
 #include <glog/logging.h>
+#include <cstdlib>
 #include <memory>
 #include <stdexcept>
 
@@ -299,10 +300,10 @@ class S3FileSystem::Impl {
     clientConfig.payloadSigningPolicy =
         inferPayloadSign(s3Config_->payloadSigningPolicy());
 
-    auto credentialsProvider = getCredentialsProvider(*s3Config_);
+    credentialsProvider_ = getCredentialsProvider(*s3Config_);
 
     client_ = std::make_shared<Aws::S3::S3Client>(
-        credentialsProvider, nullptr /* endpointProvider */, clientConfig);
+        credentialsProvider_, nullptr /* endpointProvider */, clientConfig);
     ++fileSystemCount;
   }
 
@@ -452,8 +453,35 @@ class S3FileSystem::Impl {
     return s3Config_;
   }
 
+  S3CredentialSnapshot getCredentialSnapshot() const {
+    const auto credentials = credentialsProvider_->GetAWSCredentials();
+    VELOX_USER_CHECK(
+        !credentials.GetAWSAccessKeyId().empty() &&
+            !credentials.GetAWSSecretKey().empty(),
+        "Failed to resolve S3 credentials for native remote IO");
+
+    auto region = s3Config_->endpointRegion();
+    if (!region.has_value()) {
+      if (const auto* value = std::getenv("AWS_REGION");
+          value != nullptr && value[0] != '\0') {
+        region = value;
+      } else if (const auto* value = std::getenv("AWS_DEFAULT_REGION");
+                 value != nullptr && value[0] != '\0') {
+        region = value;
+      }
+    }
+
+    return {
+        std::string(credentials.GetAWSAccessKeyId().c_str()),
+        std::string(credentials.GetAWSSecretKey().c_str()),
+        std::string(credentials.GetSessionToken().c_str()),
+        std::move(region),
+        s3Config_->endpoint()};
+  }
+
  private:
   std::shared_ptr<Aws::S3::S3Client> client_;
+  std::shared_ptr<Aws::Auth::AWSCredentialsProvider> credentialsProvider_;
   std::shared_ptr<S3Config> s3Config_;
 };
 
@@ -471,6 +499,10 @@ std::string S3FileSystem::getLogLevelName() const {
 
 std::string S3FileSystem::getLogPrefix() const {
   return impl_->getLogPrefix();
+}
+
+S3CredentialSnapshot S3FileSystem::getCredentialSnapshot() const {
+  return impl_->getCredentialSnapshot();
 }
 
 std::unique_ptr<ReadFile> S3FileSystem::openFileForRead(

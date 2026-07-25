@@ -29,9 +29,16 @@
 #include <cudf/io/types.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
+#include <rmm/device_buffer.hpp>
 #include <rmm/resource_ref.hpp>
 
+#ifdef VELOX_ENABLE_S3
+#include <kvikio/remote_handle.hpp>
+#endif
+
 #include <algorithm>
+#include <future>
+#include <optional>
 #include <vector>
 
 namespace facebook::velox::cudf_velox::connector::hive {
@@ -92,6 +99,64 @@ class BufferedInputDataSource : public cudf::io::datasource {
   std::vector<std::function<void(rmm::cuda_stream_view stream)>>
       pendingDeviceLoads_;
 };
+
+/// KvikIO remote S3 source with credentials resolved by Velox's AWS provider
+/// chain. KvikIO remote handles do not consume Velox credential providers.
+#ifdef VELOX_ENABLE_S3
+class KvikioS3DataSource final : public cudf::io::datasource {
+ public:
+  KvikioS3DataSource(
+      const std::string& filePath,
+      const std::string& accessKeyId,
+      const std::string& secretAccessKey,
+      const std::string& sessionToken,
+      std::optional<std::string> region,
+      std::optional<std::string> endpoint,
+      std::optional<std::size_t> fileSize = std::nullopt);
+
+  [[nodiscard]] size_t size() const override;
+
+  std::unique_ptr<datasource::buffer> host_read(size_t offset, size_t size)
+      override;
+
+  size_t host_read(size_t offset, size_t size, uint8_t* dst) override;
+
+  std::future<std::unique_ptr<datasource::buffer>> host_read_async(
+      size_t offset,
+      size_t size) override;
+
+  std::future<size_t> host_read_async(
+      size_t offset,
+      size_t size,
+      uint8_t* dst) override;
+
+  [[nodiscard]] bool supports_device_read() const override;
+
+  [[nodiscard]] bool is_device_read_preferred(size_t size) const override;
+
+  std::future<size_t> device_read_async(
+      size_t offset,
+      size_t size,
+      uint8_t* dst,
+      rmm::cuda_stream_view stream) override;
+
+  size_t device_read(
+      size_t offset,
+      size_t size,
+      uint8_t* dst,
+      rmm::cuda_stream_view stream) override;
+
+  std::unique_ptr<datasource::buffer> device_read(
+      size_t offset,
+      size_t size,
+      rmm::cuda_stream_view stream) override;
+
+ private:
+  size_t clampedReadSize(size_t offset, size_t requestedSize) const;
+
+  kvikio::RemoteHandle handle_;
+};
+#endif
 
 /**
  * @brief Hybrid scan reader state

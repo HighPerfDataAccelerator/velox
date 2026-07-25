@@ -37,6 +37,16 @@ using AWSCredentialsProviderFactory =
     std::function<std::shared_ptr<Aws::Auth::AWSCredentialsProvider>(
         const S3Config& config)>;
 
+/// Point-in-time credentials for native S3 clients that cannot consume an AWS
+/// SDK credentials provider directly. Never log this structure.
+struct S3CredentialSnapshot {
+  std::string accessKeyId;
+  std::string secretAccessKey;
+  std::string sessionToken;
+  std::optional<std::string> region;
+  std::optional<std::string> endpoint;
+};
+
 void registerCredentialsProvider(
     const std::string& providerName,
     const AWSCredentialsProviderFactory& factory);
@@ -86,6 +96,10 @@ class S3FileSystem : public FileSystem {
   std::string getLogLevelName() const;
 
   std::string getLogPrefix() const;
+
+  /// Resolves the provider again on every call so rotating credentials such
+  /// as web identity/IRSA are refreshed when a native handle is opened.
+  S3CredentialSnapshot getCredentialSnapshot() const;
 
  protected:
   class Impl;

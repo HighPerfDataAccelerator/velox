@@ -71,6 +71,11 @@ class CudfIcebergSplitReader : public CudfSplitReader {
   /// directly into the DataSource's stats object.
   void prepareSplit(dwio::common::RuntimeStatistics& runtimeStats) override;
 
+  void setDataSourceContext(
+      const ConnectorQueryCtx* connectorQueryCtx,
+      dwio::common::RuntimeStatistics& runtimeStats,
+      cudf::ast::expression const* subfieldFilterExpr) override;
+
  protected:
   // Override to also clear delete readers and column injection
   void resetSplit() override;

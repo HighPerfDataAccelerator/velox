@@ -316,6 +316,35 @@ void CudfHiveDataSource::addSplit(std::shared_ptr<ConnectorSplit> split) {
   }
 }
 
+void CudfHiveDataSource::setFromDataSource(
+    std::unique_ptr<DataSource> sourceUnique) {
+  auto* source = dynamic_cast<CudfHiveDataSource*>(sourceUnique.get());
+  VELOX_CHECK_NOT_NULL(source, "Bad DataSource type");
+
+  split_ = std::move(source->split_);
+  runtimeStats_.skippedSplits += source->runtimeStats_.skippedSplits;
+  runtimeStats_.processedSplits += source->runtimeStats_.processedSplits;
+  runtimeStats_.skippedSplitBytes += source->runtimeStats_.skippedSplitBytes;
+  completedRows_ += source->completedRows_;
+  completedBytes_ += source->completedBytes_;
+  numFilesCoalesced_ += source->numFilesCoalesced_;
+  totalRemainingFilterTime_.fetch_add(
+      source->totalRemainingFilterTime_.load(std::memory_order_relaxed),
+      std::memory_order_relaxed);
+
+  // The prepared reader records IO into the prepared DataSource's counters.
+  // Preserve counters accumulated by earlier splits before adopting them.
+  source->ioStatistics_->merge(*ioStatistics_);
+  ioStatistics_ = std::move(source->ioStatistics_);
+  source->ioStats_->merge(*ioStats_);
+  ioStats_ = std::move(source->ioStats_);
+
+  cudfSplitReader_ = std::move(source->cudfSplitReader_);
+  VELOX_CHECK_NOT_NULL(cudfSplitReader_);
+  cudfSplitReader_->setDataSourceContext(
+      connectorQueryCtx_, runtimeStats_, subfieldFilterExpr_);
+}
+
 std::optional<RowVectorPtr> CudfHiveDataSource::next(
     uint64_t size,
     velox::ContinueFuture& /* future */) {
