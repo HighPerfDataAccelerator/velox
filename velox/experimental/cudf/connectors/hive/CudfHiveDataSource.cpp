@@ -339,6 +339,14 @@ void CudfHiveDataSource::setFromDataSource(
   source->ioStats_->merge(*ioStats_);
   ioStats_ = std::move(source->ioStats_);
 
+  // The prepared reader's parquet_reader_options stores a non-owning pointer
+  // to the filter expression. Adopt the expression storage together with the
+  // reader; otherwise destroying sourceUnique below leaves libcudf with a
+  // dangling AST (and dangling literal scalars) during statistics pruning.
+  subfieldScalars_ = std::move(source->subfieldScalars_);
+  subfieldTree_ = std::move(source->subfieldTree_);
+  subfieldFilterExpr_ = source->subfieldFilterExpr_;
+
   cudfSplitReader_ = std::move(source->cudfSplitReader_);
   VELOX_CHECK_NOT_NULL(cudfSplitReader_);
   cudfSplitReader_->setDataSourceContext(
