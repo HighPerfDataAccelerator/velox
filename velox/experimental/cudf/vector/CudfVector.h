@@ -68,6 +68,11 @@ class CudfVector : public RowVector {
     return tabView_;
   }
 
+  /// Returns the packed storage when this vector was constructed from a
+  /// packed_table, or nullptr for ordinary table storage. The returned pointer
+  /// remains valid only while this CudfVector is alive and retains ownership.
+  const cudf::packed_columns* getPackedColumns() const;
+
   /// Releases ownership of the underlying table.
   /// If constructed from packed_table, materializes a table from the view
   /// first (which copies the data).

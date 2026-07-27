@@ -1287,12 +1287,37 @@ class ExchangeAdapter : public OperatorAdapter {
       const core::PlanNodePtr& planNode,
       exec::DriverCtx* ctx,
       int32_t operatorId) const override {
+    return createReplacementsImpl(op, planNode, ctx, operatorId, false);
+  }
+
+  std::vector<std::unique_ptr<exec::Operator>> createReplacements(
+      const exec::Operator* op,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* ctx,
+      int32_t operatorId,
+      const ReplacementContext& replacementContext) const override {
+    return createReplacementsImpl(
+        op,
+        planNode,
+        ctx,
+        operatorId,
+        replacementContext.downstreamRequiresInputBatchPreservation);
+  }
+
+ private:
+  std::vector<std::unique_ptr<exec::Operator>> createReplacementsImpl(
+      const exec::Operator* op,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* ctx,
+      int32_t operatorId,
+      bool preserveOutputBatches) const {
     auto* exchangeOp =
         const_cast<exec::Exchange*>(dynamic_cast<const exec::Exchange*>(op));
     VELOX_CHECK_NOT_NULL(exchangeOp);
     LOG(WARNING) << "CudfExchangeAdapter: replacing Exchange with UcxExchange"
                  << " task=" << op->taskId() << " pipeline=" << ctx->pipelineId
-                 << " operatorId=" << operatorId << " node=" << planNode->id();
+                 << " operatorId=" << operatorId << " node=" << planNode->id()
+                 << " preserveOutputBatches=" << preserveOutputBatches;
 
     std::shared_ptr<ucx_exchange::UcxExchangeClient> client;
     auto key = TaskPipelineKey{op->taskId(), ctx->pipelineId};
@@ -1326,7 +1351,8 @@ class ExchangeAdapter : public OperatorAdapter {
         std::make_unique<ucx_exchange::UcxExchange>(
             operatorId, ctx, planNode, client));
     if (CudfConfig::getInstance().concatOptimizationEnabled &&
-        CudfConfig::getInstance().exchangeConcatOptimizationEnabled) {
+        CudfConfig::getInstance().exchangeConcatOptimizationEnabled &&
+        !preserveOutputBatches) {
       result.push_back(
           std::make_unique<CudfBatchConcat>(
               operatorId,
@@ -1342,6 +1368,7 @@ class ExchangeAdapter : public OperatorAdapter {
     return result;
   }
 
+ public:
   bool keepOperator() const override {
     return !CudfConfig::getInstance().exchange;
   }

@@ -58,11 +58,19 @@ class OperatorAdapter {
   /// produces GPU vectors as output.
   virtual bool producesGpuOutput() const = 0;
 
+  /// Whether the operator needs the upstream source batches unchanged. This
+  /// allows source adapters to skip optional coalescing that would discard
+  /// transport-specific ownership or metadata.
+  virtual bool requiresInputBatchPreservation() const {
+    return false;
+  }
+
   /// Bundled GPU capability properties for an operator.
   struct Properties {
     bool canRunOnGPU = false;
     bool acceptsGpuInput = false;
     bool producesGpuOutput = false;
+    bool requiresInputBatchPreservation = false;
   };
 
   /// Query all GPU capability properties at once for the given operator.
@@ -75,16 +83,32 @@ class OperatorAdapter {
     props.canRunOnGPU = canRunOnGPU(op, planNode, ctx);
     props.acceptsGpuInput = props.canRunOnGPU && acceptsGpuInput();
     props.producesGpuOutput = props.canRunOnGPU && producesGpuOutput();
+    props.requiresInputBatchPreservation =
+        props.canRunOnGPU && requiresInputBatchPreservation();
     return props;
   }
 
-  /// Create replacement GPU operator(s). Returns a vector of replacement
-  /// operators (empty if operator should be kept).
+  struct ReplacementContext {
+    bool downstreamRequiresInputBatchPreservation{false};
+  };
+
+  /// Create GPU operators for this adapter. They replace the original
+  /// operator unless keepOperator() is true, in which case they are appended
+  /// after it.
   virtual std::vector<std::unique_ptr<exec::Operator>> createReplacements(
       const exec::Operator* op,
       const core::PlanNodePtr& planNode,
       exec::DriverCtx* ctx,
       int32_t operatorId) const = 0;
+
+  virtual std::vector<std::unique_ptr<exec::Operator>> createReplacements(
+      const exec::Operator* op,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* ctx,
+      int32_t operatorId,
+      const ReplacementContext& /*replacementContext*/) const {
+    return createReplacements(op, planNode, ctx, operatorId);
+  }
 
   /// Check if the original operator should be kept (not replaced). Returns
   /// true if the original operator should be kept, false otherwise.
