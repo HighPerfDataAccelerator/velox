@@ -262,11 +262,10 @@ void CudfTopNRowNumber::doAddInput(RowVectorPtr input) {
   if (isPartial_) {
     if (!partialStrategyDecided_ &&
         inputView.num_rows() >= kPartialSelectivityMinSampleRows) {
-      const auto sampleRows = std::min(
-          inputView.num_rows(), kPartialSelectivityMaxSampleRows);
+      const auto sampleRows =
+          std::min(inputView.num_rows(), kPartialSelectivityMaxSampleRows);
       auto sample = copyTableSlice(inputView, 0, sampleRows, stream, mr);
-      auto sampleCandidates =
-          reduceToCandidates(sample->view(), stream, mr);
+      auto sampleCandidates = reduceToCandidates(sample->view(), stream, mr);
       partialSampleRows_ = sampleRows;
       partialSampleCandidateRows_ = sampleCandidates->num_rows();
       partialBypass_ =
@@ -274,8 +273,7 @@ void CudfTopNRowNumber::doAddInput(RowVectorPtr input) {
           partialSampleRows_ * kPartialBypassRetentionNumerator;
       partialStrategyDecided_ = true;
       addRuntimeStat(
-          "topNRowNumberPartialSampleRows",
-          RuntimeCounter(partialSampleRows_));
+          "topNRowNumberPartialSampleRows", RuntimeCounter(partialSampleRows_));
       addRuntimeStat(
           "topNRowNumberPartialSampleCandidateRows",
           RuntimeCounter(partialSampleCandidateRows_));
@@ -297,19 +295,18 @@ void CudfTopNRowNumber::doAddInput(RowVectorPtr input) {
     addRuntimeStat(
         "topNRowNumberPartialOutputRows",
         RuntimeCounter(batchCandidates->num_rows()));
-    addRuntimeStat(
-        "topNRowNumberPartialOutputBatches", RuntimeCounter(1));
-    pendingOutputs_.push_back(std::make_shared<CudfVector>(
-        pool(),
-        inputType_,
-        batchCandidates->num_rows(),
-        std::move(batchCandidates),
-        stream));
+    addRuntimeStat("topNRowNumberPartialOutputBatches", RuntimeCounter(1));
+    pendingOutputs_.push_back(
+        std::make_shared<CudfVector>(
+            pool(),
+            inputType_,
+            batchCandidates->num_rows(),
+            std::move(batchCandidates),
+            stream));
     return;
   }
 
-  auto batchCandidates =
-      reduceToCandidates(inputView, stream, mr);
+  auto batchCandidates = reduceToCandidates(inputView, stream, mr);
   if (candidates_ && candidates_->num_rows() > 0) {
     std::vector<cudf::table_view> pieces{
         candidates_->view(), batchCandidates->view()};
@@ -338,11 +335,9 @@ void CudfTopNRowNumber::doAddInput(RowVectorPtr input) {
 void CudfTopNRowNumber::doNoMoreInput() {
   Operator::noMoreInput();
   if (isPartial_) {
+    addRuntimeStat("topNRowNumberBoundedPartialPath", RuntimeCounter(1));
     addRuntimeStat(
-        "topNRowNumberBoundedPartialPath", RuntimeCounter(1));
-    addRuntimeStat(
-        "topNRowNumberPartialBypassRows",
-        RuntimeCounter(partialBypassRows_));
+        "topNRowNumberPartialBypassRows", RuntimeCounter(partialBypassRows_));
     addRuntimeStat(
         "topNRowNumberPartialBypassBatches",
         RuntimeCounter(partialBypassBatches_));

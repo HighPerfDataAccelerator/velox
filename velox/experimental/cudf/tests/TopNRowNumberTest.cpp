@@ -293,8 +293,7 @@ TEST_F(CudfTopNRowNumberTest, boundedPartialReturnsBatchLocalRankCandidates) {
 
   assertEqualResults({expected}, actual);
   EXPECT_EQ(
-      topNRuntimeStat(task->taskStats(), "topNRowNumberBoundedPartialPath"),
-      1);
+      topNRuntimeStat(task->taskStats(), "topNRowNumberBoundedPartialPath"), 1);
   EXPECT_EQ(
       topNRuntimeStat(task->taskStats(), "topNRowNumberPartialOutputBatches"),
       2);
