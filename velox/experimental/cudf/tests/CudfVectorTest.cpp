@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "velox/experimental/cudf/exec/PackedTableHostBuffer.h"
 #include "velox/experimental/cudf/tests/utils/CudfStreamTestUtils.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
@@ -163,6 +164,80 @@ TEST_F(CudfVectorTest, rebindPackedTableDeallocationStream) {
 
   EXPECT_GT(resource.deallocationCount(), 0);
   EXPECT_EQ(resource.lastDeallocationStream(), targetStream.value());
+}
+
+TEST_F(CudfVectorTest, exposesPackedStorageWithoutMaterializing) {
+  TestCudaStream stream;
+  RecordingAsyncDeviceResource resource;
+  auto packedTable = makePackedTable(stream.view(), resource);
+  const auto* expectedData = packedTable->data.gpu_data->data();
+  const auto expectedDataSize = packedTable->data.gpu_data->size();
+  const auto expectedMetadata = *packedTable->data.metadata;
+
+  CudfVector packedVector(
+      pool_.get(),
+      ROW({"c0"}, {INTEGER()}),
+      packedTable->table.num_rows(),
+      std::move(packedTable),
+      stream.view());
+  const auto* packedColumns = packedVector.getPackedColumns();
+  ASSERT_NE(packedColumns, nullptr);
+  EXPECT_EQ(packedColumns->gpu_data->data(), expectedData);
+  EXPECT_EQ(packedColumns->gpu_data->size(), expectedDataSize);
+  EXPECT_EQ(*packedColumns->metadata, expectedMetadata);
+
+  auto table =
+      makeTable(stream.view(), cudf::get_current_device_resource_ref());
+  stream.view().synchronize();
+  CudfVector tableVector(
+      pool_.get(),
+      ROW({"c0"}, {INTEGER()}),
+      table->num_rows(),
+      std::move(table),
+      stream.view());
+  EXPECT_EQ(tableVector.getPackedColumns(), nullptr);
+}
+
+TEST_F(CudfVectorTest, packedHostRoundTripDoesNotRepack) {
+  TestCudaStream stream;
+  RecordingAsyncDeviceResource resource;
+  auto packedTable = makePackedTable(stream.view(), resource);
+  auto vector = std::make_shared<CudfVector>(
+      pool_.get(),
+      ROW({"c0"}, {INTEGER()}),
+      packedTable->table.num_rows(),
+      std::move(packedTable),
+      stream.view());
+
+  PackedTableHostBufferStats stats;
+  auto hostBuffer = PackedTableHostBuffer::fromVector(
+      std::move(vector),
+      pool_.get(),
+      rmm::to_device_async_resource_ref_checked(&resource),
+      stats);
+  EXPECT_EQ(stats.packedInputBatches, 1);
+  EXPECT_EQ(stats.repackedInputBatches, 0);
+  EXPECT_GT(stats.deviceToHostBytes, 0);
+
+  auto restored = hostBuffer.toVector(
+      pool_.get(),
+      ROW({"c0"}, {INTEGER()}),
+      stream.view(),
+      rmm::to_device_async_resource_ref_checked(&resource),
+      stats);
+  ASSERT_NE(restored->getPackedColumns(), nullptr);
+  EXPECT_EQ(restored->size(), 4);
+  EXPECT_EQ(stats.hostToDeviceBytes, stats.deviceToHostBytes);
+
+  std::array<int32_t, 4> actual{};
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+      actual.data(),
+      restored->getTableView().column(0).data<int32_t>(),
+      actual.size() * sizeof(int32_t),
+      cudaMemcpyDeviceToHost,
+      stream.value()));
+  stream.view().synchronize();
+  EXPECT_EQ(actual, (std::array<int32_t, 4>{{1, 2, 3, 4}}));
 }
 
 TEST_F(CudfVectorTest, packedTableReleaseUsesMaterializationStream) {

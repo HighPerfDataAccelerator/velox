@@ -183,6 +183,15 @@ CudfVector::CudfVector(
   flatSize_ = packedPtr->data.gpu_data->size();
 }
 
+const cudf::packed_columns* CudfVector::getPackedColumns() const {
+  const auto* packedPtr =
+      std::get_if<std::unique_ptr<cudf::packed_table>>(&tableStorage_);
+  if (packedPtr == nullptr || *packedPtr == nullptr) {
+    return nullptr;
+  }
+  return &(*packedPtr)->data;
+}
+
 std::unique_ptr<cudf::table> CudfVector::release() {
   flatSize_ = 0;
   if (auto* tablePtr =

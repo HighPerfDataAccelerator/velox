@@ -237,6 +237,7 @@ bool CompileState::compile(bool allowCpuFallback) {
           props.canRunOnGPU = true;
           props.acceptsGpuInput = true;
           props.producesGpuOutput = true;
+          props.requiresInputBatchPreservation = false;
         }
         return props;
       };
@@ -305,8 +306,12 @@ bool CompileState::compile(bool allowCpuFallback) {
       keepOperator = adapter->keepOperator();
       if (keepOperator == 0) {
         if (planNode && thisOpProps.canRunOnGPU) {
-          auto replacements =
-              adapter->createReplacements(oper, planNode, ctx, id);
+          const OperatorAdapter::ReplacementContext replacementContext{
+              .downstreamRequiresInputBatchPreservation =
+                  operatorIndex + 1 < opProps.size() &&
+                  opProps[operatorIndex + 1].requiresInputBatchPreservation};
+          auto replacements = adapter->createReplacements(
+              oper, planNode, ctx, id, replacementContext);
           for (auto& r : replacements) {
             replaceOp.push_back(std::move(r));
           }
@@ -317,8 +322,15 @@ bool CompileState::compile(bool allowCpuFallback) {
         }
       } else {
         // adapter is present and keepOperator is 1, so this is GPU compatible
-        // operator. so this CPU operators is allowed even if fallback is
-        // disabled.
+        // operator. Any returned operators are appended after the retained
+        // original operator.
+        if (planNode && thisOpProps.canRunOnGPU) {
+          auto postOperators =
+              adapter->createReplacements(oper, planNode, ctx, id);
+          for (auto& postOperator : postOperators) {
+            replaceOp.push_back(std::move(postOperator));
+          }
+        }
         isPureCpuOperator = false;
       }
     } else {
