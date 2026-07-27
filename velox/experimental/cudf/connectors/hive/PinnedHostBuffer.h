@@ -31,7 +31,10 @@ namespace facebook::velox::cudf_velox::connector::hive {
 /// correctness.
 class PinnedHostBuffer {
  public:
-  explicit PinnedHostBuffer(size_t size) : size_(size) {
+  explicit PinnedHostBuffer(
+      size_t size,
+      std::shared_ptr<void> lifetime = nullptr)
+      : lifetime_(std::move(lifetime)), size_(size) {
     if (size_ == 0) {
       return;
     }
@@ -82,6 +85,9 @@ class PinnedHostBuffer {
   }
 
  private:
+  // Keep any executor-wide byte reservation alive until after the allocation
+  // is released by the destructor body.
+  std::shared_ptr<void> lifetime_;
   uint8_t* data_{nullptr};
   size_t size_{0};
   bool pinned_{false};

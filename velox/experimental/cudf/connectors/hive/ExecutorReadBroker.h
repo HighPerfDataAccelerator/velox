@@ -32,6 +32,27 @@
 
 namespace facebook::velox::cudf_velox::connector::hive {
 
+class ExecutorReadBroker;
+
+/// Holds an executor-wide byte reservation. The reservation is released when
+/// the last owner drops it, which lets callers acquire the budget before
+/// allocating pinned buffers and retain it for the buffers' full lifetime.
+class ExecutorReadReservation {
+ public:
+  ~ExecutorReadReservation();
+
+ private:
+  friend class ExecutorReadBroker;
+
+  ExecutorReadReservation(
+      std::shared_ptr<ExecutorReadBroker> broker,
+      uint64_t bytes)
+      : broker_(std::move(broker)), bytes_(bytes) {}
+
+  std::shared_ptr<ExecutorReadBroker> broker_;
+  const uint64_t bytes_;
+};
+
 struct PrefetchRange {
   uint64_t fileOffset;
   uint64_t size;
@@ -58,11 +79,17 @@ class ExecutorReadBroker
   /// this before destroying the executor that provides the registry key.
   static void erase(folly::Executor* executor);
 
+  /// Acquires the executor-wide byte budget synchronously. A request larger
+  /// than the configured budget is admitted only when it is the sole
+  /// reservation, matching the broker's existing oversize policy.
+  std::shared_ptr<ExecutorReadReservation> reserve(uint64_t bytes);
+
   std::future<void> read(
       PrefetchReadFunction readFunction,
       uint64_t sourceSize,
       std::vector<PrefetchRange> ranges,
-      std::shared_ptr<PinnedHostBuffer> destination);
+      std::shared_ptr<PinnedHostBuffer> destination,
+      std::shared_ptr<ExecutorReadReservation> reservation = nullptr);
 
   /// Opens one physical source on a broker worker and reads all of its ranges
   /// into a pinned destination. Keeping preparation and reads in one worker
@@ -72,9 +99,12 @@ class ExecutorReadBroker
       PrefetchReadFactory readFactory,
       uint64_t sourceSize,
       std::vector<PrefetchRange> ranges,
-      std::shared_ptr<PinnedHostBuffer> destination);
+      std::shared_ptr<PinnedHostBuffer> destination,
+      std::shared_ptr<ExecutorReadReservation> reservation = nullptr);
 
  private:
+  friend class ExecutorReadReservation;
+
   ExecutorReadBroker(
       folly::Executor* executor,
       uint64_t maxInFlightBytes,

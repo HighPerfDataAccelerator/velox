@@ -43,6 +43,12 @@ brokers() {
 
 } // namespace
 
+ExecutorReadReservation::~ExecutorReadReservation() {
+  if (broker_) {
+    broker_->release(bytes_);
+  }
+}
+
 std::shared_ptr<ExecutorReadBroker> ExecutorReadBroker::get(
     folly::Executor* executor,
     uint64_t maxInFlightBytes,
@@ -96,11 +102,24 @@ void ExecutorReadBroker::release(uint64_t bytes) {
   available_.notify_all();
 }
 
+std::shared_ptr<ExecutorReadReservation> ExecutorReadBroker::reserve(
+    uint64_t bytes) {
+  acquire(bytes);
+  try {
+    return std::shared_ptr<ExecutorReadReservation>(
+        new ExecutorReadReservation(shared_from_this(), bytes));
+  } catch (...) {
+    release(bytes);
+    throw;
+  }
+}
+
 std::future<void> ExecutorReadBroker::read(
     PrefetchReadFunction readFunction,
     uint64_t sourceSize,
     std::vector<PrefetchRange> ranges,
-    std::shared_ptr<PinnedHostBuffer> destination) {
+    std::shared_ptr<PinnedHostBuffer> destination,
+    std::shared_ptr<ExecutorReadReservation> reservation) {
   VELOX_CHECK(
       static_cast<bool>(readFunction),
       "ExecutorReadBroker requires a range-read function");
@@ -131,8 +150,11 @@ std::future<void> ExecutorReadBroker::read(
          remaining,
          failure,
          failureMutex,
-         promise]() {
-          self->acquire(range.size);
+         promise,
+         reservation]() {
+          if (!reservation) {
+            self->acquire(range.size);
+          }
           try {
             readFunction(
                 range.fileOffset,
@@ -144,7 +166,9 @@ std::future<void> ExecutorReadBroker::read(
               *failure = std::current_exception();
             }
           }
-          self->release(range.size);
+          if (!reservation) {
+            self->release(range.size);
+          }
           if (remaining->fetch_sub(1, std::memory_order_acq_rel) == 1) {
             if (*failure) {
               promise->set_exception(*failure);
@@ -161,7 +185,8 @@ std::future<void> ExecutorReadBroker::readPrepared(
     PrefetchReadFactory readFactory,
     uint64_t sourceSize,
     std::vector<PrefetchRange> ranges,
-    std::shared_ptr<PinnedHostBuffer> destination) {
+    std::shared_ptr<PinnedHostBuffer> destination,
+    std::shared_ptr<ExecutorReadReservation> reservation) {
   VELOX_CHECK(
       static_cast<bool>(readFactory),
       "ExecutorReadBroker requires a range-read factory");
@@ -187,8 +212,11 @@ std::future<void> ExecutorReadBroker::readPrepared(
        ranges = std::move(ranges),
        destination = std::move(destination),
        promise,
-       totalBytes]() mutable {
-        self->acquire(totalBytes);
+       totalBytes,
+       reservation = std::move(reservation)]() mutable {
+        if (!reservation) {
+          self->acquire(totalBytes);
+        }
         try {
           auto readFunction = readFactory();
           VELOX_CHECK(
@@ -201,11 +229,15 @@ std::future<void> ExecutorReadBroker::readPrepared(
                 destination->data() + range.bufferOffset);
           }
         } catch (...) {
-          self->release(totalBytes);
+          if (!reservation) {
+            self->release(totalBytes);
+          }
           promise->set_exception(std::current_exception());
           return;
         }
-        self->release(totalBytes);
+        if (!reservation) {
+          self->release(totalBytes);
+        }
         promise->set_value();
       });
   return future;

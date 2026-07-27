@@ -320,44 +320,39 @@ void CudfSplitReader::setupSelectivePreloadDataSources() {
     ExecutorSplitPrefetch::initialize(
         executor_,
         connectorQueryCtx_->queryId(),
-        [path = split_->filePath,
-         config = cudfHiveConfig_->config()]() {
-          auto fileSystem = filesystems::getFileSystem(path, config);
+        [config = cudfHiveConfig_->config()](
+            const std::string& filePath,
+            std::optional<std::size_t> fileSize) {
+          auto fileSystem = filesystems::getFileSystem(filePath, config);
           auto s3FileSystem =
               std::dynamic_pointer_cast<filesystems::S3FileSystem>(fileSystem);
           VELOX_CHECK_NOT_NULL(
               s3FileSystem,
               "S3 path resolved to a non-S3 filesystem: {}",
-              path);
-          const auto credentials =
-              std::make_shared<const filesystems::S3CredentialSnapshot>(
-                  s3FileSystem->getCredentialSnapshot());
-          return [credentials](
-                     const std::string& filePath,
-                     std::optional<std::size_t> fileSize) {
-            auto source = std::make_shared<KvikioS3DataSource>(
-                filePath,
-                credentials->accessKeyId,
-                credentials->secretAccessKey,
-                credentials->sessionToken,
-                credentials->region,
-                credentials->endpoint,
-                fileSize);
-            return PrefetchReadFunction{
-                [source = std::move(source), filePath](
-                    uint64_t offset,
-                    uint64_t size,
-                    uint8_t* destination) {
-                  const auto bytes =
-                      source->host_read(offset, size, destination);
-                  VELOX_CHECK_EQ(
-                      bytes,
-                      size,
-                      "Short datasource read for {} at offset {}",
-                      filePath,
-                      offset);
-                }};
-          };
+              filePath);
+          const auto credentials = s3FileSystem->getCredentialSnapshot();
+          auto source = std::make_shared<KvikioS3DataSource>(
+              filePath,
+              credentials.accessKeyId,
+              credentials.secretAccessKey,
+              credentials.sessionToken,
+              credentials.region,
+              credentials.endpoint,
+              fileSize);
+          return PrefetchReadFunction{
+              [source = std::move(source), filePath](
+                  uint64_t offset,
+                  uint64_t size,
+                  uint8_t* destination) {
+                const auto bytes =
+                    source->host_read(offset, size, destination);
+                VELOX_CHECK_EQ(
+                    bytes,
+                    size,
+                    "Short datasource read for {} at offset {}",
+                    filePath,
+                    offset);
+              }};
         },
         broker,
         splitConcurrency,
@@ -419,47 +414,51 @@ void CudfSplitReader::setupSelectivePreloadDataSources() {
   const auto useBufferedInput = cudfHiveConfig_->useBufferedInputSession(
       connectorQueryCtx_->sessionProperties());
   if (!useBufferedInput && split_->filePath.starts_with("s3://")) {
-    auto fileSystem = filesystems::getFileSystem(
-        split_->filePath, cudfHiveConfig_->config());
-    auto s3FileSystem =
-        std::dynamic_pointer_cast<filesystems::S3FileSystem>(fileSystem);
-    VELOX_CHECK_NOT_NULL(
-        s3FileSystem,
-        "S3 path resolved to a non-S3 filesystem: {}",
-        split_->filePath);
-    // Resolve rotating IRSA credentials once per grouped split. Every handle
-    // constructed by a broker worker uses the same point-in-time snapshot.
-    const auto credentials =
-        std::make_shared<const filesystems::S3CredentialSnapshot>(
-            s3FileSystem->getCredentialSnapshot());
     sourceFactory =
-        [credentials](
+        [config = cudfHiveConfig_->config()](
             const std::string& path,
             std::optional<std::size_t> fileSize) {
           VELOX_CHECK(
               path.starts_with("s3://"),
               "Grouped S3 split contains a non-S3 path: {}",
               path);
+          auto fileSystem = filesystems::getFileSystem(path, config);
+          auto s3FileSystem =
+              std::dynamic_pointer_cast<filesystems::S3FileSystem>(fileSystem);
+          VELOX_CHECK_NOT_NULL(
+              s3FileSystem,
+              "S3 path resolved to a non-S3 filesystem: {}",
+              path);
+          const auto credentials = s3FileSystem->getCredentialSnapshot();
           return std::make_shared<KvikioS3DataSource>(
               path,
-              credentials->accessKeyId,
-              credentials->secretAccessKey,
-              credentials->sessionToken,
-              credentials->region,
-              credentials->endpoint,
+              credentials.accessKeyId,
+              credentials.secretAccessKey,
+              credentials.sessionToken,
+              credentials.region,
+              credentials.endpoint,
               fileSize);
         };
   }
 #endif
 
-  // Submit all physical files before waiting for any one of them. This removes
-  // the per-file synchronization barrier inside a grouped split and lets the
-  // executor-scoped broker maintain one request window across scan drivers.
-  auto submitFile = [&](const std::string& path,
-                        uint64_t start,
-                        uint64_t length) {
+  struct PreparedFile {
+    std::string path;
+    std::optional<std::size_t> knownFileSize;
+    std::shared_ptr<cudf::io::datasource> originalSource;
+    uint64_t sourceSize;
+  };
+  std::vector<PreparedFile> prepared;
+  prepared.reserve(1 + split_->coalescedFiles.size());
+  uint64_t batchBytes = 0;
+
+  auto prepareFile = [&](const std::string& path,
+                         uint64_t start,
+                         uint64_t length,
+                         bool wholeFile) {
     const std::optional<std::size_t> knownFileSize =
-        start == 0 && length != std::numeric_limits<uint64_t>::max()
+        wholeFile && start == 0 &&
+            length != std::numeric_limits<uint64_t>::max()
         ? std::optional<std::size_t>{length}
         : std::nullopt;
     std::shared_ptr<cudf::io::datasource> originalSource;
@@ -470,19 +469,52 @@ void CudfSplitReader::setupSelectivePreloadDataSources() {
             VELOX_CHECK_NOT_NULL(originalSource);
             return originalSource->size();
           })();
-    auto buffer = std::make_shared<PinnedHostBuffer>(sourceSize);
+    VELOX_CHECK_LE(
+        sourceSize,
+        std::numeric_limits<uint64_t>::max() - batchBytes,
+        "Selective preload byte count overflow");
+    batchBytes += sourceSize;
+    prepared.push_back(
+        {path, knownFileSize, std::move(originalSource), sourceSize});
+  };
+
+  // A split range that begins at zero is not necessarily a whole file. The
+  // coalesced-file contract is the only caller-provided proof that these
+  // lengths cover complete physical files.
+  prepareFile(
+      split_->filePath,
+      split_->start,
+      split_->length,
+      !split_->coalescedFiles.empty());
+  for (const auto& file : split_->coalescedFiles) {
+    prepareFile(file.filePath, 0, file.length, true);
+  }
+
+  // Reserve the whole grouped split before allocating any pinned buffer. The
+  // broker admits one oversize group only when no other reservation is live.
+  auto reservation = broker->reserve(batchBytes);
+
+  // Submit all physical files before waiting for any one of them. This removes
+  // the per-file synchronization barrier inside a grouped split and lets the
+  // executor-scoped broker maintain one request window across scan drivers.
+  auto submitFile = [&](PreparedFile file) {
+    auto buffer =
+        std::make_shared<PinnedHostBuffer>(file.sourceSize, reservation);
 
     std::vector<PrefetchRange> ranges;
-    ranges.reserve((sourceSize + kReadRangeBytes - 1) / kReadRangeBytes);
-    for (uint64_t offset = 0; offset < sourceSize;
+    ranges.reserve(
+        (file.sourceSize + kReadRangeBytes - 1) / kReadRangeBytes);
+    for (uint64_t offset = 0; offset < file.sourceSize;
          offset += kReadRangeBytes) {
       ranges.push_back(
           {offset,
-           std::min<uint64_t>(kReadRangeBytes, sourceSize - offset),
+           std::min<uint64_t>(
+               kReadRangeBytes, file.sourceSize - offset),
            offset});
     }
     auto makeReadFunction =
-        [path](std::shared_ptr<cudf::io::datasource> source) {
+        [path = file.path](
+            std::shared_ptr<cudf::io::datasource> source) {
           VELOX_CHECK_NOT_NULL(source);
           return PrefetchReadFunction{
               [source = std::move(source), path](
@@ -500,30 +532,34 @@ void CudfSplitReader::setupSelectivePreloadDataSources() {
               }};
         };
     std::future<void> future;
-    if (originalSource) {
+    if (file.originalSource) {
       // Unknown-size sources must still be opened synchronously to size the
       // destination. Preserve the existing range-parallel path for them.
       future = broker->read(
-          makeReadFunction(std::move(originalSource)),
-          sourceSize,
+          makeReadFunction(std::move(file.originalSource)),
+          file.sourceSize,
           std::move(ranges),
-          buffer);
+          buffer,
+          reservation);
     } else {
       future = broker->readPrepared(
-          [sourceFactory, makeReadFunction, path, knownFileSize]() mutable {
+          [sourceFactory,
+           makeReadFunction,
+           path = file.path,
+           knownFileSize = file.knownFileSize]() mutable {
             return makeReadFunction(sourceFactory(path, knownFileSize));
           },
-          sourceSize,
+          file.sourceSize,
           std::move(ranges),
-          buffer);
+          buffer,
+          reservation);
     }
     pending.push_back({std::move(buffer), std::move(future)});
   };
 
   selectivePreloadBuffers_.clear();
-  submitFile(split_->filePath, split_->start, split_->length);
-  for (const auto& file : split_->coalescedFiles) {
-    submitFile(file.filePath, 0, file.length);
+  for (auto& file : prepared) {
+    submitFile(std::move(file));
   }
 
   std::exception_ptr firstFailure;

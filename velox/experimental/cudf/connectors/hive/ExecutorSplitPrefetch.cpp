@@ -24,6 +24,7 @@
 #include <deque>
 #include <future>
 #include <mutex>
+#include <stdexcept>
 #include <unordered_map>
 
 namespace facebook::velox::cudf_velox::connector::hive {
@@ -57,6 +58,11 @@ class QueryPrefetchState
     }
     {
       std::lock_guard<std::mutex> lock(mutex_);
+      if (stopped_) {
+        entry->promise->set_exception(std::make_exception_ptr(
+            std::runtime_error("Split prefetch query has stopped")));
+        return;
+      }
       if (entries_.count(splitKey) != 0) {
         return;
       }
@@ -72,20 +78,20 @@ class QueryPrefetchState
   }
 
   void initialize(
-      SplitPrefetchReadFactoryBuilder factoryBuilder,
+      SplitPrefetchReadFactory readFactory,
       std::shared_ptr<ExecutorReadBroker> broker,
       uint32_t splitConcurrency,
       uint64_t maxReadyBytes) {
     {
       std::lock_guard<std::mutex> lock(mutex_);
-      if (initialized_) {
+      if (initialized_ || stopped_) {
         return;
       }
       VELOX_CHECK_NOT_NULL(broker);
-      readFactory_ = factoryBuilder();
+      readFactory_ = std::move(readFactory);
       VELOX_CHECK(
           static_cast<bool>(readFactory_),
-          "Split prefetch factory builder returned an empty factory");
+          "Split prefetch received an empty read factory");
       broker_ = std::move(broker);
       concurrency_ = std::max<uint32_t>(1, splitConcurrency);
       maxReadyBytes_ = std::max<uint64_t>(1, maxReadyBytes);
@@ -114,43 +120,66 @@ class QueryPrefetchState
     return result;
   }
 
- private:
-  void pump() {
-    std::vector<std::shared_ptr<SplitEntry>> jobs;
+  void stop() {
+    std::unique_ptr<folly::CPUThreadPoolExecutor> splitExecutor;
+    std::vector<std::shared_ptr<SplitEntry>> canceled;
     {
       std::lock_guard<std::mutex> lock(mutex_);
-      if (!initialized_) {
+      if (stopped_) {
         return;
       }
-      for (const auto& entry : order_) {
-        if (active_ >= concurrency_) {
-          break;
+      stopped_ = true;
+      initialized_ = false;
+      splitExecutor = std::move(splitExecutor_);
+      for (auto& entry : order_) {
+        if (!entry->scheduled) {
+          canceled.push_back(entry);
         }
-        if (entry->scheduled) {
-          continue;
-        }
-        const bool fits =
-            reservedBytes_ <= maxReadyBytes_ &&
-            entry->bytes <= maxReadyBytes_ - reservedBytes_;
-        if (!fits && (active_ > 0 || reservedBytes_ > 0)) {
-          continue;
-        }
-        entry->scheduled = true;
-        ++active_;
-        reservedBytes_ += entry->bytes;
-        jobs.push_back(entry);
       }
-      // Once a split is scheduled, entries_ and the worker closure provide
-      // its lifetime. Keeping it in order_ would also keep the shared_future
-      // (and therefore completed pinned buffers) alive after take().
-      std::erase_if(
-          order_,
-          [](const auto& entry) { return entry->scheduled; });
+      order_.clear();
     }
-    for (const auto& entry : jobs) {
+    const auto failure = std::make_exception_ptr(std::runtime_error(
+        "Split prefetch canceled because the query stopped"));
+    for (const auto& entry : canceled) {
+      entry->promise->set_exception(failure);
+    }
+    // CPUThreadPoolExecutor destruction joins all active reads. This method is
+    // called outside registry locks and on the query-cleanup thread, so the
+    // final scheduler reference cannot be released by one of its own workers.
+    splitExecutor.reset();
+  }
+
+ private:
+  void pump() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!initialized_ || stopped_) {
+      return;
+    }
+    for (const auto& entry : order_) {
+      if (active_ >= concurrency_) {
+        break;
+      }
+      if (entry->scheduled) {
+        continue;
+      }
+      const bool fits =
+          reservedBytes_ <= maxReadyBytes_ &&
+          entry->bytes <= maxReadyBytes_ - reservedBytes_;
+      if (!fits && (active_ > 0 || reservedBytes_ > 0)) {
+        continue;
+      }
+      entry->scheduled = true;
+      ++active_;
+      reservedBytes_ += entry->bytes;
       splitExecutor_->add(
           [self = shared_from_this(), entry]() { self->run(entry); });
     }
+    // Once a split is scheduled, entries_ and the worker closure provide
+    // its lifetime. Keeping it in order_ would also keep the shared_future
+    // (and therefore completed pinned buffers) alive after take().
+    std::erase_if(
+        order_,
+        [](const auto& entry) { return entry->scheduled; });
   }
 
   void run(const std::shared_ptr<SplitEntry>& entry) {
@@ -158,12 +187,14 @@ class QueryPrefetchState
       auto result = std::make_shared<SplitPrefetchResult>();
       result->reservedBytes = entry->bytes;
       result->buffers.reserve(entry->files.size());
+      auto reservation = broker_->reserve(entry->bytes);
 
       std::vector<std::future<void>> pending;
       pending.reserve(entry->files.size());
 
       for (const auto& file : entry->files) {
-        auto buffer = std::make_shared<PinnedHostBuffer>(file.size);
+        auto buffer =
+            std::make_shared<PinnedHostBuffer>(file.size, reservation);
         std::vector<PrefetchRange> ranges;
         ranges.reserve((file.size + kReadRangeBytes - 1) / kReadRangeBytes);
         for (uint64_t offset = 0; offset < file.size;
@@ -179,7 +210,8 @@ class QueryPrefetchState
             },
             file.size,
             std::move(ranges),
-            buffer);
+            buffer,
+            reservation);
         result->buffers.push_back(std::move(buffer));
         pending.push_back(std::move(future));
       }
@@ -233,6 +265,7 @@ class QueryPrefetchState
   uint64_t maxReadyBytes_{0};
   uint64_t reservedBytes_{0};
   bool initialized_{false};
+  bool stopped_{false};
 };
 
 struct ExecutorState {
@@ -337,7 +370,7 @@ bool ExecutorSplitPrefetch::contains(
 void ExecutorSplitPrefetch::initialize(
     folly::Executor* executor,
     const std::string& queryId,
-    SplitPrefetchReadFactoryBuilder factoryBuilder,
+    SplitPrefetchReadFactory readFactory,
     std::shared_ptr<ExecutorReadBroker> broker,
     uint32_t splitConcurrency,
     uint64_t maxReadyBytes) {
@@ -349,7 +382,7 @@ void ExecutorSplitPrefetch::initialize(
     state = getQueryState(executor, queryId, true);
   }
   state->initialize(
-      std::move(factoryBuilder),
+      std::move(readFactory),
       std::move(broker),
       splitConcurrency,
       maxReadyBytes);
@@ -389,8 +422,9 @@ void ExecutorSplitPrefetch::eraseQuery(
       executorState->queries.erase(it);
     }
   }
-  // Destroy outside registry locks. QueryPrefetchState destruction joins its
-  // scheduler workers, which may still be finishing broker-backed reads.
+  for (const auto& queryState : queryStates) {
+    queryState->stop();
+  }
   queryStates.clear();
 }
 
@@ -408,6 +442,18 @@ void ExecutorSplitPrefetch::erase(folly::Executor* executor) {
     state = std::move(it->second);
     registry().erase(it);
   }
+  std::vector<std::shared_ptr<QueryPrefetchState>> queryStates;
+  {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    for (auto& [queryId, queryState] : state->queries) {
+      queryStates.push_back(std::move(queryState));
+    }
+    state->queries.clear();
+  }
+  for (const auto& queryState : queryStates) {
+    queryState->stop();
+  }
+  queryStates.clear();
   state.reset();
 }
 

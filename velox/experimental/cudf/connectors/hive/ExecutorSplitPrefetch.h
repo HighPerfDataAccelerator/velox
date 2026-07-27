@@ -36,8 +36,6 @@ struct SplitPrefetchFile {
 
 using SplitPrefetchReadFactory = std::function<PrefetchReadFunction(
     const std::string&, std::optional<std::size_t>)>;
-using SplitPrefetchReadFactoryBuilder =
-    std::function<SplitPrefetchReadFactory()>;
 
 struct SplitPrefetchResult {
   ~SplitPrefetchResult();
@@ -71,7 +69,7 @@ class ExecutorSplitPrefetch {
   static void initialize(
       folly::Executor* executor,
       const std::string& queryId,
-      SplitPrefetchReadFactoryBuilder factoryBuilder,
+      SplitPrefetchReadFactory readFactory,
       std::shared_ptr<ExecutorReadBroker> broker,
       uint32_t splitConcurrency,
       uint64_t maxReadyBytes);
