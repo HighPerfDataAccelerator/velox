@@ -34,8 +34,8 @@ struct SplitPrefetchFile {
   uint64_t size;
 };
 
-using SplitPrefetchReadFactory = std::function<PrefetchReadFunction(
-    const std::string&, std::optional<std::size_t>)>;
+using SplitPrefetchReadFactory = std::function<
+    PrefetchReadFunction(const std::string&, std::optional<std::size_t>)>;
 
 struct SplitPrefetchResult {
   ~SplitPrefetchResult();
@@ -79,9 +79,7 @@ class ExecutorSplitPrefetch {
       const std::string& queryId,
       const std::string& splitKey);
 
-  static void eraseQuery(
-      folly::Executor* executor,
-      const std::string& queryId);
+  static void eraseQuery(folly::Executor* executor, const std::string& queryId);
 
   static void erase(folly::Executor* executor);
 };

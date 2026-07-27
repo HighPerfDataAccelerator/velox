@@ -61,8 +61,7 @@ class OperatorAttributionResource final {
   struct State;
 
  public:
-  explicit OperatorAttributionResource(
-      rmm::device_async_resource_ref upstream)
+  explicit OperatorAttributionResource(rmm::device_async_resource_ref upstream)
       : upstream_(upstream), state_(std::make_shared<State>()) {}
 
  public:
@@ -77,10 +76,8 @@ class OperatorAttributionResource final {
     std::size_t currentAllocations{0};
   };
 
-  void* allocate(
-      cuda::stream_ref stream,
-      std::size_t bytes,
-      std::size_t alignment) {
+  void*
+  allocate(cuda::stream_ref stream, std::size_t bytes, std::size_t alignment) {
     void* pointer = nullptr;
     try {
       pointer = upstream_.allocate(stream, bytes, alignment);
@@ -191,21 +188,19 @@ class OperatorAttributionResource final {
     std::size_t freeBytes = 0;
     std::size_t totalBytes = 0;
     const auto cudaStatus = cudaMemGetInfo(&freeBytes, &totalBytes);
-    LOG(ERROR)
-        << "CUDF_DEVICE_OOM triggerContext={" << currentAllocationContext
-        << "} requestedBytes=" << requestedBytes
-        << " cudaValid=" << (cudaStatus == cudaSuccess)
-        << " freeBytes=" << freeBytes << " totalBytes=" << totalBytes
-        << " attributedContexts=" << snapshot.size();
+    LOG(ERROR) << "CUDF_DEVICE_OOM triggerContext={" << currentAllocationContext
+               << "} requestedBytes=" << requestedBytes
+               << " cudaValid=" << (cudaStatus == cudaSuccess)
+               << " freeBytes=" << freeBytes << " totalBytes=" << totalBytes
+               << " attributedContexts=" << snapshot.size();
     const auto count = std::min<std::size_t>(snapshot.size(), 12);
     for (std::size_t index = 0; index < count; ++index) {
-      LOG(ERROR)
-          << "CUDF_DEVICE_OOM_OWNER rank=" << (index + 1)
-          << " currentBytes=" << snapshot[index].second.currentBytes
-          << " peakBytes=" << snapshot[index].second.peakBytes
-          << " currentAllocations="
-          << snapshot[index].second.currentAllocations
-          << " context={" << snapshot[index].first << "}";
+      LOG(ERROR) << "CUDF_DEVICE_OOM_OWNER rank=" << (index + 1)
+                 << " currentBytes=" << snapshot[index].second.currentBytes
+                 << " peakBytes=" << snapshot[index].second.peakBytes
+                 << " currentAllocations="
+                 << snapshot[index].second.currentAllocations << " context={"
+                 << snapshot[index].first << "}";
     }
   }
 
@@ -272,10 +267,9 @@ cuda::mr::any_resource<cuda::mr::device_accessible>
 wrapDeviceMemoryResourceForDiagnostics(
     cuda::mr::any_resource<cuda::mr::device_accessible> upstream,
     bool outputResource) {
-  auto& statistics =
-      outputResource ? output_statistics_mr_ : statistics_mr_;
-  auto& attribution = outputResource ? outputAttributionResource
-                                     : primaryAttributionResource;
+  auto& statistics = outputResource ? output_statistics_mr_ : statistics_mr_;
+  auto& attribution =
+      outputResource ? outputAttributionResource : primaryAttributionResource;
   statistics.emplace(std::move(upstream));
   attribution = std::make_unique<OperatorAttributionResource>(
       rmm::device_async_resource_ref{statistics.value()});

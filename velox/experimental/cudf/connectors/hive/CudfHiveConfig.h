@@ -105,8 +105,7 @@ class CudfHiveConfig {
       "cudf.hive.prefetch-max-inflight-bytes";
   static constexpr const char* kPrefetchMaxInFlightBytesSession =
       "cudf.hive.prefetch_max_inflight_bytes";
-  static constexpr const char* kPrefetchThreads =
-      "cudf.hive.prefetch-threads";
+  static constexpr const char* kPrefetchThreads = "cudf.hive.prefetch-threads";
   static constexpr const char* kPrefetchThreadsSession =
       "cudf.hive.prefetch_threads";
 
@@ -184,8 +183,7 @@ class CudfHiveConfig {
   bool useExperimentalCudfReaderSession(
       const config::ConfigBase* session) const;
 
-  bool selectivePreloadEnabledSession(
-      const config::ConfigBase* session) const;
+  bool selectivePreloadEnabledSession(const config::ConfigBase* session) const;
 
   uint64_t prefetchMaxInFlightBytesSession(
       const config::ConfigBase* session) const;

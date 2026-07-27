@@ -762,8 +762,8 @@ TEST_F(TableScanTest, splitStartingAtZeroPreloadsPhysicalFileSize) {
           cudf_velox::connector::hive::CudfHiveConfig::
               kSelectivePreloadEnabledSession,
           "true")
-      .splits({Split(makeCudfHiveConnectorSplit(
-          filePath->getPath(), 0, halfFileSize))})
+      .splits({Split(
+          makeCudfHiveConnectorSplit(filePath->getPath(), 0, halfFileSize))})
       .assertResults("SELECT * FROM tmp OFFSET 0 LIMIT 6000");
 }
 

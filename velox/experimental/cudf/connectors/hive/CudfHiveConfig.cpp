@@ -167,8 +167,7 @@ uint64_t CudfHiveConfig::prefetchMaxInFlightBytesSession(
 uint32_t CudfHiveConfig::prefetchThreadsSession(
     const config::ConfigBase* session) const {
   return session->get<uint32_t>(
-      kPrefetchThreadsSession,
-      config_->get<uint32_t>(kPrefetchThreads, 128));
+      kPrefetchThreadsSession, config_->get<uint32_t>(kPrefetchThreads, 128));
 }
 
 bool CudfHiveConfig::immutableFiles() const {

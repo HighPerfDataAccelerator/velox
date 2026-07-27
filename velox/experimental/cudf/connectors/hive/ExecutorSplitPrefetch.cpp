@@ -38,8 +38,7 @@ struct SplitEntry {
   uint64_t bytes{0};
   bool scheduled{false};
   std::shared_ptr<std::promise<std::shared_ptr<SplitPrefetchResult>>> promise{
-      std::make_shared<
-          std::promise<std::shared_ptr<SplitPrefetchResult>>>()};
+      std::make_shared<std::promise<std::shared_ptr<SplitPrefetchResult>>>()};
   std::shared_future<std::shared_ptr<SplitPrefetchResult>> future{
       promise->get_future().share()};
 };
@@ -59,8 +58,9 @@ class QueryPrefetchState
     {
       std::lock_guard<std::mutex> lock(mutex_);
       if (stopped_) {
-        entry->promise->set_exception(std::make_exception_ptr(
-            std::runtime_error("Split prefetch query has stopped")));
+        entry->promise->set_exception(
+            std::make_exception_ptr(
+                std::runtime_error("Split prefetch query has stopped")));
         return;
       }
       if (entries_.count(splitKey) != 0) {
@@ -95,8 +95,8 @@ class QueryPrefetchState
       broker_ = std::move(broker);
       concurrency_ = std::max<uint32_t>(1, splitConcurrency);
       maxReadyBytes_ = std::max<uint64_t>(1, maxReadyBytes);
-      splitExecutor_ = std::make_unique<folly::CPUThreadPoolExecutor>(
-          concurrency_);
+      splitExecutor_ =
+          std::make_unique<folly::CPUThreadPoolExecutor>(concurrency_);
       initialized_ = true;
     }
     pump();
@@ -138,8 +138,9 @@ class QueryPrefetchState
       }
       order_.clear();
     }
-    const auto failure = std::make_exception_ptr(std::runtime_error(
-        "Split prefetch canceled because the query stopped"));
+    const auto failure = std::make_exception_ptr(
+        std::runtime_error(
+            "Split prefetch canceled because the query stopped"));
     for (const auto& entry : canceled) {
       entry->promise->set_exception(failure);
     }
@@ -162,8 +163,7 @@ class QueryPrefetchState
       if (entry->scheduled) {
         continue;
       }
-      const bool fits =
-          reservedBytes_ <= maxReadyBytes_ &&
+      const bool fits = reservedBytes_ <= maxReadyBytes_ &&
           entry->bytes <= maxReadyBytes_ - reservedBytes_;
       if (!fits && (active_ > 0 || reservedBytes_ > 0)) {
         continue;
@@ -177,9 +177,7 @@ class QueryPrefetchState
     // Once a split is scheduled, entries_ and the worker closure provide
     // its lifetime. Keeping it in order_ would also keep the shared_future
     // (and therefore completed pinned buffers) alive after take().
-    std::erase_if(
-        order_,
-        [](const auto& entry) { return entry->scheduled; });
+    std::erase_if(order_, [](const auto& entry) { return entry->scheduled; });
   }
 
   void run(const std::shared_ptr<SplitEntry>& entry) {
@@ -280,9 +278,7 @@ std::mutex& registryMutex() {
 
 std::unordered_map<folly::Executor*, std::shared_ptr<ExecutorState>>&
 registry() {
-  static std::unordered_map<
-      folly::Executor*,
-      std::shared_ptr<ExecutorState>>
+  static std::unordered_map<folly::Executor*, std::shared_ptr<ExecutorState>>
       states;
   return states;
 }

@@ -110,9 +110,8 @@ KvikioS3DataSource::KvikioS3DataSource(
           std::move(endpoint),
           fileSize)) {}
 
-size_t KvikioS3DataSource::clampedReadSize(
-    size_t offset,
-    size_t requestedSize) const {
+size_t KvikioS3DataSource::clampedReadSize(size_t offset, size_t requestedSize)
+    const {
   if (offset >= size()) {
     return 0;
   }
@@ -123,8 +122,9 @@ size_t KvikioS3DataSource::size() const {
   return handle_.nbytes();
 }
 
-std::unique_ptr<cudf::io::datasource::buffer>
-KvikioS3DataSource::host_read(size_t offset, size_t requestedSize) {
+std::unique_ptr<cudf::io::datasource::buffer> KvikioS3DataSource::host_read(
+    size_t offset,
+    size_t requestedSize) {
   auto data = std::vector<uint8_t>(clampedReadSize(offset, requestedSize));
   if (!data.empty()) {
     handle_.pread(data.data(), data.size(), offset).get();
@@ -143,15 +143,15 @@ std::future<std::unique_ptr<cudf::io::datasource::buffer>>
 KvikioS3DataSource::host_read_async(size_t offset, size_t requestedSize) {
   auto data = std::vector<uint8_t>(clampedReadSize(offset, requestedSize));
   if (data.empty()) {
-    return std::async(std::launch::deferred, [data = std::move(data)]() mutable {
-      return cudf::io::datasource::buffer::create(std::move(data));
-    });
+    return std::async(
+        std::launch::deferred, [data = std::move(data)]() mutable {
+          return cudf::io::datasource::buffer::create(std::move(data));
+        });
   }
   auto readFuture = handle_.pread(data.data(), data.size(), offset);
   return std::async(
       std::launch::deferred,
-      [data = std::move(data),
-       readFuture = std::move(readFuture)]() mutable {
+      [data = std::move(data), readFuture = std::move(readFuture)]() mutable {
         readFuture.get();
         return cudf::io::datasource::buffer::create(std::move(data));
       });
@@ -163,13 +163,11 @@ std::future<size_t> KvikioS3DataSource::host_read_async(
     uint8_t* dst) {
   const auto readSize = clampedReadSize(offset, requestedSize);
   if (readSize == 0) {
-    return std::async(
-        std::launch::deferred, [] { return size_t{0}; });
+    return std::async(std::launch::deferred, [] { return size_t{0}; });
   }
   auto readFuture = handle_.pread(dst, readSize, offset);
   return std::async(
-      std::launch::deferred,
-      [readFuture = std::move(readFuture)]() mutable {
+      std::launch::deferred, [readFuture = std::move(readFuture)]() mutable {
         return readFuture.get();
       });
 }
@@ -190,16 +188,14 @@ std::future<size_t> KvikioS3DataSource::device_read_async(
     rmm::cuda_stream_view /* stream */) {
   const auto readSize = clampedReadSize(offset, requestedSize);
   if (readSize == 0) {
-    return std::async(
-        std::launch::deferred, [] { return size_t{0}; });
+    return std::async(std::launch::deferred, [] { return size_t{0}; });
   }
   // KvikIO owns the worker streams used by remote device reads. Keep the H2D
   // copy on those internal streams and use pread()'s completion as the device
   // visibility boundary. The consumer stream is not exposed to KvikIO.
   auto readFuture = handle_.pread(dst, readSize, offset);
   return std::async(
-      std::launch::deferred,
-      [readFuture = std::move(readFuture)]() mutable {
+      std::launch::deferred, [readFuture = std::move(readFuture)]() mutable {
         return readFuture.get();
       });
 }
@@ -212,17 +208,13 @@ size_t KvikioS3DataSource::device_read(
   return device_read_async(offset, requestedSize, dst, stream).get();
 }
 
-std::unique_ptr<cudf::io::datasource::buffer>
-KvikioS3DataSource::device_read(
+std::unique_ptr<cudf::io::datasource::buffer> KvikioS3DataSource::device_read(
     size_t offset,
     size_t requestedSize,
     rmm::cuda_stream_view stream) {
   rmm::device_buffer data(clampedReadSize(offset, requestedSize), stream);
   const auto readSize = device_read(
-      offset,
-      requestedSize,
-      static_cast<uint8_t*>(data.data()),
-      stream);
+      offset, requestedSize, static_cast<uint8_t*>(data.data()), stream);
   data.resize(readSize, stream);
   return cudf::io::datasource::buffer::create(std::move(data));
 }

@@ -24,8 +24,8 @@
 #include <algorithm>
 #include <condition_variable>
 #include <cstdint>
-#include <future>
 #include <functional>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -59,8 +59,7 @@ struct PrefetchRange {
   uint64_t bufferOffset;
 };
 
-using PrefetchReadFunction =
-    std::function<void(uint64_t, uint64_t, uint8_t*)>;
+using PrefetchReadFunction = std::function<void(uint64_t, uint64_t, uint8_t*)>;
 using PrefetchReadFactory = std::function<PrefetchReadFunction()>;
 
 /// Executor-scoped range-read broker. A broker is shared by all scan tasks
@@ -110,8 +109,9 @@ class ExecutorReadBroker
       uint64_t maxInFlightBytes,
       uint32_t readThreads)
       : executor_(executor),
-        readExecutor_(std::make_unique<folly::CPUThreadPoolExecutor>(
-            std::max<uint32_t>(1, readThreads))),
+        readExecutor_(
+            std::make_unique<folly::CPUThreadPoolExecutor>(
+                std::max<uint32_t>(1, readThreads))),
         maxInFlightBytes_(std::max<uint64_t>(1, maxInFlightBytes)) {}
 
   void acquire(uint64_t bytes);

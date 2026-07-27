@@ -125,10 +125,8 @@ class KvikioS3DataSource final : public cudf::io::datasource {
       size_t offset,
       size_t size) override;
 
-  std::future<size_t> host_read_async(
-      size_t offset,
-      size_t size,
-      uint8_t* dst) override;
+  std::future<size_t> host_read_async(size_t offset, size_t size, uint8_t* dst)
+      override;
 
   [[nodiscard]] bool supports_device_read() const override;
 

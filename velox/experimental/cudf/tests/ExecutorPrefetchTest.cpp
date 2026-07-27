@@ -39,9 +39,8 @@ TEST(ExecutorPrefetchTest, reservesBytesBeforeAllocation) {
   auto broker = ExecutorReadBroker::get(&executor, 4, 1);
   auto first = broker->reserve(4);
 
-  auto second = std::async(std::launch::async, [&] {
-    return broker->reserve(1);
-  });
+  auto second =
+      std::async(std::launch::async, [&] { return broker->reserve(1); });
   EXPECT_EQ(second.wait_for(50ms), std::future_status::timeout);
 
   first.reset();
@@ -89,8 +88,7 @@ TEST(ExecutorPrefetchTest, createsOneReadHandlePerPhysicalPath) {
   EXPECT_THAT(
       paths,
       testing::UnorderedElementsAre(
-          "s3://bucket-a/primary.parquet",
-          "s3://bucket-b/coalesced.parquet"));
+          "s3://bucket-a/primary.parquet", "s3://bucket-b/coalesced.parquet"));
 
   result.reset();
   ExecutorSplitPrefetch::eraseQuery(&executor, "query-paths");
@@ -139,14 +137,12 @@ TEST(ExecutorPrefetchTest, stopsBeforeErasingQueryState) {
       1);
 
   ASSERT_EQ(
-      firstReadStarted.get_future().wait_for(5s),
-      std::future_status::ready);
+      firstReadStarted.get_future().wait_for(5s), std::future_status::ready);
   auto waitingTake = std::async(std::launch::async, [&] {
     return ExecutorSplitPrefetch::take(
         &executor, "query-stop", "s3://bucket/second.parquet");
   });
-  ASSERT_EQ(
-      waitingTake.wait_for(50ms), std::future_status::timeout);
+  ASSERT_EQ(waitingTake.wait_for(50ms), std::future_status::timeout);
 
   auto cleanup = std::async(std::launch::async, [&] {
     ExecutorSplitPrefetch::eraseQuery(&executor, "query-stop");

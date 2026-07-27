@@ -1191,9 +1191,7 @@ void CudfGroupby::initialize() {
           orderBy->sortingKeys().end(),
           aggregationNode_->groupingKeys().begin(),
           aggregationNode_->groupingKeys().end(),
-          [](const auto& left, const auto& right) {
-            return *left == *right;
-          });
+          [](const auto& left, const auto& right) { return *left == *right; });
       if (finalInputKeysSorted_) {
         finalInputColumnOrder_.reserve(orderBy->sortingOrders().size());
         finalInputNullOrder_.reserve(orderBy->sortingOrders().size());
@@ -2009,8 +2007,7 @@ CudfVectorPtr CudfGroupby::doGroupByAggregation(
 
   cudf::groupby::groupby groupByOwner(
       groupbyKeyView,
-      ignoreNullKeys_ ? cudf::null_policy::EXCLUDE
-                      : cudf::null_policy::INCLUDE,
+      ignoreNullKeys_ ? cudf::null_policy::EXCLUDE : cudf::null_policy::INCLUDE,
       keysAreSorted ? cudf::sorted::YES : cudf::sorted::NO,
       keysAreSorted ? finalInputColumnOrder_ : std::vector<cudf::order>{},
       keysAreSorted ? finalInputNullOrder_ : std::vector<cudf::null_order>{});

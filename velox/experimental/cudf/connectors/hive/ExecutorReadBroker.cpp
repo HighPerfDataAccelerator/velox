@@ -34,10 +34,9 @@ std::mutex& brokersMutex() {
 
 std::unordered_map<folly::Executor*, std::shared_ptr<ExecutorReadBroker>>&
 brokers() {
-  static std::unordered_map<
-      folly::Executor*,
-      std::shared_ptr<ExecutorReadBroker>>
-      instances;
+  static std::
+      unordered_map<folly::Executor*, std::shared_ptr<ExecutorReadBroker>>
+          instances;
   return instances;
 }
 
@@ -88,8 +87,8 @@ void ExecutorReadBroker::acquire(uint64_t bytes) {
   std::unique_lock<std::mutex> lock(mutex_);
   available_.wait(lock, [&] {
     return admittedBytes_ == 0 ||
-        bytes <= maxInFlightBytes_ - std::min(
-                    admittedBytes_, maxInFlightBytes_);
+        bytes <=
+        maxInFlightBytes_ - std::min(admittedBytes_, maxInFlightBytes_);
   });
   admittedBytes_ += bytes;
 }
@@ -125,8 +124,7 @@ std::future<void> ExecutorReadBroker::read(
       "ExecutorReadBroker requires a range-read function");
   VELOX_CHECK_NOT_NULL(destination);
   for (const auto& range : ranges) {
-    VELOX_CHECK_LE(
-        range.bufferOffset + range.size, destination->size());
+    VELOX_CHECK_LE(range.bufferOffset + range.size, destination->size());
     VELOX_CHECK_LE(range.fileOffset + range.size, sourceSize);
   }
 
@@ -137,46 +135,44 @@ std::future<void> ExecutorReadBroker::read(
     return future;
   }
 
-  auto remaining =
-      std::make_shared<std::atomic<size_t>>(ranges.size());
+  auto remaining = std::make_shared<std::atomic<size_t>>(ranges.size());
   auto failure = std::make_shared<std::exception_ptr>();
   auto failureMutex = std::make_shared<std::mutex>();
   for (const auto range : ranges) {
-    readExecutor_->add(
-        [self = shared_from_this(),
-         readFunction,
-         destination,
-         range,
-         remaining,
-         failure,
-         failureMutex,
-         promise,
-         reservation]() {
-          if (!reservation) {
-            self->acquire(range.size);
-          }
-          try {
-            readFunction(
-                range.fileOffset,
-                range.size,
-                destination->data() + range.bufferOffset);
-          } catch (...) {
-            std::lock_guard<std::mutex> lock(*failureMutex);
-            if (!*failure) {
-              *failure = std::current_exception();
-            }
-          }
-          if (!reservation) {
-            self->release(range.size);
-          }
-          if (remaining->fetch_sub(1, std::memory_order_acq_rel) == 1) {
-            if (*failure) {
-              promise->set_exception(*failure);
-            } else {
-              promise->set_value();
-            }
-          }
-        });
+    readExecutor_->add([self = shared_from_this(),
+                        readFunction,
+                        destination,
+                        range,
+                        remaining,
+                        failure,
+                        failureMutex,
+                        promise,
+                        reservation]() {
+      if (!reservation) {
+        self->acquire(range.size);
+      }
+      try {
+        readFunction(
+            range.fileOffset,
+            range.size,
+            destination->data() + range.bufferOffset);
+      } catch (...) {
+        std::lock_guard<std::mutex> lock(*failureMutex);
+        if (!*failure) {
+          *failure = std::current_exception();
+        }
+      }
+      if (!reservation) {
+        self->release(range.size);
+      }
+      if (remaining->fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        if (*failure) {
+          promise->set_exception(*failure);
+        } else {
+          promise->set_value();
+        }
+      }
+    });
   }
   return future;
 }
@@ -193,8 +189,7 @@ std::future<void> ExecutorReadBroker::readPrepared(
   VELOX_CHECK_NOT_NULL(destination);
   uint64_t totalBytes = 0;
   for (const auto& range : ranges) {
-    VELOX_CHECK_LE(
-        range.bufferOffset + range.size, destination->size());
+    VELOX_CHECK_LE(range.bufferOffset + range.size, destination->size());
     VELOX_CHECK_LE(range.fileOffset + range.size, sourceSize);
     totalBytes += range.size;
   }
@@ -206,40 +201,39 @@ std::future<void> ExecutorReadBroker::readPrepared(
     return future;
   }
 
-  readExecutor_->add(
-      [self = shared_from_this(),
-       readFactory = std::move(readFactory),
-       ranges = std::move(ranges),
-       destination = std::move(destination),
-       promise,
-       totalBytes,
-       reservation = std::move(reservation)]() mutable {
-        if (!reservation) {
-          self->acquire(totalBytes);
-        }
-        try {
-          auto readFunction = readFactory();
-          VELOX_CHECK(
-              static_cast<bool>(readFunction),
-              "Range-read factory returned an empty function");
-          for (const auto& range : ranges) {
-            readFunction(
-                range.fileOffset,
-                range.size,
-                destination->data() + range.bufferOffset);
-          }
-        } catch (...) {
-          if (!reservation) {
-            self->release(totalBytes);
-          }
-          promise->set_exception(std::current_exception());
-          return;
-        }
-        if (!reservation) {
-          self->release(totalBytes);
-        }
-        promise->set_value();
-      });
+  readExecutor_->add([self = shared_from_this(),
+                      readFactory = std::move(readFactory),
+                      ranges = std::move(ranges),
+                      destination = std::move(destination),
+                      promise,
+                      totalBytes,
+                      reservation = std::move(reservation)]() mutable {
+    if (!reservation) {
+      self->acquire(totalBytes);
+    }
+    try {
+      auto readFunction = readFactory();
+      VELOX_CHECK(
+          static_cast<bool>(readFunction),
+          "Range-read factory returned an empty function");
+      for (const auto& range : ranges) {
+        readFunction(
+            range.fileOffset,
+            range.size,
+            destination->data() + range.bufferOffset);
+      }
+    } catch (...) {
+      if (!reservation) {
+        self->release(totalBytes);
+      }
+      promise->set_exception(std::current_exception());
+      return;
+    }
+    if (!reservation) {
+      self->release(totalBytes);
+    }
+    promise->set_value();
+  });
   return future;
 }
 
