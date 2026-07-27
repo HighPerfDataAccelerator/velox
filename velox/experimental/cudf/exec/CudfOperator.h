@@ -132,7 +132,11 @@ class CudfOperatorBase : public exec::Operator, public NvtxHelper {
     VELOX_NVTX_OPERATOR_FUNC_RANGE_IF(
         nvtxMethods_ & NvtxMethodFlag::kAddInput, className_);
     CudaAllocationTraceScope allocationTrace(
-        fmt::format("{} node={} method=addInput", className_, planNodeId_));
+        fmt::format(
+            "{} node={} instance={} method=addInput",
+            className_,
+            planNodeId_,
+            static_cast<const void*>(this)));
     const auto inputRows = input == nullptr ? 0 : input->size();
     const auto sample = shouldSampleDeviceMemory(false);
     if (sample) {
@@ -154,7 +158,11 @@ class CudfOperatorBase : public exec::Operator, public NvtxHelper {
     VELOX_NVTX_OPERATOR_FUNC_RANGE_IF(
         nvtxMethods_ & NvtxMethodFlag::kGetOutput, className_);
     CudaAllocationTraceScope allocationTrace(
-        fmt::format("{} node={} method=getOutput", className_, planNodeId_));
+        fmt::format(
+            "{} node={} instance={} method=getOutput",
+            className_,
+            planNodeId_,
+            static_cast<const void*>(this)));
     const auto sample = shouldSampleDeviceMemory(false);
     if (sample) {
       logDeviceMemory("getOutput", "before", -1, -1);
@@ -244,11 +252,12 @@ class CudfOperatorBase : public exec::Operator, public NvtxHelper {
     }
     logDeviceMemorySnapshot(
         fmt::format(
-            "operator={} node={} operatorId={} method={} phase={} inputRows={} "
-            "outputRows={} call={}",
+            "operator={} node={} operatorId={} instance={} method={} phase={} "
+            "inputRows={} outputRows={} call={}",
             className_,
             planNodeId_,
             operatorId_,
+            static_cast<const void*>(this),
             method,
             phase,
             inputRows,
