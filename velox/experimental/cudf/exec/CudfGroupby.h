@@ -136,7 +136,8 @@ class CudfGroupby : public CudfOperatorBase {
       std::vector<std::unique_ptr<GroupbyAggregator>>& aggregators,
       TypePtr const& outputType,
       rmm::cuda_stream_view stream,
-      rmm::device_async_resource_ref mr);
+      rmm::device_async_resource_ref mr,
+      bool keysAreSorted = false);
 
   CudfVectorPtr releaseAndResetBufferedResult();
 
@@ -192,6 +193,13 @@ class CudfGroupby : public CudfOperatorBase {
   bool finished_ = false;
   size_t numAggregates_;
   bool ignoreNullKeys_;
+  // A FINAL aggregation fed directly by a complete OrderBy on the same keys
+  // can use cuDF's sorted-groupby implementation for its levelled runs. This
+  // is intentionally stricter than Velox's preGroupedKeys contract, which
+  // guarantees clustering but does not by itself guarantee sort order.
+  bool finalInputKeysSorted_{false};
+  std::vector<cudf::order> finalInputColumnOrder_;
+  std::vector<cudf::null_order> finalInputNullOrder_;
 
   std::vector<CudfVectorPtr> inputs_;
   TypePtr inputType_;

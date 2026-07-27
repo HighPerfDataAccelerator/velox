@@ -37,7 +37,10 @@
 #include <cudf/concatenate.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/detail/utilities/stream_pool.hpp>
+#include <cudf/lists/lists_column_view.hpp>
 #include <cudf/reduction.hpp>
+#include <cudf/replace.hpp>
+#include <cudf/scalar/scalar_factories.hpp>
 #include <cudf/unary.hpp>
 
 #include <cstdlib>
@@ -91,6 +94,23 @@ constexpr const char* kIntermediateAggregationMaxLevel =
     "cudfIntermediateAggregationMaxLevel";
 constexpr const char* kIntermediateAggregationSerializedMerges =
     "cudfIntermediateAggregationSerializedMerges";
+
+cudf::column_view withoutTopLevelNullMask(cudf::column_view input) {
+  VELOX_CHECK_EQ(
+      input.null_count(),
+      0,
+      "Cannot remove a top-level null mask while null values remain");
+  std::vector<cudf::column_view> children(
+      input.child_begin(), input.child_end());
+  return cudf::column_view(
+      input.type(),
+      input.size(),
+      input.head(),
+      nullptr,
+      0,
+      input.offset(),
+      children);
+}
 
 bool serializeLargeIntermediateAggregationMergesEnabled() {
   static const bool enabled = [] {
@@ -912,7 +932,7 @@ struct GroupbyCollectListAggregator : GroupbyAggregator {
   void addGroupbyRequest(
       cudf::table_view const& tbl,
       std::vector<cudf::groupby::aggregation_request>& requests,
-      rmm::cuda_stream_view /*stream*/) override {
+      rmm::cuda_stream_view stream) override {
     VELOX_CHECK(
         constant == nullptr,
         "GroupbyCollectListAggregator does not support constant input");
@@ -920,13 +940,42 @@ struct GroupbyCollectListAggregator : GroupbyAggregator {
     outputIdx_ = requests.size() - 1;
     request.values = tbl.column(inputIndex);
     if (exec::isRawInput(step)) {
+      nonNullMergeInput_.reset();
       request.aggregations.push_back(
           cudf::make_collect_list_aggregation<cudf::groupby_aggregation>(
               cudf::null_policy::EXCLUDE));
       return;
     }
+
+    // MPP exchange may conservatively attach a top-level null mask to an
+    // intermediate ARRAY column. A null partial collect_list state represents
+    // no collected values and must therefore merge like an empty list. cuDF's
+    // MERGE_LISTS primitive requires the lists column itself to be
+    // non-nullable, even though nested elements may remain nullable.
+    nonNullMergeInput_.reset();
+    // MERGE_LISTS rejects a nullable column even when its computed null count
+    // is zero. MPP exchange preserves a conservative top-level null mask for
+    // this state, so test for mask presence rather than actual null values.
+    if (request.values.nullable()) {
+      if (request.values.has_nulls()) {
+        auto lists = cudf::lists_column_view(request.values);
+        auto emptyElements = cudf::slice(lists.child(), {0, 0}, stream);
+        auto emptyList = cudf::make_list_scalar(
+            emptyElements.front(), stream, get_temp_mr());
+        nonNullMergeInput_ = cudf::replace_nulls(
+            request.values, *emptyList, stream, get_temp_mr());
+        request.values = nonNullMergeInput_->view();
+      }
+      request.values = withoutTopLevelNullMask(request.values);
+    }
     request.aggregations.push_back(
         cudf::make_merge_lists_aggregation<cudf::groupby_aggregation>());
+  }
+
+  size_t releaseRequestState() override {
+    const size_t released = nonNullMergeInput_ == nullptr ? 0 : 1;
+    nonNullMergeInput_.reset();
+    return released;
   }
 
   std::unique_ptr<cudf::column> makeOutputColumn(
@@ -938,6 +987,7 @@ struct GroupbyCollectListAggregator : GroupbyAggregator {
 
  private:
   uint32_t outputIdx_{0};
+  std::unique_ptr<cudf::column> nonNullMergeInput_;
 };
 
 std::unique_ptr<GroupbyAggregator> createGroupbyAggregator(
@@ -1125,9 +1175,45 @@ void CudfGroupby::initialize() {
   setupGroupingKeyChannelProjections(
       *aggregationNode_, groupingKeyInputChannels_, groupingKeyOutputChannels_);
 
-  // Velox CPU does optimizations related to pre-grouped keys. This can be
-  // done in cudf by passing sort information to cudf::groupby() constructor.
-  // We're postponing this for now.
+  // Spark represents streaming aggregation over ordered input as an
+  // AggregationNode directly above OrderBy. Use the sorted cuDF groupby only
+  // when OrderBy covers every grouping key in the same order. Merely checking
+  // preGroupedKeys would be unsafe because Velox's contract allows clustered
+  // but non-monotonic groups.
+  if (aggregationNode_->step() == core::AggregationNode::Step::kFinal) {
+    auto orderBy = std::dynamic_pointer_cast<const core::OrderByNode>(
+        aggregationNode_->sources()[0]);
+    if (orderBy != nullptr && !orderBy->isPartial() &&
+        orderBy->sortingKeys().size() ==
+            aggregationNode_->groupingKeys().size()) {
+      finalInputKeysSorted_ = std::equal(
+          orderBy->sortingKeys().begin(),
+          orderBy->sortingKeys().end(),
+          aggregationNode_->groupingKeys().begin(),
+          aggregationNode_->groupingKeys().end(),
+          [](const auto& left, const auto& right) {
+            return *left == *right;
+          });
+      if (finalInputKeysSorted_) {
+        finalInputColumnOrder_.reserve(orderBy->sortingOrders().size());
+        finalInputNullOrder_.reserve(orderBy->sortingOrders().size());
+        for (const auto& sortingOrder : orderBy->sortingOrders()) {
+          finalInputColumnOrder_.push_back(
+              sortingOrder.isAscending() ? cudf::order::ASCENDING
+                                         : cudf::order::DESCENDING);
+          finalInputNullOrder_.push_back(
+              (sortingOrder.isNullsFirst() ^ !sortingOrder.isAscending())
+                  ? cudf::null_order::BEFORE
+                  : cudf::null_order::AFTER);
+        }
+        LOG(INFO) << "CUDF_GROUPBY_SORTED_FINAL node=" << diagnosticNodeId_
+                  << " keys=" << finalInputColumnOrder_.size();
+      }
+    }
+  }
+
+  // Other pre-grouped inputs continue to use the hash groupby path. Velox's
+  // preGroupedKeys contract alone does not prove that the keys are sorted.
 
   numAggregates_ = aggregationNode_->aggregates().size();
   const auto inputRowSchema = asRowType(inputType_);
@@ -1266,7 +1352,8 @@ void CudfGroupby::computeFinalGroupbyStreaming(CudfVectorPtr tbl) {
         intermediateAggregators_,
         bufferedResultType_,
         stateStream_,
-        get_output_mr());
+        get_output_mr(),
+        finalInputKeysSorted_);
     if (run) {
       addFinalAggregationRun(
           FinalAggregationRun{std::move(run), representedRows});
@@ -1496,7 +1583,8 @@ CudfGroupby::FinalAggregationRun CudfGroupby::mergeFinalAggregationRuns(
       intermediateAggregators_,
       bufferedResultType_,
       stateStream_,
-      get_output_mr());
+      get_output_mr(),
+      finalInputKeysSorted_);
   VELOX_CHECK_NOT_NULL(output);
 
   ++finalRunMergeCount_;
@@ -1578,8 +1666,11 @@ CudfVectorPtr CudfGroupby::drainFinalAggregationRuns() {
     const auto representedRows =
         addRepresentedRows(carry->representedRows, run.representedRows);
     const auto outputLevel = aggregationRunLevel(representedRows);
+    // Binary levels retain newer runs at lower levels and older runs at higher
+    // levels. Preserve original input order when combining the final carry so
+    // sorted runs remain sorted across their boundary.
     carry = mergeFinalAggregationRuns(
-        std::move(*carry), std::move(run), outputLevel, true);
+        std::move(run), std::move(*carry), outputLevel, true);
   }
   finalRunLevels_.clear();
 
@@ -1911,16 +2002,18 @@ CudfVectorPtr CudfGroupby::doGroupByAggregation(
     std::vector<std::unique_ptr<GroupbyAggregator>>& aggregators,
     TypePtr const& outputType,
     rmm::cuda_stream_view stream,
-    rmm::device_async_resource_ref mr) {
+    rmm::device_async_resource_ref mr,
+    bool keysAreSorted) {
   auto groupbyKeyView =
       tableView.select(groupByKeys.begin(), groupByKeys.end());
 
-  // TODO: All other args to groupby are related to sort groupby. We don't
-  // support optimizations related to it yet.
   cudf::groupby::groupby groupByOwner(
       groupbyKeyView,
       ignoreNullKeys_ ? cudf::null_policy::EXCLUDE
-                      : cudf::null_policy::INCLUDE);
+                      : cudf::null_policy::INCLUDE,
+      keysAreSorted ? cudf::sorted::YES : cudf::sorted::NO,
+      keysAreSorted ? finalInputColumnOrder_ : std::vector<cudf::order>{},
+      keysAreSorted ? finalInputNullOrder_ : std::vector<cudf::null_order>{});
 
   std::vector<cudf::groupby::aggregation_request> requests;
   for (auto& aggregator : aggregators) {
@@ -2049,7 +2142,8 @@ RowVectorPtr CudfGroupby::doGetOutput() {
         aggs,
         outputType_,
         stream,
-        get_output_mr());
+        get_output_mr(),
+        finalInputKeysSorted_);
     stream.synchronize();
     logDeviceMemorySnapshot(
         fmt::format(
