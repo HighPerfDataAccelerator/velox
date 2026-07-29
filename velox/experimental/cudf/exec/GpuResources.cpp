@@ -43,6 +43,7 @@
 #include <cerrno>
 #include <cstdlib>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -54,6 +55,162 @@
 namespace facebook::velox::cudf_velox {
 
 namespace {
+thread_local std::string currentAllocationContext{"unattributed"};
+
+class OperatorAttributionResource final {
+  struct State;
+
+ public:
+  explicit OperatorAttributionResource(rmm::device_async_resource_ref upstream)
+      : upstream_(upstream), state_(std::make_shared<State>()) {}
+
+ public:
+  struct Allocation {
+    std::size_t bytes;
+    std::string context;
+  };
+
+  struct ContextStats {
+    std::size_t currentBytes{0};
+    std::size_t peakBytes{0};
+    std::size_t currentAllocations{0};
+  };
+
+  void*
+  allocate(cuda::stream_ref stream, std::size_t bytes, std::size_t alignment) {
+    void* pointer = nullptr;
+    try {
+      pointer = upstream_.allocate(stream, bytes, alignment);
+    } catch (...) {
+      dumpFailure(bytes);
+      throw;
+    }
+
+    const auto context = currentAllocationContext.empty()
+        ? std::string{"unattributed"}
+        : currentAllocationContext;
+    recordAllocation(pointer, bytes);
+    return pointer;
+  }
+
+  void deallocate(
+      cuda::stream_ref stream,
+      void* pointer,
+      std::size_t bytes,
+      std::size_t alignment) noexcept {
+    upstream_.deallocate(stream, pointer, bytes, alignment);
+    recordDeallocation(pointer);
+  }
+
+  void* allocate_sync(std::size_t bytes, std::size_t alignment) {
+    void* pointer = nullptr;
+    try {
+      pointer = upstream_.allocate_sync(bytes, alignment);
+    } catch (...) {
+      dumpFailure(bytes);
+      throw;
+    }
+    recordAllocation(pointer, bytes);
+    return pointer;
+  }
+
+  void deallocate_sync(
+      void* pointer,
+      std::size_t bytes,
+      std::size_t alignment) noexcept {
+    upstream_.deallocate_sync(pointer, bytes, alignment);
+    recordDeallocation(pointer);
+  }
+
+  bool operator==(OperatorAttributionResource const& other) const noexcept {
+    return state_ == other.state_;
+  }
+
+  bool operator!=(OperatorAttributionResource const& other) const noexcept {
+    return !(*this == other);
+  }
+
+  friend void get_property(
+      OperatorAttributionResource const&,
+      cuda::mr::device_accessible) noexcept {}
+
+ private:
+  struct State {
+    mutable std::mutex mutex;
+    std::unordered_map<void*, Allocation> allocations;
+    std::unordered_map<std::string, ContextStats> contexts;
+  };
+
+  void recordAllocation(void* pointer, std::size_t bytes) {
+    const auto context = currentAllocationContext.empty()
+        ? std::string{"unattributed"}
+        : currentAllocationContext;
+    std::lock_guard<std::mutex> lock(state_->mutex);
+    state_->allocations.emplace(pointer, Allocation{bytes, context});
+    auto& stats = state_->contexts[context];
+    stats.currentBytes += bytes;
+    stats.peakBytes = std::max(stats.peakBytes, stats.currentBytes);
+    ++stats.currentAllocations;
+  }
+
+  void recordDeallocation(void* pointer) noexcept {
+    std::lock_guard<std::mutex> lock(state_->mutex);
+    const auto allocation = state_->allocations.find(pointer);
+    if (allocation == state_->allocations.end()) {
+      return;
+    }
+    auto context = state_->contexts.find(allocation->second.context);
+    if (context != state_->contexts.end()) {
+      context->second.currentBytes -= allocation->second.bytes;
+      --context->second.currentAllocations;
+    }
+    state_->allocations.erase(allocation);
+  }
+
+  void dumpFailure(std::size_t requestedBytes) const {
+    std::vector<std::pair<std::string, ContextStats>> snapshot;
+    {
+      std::lock_guard<std::mutex> lock(state_->mutex);
+      snapshot.reserve(state_->contexts.size());
+      for (const auto& entry : state_->contexts) {
+        if (entry.second.currentBytes != 0) {
+          snapshot.push_back(entry);
+        }
+      }
+    }
+    std::sort(
+        snapshot.begin(),
+        snapshot.end(),
+        [](const auto& left, const auto& right) {
+          return left.second.currentBytes > right.second.currentBytes;
+        });
+
+    std::size_t freeBytes = 0;
+    std::size_t totalBytes = 0;
+    const auto cudaStatus = cudaMemGetInfo(&freeBytes, &totalBytes);
+    LOG(ERROR) << "CUDF_DEVICE_OOM triggerContext={" << currentAllocationContext
+               << "} requestedBytes=" << requestedBytes
+               << " cudaValid=" << (cudaStatus == cudaSuccess)
+               << " freeBytes=" << freeBytes << " totalBytes=" << totalBytes
+               << " attributedContexts=" << snapshot.size();
+    const auto count = std::min<std::size_t>(snapshot.size(), 12);
+    for (std::size_t index = 0; index < count; ++index) {
+      LOG(ERROR) << "CUDF_DEVICE_OOM_OWNER rank=" << (index + 1)
+                 << " currentBytes=" << snapshot[index].second.currentBytes
+                 << " peakBytes=" << snapshot[index].second.peakBytes
+                 << " currentAllocations="
+                 << snapshot[index].second.currentAllocations << " context={"
+                 << snapshot[index].first << "}";
+    }
+  }
+
+  rmm::device_async_resource_ref upstream_;
+  std::shared_ptr<State> state_;
+};
+
+std::unique_ptr<OperatorAttributionResource> primaryAttributionResource;
+std::unique_ptr<OperatorAttributionResource> outputAttributionResource;
+
 std::mutex asyncMemoryPoolsMutex;
 std::vector<cudaMemPool_t> asyncMemoryPools;
 // registerCudf creates the main resource before its optional output resource.
@@ -105,6 +262,20 @@ void releaseDeviceMemoryAdmission(int device, std::size_t bytes) noexcept {
   }
 }
 } // namespace
+
+cuda::mr::any_resource<cuda::mr::device_accessible>
+wrapDeviceMemoryResourceForDiagnostics(
+    cuda::mr::any_resource<cuda::mr::device_accessible> upstream,
+    bool outputResource) {
+  auto& statistics = outputResource ? output_statistics_mr_ : statistics_mr_;
+  auto& attribution =
+      outputResource ? outputAttributionResource : primaryAttributionResource;
+  statistics.emplace(std::move(upstream));
+  attribution = std::make_unique<OperatorAttributionResource>(
+      rmm::device_async_resource_ref{statistics.value()});
+  return cuda::mr::any_resource<cuda::mr::device_accessible>{
+      rmm::device_async_resource_ref{*attribution}};
+}
 
 cuda::mr::any_resource<cuda::mr::device_accessible> createMemoryResource(
     std::string_view mode,
@@ -448,6 +619,8 @@ void logDeviceMemorySnapshot(
 }
 
 CudaAllocationTraceScope::CudaAllocationTraceScope(const std::string& label) {
+  previousContext_ = currentAllocationContext;
+  currentAllocationContext = label;
   using Push = void (*)(const char*);
   static auto push = reinterpret_cast<Push>(
       dlsym(RTLD_DEFAULT, "cuda_alloc_trace_push_context"));
@@ -458,6 +631,7 @@ CudaAllocationTraceScope::CudaAllocationTraceScope(const std::string& label) {
 }
 
 CudaAllocationTraceScope::~CudaAllocationTraceScope() {
+  currentAllocationContext = previousContext_;
   if (!active_) {
     return;
   }

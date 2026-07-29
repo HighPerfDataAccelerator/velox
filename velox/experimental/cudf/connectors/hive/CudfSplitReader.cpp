@@ -18,6 +18,8 @@
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/connectors/hive/CudfSplitReader.h"
 #include "velox/experimental/cudf/connectors/hive/CudfSplitReaderHelpers.h"
+#include "velox/experimental/cudf/connectors/hive/ExecutorReadBroker.h"
+#include "velox/experimental/cudf/connectors/hive/ExecutorSplitPrefetch.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 
 #include "velox/common/caching/CacheTTLController.h"
@@ -29,6 +31,9 @@
 #include "velox/connectors/hive/TableHandle.h"
 #ifdef VELOX_ENABLE_ABFS
 #include "velox/connectors/hive/storage_adapters/abfs/AbfsUtil.h"
+#endif
+#ifdef VELOX_ENABLE_S3
+#include "velox/connectors/hive/storage_adapters/s3fs/S3FileSystem.h"
 #endif
 
 #include <cudf/io/datasource.hpp>
@@ -43,6 +48,7 @@
 #include <cuda_runtime.h>
 #include <nvtx3/nvtx3.hpp>
 
+#include <future>
 #include <memory>
 
 namespace facebook::velox::cudf_velox::connector::hive {
@@ -135,6 +141,14 @@ void CudfSplitReader::prepareSplit(
   runtimeStats.processedSplits++;
 }
 
+void CudfSplitReader::setDataSourceContext(
+    const ConnectorQueryCtx* connectorQueryCtx,
+    dwio::common::RuntimeStatistics& /* runtimeStats */,
+    cudf::ast::expression const* subfieldFilterExpr) {
+  connectorQueryCtx_ = connectorQueryCtx;
+  subfieldFilterExpr_ = subfieldFilterExpr;
+}
+
 std::optional<std::unique_ptr<cudf::table>> CudfSplitReader::next(
     uint64_t /*size*/) {
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
@@ -205,8 +219,10 @@ std::optional<std::unique_ptr<cudf::table>> CudfSplitReader::readNextChunk() {
     auto ioData = fetchByteRangesAsync(
         dataSource_, columnChunkByteRanges, stream_, get_temp_mr());
 
-    // Wait for all pending reads to complete
-    std::get<2>(ioData).wait();
+    // Wait for all pending reads to complete and propagate any I/O failure.
+    // Calling wait() alone silently discards exceptions from the deferred
+    // range-read task and can let decoding continue with incomplete buffers.
+    std::get<2>(ioData).get();
     nvtxRangePop();
 
     // Save state for hybrid scan reader for future calls to `next()`
@@ -239,6 +255,8 @@ void CudfSplitReader::resetSplit() {
   hybridScanState_.reset();
   dataSource_.reset();
   coalescedDataSources_.clear();
+  selectivePreloadBuffers_.clear();
+  selectivePreloadResult_.reset();
   fileMetaData_.clear();
 }
 
@@ -251,11 +269,310 @@ void CudfSplitReader::setupCudfDataSource() {
     return;
   }
 
-  dataSource_ = createCudfDataSource(split_->filePath);
+  std::optional<std::size_t> primaryFileSize;
+  if (!split_->coalescedFiles.empty() && split_->start == 0 &&
+      split_->length != std::numeric_limits<uint64_t>::max()) {
+    primaryFileSize = split_->length;
+  }
+  dataSource_ = createCudfDataSource(split_->filePath, primaryFileSize);
   coalescedDataSources_.reserve(split_->coalescedFiles.size());
   for (const auto& file : split_->coalescedFiles) {
-    coalescedDataSources_.push_back(createCudfDataSource(file.filePath));
+    coalescedDataSources_.push_back(
+        createCudfDataSource(file.filePath, file.length));
   }
+}
+
+void CudfSplitReader::setupSelectivePreloadDataSources() {
+  // Iceberg needs file metadata while preparing the split. In that path the
+  // preload is intentionally set up before schema inspection, and
+  // createCudfReader() calls this method again later. Keep the second call a
+  // no-op so that we neither fetch the same remote file twice nor replace the
+  // pinned data sources and invalidate the cached footer metadata.
+  if (selectivePreloadResult_ || !selectivePreloadBuffers_.empty()) {
+    return;
+  }
+
+  const auto* session = connectorQueryCtx_->sessionProperties();
+  const auto enabled = cudfHiveConfig_->selectivePreloadEnabledSession(session);
+  if (useExperimentalCudfReader_ || !enabled || readColumnNames_.empty()) {
+    return;
+  }
+  VELOX_CHECK_NOT_NULL(
+      executor_,
+      "Selective Parquet preload requires a non-zero Velox IOThreads setting");
+
+  auto broker = ExecutorReadBroker::get(
+      executor_,
+      cudfHiveConfig_->prefetchMaxInFlightBytesSession(session),
+      cudfHiveConfig_->prefetchThreadsSession(session));
+
+#ifdef VELOX_ENABLE_S3
+  if (split_->filePath.starts_with("s3://") &&
+      ExecutorSplitPrefetch::contains(
+          executor_, connectorQueryCtx_->queryId(), split_->filePath)) {
+    const auto splitConcurrency = std::max<uint32_t>(
+        1,
+        std::min<uint32_t>(
+            16, cudfHiveConfig_->prefetchThreadsSession(session)));
+    const auto maxReadyBytes =
+        cudfHiveConfig_->prefetchMaxInFlightBytesSession(session);
+    ExecutorSplitPrefetch::initialize(
+        executor_,
+        connectorQueryCtx_->queryId(),
+        [config = cudfHiveConfig_->config()](
+            const std::string& filePath, std::optional<std::size_t> fileSize) {
+          auto fileSystem = filesystems::getFileSystem(filePath, config);
+          auto s3FileSystem =
+              std::dynamic_pointer_cast<filesystems::S3FileSystem>(fileSystem);
+          VELOX_CHECK_NOT_NULL(
+              s3FileSystem,
+              "S3 path resolved to a non-S3 filesystem: {}",
+              filePath);
+          const auto credentials = s3FileSystem->getCredentialSnapshot();
+          auto source = std::make_shared<KvikioS3DataSource>(
+              filePath,
+              credentials.accessKeyId,
+              credentials.secretAccessKey,
+              credentials.sessionToken,
+              credentials.region,
+              credentials.endpoint,
+              fileSize);
+          return PrefetchReadFunction{
+              [source = std::move(source), filePath](
+                  uint64_t offset, uint64_t size, uint8_t* destination) {
+                const auto bytes = source->host_read(offset, size, destination);
+                VELOX_CHECK_EQ(
+                    bytes,
+                    size,
+                    "Short datasource read for {} at offset {}",
+                    filePath,
+                    offset);
+              }};
+        },
+        broker,
+        splitConcurrency,
+        maxReadyBytes);
+    selectivePreloadResult_ = ExecutorSplitPrefetch::take(
+        executor_, connectorQueryCtx_->queryId(), split_->filePath);
+    if (selectivePreloadResult_) {
+      VELOX_CHECK_EQ(
+          selectivePreloadResult_->buffers.size(),
+          1 + split_->coalescedFiles.size());
+      dataSource_.reset();
+      coalescedDataSources_.clear();
+      selectivePreloadBuffers_.clear();
+      coalescedDataSources_.reserve(
+          selectivePreloadResult_->buffers.size() - 1);
+      selectivePreloadBuffers_.reserve(selectivePreloadResult_->buffers.size());
+      for (size_t index = 0; index < selectivePreloadResult_->buffers.size();
+           ++index) {
+        const auto& buffer = selectivePreloadResult_->buffers[index];
+        auto span = cudf::host_span<const std::byte>(
+            reinterpret_cast<const std::byte*>(buffer->data()), buffer->size());
+        auto source = std::shared_ptr<cudf::io::datasource>(
+            cudf::io::datasource::create(span));
+        if (index == 0) {
+          dataSource_ = std::move(source);
+        } else {
+          coalescedDataSources_.push_back(std::move(source));
+        }
+        selectivePreloadBuffers_.push_back(buffer);
+      }
+      fileMetaData_.clear();
+      return;
+    }
+  }
+#endif
+
+  struct PendingFile {
+    std::shared_ptr<PinnedHostBuffer> buffer;
+    std::future<void> future;
+  };
+
+  constexpr uint64_t kReadRangeBytes = 16ULL << 20;
+  std::vector<PendingFile> pending;
+  pending.reserve(1 + split_->coalescedFiles.size());
+
+  using DataSourceFactory = std::function<std::shared_ptr<cudf::io::datasource>(
+      const std::string&, std::optional<std::size_t>)>;
+  DataSourceFactory sourceFactory =
+      [this](const std::string& path, std::optional<std::size_t> fileSize) {
+        return createCudfDataSource(path, fileSize);
+      };
+#ifdef VELOX_ENABLE_S3
+  const auto useBufferedInput = cudfHiveConfig_->useBufferedInputSession(
+      connectorQueryCtx_->sessionProperties());
+  if (!useBufferedInput && split_->filePath.starts_with("s3://")) {
+    sourceFactory = [config = cudfHiveConfig_->config()](
+                        const std::string& path,
+                        std::optional<std::size_t> fileSize) {
+      VELOX_CHECK(
+          path.starts_with("s3://"),
+          "Grouped S3 split contains a non-S3 path: {}",
+          path);
+      auto fileSystem = filesystems::getFileSystem(path, config);
+      auto s3FileSystem =
+          std::dynamic_pointer_cast<filesystems::S3FileSystem>(fileSystem);
+      VELOX_CHECK_NOT_NULL(
+          s3FileSystem, "S3 path resolved to a non-S3 filesystem: {}", path);
+      const auto credentials = s3FileSystem->getCredentialSnapshot();
+      return std::make_shared<KvikioS3DataSource>(
+          path,
+          credentials.accessKeyId,
+          credentials.secretAccessKey,
+          credentials.sessionToken,
+          credentials.region,
+          credentials.endpoint,
+          fileSize);
+    };
+  }
+#endif
+
+  struct PreparedFile {
+    std::string path;
+    std::optional<std::size_t> knownFileSize;
+    std::shared_ptr<cudf::io::datasource> originalSource;
+    uint64_t sourceSize;
+  };
+  std::vector<PreparedFile> prepared;
+  prepared.reserve(1 + split_->coalescedFiles.size());
+  uint64_t batchBytes = 0;
+
+  auto prepareFile = [&](const std::string& path,
+                         uint64_t start,
+                         uint64_t length,
+                         bool wholeFile) {
+    const std::optional<std::size_t> knownFileSize = wholeFile && start == 0 &&
+            length != std::numeric_limits<uint64_t>::max()
+        ? std::optional<std::size_t>{length}
+        : std::nullopt;
+    std::shared_ptr<cudf::io::datasource> originalSource;
+    const auto sourceSize =
+        knownFileSize.has_value() ? knownFileSize.value() : ([&]() {
+          originalSource = sourceFactory(path, knownFileSize);
+          VELOX_CHECK_NOT_NULL(originalSource);
+          return originalSource->size();
+        })();
+    VELOX_CHECK_LE(
+        sourceSize,
+        std::numeric_limits<uint64_t>::max() - batchBytes,
+        "Selective preload byte count overflow");
+    batchBytes += sourceSize;
+    prepared.push_back(
+        {path, knownFileSize, std::move(originalSource), sourceSize});
+  };
+
+  // A split range that begins at zero is not necessarily a whole file. The
+  // coalesced-file contract is the only caller-provided proof that these
+  // lengths cover complete physical files.
+  prepareFile(
+      split_->filePath,
+      split_->start,
+      split_->length,
+      !split_->coalescedFiles.empty());
+  for (const auto& file : split_->coalescedFiles) {
+    prepareFile(file.filePath, 0, file.length, true);
+  }
+
+  // Reserve the whole grouped split before allocating any pinned buffer. The
+  // broker admits one oversize group only when no other reservation is live.
+  auto reservation = broker->reserve(batchBytes);
+
+  // Submit all physical files before waiting for any one of them. This removes
+  // the per-file synchronization barrier inside a grouped split and lets the
+  // executor-scoped broker maintain one request window across scan drivers.
+  auto submitFile = [&](PreparedFile file) {
+    auto buffer =
+        std::make_shared<PinnedHostBuffer>(file.sourceSize, reservation);
+
+    std::vector<PrefetchRange> ranges;
+    ranges.reserve((file.sourceSize + kReadRangeBytes - 1) / kReadRangeBytes);
+    for (uint64_t offset = 0; offset < file.sourceSize;
+         offset += kReadRangeBytes) {
+      ranges.push_back(
+          {offset,
+           std::min<uint64_t>(kReadRangeBytes, file.sourceSize - offset),
+           offset});
+    }
+    auto makeReadFunction =
+        [path = file.path](std::shared_ptr<cudf::io::datasource> source) {
+          VELOX_CHECK_NOT_NULL(source);
+          return PrefetchReadFunction{
+              [source = std::move(source), path](
+                  uint64_t offset, uint64_t size, uint8_t* destination) {
+                const auto bytes = source->host_read(offset, size, destination);
+                VELOX_CHECK_EQ(
+                    bytes,
+                    size,
+                    "Short datasource read for {} at offset {}",
+                    path,
+                    offset);
+              }};
+        };
+    std::future<void> future;
+    if (file.originalSource) {
+      // Unknown-size sources must still be opened synchronously to size the
+      // destination. Preserve the existing range-parallel path for them.
+      future = broker->read(
+          makeReadFunction(std::move(file.originalSource)),
+          file.sourceSize,
+          std::move(ranges),
+          buffer,
+          reservation);
+    } else {
+      future = broker->readPrepared(
+          [sourceFactory,
+           makeReadFunction,
+           path = file.path,
+           knownFileSize = file.knownFileSize]() mutable {
+            return makeReadFunction(sourceFactory(path, knownFileSize));
+          },
+          file.sourceSize,
+          std::move(ranges),
+          buffer,
+          reservation);
+    }
+    pending.push_back({std::move(buffer), std::move(future)});
+  };
+
+  selectivePreloadBuffers_.clear();
+  for (auto& file : prepared) {
+    submitFile(std::move(file));
+  }
+
+  std::exception_ptr firstFailure;
+  for (auto& file : pending) {
+    try {
+      file.future.get();
+    } catch (...) {
+      if (!firstFailure) {
+        firstFailure = std::current_exception();
+      }
+    }
+  }
+  if (firstFailure) {
+    std::rethrow_exception(firstFailure);
+  }
+
+  dataSource_.reset();
+  coalescedDataSources_.clear();
+  coalescedDataSources_.reserve(pending.empty() ? 0 : pending.size() - 1);
+  selectivePreloadBuffers_.reserve(pending.size());
+  for (size_t index = 0; index < pending.size(); ++index) {
+    auto& file = pending[index];
+    auto span = cudf::host_span<const std::byte>(
+        reinterpret_cast<const std::byte*>(file.buffer->data()),
+        file.buffer->size());
+    auto source = std::shared_ptr<cudf::io::datasource>(
+        cudf::io::datasource::create(span));
+    if (index == 0) {
+      dataSource_ = std::move(source);
+    } else {
+      coalescedDataSources_.push_back(std::move(source));
+    }
+    selectivePreloadBuffers_.push_back(std::move(file.buffer));
+  }
+  fileMetaData_.clear();
 }
 
 uint64_t CudfSplitReader::primaryDataSourceSize() const {
@@ -266,7 +583,8 @@ uint64_t CudfSplitReader::primaryDataSourceSize() const {
 }
 
 std::shared_ptr<cudf::io::datasource> CudfSplitReader::createCudfDataSource(
-    const std::string& filePath) {
+    const std::string& filePath,
+    std::optional<std::size_t> fileSize) {
   const auto useBufferedInput = cudfHiveConfig_->useBufferedInputSession(
       connectorQueryCtx_->sessionProperties());
 
@@ -281,6 +599,29 @@ std::shared_ptr<cudf::io::datasource> CudfSplitReader::createCudfDataSource(
 
   // Use KvikIO data source if we don't want to use the BufferedInput source
   if (not useBufferedInput) {
+#ifdef VELOX_ENABLE_S3
+    if (filePath.starts_with("s3://")) {
+      auto fileSystem =
+          filesystems::getFileSystem(filePath, cudfHiveConfig_->config());
+      auto s3FileSystem =
+          std::dynamic_pointer_cast<filesystems::S3FileSystem>(fileSystem);
+      VELOX_CHECK_NOT_NULL(
+          s3FileSystem,
+          "S3 path resolved to a non-S3 filesystem: {}",
+          filePath);
+      const auto credentials = s3FileSystem->getCredentialSnapshot();
+      VLOG(1) << fmt::format(
+          "Using IRSA-aware KvikIO S3 data source for file: {}", filePath);
+      return std::make_shared<KvikioS3DataSource>(
+          filePath,
+          credentials.accessKeyId,
+          credentials.secretAccessKey,
+          credentials.sessionToken,
+          credentials.region,
+          credentials.endpoint,
+          fileSize);
+    }
+#endif
     VLOG(1) << fmt::format("Using KvikIO data source for file: {}", filePath);
     return std::move(
         cudf::io::make_datasources(cudf::io::source_info{filePath}).front());
@@ -425,6 +766,12 @@ void CudfSplitReader::fileMetaDatas() {
 }
 
 void CudfSplitReader::createCudfReader() {
+  // Ensure selective buffers exist before footer parsing and reader
+  // construction. Iceberg may already have created them before its schema
+  // inspection; whole-file preload is projection-independent, so the
+  // idempotent call preserves those sources and their cached metadata.
+  setupSelectivePreloadDataSources();
+
   // Read file metadatas
   fileMetaDatas();
 

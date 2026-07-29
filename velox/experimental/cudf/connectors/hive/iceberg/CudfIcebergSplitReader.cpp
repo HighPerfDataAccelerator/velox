@@ -152,6 +152,11 @@ void CudfIcebergSplitReader::prepareSplit(
 
   resetSplit();
   stream_ = cudfGlobalStreamPool().get_stream();
+  // Iceberg schema adaptation inspects Parquet footer metadata. Set up the
+  // selective preload first so that this inspection reads from the pinned
+  // host spans instead of issuing a remote S3 footer request. Reader creation
+  // invokes the same setup again; CudfSplitReader keeps that call idempotent.
+  setupSelectivePreloadDataSources();
   cacheSchemaFromMetadata();
 
   if (fileMetaData_.size() > 1) {
@@ -184,11 +189,21 @@ void CudfIcebergSplitReader::prepareSplit(
       split_ = fallbackSplits_.front();
       fallbackSplits_.pop_front();
       resetSplit();
+      setupSelectivePreloadDataSources();
       cacheSchemaFromMetadata();
     }
   }
 
   prepareCurrentSplit(runtimeStats, true);
+}
+
+void CudfIcebergSplitReader::setDataSourceContext(
+    const ConnectorQueryCtx* connectorQueryCtx,
+    dwio::common::RuntimeStatistics& runtimeStats,
+    cudf::ast::expression const* subfieldFilterExpr) {
+  CudfSplitReader::setDataSourceContext(
+      connectorQueryCtx, runtimeStats, subfieldFilterExpr);
+  runtimeStats_ = &runtimeStats;
 }
 
 void CudfIcebergSplitReader::prepareCurrentSplit(
@@ -267,6 +282,7 @@ bool CudfIcebergSplitReader::prepareNextFallbackSplit() {
   split_ = fallbackSplits_.front();
   fallbackSplits_.pop_front();
   resetSplit();
+  setupSelectivePreloadDataSources();
   cacheSchemaFromMetadata();
   prepareCurrentSplit(*runtimeStats_, false);
   return true;

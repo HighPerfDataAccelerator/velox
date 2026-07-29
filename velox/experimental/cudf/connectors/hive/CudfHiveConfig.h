@@ -96,6 +96,19 @@ class CudfHiveConfig {
   static constexpr const char* kUseExperimentalCudfReaderSession =
       "cudf.hive.use_experimental_reader";
 
+  static constexpr const char* kSelectivePreloadEnabled =
+      "cudf.hive.selective-preload-enabled";
+  static constexpr const char* kSelectivePreloadEnabledSession =
+      "cudf.hive.selective_preload_enabled";
+
+  static constexpr const char* kPrefetchMaxInFlightBytes =
+      "cudf.hive.prefetch-max-inflight-bytes";
+  static constexpr const char* kPrefetchMaxInFlightBytesSession =
+      "cudf.hive.prefetch_max_inflight_bytes";
+  static constexpr const char* kPrefetchThreads = "cudf.hive.prefetch-threads";
+  static constexpr const char* kPrefetchThreadsSession =
+      "cudf.hive.prefetch_threads";
+
   // Writer config options
 
   /// Whether new data can be inserted into a CudfHive file
@@ -169,6 +182,12 @@ class CudfHiveConfig {
   bool useExperimentalCudfReader() const;
   bool useExperimentalCudfReaderSession(
       const config::ConfigBase* session) const;
+
+  bool selectivePreloadEnabledSession(const config::ConfigBase* session) const;
+
+  uint64_t prefetchMaxInFlightBytesSession(
+      const config::ConfigBase* session) const;
+  uint32_t prefetchThreadsSession(const config::ConfigBase* session) const;
 
   bool immutableFiles() const;
 

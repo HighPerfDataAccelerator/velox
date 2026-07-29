@@ -472,9 +472,7 @@ void registerCudf() {
   auto mr = cudf_velox::createMemoryResource(
       mrMode, CudfConfig::getInstance().memoryPercent);
   if (deviceMemoryDiagnosticsEnabled()) {
-    statistics_mr_.emplace(std::move(mr));
-    mr_ = cuda::mr::any_resource<cuda::mr::device_accessible>{
-        statistics_mr_.value()};
+    mr_ = wrapDeviceMemoryResourceForDiagnostics(std::move(mr), false);
     LOG(INFO) << "Enabled cuDF RMM statistics for device-memory diagnostics";
   } else {
     mr_ = std::move(mr);
@@ -486,9 +484,8 @@ void registerCudf() {
     auto outputMr = cudf_velox::createMemoryResource(
         outputMrMode, CudfConfig::getInstance().memoryPercent);
     if (deviceMemoryDiagnosticsEnabled()) {
-      output_statistics_mr_.emplace(std::move(outputMr));
-      output_mr_ = cuda::mr::any_resource<cuda::mr::device_accessible>{
-          output_statistics_mr_.value()};
+      output_mr_ =
+          wrapDeviceMemoryResourceForDiagnostics(std::move(outputMr), true);
     } else {
       output_mr_ = std::move(outputMr);
     }

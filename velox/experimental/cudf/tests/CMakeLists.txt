@@ -257,6 +257,12 @@ velox_add_cudf_test(
     fmt::fmt
 )
 
+velox_add_cudf_test(
+  NAME velox_cudf_executor_prefetch_test
+  SOURCES Main.cpp ExecutorPrefetchTest.cpp
+  LIBS velox_cudf_hive_connector
+)
+
 # Disabling writer tests until we re-add writing ability to CudfHiveConnector
 # velox_add_cudf_test(
 #   NAME velox_cudf_table_write_test
