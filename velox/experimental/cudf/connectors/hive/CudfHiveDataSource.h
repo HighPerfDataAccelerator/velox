@@ -53,6 +53,8 @@ class CudfHiveDataSource : public DataSource, public NvtxHelper {
 
   void addSplit(std::shared_ptr<ConnectorSplit> split) override;
 
+  void setFromDataSource(std::unique_ptr<DataSource> sourceUnique) override;
+
   void addDynamicFilter(
       column_index_t /*outputChannel*/,
       const std::shared_ptr<facebook::velox::common::Filter>& /*filter*/)

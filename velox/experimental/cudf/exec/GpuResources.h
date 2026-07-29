@@ -129,6 +129,13 @@ rmm::device_async_resource_ref get_output_mr();
 [[nodiscard]] cuda::mr::any_resource<cuda::mr::device_accessible>
 createMemoryResource(std::string_view mode, int percent);
 
+/// Wraps a cuDF resource with global statistics and per-operator live
+/// allocation attribution. Enabled only by the diagnostic execution path.
+[[nodiscard]] cuda::mr::any_resource<cuda::mr::device_accessible>
+wrapDeviceMemoryResourceForDiagnostics(
+    cuda::mr::any_resource<cuda::mr::device_accessible> upstream,
+    bool outputResource);
+
 /// If GLUTEN_CUDF_ASYNC_QUERY_END_TRIM_BYTES is set, synchronizes the device
 /// and releases unused cudaMallocAsync pool memory down to that retained-byte
 /// target. Returns true when a trim was requested and completed successfully.
@@ -199,6 +206,7 @@ class CudaAllocationTraceScope {
 
  private:
   bool active_{false};
+  std::string previousContext_;
 };
 
 } // namespace facebook::velox::cudf_velox

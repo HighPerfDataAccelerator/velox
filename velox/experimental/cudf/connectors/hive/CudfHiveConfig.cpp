@@ -150,6 +150,26 @@ bool CudfHiveConfig::useExperimentalCudfReaderSession(
       config_->get<bool>(kUseExperimentalCudfReader, false));
 }
 
+bool CudfHiveConfig::selectivePreloadEnabledSession(
+    const config::ConfigBase* session) const {
+  return session->get<bool>(
+      kSelectivePreloadEnabledSession,
+      config_->get<bool>(kSelectivePreloadEnabled, false));
+}
+
+uint64_t CudfHiveConfig::prefetchMaxInFlightBytesSession(
+    const config::ConfigBase* session) const {
+  return session->get<uint64_t>(
+      kPrefetchMaxInFlightBytesSession,
+      config_->get<uint64_t>(kPrefetchMaxInFlightBytes, 4ULL << 30));
+}
+
+uint32_t CudfHiveConfig::prefetchThreadsSession(
+    const config::ConfigBase* session) const {
+  return session->get<uint32_t>(
+      kPrefetchThreadsSession, config_->get<uint32_t>(kPrefetchThreads, 128));
+}
+
 bool CudfHiveConfig::immutableFiles() const {
   return config_->get<bool>(kImmutableFiles, false);
 }

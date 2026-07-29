@@ -37,6 +37,31 @@
 
 namespace {
 
+#ifdef VELOX_ENABLE_S3
+kvikio::RemoteHandle makeKvikioS3Handle(
+    const std::string& filePath,
+    const std::string& accessKeyId,
+    const std::string& secretAccessKey,
+    const std::string& sessionToken,
+    std::optional<std::string> region,
+    std::optional<std::string> endpoint,
+    std::optional<std::size_t> fileSize) {
+  auto bucketAndObject = kvikio::S3Endpoint::parse_s3_url(filePath);
+  auto s3Endpoint = std::make_unique<kvikio::S3Endpoint>(
+      std::move(bucketAndObject),
+      std::move(region),
+      accessKeyId,
+      secretAccessKey,
+      std::move(endpoint),
+      sessionToken.empty() ? std::nullopt
+                           : std::optional<std::string>{sessionToken});
+  if (fileSize.has_value()) {
+    return kvikio::RemoteHandle(std::move(s3Endpoint), fileSize.value());
+  }
+  return kvikio::RemoteHandle(std::move(s3Endpoint));
+}
+#endif
+
 /**
  * @brief Static mutex to serialize batches of IO operations across drivers
  *
@@ -66,6 +91,134 @@ std::future<T> toStdFuture(folly::Future<T> follyFuture) {
 } // namespace
 
 namespace facebook::velox::cudf_velox::connector::hive {
+
+#ifdef VELOX_ENABLE_S3
+KvikioS3DataSource::KvikioS3DataSource(
+    const std::string& filePath,
+    const std::string& accessKeyId,
+    const std::string& secretAccessKey,
+    const std::string& sessionToken,
+    std::optional<std::string> region,
+    std::optional<std::string> endpoint,
+    std::optional<std::size_t> fileSize)
+    : handle_(makeKvikioS3Handle(
+          filePath,
+          accessKeyId,
+          secretAccessKey,
+          sessionToken,
+          std::move(region),
+          std::move(endpoint),
+          fileSize)) {}
+
+size_t KvikioS3DataSource::clampedReadSize(size_t offset, size_t requestedSize)
+    const {
+  if (offset >= size()) {
+    return 0;
+  }
+  return std::min(requestedSize, size() - offset);
+}
+
+size_t KvikioS3DataSource::size() const {
+  return handle_.nbytes();
+}
+
+std::unique_ptr<cudf::io::datasource::buffer> KvikioS3DataSource::host_read(
+    size_t offset,
+    size_t requestedSize) {
+  auto data = std::vector<uint8_t>(clampedReadSize(offset, requestedSize));
+  if (!data.empty()) {
+    handle_.pread(data.data(), data.size(), offset).get();
+  }
+  return cudf::io::datasource::buffer::create(std::move(data));
+}
+
+size_t KvikioS3DataSource::host_read(
+    size_t offset,
+    size_t requestedSize,
+    uint8_t* dst) {
+  return host_read_async(offset, requestedSize, dst).get();
+}
+
+std::future<std::unique_ptr<cudf::io::datasource::buffer>>
+KvikioS3DataSource::host_read_async(size_t offset, size_t requestedSize) {
+  auto data = std::vector<uint8_t>(clampedReadSize(offset, requestedSize));
+  if (data.empty()) {
+    return std::async(
+        std::launch::deferred, [data = std::move(data)]() mutable {
+          return cudf::io::datasource::buffer::create(std::move(data));
+        });
+  }
+  auto readFuture = handle_.pread(data.data(), data.size(), offset);
+  return std::async(
+      std::launch::deferred,
+      [data = std::move(data), readFuture = std::move(readFuture)]() mutable {
+        readFuture.get();
+        return cudf::io::datasource::buffer::create(std::move(data));
+      });
+}
+
+std::future<size_t> KvikioS3DataSource::host_read_async(
+    size_t offset,
+    size_t requestedSize,
+    uint8_t* dst) {
+  const auto readSize = clampedReadSize(offset, requestedSize);
+  if (readSize == 0) {
+    return std::async(std::launch::deferred, [] { return size_t{0}; });
+  }
+  auto readFuture = handle_.pread(dst, readSize, offset);
+  return std::async(
+      std::launch::deferred, [readFuture = std::move(readFuture)]() mutable {
+        return readFuture.get();
+      });
+}
+
+bool KvikioS3DataSource::supports_device_read() const {
+  return true;
+}
+
+bool KvikioS3DataSource::is_device_read_preferred(
+    size_t /* requestedSize */) const {
+  return true;
+}
+
+std::future<size_t> KvikioS3DataSource::device_read_async(
+    size_t offset,
+    size_t requestedSize,
+    uint8_t* dst,
+    rmm::cuda_stream_view /* stream */) {
+  const auto readSize = clampedReadSize(offset, requestedSize);
+  if (readSize == 0) {
+    return std::async(std::launch::deferred, [] { return size_t{0}; });
+  }
+  // KvikIO owns the worker streams used by remote device reads. Keep the H2D
+  // copy on those internal streams and use pread()'s completion as the device
+  // visibility boundary. The consumer stream is not exposed to KvikIO.
+  auto readFuture = handle_.pread(dst, readSize, offset);
+  return std::async(
+      std::launch::deferred, [readFuture = std::move(readFuture)]() mutable {
+        return readFuture.get();
+      });
+}
+
+size_t KvikioS3DataSource::device_read(
+    size_t offset,
+    size_t requestedSize,
+    uint8_t* dst,
+    rmm::cuda_stream_view stream) {
+  return device_read_async(offset, requestedSize, dst, stream).get();
+}
+
+std::unique_ptr<cudf::io::datasource::buffer> KvikioS3DataSource::device_read(
+    size_t offset,
+    size_t requestedSize,
+    rmm::cuda_stream_view stream) {
+  rmm::device_buffer data(clampedReadSize(offset, requestedSize), stream);
+  const auto readSize = device_read(
+      offset, requestedSize, static_cast<uint8_t*>(data.data()), stream);
+  data.resize(readSize, stream);
+  return cudf::io::datasource::buffer::create(std::move(data));
+}
+#endif
 
 BufferedInputDataSource::BufferedInputDataSource(
     std::shared_ptr<facebook::velox::dwio::common::BufferedInput> input)
@@ -286,8 +439,9 @@ fetchByteRangesAsync(
   deviceReadTasks.reserve(ioOffsets.size());
   hostReadTasks.reserve(ioOffsets.size());
 
-  // device_read_async is not guaranteed to follow stream-ordering (see
-  // datasource API docs)
+  // KvikIO's remote read uses internal worker streams. Synchronize preceding
+  // consumer work before scheduling the batch; completion of each pread()
+  // includes its H2D copy.
   stream.synchronize();
 
   {
