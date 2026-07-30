@@ -136,6 +136,16 @@ class SplitsStore {
     return std::move(promises_);
   }
 
+  /// Wakes drivers waiting for a preloaded split to become ready.
+  ///
+  /// Readiness is level-triggered: by the time this completion arrives there
+  /// may already be multiple ready splits, and completions that happened
+  /// before waiters registered do not leave an edge to wake them later.
+  /// Wake all current waiters so each rechecks the ready queue.
+  std::vector<ContinuePromise> splitPreloadFinished() {
+    return std::move(promises_);
+  }
+
   void setTaskStats(TaskStats& taskStats) {
     taskStats_ = &taskStats;
   }
@@ -147,9 +157,10 @@ class SplitsStore {
   }
 
  protected:
-  Split getSplit(
+  bool getSplit(
       int maxPreloadSplits,
-      const ConnectorSplitPreloadFunc& preload);
+      const ConnectorSplitPreloadFunc& preload,
+      Split& split);
 
   ContinueFuture makeFuture();
 
