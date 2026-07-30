@@ -581,6 +581,12 @@ void CudfConfig::initialize(
     batchSizeMaxThreshold =
         folly::to<int32_t>(config[kCudfBatchSizeMaxThreshold]);
   }
+  if (config.find(kCudfBatchConcatMaxBytes) != config.end()) {
+    const auto value = folly::to<uint64_t>(config[kCudfBatchConcatMaxBytes]);
+    VELOX_USER_CHECK_GT(
+        value, 0, "{} must be positive", kCudfBatchConcatMaxBytes);
+    batchConcatMaxBytes = value;
+  }
   if (config.find(kCudfConcatOptimizationEnabled) != config.end()) {
     concatOptimizationEnabled =
         folly::to<bool>(config[kCudfConcatOptimizationEnabled]);

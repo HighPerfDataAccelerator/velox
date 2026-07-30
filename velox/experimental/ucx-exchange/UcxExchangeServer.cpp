@@ -14,11 +14,13 @@
  * limitations under the License.
  */
 #include "velox/experimental/ucx-exchange/UcxExchangeServer.h"
+
 #include <glog/logging.h>
 #include <malloc.h>
 #include <rmm/cuda_stream_view.hpp>
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <string>
 #include "cuda_runtime.h"
@@ -30,6 +32,12 @@
 namespace facebook::velox::ucx_exchange {
 
 namespace {
+std::unique_ptr<std::vector<uint8_t>> transferMetadata(
+    const UcxTransferData& data) {
+  VELOX_CHECK_NOT_NULL(data.metadata);
+  return std::make_unique<std::vector<uint8_t>>(*data.metadata);
+}
+
 void accountFreedHostBytesAndTrim(uint64_t bytes) {
   constexpr uint64_t kTrimInterval = 64ULL * 1024 * 1024;
   static std::atomic<uint64_t> freedSinceTrim{0};
@@ -181,7 +189,7 @@ struct MetaSendContext {
 };
 
 struct DataSendContext {
-  std::shared_ptr<cudf::packed_columns> data;
+  std::shared_ptr<UcxTransferData> data;
   // The UCX build used by Gluten MPP may not include CUDA memory-type
   // transports.  In that case handing an rmm device pointer to tagSend makes
   // the shared-memory transport memcpy from an inaccessible address.  Keep a
@@ -276,7 +284,7 @@ void UcxExchangeServer::process() {
       // callback
       {
         std::weak_ptr<UcxExchangeServer> weakQueue = weak_from_this();
-        queueMgr_->getData(
+        queueMgr_->getTransferData(
             partitionKey_.taskId,
             partitionKey_.destination,
             // Unbounded per-fetch cap; rendezvous + queue-occupancy
@@ -284,7 +292,7 @@ void UcxExchangeServer::process() {
             std::numeric_limits<uint64_t>::max(),
             static_cast<int64_t>(sequenceNumber_),
             [weakQueue](
-                std::shared_ptr<cudf::packed_columns> data,
+                std::shared_ptr<UcxTransferData> data,
                 int64_t sequence,
                 std::vector<int64_t> remainingBytes) {
               auto self = weakQueue.lock();
@@ -463,9 +471,7 @@ void UcxExchangeServer::sendData() {
   VLOG(2) << (isIntraNodeTransfer_ ? "[INTRA]" : "[REMOTE]") << " [ExSrv "
           << partitionKey_.toString() << " seq=" << sequenceNumber_
           << "] sendData hasData=" << (dataPtr_ != nullptr)
-          << (dataPtr_ && dataPtr_->gpu_data
-                  ? " size=" + std::to_string(dataPtr_->gpu_data->size())
-                  : "");
+          << (dataPtr_ ? " size=" + std::to_string(dataPtr_->size()) : "");
 
   if (isIntraNodeTransfer_) {
     // INTRA-NODE TRANSFER PATH: Use registry for all communication, no UCXX
@@ -473,7 +479,21 @@ void UcxExchangeServer::sendData() {
     sendStart_ = std::chrono::high_resolution_clock::now();
 
     if (dataPtr_) {
-      bytes_ = dataPtr_->gpu_data->size();
+      bytes_ = dataPtr_->size();
+      if (dataPtr_->isHostStaged()) {
+        auto metadata = transferMetadata(*dataPtr_);
+        auto deviceBuffer = std::make_unique<rmm::device_buffer>(
+            bytes_, rmm::cuda_stream_default);
+        CUDF_CUDA_TRY(cudaMemcpy(
+            deviceBuffer->data(),
+            dataPtr_->hostData->data(),
+            bytes_,
+            cudaMemcpyHostToDevice));
+        dataPtr_->deviceData = std::make_shared<cudf::packed_columns>(
+            std::move(metadata), std::move(deviceBuffer));
+        dataPtr_->hostData.reset();
+        dataPtr_->metadata.reset();
+      }
 
       VLOG(3) << "@" << partitionKey_.taskId
               << " Intra-node transfer: publishing data for sequence "
@@ -481,14 +501,14 @@ void UcxExchangeServer::sendData() {
 
       IntraNodeTransferKey key{
           partitionKey_.taskId, partitionKey_.destination, sequenceNumber_};
-      const auto stream = dataPtr_->gpu_data->stream();
+      const auto stream = dataPtr_->deviceData->gpu_data->stream();
       // The consumer tags uniquely owned pages with this stream so downstream
       // reads and stream-ordered async frees remain ordered with the buffer.
       // dataPtr_ is already a shared_ptr, pass directly to share ownership.
       intraNodeRetrieveFuture_ =
           IntraNodeTransferRegistry::getInstance()->publish(
               key,
-              dataPtr_,
+              dataPtr_->deviceData,
               stream,
               /*atEnd=*/false,
               makeIntraNodeRetrieveWakeup());
@@ -530,12 +550,14 @@ void UcxExchangeServer::sendData() {
     }
   } else {
     // REMOTE EXCHANGE PATH: Use UCXX for metadata and data transfer
-    const bool useHostStaging = !communicator->hasCudaTransport();
+    const bool preStaged = dataPtr_ && dataPtr_->isHostStaged();
+    const bool useHostStaging = preStaged || !communicator->hasCudaTransport();
     std::shared_ptr<DataSendContext> dataCtx;
     if (dataPtr_) {
-      const auto hostBytes = static_cast<int64_t>(dataPtr_->gpu_data->size());
+      const auto hostBytes = dataPtr_->size();
       dataCtx = std::make_shared<DataSendContext>();
-      if (useHostStaging && !dataCtx->reserveHostBytes(hostBytes)) {
+      if (!preStaged && useHostStaging &&
+          !dataCtx->reserveHostBytes(hostBytes)) {
         // Keep dataPtr_ and state=DataReady.  Completed UCX callbacks release
         // process-wide credit; requeueing lets this server retry without
         // dequeuing or staging another packed table.
@@ -549,9 +571,11 @@ void UcxExchangeServer::sendData() {
       // Copy metadata (not move) because in broadcast mode, the same
       // packed_columns may be shared across multiple destination queues.
       // Metadata is small (CPU-side), so copying is negligible.
-      metadataMsg->cudfMetadata =
-          std::make_unique<std::vector<uint8_t>>(*dataPtr_->metadata);
-      metadataMsg->dataSizeBytes = dataPtr_->gpu_data->size();
+      metadataMsg->cudfMetadata = preStaged
+          ? transferMetadata(*dataPtr_)
+          : std::make_unique<std::vector<uint8_t>>(
+                *dataPtr_->deviceData->metadata);
+      metadataMsg->dataSizeBytes = dataPtr_->size();
       metadataMsg->remainingBytes = {};
       metadataMsg->atEnd = false;
     } else {
@@ -620,13 +644,10 @@ void UcxExchangeServer::sendData() {
     // send the data chunk (if any)
     if (dataPtr_) {
       sendStart_ = std::chrono::high_resolution_clock::now();
-      bytes_ = dataPtr_->gpu_data->size();
+      bytes_ = dataPtr_->size();
 
-      VLOG(3) << "@" << partitionKey_.taskId
-              << " Sending rmm::buffer: " << std::hex
-              << dataPtr_->gpu_data.get()
-              << " pointing to device memory: " << std::hex
-              << dataPtr_->gpu_data->data() << std::dec << " to task "
+      VLOG(3) << "@" << partitionKey_.taskId << " Sending "
+              << (preStaged ? "host buffer" : "rmm::buffer") << " to task "
               << partitionKey_.toString() << ":" << this->sequenceNumber_
               << std::dec << " of size " << bytes_;
 
@@ -642,20 +663,25 @@ void UcxExchangeServer::sendData() {
       // it after the DMA completes, while the Request (and context shell)
       // stays alive for UCP wireup replay.
       dataCtx->data = dataPtr_;
-      void* sendBuffer = dataCtx->data->gpu_data->data();
-      if (useHostStaging) {
+      void* sendBuffer = preStaged
+          ? static_cast<void*>(dataCtx->data->hostData->data())
+          : dataCtx->data->deviceData->gpu_data->data();
+      if (useHostStaging && !preStaged) {
         dataCtx->hostData = std::make_shared<std::vector<uint8_t>>(bytes_);
-        const auto producerStream = dataCtx->data->gpu_data->stream();
+        const auto producerStream =
+            dataCtx->data->deviceData->gpu_data->stream();
         CUDF_CUDA_TRY(cudaStreamSynchronize(producerStream.value()));
         CUDF_CUDA_TRY(cudaMemcpy(
             dataCtx->hostData->data(),
-            dataCtx->data->gpu_data->data(),
+            dataCtx->data->deviceData->gpu_data->data(),
             bytes_,
             cudaMemcpyDeviceToHost));
         sendBuffer = dataCtx->hostData->data();
       }
       VLOG(2) << "@" << partitionKey_.taskId << " posting "
-              << (useHostStaging ? "host-staged" : "direct-device")
+              << (preStaged            ? "pre-staged-host"
+                      : useHostStaging ? "host-staged"
+                                       : "direct-device")
               << " send for " << bytes_ << " bytes";
 
       dataRequest_ = endpointRef_->endpoint_->tagSend(
@@ -673,23 +699,22 @@ void UcxExchangeServer::sendData() {
             // callback means UCX has finished with both payloads; only the
             // empty context shell must remain alive with the Request.
             auto ctx = std::static_pointer_cast<DataSendContext>(arg);
+            const auto releasedHostBytes =
+                ctx->data != nullptr && ctx->data->isHostStaged()
+                ? ctx->data->size()
+                : ctx->reservedHostBytes;
             auto dataHolder = std::move(ctx->data);
             auto hostDataHolder = std::move(ctx->hostData);
-            const auto releasedHostBytes = ctx->reservedHostBytes;
             ctx->releaseHostReservation();
             hostDataHolder.reset();
-            // The default allocator retains these very large vector arenas in
-            // the executor even after free().  A long exchange therefore has
-            // bounded live staging but unbounded RSS. Return completed large
-            // transfers to the OS instead of waiting for process teardown.
-            accountFreedHostBytesAndTrim(releasedHostBytes);
-
+            dataHolder.reset();
             if (auto self = weakData.lock()) {
               self->sendComplete(status, arg);
             }
-            // The holders are destroyed here, releasing the GPU buffer if
-            // sendComplete() already reset the server's dataPtr_, and always
-            // releasing the completed transfer's host staging allocation.
+            // sendComplete() drops the server's last payload reference. Return
+            // completed large host allocations to the OS instead of retaining
+            // their arenas for the lifetime of the executor.
+            accountFreedHostBytesAndTrim(releasedHostBytes);
           },
           dataCtx);
     } else {

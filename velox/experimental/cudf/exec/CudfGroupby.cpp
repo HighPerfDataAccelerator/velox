@@ -94,6 +94,12 @@ constexpr const char* kIntermediateAggregationMaxLevel =
     "cudfIntermediateAggregationMaxLevel";
 constexpr const char* kIntermediateAggregationSerializedMerges =
     "cudfIntermediateAggregationSerializedMerges";
+constexpr const char* kIntermediateAggregationMemoryLimitFlushes =
+    "cudfIntermediateAggregationMemoryLimitFlushes";
+constexpr const char* kIntermediateAggregationMemoryLimitFlushBytes =
+    "cudfIntermediateAggregationMemoryLimitFlushBytes";
+constexpr const char* kIntermediateAggregationBufferedBytes =
+    "cudfIntermediateAggregationBufferedBytes";
 
 cudf::column_view withoutTopLevelNullMask(cudf::column_view input) {
   VELOX_CHECK_EQ(
@@ -1167,6 +1173,16 @@ CudfGroupby::CudfGroupby(
       maxPartialAggregationMemoryUsage_(
           driverCtx->queryConfig().maxPartialAggregationMemoryUsage()) {}
 
+bool CudfGroupby::needsInput() const {
+  if (noMoreInput_) {
+    return false;
+  }
+  if (!isPartialOutput_ || !streamingEnabled_) {
+    return true;
+  }
+  return bufferedResult_ == nullptr && !partialAggregationMemoryLimitReached();
+}
+
 void CudfGroupby::initialize() {
   Operator::initialize();
 
@@ -1785,6 +1801,7 @@ void CudfGroupby::addIntermediateAggregationRun(
   ++intermediateInputRunCount_;
 
   auto level = aggregationRunLevel(run.representedRows);
+  const auto runBytes = run.data->estimateFlatSize();
   {
     auto lockedStats = stats_.wlock();
     lockedStats->addRuntimeStat(
@@ -1794,13 +1811,34 @@ void CudfGroupby::addIntermediateAggregationRun(
         RuntimeCounter(static_cast<int64_t>(level)));
   }
 
+  if (isPartialOutput_ && maxPartialAggregationMemoryUsage_ > 0 &&
+      intermediateBufferedBytes_ > 0) {
+    const auto memoryLimit =
+        static_cast<uint64_t>(maxPartialAggregationMemoryUsage_);
+    if (runBytes > memoryLimit ||
+        intermediateBufferedBytes_ > memoryLimit - runBytes) {
+      bufferIntermediateAggregationRunsForMemoryLimit(run.representedRows);
+    }
+  }
+
   for (;;) {
     if (intermediateRunLevels_.size() <= level) {
       intermediateRunLevels_.resize(level + 1);
     }
     if (!intermediateRunLevels_[level].has_value()) {
-      intermediateBufferedBytes_ += run.data->estimateFlatSize();
+      const auto bufferedRunBytes = run.data->estimateFlatSize();
+      VELOX_CHECK_LE(
+          intermediateBufferedBytes_,
+          std::numeric_limits<uint64_t>::max() - bufferedRunBytes);
+      intermediateBufferedBytes_ += bufferedRunBytes;
       intermediateRunLevels_[level] = std::move(run);
+      VELOX_CHECK_LE(
+          intermediateBufferedBytes_,
+          static_cast<uint64_t>(std::numeric_limits<int64_t>::max()));
+      auto lockedStats = stats_.wlock();
+      lockedStats->addRuntimeStat(
+          kIntermediateAggregationBufferedBytes,
+          RuntimeCounter(static_cast<int64_t>(intermediateBufferedBytes_)));
       return;
     }
 
@@ -1820,6 +1858,36 @@ void CudfGroupby::addIntermediateAggregationRun(
   }
 }
 
+bool CudfGroupby::partialAggregationMemoryLimitReached() const {
+  return maxPartialAggregationMemoryUsage_ > 0 &&
+      intermediateBufferedBytes_ >=
+      static_cast<uint64_t>(maxPartialAggregationMemoryUsage_);
+}
+
+void CudfGroupby::bufferIntermediateAggregationRunsForMemoryLimit(
+    uint64_t retainedInputRows) {
+  VELOX_CHECK(isPartialOutput_);
+  VELOX_CHECK(streamingEnabled_);
+  VELOX_CHECK_NULL(bufferedResult_);
+  VELOX_CHECK_GT(intermediateBufferedBytes_, 0);
+  VELOX_CHECK_LE(retainedInputRows, static_cast<uint64_t>(numInputRows_));
+
+  const auto flushBytes = intermediateBufferedBytes_;
+  numInputRows_ -= static_cast<int64_t>(retainedInputRows);
+  inputRowsRetainedAfterFlush_ = retainedInputRows;
+  bufferedResult_ = drainIntermediateAggregationRuns();
+  VELOX_CHECK_NOT_NULL(bufferedResult_);
+
+  VELOX_CHECK_LE(
+      flushBytes, static_cast<uint64_t>(std::numeric_limits<int64_t>::max()));
+  auto lockedStats = stats_.wlock();
+  lockedStats->addRuntimeStat(
+      kIntermediateAggregationMemoryLimitFlushes, RuntimeCounter(1));
+  lockedStats->addRuntimeStat(
+      kIntermediateAggregationMemoryLimitFlushBytes,
+      RuntimeCounter(static_cast<int64_t>(flushBytes)));
+}
+
 CudfGroupby::IntermediateAggregationRun
 CudfGroupby::mergeIntermediateAggregationRuns(
     IntermediateAggregationRun left,
@@ -1837,6 +1905,12 @@ CudfGroupby::mergeIntermediateAggregationRuns(
       left.data->estimateFlatSize() + right.data->estimateFlatSize();
   VELOX_CHECK_LE(
       inputBytes, static_cast<uint64_t>(std::numeric_limits<int64_t>::max()));
+  if (isPartialOutput_ && maxPartialAggregationMemoryUsage_ > 0) {
+    VELOX_CHECK_LE(
+        inputBytes,
+        static_cast<uint64_t>(maxPartialAggregationMemoryUsage_),
+        "CudfGroupby partial merge input exceeded its memory limit");
+  }
   const auto representedRows =
       addRepresentedRows(left.representedRows, right.representedRows);
   // The pre-rebase MPP path deliberately serialized very large merge kernels
@@ -2063,7 +2137,11 @@ CudfVectorPtr CudfGroupby::releaseAndResetBufferedResult() {
         RuntimeCounter(aggregationPct));
   }
 
-  numInputRows_ = 0;
+  VELOX_CHECK_LE(
+      inputRowsRetainedAfterFlush_,
+      static_cast<uint64_t>(std::numeric_limits<int64_t>::max()));
+  numInputRows_ = static_cast<int64_t>(inputRowsRetainedAfterFlush_);
+  inputRowsRetainedAfterFlush_ = 0;
   // We're moving bufferedResult_ to the caller because we want it to be null
   // after this call.
   return std::move(bufferedResult_);
@@ -2072,10 +2150,8 @@ CudfVectorPtr CudfGroupby::releaseAndResetBufferedResult() {
 RowVectorPtr CudfGroupby::doGetOutput() {
   // Handle partial streaming groupby.
   if (isPartialOutput_ && streamingEnabled_) {
-    if (!bufferedResult_ && maxPartialAggregationMemoryUsage_ > 0 &&
-        intermediateBufferedBytes_ >
-            static_cast<uint64_t>(maxPartialAggregationMemoryUsage_)) {
-      bufferedResult_ = drainIntermediateAggregationRuns();
+    if (!bufferedResult_ && partialAggregationMemoryLimitReached()) {
+      bufferIntermediateAggregationRunsForMemoryLimit(0);
     }
     if (bufferedResult_) {
       return releaseAndResetBufferedResult();
@@ -2191,7 +2267,7 @@ RowVectorPtr CudfGroupby::doGetOutput() {
 
 void CudfGroupby::doNoMoreInput() {
   Operator::noMoreInput();
-  if (isPartialOutput_ && inputs_.empty()) {
+  if (isPartialOutput_ && !streamingEnabled_ && inputs_.empty()) {
     finished_ = true;
   }
 }
@@ -2209,6 +2285,7 @@ void CudfGroupby::doClose() {
   finalStreamingRequestAggregationCounts_.clear();
   intermediateRunLevels_.clear();
   intermediateBufferedBytes_ = 0;
+  inputRowsRetainedAfterFlush_ = 0;
   finalRunLevels_.clear();
   bufferedResult_.reset();
   inputs_.clear();

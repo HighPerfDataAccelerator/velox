@@ -55,6 +55,15 @@ class CudfBatchConcat : public CudfOperatorBase {
       int32_t targetRows,
       uint64_t targetBytes);
 
+  CudfBatchConcat(
+      int32_t operatorId,
+      exec::DriverCtx* driverCtx,
+      std::shared_ptr<const core::PlanNode> planNode,
+      RowTypePtr outputType,
+      int32_t targetRows,
+      uint64_t targetBytes,
+      uint64_t maxConcatBytes);
+
   bool needsInput() const override;
 
   exec::BlockingReason isBlocked(ContinueFuture* /*future*/) override {
@@ -68,6 +77,9 @@ class CudfBatchConcat : public CudfOperatorBase {
   RowVectorPtr doGetOutput() override;
 
  private:
+  void flushBufferedInputs();
+  void publishRuntimeStats();
+
   exec::DriverCtx* const driverCtx_;
   const std::string aggregationStep_;
   std::vector<CudfVectorPtr> buffer_;
@@ -80,6 +92,11 @@ class CudfBatchConcat : public CudfOperatorBase {
   uint64_t currentNumBytes_{0};
   const size_t targetRows_{0};
   const uint64_t targetBytes_{0};
+  const uint64_t maxConcatBytes_{0};
+  uint64_t hardByteCapFlushes_{0};
+  uint64_t oversizedInputPassthroughs_{0};
+  uint64_t concatenateCalls_{0};
+  uint64_t maxConcatenateInputBytes_{0};
   bool summaryLogged_{false};
 };
 

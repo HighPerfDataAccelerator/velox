@@ -126,7 +126,7 @@ class UcxExchangeServer
   bool isIntraNodeTransfer_{false};
 
   std::atomic<ServerState> state_;
-  std::shared_ptr<cudf::packed_columns> dataPtr_{nullptr};
+  std::shared_ptr<UcxTransferData> dataPtr_{nullptr};
   /// Protects dataPtr_. Must be recursive because sendData() holds the lock
   /// when calling tagSend(), and for small messages UCX completes inline via
   /// its fast-completion path, firing the sendComplete() callback on the same

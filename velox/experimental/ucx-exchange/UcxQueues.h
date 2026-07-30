@@ -27,6 +27,36 @@
 
 namespace facebook::velox::ucx_exchange {
 
+/// A packed table waiting in a producer output queue. The normal path keeps
+/// the original device-resident packed_columns. Phase-separated exchanges may
+/// instead keep the contiguous payload in host memory until its destination is
+/// active.
+struct UcxTransferData {
+  std::shared_ptr<cudf::packed_columns> deviceData;
+  std::shared_ptr<std::vector<uint8_t>> hostData;
+  std::shared_ptr<std::vector<uint8_t>> metadata;
+
+  int64_t size() const {
+    if (deviceData != nullptr) {
+      return deviceData->gpu_data->size();
+    }
+    return hostData == nullptr ? 0 : hostData->size();
+  }
+
+  int64_t hostResidentSize() const {
+    return (hostData == nullptr ? 0 : hostData->size()) +
+        (metadata == nullptr ? 0 : metadata->size());
+  }
+
+  int64_t backpressureSize() const {
+    return isHostStaged() ? hostResidentSize() : size();
+  }
+
+  bool isHostStaged() const {
+    return hostData != nullptr;
+  }
+};
+
 /// @brief  Callback function for getting data from the queues.
 /// A nullptr indicates that there is no more data.
 /// The remainingBytes vector contains the sizes for the
@@ -42,18 +72,20 @@ using UcxDataAvailableCallbackV2 = std::function<void(
     int64_t sequence,
     std::vector<int64_t> remainingBytes)>;
 
+using UcxTransferDataAvailableCallback = std::function<void(
+    std::shared_ptr<UcxTransferData> data,
+    int64_t sequence,
+    std::vector<int64_t> remainingBytes)>;
+
 struct UcxDataAvailable {
-  UcxDataAvailableCallback callback{nullptr};
-  UcxDataAvailableCallbackV2 callbackV2{nullptr};
-  std::shared_ptr<cudf::packed_columns> data;
+  UcxTransferDataAvailableCallback callback{nullptr};
+  std::shared_ptr<UcxTransferData> data;
   int64_t sequence{0};
   std::vector<int64_t> remainingBytes;
 
   void notify() {
-    if (callbackV2) {
-      callbackV2(std::move(data), sequence, remainingBytes);
-    } else if (callback) {
-      callback(std::move(data), remainingBytes);
+    if (callback) {
+      callback(std::move(data), sequence, remainingBytes);
     }
   }
 };
@@ -67,12 +99,14 @@ struct UcxDataAvailable {
 class UcxDestinationQueue {
  public:
   struct Stats {
-    void recordEnqueue(const cudf::packed_columns* data);
+    void recordEnqueue(const UcxTransferData* data);
 
-    void recordDequeue(const cudf::packed_columns* data);
+    void recordDequeue(const UcxTransferData* data);
 
     // what has been queued
     int64_t bytesQueued{0};
+    int64_t backpressureBytesQueued{0};
+    int64_t deviceBytesQueued{0};
     int64_t packedColumnsQueued{0};
 
     // what has been dequeued
@@ -82,15 +116,15 @@ class UcxDestinationQueue {
 
   /// @brief Enqueues the data to the back of the queue.
   /// @param data Corresponds to a RowVector
-  void enqueueBack(std::shared_ptr<cudf::packed_columns> data);
+  void enqueueBack(std::shared_ptr<UcxTransferData> data);
 
   /// @brief Enqueues the data to the front of the queue. This is needed when
   /// a transfer fails.
   /// @param data
-  void enqueueFront(std::shared_ptr<cudf::packed_columns> data);
+  void enqueueFront(std::shared_ptr<UcxTransferData> data);
 
   struct Data {
-    std::shared_ptr<cudf::packed_columns> data;
+    std::shared_ptr<UcxTransferData> data;
     int64_t sequence{0};
     std::vector<int64_t> remainingBytes;
     /// Whether the result is returned immediately without invoking the `notify'
@@ -102,12 +136,12 @@ class UcxDestinationQueue {
   /// ownership to the caller. If there is no data, 'notify' is installed and it
   /// will be called when data becomes available. In this case, a nullptr is
   /// returned.
-  [[nodiscard]] Data getData(UcxDataAvailableCallback notify);
+  [[nodiscard]] Data getData(UcxTransferDataAvailableCallback notify);
 
   [[nodiscard]] Data getData(
       uint64_t maxBytes,
       int64_t sequence,
-      UcxDataAvailableCallbackV2 notify);
+      UcxTransferDataAvailableCallback notify);
 
   /// Removes all remaining data from the queue and returns any pending waiter
   /// so it can be woken with an end marker.
@@ -128,9 +162,8 @@ class UcxDestinationQueue {
  private:
   void clearNotify();
 
-  std::deque<std::shared_ptr<cudf::packed_columns>> queue_;
-  UcxDataAvailableCallback notify_{nullptr};
-  UcxDataAvailableCallbackV2 notifyV2_{nullptr};
+  std::deque<std::shared_ptr<UcxTransferData>> queue_;
+  UcxTransferDataAvailableCallback notify_{nullptr};
   int64_t sequence_{0};
   int64_t notifySequence_{0};
   uint64_t notifyMaxBytes_{0};
@@ -204,6 +237,10 @@ class UcxOutputQueue : public std::enable_shared_from_this<UcxOutputQueue> {
       std::unique_ptr<cudf::packed_columns> data,
       int32_t numRows);
 
+  /// Materializes subsequently enqueued partitioned payloads in host memory.
+  /// This must be enabled before the producer task starts.
+  void enableHostSpooling();
+
   /// @brief Checks if the queue is over capacity and returns a future if so.
   /// This should be called after enqueueing all partitions for a batch.
   /// @param future Output parameter - populated with a future if blocked.
@@ -221,6 +258,12 @@ class UcxOutputQueue : public std::enable_shared_from_this<UcxOutputQueue> {
       uint64_t maxBytes,
       int64_t sequence,
       UcxDataAvailableCallbackV2 notify);
+
+  void getTransferData(
+      int destination,
+      uint64_t maxBytes,
+      int64_t sequence,
+      UcxTransferDataAvailableCallback notify);
 
   /// @brief Indicates that a driver is done and won't enqueue any more data.
   void noMoreData();
@@ -260,13 +303,18 @@ class UcxOutputQueue : public std::enable_shared_from_this<UcxOutputQueue> {
   static constexpr int32_t kContinuePct = 90;
 
   // Methods that update the statistics.
-  void updateStatsWithEnqueuedLocked(int64_t bytes, int64_t rows);
+  void updateStatsWithEnqueuedLocked(
+      int64_t logicalBytes,
+      int64_t backpressureBytes,
+      int64_t deviceBytes,
+      int64_t rows);
 
   // updates the counters and returns promises if the queuedBytes_ counter falls
   // below the continueSize_ low water mark. These promises then need to be
   // realized outside the lock.
   void updateStatsWithFreedLocked(
       int64_t bytes,
+      int64_t deviceBytes,
       int64_t numPackedCols,
       std::vector<ContinuePromise>& promises);
 
@@ -288,7 +336,7 @@ class UcxOutputQueue : public std::enable_shared_from_this<UcxOutputQueue> {
 
   bool enqueuePartitionedOutputLocked(
       int destination,
-      std::shared_ptr<cudf::packed_columns> data,
+      std::shared_ptr<UcxTransferData> data,
       std::vector<UcxDataAvailable>& dataAvailableCbs);
 
   void enqueueBroadcastOutputLocked(
@@ -310,6 +358,14 @@ class UcxOutputQueue : public std::enable_shared_from_this<UcxOutputQueue> {
   // For broadcast: stores data for late-arriving destinations that need
   // backfill. Cleared once noMoreQueues_ is set.
   std::vector<std::shared_ptr<cudf::packed_columns>> dataToBroadcast_;
+
+  bool hostSpooling_{false};
+  int64_t hostSpooledBytes_{0};
+  int64_t hostSpoolPeakBytes_{0};
+  int64_t hostSpoolResidentBytes_{0};
+  int64_t hostSpoolPeakResidentBytes_{0};
+  uint64_t hostSpoolMaxSize_{0};
+  uint64_t hostSpoolContinueSize_{0};
 
   /// If 'queuedBytes_' > 'maxSize_', each producer is blocked after adding
   /// data.
@@ -343,6 +399,7 @@ class UcxOutputQueue : public std::enable_shared_from_this<UcxOutputQueue> {
 
   // actual data in 'queues_'
   int64_t queuedBytes_{0};
+  int64_t deviceQueuedBytes_{0};
   int64_t queuedPackedColumns_{0};
 
   // Last reported 256 MiB bucket. Diagnostic-only; it does not cap the queue.

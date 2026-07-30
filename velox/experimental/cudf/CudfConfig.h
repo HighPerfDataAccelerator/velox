@@ -53,6 +53,8 @@ struct CudfConfig {
       "cudf.batch_size_min_threshold_bytes"};
   static constexpr const char* kCudfBatchSizeMaxThreshold{
       "cudf.batch_size_max_threshold"};
+  static constexpr const char* kCudfBatchConcatMaxBytes{
+      "cudf.batch_concat_max_bytes"};
   static constexpr const char* kCudfConcatOptimizationEnabled{
       "cudf.concat_optimization_enabled"};
   static constexpr const char* kCudfGroupbyStreamingMaxDistinctKeys{
@@ -230,6 +232,10 @@ struct CudfConfig {
   /// This field is intentionally appended so incremental builds that reuse
   /// stable UCX objects preserve the offsets of every pre-existing field.
   bool exchangeConcatOptimizationEnabled{true};
+
+  /// Hard upper bound on the estimated input bytes passed to one
+  /// cudf::concatenate call by CudfBatchConcat.
+  uint64_t batchConcatMaxBytes{1ULL << 30};
 };
 
 } // namespace facebook::velox::cudf_velox
