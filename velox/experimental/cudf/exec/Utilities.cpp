@@ -28,6 +28,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <sstream>
 #include <vector>
 
 namespace facebook::velox::cudf_velox {
@@ -217,7 +218,9 @@ std::vector<std::unique_ptr<cudf::table>> getConcatenatedTableBatched(
     std::vector<CudfVectorPtr>&& tables,
     const TypePtr& tableType,
     rmm::cuda_stream_view stream,
-    rmm::device_async_resource_ref mr) {
+    rmm::device_async_resource_ref mr,
+    uint64_t maxConcatBytes,
+    ConcatenateBatchStats* concatStats) {
   std::vector<std::unique_ptr<cudf::table>> concatTables;
   // Check for empty vector
   if (tables.size() == 0) {
@@ -227,14 +230,22 @@ std::vector<std::unique_ptr<cudf::table>> getConcatenatedTableBatched(
 
   auto inputStreams = std::vector<rmm::cuda_stream_view>();
   auto tableViews = std::vector<cudf::table_view>();
+  auto inputBytes = std::vector<uint64_t>();
+  const bool observeInputBytes = maxConcatBytes != 0 || concatStats != nullptr;
 
   inputStreams.reserve(tables.size());
   tableViews.reserve(tables.size());
+  if (observeInputBytes) {
+    inputBytes.reserve(tables.size());
+  }
 
   for (const auto& table : tables) {
     VELOX_CHECK_NOT_NULL(table);
     tableViews.push_back(table->getTableView());
     inputStreams.push_back(table->stream());
+    if (observeInputBytes) {
+      inputBytes.push_back(table->estimateFlatSize());
+    }
   }
 
   cudf::detail::join_streams(inputStreams, stream);
@@ -244,30 +255,60 @@ std::vector<std::unique_ptr<cudf::table>> getConcatenatedTableBatched(
     auto const maxRows = maxBatchRows();
     size_t startpos = 0;
     size_t runningRows = 0;
+    uint64_t runningBytes = 0;
+    const auto flushBatch = [&](size_t endpos) {
+      VELOX_CHECK_LT(startpos, endpos);
+      VELOX_CHECK(
+          maxConcatBytes == 0 || runningBytes <= maxConcatBytes,
+          "Concatenate input estimate {} exceeds hard byte cap {}",
+          runningBytes,
+          maxConcatBytes);
+      if (concatStats != nullptr) {
+        ++concatStats->concatenateCalls;
+        concatStats->maxInputBytes =
+            std::max(concatStats->maxInputBytes, runningBytes);
+      }
+      outputTables.push_back(cudf::concatenate(
+          std::vector<cudf::table_view>(
+              tableViews.begin() + startpos, tableViews.begin() + endpos),
+          stream,
+          mr));
+    };
     for (size_t i = 0; i < tableViews.size(); ++i) {
       auto const numRows = static_cast<size_t>(tableViews[i].num_rows());
-      // If adding this table would exceed the limit, flush current batch
-      // [startpos, i).
-      if (runningRows > 0 && runningRows + numRows > maxRows) {
-        outputTables.push_back(
-            cudf::concatenate(
-                std::vector<cudf::table_view>(
-                    tableViews.begin() + startpos, tableViews.begin() + i),
-                stream,
-                mr));
+      const auto bytes = observeInputBytes ? inputBytes[i] : 0;
+      VELOX_CHECK(
+          maxConcatBytes == 0 || bytes <= maxConcatBytes,
+          "A single concatenate input estimate {} exceeds hard byte cap {}. "
+          "The caller must pass it through without concatenating.",
+          bytes,
+          maxConcatBytes);
+      const bool exceedsRows =
+          runningRows > maxRows || numRows > maxRows - runningRows;
+      const bool exceedsBytes = maxConcatBytes != 0 &&
+          (runningBytes > maxConcatBytes ||
+           bytes > maxConcatBytes - runningBytes);
+      // Flush before adding the input that would cross either hard bound.
+      if (i > startpos && (exceedsRows || exceedsBytes)) {
+        flushBatch(i);
         startpos = i;
         runningRows = 0;
+        runningBytes = 0;
       }
+      VELOX_CHECK_LE(
+          numRows,
+          std::numeric_limits<size_t>::max() - runningRows,
+          "Concatenate input row count overflow");
+      VELOX_CHECK_LE(
+          bytes,
+          std::numeric_limits<uint64_t>::max() - runningBytes,
+          "Concatenate input byte estimate overflow");
       runningRows += numRows;
+      runningBytes += bytes;
     }
     // Flush the final batch [startpos, end).
     if (startpos < tableViews.size()) {
-      outputTables.push_back(
-          cudf::concatenate(
-              std::vector<cudf::table_view>(
-                  tableViews.begin() + startpos, tableViews.end()),
-              stream,
-              mr));
+      flushBatch(tableViews.size());
     }
     orderCudfVectorDeallocationsAfterStream(tables, inputStreams, stream);
 
@@ -276,6 +317,19 @@ std::vector<std::unique_ptr<cudf::table>> getConcatenatedTableBatched(
   } catch (...) {
     // A failed later batch may leave earlier concatenate kernels in flight.
     stream.synchronize();
+    std::ostringstream streamList;
+    for (size_t i = 0; i < std::min<size_t>(inputStreams.size(), 16); ++i) {
+      if (i > 0) {
+        streamList << ",";
+      }
+      streamList << inputStreams[i].value();
+    }
+    if (inputStreams.size() > 16) {
+      streamList << ",...";
+    }
+    LOG(ERROR) << "getConcatenatedTableBatched failed outputStream="
+               << stream.value() << ", inputStreams=[" << streamList.str()
+               << "]";
     throw;
   }
 }
@@ -285,13 +339,15 @@ std::vector<CudfVectorPtr> getConcatenatedCudfVectorsBatched(
     std::vector<CudfVectorPtr>&& vectors,
     const TypePtr& tableType,
     rmm::cuda_stream_view stream,
-    rmm::device_async_resource_ref mr) {
+    rmm::device_async_resource_ref mr,
+    uint64_t maxConcatBytes,
+    ConcatenateBatchStats* concatStats) {
   VELOX_CHECK_NOT_NULL(pool);
 
   std::vector<CudfVectorPtr> outputVectors;
   if (tableType->size() > 0) {
-    auto tables =
-        getConcatenatedTableBatched(std::move(vectors), tableType, stream, mr);
+    auto tables = getConcatenatedTableBatched(
+        std::move(vectors), tableType, stream, mr, maxConcatBytes, concatStats);
     outputVectors.reserve(tables.size());
     for (auto& table : tables) {
       VELOX_CHECK_NOT_NULL(table);

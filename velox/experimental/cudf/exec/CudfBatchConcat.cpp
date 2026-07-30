@@ -20,6 +20,7 @@
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <limits>
 #include <string_view>
@@ -77,6 +78,16 @@ int32_t queryConcatTargetRows(exec::DriverCtx* driverCtx) {
       static_cast<uint64_t>(std::numeric_limits<int32_t>::max()),
       "CudfBatchConcat target row count exceeds INT32_MAX");
   return static_cast<int32_t>(targetRows);
+}
+
+uint64_t queryConcatMaxBytes(exec::DriverCtx* driverCtx) {
+  const auto maxBytes = concatThreshold(
+      driverCtx,
+      CudfConfig::kCudfBatchConcatMaxBytes,
+      "GLUTEN_CUDF_BATCH_CONCAT_MAX_BYTES",
+      CudfConfig::getInstance().batchConcatMaxBytes);
+  VELOX_CHECK_GT(maxBytes, 0, "CudfBatchConcat hard byte cap must be positive");
+  return maxBytes;
 }
 
 std::string getAggregationStep(
@@ -141,6 +152,23 @@ CudfBatchConcat::CudfBatchConcat(
     RowTypePtr outputType,
     int32_t targetRows,
     uint64_t targetBytes)
+    : CudfBatchConcat(
+          operatorId,
+          driverCtx,
+          std::move(planNode),
+          std::move(outputType),
+          targetRows,
+          targetBytes,
+          queryConcatMaxBytes(driverCtx)) {}
+
+CudfBatchConcat::CudfBatchConcat(
+    int32_t operatorId,
+    exec::DriverCtx* driverCtx,
+    std::shared_ptr<const core::PlanNode> planNode,
+    RowTypePtr outputType,
+    int32_t targetRows,
+    uint64_t targetBytes,
+    uint64_t maxConcatBytes)
     : CudfOperatorBase(
           operatorId,
           driverCtx,
@@ -154,17 +182,68 @@ CudfBatchConcat::CudfBatchConcat(
       driverCtx_(driverCtx),
       aggregationStep_(getAggregationStep(planNode)),
       targetRows_(checkedConcatTargetRows(targetRows)),
-      targetBytes_(targetBytes) {
+      targetBytes_(targetBytes),
+      maxConcatBytes_(maxConcatBytes) {
+  VELOX_CHECK_GT(
+      maxConcatBytes_, 0, "CudfBatchConcat hard byte cap must be positive");
   if (logConcatConfig()) {
     LOG(WARNING) << "CudfBatchConcat configured targetRows=" << targetRows_
-                 << ", targetBytes=" << targetBytes_;
+                 << ", targetBytes=" << targetBytes_
+                 << ", maxConcatBytes=" << maxConcatBytes_;
   }
 }
 
 bool CudfBatchConcat::needsInput() const {
   return !noMoreInput_ && outputQueue_.empty() &&
       currentNumRows_ < targetRows_ &&
-      (targetBytes_ == 0 || currentNumBytes_ < targetBytes_);
+      (targetBytes_ == 0 || currentNumBytes_ < targetBytes_) &&
+      currentNumBytes_ < maxConcatBytes_;
+}
+
+void CudfBatchConcat::flushBufferedInputs() {
+  if (buffer_.empty()) {
+    return;
+  }
+
+  if (buffer_.size() == 1) {
+    outputQueue_.push(std::move(buffer_.front()));
+    buffer_.clear();
+  } else {
+    const auto outputStream = buffer_.front()->stream();
+    const auto bufferedInputs = buffer_.size();
+    ConcatenateBatchStats concatStats;
+    std::vector<CudfVectorPtr> outputVectors;
+    try {
+      outputVectors = getConcatenatedCudfVectorsBatched(
+          pool(),
+          std::exchange(buffer_, {}),
+          outputType_,
+          outputStream,
+          get_output_mr(),
+          maxConcatBytes_,
+          &concatStats);
+    } catch (...) {
+      concatenateCalls_ += concatStats.concatenateCalls;
+      maxConcatenateInputBytes_ =
+          std::max(maxConcatenateInputBytes_, concatStats.maxInputBytes);
+      publishRuntimeStats();
+      LOG(ERROR) << "CudfBatchConcat concatenate failed planNode="
+                 << planNodeId() << ", bufferedInputs=" << bufferedInputs
+                 << ", bufferedBytes=" << currentNumBytes_
+                 << ", maxConcatBytes=" << maxConcatBytes_
+                 << ", outputStream=" << outputStream.value();
+      throw;
+    }
+    concatenateCalls_ += concatStats.concatenateCalls;
+    maxConcatenateInputBytes_ =
+        std::max(maxConcatenateInputBytes_, concatStats.maxInputBytes);
+    publishRuntimeStats();
+    for (auto& output : outputVectors) {
+      outputQueue_.push(std::move(output));
+    }
+  }
+  currentNumRows_ = 0;
+  currentNumBytes_ = 0;
 }
 
 void CudfBatchConcat::doAddInput(RowVectorPtr input) {
@@ -175,38 +254,50 @@ void CudfBatchConcat::doAddInput(RowVectorPtr input) {
     return;
   }
 
-  // Push input cudf table to buffer
+  const auto inputRows = static_cast<size_t>(cudfVector->size());
+  const auto inputBytes = cudfVector->estimateFlatSize();
   ++inputBatches_;
-  totalInputRows_ += cudfVector->size();
-  totalInputBytes_ += cudfVector->estimateFlatSize();
-  currentNumRows_ += cudfVector->size();
-  currentNumBytes_ += cudfVector->estimateFlatSize();
+  VELOX_CHECK_LE(
+      inputRows,
+      std::numeric_limits<uint64_t>::max() - totalInputRows_,
+      "CudfBatchConcat total input row count overflow");
+  totalInputRows_ += inputRows;
+  VELOX_CHECK_LE(
+      inputBytes,
+      std::numeric_limits<uint64_t>::max() - totalInputBytes_,
+      "CudfBatchConcat total input byte count overflow");
+  totalInputBytes_ += inputBytes;
+
+  if (inputBytes > maxConcatBytes_) {
+    if (!buffer_.empty()) {
+      ++hardByteCapFlushes_;
+      flushBufferedInputs();
+    }
+    ++oversizedInputPassthroughs_;
+    outputQueue_.push(std::move(cudfVector));
+    return;
+  }
+
+  if (!buffer_.empty() && inputBytes > maxConcatBytes_ - currentNumBytes_) {
+    ++hardByteCapFlushes_;
+    flushBufferedInputs();
+  }
+
+  VELOX_CHECK_LE(
+      inputRows,
+      std::numeric_limits<size_t>::max() - currentNumRows_,
+      "CudfBatchConcat buffered row count overflow");
+  currentNumRows_ += inputRows;
+  currentNumBytes_ += inputBytes;
   buffer_.push_back(std::move(cudfVector));
 
-  // Enforce the bound here as well as in needsInput(). Source pipelines may
-  // have already scheduled another input before the driver observes the
-  // updated needsInput() result. Keeping a ready output in outputQueue_ makes
-  // the backpressure explicit and prevents scan batches from accumulating up
-  // to device capacity. Avoid a redundant D2D concatenate for one large input.
   if (currentNumRows_ >= targetRows_ ||
-      (targetBytes_ != 0 && currentNumBytes_ >= targetBytes_)) {
-    if (buffer_.size() == 1) {
-      outputQueue_.push(std::move(buffer_.front()));
-      buffer_.clear();
-    } else {
-      const auto outputStream = buffer_.front()->stream();
-      auto outputVectors = getConcatenatedCudfVectorsBatched(
-          pool(),
-          std::exchange(buffer_, {}),
-          outputType_,
-          outputStream,
-          get_output_mr());
-      for (auto& output : outputVectors) {
-        outputQueue_.push(std::move(output));
-      }
+      (targetBytes_ != 0 && currentNumBytes_ >= targetBytes_) ||
+      currentNumBytes_ >= maxConcatBytes_) {
+    if (currentNumBytes_ >= maxConcatBytes_) {
+      ++hardByteCapFlushes_;
     }
-    currentNumRows_ = 0;
-    currentNumBytes_ = 0;
+    flushBufferedInputs();
   }
 }
 
@@ -223,50 +314,8 @@ RowVectorPtr CudfBatchConcat::doGetOutput() {
   if (!buffer_.empty() &&
       (currentNumRows_ >= targetRows_ ||
        (targetBytes_ != 0 && currentNumBytes_ >= targetBytes_) ||
-       noMoreInput_)) {
-    // Preserve the zero-copy Exchange fast path when a single received batch
-    // already satisfies the target (or is the final tail batch). CudfVector
-    // carries its producing stream, so downstream operators can consume it
-    // directly without rebinding allocation ownership to another stream.
-    if (buffer_.size() == 1) {
-      auto output = std::move(buffer_.front());
-      buffer_.clear();
-      currentNumRows_ = 0;
-      currentNumBytes_ = 0;
-      ++outputBatches_;
-      return output;
-    }
-    // Use stream from existing buffer vectors
-    const auto outputStream = buffer_[0]->stream();
-    auto outputVectors = getConcatenatedCudfVectorsBatched(
-        pool(),
-        std::exchange(buffer_, {}),
-        outputType_,
-        outputStream,
-        get_output_mr());
-
-    currentNumRows_ = 0;
-    currentNumBytes_ = 0;
-    VELOX_CHECK_GT(outputVectors.size(), 0);
-
-    for (auto it = outputVectors.begin(); it + 1 != outputVectors.end(); ++it) {
-      outputQueue_.push(std::move(*it));
-    }
-
-    // If last table is a smaller batch and we still expect more input and keep
-    // it in buffer.
-    auto& last = outputVectors.back();
-    auto rowCount = last->size();
-
-    const auto lastBytes = last->estimateFlatSize();
-    if (!noMoreInput_ && rowCount < targetRows_ &&
-        (targetBytes_ == 0 || lastBytes < targetBytes_)) {
-      currentNumRows_ = rowCount;
-      currentNumBytes_ = lastBytes;
-      buffer_.push_back(std::move(last));
-    } else {
-      outputQueue_.push(std::move(last));
-    }
+       currentNumBytes_ >= maxConcatBytes_ || noMoreInput_)) {
+    flushBufferedInputs();
 
     // Return the first batch from the new queue
     if (!outputQueue_.empty()) {
@@ -280,16 +329,42 @@ RowVectorPtr CudfBatchConcat::doGetOutput() {
   return nullptr;
 }
 
+void CudfBatchConcat::publishRuntimeStats() {
+  auto lockedStats = stats_.wlock();
+  lockedStats->setRuntimeStat(
+      "concatenateCalls", RuntimeMetric(saturateCast(concatenateCalls_)));
+  lockedStats->setRuntimeStat(
+      "hardByteCapFlushes", RuntimeMetric(saturateCast(hardByteCapFlushes_)));
+  lockedStats->setRuntimeStat(
+      "oversizedInputPassthroughs",
+      RuntimeMetric(saturateCast(oversizedInputPassthroughs_)));
+  lockedStats->setRuntimeStat(
+      "maxConcatenateInputBytes",
+      RuntimeMetric(
+          saturateCast(maxConcatenateInputBytes_),
+          RuntimeCounter::Unit::kBytes));
+}
+
 bool CudfBatchConcat::isFinished() {
   const bool finished = noMoreInput_ && buffer_.empty() && outputQueue_.empty();
-  if (finished && !summaryLogged_ && logConcatConfig()) {
+  if (finished && !summaryLogged_) {
     summaryLogged_ = true;
-    LOG(WARNING) << "CudfBatchConcat summary planNode=" << planNodeId()
-                 << ", step=" << aggregationStep_
-                 << ", inputBatches=" << inputBatches_
-                 << ", outputBatches=" << outputBatches_
-                 << ", inputRows=" << totalInputRows_
-                 << ", inputBytes=" << totalInputBytes_;
+    publishRuntimeStats();
+    if (logConcatConfig()) {
+      LOG(WARNING) << "CudfBatchConcat summary planNode=" << planNodeId()
+                   << ", step=" << aggregationStep_
+                   << ", inputBatches=" << inputBatches_
+                   << ", outputBatches=" << outputBatches_
+                   << ", inputRows=" << totalInputRows_
+                   << ", inputBytes=" << totalInputBytes_
+                   << ", maxConcatBytes=" << maxConcatBytes_
+                   << ", hardByteCapFlushes=" << hardByteCapFlushes_
+                   << ", oversizedInputPassthroughs="
+                   << oversizedInputPassthroughs_
+                   << ", concatenateCalls=" << concatenateCalls_
+                   << ", maxConcatenateInputBytes="
+                   << maxConcatenateInputBytes_;
+    }
   }
   return finished;
 }

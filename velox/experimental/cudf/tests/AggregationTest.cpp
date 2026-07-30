@@ -1000,6 +1000,14 @@ TEST_F(AggregationTest, partialAggregationMemoryLimit) {
                       .customStats.at("flushRowCount");
   EXPECT_GT(rowFlushStats.sum, 0);
   EXPECT_GT(rowFlushStats.max, 0);
+  const auto countPlanStats = toPlanStats(task->taskStats());
+  const auto& oversizedRunStats = countPlanStats.at(aggNodeId).customStats;
+  EXPECT_EQ(oversizedRunStats.count("cudfIntermediateAggregationRunMerges"), 0);
+  EXPECT_EQ(
+      oversizedRunStats.at("cudfIntermediateAggregationMemoryLimitFlushes").sum,
+      vectors.size());
+  EXPECT_GT(
+      oversizedRunStats.at("cudfIntermediateAggregationBufferedBytes").max, 1);
 
   // Global aggregation.
   task = AssertQueryBuilder(duckDbQueryRunner_)
@@ -1070,6 +1078,50 @@ TEST_F(AggregationTest, partialAggregationUsesBalancedRunMerges) {
   // 3,500 rows for the same eight pages.
   EXPECT_EQ(stats.at("cudfIntermediateAggregationMergeRows").sum, 2400);
   EXPECT_EQ(stats.count("cudfIntermediateAggregationFinalizeMerges"), 0);
+}
+
+TEST_F(AggregationTest, partialAggregationEnforcesMemoryLimitDuringInput) {
+  std::vector<RowVectorPtr> vectors;
+  constexpr int32_t kBatches = 4;
+  constexpr int32_t kRowsPerBatch = 100;
+  constexpr int64_t kMemoryLimit = 4'000;
+  for (int32_t batch = 0; batch < kBatches; ++batch) {
+    vectors.push_back(makeRowVector(
+        {makeFlatVector<int64_t>(kRowsPerBatch, [batch](vector_size_t row) {
+          return static_cast<int64_t>(batch) * kRowsPerBatch + row;
+        })}));
+  }
+
+  createDuckDbTable(vectors);
+  core::PlanNodeId partialAggId;
+  auto plan = PlanBuilder()
+                  .values(vectors)
+                  .partialAggregation({"c0"}, {"count(1)"})
+                  .capturePlanNodeId(partialAggId)
+                  .finalAggregation()
+                  .planNode();
+
+  auto task =
+      AssertQueryBuilder(duckDbQueryRunner_)
+          .maxDrivers(1)
+          .config(QueryConfig::kMaxPartialAggregationMemory, kMemoryLimit)
+          .plan(plan)
+          .assertResults("SELECT c0, count(1) FROM tmp GROUP BY c0");
+
+  const auto planStats = toPlanStats(task->taskStats());
+  const auto& partialStats = planStats.at(partialAggId);
+  EXPECT_EQ(partialStats.inputVectors, kBatches);
+  EXPECT_EQ(partialStats.inputRows, kBatches * kRowsPerBatch);
+  const auto& stats = partialStats.customStats;
+  ASSERT_EQ(stats.count("flushTimes"), 1);
+  EXPECT_EQ(stats.at("flushTimes").sum, 2);
+  ASSERT_EQ(stats.count("cudfIntermediateAggregationRunMerges"), 1);
+  EXPECT_EQ(stats.at("cudfIntermediateAggregationRunMerges").sum, 2);
+  EXPECT_EQ(stats.at("cudfIntermediateAggregationMemoryLimitFlushes").sum, 1);
+  EXPECT_LE(
+      stats.at("cudfIntermediateAggregationBufferedBytes").max, kMemoryLimit);
+  EXPECT_LE(
+      stats.at("cudfIntermediateAggregationMergeBytes").max, kMemoryLimit);
 }
 
 class FinalAggregationStreamingTest : public AggregationTest {

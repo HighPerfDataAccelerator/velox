@@ -17,9 +17,14 @@
 
 #include "velox/experimental/cudf/exec/GpuResources.h"
 
+#include <malloc.h>
 #include <atomic>
+#include <cerrno>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <sstream>
+#include "cuda_runtime.h"
 
 namespace facebook::velox::ucx_exchange {
 
@@ -27,6 +32,48 @@ namespace {
 std::atomic<int64_t> diagnosticGlobalQueuedBytes{0};
 std::atomic<int64_t> diagnosticGlobalQueuedColumns{0};
 std::atomic<int64_t> diagnosticGlobalQueueGiB{0};
+
+struct PinnedScratch {
+  ~PinnedScratch() {
+    if (data != nullptr) {
+      cudaFreeHost(data);
+    }
+  }
+
+  uint8_t* ensure(size_t bytes) {
+    if (capacity >= bytes) {
+      return data;
+    }
+    if (data != nullptr) {
+      CUDF_CUDA_TRY(cudaFreeHost(data));
+      data = nullptr;
+      capacity = 0;
+    }
+    CUDF_CUDA_TRY(cudaMallocHost(reinterpret_cast<void**>(&data), bytes));
+    capacity = bytes;
+    return data;
+  }
+
+  uint8_t* data{nullptr};
+  size_t capacity{0};
+};
+
+thread_local PinnedScratch pinnedScratch;
+
+uint64_t configuredHostSpoolMaxBytes() {
+  const auto* value = std::getenv("GLUTEN_UCX_HOST_SPOOL_MAX_BYTES");
+  if (value == nullptr || *value == '\0') {
+    return 0;
+  }
+  errno = 0;
+  char* end = nullptr;
+  const auto parsed = std::strtoull(value, &end, 10);
+  if (errno == 0 && end != value && *end == '\0' && parsed > 0) {
+    return parsed;
+  }
+  LOG(WARNING) << "Ignoring invalid GLUTEN_UCX_HOST_SPOOL_MAX_BYTES=" << value;
+  return 0;
+}
 
 void updateDiagnosticGlobalQueue(
     int64_t bytes,
@@ -54,21 +101,31 @@ void updateDiagnosticGlobalQueue(
 }
 } // namespace
 
-void UcxDestinationQueue::Stats::recordEnqueue(
-    const cudf::packed_columns* data) {
+void UcxDestinationQueue::Stats::recordEnqueue(const UcxTransferData* data) {
   if (data != nullptr) {
-    bytesQueued += data->gpu_data->size();
+    bytesQueued += data->size();
+    backpressureBytesQueued += data->backpressureSize();
+    deviceBytesQueued += data->isHostStaged() ? 0 : data->backpressureSize();
     packedColumnsQueued++;
   }
 }
 
-void UcxDestinationQueue::Stats::recordDequeue(
-    const cudf::packed_columns* data) {
+void UcxDestinationQueue::Stats::recordDequeue(const UcxTransferData* data) {
   if (data != nullptr) {
-    const int64_t size = data->gpu_data->size();
+    const int64_t size = data->size();
+    const int64_t backpressureSize = data->backpressureSize();
+    const int64_t deviceBytes = data->isHostStaged() ? 0 : backpressureSize;
 
     bytesQueued -= size;
     VELOX_DCHECK_GE(bytesQueued, 0, "bytesQueued must be non-negative");
+    backpressureBytesQueued -= backpressureSize;
+    VELOX_DCHECK_GE(
+        backpressureBytesQueued,
+        0,
+        "backpressureBytesQueued must be non-negative");
+    deviceBytesQueued -= deviceBytes;
+    VELOX_DCHECK_GE(
+        deviceBytesQueued, 0, "deviceBytesQueued must be non-negative");
     --packedColumnsQueued;
     VELOX_DCHECK_GE(
         packedColumnsQueued, 0, "packedColumnsQueued must be non-negative");
@@ -78,8 +135,7 @@ void UcxDestinationQueue::Stats::recordDequeue(
   }
 }
 
-void UcxDestinationQueue::enqueueBack(
-    std::shared_ptr<cudf::packed_columns> data) {
+void UcxDestinationQueue::enqueueBack(std::shared_ptr<UcxTransferData> data) {
   // drop duplicate end markers.
   if (data == nullptr && !queue_.empty() && queue_.back() == nullptr) {
     return;
@@ -91,8 +147,7 @@ void UcxDestinationQueue::enqueueBack(
   queue_.push_back(std::move(data));
 }
 
-void UcxDestinationQueue::enqueueFront(
-    std::shared_ptr<cudf::packed_columns> data) {
+void UcxDestinationQueue::enqueueFront(std::shared_ptr<UcxTransferData> data) {
   // ignore nullptr.
   if (data == nullptr) {
     return;
@@ -103,24 +158,15 @@ void UcxDestinationQueue::enqueueFront(
 }
 
 UcxDestinationQueue::Data UcxDestinationQueue::getData(
-    UcxDataAvailableCallback notify) {
+    UcxTransferDataAvailableCallback notify) {
   return getData(
-      std::numeric_limits<uint64_t>::max(),
-      sequence_,
-      [notify = std::move(notify)](
-          std::shared_ptr<cudf::packed_columns> data,
-          int64_t /*sequence*/,
-          std::vector<int64_t> remainingBytes) mutable {
-        if (notify) {
-          notify(std::move(data), std::move(remainingBytes));
-        }
-      });
+      std::numeric_limits<uint64_t>::max(), sequence_, std::move(notify));
 }
 
 UcxDestinationQueue::Data UcxDestinationQueue::getData(
     uint64_t maxBytes,
     int64_t sequence,
-    UcxDataAvailableCallbackV2 notify) {
+    UcxTransferDataAvailableCallback notify) {
   if (sequence < sequence_) {
     // A retried/duplicate UCX connection can race with task abort after the
     // original server has already advanced this destination queue.  Treat
@@ -132,7 +178,7 @@ UcxDestinationQueue::Data UcxDestinationQueue::getData(
                  << sequence << " acknowledgedSequence=" << sequence_;
     return {nullptr, sequence_, {}, true};
   }
-  if (notifyV2_ != nullptr && notify != nullptr) {
+  if (notify_ != nullptr && notify != nullptr) {
     // A second server for the same task/destination/sequence must not replace
     // the active server's waiter.  Return a deliberately different sequence
     // so the duplicate UcxExchangeServer follows its stale-connection close
@@ -142,13 +188,13 @@ UcxDestinationQueue::Data UcxDestinationQueue::getData(
     return {nullptr, sequence_ + 1, {}, true};
   }
   VELOX_CHECK(
-      notify_ == nullptr && notifyV2_ == nullptr,
+      notify_ == nullptr,
       "UcxDestinationQueue already has a pending data notification");
   if (sequence > sequence_) {
     // Minimal V2 implementation only supports in-order requests. The full
     // Presto-style ack path can skip prefixes later; for now, install the
     // notify and wait for the requested sequence to become available.
-    notifyV2_ = std::move(notify);
+    notify_ = std::move(notify);
     notifySequence_ = sequence;
     notifyMaxBytes_ = maxBytes;
     return {};
@@ -156,7 +202,7 @@ UcxDestinationQueue::Data UcxDestinationQueue::getData(
 
   if (queue_.empty()) {
     // delay notification.
-    notifyV2_ = std::move(notify);
+    notify_ = std::move(notify);
     notifySequence_ = sequence;
     notifyMaxBytes_ = maxBytes;
     return {};
@@ -189,18 +235,16 @@ UcxDataAvailable UcxDestinationQueue::deleteResults() {
 
   UcxDataAvailable result;
   result.callback = std::move(notify_);
-  result.callbackV2 = std::move(notifyV2_);
   result.sequence = notifySequence_;
   clearNotify();
   return result;
 }
 
 UcxDataAvailable UcxDestinationQueue::getAndClearNotify() {
-  if (notify_ == nullptr && notifyV2_ == nullptr) {
+  if (notify_ == nullptr) {
     return UcxDataAvailable();
   }
-  auto savedV1 = std::move(notify_);
-  auto savedV2 = std::move(notifyV2_);
+  auto saved = std::move(notify_);
   const auto savedSequence = notifySequence_;
   const auto savedMaxBytes = notifyMaxBytes_;
   clearNotify();
@@ -210,16 +254,14 @@ UcxDataAvailable UcxDestinationQueue::getAndClearNotify() {
       savedSequence,
       nullptr);
   if (!data.immediate) {
-    notify_ = std::move(savedV1);
-    notifyV2_ = std::move(savedV2);
+    notify_ = std::move(saved);
     notifySequence_ = savedSequence;
     notifyMaxBytes_ = savedMaxBytes;
     return UcxDataAvailable();
   }
 
   UcxDataAvailable result;
-  result.callback = std::move(savedV1);
-  result.callbackV2 = std::move(savedV2);
+  result.callback = std::move(saved);
   result.sequence = data.sequence;
   result.data = std::move(data.data);
   result.remainingBytes = std::move(data.remainingBytes);
@@ -228,14 +270,12 @@ UcxDataAvailable UcxDestinationQueue::getAndClearNotify() {
 
 void UcxDestinationQueue::clearNotify() {
   notify_ = nullptr;
-  notifyV2_ = nullptr;
   notifySequence_ = 0;
   notifyMaxBytes_ = 0;
 }
 
 void UcxDestinationQueue::finish() {
   VELOX_CHECK_NULL(notify_, "notify must be cleared before finish");
-  VELOX_CHECK_NULL(notifyV2_, "V2 notify must be cleared before finish");
   VELOX_CHECK(queue_.empty(), "data must be fetched before finish");
 }
 
@@ -247,7 +287,6 @@ std::string UcxDestinationQueue::toString() {
   std::stringstream out;
   out << "[available: " << queue_.size() << ", "
       << "sequence: " << sequence_ << ", "
-      << (notifyV2_ ? "notifyV2 registered, " : "")
       << (notify_ ? "notify registered, " : "") << this << "]";
   return out.str();
 }
@@ -289,6 +328,10 @@ bool UcxOutputQueue::initialize(
   task_ = task;
   maxSize_ = task_->queryCtx()->queryConfig().maxOutputBufferSize();
   continueSize_ = (maxSize_ * kContinuePct) / 100;
+  if (hostSpooling_) {
+    hostSpoolMaxSize_ = std::max(hostSpoolMaxSize_, maxSize_);
+    hostSpoolContinueSize_ = (hostSpoolMaxSize_ * kContinuePct) / 100;
+  }
   // Publish task metadata before destination queue expansion. Acceptor only
   // needs task/kind to choose the intra-node path; getData() takes mutex_ and
   // waits for any queue expansion in this function to finish.
@@ -324,17 +367,48 @@ void UcxOutputQueue::enqueue(
   VELOX_CHECK_NOT_NULL(task_);
   VELOX_CHECK(
       task_->isRunning(), "Task is terminated, cannot add data to output.");
-  std::vector<UcxDataAvailable> dataAvailableCallbacks;
+
+  bool hostSpooling = false;
   {
     std::lock_guard<std::mutex> l(mutex_);
-    auto numBytes = data->gpu_data->size();
-    auto sharedData = std::shared_ptr<cudf::packed_columns>(std::move(data));
+    VELOX_CHECK_GE(destination, 0);
+    VELOX_CHECK_LT(destination, queues_.size());
+    hostSpooling = hostSpooling_;
+  }
 
+  const auto numBytes = static_cast<int64_t>(data->gpu_data->size());
+  auto transfer = std::make_shared<UcxTransferData>();
+  if (hostSpooling) {
+    VELOX_CHECK_NE(
+        kind_,
+        core::PartitionedOutputNode::Kind::kBroadcast,
+        "Host spooling is only supported for partitioned output");
+    transfer->metadata =
+        std::shared_ptr<std::vector<uint8_t>>(std::move(data->metadata));
+    auto* hostStaging = pinnedScratch.ensure(static_cast<size_t>(numBytes));
+    const auto stream = data->gpu_data->stream();
+    CUDF_CUDA_TRY(cudaStreamSynchronize(stream.value()));
+    CUDF_CUDA_TRY(cudaMemcpy(
+        hostStaging, data->gpu_data->data(), numBytes, cudaMemcpyDeviceToHost));
+    transfer->hostData =
+        std::make_shared<std::vector<uint8_t>>(static_cast<size_t>(numBytes));
+    std::memcpy(transfer->hostData->data(), hostStaging, numBytes);
+    data.reset();
+  } else {
+    transfer->deviceData =
+        std::shared_ptr<cudf::packed_columns>(std::move(data));
+  }
+  const auto hostResidentBytes = transfer->hostResidentSize();
+
+  std::vector<UcxDataAvailable> dataAvailableCallbacks;
+  bool trimHostAllocator = false;
+  {
+    std::lock_guard<std::mutex> l(mutex_);
     bool success = false;
     if (kind_ == core::PartitionedOutputNode::Kind::kBroadcast) {
       VELOX_CHECK_EQ(destination, 0, "Broadcast uses destination 0");
       enqueueBroadcastOutputLocked(
-          std::move(sharedData), dataAvailableCallbacks);
+          transfer->deviceData, dataAvailableCallbacks);
       // For broadcast, count queuedBytes_ once per active destination so
       // that each destination's dequeue symmetrically decrements it. The
       // total sent stats count the logical data once.
@@ -346,6 +420,7 @@ void UcxOutputQueue::enqueue(
       }
       updateTotalQueuedBytesMsLocked();
       queuedBytes_ += numBytes * numActive;
+      deviceQueuedBytes_ += numBytes * numActive;
       queuedPackedColumns_ += numActive;
       totalBytesSent_ += numBytes;
       totalRowsSent_ += numRows;
@@ -354,9 +429,34 @@ void UcxOutputQueue::enqueue(
     } else {
       VELOX_CHECK_LT(destination, queues_.size());
       success = enqueuePartitionedOutputLocked(
-          destination, std::move(sharedData), dataAvailableCallbacks);
+          destination, std::move(transfer), dataAvailableCallbacks);
       if (success) {
-        updateStatsWithEnqueuedLocked(numBytes, numRows);
+        updateStatsWithEnqueuedLocked(
+            numBytes,
+            hostSpooling ? hostResidentBytes : numBytes,
+            hostSpooling ? 0 : numBytes,
+            numRows);
+        if (hostSpooling) {
+          hostSpooledBytes_ += numBytes;
+          hostSpoolPeakBytes_ =
+              std::max(hostSpoolPeakBytes_, hostSpooledBytes_);
+          hostSpoolResidentBytes_ += hostResidentBytes;
+          hostSpoolPeakResidentBytes_ =
+              std::max(hostSpoolPeakResidentBytes_, hostSpoolResidentBytes_);
+          const auto currentGiB = hostSpooledBytes_ >> 30;
+          const auto previousGiB = (hostSpooledBytes_ - numBytes) >> 30;
+          if (currentGiB != previousGiB) {
+            trimHostAllocator = true;
+            LOG(WARNING) << "CUDF_UCX_HOST_SPOOL task=" << task_->taskId()
+                         << " event=enqueue hostQueuedBytes="
+                         << hostSpooledBytes_
+                         << " hostPeakBytes=" << hostSpoolPeakBytes_
+                         << " hostResidentBytes=" << hostSpoolResidentBytes_
+                         << " hostPeakResidentBytes="
+                         << hostSpoolPeakResidentBytes_
+                         << " packedColumns=" << queuedPackedColumns_;
+          }
+        }
       }
     }
   }
@@ -364,14 +464,42 @@ void UcxOutputQueue::enqueue(
   for (auto& callback : dataAvailableCallbacks) {
     callback.notify();
   }
+  if (trimHostAllocator) {
+    malloc_trim(0);
+  }
+}
+
+void UcxOutputQueue::enableHostSpooling() {
+  std::lock_guard<std::mutex> l(mutex_);
+  VELOX_CHECK_EQ(
+      queuedPackedColumns_, 0, "Host spooling must be enabled before enqueue");
+  VELOX_CHECK_NE(
+      kind_,
+      core::PartitionedOutputNode::Kind::kBroadcast,
+      "Host spooling is not supported for broadcast output");
+  if (hostSpooling_) {
+    return;
+  }
+  hostSpooling_ = true;
+  hostSpoolMaxSize_ =
+      std::max<uint64_t>(maxSize_, configuredHostSpoolMaxBytes());
+  hostSpoolContinueSize_ = (hostSpoolMaxSize_ * kContinuePct) / 100;
+  LOG(WARNING) << "CUDF_UCX_HOST_SPOOL task="
+               << (task_ ? task_->taskId() : "pending")
+               << " event=enabled hostMaxBytes=" << hostSpoolMaxSize_
+               << " deviceMaxBytes=" << maxSize_;
 }
 
 bool UcxOutputQueue::checkBlocked(ContinueFuture* future) {
   std::lock_guard<std::mutex> l(mutex_);
-  if (queuedBytes_ >= maxSize_ && future) {
+  const bool deviceBlocked = deviceQueuedBytes_ >= maxSize_;
+  const bool hostBlocked = hostSpooling_ && queuedBytes_ >= hostSpoolMaxSize_;
+  if ((deviceBlocked || hostBlocked) && future) {
     VLOG(2) << "[BACKPRESSURE] task=" << (task_ ? task_->taskId() : "n/a")
             << " BLOCKED queuedBytes=" << queuedBytes_
-            << " maxSize=" << maxSize_
+            << " hostMaxSize=" << hostSpoolMaxSize_
+            << " deviceQueuedBytes=" << deviceQueuedBytes_
+            << " deviceMaxSize=" << maxSize_
             << " waitingProducers=" << (promises_.size() + 1);
     promises_.emplace_back("UcxOutputQueue::checkBlocked");
     *future = promises_.back().getSemiFuture();
@@ -381,68 +509,21 @@ bool UcxOutputQueue::checkBlocked(ContinueFuture* future) {
 }
 
 void UcxOutputQueue::getData(int destination, UcxDataAvailableCallback notify) {
-  UcxDestinationQueue::Data data;
-  std::vector<ContinuePromise> promises;
-  {
-    std::lock_guard<std::mutex> l(mutex_);
-    // If the queue doesn't exist yet, create an empty queue to store
-    // the notify callback. The queue will eventually be initialized when
-    // the task is being created.
-    for (int i = queues_.size(); i <= destination; ++i) {
-      // create the destination queues inside the vector using emplace_back.
-      queues_.emplace_back(std::make_unique<UcxDestinationQueue>());
-    }
-    auto* queue = queues_[destination].get();
-    // queue can be nullptr here if the task has terminated and results
-    // have been removed. In this case, no data is returned.
-    if (queue) {
-      // Capture weak_ptr instead of raw `this` to prevent use-after-free.
-      // The callback fires outside the lock (from enqueue() or terminate()),
-      // and concurrent removeTask() can destroy the UcxOutputQueue while
-      // the callback is still executing.
-      std::weak_ptr<UcxOutputQueue> weakSelf = shared_from_this();
-      data = queue->getData([notify, weakSelf](
-                                std::shared_ptr<cudf::packed_columns> data,
-                                std::vector<int64_t> remainingBytes) {
-        std::vector<ContinuePromise> promises;
-        int64_t bytes = data ? data->gpu_data->size() : -1L;
-        notify(std::move(data), std::move(remainingBytes));
-        if (bytes >= 0L) {
-          auto self = weakSelf.lock();
-          if (!self) {
-            // Queue was destroyed by removeTask(), safe to skip stats update.
-            return;
-          }
-          std::lock_guard<std::mutex> l(self->mutex_);
-          self->updateStatsWithFreedLocked(bytes, 1L, promises);
-        }
-        // outside of lock:
-        // wake up any producers that are waiting for queue to become less full.
-        for (auto& promise : promises) {
-          promise.setValue();
-        }
+  getTransferData(
+      destination,
+      std::numeric_limits<uint64_t>::max(),
+      -1,
+      [notify = std::move(notify)](
+          std::shared_ptr<UcxTransferData> data,
+          int64_t /*sequence*/,
+          std::vector<int64_t> remainingBytes) mutable {
+        VELOX_CHECK(
+            data == nullptr || data->deviceData != nullptr,
+            "Legacy UCX queue fetch cannot consume host-spooled data");
+        notify(
+            data == nullptr ? nullptr : data->deviceData,
+            std::move(remainingBytes));
       });
-      if (data.data) {
-        // This implies data.immediate and no notify upcall will be done.
-        // Need to update the stats here.
-        updateStatsWithFreedLocked(data.data->gpu_data->size(), 1L, promises);
-      }
-    } else {
-      data = UcxDestinationQueue::Data{nullptr, 0, {}, true};
-    }
-  }
-  // outside lock: If we have data, then return it immediately.
-  if (data.immediate) {
-    notify(std::move(data.data), std::move(data.remainingBytes));
-  } else {
-    VLOG(2) << "[QUEUE] task=" << (task_ ? task_->taskId() : "n/a")
-            << " dest=" << destination
-            << " server waiting for data (callback installed)";
-  }
-  // wake up any producers that are waiting for queue to become less full.
-  for (auto& promise : promises) {
-    promise.setValue();
-  }
 }
 
 void UcxOutputQueue::getData(
@@ -450,6 +531,29 @@ void UcxOutputQueue::getData(
     uint64_t maxBytes,
     int64_t sequence,
     UcxDataAvailableCallbackV2 notify) {
+  getTransferData(
+      destination,
+      maxBytes,
+      sequence,
+      [notify = std::move(notify)](
+          std::shared_ptr<UcxTransferData> data,
+          int64_t sequence,
+          std::vector<int64_t> remainingBytes) mutable {
+        VELOX_CHECK(
+            data == nullptr || data->deviceData != nullptr,
+            "Legacy UCX queue fetch cannot consume host-spooled data");
+        notify(
+            data == nullptr ? nullptr : data->deviceData,
+            sequence,
+            std::move(remainingBytes));
+      });
+}
+
+void UcxOutputQueue::getTransferData(
+    int destination,
+    uint64_t maxBytes,
+    int64_t sequence,
+    UcxTransferDataAvailableCallback notify) {
   UcxDestinationQueue::Data data;
   std::vector<ContinuePromise> promises;
   {
@@ -460,30 +564,55 @@ void UcxOutputQueue::getData(
     auto* queue = queues_[destination].get();
     if (queue) {
       std::weak_ptr<UcxOutputQueue> weakSelf = shared_from_this();
-      data = queue->getData(
-          maxBytes,
-          sequence,
-          [notify, weakSelf](
-              std::shared_ptr<cudf::packed_columns> data,
-              int64_t sequence,
-              std::vector<int64_t> remainingBytes) {
-            std::vector<ContinuePromise> promises;
-            int64_t bytes = data ? data->gpu_data->size() : -1L;
-            notify(std::move(data), sequence, std::move(remainingBytes));
-            if (bytes >= 0L) {
-              auto self = weakSelf.lock();
-              if (!self) {
-                return;
-              }
-              std::lock_guard<std::mutex> l(self->mutex_);
-              self->updateStatsWithFreedLocked(bytes, 1L, promises);
-            }
-            for (auto& promise : promises) {
-              promise.setValue();
-            }
-          });
+      auto callback = [notify, weakSelf](
+                          std::shared_ptr<UcxTransferData> data,
+                          int64_t sequence,
+                          std::vector<int64_t> remainingBytes) {
+        std::vector<ContinuePromise> promises;
+        int64_t bytes = data ? data->size() : -1L;
+        int64_t backpressureBytes = data ? data->backpressureSize() : -1L;
+        const bool hostStaged = data && data->isHostStaged();
+        const int64_t hostResidentBytes =
+            hostStaged ? data->hostResidentSize() : 0;
+        notify(std::move(data), sequence, std::move(remainingBytes));
+        if (bytes >= 0L) {
+          auto self = weakSelf.lock();
+          if (!self) {
+            return;
+          }
+          std::lock_guard<std::mutex> l(self->mutex_);
+          self->updateStatsWithFreedLocked(
+              backpressureBytes,
+              hostStaged ? 0 : backpressureBytes,
+              1L,
+              promises);
+          if (hostStaged) {
+            self->hostSpooledBytes_ -= bytes;
+            VELOX_CHECK_GE(self->hostSpooledBytes_, 0);
+            self->hostSpoolResidentBytes_ -= hostResidentBytes;
+            VELOX_CHECK_GE(self->hostSpoolResidentBytes_, 0);
+          }
+        }
+        for (auto& promise : promises) {
+          promise.setValue();
+        }
+      };
+      data = sequence < 0
+          ? queue->getData(std::move(callback))
+          : queue->getData(maxBytes, sequence, std::move(callback));
       if (data.data) {
-        updateStatsWithFreedLocked(data.data->gpu_data->size(), 1L, promises);
+        const auto bytes = data.data->size();
+        updateStatsWithFreedLocked(
+            data.data->backpressureSize(),
+            data.data->isHostStaged() ? 0 : data.data->backpressureSize(),
+            1L,
+            promises);
+        if (data.data->isHostStaged()) {
+          hostSpooledBytes_ -= bytes;
+          VELOX_CHECK_GE(hostSpooledBytes_, 0);
+          hostSpoolResidentBytes_ -= data.data->hostResidentSize();
+          VELOX_CHECK_GE(hostSpoolResidentBytes_, 0);
+        }
       }
     } else {
       data = UcxDestinationQueue::Data{nullptr, sequence, {}, true};
@@ -536,6 +665,17 @@ void UcxOutputQueue::checkIfDone(bool oneDriverFinished) {
               << " chunks=" << totalPackedColumnsSent_
               << " avgRowsPerChunk=" << avgRows
               << " totalBytes=" << totalBytesSent_;
+      if (hostSpooling_) {
+        LOG(WARNING) << "CUDF_UCX_HOST_SPOOL task="
+                     << (task_ ? task_->taskId() : "n/a")
+                     << " event=producer_finished"
+                     << " hostQueuedBytes=" << hostSpooledBytes_
+                     << " hostPeakBytes=" << hostSpoolPeakBytes_
+                     << " hostResidentBytes=" << hostSpoolResidentBytes_
+                     << " hostPeakResidentBytes=" << hostSpoolPeakResidentBytes_
+                     << " totalBytes=" << totalBytesSent_
+                     << " packedColumns=" << totalPackedColumnsSent_;
+      }
     }
     for (auto& queue : queues_) {
       if (queue != nullptr) {
@@ -552,7 +692,7 @@ void UcxOutputQueue::checkIfDone(bool oneDriverFinished) {
 
 bool UcxOutputQueue::enqueuePartitionedOutputLocked(
     int destination,
-    std::shared_ptr<cudf::packed_columns> data,
+    std::shared_ptr<UcxTransferData> data,
     std::vector<UcxDataAvailable>& dataAvailableCbs) {
   VELOX_DCHECK(dataAvailableCbs.empty());
   VELOX_CHECK_LT(destination, queues_.size());
@@ -571,9 +711,11 @@ void UcxOutputQueue::enqueueBroadcastOutputLocked(
     std::vector<UcxDataAvailable>& dataAvailableCbs) {
   VELOX_DCHECK(dataAvailableCbs.empty());
 
+  auto transfer = std::make_shared<UcxTransferData>();
+  transfer->deviceData = data;
   for (auto& queue : queues_) {
     if (queue != nullptr) {
-      queue->enqueueBack(data);
+      queue->enqueueBack(transfer);
       dataAvailableCbs.emplace_back(queue->getAndClearNotify());
     }
   }
@@ -626,10 +768,13 @@ void UcxOutputQueue::updateOutputBuffers(int numBuffers, bool noMoreBuffers) {
       for (int32_t i = 0; i < numNewBuffers; ++i) {
         auto buffer = std::make_unique<UcxDestinationQueue>();
         for (const auto& data : dataToBroadcast_) {
-          buffer->enqueueBack(data);
+          auto transfer = std::make_shared<UcxTransferData>();
+          transfer->deviceData = data;
+          buffer->enqueueBack(std::move(transfer));
           // Account for backfilled data in queuedBytes_ so that dequeue
           // decrements don't drive it negative.
           queuedBytes_ += data->gpu_data->size();
+          deviceQueuedBytes_ += data->gpu_data->size();
           queuedPackedColumns_++;
         }
         if (atEnd_) {
@@ -670,7 +815,8 @@ void UcxOutputQueue::deleteResults(int destination) {
       return;
     }
     // remember destination queue fill stats
-    int64_t bytes = queue->stats().bytesQueued;
+    int64_t bytes = queue->stats().backpressureBytesQueued;
+    int64_t deviceBytes = queue->stats().deviceBytesQueued;
     int64_t packedCols = queue->stats().packedColumnsQueued;
     dataAvailable = queue->deleteResults();
     queue->finish();
@@ -678,7 +824,7 @@ void UcxOutputQueue::deleteResults(int destination) {
     isFinished = isFinishedLocked();
     // update UcxOutputQueue stats
     if (bytes > 0 || packedCols > 0) {
-      updateStatsWithFreedLocked(bytes, packedCols, promises);
+      updateStatsWithFreedLocked(bytes, deviceBytes, packedCols, promises);
     } else {
       promises = std::move(promises_);
     }
@@ -751,41 +897,52 @@ exec::OutputBuffer::Stats UcxOutputQueue::stats() {
 }
 
 void UcxOutputQueue::updateStatsWithEnqueuedLocked(
-    int64_t bytes,
+    int64_t logicalBytes,
+    int64_t backpressureBytes,
+    int64_t deviceBytes,
     int64_t rows) {
   updateTotalQueuedBytesMsLocked();
 
-  queuedBytes_ += bytes;
+  queuedBytes_ += backpressureBytes;
+  deviceQueuedBytes_ += deviceBytes;
   queuedPackedColumns_++;
 
-  totalBytesSent_ += bytes;
+  totalBytesSent_ += logicalBytes;
   totalRowsSent_ += rows;
   totalPackedColumnsSent_++;
-  updateDiagnosticGlobalQueue(bytes, 1, "enqueue", task_);
+  updateDiagnosticGlobalQueue(backpressureBytes, 1, "enqueue", task_);
   logDeviceQueueResidencyLocked("enqueue");
 }
 
 void UcxOutputQueue::updateStatsWithFreedLocked(
     int64_t bytes,
+    int64_t deviceBytes,
     int64_t numPackedCols,
     std::vector<ContinuePromise>& promises) {
   updateTotalQueuedBytesMsLocked();
 
   queuedBytes_ -= bytes;
+  deviceQueuedBytes_ -= deviceBytes;
   queuedPackedColumns_ -= numPackedCols;
 
   VELOX_CHECK_GE(queuedBytes_, 0);
+  VELOX_CHECK_GE(deviceQueuedBytes_, 0);
   VELOX_CHECK_GE(queuedPackedColumns_, 0);
   updateDiagnosticGlobalQueue(-bytes, -numPackedCols, "dequeue", task_);
   logDeviceQueueResidencyLocked("dequeue");
 
   // Check whether queue is below low-water mark and return outstanding
   // promises
-  if (queuedBytes_ <= continueSize_ && !promises_.empty()) {
+  const bool belowDeviceLowWater = deviceQueuedBytes_ <= continueSize_;
+  const bool belowHostLowWater =
+      !hostSpooling_ || queuedBytes_ <= hostSpoolContinueSize_;
+  if (belowDeviceLowWater && belowHostLowWater && !promises_.empty()) {
     VLOG(2) << "[BACKPRESSURE] task=" << (task_ ? task_->taskId() : "n/a")
             << " UNBLOCKING " << promises_.size() << " producers"
             << " queuedBytes=" << queuedBytes_
-            << " continueSize=" << continueSize_;
+            << " hostContinueSize=" << hostSpoolContinueSize_
+            << " deviceQueuedBytes=" << deviceQueuedBytes_
+            << " deviceContinueSize=" << continueSize_;
     promises = std::move(promises_);
   }
 }
@@ -803,6 +960,7 @@ void UcxOutputQueue::logDeviceQueueResidencyLocked(const char* event) {
   LOG(WARNING) << "CUDF_DEVICE_QUEUE event=" << event
                << " task=" << (task_ ? task_->taskId() : "n/a")
                << " queuedBytes=" << queuedBytes_
+               << " deviceQueuedBytes=" << deviceQueuedBytes_
                << " queuedPackedColumns=" << queuedPackedColumns_
                << " maxSize=" << maxSize_ << " continueSize=" << continueSize_;
 }

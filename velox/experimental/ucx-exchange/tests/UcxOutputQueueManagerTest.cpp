@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #include "velox/experimental/ucx-exchange/UcxOutputQueueManager.h"
+
 #include <cudf/column/column_factories.hpp>
 #include <cudf/contiguous_split.hpp>
 #include <cudf/table/table.hpp>
@@ -22,8 +23,11 @@
 #include <folly/synchronization/EventCount.h>
 #include <gtest/gtest.h>
 #include <rmm/device_buffer.hpp>
+#include <cstdlib>
 #include <limits>
 #include <memory>
+#include <optional>
+#include <string>
 #include <vector>
 #include "velox/common/memory/MemoryPool.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
@@ -34,6 +38,30 @@ using namespace facebook::velox::ucx_exchange;
 using namespace facebook::velox;
 using namespace facebook::velox::exec;
 using namespace facebook::velox::core;
+
+namespace {
+class ScopedEnvironment {
+ public:
+  ScopedEnvironment(const char* name, const char* value) : name_(name) {
+    if (const auto* previous = std::getenv(name)) {
+      previous_ = previous;
+    }
+    setenv(name, value, 1);
+  }
+
+  ~ScopedEnvironment() {
+    if (previous_.has_value()) {
+      setenv(name_.c_str(), previous_->c_str(), 1);
+    } else {
+      unsetenv(name_.c_str());
+    }
+  }
+
+ private:
+  std::string name_;
+  std::optional<std::string> previous_;
+};
+} // namespace
 
 class UcxOutputQueueManagerTest : public testing::Test {
  protected:
@@ -54,12 +82,14 @@ class UcxOutputQueueManagerTest : public testing::Test {
       int numDrivers,
       bool cleanup = true,
       core::PartitionedOutputNode::Kind kind =
-          core::PartitionedOutputNode::Kind::kPartitioned) {
+          core::PartitionedOutputNode::Kind::kPartitioned,
+      uint64_t maxOutputBufferSize = FOUR_GBYTES) {
     if (cleanup) {
       queueManager_->removeTask(taskId);
     }
 
-    auto task = createSourceTask(taskId, pool_, UcxTestData::kTestRowType);
+    auto task = createSourceTask(
+        taskId, pool_, UcxTestData::kTestRowType, maxOutputBufferSize);
 
     queueManager_->initializeTask(task, kind, numDestinations, numDrivers);
     return task;
@@ -339,6 +369,172 @@ TEST_F(UcxOutputQueueManagerTest, basicPartitioned) {
 
   queueManager_->removeTask(taskId);
   EXPECT_TRUE(task->isFinished());
+}
+
+TEST_F(UcxOutputQueueManagerTest, hostSpoolingReleasesQueuedDevicePayload) {
+  const std::string taskId = "hostSpooling";
+  constexpr int32_t numRows = 100;
+  queueManager_->removeTask(taskId);
+  queueManager_->enableHostSpooling(taskId);
+  auto task = initializeTask(
+      taskId, 2 /* numDestinations*/, 1 /*numDrivers*/, false /*cleanup*/);
+
+  auto packed = makePackedColumns(numRows);
+  const auto expectedBytes = packed->gpu_data->size();
+  queueManager_->enqueue(taskId, 1, std::move(packed), numRows);
+
+  bool received = false;
+  queueManager_->getTransferData(
+      taskId,
+      1,
+      std::numeric_limits<uint64_t>::max(),
+      0,
+      [&](std::shared_ptr<UcxTransferData> data,
+          int64_t sequence,
+          std::vector<int64_t> remainingBytes) {
+        ASSERT_NE(data, nullptr);
+        EXPECT_EQ(sequence, 0);
+        EXPECT_TRUE(remainingBytes.empty());
+        EXPECT_TRUE(data->isHostStaged());
+        EXPECT_EQ(data->deviceData, nullptr);
+        ASSERT_NE(data->hostData, nullptr);
+        ASSERT_NE(data->metadata, nullptr);
+        EXPECT_EQ(data->size(), expectedBytes);
+
+        auto deviceBuffer = std::make_unique<rmm::device_buffer>(
+            expectedBytes, rmm::cuda_stream_default);
+        CUDF_CUDA_TRY(cudaMemcpy(
+            deviceBuffer->data(),
+            data->hostData->data(),
+            expectedBytes,
+            cudaMemcpyHostToDevice));
+        auto metadata = std::make_unique<std::vector<uint8_t>>(*data->metadata);
+        cudf::packed_columns restored(
+            std::move(metadata), std::move(deviceBuffer));
+        EXPECT_EQ(cudf::unpack(restored).num_rows(), numRows);
+        received = true;
+      });
+  EXPECT_TRUE(received);
+
+  noMoreData(taskId);
+  fetchEndMarker(taskId, 0);
+  fetchEndMarker(taskId, 1);
+  queueManager_->removeTask(taskId);
+  EXPECT_TRUE(task->isFinished());
+}
+
+TEST_F(UcxOutputQueueManagerTest, hostSpoolingSupportsCapacityOverride) {
+  ScopedEnvironment maxBytes{"GLUTEN_UCX_HOST_SPOOL_MAX_BYTES", "1073741824"};
+  const std::string taskId = "hostSpoolingCapacityOverride";
+  constexpr int32_t numRows = 1'000;
+  auto packed = makePackedColumns(numRows);
+  const auto logicalBytes = packed->gpu_data->size();
+  const auto maxOutputBufferSize = logicalBytes - 1;
+
+  queueManager_->removeTask(taskId);
+  queueManager_->enableHostSpooling(taskId);
+  auto task = initializeTask(
+      taskId,
+      1,
+      1,
+      false,
+      core::PartitionedOutputNode::Kind::kPartitioned,
+      maxOutputBufferSize);
+  queueManager_->enqueue(taskId, 0, std::move(packed), numRows);
+
+  ContinueFuture future;
+  EXPECT_FALSE(queueManager_->checkBlocked(taskId, &future));
+  bool received = false;
+  queueManager_->getTransferData(
+      taskId,
+      0,
+      std::numeric_limits<uint64_t>::max(),
+      0,
+      [&](std::shared_ptr<UcxTransferData> data,
+          int64_t sequence,
+          std::vector<int64_t> remainingBytes) {
+        ASSERT_NE(data, nullptr);
+        EXPECT_EQ(sequence, 0);
+        EXPECT_TRUE(remainingBytes.empty());
+        EXPECT_EQ(data->hostData->size(), logicalBytes);
+        received = true;
+      });
+  EXPECT_TRUE(received);
+
+  noMoreData(taskId);
+  fetchEndMarker(taskId, 0);
+  queueManager_->removeTask(taskId);
+  EXPECT_TRUE(task->isFinished());
+}
+
+TEST_F(UcxOutputQueueManagerTest, hostSpoolingBackpressureUsesResidentBytes) {
+  ScopedEnvironment maxBytes{"GLUTEN_UCX_HOST_SPOOL_MAX_BYTES", "1073741824"};
+  const std::string hostTaskId = "hostSpoolingBackpressure";
+  constexpr int32_t numRows = 1000;
+  auto packed = makePackedColumns(numRows);
+  const auto logicalBytes = packed->gpu_data->size();
+  const auto maxOutputBufferSize = logicalBytes - 1;
+
+  queueManager_->removeTask(hostTaskId);
+  queueManager_->enableHostSpooling(hostTaskId);
+  auto hostTask = initializeTask(
+      hostTaskId,
+      1,
+      1,
+      false,
+      core::PartitionedOutputNode::Kind::kPartitioned,
+      maxOutputBufferSize);
+  queueManager_->enqueue(hostTaskId, 0, std::move(packed), numRows);
+
+  ContinueFuture hostFuture;
+  EXPECT_FALSE(queueManager_->checkBlocked(hostTaskId, &hostFuture));
+  auto hostStats = queueManager_->stats(hostTaskId);
+  ASSERT_TRUE(hostStats.has_value());
+  EXPECT_GT(hostStats->bufferedBytes, logicalBytes);
+  EXPECT_EQ(hostStats->totalBytesSent, logicalBytes);
+
+  bool received = false;
+  std::shared_ptr<UcxTransferData> response;
+  queueManager_->getTransferData(
+      hostTaskId,
+      0,
+      std::numeric_limits<uint64_t>::max(),
+      0,
+      [&](std::shared_ptr<UcxTransferData> data,
+          int64_t sequence,
+          std::vector<int64_t> remainingBytes) {
+        received = true;
+        EXPECT_EQ(sequence, 0);
+        EXPECT_TRUE(remainingBytes.empty());
+        response = std::move(data);
+      });
+  EXPECT_TRUE(received);
+  ASSERT_NE(response, nullptr);
+  EXPECT_TRUE(response->isHostStaged());
+  EXPECT_EQ(response->size(), logicalBytes);
+  EXPECT_EQ(response->backpressureSize(), hostStats->bufferedBytes);
+  noMoreData(hostTaskId);
+  fetchEndMarker(hostTaskId, 0);
+  queueManager_->removeTask(hostTaskId);
+  EXPECT_TRUE(hostTask->isFinished());
+
+  const std::string deviceTaskId = "deviceBackpressure";
+  auto deviceTask = initializeTask(
+      deviceTaskId,
+      1,
+      1,
+      true,
+      core::PartitionedOutputNode::Kind::kPartitioned,
+      maxOutputBufferSize);
+  queueManager_->enqueue(deviceTaskId, 0, makePackedColumns(numRows), numRows);
+  ContinueFuture deviceFuture;
+  EXPECT_TRUE(queueManager_->checkBlocked(deviceTaskId, &deviceFuture));
+  fetch(deviceTaskId, 0);
+  deviceFuture.wait();
+  noMoreData(deviceTaskId);
+  fetchEndMarker(deviceTaskId, 0);
+  queueManager_->removeTask(deviceTaskId);
+  EXPECT_TRUE(deviceTask->isFinished());
 }
 
 TEST_F(UcxOutputQueueManagerTest, v1RepeatedFetchAdvancesQueue) {
@@ -844,6 +1040,39 @@ TEST_F(UcxOutputQueueManagerTest, broadcastBasic) {
 
   EXPECT_TRUE(queueManager_->isFinished(taskId));
   queueManager_->removeTask(taskId);
+}
+
+TEST_F(UcxOutputQueueManagerTest, broadcastDeviceBackpressureAccounting) {
+  const vector_size_t size = 100;
+  const std::string taskId = "broadcastDeviceBackpressure";
+  constexpr int numDestinations = 3;
+  auto packed = makePackedColumns(size);
+  const auto bytes = packed->gpu_data->size();
+
+  auto task = initializeTask(
+      taskId,
+      numDestinations,
+      1 /* numDrivers */,
+      true /* cleanup */,
+      core::PartitionedOutputNode::Kind::kBroadcast,
+      bytes * 2);
+  queueManager_->updateOutputBuffers(taskId, numDestinations, true);
+  queueManager_->enqueue(taskId, 0, std::move(packed), size);
+
+  ContinueFuture future;
+  EXPECT_TRUE(queueManager_->checkBlocked(taskId, &future));
+  fetch(taskId, 0);
+  EXPECT_FALSE(future.isReady());
+  fetch(taskId, 1);
+  future.wait();
+  fetch(taskId, 2);
+
+  noMoreData(taskId);
+  for (int destination = 0; destination < numDestinations; ++destination) {
+    fetchEndMarker(taskId, destination);
+  }
+  queueManager_->removeTask(taskId);
+  EXPECT_TRUE(task->isFinished());
 }
 
 // Broadcast: late destination receives backfilled data.

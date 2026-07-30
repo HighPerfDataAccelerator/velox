@@ -40,6 +40,8 @@ void UcxOutputQueueManager::initializeTask(
     int numDestinations,
     int numDrivers) {
   const auto& taskId = task->taskId();
+  const bool hostSpooling = hostSpoolingTasks_.withLock(
+      [&](const auto& tasks) { return tasks.count(taskId) != 0; });
   queues_.withLock([&](auto& queues) {
     auto it = queues.find(taskId);
     if (it == queues.end()) {
@@ -54,6 +56,9 @@ void UcxOutputQueueManager::initializeTask(
         VLOG(2) << "[QUEUE-MGR] task=" << taskId
                 << " initializeTask ignored (already initialized)";
       }
+    }
+    if (hostSpooling) {
+      queues[taskId]->enableHostSpooling();
     }
   });
   // Clear any stale "removed" state so that getData() calls after this
@@ -98,6 +103,14 @@ void UcxOutputQueueManager::enqueue(
     std::unique_ptr<cudf::packed_columns> txData,
     int numRows) {
   getQueue(taskId)->enqueue(destination, std::move(txData), numRows);
+}
+
+void UcxOutputQueueManager::enableHostSpooling(std::string_view taskId) {
+  const std::string taskIdStr{taskId};
+  hostSpoolingTasks_.withLock([&](auto& tasks) { tasks.emplace(taskIdStr); });
+  if (auto queue = getQueueIfExists(taskId)) {
+    queue->enableHostSpooling();
+  }
 }
 
 bool UcxOutputQueueManager::checkBlocked(
@@ -200,6 +213,37 @@ void UcxOutputQueueManager::getData(
   outputQueue->getData(destination, maxBytes, sequence, notify);
 }
 
+void UcxOutputQueueManager::getTransferData(
+    std::string_view taskId,
+    int destination,
+    uint64_t maxBytes,
+    int64_t sequence,
+    UcxTransferDataAvailableCallback notify) {
+  std::shared_ptr<UcxOutputQueue> outputQueue;
+  bool taskRemoved = false;
+  std::string taskIdStr{taskId};
+  queues_.withLock([&](auto& queues) {
+    auto it = queues.find(taskIdStr);
+    if (it == queues.end()) {
+      if (removedTasks_.withLock(
+              [&](auto& removed) { return removed.count(taskIdStr) > 0; })) {
+        taskRemoved = true;
+        return;
+      }
+      outputQueue = std::make_shared<UcxOutputQueue>(nullptr, destination, 0);
+      queues[taskIdStr] = outputQueue;
+    } else {
+      outputQueue = it->second;
+    }
+  });
+  if (taskRemoved) {
+    notify(nullptr, sequence, {});
+    return;
+  }
+  outputQueue->getTransferData(
+      destination, maxBytes, sequence, std::move(notify));
+}
+
 bool UcxOutputQueueManager::canUseIntraNode(std::string_view taskId) {
   auto queue = getQueueIfExists(taskId);
   if (!queue) {
@@ -247,6 +291,7 @@ void UcxOutputQueueManager::removeTask(std::string_view taskId) {
   if (queue != nullptr) {
     queue->terminate();
   }
+  hostSpoolingTasks_.withLock([&](auto& tasks) { tasks.erase(taskIdStr); });
   // Notify the intra-node registry so that any sources polling for this
   // task get an atEnd result instead of spinning forever.
   IntraNodeTransferRegistry::getInstance()->cancelTask(taskId);

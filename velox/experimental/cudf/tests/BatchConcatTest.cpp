@@ -15,12 +15,17 @@
  */
 
 #include "velox/experimental/cudf/CudfConfig.h"
+#include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
+#include "velox/experimental/cudf/exec/Utilities.h"
+#include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 
 #include "velox/exec/PlanNodeStats.h"
 #include "velox/exec/tests/utils/AssertQueryBuilder.h"
 #include "velox/exec/tests/utils/OperatorTestBase.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
+
+#include <rmm/cuda_stream.hpp>
 
 using namespace facebook::velox;
 using namespace facebook::velox::exec;
@@ -36,7 +41,12 @@ class CudfBatchConcatTest : public OperatorTestBase {
   }
 
   void TearDown() override {
-    CudfConfig::getInstance().concatOptimizationEnabled = false;
+    auto& config = CudfConfig::getInstance();
+    config.concatOptimizationEnabled = false;
+    config.batchSizeMinThreshold = 100000;
+    config.batchSizeMaxThreshold = std::nullopt;
+    config.batchSizeMinThresholdBytes = 0;
+    config.batchConcatMaxBytes = 1ULL << 30;
     cudf_velox::unregisterCudf();
     OperatorTestBase::TearDown();
   }
@@ -44,11 +54,13 @@ class CudfBatchConcatTest : public OperatorTestBase {
   void updateCudfConfig(
       int32_t min,
       std::optional<int32_t> max,
-      uint64_t minBytes = 0) {
+      uint64_t minBytes = 0,
+      uint64_t maxConcatBytes = 1ULL << 30) {
     auto& config = CudfConfig::getInstance();
     config.batchSizeMinThreshold = min;
     config.batchSizeMaxThreshold = max;
     config.batchSizeMinThresholdBytes = minBytes;
+    config.batchConcatMaxBytes = maxConcatBytes;
   }
 
   template <typename T>
@@ -66,6 +78,30 @@ class CudfBatchConcatTest : public OperatorTestBase {
       sources.push_back(PlanBuilder(generator).values({vec}).planNode());
     }
     return PlanBuilder(generator).localPartitionRoundRobin(sources).planNode();
+  }
+
+  PlanNodeStats runGlobalAggregation(
+      const std::vector<RowVectorPtr>& vectors,
+      const std::string& aggregate,
+      const std::string& query) {
+    createDuckDbTable(vectors);
+    auto generator = std::make_shared<core::PlanNodeIdGenerator>();
+    core::PlanNodeId aggNodeId;
+    auto plan = PlanBuilder(generator)
+                    .addNode([&](auto, auto) {
+                      return createFragmentedSource(vectors, generator);
+                    })
+                    .singleAggregation({}, {aggregate})
+                    .capturePlanNodeId(aggNodeId)
+                    .planNode();
+    auto task = AssertQueryBuilder(duckDbQueryRunner_)
+                    .plan(plan)
+                    .maxDrivers(1)
+                    .assertResults(query);
+    auto planStats = toPlanStats(task->taskStats());
+    auto concatStats =
+        std::move(planStats.at(aggNodeId).operatorStats.at("CudfBatchConcat"));
+    return std::move(*concatStats);
   }
 };
 
@@ -151,6 +187,84 @@ TEST_F(CudfBatchConcatTest, concatFlushesAtByteThreshold) {
   EXPECT_EQ(concatStats.inputVectors, 6);
   EXPECT_GT(concatStats.outputVectors, 1);
   EXPECT_LT(concatStats.outputVectors, concatStats.inputVectors);
+}
+
+TEST_F(CudfBatchConcatTest, concatFastPathStaysSingleBatchBelowHardCap) {
+  updateCudfConfig(
+      /*min=*/100000,
+      /*max=*/std::nullopt,
+      /*minBytes=*/0,
+      /*maxConcatBytes=*/500);
+  CudfConfig::getInstance().concatOptimizationEnabled = true;
+
+  std::vector<RowVectorPtr> vectors;
+  for (int i = 0; i < 6; ++i) {
+    vectors.push_back(makeRowVector({makeFlatSequence<int64_t>(i * 10, 10)}));
+  }
+  const auto concatStats =
+      runGlobalAggregation(vectors, "sum(c0)", "SELECT sum(c0) FROM tmp");
+  EXPECT_EQ(concatStats.outputVectors, 1);
+  EXPECT_EQ(concatStats.customStats.at("concatenateCalls").sum, 1);
+  EXPECT_EQ(concatStats.customStats.at("maxConcatenateInputBytes").max, 480);
+  EXPECT_EQ(concatStats.customStats.at("hardByteCapFlushes").sum, 0);
+}
+
+TEST_F(CudfBatchConcatTest, concatFlushesBeforeNextInputExceedsHardCap) {
+  updateCudfConfig(
+      /*min=*/100000,
+      /*max=*/std::nullopt,
+      /*minBytes=*/0,
+      /*maxConcatBytes=*/200);
+  CudfConfig::getInstance().concatOptimizationEnabled = true;
+
+  std::vector<RowVectorPtr> vectors;
+  for (int i = 0; i < 6; ++i) {
+    vectors.push_back(makeRowVector({makeFlatSequence<int64_t>(i * 10, 10)}));
+  }
+  const auto concatStats =
+      runGlobalAggregation(vectors, "sum(c0)", "SELECT sum(c0) FROM tmp");
+  EXPECT_EQ(concatStats.inputVectors, 6);
+  EXPECT_EQ(concatStats.outputVectors, 3);
+  EXPECT_EQ(concatStats.customStats.at("concatenateCalls").sum, 3);
+  EXPECT_EQ(concatStats.customStats.at("maxConcatenateInputBytes").max, 160);
+  EXPECT_EQ(concatStats.customStats.at("hardByteCapFlushes").sum, 2);
+}
+
+TEST_F(CudfBatchConcatTest, concatHonorsRowAndByteLimitsTogether) {
+  updateCudfConfig(
+      /*min=*/30,
+      /*max=*/20,
+      /*minBytes=*/0,
+      /*maxConcatBytes=*/250);
+  CudfConfig::getInstance().concatOptimizationEnabled = true;
+
+  std::vector<RowVectorPtr> vectors;
+  for (int i = 0; i < 6; ++i) {
+    vectors.push_back(makeRowVector({makeFlatSequence<int64_t>(i * 10, 10)}));
+  }
+  const auto concatStats =
+      runGlobalAggregation(vectors, "sum(c0)", "SELECT sum(c0) FROM tmp");
+  EXPECT_EQ(concatStats.outputVectors, 4);
+  EXPECT_EQ(concatStats.customStats.at("concatenateCalls").sum, 4);
+  EXPECT_LE(concatStats.customStats.at("maxConcatenateInputBytes").max, 250);
+}
+
+TEST_F(CudfBatchConcatTest, oversizedInputIsPassedThroughWithoutConcatenate) {
+  updateCudfConfig(
+      /*min=*/100000,
+      /*max=*/std::nullopt,
+      /*minBytes=*/0,
+      /*maxConcatBytes=*/64);
+  CudfConfig::getInstance().concatOptimizationEnabled = true;
+
+  std::vector<RowVectorPtr> vectors{
+      makeRowVector({makeFlatSequence<int64_t>(0, 10)})};
+  const auto concatStats =
+      runGlobalAggregation(vectors, "sum(c0)", "SELECT sum(c0) FROM tmp");
+  EXPECT_EQ(concatStats.outputVectors, 1);
+  EXPECT_EQ(concatStats.customStats.at("concatenateCalls").sum, 0);
+  EXPECT_EQ(concatStats.customStats.at("oversizedInputPassthroughs").sum, 1);
+  EXPECT_EQ(concatStats.customStats.at("maxConcatenateInputBytes").max, 0);
 }
 
 // Verifies that CudfBatchConcat is not inserted when the optimization is
@@ -262,6 +376,163 @@ TEST_F(CudfBatchConcatTest, concatWithGroupedAggregation) {
   ASSERT_NE(concatIt, nodeStats.operatorStats.end());
   EXPECT_EQ(concatIt->second->inputVectors, 6);
   EXPECT_LT(concatIt->second->outputVectors, 6);
+}
+
+TEST_F(CudfBatchConcatTest, concatBoundsWideStringInputs) {
+  updateCudfConfig(
+      /*min=*/100000,
+      /*max=*/std::nullopt,
+      /*minBytes=*/0,
+      /*maxConcatBytes=*/1200);
+  CudfConfig::getInstance().concatOptimizationEnabled = true;
+
+  std::vector<RowVectorPtr> vectors;
+  for (int batch = 0; batch < 6; ++batch) {
+    vectors.push_back(makeRowVector(
+        {makeFlatSequence<int64_t>(batch * 4, 4),
+         makeFlatVector<std::string>(4, [batch](auto row) {
+           return std::string(128, static_cast<char>('a' + batch + row));
+         })}));
+  }
+  createDuckDbTable(vectors);
+
+  auto generator = std::make_shared<core::PlanNodeIdGenerator>();
+  core::PlanNodeId aggNodeId;
+  auto plan = PlanBuilder(generator)
+                  .addNode([&](auto, auto) {
+                    return createFragmentedSource(vectors, generator);
+                  })
+                  .singleAggregation({}, {"sum(c0)"})
+                  .capturePlanNodeId(aggNodeId)
+                  .planNode();
+
+  auto task = AssertQueryBuilder(duckDbQueryRunner_)
+                  .plan(plan)
+                  .maxDrivers(1)
+                  .assertResults("SELECT sum(c0) FROM tmp");
+
+  const auto planStats = toPlanStats(task->taskStats());
+  const auto& concatStats =
+      *planStats.at(aggNodeId).operatorStats.at("CudfBatchConcat");
+  EXPECT_EQ(concatStats.inputVectors, 6);
+  EXPECT_EQ(concatStats.outputVectors, 3);
+  EXPECT_EQ(concatStats.customStats.at("concatenateCalls").sum, 3);
+  EXPECT_LE(concatStats.customStats.at("maxConcatenateInputBytes").max, 1200);
+  EXPECT_GT(concatStats.customStats.at("hardByteCapFlushes").sum, 0);
+}
+
+TEST_F(CudfBatchConcatTest, concatSupportsNestedInputsBelowHardCap) {
+  updateCudfConfig(
+      /*min=*/100000,
+      /*max=*/std::nullopt,
+      /*minBytes=*/0,
+      /*maxConcatBytes=*/1 << 20);
+  CudfConfig::getInstance().concatOptimizationEnabled = true;
+
+  std::vector<RowVectorPtr> vectors;
+  for (int batch = 0; batch < 3; ++batch) {
+    vectors.push_back(makeRowVector(
+        {makeArrayVector<int64_t>(
+             {{batch, batch + 1}, {}, {batch + 2}, {batch + 3, batch + 4}}),
+         makeFlatSequence<int64_t>(batch * 4, 4)}));
+  }
+  createDuckDbTable(vectors);
+
+  auto generator = std::make_shared<core::PlanNodeIdGenerator>();
+  core::PlanNodeId aggNodeId;
+  auto plan = PlanBuilder(generator)
+                  .addNode([&](auto, auto) {
+                    return createFragmentedSource(vectors, generator);
+                  })
+                  .singleAggregation({}, {"sum(c1)"})
+                  .capturePlanNodeId(aggNodeId)
+                  .planNode();
+
+  auto task = AssertQueryBuilder(duckDbQueryRunner_)
+                  .plan(plan)
+                  .maxDrivers(1)
+                  .assertResults("SELECT sum(c1) FROM tmp");
+
+  const auto planStats = toPlanStats(task->taskStats());
+  const auto& concatStats =
+      *planStats.at(aggNodeId).operatorStats.at("CudfBatchConcat");
+  EXPECT_EQ(concatStats.outputVectors, 1);
+  EXPECT_EQ(concatStats.customStats.at("concatenateCalls").sum, 1);
+  EXPECT_LE(
+      concatStats.customStats.at("maxConcatenateInputBytes").max, 1 << 20);
+}
+
+TEST_F(CudfBatchConcatTest, concatJoinsInputStreamsAndPreservesOrder) {
+  auto inputType = ROW({"c0", "c1"}, {BIGINT(), VARCHAR()});
+  auto first = makeRowVector(
+      {"c0", "c1"},
+      {makeFlatVector<int64_t>({0, 1, 2, 3}),
+       makeFlatVector<std::string>({"s0", "s1", "s2", "s3"})});
+  auto second = makeRowVector(
+      {"c0", "c1"},
+      {makeFlatVector<int64_t>({4, 5, 6, 7}),
+       makeFlatVector<std::string>({"s4", "s5", "s6", "s7"})});
+  auto third = makeRowVector(
+      {"c0", "c1"},
+      {makeFlatVector<int64_t>({8, 9, 10, 11}),
+       makeFlatVector<std::string>({"s8", "s9", "s10", "s11"})});
+  auto expected = makeRowVector(
+      {"c0", "c1"},
+      {makeFlatSequence<int64_t>(0, 12),
+       makeFlatVector<std::string>(
+           {"s0",
+            "s1",
+            "s2",
+            "s3",
+            "s4",
+            "s5",
+            "s6",
+            "s7",
+            "s8",
+            "s9",
+            "s10",
+            "s11"})});
+
+  rmm::cuda_stream firstStream{rmm::cuda_stream::flags::non_blocking};
+  rmm::cuda_stream secondStream{rmm::cuda_stream::flags::non_blocking};
+  rmm::cuda_stream thirdStream{rmm::cuda_stream::flags::non_blocking};
+  rmm::cuda_stream outputStream{rmm::cuda_stream::flags::non_blocking};
+  ASSERT_NE(firstStream.value(), secondStream.value());
+  ASSERT_NE(secondStream.value(), thirdStream.value());
+  ASSERT_NE(thirdStream.value(), outputStream.value());
+
+  std::vector<CudfVectorPtr> inputs;
+  const auto addInput = [&](const RowVectorPtr& input, auto stream) {
+    auto table = with_arrow::toCudfTable(
+        input, pool(), stream, cudf_velox::get_output_mr());
+    inputs.push_back(std::make_shared<CudfVector>(
+        pool(), inputType, input->size(), std::move(table), stream));
+  };
+  addInput(first, firstStream.view());
+  addInput(second, secondStream.view());
+  addInput(third, thirdStream.view());
+
+  ConcatenateBatchStats stats;
+  auto outputs = getConcatenatedCudfVectorsBatched(
+      pool(),
+      std::move(inputs),
+      inputType,
+      outputStream.view(),
+      cudf_velox::get_output_mr(),
+      /*maxConcatBytes=*/1 << 20,
+      &stats);
+  ASSERT_EQ(outputs.size(), 1);
+  EXPECT_EQ(stats.concatenateCalls, 1);
+  EXPECT_LE(stats.maxInputBytes, 1 << 20);
+
+  auto result = with_arrow::toVeloxColumn(
+      outputs.front()->getTableView(),
+      pool(),
+      inputType,
+      outputStream.view(),
+      cudf_velox::get_output_mr());
+  outputStream.view().synchronize();
+  facebook::velox::test::assertEqualVectors(expected, result);
 }
 
 TEST_F(CudfBatchConcatTest, concatPreservesZeroColumnRowCountForCountStar) {

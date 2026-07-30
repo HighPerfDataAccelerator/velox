@@ -94,9 +94,7 @@ class CudfGroupby : public CudfOperatorBase {
 
   void initialize() override;
 
-  bool needsInput() const override {
-    return !noMoreInput_;
-  }
+  bool needsInput() const override;
 
   exec::BlockingReason isBlocked(ContinueFuture* /* unused */) override {
     return exec::BlockingReason::kNotBlocked;
@@ -147,6 +145,9 @@ class CudfGroupby : public CudfOperatorBase {
   void computeSingleGroupbyStreaming(CudfVectorPtr tbl);
 
   void addIntermediateAggregationRun(IntermediateAggregationRun run);
+  bool partialAggregationMemoryLimitReached() const;
+  void bufferIntermediateAggregationRunsForMemoryLimit(
+      uint64_t retainedInputRows);
   IntermediateAggregationRun mergeIntermediateAggregationRuns(
       IntermediateAggregationRun left,
       IntermediateAggregationRun right,
@@ -207,6 +208,7 @@ class CudfGroupby : public CudfOperatorBase {
   uint64_t intermediateBufferedBytes_{0};
   uint64_t intermediateInputRunCount_{0};
   uint64_t intermediateRunMergeCount_{0};
+  uint64_t inputRowsRetainedAfterFlush_{0};
 
   // Supported FINAL aggregates use cuDF's persistent hash state directly
   // across exchange pages. The choice is made from the first page and is never

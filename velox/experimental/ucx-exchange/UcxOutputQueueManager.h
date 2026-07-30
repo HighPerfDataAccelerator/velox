@@ -81,6 +81,10 @@ class UcxOutputQueueManager {
       std::unique_ptr<cudf::packed_columns> txData,
       int32_t numRows);
 
+  /// Marks a producer task for eager host materialization before it starts.
+  /// The marker is retained until initializeTask() creates its output queue.
+  void enableHostSpooling(std::string_view taskId);
+
   /// @brief Checks if the queue for a task is over capacity.
   /// Should be called after enqueueing all partitions for a batch.
   /// @param taskId The unique task Id.
@@ -119,6 +123,13 @@ class UcxOutputQueueManager {
       int64_t sequence,
       UcxDataAvailableCallbackV2 notify);
 
+  void getTransferData(
+      std::string_view taskId,
+      int destination,
+      uint64_t maxBytes,
+      int64_t sequence,
+      UcxTransferDataAvailableCallback notify);
+
   /// Returns true if the given task can use intra-node transfer.
   /// Returns false until the task queue is initialized. Initialized broadcast
   /// queues are safe because shared pages are cloned by UcxExchangeSource.
@@ -153,6 +164,9 @@ class UcxOutputQueueManager {
   // that exceed the placeholder's undersized queues_ vector.
   folly::Synchronized<std::unordered_set<std::string>, std::mutex>
       removedTasks_;
+
+  folly::Synchronized<std::unordered_set<std::string>, std::mutex>
+      hostSpoolingTasks_;
 };
 
 } // namespace facebook::velox::ucx_exchange

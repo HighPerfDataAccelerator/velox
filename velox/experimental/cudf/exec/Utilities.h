@@ -27,6 +27,11 @@
 
 namespace facebook::velox::cudf_velox {
 
+struct ConcatenateBatchStats {
+  uint64_t concatenateCalls{0};
+  uint64_t maxInputBytes{0};
+};
+
 // Concatenate a vector of cuDF tables into a single table
 [[nodiscard]] std::unique_ptr<cudf::table> concatenateTables(
     std::vector<std::unique_ptr<cudf::table>> tables,
@@ -62,12 +67,10 @@ namespace facebook::velox::cudf_velox {
  * @brief Concatenates multiple CUDF tables with automatic batching based on
  * size limits.
  *
- * This function concatenates a vector of CUDF tables while respecting size
- * limits imposed by cudf::size_type i.e. 32-bit signed integer. Unlike
- * getConcatenatedTable that returns a single concatenated table, this batched
- * version splits the concatenation into multiple output tables when the total
- * number of rows would exceeds ~2.1 billion, the maximum value representable by
- * cudf::size_type
+ * This function concatenates a vector of CUDF tables while respecting the row
+ * limit and, when maxConcatBytes is non-zero, an estimated-input-byte limit.
+ * A single input larger than maxConcatBytes is rejected so the caller can
+ * preserve it without a redundant device-to-device copy.
  *
  * The function is stream-safe and handles proper stream synchronization. All
  * input streams from individual tables are collected and joined on the provided
@@ -80,6 +83,9 @@ namespace facebook::velox::cudf_velox {
  * @param tableType Velox type representation for creating empty tables when
  * needed
  * @param stream CUDA stream for asynchronous operations and memory management
+ * @param maxConcatBytes Hard estimated input byte limit for each concatenate
+ * call, or zero to preserve row-only batching
+ * @param concatStats Optional concatenate-call observations
  * @return Vector of concatenated tables (multiple if input exceeded size
  * limits)
  *
@@ -89,7 +95,9 @@ getConcatenatedTableBatched(
     std::vector<CudfVectorPtr>&& tables,
     const TypePtr& tableType,
     rmm::cuda_stream_view stream,
-    rmm::device_async_resource_ref mr);
+    rmm::device_async_resource_ref mr,
+    uint64_t maxConcatBytes = 0,
+    ConcatenateBatchStats* concatStats = nullptr);
 
 /**
  * @brief Concatenates multiple CudfVectors into CudfVector output batches.
@@ -103,7 +111,9 @@ getConcatenatedTableBatched(
     std::vector<CudfVectorPtr>&& vectors,
     const TypePtr& tableType,
     rmm::cuda_stream_view stream,
-    rmm::device_async_resource_ref mr);
+    rmm::device_async_resource_ref mr,
+    uint64_t maxConcatBytes = 0,
+    ConcatenateBatchStats* concatStats = nullptr);
 
 /**
  * @brief Wrapper for CUDA events used for stream synchronization.
