@@ -282,8 +282,11 @@ class QueueSplitsStore : public SplitsStore {
       Split& split,
       ContinueFuture& future) override {
     if (!splits_.empty()) {
-      split = getSplit(maxPreloadSplits, preload);
-      return true;
+      if (getSplit(maxPreloadSplits, preload, split)) {
+        return true;
+      }
+      future = makeFuture();
+      return false;
     }
     if (tryGetBarrier(driverId, split)) {
       return true;
@@ -2305,6 +2308,29 @@ BlockingReason Task::getSplitOrFuture(
   stateChangeNotifier.notify();
   return notBlocked ? BlockingReason::kNotBlocked
                     : BlockingReason::kWaitForSplit;
+}
+
+void Task::splitPreloadFinished(
+    uint32_t splitGroupId,
+    const core::PlanNodeId& planNodeId) {
+  std::vector<ContinuePromise> promises;
+  {
+    std::lock_guard<std::timed_mutex> l(mutex_);
+    const auto stateIt = splitsStates_.find(planNodeId);
+    if (stateIt == splitsStates_.end()) {
+      return;
+    }
+    const auto storeIt =
+        stateIt->second.groupSplitsStores.find(splitGroupId);
+    if (storeIt == stateIt->second.groupSplitsStores.end() ||
+        storeIt->second == nullptr) {
+      return;
+    }
+    promises = storeIt->second->splitPreloadFinished();
+  }
+  for (auto& promise : promises) {
+    promise.setValue();
+  }
 }
 
 bool Task::testingHasDriverWaitForSplit() const {

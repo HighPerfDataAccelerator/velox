@@ -24,7 +24,68 @@
 
 #include "velox/connectors/hive/storage_adapters/s3fs/S3Util.h"
 
+#include <mutex>
+
 namespace facebook::velox::filesystems {
+namespace {
+
+class SynchronizedCachingCredentialsProvider final
+    : public Aws::Auth::AWSCredentialsProvider {
+ public:
+  explicit SynchronizedCachingCredentialsProvider(
+      std::shared_ptr<Aws::Auth::AWSCredentialsProvider> source)
+      : source_(std::move(source)) {
+    refresh();
+  }
+
+  Aws::Auth::AWSCredentials GetAWSCredentials() override {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (isUsable(credentials_)) {
+        return credentials_;
+      }
+    }
+    refresh();
+    std::lock_guard<std::mutex> lock(mutex_);
+    return credentials_;
+  }
+
+ private:
+  static bool isUsable(const Aws::Auth::AWSCredentials& credentials) {
+    return !credentials.IsEmpty() &&
+        !credentials.ExpiresSoon(5 * 60 * 1000);
+  }
+
+  void refresh() {
+    std::lock_guard<std::mutex> refreshLock(refreshMutex_);
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (isUsable(credentials_)) {
+        return;
+      }
+    }
+    auto refreshed = source_->GetAWSCredentials();
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!refreshed.IsEmpty()) {
+      credentials_ = std::move(refreshed);
+    }
+  }
+
+  const std::shared_ptr<Aws::Auth::AWSCredentialsProvider> source_;
+  std::mutex mutex_;
+  std::mutex refreshMutex_;
+  Aws::Auth::AWSCredentials credentials_;
+};
+
+} // namespace
+
+std::shared_ptr<Aws::Auth::AWSCredentialsProvider>
+makeSynchronizedCachingCredentialsProvider(
+    std::shared_ptr<Aws::Auth::AWSCredentialsProvider> source) {
+  VELOX_CHECK_NOT_NULL(source);
+  return std::make_shared<SynchronizedCachingCredentialsProvider>(
+      std::move(source));
+}
 
 std::string getErrorStringFromS3Error(
     const Aws::Client::AWSError<Aws::S3::S3Errors>& error) {
