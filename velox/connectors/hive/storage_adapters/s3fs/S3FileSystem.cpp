@@ -324,7 +324,8 @@ class S3FileSystem::Impl {
   // Return a default AWSCredentialsProvider.
   std::shared_ptr<Aws::Auth::AWSCredentialsProvider>
   getDefaultCredentialsProvider() const {
-    return std::make_shared<Aws::Auth::DefaultAWSCredentialsProviderChain>();
+    return makeSynchronizedCachingCredentialsProvider(
+        std::make_shared<Aws::Auth::DefaultAWSCredentialsProviderChain>());
   }
 
   // Configure and return an AWSCredentialsProvider with S3 IAM Role.
