@@ -5916,6 +5916,10 @@ class TopNRowNumberNode : public PlanNode {
   /// @param limit Per-partition limit. The number of
   /// rows produced by this node will not exceed this value for any given
   /// partition. Extra rows will be dropped.
+  /// @param partialOutput If true, the output is an independently reduced
+  /// partial result and must be consumed by another TopNRowNumber with the
+  /// same keys and limit. Implementations may emit one reduced result per
+  /// input batch instead of retaining state across the complete input.
   TopNRowNumberNode(
       PlanNodeId id,
       RankFunction function,
@@ -5924,7 +5928,8 @@ class TopNRowNumberNode : public PlanNode {
       std::vector<SortOrder> sortingOrders,
       const std::optional<std::string>& rowNumberColumnName,
       int32_t limit,
-      PlanNodePtr source);
+      PlanNodePtr source,
+      bool partialOutput = false);
 
   class Builder {
    public:
@@ -5942,6 +5947,7 @@ class TopNRowNumberNode : public PlanNode {
       VELOX_CHECK_EQ(other.sources().size(), 1);
       source_ = other.sources()[0];
       function_ = other.rankFunction();
+      partialOutput_ = other.partialOutput();
     }
 
     Builder& id(PlanNodeId id) {
@@ -5985,6 +5991,11 @@ class TopNRowNumberNode : public PlanNode {
       return *this;
     }
 
+    Builder& partialOutput(bool partialOutput) {
+      partialOutput_ = partialOutput;
+      return *this;
+    }
+
     std::shared_ptr<TopNRowNumberNode> build() const {
       VELOX_USER_CHECK(id_.has_value(), "TopNRowNumberNode id is not set");
       VELOX_USER_CHECK(
@@ -6011,7 +6022,8 @@ class TopNRowNumberNode : public PlanNode {
           sortingOrders_.value(),
           rowNumberColumnName_.value(),
           limit_.value(),
-          source_.value());
+          source_.value(),
+          partialOutput_);
     }
 
    private:
@@ -6023,6 +6035,7 @@ class TopNRowNumberNode : public PlanNode {
     std::optional<std::optional<std::string>> rowNumberColumnName_;
     std::optional<int32_t> limit_;
     std::optional<PlanNodePtr> source_;
+    bool partialOutput_{false};
   };
 
   const std::vector<PlanNodePtr>& sources() const override {
@@ -6068,6 +6081,10 @@ class TopNRowNumberNode : public PlanNode {
     return outputType_->size() > sources_[0]->outputType()->size();
   }
 
+  bool partialOutput() const {
+    return partialOutput_;
+  }
+
   std::string_view name() const override {
     return "TopNRowNumber";
   }
@@ -6087,6 +6104,7 @@ class TopNRowNumberNode : public PlanNode {
   const std::vector<SortOrder> sortingOrders_;
 
   const int32_t limit_;
+  const bool partialOutput_;
 
   const std::vector<PlanNodePtr> sources_;
 

@@ -1327,6 +1327,7 @@ TEST_F(PlanNodeBuilderTest, topNRowNumberNode) {
         EXPECT_EQ(node->sortingOrders(), sortingOrders);
         EXPECT_EQ(node->limit(), limit);
         EXPECT_TRUE(node->generateRowNumber());
+        EXPECT_FALSE(node->partialOutput());
         EXPECT_EQ(node->outputType()->names().back(), rowNumberColumnName);
         EXPECT_EQ(node->sources().size(), 1);
         EXPECT_EQ(node->sources()[0], source_);
@@ -1345,4 +1346,19 @@ TEST_F(PlanNodeBuilderTest, topNRowNumberNode) {
 
   const auto node2 = TopNRowNumberNode::Builder(*node).build();
   verify(node2);
+
+  const auto partialNode = TopNRowNumberNode::Builder()
+                               .id(id)
+                               .partitionKeys(partitionKeys)
+                               .sortingKeys(sortingKeys)
+                               .sortingOrders(sortingOrders)
+                               .rowNumberColumnName(std::nullopt)
+                               .limit(limit)
+                               .source(source_)
+                               .partialOutput(true)
+                               .build();
+  EXPECT_TRUE(partialNode->partialOutput());
+  EXPECT_FALSE(partialNode->generateRowNumber());
+  EXPECT_TRUE(
+      TopNRowNumberNode::Builder(*partialNode).build()->partialOutput());
 }

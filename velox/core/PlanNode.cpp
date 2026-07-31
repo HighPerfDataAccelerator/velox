@@ -2932,13 +2932,15 @@ TopNRowNumberNode::TopNRowNumberNode(
     std::vector<SortOrder> sortingOrders,
     const std::optional<std::string>& rowNumberColumnName,
     int32_t limit,
-    PlanNodePtr source)
+    PlanNodePtr source,
+    bool partialOutput)
     : PlanNode(std::move(id)),
       function_(function),
       partitionKeys_{std::move(partitionKeys)},
       sortingKeys_{std::move(sortingKeys)},
       sortingOrders_{std::move(sortingOrders)},
       limit_{limit},
+      partialOutput_{partialOutput},
       sources_{std::move(source)},
       outputType_{getOptionalRowNumberOutputType(
           sources_[0]->outputType(),
@@ -2954,6 +2956,9 @@ TopNRowNumberNode::TopNRowNumberNode(
       "Number of sorting keys must be greater than zero");
 
   VELOX_USER_CHECK_GT(limit, 0, "Limit must be greater than zero");
+  VELOX_USER_CHECK(
+      !partialOutput_ || !rowNumberColumnName.has_value(),
+      "Partial TopNRowNumber output cannot include a rank column");
 
   std::unordered_set<std::string> keyNames;
   for (const auto& key : partitionKeys_) {
@@ -2972,6 +2977,9 @@ TopNRowNumberNode::TopNRowNumberNode(
 }
 
 void TopNRowNumberNode::addDetails(std::stringstream& stream) const {
+  if (partialOutput_) {
+    stream << "partial ";
+  }
   stream << rankFunctionName(function_) << " ";
 
   if (!partitionKeys_.empty()) {
@@ -2997,6 +3005,7 @@ folly::dynamic TopNRowNumberNode::serialize() const {
     obj["rowNumberColumnName"] = outputType_->names().back();
   }
   obj["limit"] = limit_;
+  obj["partialOutput"] = partialOutput_;
   return obj;
 }
 
@@ -3030,7 +3039,8 @@ PlanNodePtr TopNRowNumberNode::create(
       sortingOrders,
       rowNumberColumnName,
       obj["limit"].asInt(),
-      source);
+      source,
+      obj.getDefault("partialOutput", false).asBool());
 }
 
 void LocalMergeNode::addDetails(std::stringstream& stream) const {
