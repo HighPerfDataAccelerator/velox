@@ -30,40 +30,17 @@
 
 namespace facebook::velox::ucx_exchange {
 
-// Data and metadata tags are a uint64_t split into 3 fields, most-significant
-// first:
-// - Bits 63..32 (4 bytes): FNV-1a hash of the producing taskId, which is
-//   unique within a cluster.
-// - Bits 31..24 (1 byte): Operation type (metadata, data, or handshake
-//   response).
-// - Bits 23..0  (3 bytes): Sequence number of the chunk exchanged between 2
-//   tasks.
+// UCX tags contain a 48-bit hash of the producer task and destination, a
+// 2-bit message type, and a 14-bit page sequence number. The previous 32-bit
+// FNV hash collides frequently in large MPP plans with hundreds of thousands
+// of similarly named streams, allowing one exchange to consume another
+// exchange's packed table.
+constexpr uint64_t kMaxExchangeSequenceNumber = (uint64_t{1} << 14) - 1;
 
-// Definition of the operations.
-constexpr uint64_t METADATA_TAG = 0x02000000;
-constexpr uint64_t DATA_TAG = 0x03000000;
-constexpr uint64_t HANDSHAKE_RESPONSE_TAG = 0x04000000;
-
-// Implementation of the fowler-noll-vo hash function for 32 bits.
-uint32_t fnv1a_32(std::string_view s);
-
-// Gets the tag used for metadata communication
-// Note: taskHash and sequenceNumber are implicitly converted to 64 bits.
-inline uint64_t getMetadataTag(uint64_t taskHash, uint64_t sequenceNumber) {
-  return (taskHash << 32) | METADATA_TAG | sequenceNumber;
-}
-
-// Gets the tag used for data communication
-// Note: taskHash and sequenceNumber are implicitly converted to 64 bits.
-inline uint64_t getDataTag(uint64_t taskHash, uint64_t sequenceNumber) {
-  return (taskHash << 32) | DATA_TAG | sequenceNumber;
-}
-
-// Gets the tag used for handshake response communication.
-// Note: taskHash is implicitly converted to 64 bits.
-inline uint64_t getHandshakeResponseTag(uint64_t taskHash) {
-  return (taskHash << 32) | HANDSHAKE_RESPONSE_TAG;
-}
+uint64_t partitionKeyHash(std::string_view key);
+uint64_t getMetadataTag(uint64_t taskHash, uint64_t sequenceNumber);
+uint64_t getDataTag(uint64_t taskHash, uint64_t sequenceNumber);
+uint64_t getHandshakeResponseTag(uint64_t taskHash);
 
 /// @brief Request that is sent from the client (UcxExchangeSource) to the
 /// server (UcxExchangeServer) after connection.

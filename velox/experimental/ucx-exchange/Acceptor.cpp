@@ -164,7 +164,7 @@ void Acceptor::cStyleAMCallback(
     auto response = std::make_shared<HandshakeResponse>();
     response->isIntraNodeTransfer = exchangeServer->isIntraNodeTransfer();
 
-    uint32_t keyHash = fnv1a_32(key.toString());
+    const auto keyHash = partitionKeyHash(key.toString());
     uint64_t responseTag = getHandshakeResponseTag(keyHash);
 
     VLOG(3) << "Sending HandshakeResponse to " << key.toString()

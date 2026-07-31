@@ -33,6 +33,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <filesystem>
 #include <utility>
 
@@ -43,6 +44,7 @@ constexpr uint64_t kMergeChunkBytes = 32ULL << 20;
 constexpr uint64_t kMergePassBytes = 128ULL << 20;
 constexpr uint64_t kSpillRowGroupBytes = 64ULL << 20;
 constexpr size_t kFinalMergeRuns = 2;
+constexpr uint64_t kMinDeviceReserveBytes = 2ULL << 30;
 
 std::atomic<uint64_t> orderBySpillDirectorySequence{0};
 std::atomic<uint64_t> testingSortedRunBytes{0};
@@ -133,6 +135,14 @@ void updateAtomicMax(std::atomic<uint64_t>& target, uint64_t value) {
   auto current = target.load();
   while (current < value && !target.compare_exchange_weak(current, value)) {
   }
+}
+
+uint64_t admissionCapacity(const DeviceAllocationHeadroom& headroom) {
+  const auto allocatableBytes = headroom.allocatableBytes();
+  const auto reserveBytes = std::max<uint64_t>(
+      kMinDeviceReserveBytes, static_cast<uint64_t>(headroom.totalBytes) / 8);
+  return allocatableBytes > reserveBytes ? allocatableBytes - reserveBytes
+                                         : allocatableBytes / 2;
 }
 
 void resetTestingStats() {
@@ -297,6 +307,7 @@ CudfOrderBy::CudfOrderBy(
             ? cudf::null_order::BEFORE
             : cudf::null_order::AFTER);
   }
+  initializeInputAdmission();
 }
 
 void CudfOrderBy::doAddInput(RowVectorPtr input) {
@@ -307,27 +318,82 @@ void CudfOrderBy::doAddInput(RowVectorPtr input) {
   try {
     auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input);
     VELOX_CHECK_NOT_NULL(cudfInput, "Expected CudfVector input");
-
-    const auto inputStream = cudfInput->stream();
-    if (inputStream.value() != stateStream_.value()) {
-      std::vector<rmm::cuda_stream_view> inputStreams{inputStream};
-      cudf::detail::join_streams(inputStreams, stateStream_);
-    }
-    // A packed-table backing buffer can retain a different deallocation stream
-    // even when the vector's logical stream already equals stateStream_.
-    VELOX_CHECK(
-        cudfInput->rebindStream(stateStream_),
-        "CudfOrderBy cannot rebind its input to the state stream");
-
-    bufferedBytes_ += cudfInput->estimateFlatSize();
-    inputs_.push_back(std::move(cudfInput));
-    if (bufferedBytes_ >= sortedRunBytes_) {
-      spillSortedRun();
-    }
+    bufferInput(std::move(cudfInput));
   } catch (...) {
+    releaseInputAdmission();
     cleanupSpillStateAfterFailure("addInput");
     throw;
   }
+}
+
+void CudfOrderBy::initializeInputAdmission() {
+  const auto headroom = captureDeviceAllocationHeadroom();
+  if (!headroom.cudaValid || headroom.totalBytes == 0) {
+    return;
+  }
+
+  admissionEnabled_ = true;
+  pendingAdmissionDevice_ = headroom.device;
+  pendingAdmissionCapacity_ = admissionCapacity(headroom);
+  pendingAdmissionBytes_ = pendingAdmissionCapacity_;
+  pendingAdmissionStart_ = std::chrono::steady_clock::now();
+  inputAdmission_ = tryAcquireDeviceMemoryAdmission(
+      pendingAdmissionDevice_,
+      pendingAdmissionBytes_,
+      pendingAdmissionCapacity_);
+  if (!inputAdmission_) {
+    ++blockingAdmissions_;
+  }
+}
+
+exec::BlockingReason CudfOrderBy::isBlocked(ContinueFuture* future) {
+  if (!admissionEnabled_ || inputAdmission_) {
+    return exec::BlockingReason::kNotBlocked;
+  }
+
+  auto admission = acquireDeviceMemoryAdmissionOrFuture(
+      pendingAdmissionDevice_,
+      pendingAdmissionBytes_,
+      pendingAdmissionCapacity_,
+      future);
+  if (!admission) {
+    return exec::BlockingReason::kWaitForMemory;
+  }
+
+  admissionWaitNanos_ +=
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - pendingAdmissionStart_)
+          .count();
+  inputAdmission_ = std::move(admission);
+  return exec::BlockingReason::kNotBlocked;
+}
+
+void CudfOrderBy::bufferInput(CudfVectorPtr input) {
+  const auto inputStream = input->stream();
+  if (inputStream.value() != stateStream_.value()) {
+    std::vector<rmm::cuda_stream_view> inputStreams{inputStream};
+    cudf::detail::join_streams(inputStreams, stateStream_);
+  }
+  // A packed-table backing buffer can retain a different deallocation stream
+  // even when the vector's logical stream already equals stateStream_.
+  VELOX_CHECK(
+      input->rebindStream(stateStream_),
+      "CudfOrderBy cannot rebind its input to the state stream");
+
+  bufferedBytes_ += input->estimateFlatSize();
+  inputs_.push_back(std::move(input));
+  if (bufferedBytes_ >= sortedRunBytes_) {
+    spillSortedRun();
+  }
+}
+
+void CudfOrderBy::releaseInputAdmission() {
+  if (!inputAdmission_) {
+    return;
+  }
+  releaseDeviceMemoryAdmissionAfterStream(
+      std::move(*inputAdmission_), stateStream_);
+  inputAdmission_.reset();
 }
 
 void CudfOrderBy::doNoMoreInput() {
@@ -339,11 +405,13 @@ void CudfOrderBy::doNoMoreInput() {
     }
     if (spilled_) {
       prepareSpilledOutput();
+      releaseInputAdmission();
       return;
     }
 
     if (inputs_.empty()) {
       finished_ = true;
+      releaseInputAdmission();
       return;
     }
 
@@ -360,7 +428,9 @@ void CudfOrderBy::doNoMoreInput() {
         stateStream_,
         get_output_mr());
     setPendingOutput(std::move(sorted));
+    releaseInputAdmission();
   } catch (...) {
+    releaseInputAdmission();
     cleanupSpillStateAfterFailure("noMoreInput");
     throw;
   }
@@ -415,30 +485,27 @@ void CudfOrderBy::spillSortedRun() {
     spilled_ = true;
   }
 
-  logDeviceMemorySnapshot(
-      fmt::format(
-          "operator=CudfOrderBy node={} state=sortRun.concatenate.begin "
-          "bufferedBytes={} bufferedInputs={} existingRuns={} "
-          "sortedRunBytes={} mergeFanIn={}",
-          orderByNode_->id(),
-          bufferedBytes_,
-          inputs_.size(),
-          sortedRuns_.size(),
-          sortedRunBytes_,
-          mergeFanIn_));
+  logDeviceMemorySnapshot(fmt::format(
+      "operator=CudfOrderBy node={} state=sortRun.concatenate.begin "
+      "bufferedBytes={} bufferedInputs={} existingRuns={} "
+      "sortedRunBytes={} mergeFanIn={}",
+      orderByNode_->id(),
+      bufferedBytes_,
+      inputs_.size(),
+      sortedRuns_.size(),
+      sortedRunBytes_,
+      mergeFanIn_));
   auto input = getConcatenatedTable(
       std::exchange(inputs_, {}), outputType_, stateStream_, get_output_mr());
   bufferedBytes_ = 0;
-  logDeviceMemorySnapshot(
-      fmt::format(
-          "operator=CudfOrderBy node={} state=sortRun.concatenate.end rows={}",
-          orderByNode_->id(),
-          input->num_rows()));
-  logDeviceMemorySnapshot(
-      fmt::format(
-          "operator=CudfOrderBy node={} state=sortRun.sort.begin rows={}",
-          orderByNode_->id(),
-          input->num_rows()));
+  logDeviceMemorySnapshot(fmt::format(
+      "operator=CudfOrderBy node={} state=sortRun.concatenate.end rows={}",
+      orderByNode_->id(),
+      input->num_rows()));
+  logDeviceMemorySnapshot(fmt::format(
+      "operator=CudfOrderBy node={} state=sortRun.sort.begin rows={}",
+      orderByNode_->id(),
+      input->num_rows()));
   auto sorted = cudf::sort_by_key(
       input->view(),
       input->view().select(sortKeys_),
@@ -446,11 +513,10 @@ void CudfOrderBy::spillSortedRun() {
       nullOrder_,
       stateStream_,
       get_output_mr());
-  logDeviceMemorySnapshot(
-      fmt::format(
-          "operator=CudfOrderBy node={} state=sortRun.sort.end rows={}",
-          orderByNode_->id(),
-          sorted->num_rows()));
+  logDeviceMemorySnapshot(fmt::format(
+      "operator=CudfOrderBy node={} state=sortRun.sort.end rows={}",
+      orderByNode_->id(),
+      sorted->num_rows()));
 
   auto path = fmt::format(
       "{}/run-{:06}.parquet", spillDirectory_, spillFileSequence_++);
@@ -458,27 +524,25 @@ void CudfOrderBy::spillSortedRun() {
                      cudf::io::sink_info{path}, sorted->view())
                      .row_group_size_bytes(kSpillRowGroupBytes)
                      .build();
-  logDeviceMemorySnapshot(
-      fmt::format(
-          "operator=CudfOrderBy node={} state=sortRun.write.begin rows={} "
-          "existingRuns={} path={}",
-          orderByNode_->id(),
-          sorted->num_rows(),
-          sortedRuns_.size(),
-          path));
+  logDeviceMemorySnapshot(fmt::format(
+      "operator=CudfOrderBy node={} state=sortRun.write.begin rows={} "
+      "existingRuns={} path={}",
+      orderByNode_->id(),
+      sorted->num_rows(),
+      sortedRuns_.size(),
+      path));
   cudf::io::write_parquet(options, stateStream_);
 
   SortedRun run;
   run.path = std::move(path);
   sortedRuns_.push_back(std::move(run));
-  logDeviceMemorySnapshot(
-      fmt::format(
-          "operator=CudfOrderBy node={} state=sortRun.write.end rows={} runs={} "
-          "path={}",
-          orderByNode_->id(),
-          sorted->num_rows(),
-          sortedRuns_.size(),
-          sortedRuns_.back().path));
+  logDeviceMemorySnapshot(fmt::format(
+      "operator=CudfOrderBy node={} state=sortRun.write.end rows={} runs={} "
+      "path={}",
+      orderByNode_->id(),
+      sorted->num_rows(),
+      sortedRuns_.size(),
+      sortedRuns_.back().path));
   ::malloc_trim(0);
 }
 
@@ -733,34 +797,32 @@ void CudfOrderBy::compactSortedRunsForMerge() {
     compactionStats.maxActiveRuns =
         std::max(compactionStats.maxActiveRuns, levelStats.maxActiveRuns);
 
-    logDeviceMemorySnapshot(
-        fmt::format(
-            "operator=CudfOrderBy node={} state=compaction.level.end "
-            "inputRuns={} outputRuns={} sourceChunks={} outputBatches={} "
-            "maxResidentBytes={} maxOutputBytes={} maxActiveRuns={}",
-            orderByNode_->id(),
-            inputRunCount,
-            sortedRuns_.size(),
-            levelStats.sourceChunks,
-            levelStats.outputBatches,
-            levelStats.maxResidentBytes,
-            levelStats.maxOutputBytes,
-            levelStats.maxActiveRuns));
+    logDeviceMemorySnapshot(fmt::format(
+        "operator=CudfOrderBy node={} state=compaction.level.end "
+        "inputRuns={} outputRuns={} sourceChunks={} outputBatches={} "
+        "maxResidentBytes={} maxOutputBytes={} maxActiveRuns={}",
+        orderByNode_->id(),
+        inputRunCount,
+        sortedRuns_.size(),
+        levelStats.sourceChunks,
+        levelStats.outputBatches,
+        levelStats.maxResidentBytes,
+        levelStats.maxOutputBytes,
+        levelStats.maxActiveRuns));
   }
 
   stateStream_.synchronize();
-  logDeviceMemorySnapshot(
-      fmt::format(
-          "operator=CudfOrderBy node={} state=compaction.end runs={} "
-          "sourceChunks={} outputBatches={} maxResidentBytes={} "
-          "maxOutputBytes={} maxActiveRuns={}",
-          orderByNode_->id(),
-          sortedRuns_.size(),
-          compactionStats.sourceChunks,
-          compactionStats.outputBatches,
-          compactionStats.maxResidentBytes,
-          compactionStats.maxOutputBytes,
-          compactionStats.maxActiveRuns));
+  logDeviceMemorySnapshot(fmt::format(
+      "operator=CudfOrderBy node={} state=compaction.end runs={} "
+      "sourceChunks={} outputBatches={} maxResidentBytes={} "
+      "maxOutputBytes={} maxActiveRuns={}",
+      orderByNode_->id(),
+      sortedRuns_.size(),
+      compactionStats.sourceChunks,
+      compactionStats.outputBatches,
+      compactionStats.maxResidentBytes,
+      compactionStats.maxOutputBytes,
+      compactionStats.maxActiveRuns));
 }
 
 void CudfOrderBy::initializeSortedRunReaders() {
@@ -783,14 +845,13 @@ void CudfOrderBy::initializeSortedRunReaders() {
     run.chunkBytes = 0;
   }
   readersInitialized_ = true;
-  logDeviceMemorySnapshot(
-      fmt::format(
-          "operator=CudfOrderBy node={} state=output.merge.begin runs={} "
-          "chunkReadLimit={} passReadLimit={}",
-          orderByNode_->id(),
-          sortedRuns_.size(),
-          mergeChunkBytes.load(),
-          kMergePassBytes));
+  logDeviceMemorySnapshot(fmt::format(
+      "operator=CudfOrderBy node={} state=output.merge.begin runs={} "
+      "chunkReadLimit={} passReadLimit={}",
+      orderByNode_->id(),
+      sortedRuns_.size(),
+      mergeChunkBytes.load(),
+      kMergePassBytes));
 }
 
 void CudfOrderBy::prepareSpilledOutput() {
@@ -813,24 +874,23 @@ std::unique_ptr<cudf::table> CudfOrderBy::mergeNextSortedBatch() {
   auto result = mergeNextPausedBatch(
       runs, stateStream_, get_output_mr(), mergeFinished_, outputMergeStats_);
   if (mergeFinished_) {
-    logDeviceMemorySnapshot(
-        fmt::format(
-            "operator=CudfOrderBy node={} state=output.merge.end runs={} "
-            "sourceChunks={} sourceRows={} sourceBytes={} outputBatches={} "
-            "outputRows={} outputBytes={} maxResidentRows={} "
-            "maxResidentBytes={} maxOutputBytes={} maxActiveRuns={}",
-            orderByNode_->id(),
-            sortedRuns_.size(),
-            outputMergeStats_.sourceChunks,
-            outputMergeStats_.sourceRows,
-            outputMergeStats_.sourceBytes,
-            outputMergeStats_.outputBatches,
-            outputMergeStats_.outputRows,
-            outputMergeStats_.outputBytes,
-            outputMergeStats_.maxResidentRows,
-            outputMergeStats_.maxResidentBytes,
-            outputMergeStats_.maxOutputBytes,
-            outputMergeStats_.maxActiveRuns));
+    logDeviceMemorySnapshot(fmt::format(
+        "operator=CudfOrderBy node={} state=output.merge.end runs={} "
+        "sourceChunks={} sourceRows={} sourceBytes={} outputBatches={} "
+        "outputRows={} outputBytes={} maxResidentRows={} "
+        "maxResidentBytes={} maxOutputBytes={} maxActiveRuns={}",
+        orderByNode_->id(),
+        sortedRuns_.size(),
+        outputMergeStats_.sourceChunks,
+        outputMergeStats_.sourceRows,
+        outputMergeStats_.sourceBytes,
+        outputMergeStats_.outputBatches,
+        outputMergeStats_.outputRows,
+        outputMergeStats_.outputBytes,
+        outputMergeStats_.maxResidentRows,
+        outputMergeStats_.maxResidentBytes,
+        outputMergeStats_.maxOutputBytes,
+        outputMergeStats_.maxActiveRuns));
   }
   return result;
 }
@@ -975,6 +1035,14 @@ void CudfOrderBy::cleanupSpillStateAfterFailure(
 }
 
 void CudfOrderBy::doClose() {
+  releaseInputAdmission();
+  {
+    auto lockedStats = stats_.wlock();
+    lockedStats->addRuntimeStat(
+        "orderByBlockingAdmissions", RuntimeCounter(blockingAdmissions_));
+    lockedStats->addRuntimeStat(
+        "orderByAdmissionWaitNanos", RuntimeCounter(admissionWaitNanos_));
+  }
   // close() also runs during task failure; cleanup preserves the original
   // exception while draining and destroying all state-stream owners.
   cleanupSpillStateAfterFailure("close");

@@ -114,36 +114,41 @@ rmm::mr::statistics_resource_adaptor& receiveDeviceMemoryResource() {
   return resource;
 }
 
-int64_t maxInFlightRecvDeviceBytes() {
-  static const int64_t limit = [] {
+uint64_t receiveDeviceCapacityBytes() {
+  static const uint64_t limit = [] {
     if (const char* value =
             std::getenv("GLUTEN_UCX_MAX_INFLIGHT_RECV_DEVICE_BYTES")) {
       try {
-        const auto parsed = static_cast<int64_t>(std::stoll(value));
-        if (parsed > 0) {
-          return parsed;
+        const auto parsed = static_cast<uint64_t>(std::stoull(value));
+        if (parsed == 0) {
+          return uint64_t{0};
         }
+        return parsed;
       } catch (...) {
       }
     }
-    // A query-wide credit pool needs dependency-aware wakeups. A blind global
-    // cap can deadlock a DAG when an edge holding credit is downstream of an
-    // edge waiting for credit. Keep this diagnostic mechanism opt-in until
-    // the coordinator owns that dependency-aware arbitration.
-    return static_cast<int64_t>(0);
+    constexpr uint64_t kMinCapacity = uint64_t{512} << 20;
+    constexpr uint64_t kMaxCapacity = uint64_t{1} << 30;
+    const auto headroom = cudf_velox::captureDeviceAllocationHeadroom();
+    if (!headroom.cudaValid || headroom.totalBytes == 0) {
+      return kMaxCapacity;
+    }
+    return std::clamp(
+        static_cast<uint64_t>(headroom.totalBytes) / uint64_t{32},
+        kMinCapacity,
+        kMaxCapacity);
   }();
   return limit;
 }
 
-bool hasRecvDeviceCredit(int64_t bytes) {
-  const auto limit = maxInFlightRecvDeviceBytes();
-  if (limit <= 0) {
-    return true;
-  }
-  const auto current = receiveDeviceMemoryResource().get_bytes_counter().value;
-  // Packed tables cannot be split. Permit one oversized receive only when no
-  // other receive page is live, matching the host-credit behavior.
-  return current == 0 || current + bytes <= limit;
+std::shared_ptr<UcxOutputQueueMemoryManager> receiveDeviceMemoryManager() {
+  static const auto manager = [] {
+    const auto capacity = receiveDeviceCapacityBytes();
+    return capacity == 0 ? std::shared_ptr<UcxOutputQueueMemoryManager>{}
+                         : std::make_shared<UcxOutputQueueMemoryManager>(
+                               capacity, "receive residency");
+  }();
+  return manager;
 }
 
 std::atomic<int64_t> lastReportedReceiveDevicePeakBucket{0};
@@ -223,7 +228,7 @@ UcxExchangeSource::UcxExchangeSource(
       port_(port),
       taskId_(taskId),
       partitionKey_(partitionKey),
-      partitionKeyHash_(fnv1a_32(partitionKey_.toString())),
+      partitionKeyHash_(partitionKeyHash(partitionKey_.toString())),
       queue_(std::move(queue)) {
   setState(ReceiverState::Created);
 }
@@ -525,6 +530,8 @@ void UcxExchangeSource::deliverEndMarker() {
 }
 
 void UcxExchangeSource::releaseReceiveReservation() {
+  receiveDeviceReservation_.reset();
+  receiveDeviceReservationWaiter_.reset();
   if (reservedReceiveBytes_ > 0) {
     queue_->releaseReservedReceive(reservedReceiveBytes_);
     reservedReceiveBytes_ = 0;
@@ -771,15 +778,29 @@ bool UcxExchangeSource::tryStartDataReceive(
     reservedGlobalHostReceiveBytes_ = ptr->metadata.dataSizeBytes;
   }
 
-  if (!hasRecvDeviceCredit(ptr->metadata.dataSizeBytes)) {
-    releaseReceiveReservation();
-    if (getState() == expectedState) {
-      setStateIf(expectedState, ReceiverState::WaitingForReceiveCredit);
+  if (auto manager = receiveDeviceMemoryManager()) {
+    std::weak_ptr<UcxExchangeSource> weak = weak_from_this();
+    if (manager->reserve(
+            ptr->metadata.dataSizeBytes,
+            taskId_,
+            [weak]() {
+              if (auto source = weak.lock()) {
+                source->wakeCommunicator();
+              }
+            },
+            receiveDeviceReservation_,
+            receiveDeviceReservationWaiter_)) {
+      queue_->releaseReservedReceive(reservedReceiveBytes_);
+      reservedReceiveBytes_ = 0;
+      if (reservedGlobalHostReceiveBytes_ > 0) {
+        releaseRecvHostBytes(reservedGlobalHostReceiveBytes_);
+        reservedGlobalHostReceiveBytes_ = 0;
+      }
+      if (getState() == expectedState) {
+        setStateIf(expectedState, ReceiverState::WaitingForReceiveCredit);
+      }
+      return false;
     }
-    // A different ExchangeQueue may release the process-wide credit. Retry
-    // from the communicator loop instead of waiting on this queue's promise.
-    wakeCommunicator();
-    return false;
   }
 
   // REMOTE EXCHANGE PATH: Allocate buffer and receive via UCXX.
@@ -849,22 +870,21 @@ bool UcxExchangeSource::tryStartDataReceive(
       }
       if (crossedPeakBucket ||
           ptr->metadata.dataSizeBytes >= static_cast<uint64_t>(64) << 20) {
-        facebook::velox::cudf_velox::logDeviceMemorySnapshot(
-            fmt::format(
-                "operator=UcxExchangeSource state=receive.allocate "
-                "task={} remoteTask={} destination={} allocationBytes={} "
-                "ucxRecvCurrentBytes={} ucxRecvPeakBytes={} "
-                "ucxRecvTotalBytes={} queueBytes={} pendingReceiveBytes={} cap={}",
-                taskId_,
-                partitionKey_.taskId,
-                partitionKey_.destination,
-                ptr->metadata.dataSizeBytes,
-                bytes.value,
-                bytes.peak,
-                bytes.total,
-                stats.queuedBytes,
-                stats.pendingReceiveBytes,
-                maxInFlightRecvBytes()));
+        facebook::velox::cudf_velox::logDeviceMemorySnapshot(fmt::format(
+            "operator=UcxExchangeSource state=receive.allocate "
+            "task={} remoteTask={} destination={} allocationBytes={} "
+            "ucxRecvCurrentBytes={} ucxRecvPeakBytes={} "
+            "ucxRecvTotalBytes={} queueBytes={} pendingReceiveBytes={} cap={}",
+            taskId_,
+            partitionKey_.taskId,
+            partitionKey_.destination,
+            ptr->metadata.dataSizeBytes,
+            bytes.value,
+            bytes.peak,
+            bytes.total,
+            stats.queuedBytes,
+            stats.pendingReceiveBytes,
+            maxInFlightRecvBytes()));
       }
     }
   } else {
@@ -906,6 +926,13 @@ bool UcxExchangeSource::tryStartDataReceive(
     releaseReceiveReservation();
     VLOG(1) << toString() << " tryStartDataReceive Invalid previous state ";
     return false;
+  }
+
+  if (receiveDeviceReservation_.has_value()) {
+    ptr->deviceResidencyOwner =
+        std::make_shared<UcxOutputQueueMemoryManager::Reservation>(
+            std::move(*receiveDeviceReservation_));
+    receiveDeviceReservation_.reset();
   }
 
   std::weak_ptr<UcxExchangeSource> weak = weak_from_this();
@@ -996,7 +1023,9 @@ void UcxExchangeSource::onData(ucs_status_t status, std::shared_ptr<void> arg) {
 
     // Bundle the packed_table with the stream that was used for allocation
     auto data = std::make_unique<PackedTableWithStream>(
-        std::move(packedTable), ptr->stream);
+        std::move(packedTable),
+        ptr->stream,
+        std::move(ptr->deviceResidencyOwner));
 
     const int64_t reservedReceiveBytes = reservedReceiveBytes_;
     enqueue(std::move(data), reservedReceiveBytes);
@@ -1202,8 +1231,8 @@ void UcxExchangeSource::onIntraNodeData(
   auto packedTable = std::make_unique<cudf::packed_table>(
       cudf::packed_table{tableView, std::move(packedCols)});
 
-  auto tableWithStream =
-      std::make_unique<PackedTableWithStream>(std::move(packedTable), stream);
+  auto tableWithStream = std::make_unique<PackedTableWithStream>(
+      std::move(packedTable), stream, sharedPage ? nullptr : std::move(data));
 
   enqueue(std::move(tableWithStream));
 

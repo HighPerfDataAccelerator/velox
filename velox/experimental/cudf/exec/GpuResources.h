@@ -16,15 +16,21 @@
 
 #pragma once
 
+#include "velox/common/future/VeloxPromise.h"
+
 #include <cudf/detail/utilities/stream_pool.hpp>
 
+#include <rmm/cuda_stream_view.hpp>
 #include <rmm/mr/statistics_resource_adaptor.hpp>
 #include <rmm/resource_ref.hpp>
 
 #include <cuda/memory_resource>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -101,6 +107,17 @@ class DeviceMemoryAdmissionReservation {
       int device,
       std::size_t bytes,
       std::size_t capacityBytes);
+  friend std::optional<DeviceMemoryAdmissionReservation>
+  waitAcquireDeviceMemoryAdmission(
+      int device,
+      std::size_t bytes,
+      std::size_t capacityBytes);
+  friend std::optional<DeviceMemoryAdmissionReservation>
+  acquireDeviceMemoryAdmissionOrFuture(
+      int device,
+      std::size_t bytes,
+      std::size_t capacityBytes,
+      ContinueFuture* future);
 
   DeviceMemoryAdmissionReservation(int device, std::size_t bytes) noexcept;
 
@@ -108,6 +125,126 @@ class DeviceMemoryAdmissionReservation {
   std::size_t bytes_{0};
   bool active_{false};
 };
+
+enum class DeviceConcurrencyAdmissionDomain : uint8_t {
+  kTransientKernel,
+  kRetainedState,
+};
+
+/// Process-wide, per-device concurrency reservation. Independent domains let
+/// operators bound transient kernels and long-lived retained state separately.
+class DeviceConcurrencyAdmissionReservation {
+ public:
+  DeviceConcurrencyAdmissionReservation() = default;
+  ~DeviceConcurrencyAdmissionReservation();
+
+  DeviceConcurrencyAdmissionReservation(
+      DeviceConcurrencyAdmissionReservation&& other) noexcept;
+  DeviceConcurrencyAdmissionReservation& operator=(
+      DeviceConcurrencyAdmissionReservation&& other) noexcept;
+
+  DeviceConcurrencyAdmissionReservation(
+      const DeviceConcurrencyAdmissionReservation&) = delete;
+  DeviceConcurrencyAdmissionReservation& operator=(
+      const DeviceConcurrencyAdmissionReservation&) = delete;
+
+  [[nodiscard]] explicit operator bool() const noexcept {
+    return active_;
+  }
+
+  void release() noexcept;
+
+ private:
+  friend std::optional<DeviceConcurrencyAdmissionReservation>
+  acquireDeviceConcurrencyAdmissionOrFuture(
+      int device,
+      std::size_t maxConcurrent,
+      ContinueFuture* future,
+      DeviceConcurrencyAdmissionDomain domain,
+      uint64_t scope);
+
+  explicit DeviceConcurrencyAdmissionReservation(
+      int device,
+      DeviceConcurrencyAdmissionDomain domain,
+      uint64_t scope) noexcept;
+
+  int device_{-1};
+  DeviceConcurrencyAdmissionDomain domain_{
+      DeviceConcurrencyAdmissionDomain::kTransientKernel};
+  uint64_t scope_{0};
+  bool active_{false};
+};
+
+/// Registers admission bytes that are already reserved for a logical task.
+/// Downstream operators can reuse this credit even when intermediate
+/// operators replace the input vector.
+class DeviceMemoryAdmissionCreditRegistration {
+ public:
+  DeviceMemoryAdmissionCreditRegistration() = default;
+  ~DeviceMemoryAdmissionCreditRegistration();
+
+  DeviceMemoryAdmissionCreditRegistration(
+      DeviceMemoryAdmissionCreditRegistration&& other) noexcept;
+  DeviceMemoryAdmissionCreditRegistration& operator=(
+      DeviceMemoryAdmissionCreditRegistration&& other) noexcept;
+
+  DeviceMemoryAdmissionCreditRegistration(
+      const DeviceMemoryAdmissionCreditRegistration&) = delete;
+  DeviceMemoryAdmissionCreditRegistration& operator=(
+      const DeviceMemoryAdmissionCreditRegistration&) = delete;
+
+  void release() noexcept;
+
+ private:
+  friend DeviceMemoryAdmissionCreditRegistration
+  registerScopedDeviceMemoryAdmissionCredit(
+      std::string scope,
+      int device,
+      std::size_t bytes,
+      std::shared_ptr<void> owner,
+      std::function<void()> onConsumed);
+
+  DeviceMemoryAdmissionCreditRegistration(
+      std::string scope,
+      uint64_t registrationId) noexcept;
+
+  std::string scope_;
+  uint64_t registrationId_{0};
+};
+
+/// Admission credit attached to a device vector and propagated with its
+/// lineage. A consumer may use the credit once and release its owner after
+/// preceding work on the consumer stream completes.
+class DeviceMemoryAdmissionCredit {
+ public:
+  DeviceMemoryAdmissionCredit(
+      int device,
+      std::size_t bytes,
+      std::shared_ptr<void> owner,
+      std::function<void()> onConsumed);
+
+  int device() const {
+    return device_;
+  }
+
+  std::size_t availableBytes() const {
+    return consumed_.load(std::memory_order_acquire) ? 0 : bytes_;
+  }
+
+ private:
+  friend std::size_t consumeDeviceMemoryAdmissionCreditAfterStream(
+      const std::shared_ptr<DeviceMemoryAdmissionCredit>& credit,
+      rmm::cuda_stream_view stream);
+
+  const int device_;
+  const std::size_t bytes_;
+  std::shared_ptr<void> owner_;
+  std::function<void()> onConsumed_;
+  std::atomic<bool> consumed_{false};
+};
+
+using DeviceMemoryAdmissionCreditPtr =
+    std::shared_ptr<DeviceMemoryAdmissionCredit>;
 
 extern std::optional<cuda::mr::any_resource<cuda::mr::device_accessible>> mr_;
 extern std::optional<cuda::mr::any_resource<cuda::mr::device_accessible>>
@@ -156,9 +293,81 @@ tryAcquireDeviceMemoryAdmission(
     std::size_t bytes,
     std::size_t capacityBytes);
 
+/// Waits until a cooperative reservation fits within 'capacityBytes'. Returns
+/// nullopt only when the request itself is invalid or exceeds the capacity.
+[[nodiscard]] std::optional<DeviceMemoryAdmissionReservation>
+waitAcquireDeviceMemoryAdmission(
+    int device,
+    std::size_t bytes,
+    std::size_t capacityBytes);
+
+/// Atomically acquires a cooperative reservation or registers a wake-up future
+/// that becomes ready after an existing reservation is released. Callers must
+/// retry after the future completes; no executor thread is blocked while
+/// waiting.
+[[nodiscard]] std::optional<DeviceMemoryAdmissionReservation>
+acquireDeviceMemoryAdmissionOrFuture(
+    int device,
+    std::size_t bytes,
+    std::size_t capacityBytes,
+    ContinueFuture* future);
+
+/// Keeps a reservation alive until all work already submitted to 'stream' has
+/// completed. This is required for asynchronous cuDF calls whose temporary
+/// allocations outlive their host function scope.
+void releaseDeviceMemoryAdmissionAfterStream(
+    DeviceMemoryAdmissionReservation reservation,
+    rmm::cuda_stream_view stream);
+
 /// Returns bytes currently reserved by cooperative admission clients on a
 /// device. This is admission accounting, not live RMM allocation usage.
 [[nodiscard]] std::size_t deviceMemoryAdmissionReservedBytes(int device);
+
+/// Acquires one independent GPU-concurrency slot or registers a wake-up
+/// future. This does not consume device-memory ownership credit and therefore
+/// cannot form a credit cycle with exchange.
+[[nodiscard]] std::optional<DeviceConcurrencyAdmissionReservation>
+acquireDeviceConcurrencyAdmissionOrFuture(
+    int device,
+    std::size_t maxConcurrent,
+    ContinueFuture* future,
+    DeviceConcurrencyAdmissionDomain domain =
+        DeviceConcurrencyAdmissionDomain::kTransientKernel,
+    uint64_t scope = 0);
+
+/// Releases a concurrency slot after preceding work on 'stream' completes.
+void releaseDeviceConcurrencyAdmissionAfterStream(
+    DeviceConcurrencyAdmissionReservation reservation,
+    rmm::cuda_stream_view stream);
+
+/// Publishes an existing reservation as reusable credit within 'scope'. The
+/// owner must keep the underlying reservation alive for the registration's
+/// lifetime.
+[[nodiscard]] DeviceMemoryAdmissionCreditRegistration
+registerScopedDeviceMemoryAdmissionCredit(
+    std::string scope,
+    int device,
+    std::size_t bytes,
+    std::shared_ptr<void> owner,
+    std::function<void()> onConsumed = {});
+
+/// Returns live admission credit published for 'scope' on 'device'.
+[[nodiscard]] std::size_t scopedDeviceMemoryAdmissionCreditBytes(
+    std::string_view scope,
+    int device);
+
+/// Consumes enough live credit to cover 'bytes'. Credit ownership and its
+/// optional callback remain alive until all preceding work on 'stream'
+/// completes.
+[[nodiscard]] std::size_t consumeScopedDeviceMemoryAdmissionCreditAfterStream(
+    std::string_view scope,
+    int device,
+    std::size_t bytes,
+    rmm::cuda_stream_view stream);
+
+[[nodiscard]] std::size_t consumeDeviceMemoryAdmissionCreditAfterStream(
+    const DeviceMemoryAdmissionCreditPtr& credit,
+    rmm::cuda_stream_view stream);
 
 /**
  * @brief Returns the global CUDA stream pool used by cudf.

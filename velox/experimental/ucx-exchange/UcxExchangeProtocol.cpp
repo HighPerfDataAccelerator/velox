@@ -16,19 +16,45 @@
 
 #include "velox/experimental/ucx-exchange/UcxExchangeProtocol.h"
 
+#include <folly/hash/SpookyHashV2.h>
 #include <cstring>
 #include <stdexcept>
 #include "velox/common/base/Exceptions.h"
 
 namespace facebook::velox::ucx_exchange {
 
-uint32_t fnv1a_32(std::string_view s) {
-  uint32_t hash = 0x811C9DC5u; // FNV offset basis
-  for (unsigned char c : s) {
-    hash ^= c;
-    hash *= 0x01000193u; // FNV prime
-  }
-  return hash;
+namespace {
+constexpr uint64_t kPartitionKeyHashMask = (uint64_t{1} << 48) - 1;
+constexpr uint64_t kMetadataTag = uint64_t{0} << 14;
+constexpr uint64_t kDataTag = uint64_t{1} << 14;
+constexpr uint64_t kHandshakeResponseTag = uint64_t{2} << 14;
+
+uint64_t
+makeTag(uint64_t taskHash, uint64_t messageType, uint64_t sequenceNumber) {
+  VELOX_CHECK_LE(
+      sequenceNumber,
+      kMaxExchangeSequenceNumber,
+      "UCX exchange sequence number exceeds the tag protocol capacity");
+  return ((taskHash & kPartitionKeyHashMask) << 16) | messageType |
+      sequenceNumber;
+}
+} // namespace
+
+uint64_t partitionKeyHash(std::string_view key) {
+  return folly::hash::SpookyHashV2::Hash64(key.data(), key.size(), 0) &
+      kPartitionKeyHashMask;
+}
+
+uint64_t getMetadataTag(uint64_t taskHash, uint64_t sequenceNumber) {
+  return makeTag(taskHash, kMetadataTag, sequenceNumber);
+}
+
+uint64_t getDataTag(uint64_t taskHash, uint64_t sequenceNumber) {
+  return makeTag(taskHash, kDataTag, sequenceNumber);
+}
+
+uint64_t getHandshakeResponseTag(uint64_t taskHash) {
+  return makeTag(taskHash, kHandshakeResponseTag, 0);
 }
 
 std::pair<std::shared_ptr<uint8_t>, size_t> MetadataMsg::serialize() {

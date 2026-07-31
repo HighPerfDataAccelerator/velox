@@ -41,6 +41,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
+#include <condition_variable>
 #include <cstdlib>
 #include <limits>
 #include <mutex>
@@ -63,7 +64,54 @@ std::unordered_set<int> primaryMemoryResourceDevices;
 std::unordered_map<int, cudaMemPool_t> primaryAsyncMemoryPools;
 
 std::mutex deviceMemoryAdmissionMutex;
+std::condition_variable deviceMemoryAdmissionCondition;
 std::unordered_map<int, std::size_t> deviceMemoryAdmissionBytes;
+std::unordered_map<int, std::vector<ContinuePromise>>
+    deviceMemoryAdmissionWaiters;
+
+struct DeviceConcurrencyAdmissionKey {
+  int device;
+  DeviceConcurrencyAdmissionDomain domain;
+  uint64_t scope;
+
+  bool operator==(const DeviceConcurrencyAdmissionKey& other) const {
+    return device == other.device && domain == other.domain &&
+        scope == other.scope;
+  }
+};
+
+struct DeviceConcurrencyAdmissionKeyHash {
+  size_t operator()(const DeviceConcurrencyAdmissionKey& key) const {
+    size_t hash = std::hash<int>{}(key.device);
+    hash ^= std::hash<uint8_t>{}(static_cast<uint8_t>(key.domain)) +
+        0x9e3779b9 + (hash << 6) + (hash >> 2);
+    hash ^= std::hash<uint64_t>{}(key.scope) + 0x9e3779b9 + (hash << 6) +
+        (hash >> 2);
+    return hash;
+  }
+};
+
+std::mutex deviceConcurrencyAdmissionMutex;
+std::unordered_map<
+    DeviceConcurrencyAdmissionKey,
+    std::size_t,
+    DeviceConcurrencyAdmissionKeyHash>
+    deviceConcurrencyAdmissionCounts;
+std::unordered_map<
+    DeviceConcurrencyAdmissionKey,
+    std::vector<ContinuePromise>,
+    DeviceConcurrencyAdmissionKeyHash>
+    deviceConcurrencyAdmissionWaiters;
+struct ScopedDeviceMemoryAdmissionCredit {
+  uint64_t registrationId;
+  int device;
+  std::size_t bytes;
+  std::weak_ptr<void> owner;
+  std::function<void()> onConsumed;
+};
+std::unordered_map<std::string, std::vector<ScopedDeviceMemoryAdmissionCredit>>
+    scopedDeviceMemoryAdmissionCredits;
+uint64_t nextScopedDeviceMemoryAdmissionCreditId{1};
 
 struct MemoryResourceRegistration {
   int device{-1};
@@ -92,16 +140,106 @@ void registerAsyncMemoryPool(
 }
 
 void releaseDeviceMemoryAdmission(int device, std::size_t bytes) noexcept {
-  std::lock_guard<std::mutex> lock(deviceMemoryAdmissionMutex);
-  const auto it = deviceMemoryAdmissionBytes.find(device);
-  if (it == deviceMemoryAdmissionBytes.end() || it->second < bytes) {
-    LOG(ERROR) << "Invalid device-memory admission release device=" << device
-               << " bytes=" << bytes;
+  std::vector<ContinuePromise> waiters;
+  {
+    std::lock_guard<std::mutex> lock(deviceMemoryAdmissionMutex);
+    const auto it = deviceMemoryAdmissionBytes.find(device);
+    if (it == deviceMemoryAdmissionBytes.end() || it->second < bytes) {
+      LOG(ERROR) << "Invalid device-memory admission release device=" << device
+                 << " bytes=" << bytes;
+      return;
+    }
+    it->second -= bytes;
+    if (it->second == 0) {
+      deviceMemoryAdmissionBytes.erase(it);
+    }
+    const auto waiterIt = deviceMemoryAdmissionWaiters.find(device);
+    if (waiterIt != deviceMemoryAdmissionWaiters.end()) {
+      waiters = std::move(waiterIt->second);
+      deviceMemoryAdmissionWaiters.erase(waiterIt);
+    }
+  }
+  deviceMemoryAdmissionCondition.notify_all();
+  for (auto& waiter : waiters) {
+    waiter.setValue();
+  }
+}
+
+void CUDART_CB releaseDeviceMemoryAdmissionCallback(void* data) {
+  delete static_cast<DeviceMemoryAdmissionReservation*>(data);
+}
+
+DeviceConcurrencyAdmissionKey deviceConcurrencyAdmissionKey(
+    int device,
+    DeviceConcurrencyAdmissionDomain domain,
+    uint64_t scope) {
+  return DeviceConcurrencyAdmissionKey{device, domain, scope};
+}
+
+void releaseDeviceConcurrencyAdmission(
+    int device,
+    DeviceConcurrencyAdmissionDomain domain,
+    uint64_t scope) noexcept {
+  std::vector<ContinuePromise> waiters;
+  {
+    std::lock_guard<std::mutex> lock(deviceConcurrencyAdmissionMutex);
+    const auto key = deviceConcurrencyAdmissionKey(device, domain, scope);
+    const auto it = deviceConcurrencyAdmissionCounts.find(key);
+    if (it == deviceConcurrencyAdmissionCounts.end() || it->second == 0) {
+      LOG(ERROR) << "Invalid device-concurrency admission release device="
+                 << device << " domain=" << static_cast<int>(domain)
+                 << " scope=" << scope;
+      return;
+    }
+    if (--it->second == 0) {
+      deviceConcurrencyAdmissionCounts.erase(it);
+    }
+    const auto waiterIt = deviceConcurrencyAdmissionWaiters.find(key);
+    if (waiterIt != deviceConcurrencyAdmissionWaiters.end()) {
+      waiters = std::move(waiterIt->second);
+      deviceConcurrencyAdmissionWaiters.erase(waiterIt);
+    }
+  }
+  for (auto& waiter : waiters) {
+    waiter.setValue();
+  }
+}
+
+void CUDART_CB releaseDeviceConcurrencyAdmissionCallback(void* data) {
+  delete static_cast<DeviceConcurrencyAdmissionReservation*>(data);
+}
+
+struct DeferredScopedDeviceMemoryAdmissionCredit {
+  std::vector<std::shared_ptr<void>> owners;
+  std::vector<std::function<void()>> callbacks;
+};
+
+void CUDART_CB consumeScopedDeviceMemoryAdmissionCreditCallback(void* data) {
+  std::unique_ptr<DeferredScopedDeviceMemoryAdmissionCredit> deferred{
+      static_cast<DeferredScopedDeviceMemoryAdmissionCredit*>(data)};
+  for (auto& callback : deferred->callbacks) {
+    if (callback) {
+      callback();
+    }
+  }
+}
+
+void unregisterScopedDeviceMemoryAdmissionCredit(
+    const std::string& scope,
+    uint64_t registrationId) noexcept {
+  if (scope.empty() || registrationId == 0) {
     return;
   }
-  it->second -= bytes;
-  if (it->second == 0) {
-    deviceMemoryAdmissionBytes.erase(it);
+  std::lock_guard<std::mutex> lock(deviceMemoryAdmissionMutex);
+  const auto it = scopedDeviceMemoryAdmissionCredits.find(scope);
+  if (it == scopedDeviceMemoryAdmissionCredits.end()) {
+    return;
+  }
+  std::erase_if(it->second, [&](const auto& credit) {
+    return credit.registrationId == registrationId;
+  });
+  if (it->second.empty()) {
+    scopedDeviceMemoryAdmissionCredits.erase(it);
   }
 }
 } // namespace
@@ -146,10 +284,9 @@ cuda::mr::any_resource<cuda::mr::device_accessible> createMemoryResource(
         rmm::mr::managed_memory_resource{});
   } else if (mode == "prefetch_managed_pool") {
     cudf::prefetch::enable();
-    return rmm::mr::prefetch_resource_adaptor(
-        rmm::mr::pool_memory_resource(
-            rmm::mr::managed_memory_resource{},
-            rmm::percent_of_free_device_memory(percent)));
+    return rmm::mr::prefetch_resource_adaptor(rmm::mr::pool_memory_resource(
+        rmm::mr::managed_memory_resource{},
+        rmm::percent_of_free_device_memory(percent)));
   } else if (mode == "prefetch_managed_async") {
     cudf::prefetch::enable();
     return rmm::mr::prefetch_resource_adaptor(
@@ -320,6 +457,107 @@ void DeviceMemoryAdmissionReservation::release() noexcept {
   active_ = false;
 }
 
+DeviceConcurrencyAdmissionReservation::DeviceConcurrencyAdmissionReservation(
+    int device,
+    DeviceConcurrencyAdmissionDomain domain,
+    uint64_t scope) noexcept
+    : device_{device}, domain_{domain}, scope_{scope}, active_{true} {}
+
+DeviceConcurrencyAdmissionReservation::
+    ~DeviceConcurrencyAdmissionReservation() {
+  release();
+}
+
+DeviceConcurrencyAdmissionReservation::DeviceConcurrencyAdmissionReservation(
+    DeviceConcurrencyAdmissionReservation&& other) noexcept
+    : device_{other.device_},
+      domain_{other.domain_},
+      scope_{other.scope_},
+      active_{other.active_} {
+  other.device_ = -1;
+  other.scope_ = 0;
+  other.active_ = false;
+}
+
+DeviceConcurrencyAdmissionReservation&
+DeviceConcurrencyAdmissionReservation::operator=(
+    DeviceConcurrencyAdmissionReservation&& other) noexcept {
+  if (this == &other) {
+    return *this;
+  }
+  release();
+  device_ = other.device_;
+  domain_ = other.domain_;
+  scope_ = other.scope_;
+  active_ = other.active_;
+  other.device_ = -1;
+  other.scope_ = 0;
+  other.active_ = false;
+  return *this;
+}
+
+void DeviceConcurrencyAdmissionReservation::release() noexcept {
+  if (!active_) {
+    return;
+  }
+  releaseDeviceConcurrencyAdmission(device_, domain_, scope_);
+  device_ = -1;
+  scope_ = 0;
+  active_ = false;
+}
+
+DeviceMemoryAdmissionCreditRegistration::
+    DeviceMemoryAdmissionCreditRegistration(
+        std::string scope,
+        uint64_t registrationId) noexcept
+    : scope_{std::move(scope)}, registrationId_{registrationId} {}
+
+DeviceMemoryAdmissionCreditRegistration::
+    ~DeviceMemoryAdmissionCreditRegistration() {
+  release();
+}
+
+DeviceMemoryAdmissionCreditRegistration::
+    DeviceMemoryAdmissionCreditRegistration(
+        DeviceMemoryAdmissionCreditRegistration&& other) noexcept
+    : scope_{std::move(other.scope_)}, registrationId_{other.registrationId_} {
+  other.registrationId_ = 0;
+}
+
+DeviceMemoryAdmissionCreditRegistration&
+DeviceMemoryAdmissionCreditRegistration::operator=(
+    DeviceMemoryAdmissionCreditRegistration&& other) noexcept {
+  if (this == &other) {
+    return *this;
+  }
+  release();
+  scope_ = std::move(other.scope_);
+  registrationId_ = other.registrationId_;
+  other.registrationId_ = 0;
+  return *this;
+}
+
+void DeviceMemoryAdmissionCreditRegistration::release() noexcept {
+  unregisterScopedDeviceMemoryAdmissionCredit(scope_, registrationId_);
+  scope_.clear();
+  registrationId_ = 0;
+}
+
+DeviceMemoryAdmissionCredit::DeviceMemoryAdmissionCredit(
+    int device,
+    std::size_t bytes,
+    std::shared_ptr<void> owner,
+    std::function<void()> onConsumed)
+    : device_{device},
+      bytes_{bytes},
+      owner_{std::move(owner)},
+      onConsumed_{std::move(onConsumed)} {
+  VELOX_CHECK_GE(device_, 0, "Invalid device-memory admission device");
+  VELOX_CHECK_GT(bytes_, 0, "Device-memory admission credit cannot be zero");
+  VELOX_CHECK_NOT_NULL(
+      owner_, "Device-memory admission credit requires an owner");
+}
+
 std::optional<DeviceMemoryAdmissionReservation> tryAcquireDeviceMemoryAdmission(
     int device,
     std::size_t bytes,
@@ -345,6 +583,76 @@ std::optional<DeviceMemoryAdmissionReservation> tryAcquireDeviceMemoryAdmission(
   return DeviceMemoryAdmissionReservation{device, bytes};
 }
 
+std::optional<DeviceMemoryAdmissionReservation>
+waitAcquireDeviceMemoryAdmission(
+    int device,
+    std::size_t bytes,
+    std::size_t capacityBytes) {
+  if (device < 0 || bytes > capacityBytes) {
+    return std::nullopt;
+  }
+
+  std::unique_lock<std::mutex> lock(deviceMemoryAdmissionMutex);
+  deviceMemoryAdmissionCondition.wait(lock, [&] {
+    const auto it = deviceMemoryAdmissionBytes.find(device);
+    const auto reserved =
+        it == deviceMemoryAdmissionBytes.end() ? 0 : it->second;
+    return reserved <= capacityBytes - bytes;
+  });
+  auto [it, inserted] = deviceMemoryAdmissionBytes.try_emplace(device, bytes);
+  if (!inserted) {
+    it->second += bytes;
+  }
+  return DeviceMemoryAdmissionReservation{device, bytes};
+}
+
+std::optional<DeviceMemoryAdmissionReservation>
+acquireDeviceMemoryAdmissionOrFuture(
+    int device,
+    std::size_t bytes,
+    std::size_t capacityBytes,
+    ContinueFuture* future) {
+  VELOX_CHECK_NOT_NULL(future);
+  if (device < 0 || bytes > capacityBytes) {
+    return std::nullopt;
+  }
+
+  std::lock_guard<std::mutex> lock(deviceMemoryAdmissionMutex);
+  const auto it = deviceMemoryAdmissionBytes.find(device);
+  const auto reserved = it == deviceMemoryAdmissionBytes.end() ? 0 : it->second;
+  if (reserved <= capacityBytes - bytes) {
+    if (it == deviceMemoryAdmissionBytes.end()) {
+      deviceMemoryAdmissionBytes.emplace(device, bytes);
+    } else {
+      it->second += bytes;
+    }
+    return DeviceMemoryAdmissionReservation{device, bytes};
+  }
+
+  auto [promise, admissionFuture] =
+      makeVeloxContinuePromiseContract("device memory admission");
+  deviceMemoryAdmissionWaiters[device].push_back(std::move(promise));
+  *future = std::move(admissionFuture);
+  return std::nullopt;
+}
+
+void releaseDeviceMemoryAdmissionAfterStream(
+    DeviceMemoryAdmissionReservation reservation,
+    rmm::cuda_stream_view stream) {
+  if (!reservation) {
+    return;
+  }
+  auto* deferred = new DeviceMemoryAdmissionReservation(std::move(reservation));
+  const auto status = cudaLaunchHostFunc(
+      stream.value(), releaseDeviceMemoryAdmissionCallback, deferred);
+  if (status != cudaSuccess) {
+    delete deferred;
+    VELOX_FAIL(
+        "cudaLaunchHostFunc failed while deferring device-memory admission: {}",
+        cudaGetErrorString(status));
+  }
+}
+
 std::size_t deviceMemoryAdmissionReservedBytes(int device) {
   if (device < 0) {
     return 0;
@@ -352,6 +660,188 @@ std::size_t deviceMemoryAdmissionReservedBytes(int device) {
   std::lock_guard<std::mutex> lock(deviceMemoryAdmissionMutex);
   const auto it = deviceMemoryAdmissionBytes.find(device);
   return it == deviceMemoryAdmissionBytes.end() ? 0 : it->second;
+}
+
+std::optional<DeviceConcurrencyAdmissionReservation>
+acquireDeviceConcurrencyAdmissionOrFuture(
+    int device,
+    std::size_t maxConcurrent,
+    ContinueFuture* future,
+    DeviceConcurrencyAdmissionDomain domain,
+    uint64_t scope) {
+  VELOX_CHECK_NOT_NULL(future);
+  if (device < 0 || maxConcurrent == 0) {
+    return std::nullopt;
+  }
+
+  std::lock_guard<std::mutex> lock(deviceConcurrencyAdmissionMutex);
+  const auto key = deviceConcurrencyAdmissionKey(device, domain, scope);
+  auto [it, inserted] = deviceConcurrencyAdmissionCounts.try_emplace(key, 0);
+  if (it->second < maxConcurrent) {
+    ++it->second;
+    return DeviceConcurrencyAdmissionReservation{device, domain, scope};
+  }
+
+  auto [promise, admissionFuture] =
+      makeVeloxContinuePromiseContract("device concurrency admission");
+  deviceConcurrencyAdmissionWaiters[key].push_back(std::move(promise));
+  *future = std::move(admissionFuture);
+  return std::nullopt;
+}
+
+void releaseDeviceConcurrencyAdmissionAfterStream(
+    DeviceConcurrencyAdmissionReservation reservation,
+    rmm::cuda_stream_view stream) {
+  if (!reservation) {
+    return;
+  }
+  auto* deferred =
+      new DeviceConcurrencyAdmissionReservation(std::move(reservation));
+  const auto status = cudaLaunchHostFunc(
+      stream.value(), releaseDeviceConcurrencyAdmissionCallback, deferred);
+  if (status != cudaSuccess) {
+    delete deferred;
+    VELOX_FAIL(
+        "cudaLaunchHostFunc failed while deferring device-kernel admission: {}",
+        cudaGetErrorString(status));
+  }
+}
+
+DeviceMemoryAdmissionCreditRegistration
+registerScopedDeviceMemoryAdmissionCredit(
+    std::string scope,
+    int device,
+    std::size_t bytes,
+    std::shared_ptr<void> owner,
+    std::function<void()> onConsumed) {
+  VELOX_CHECK(!scope.empty(), "Device-memory admission scope cannot be empty");
+  VELOX_CHECK_GE(device, 0, "Invalid device-memory admission device");
+  VELOX_CHECK_GT(bytes, 0, "Device-memory admission credit cannot be zero");
+  VELOX_CHECK_NOT_NULL(
+      owner, "Device-memory admission credit requires an owner");
+
+  std::lock_guard<std::mutex> lock(deviceMemoryAdmissionMutex);
+  const auto registrationId = nextScopedDeviceMemoryAdmissionCreditId++;
+  scopedDeviceMemoryAdmissionCredits[scope].push_back(
+      {registrationId, device, bytes, owner, std::move(onConsumed)});
+  return DeviceMemoryAdmissionCreditRegistration{
+      std::move(scope), registrationId};
+}
+
+std::size_t scopedDeviceMemoryAdmissionCreditBytes(
+    std::string_view scope,
+    int device) {
+  if (scope.empty() || device < 0) {
+    return 0;
+  }
+  std::lock_guard<std::mutex> lock(deviceMemoryAdmissionMutex);
+  const auto it = scopedDeviceMemoryAdmissionCredits.find(std::string(scope));
+  if (it == scopedDeviceMemoryAdmissionCredits.end()) {
+    return 0;
+  }
+  std::size_t bytes = 0;
+  std::erase_if(it->second, [&](const auto& credit) {
+    auto owner = credit.owner.lock();
+    if (!owner) {
+      return true;
+    }
+    if (credit.device == device) {
+      bytes += credit.bytes;
+    }
+    return false;
+  });
+  if (it->second.empty()) {
+    scopedDeviceMemoryAdmissionCredits.erase(it);
+  }
+  return bytes;
+}
+
+std::size_t consumeScopedDeviceMemoryAdmissionCreditAfterStream(
+    std::string_view scope,
+    int device,
+    std::size_t bytes,
+    rmm::cuda_stream_view stream) {
+  if (scope.empty() || device < 0 || bytes == 0) {
+    return 0;
+  }
+
+  auto deferred = std::make_unique<DeferredScopedDeviceMemoryAdmissionCredit>();
+  std::size_t consumedBytes = 0;
+  {
+    std::lock_guard<std::mutex> lock(deviceMemoryAdmissionMutex);
+    const auto it = scopedDeviceMemoryAdmissionCredits.find(std::string(scope));
+    if (it == scopedDeviceMemoryAdmissionCredits.end()) {
+      return 0;
+    }
+    std::erase_if(it->second, [&](auto& credit) {
+      auto owner = credit.owner.lock();
+      if (!owner) {
+        return true;
+      }
+      if (credit.device != device || consumedBytes >= bytes) {
+        return false;
+      }
+      consumedBytes += credit.bytes;
+      deferred->owners.push_back(std::move(owner));
+      deferred->callbacks.push_back(std::move(credit.onConsumed));
+      return true;
+    });
+    if (it->second.empty()) {
+      scopedDeviceMemoryAdmissionCredits.erase(it);
+    }
+  }
+  if (consumedBytes == 0) {
+    return 0;
+  }
+
+  auto* deferredPtr = deferred.release();
+  const auto status = cudaLaunchHostFunc(
+      stream.value(),
+      consumeScopedDeviceMemoryAdmissionCreditCallback,
+      deferredPtr);
+  if (status != cudaSuccess) {
+    stream.synchronize();
+    consumeScopedDeviceMemoryAdmissionCreditCallback(deferredPtr);
+    VELOX_FAIL(
+        "cudaLaunchHostFunc failed while consuming scoped device-memory "
+        "admission credit: {}",
+        cudaGetErrorString(status));
+  }
+  return consumedBytes;
+}
+
+std::size_t consumeDeviceMemoryAdmissionCreditAfterStream(
+    const DeviceMemoryAdmissionCreditPtr& credit,
+    rmm::cuda_stream_view stream) {
+  if (credit == nullptr ||
+      credit->consumed_.exchange(true, std::memory_order_acq_rel)) {
+    return 0;
+  }
+
+  const auto consumedBytes = credit->bytes_;
+  auto deferred = std::make_unique<DeferredScopedDeviceMemoryAdmissionCredit>();
+  deferred->owners.push_back(credit);
+  deferred->callbacks.push_back([credit] {
+    auto callback = std::move(credit->onConsumed_);
+    credit->owner_.reset();
+    if (callback) {
+      callback();
+    }
+  });
+  auto* deferredPtr = deferred.release();
+  const auto status = cudaLaunchHostFunc(
+      stream.value(),
+      consumeScopedDeviceMemoryAdmissionCreditCallback,
+      deferredPtr);
+  if (status != cudaSuccess) {
+    stream.synchronize();
+    consumeScopedDeviceMemoryAdmissionCreditCallback(deferredPtr);
+    VELOX_FAIL(
+        "cudaLaunchHostFunc failed while consuming device-memory admission "
+        "credit: {}",
+        cudaGetErrorString(status));
+  }
+  return consumedBytes;
 }
 
 cudf::detail::cuda_stream_pool& cudfGlobalStreamPool() {

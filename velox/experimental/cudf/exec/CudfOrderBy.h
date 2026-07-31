@@ -17,6 +17,7 @@
 #pragma once
 
 #include "velox/experimental/cudf/exec/CudfOperator.h"
+#include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
 #include "velox/exec/Operator.h"
@@ -27,7 +28,9 @@
 
 #include <rmm/cuda_stream_view.hpp>
 
+#include <chrono>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -55,12 +58,10 @@ class CudfOrderBy : public CudfOperatorBase {
       const std::shared_ptr<const core::OrderByNode>& orderByNode);
 
   bool needsInput() const override {
-    return !noMoreInput_;
+    return !noMoreInput_ && (!admissionEnabled_ || inputAdmission_.has_value());
   }
 
-  exec::BlockingReason isBlocked(ContinueFuture* /*future*/) override {
-    return exec::BlockingReason::kNotBlocked;
-  }
+  exec::BlockingReason isBlocked(ContinueFuture* future) override;
 
   bool isFinished() override {
     return finished_;
@@ -110,7 +111,10 @@ class CudfOrderBy : public CudfOperatorBase {
   static uint64_t testingEmittedChunks();
   static uint64_t testingSpillCleanups();
 
+  void initializeInputAdmission();
   void spillSortedRun();
+  void bufferInput(CudfVectorPtr input);
+  void releaseInputAdmission();
   void compactSortedRunsForMerge();
   void initializeSortedRunReaders();
   void prepareSpilledOutput();
@@ -138,6 +142,11 @@ class CudfOrderBy : public CudfOperatorBase {
   // call. Keep their work and destruction ordered on one persistent stream.
   const rmm::cuda_stream_view stateStream_;
   std::vector<CudfVectorPtr> inputs_;
+  std::optional<DeviceMemoryAdmissionReservation> inputAdmission_;
+  int pendingAdmissionDevice_{-1};
+  uint64_t pendingAdmissionBytes_{0};
+  uint64_t pendingAdmissionCapacity_{0};
+  std::chrono::steady_clock::time_point pendingAdmissionStart_;
   std::vector<cudf::size_type> sortKeys_;
   std::vector<cudf::order> columnOrder_;
   std::vector<cudf::null_order> nullOrder_;
@@ -157,6 +166,9 @@ class CudfOrderBy : public CudfOperatorBase {
   bool mergeFinished_{false};
   bool spilled_{false};
   bool finished_{false};
+  bool admissionEnabled_{false};
+  uint64_t blockingAdmissions_{0};
+  uint64_t admissionWaitNanos_{0};
 
   friend class test::CudfOrderByTestHelper;
 };

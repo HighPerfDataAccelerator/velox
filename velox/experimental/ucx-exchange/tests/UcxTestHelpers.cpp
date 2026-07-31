@@ -106,7 +106,8 @@ std::shared_ptr<Task> createPartitionedOutputTask(
     const std::vector<std::string>& partitionKeys,
     uint64_t kMaxOutputBufferSize,
     const std::unordered_map<std::string, std::string>& extraConfig,
-    core::PartitionFunctionSpecPtr partitionFunctionSpec) {
+    core::PartitionFunctionSpecPtr partitionFunctionSpec,
+    std::function<core::PlanNodePtr(core::PlanNodePtr)> sourceWrapper) {
   VLOG(3) << "Creating PartitionedOutput task with " << numPartitions
           << " partitions";
 
@@ -128,6 +129,15 @@ std::shared_ptr<Task> createPartitionedOutputTask(
                           .values({rowVector})
                           .partitionedOutput(partitionKeys, numPartitions)
                           .planFragment();
+  if (sourceWrapper) {
+    auto output = std::dynamic_pointer_cast<const core::PartitionedOutputNode>(
+        planFragment.planNode);
+    VELOX_CHECK_NOT_NULL(output);
+    planFragment.planNode =
+        core::PartitionedOutputNode::Builder(*output)
+            .source(sourceWrapper(output->sources().front()))
+            .build();
+  }
   if (partitionFunctionSpec) {
     auto output = std::dynamic_pointer_cast<const core::PartitionedOutputNode>(
         planFragment.planNode);

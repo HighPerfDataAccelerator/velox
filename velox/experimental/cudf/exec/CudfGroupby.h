@@ -17,9 +17,11 @@
 
 #include "velox/experimental/cudf/exec/CudfAggregation.h"
 #include "velox/experimental/cudf/exec/CudfOperator.h"
+#include "velox/experimental/cudf/exec/GpuResources.h"
 
 #include <cudf/groupby.hpp>
 
+#include <chrono>
 #include <optional>
 
 namespace facebook::velox::cudf_velox {
@@ -51,6 +53,17 @@ struct GroupbyAggregator {
       std::vector<cudf::groupby::aggregation_result>& results,
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr) = 0;
+
+  virtual bool supportsPartialPassthrough() const {
+    return false;
+  }
+
+  virtual std::unique_ptr<cudf::column> makePartialPassthroughColumn(
+      cudf::table_view const& /*tbl*/,
+      rmm::cuda_stream_view /*stream*/,
+      rmm::device_async_resource_ref /*mr*/) {
+    VELOX_UNSUPPORTED("Partial aggregation passthrough is not supported");
+  }
 
   virtual ~GroupbyAggregator() = default;
 
@@ -95,12 +108,11 @@ class CudfGroupby : public CudfOperatorBase {
   void initialize() override;
 
   bool needsInput() const override {
-    return !noMoreInput_;
+    return !noMoreInput_ && bufferedResult_ == nullptr &&
+        pendingInput_ == nullptr;
   }
 
-  exec::BlockingReason isBlocked(ContinueFuture* /* unused */) override {
-    return exec::BlockingReason::kNotBlocked;
-  }
+  exec::BlockingReason isBlocked(ContinueFuture* future) override;
 
   bool isFinished() override;
 
@@ -139,7 +151,15 @@ class CudfGroupby : public CudfOperatorBase {
       rmm::device_async_resource_ref mr);
 
   CudfVectorPtr releaseAndResetBufferedResult();
+  CudfVectorPtr makePartialAggregationPassthrough(CudfVectorPtr input);
+  bool shouldAbandonPartialAggregation(
+      int64_t numInputRows,
+      int64_t numOutputRows) const;
 
+  void processInput(CudfVectorPtr input);
+  void initializeExpandingPartialAdmission();
+  void releaseExpandingPartialAdmission();
+  void releaseExpandingStateAdmission();
   void prepareInputForStateStream(const CudfVectorPtr& input);
 
   void computePartialGroupbyStreaming(CudfVectorPtr tbl);
@@ -187,7 +207,27 @@ class CudfGroupby : public CudfOperatorBase {
   // compaction overrides that suffix with the intermediate step.
   bool streamingEnabled_{true};
   const int64_t maxPartialAggregationMemoryUsage_;
+  const int32_t abandonPartialAggregationMinRows_;
+  const int32_t abandonPartialAggregationMinPct_;
+  bool partialPassthroughSupported_{false};
+  bool abandonedPartialAggregation_{false};
   int64_t numInputRows_ = 0;
+
+  bool expandingPartialAdmissionEnabled_{false};
+  int expandingPartialAdmissionDevice_{-1};
+  std::optional<DeviceConcurrencyAdmissionReservation>
+      expandingPartialAdmission_;
+  std::optional<std::chrono::steady_clock::time_point>
+      expandingPartialAdmissionWaitStart_;
+  bool currentExpandingPartialAdmissionBlocked_{false};
+  int64_t currentExpandingPartialAdmissionWaitNanos_{0};
+  bool expandingStateAdmissionEnabled_{false};
+  uint64_t expandingStateAdmissionScope_{0};
+  std::optional<DeviceConcurrencyAdmissionReservation> expandingStateAdmission_;
+  std::optional<std::chrono::steady_clock::time_point>
+      expandingStateAdmissionWaitStart_;
+  bool expandingStateAdmissionBlocked_{false};
+  CudfVectorPtr pendingInput_;
 
   bool finished_ = false;
   size_t numAggregates_;
@@ -197,6 +237,7 @@ class CudfGroupby : public CudfOperatorBase {
   TypePtr inputType_;
   RowTypePtr bufferedResultType_;
   CudfVectorPtr bufferedResult_;
+  int64_t bufferedResultInputRows_{0};
 
   // PARTIAL and SINGLE aggregation produce one compacted state per input
   // page. Keep those states in logarithmic size levels and merge only peers

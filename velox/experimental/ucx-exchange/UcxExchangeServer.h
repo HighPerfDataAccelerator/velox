@@ -117,7 +117,7 @@ class UcxExchangeServer
   }
 
   const PartitionKey partitionKey_;
-  const uint32_t
+  const uint64_t
       partitionKeyHash_; // A hash of above, used to create unique tags.
 
   /// True if server and source are on the same node (determined by checking

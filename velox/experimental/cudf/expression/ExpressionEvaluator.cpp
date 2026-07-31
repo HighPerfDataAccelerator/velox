@@ -62,6 +62,7 @@
 #include <cudf/strings/combine.hpp>
 #include <cudf/strings/contains.hpp>
 #include <cudf/strings/convert/convert_datetime.hpp>
+#include <cudf/strings/convert/convert_fixed_point.hpp>
 #include <cudf/strings/convert/convert_floats.hpp>
 #include <cudf/strings/convert/convert_integers.hpp>
 #include <cudf/strings/extract.hpp>
@@ -611,6 +612,13 @@ bool isStringToTimestampVeloxCast(
       dstVelox->kind() == TypeKind::TIMESTAMP;
 }
 
+bool isStringToDecimalVeloxCast(
+    const TypePtr& srcVelox,
+    const TypePtr& dstVelox) {
+  return srcVelox != nullptr && dstVelox != nullptr &&
+      srcVelox->kind() == TypeKind::VARCHAR && dstVelox->isDecimal();
+}
+
 bool isTimestampToStringVeloxCast(
     const TypePtr& srcVelox,
     const TypePtr& dstVelox) {
@@ -834,6 +842,30 @@ std::unique_ptr<cudf::column> parseSparkStringDateCast(
       dateValidNoNulls->view(),
       stream,
       mr);
+}
+
+std::unique_ptr<cudf::column> parseFixedPointWithInvalidsAsNulls(
+    cudf::column_view inputCol,
+    cudf::data_type targetType,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) {
+  auto strings = cudf::strings_column_view(inputCol);
+  auto validMask =
+      cudf::strings::is_fixed_point(strings, targetType, stream, mr);
+  cudf::numeric_scalar<bool> falseScalar(false, true, stream, mr);
+  auto validNoNulls =
+      cudf::replace_nulls(validMask->view(), falseScalar, stream, mr);
+
+  cudf::string_scalar zero("0", true, stream, mr);
+  auto safeInput =
+      cudf::copy_if_else(inputCol, zero, validNoNulls->view(), stream, mr);
+  auto parsed = cudf::strings::to_fixed_point(
+      cudf::strings_column_view(safeInput->view()), targetType, stream, mr);
+  auto nullScalar =
+      cudf::make_default_constructed_scalar(targetType, stream, mr);
+  nullScalar->set_valid_async(false, stream);
+  return cudf::copy_if_else(
+      parsed->view(), *nullScalar, validNoNulls->view(), stream, mr);
 }
 
 double timestampUnitFactor(cudf::data_type targetType) {
@@ -1374,6 +1406,7 @@ class CastFunction : public CudfFunction {
     kStringToBool,
     kStringToDate,
     kStringToTimestamp,
+    kStringToDecimal,
     kNumericToTimestamp,
     kNumericToBool,
     kListIntegralToString
@@ -1420,6 +1453,8 @@ class CastFunction : public CudfFunction {
       castMode_ = CastMode::kStringToDate;
     } else if (isStringToTimestampVeloxCast(sourceVeloxType, targetVeloxType)) {
       castMode_ = CastMode::kStringToTimestamp;
+    } else if (isStringToDecimalVeloxCast(sourceVeloxType, targetVeloxType)) {
+      castMode_ = CastMode::kStringToDecimal;
     } else if (isNumericToTimestampVeloxCast(
                    sourceVeloxType, targetVeloxType)) {
       castMode_ = CastMode::kNumericToTimestamp;
@@ -1450,26 +1485,24 @@ class CastFunction : public CudfFunction {
         return cudf::strings::from_timestamps(
             inputCol,
             "%Y-%m-%d",
-            cudf::strings_column_view(
-                cudf::column_view{
-                    cudf::data_type{cudf::type_id::STRING},
-                    0,
-                    nullptr,
-                    nullptr,
-                    0}),
+            cudf::strings_column_view(cudf::column_view{
+                cudf::data_type{cudf::type_id::STRING},
+                0,
+                nullptr,
+                nullptr,
+                0}),
             stream,
             mr);
       case CastMode::kTimestampToString:
         return cudf::strings::from_timestamps(
             inputCol,
             "%Y-%m-%d %H:%M:%S",
-            cudf::strings_column_view(
-                cudf::column_view{
-                    cudf::data_type{cudf::type_id::STRING},
-                    0,
-                    nullptr,
-                    nullptr,
-                    0}),
+            cudf::strings_column_view(cudf::column_view{
+                cudf::data_type{cudf::type_id::STRING},
+                0,
+                nullptr,
+                nullptr,
+                0}),
             stream,
             mr);
       case CastMode::kIntToString:
@@ -1536,6 +1569,9 @@ class CastFunction : public CudfFunction {
         return parseSparkStringDateCast(inputCol, targetCudfType_, stream, mr);
       case CastMode::kStringToTimestamp:
         return parseSparkStringDateCast(inputCol, targetCudfType_, stream, mr);
+      case CastMode::kStringToDecimal:
+        return parseFixedPointWithInvalidsAsNulls(
+            inputCol, targetCudfType_, stream, mr);
       case CastMode::kNumericToTimestamp:
         return castNumericSecondsToTimestamp(
             inputCol,
@@ -1688,9 +1724,8 @@ class ArrayConstructorFunction : public CudfFunction {
 
     for (size_t arg = 0; arg < numInputs_; ++arg) {
       if (literals_[arg]) {
-        materializedLiterals.push_back(
-            cudf::make_column_from_scalar(
-                *literals_[arg], outputSize, stream, mr));
+        materializedLiterals.push_back(cudf::make_column_from_scalar(
+            *literals_[arg], outputSize, stream, mr));
         views.push_back(materializedLiterals.back()->view());
       } else {
         const auto inputColumnIndex = inputColumnIndices_[arg];
@@ -1790,6 +1825,29 @@ class SortArrayFunction : public CudfFunction {
 
  private:
   bool asc_{true};
+};
+
+class ArraySortFunction : public CudfFunction {
+ public:
+  explicit ArraySortFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
+    VELOX_CHECK_EQ(
+        expr->inputs().size(),
+        1,
+        "array_sort default comparator expects exactly 1 input");
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    VELOX_CHECK_EQ(inputColumns.size(), 1);
+    return cudf::lists::sort_lists(
+        cudf::lists_column_view(asView(inputColumns[0])),
+        cudf::order::ASCENDING,
+        cudf::null_order::AFTER,
+        stream,
+        mr);
+  }
 };
 
 class ArrayDistinctFunction : public CudfFunction {
@@ -2790,13 +2848,12 @@ class SwitchFunction : public CudfFunction {
         } else if (isNonNullEmptyArrayConstantLiteral(inputs[i])) {
           operands_.push_back(Operand{nullptr, nullptr, inputs[i]->type(), 0});
         } else {
-          operands_.push_back(
-              Operand{
-                  VELOX_DYNAMIC_SCALAR_TYPE_DISPATCH(
-                      createCudfScalar, constValue->typeKind(), constValue),
-                  nullptr,
-                  nullptr,
-                  0});
+          operands_.push_back(Operand{
+              VELOX_DYNAMIC_SCALAR_TYPE_DISPATCH(
+                  createCudfScalar, constValue->typeKind(), constValue),
+              nullptr,
+              nullptr,
+              0});
         }
       } else {
         operands_.push_back(Operand{nullptr, nullptr, nullptr, columnIndex++});
@@ -2816,9 +2873,8 @@ class SwitchFunction : public CudfFunction {
 
     auto operandView = [&](const Operand& operand) -> cudf::column_view {
       if (operand.scalar) {
-        materializedScalars.push_back(
-            cudf::make_column_from_scalar(
-                *operand.scalar, rowCount, stream, mr));
+        materializedScalars.push_back(cudf::make_column_from_scalar(
+            *operand.scalar, rowCount, stream, mr));
         return materializedScalars.back()->view();
       }
       if (operand.nullArrayType) {
@@ -3932,13 +3988,12 @@ class RowConstructorFunction : public CudfFunction {
         // Velox UNKNOWN is the logical type of an untyped NULL literal and
         // has no cuDF physical type. Keep the logical UNKNOWN in the row
         // schema and use an all-null byte column as its inert physical child.
-        children.push_back(
-            cudf::make_fixed_width_column(
-                cudf::data_type{cudf::type_id::INT8},
-                outputSize,
-                cudf::mask_state::ALL_NULL,
-                stream,
-                mr));
+        children.push_back(cudf::make_fixed_width_column(
+            cudf::data_type{cudf::type_id::INT8},
+            outputSize,
+            cudf::mask_state::ALL_NULL,
+            stream,
+            mr));
       } else {
         VELOX_CHECK_LT(nextInputColumnIndex, inputColumns.size());
         children.push_back(
@@ -4087,9 +4142,8 @@ class MapFunction : public CudfFunction {
 
     for (size_t arg = firstArg; arg < numInputs_; arg += 2) {
       if (literals_[arg]) {
-        materializedLiterals.push_back(
-            cudf::make_column_from_scalar(
-                *literals_[arg], outputSize, stream, mr));
+        materializedLiterals.push_back(cudf::make_column_from_scalar(
+            *literals_[arg], outputSize, stream, mr));
         views.push_back(materializedLiterals.back()->view());
       } else {
         const auto inputColumnIndex = inputColumnIndices_[arg];
@@ -4599,6 +4653,13 @@ bool registerBuiltinFunctions(const std::string& prefix) {
            .argumentType("array(T)")
            .constantArgumentType("boolean")
            .build()});
+
+  registerCudfFunction(
+      prefix + "array_sort",
+      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<ArraySortFunction>(expr);
+      },
+      {arrayIdentitySignature});
 
   registerCudfFunction(
       prefix + "array_distinct",
@@ -5525,6 +5586,9 @@ bool FunctionExpression::canEvaluate(std::shared_ptr<velox::exec::Expr> expr) {
       return true;
     }
     if (isStringToTimestampVeloxCast(srcType, dstType)) {
+      return true;
+    }
+    if (isStringToDecimalVeloxCast(srcType, dstType)) {
       return true;
     }
     if (isNumericToTimestampVeloxCast(srcType, dstType)) {

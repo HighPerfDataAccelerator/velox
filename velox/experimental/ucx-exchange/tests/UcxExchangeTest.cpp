@@ -28,11 +28,13 @@
 #include <gtest/gtest-param-test.h>
 #include <gtest/gtest.h>
 #include <rmm/device_buffer.hpp>
+#include <array>
 #include <chrono>
 #include <future>
 #include <memory>
 #include <optional>
 #include <sstream>
+#include <unordered_set>
 #include <vector>
 #include "velox/common/memory/MemoryPool.h"
 #include "velox/core/QueryConfig.h"
@@ -55,6 +57,42 @@ using namespace facebook::velox::core;
 
 namespace facebook::velox::ucx_exchange {
 
+TEST(UcxExchangeProtocolTest, largeMppStreamTagsDoNotAlias) {
+  // These two stream keys collide under the old 32-bit FNV-1a tag layout.
+  const std::string first =
+      "gpu-local-spark-c546902dc2194410bde3fc8efbc4c906-0-28-p8/80";
+  const std::string second =
+      "gpu-local-spark-c546902dc2194410bde3fc8efbc4c906-2-4-p15/84";
+
+  const auto firstHash = partitionKeyHash(first);
+  const auto secondHash = partitionKeyHash(second);
+  EXPECT_NE(firstHash, secondHash);
+  EXPECT_NE(getMetadataTag(firstHash, 0), getMetadataTag(secondHash, 0));
+  EXPECT_NE(getMetadataTag(firstHash, 7), getDataTag(firstHash, 7));
+  EXPECT_NE(getMetadataTag(firstHash, 0), getHandshakeResponseTag(firstHash));
+  EXPECT_THROW(
+      getMetadataTag(firstHash, kMaxExchangeSequenceNumber + 1),
+      VeloxException);
+
+  std::unordered_set<uint64_t> hashes;
+  hashes.reserve(4 * 31 * 32 * 128);
+  for (int peer = 0; peer < 4; ++peer) {
+    for (int fragment = 0; fragment < 31; ++fragment) {
+      for (int replica = 0; replica < 32; ++replica) {
+        for (int destination = 0; destination < 128; ++destination) {
+          const auto key = fmt::format(
+              "gpu-local-spark-c546902dc2194410bde3fc8efbc4c906-{}-{}-p{}/{}",
+              peer,
+              fragment,
+              replica,
+              destination);
+          EXPECT_TRUE(hashes.insert(partitionKeyHash(key)).second) << key;
+        }
+      }
+    }
+  }
+}
+
 struct ExchangeTestParams {
   int numSrcDrivers;
   int numDstDrivers;
@@ -65,6 +103,38 @@ struct ExchangeTestParams {
   TableType tableType = TableType::NARROW; // Default to narrow table
 
   bool operator==(const ExchangeTestParams&) const = default;
+};
+
+class ConditionalTopNTestTable : public WideTestTable {
+ public:
+  inline static const RowTypePtr kConditionalRowType =
+      ROW({"int8_col",
+           "int16_col",
+           "int32_col",
+           "int64_col",
+           "float32_col",
+           "float64_col",
+           "__gluten_mpp_topn_active"},
+          kColumnTypes);
+
+  void initialize(size_t numRows) override {
+    WideTestTable::initialize(numRows);
+    std::fill(boolData_.begin(), boolData_.end(), false);
+  }
+
+  RowTypePtr getRowType() const override {
+    return kConditionalRowType;
+  }
+};
+
+class SyntheticConditionalTopNTestTable : public ConditionalTopNTestTable {
+ public:
+  inline static const RowTypePtr kSyntheticRowType =
+      ROW({"n0", "n1", "n2", "n3", "n4", "n5", "n6"}, kColumnTypes);
+
+  RowTypePtr getRowType() const override {
+    return kSyntheticRowType;
+  }
 };
 
 // Helper function to generate test parameters with different numUpstreamTasks
@@ -252,13 +322,12 @@ TEST_P(UcxExchangeTest, basicTest) {
         p.numPartitions,
         p.numSrcDrivers);
 
-    sourceMocks.emplace_back(
-        std::make_shared<UcxPartitionedOutputMock>(
-            srcTaskId,
-            p.numSrcDrivers,
-            p.numPartitions,
-            p.numChunks,
-            p.numRowsPerChunk));
+    sourceMocks.emplace_back(std::make_shared<UcxPartitionedOutputMock>(
+        srcTaskId,
+        p.numSrcDrivers,
+        p.numPartitions,
+        p.numChunks,
+        p.numRowsPerChunk));
   }
 
   // Create one sink task per partition to receive data from each partition
@@ -364,14 +433,13 @@ TEST_P(UcxExchangeTest, dataIntegrityTest) {
     // Mock the UcxPartitionedOutput operator, it will produce numChunks of
     // data each containing numRowsPerChunk of data copied from the UcxTestData
     // object data
-    sourceMocks.emplace_back(
-        std::make_shared<UcxPartitionedOutputMock>(
-            srcTaskId,
-            p.numSrcDrivers,
-            p.numPartitions,
-            p.numChunks,
-            p.numRowsPerChunk,
-            dataToSend));
+    sourceMocks.emplace_back(std::make_shared<UcxPartitionedOutputMock>(
+        srcTaskId,
+        p.numSrcDrivers,
+        p.numPartitions,
+        p.numChunks,
+        p.numRowsPerChunk,
+        dataToSend));
   }
 
   // Create one sink task per partition to receive data from each partition
@@ -484,14 +552,13 @@ TEST_P(UcxExchangeTest, bandwidthTest) {
     // Mock the UcxPartitionedOutput operator, it will produce numChunks of
     // data each containing numRowsPerChunk of data copied from the UcxTestData
     // object data
-    sourceMocks.emplace_back(
-        std::make_shared<UcxPartitionedOutputMock>(
-            srcTaskId,
-            p.numSrcDrivers,
-            p.numPartitions,
-            p.numChunks,
-            p.numRowsPerChunk,
-            dataToSend));
+    sourceMocks.emplace_back(std::make_shared<UcxPartitionedOutputMock>(
+        srcTaskId,
+        p.numSrcDrivers,
+        p.numPartitions,
+        p.numChunks,
+        p.numRowsPerChunk,
+        dataToSend));
   }
 
   const std::string sinkTaskId = taskPrefix + "sinkTask";
@@ -658,6 +725,182 @@ TEST_P(UcxExchangeTest, realPartitionedOutputTest) {
   queueManager_->removeTask(srcTaskId);
 
   VLOG(3) << "- UcxExchangeTest::realPartitionedOutputTest";
+}
+
+TEST_P(UcxExchangeTest, conditionalTopNPassthroughStaysOnPeer) {
+  const auto p = GetParam();
+  if (p.tableType != TableType::NARROW || p.numSrcDrivers != 1 ||
+      p.numPartitions != 4 || p.numChunks != 100 || p.numRowsPerChunk != 1000 ||
+      p.numUpstreamTasks != 1) {
+    GTEST_SKIP();
+  }
+
+  const auto taskPrefix = getUniqueTaskPrefix();
+  const auto srcTaskId = taskPrefix + "sourceTask0";
+  constexpr int32_t kNumPartitions = 4;
+  constexpr int32_t kPeerIndex = 1;
+  constexpr int32_t kPeerCount = 2;
+
+  auto dataToSend = std::make_shared<ConditionalTopNTestTable>();
+  dataToSend->initialize(p.numRowsPerChunk);
+  std::unordered_map<std::string, std::string> extraConfig{
+      {"gluten.mpp.peer_index", std::to_string(kPeerIndex)},
+      {"gluten.mpp.peer_count", std::to_string(kPeerCount)}};
+  auto srcTask = createPartitionedOutputTask(
+      srcTaskId,
+      pool_,
+      ConditionalTopNTestTable::kConditionalRowType,
+      kNumPartitions,
+      {"__gluten_mpp_topn_active", "int32_col"},
+      FOUR_GBYTES,
+      extraConfig);
+  queueManager_->initializeTask(
+      srcTask,
+      core::PartitionedOutputNode::Kind::kPartitioned,
+      kNumPartitions,
+      1);
+  auto sourceDriver = std::make_shared<SourceDriverMock>(
+      srcTask, 1, p.numChunks, p.numRowsPerChunk, dataToSend);
+
+  sourceDriver->run();
+  sourceDriver->joinThreads();
+
+  std::array<uint64_t, kNumPartitions> rowsByDestination{};
+  for (int32_t destination = 0; destination < kNumPartitions; ++destination) {
+    while (true) {
+      bool callbackInvoked = false;
+      std::shared_ptr<cudf::packed_columns> data;
+      queueManager_->getData(
+          srcTaskId,
+          destination,
+          [&](std::shared_ptr<cudf::packed_columns> next,
+              std::vector<int64_t>) {
+            data = std::move(next);
+            callbackInvoked = true;
+          });
+      ASSERT_TRUE(callbackInvoked);
+      if (data == nullptr) {
+        break;
+      }
+      rowsByDestination[destination] += cudf::unpack(*data).num_rows();
+    }
+    queueManager_->deleteResults(srcTaskId, destination);
+  }
+
+  EXPECT_EQ(rowsByDestination[0], 0);
+  EXPECT_EQ(rowsByDestination[1], 0);
+  EXPECT_GT(rowsByDestination[2], 0);
+  EXPECT_GT(rowsByDestination[3], 0);
+  EXPECT_EQ(
+      rowsByDestination[2] + rowsByDestination[3],
+      static_cast<uint64_t>(p.numChunks) * p.numRowsPerChunk);
+  queueManager_->removeTask(srcTaskId);
+}
+
+TEST_P(
+    UcxExchangeTest,
+    conditionalTopNMetadataRoutesSyntheticVeloxNamesLocally) {
+  const auto p = GetParam();
+  if (p.tableType != TableType::NARROW || p.numSrcDrivers != 1 ||
+      p.numPartitions != 4 || p.numChunks != 100 || p.numRowsPerChunk != 1000 ||
+      p.numUpstreamTasks != 1) {
+    GTEST_SKIP();
+  }
+
+  const auto taskPrefix = getUniqueTaskPrefix();
+  const auto srcTaskId = taskPrefix + "sourceTask0";
+  constexpr int32_t kNumPartitions = 4;
+  constexpr int32_t kPeerIndex = 1;
+  constexpr int32_t kPeerCount = 2;
+  constexpr int32_t kMarkerChannel = 6;
+
+  auto dataToSend = std::make_shared<SyntheticConditionalTopNTestTable>();
+  dataToSend->initialize(p.numRowsPerChunk);
+  std::unordered_map<std::string, std::string> extraConfig{
+      {"gluten.mpp.peer_index", std::to_string(kPeerIndex)},
+      {"gluten.mpp.peer_count", std::to_string(kPeerCount)}};
+  auto srcTask = createPartitionedOutputTask(
+      srcTaskId,
+      pool_,
+      SyntheticConditionalTopNTestTable::kSyntheticRowType,
+      kNumPartitions,
+      {"n2"},
+      FOUR_GBYTES,
+      extraConfig,
+      nullptr,
+      [kMarkerChannel](core::PlanNodePtr source) {
+        const auto& inputType = source->outputType();
+        return std::make_shared<core::TopNRowNumberNode>(
+            "partial_topn",
+            core::TopNRowNumberNode::RankFunction::kRank,
+            std::vector<core::FieldAccessTypedExprPtr>{
+                std::make_shared<core::FieldAccessTypedExpr>(
+                    inputType->childAt(kMarkerChannel), "n6"),
+                std::make_shared<core::FieldAccessTypedExpr>(
+                    inputType->childAt(2), "n2")},
+            std::vector<core::FieldAccessTypedExprPtr>{
+                std::make_shared<core::FieldAccessTypedExpr>(
+                    inputType->childAt(3), "n3")},
+            std::vector<core::SortOrder>{core::kDescNullsLast},
+            std::nullopt,
+            1,
+            std::move(source),
+            true,
+            kMarkerChannel);
+      });
+  const auto output =
+      std::dynamic_pointer_cast<const core::PartitionedOutputNode>(
+          srcTask->planFragment().planNode);
+  ASSERT_NE(output, nullptr);
+  const auto partialTopN =
+      std::dynamic_pointer_cast<const core::TopNRowNumberNode>(
+          output->sources().front());
+  ASSERT_NE(partialTopN, nullptr);
+  EXPECT_TRUE(partialTopN->emitBatchCandidates());
+  EXPECT_EQ(
+      partialTopN->conditionalPassthroughKey(),
+      std::optional<int32_t>{kMarkerChannel});
+  queueManager_->initializeTask(
+      srcTask,
+      core::PartitionedOutputNode::Kind::kPartitioned,
+      kNumPartitions,
+      1);
+  auto sourceDriver = std::make_shared<SourceDriverMock>(
+      srcTask, 1, p.numChunks, p.numRowsPerChunk, dataToSend);
+
+  sourceDriver->run();
+  sourceDriver->joinThreads();
+
+  std::array<uint64_t, kNumPartitions> rowsByDestination{};
+  for (int32_t destination = 0; destination < kNumPartitions; ++destination) {
+    while (true) {
+      bool callbackInvoked = false;
+      std::shared_ptr<cudf::packed_columns> data;
+      queueManager_->getData(
+          srcTaskId,
+          destination,
+          [&](std::shared_ptr<cudf::packed_columns> next,
+              std::vector<int64_t>) {
+            data = std::move(next);
+            callbackInvoked = true;
+          });
+      ASSERT_TRUE(callbackInvoked);
+      if (data == nullptr) {
+        break;
+      }
+      rowsByDestination[destination] += cudf::unpack(*data).num_rows();
+    }
+    queueManager_->deleteResults(srcTaskId, destination);
+  }
+
+  EXPECT_EQ(rowsByDestination[0], 0);
+  EXPECT_EQ(rowsByDestination[1], 0);
+  EXPECT_GT(rowsByDestination[2], 0);
+  EXPECT_GT(rowsByDestination[3], 0);
+  EXPECT_EQ(
+      rowsByDestination[2] + rowsByDestination[3],
+      static_cast<uint64_t>(p.numChunks) * p.numRowsPerChunk);
+  queueManager_->removeTask(srcTaskId);
 }
 
 // Test using real UcxPartitionedOutput with data integrity verification.

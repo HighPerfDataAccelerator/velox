@@ -153,6 +153,91 @@ TEST_F(CudfBatchConcatTest, concatFlushesAtByteThreshold) {
   EXPECT_LT(concatStats.outputVectors, concatStats.inputVectors);
 }
 
+TEST_F(CudfBatchConcatTest, partialConcatRespectsAggregationMemoryLimit) {
+  updateCudfConfig(
+      /*min=*/std::numeric_limits<int32_t>::max(),
+      /*max=*/std::nullopt,
+      /*minBytes=*/10'000);
+  CudfConfig::getInstance().concatOptimizationEnabled = true;
+
+  std::vector<RowVectorPtr> vectors;
+  for (int i = 0; i < 6; ++i) {
+    vectors.push_back(makeRowVector(
+        {makeFlatSequence<int64_t>(i * 10, 10),
+         makeFlatSequence<int64_t>(i * 10, 10)}));
+  }
+  createDuckDbTable(vectors);
+
+  auto generator = std::make_shared<core::PlanNodeIdGenerator>();
+  core::PlanNodeId partialNodeId;
+  auto plan = PlanBuilder(generator)
+                  .addNode([&](auto, auto) {
+                    return createFragmentedSource(vectors, generator);
+                  })
+                  .partialAggregation({"c0"}, {"sum(c1)"})
+                  .capturePlanNodeId(partialNodeId)
+                  .finalAggregation()
+                  .planNode();
+
+  auto task = AssertQueryBuilder(duckDbQueryRunner_)
+                  .plan(plan)
+                  .config(core::QueryConfig::kMaxPartialAggregationMemory, 100)
+                  .maxDrivers(1)
+                  .assertResults("SELECT c0, sum(c1) FROM tmp GROUP BY c0");
+
+  const auto planStats = toPlanStats(task->taskStats());
+  const auto& nodeStats = planStats.at(partialNodeId);
+  const auto concatIt = nodeStats.operatorStats.find("CudfBatchConcat");
+  ASSERT_NE(concatIt, nodeStats.operatorStats.end());
+  EXPECT_EQ(concatIt->second->inputVectors, 6);
+  EXPECT_EQ(concatIt->second->outputVectors, 6);
+}
+
+TEST_F(CudfBatchConcatTest, finalConcatRespectsExchangeByteThreshold) {
+  updateCudfConfig(
+      /*min=*/std::numeric_limits<int32_t>::max(),
+      /*max=*/std::nullopt,
+      /*minBytes=*/0);
+  CudfConfig::getInstance().concatOptimizationEnabled = true;
+
+  std::vector<RowVectorPtr> vectors;
+  for (int i = 0; i < 6; ++i) {
+    vectors.push_back(makeRowVector(
+        {makeFlatSequence<int64_t>(i * 10, 10),
+         makeFlatSequence<int64_t>(i * 10, 10)}));
+  }
+  createDuckDbTable(vectors);
+
+  auto generator = std::make_shared<core::PlanNodeIdGenerator>();
+  core::PlanNodeId finalNodeId;
+  auto plan = PlanBuilder(generator)
+                  .addNode([&](auto, auto) {
+                    return createFragmentedSource(vectors, generator);
+                  })
+                  .partialAggregation({"c0"}, {"sum(c1)"})
+                  .localPartition({"c0"})
+                  .finalAggregation()
+                  .capturePlanNodeId(finalNodeId)
+                  .planNode();
+
+  auto task =
+      AssertQueryBuilder(duckDbQueryRunner_)
+          .plan(plan)
+          .config(core::QueryConfig::kMaxPartialAggregationMemory, 100)
+          .config(CudfConfig::kCudfExchangeBatchSizeMinThresholdBytes, "256")
+          .maxDrivers(1)
+          .assertResults("SELECT c0, sum(c1) FROM tmp GROUP BY c0");
+
+  const auto planStats = toPlanStats(task->taskStats());
+  const auto& nodeStats = planStats.at(finalNodeId);
+  const auto concatIt = nodeStats.operatorStats.find("CudfBatchConcat");
+  ASSERT_NE(concatIt, nodeStats.operatorStats.end());
+  const auto targetBytes =
+      concatIt->second->customStats.find("cudfBatchConcatTargetBytes");
+  ASSERT_NE(targetBytes, concatIt->second->customStats.end());
+  EXPECT_EQ(targetBytes->second.sum, 256);
+}
+
 // Verifies that CudfBatchConcat is not inserted when the optimization is
 // disabled, even when aggregation is present.
 TEST_F(CudfBatchConcatTest, concatNotInsertedWhenDisabled) {

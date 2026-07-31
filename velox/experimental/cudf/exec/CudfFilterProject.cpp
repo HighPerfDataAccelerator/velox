@@ -58,8 +58,18 @@ bool checkAddIdentityProjection(
     const core::TypedExprPtr& projection,
     const RowTypePtr& inputType,
     column_index_t outputChannel,
-    std::vector<exec::IdentityProjection>& identityProjections) {
-  if (auto field = core::TypedExprs::asFieldAccess(projection)) {
+    std::vector<exec::IdentityProjection>& identityProjections,
+    bool& sameTypeCast) {
+  auto candidate = projection;
+  if (const auto cast =
+          std::dynamic_pointer_cast<const core::CastTypedExpr>(projection);
+      cast != nullptr && cast->inputs().size() == 1 &&
+      *cast->type() == *cast->inputs()[0]->type()) {
+    candidate = cast->inputs()[0];
+    sameTypeCast = true;
+  }
+
+  if (auto field = core::TypedExprs::asFieldAccess(candidate)) {
     const auto& inputs = field->inputs();
     if (inputs.empty() ||
         (inputs.size() == 1 &&
@@ -280,11 +290,14 @@ void CudfFilterProject::initialize() {
 
     for (column_index_t i = 0; i < project_->projections().size(); i++) {
       auto& projection = project_->projections()[i];
+      bool sameTypeCast = false;
       bool identityProjection = checkAddIdentityProjection(
-          projection, inputType, i, identityProjections_);
+          projection, inputType, i, identityProjections_, sameTypeCast);
       if (!identityProjection) {
         allExprs.push_back(projection);
         nonIdentityProjectionChannels.push_back(i);
+      } else if (sameTypeCast) {
+        ++sameTypeCastIdentityProjections_;
       }
     }
     resultProjections_.reserve(nonIdentityProjectionChannels.size());
@@ -515,6 +528,19 @@ bool CudfFilterProject::allInputProcessed() {
 
 bool CudfFilterProject::isFinished() {
   return noMoreInput_ && allInputProcessed();
+}
+
+void CudfFilterProject::doClose() {
+  if (sameTypeCastIdentityProjections_ > 0) {
+    Operator::stats().wlock()->addRuntimeStat(
+        "cudfSameTypeCastIdentityProjections",
+        RuntimeCounter(sameTypeCastIdentityProjections_));
+  }
+  Operator::close();
+  projectEvaluators_.clear();
+  literalScalars_.clear();
+  nullComplexLiteralProjections_.clear();
+  filterEvaluator_.reset();
 }
 
 } // namespace facebook::velox::cudf_velox

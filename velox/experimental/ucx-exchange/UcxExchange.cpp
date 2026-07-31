@@ -186,7 +186,12 @@ RowVectorPtr UcxExchange::getOutputFromPackedTable() {
   // Use the stream that was allocated in UcxExchangeSource::onMetadata
   // and the packed_table constructor of CudfVector to avoid copying data.
   auto result = std::make_shared<cudf_velox::CudfVector>(
-      pool(), outputType_, numRows, std::move(data.packedTable), data.stream);
+      pool(),
+      outputType_,
+      numRows,
+      std::move(data.packedTable),
+      data.stream,
+      std::move(data.residencyOwner));
 
   recordInputStats(gpuDataSize, result);
   // free the memory owned by PackedTableWithStream and set it to nullptr;

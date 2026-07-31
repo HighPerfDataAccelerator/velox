@@ -19,6 +19,7 @@
 #include "velox/experimental/cudf/exec/DebugUtil.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/NvtxHelper.h"
+#include "velox/experimental/cudf/vector/CudfVector.h"
 
 #include "velox/common/base/SpillConfig.h"
 #include "velox/core/PlanNode.h"
@@ -26,6 +27,7 @@
 
 #include <glog/logging.h>
 
+#include <algorithm>
 #include <type_traits>
 
 namespace facebook::velox::cudf_velox {
@@ -139,6 +141,19 @@ class CudfOperatorBase : public exec::Operator, public NvtxHelper {
       logDeviceMemory("addInput", "before", inputRows, -1);
     }
     try {
+      if (const auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input)) {
+        for (const auto& credit : cudfInput->deviceMemoryAdmissionCredits()) {
+          const auto duplicate = std::find_if(
+              deviceMemoryAdmissionCredits_.begin(),
+              deviceMemoryAdmissionCredits_.end(),
+              [&](const auto& existing) {
+                return existing.get() == credit.get();
+              });
+          if (duplicate == deviceMemoryAdmissionCredits_.end()) {
+            deviceMemoryAdmissionCredits_.push_back(credit);
+          }
+        }
+      }
       doAddInput(std::move(input));
       checkCudaErrorInDebug();
       if (sample) {
@@ -161,6 +176,11 @@ class CudfOperatorBase : public exec::Operator, public NvtxHelper {
     }
     try {
       auto result = doGetOutput();
+      if (auto cudfResult = std::dynamic_pointer_cast<CudfVector>(result)) {
+        for (const auto& credit : deviceMemoryAdmissionCredits_) {
+          cudfResult->addDeviceMemoryAdmissionCredit(credit);
+        }
+      }
       checkCudaErrorInDebug();
       if (sample) {
         logDeviceMemory(
@@ -201,6 +221,7 @@ class CudfOperatorBase : public exec::Operator, public NvtxHelper {
     }
     try {
       doClose();
+      deviceMemoryAdmissionCredits_.clear();
       checkCudaErrorInDebug();
       if (sample) {
         logDeviceMemory("close", "after", -1, -1);
@@ -242,18 +263,17 @@ class CudfOperatorBase : public exec::Operator, public NvtxHelper {
     if (!deviceMemoryDiagnosticsEnabled()) {
       return;
     }
-    logDeviceMemorySnapshot(
-        fmt::format(
-            "operator={} node={} operatorId={} method={} phase={} inputRows={} "
-            "outputRows={} call={}",
-            className_,
-            planNodeId_,
-            operatorId_,
-            method,
-            phase,
-            inputRows,
-            outputRows,
-            deviceMemoryCallCount_));
+    logDeviceMemorySnapshot(fmt::format(
+        "operator={} node={} operatorId={} method={} phase={} inputRows={} "
+        "outputRows={} call={}",
+        className_,
+        planNodeId_,
+        operatorId_,
+        method,
+        phase,
+        inputRows,
+        outputRows,
+        deviceMemoryCallCount_));
   }
 
   const std::string className_;
@@ -261,6 +281,7 @@ class CudfOperatorBase : public exec::Operator, public NvtxHelper {
   const int32_t operatorId_;
   const NvtxMethodFlag nvtxMethods_;
   uint64_t deviceMemoryCallCount_{0};
+  std::vector<DeviceMemoryAdmissionCreditPtr> deviceMemoryAdmissionCredits_;
 };
 
 } // namespace facebook::velox::cudf_velox

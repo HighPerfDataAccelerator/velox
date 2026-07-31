@@ -80,6 +80,7 @@ class CudfBatchConcat : public CudfOperatorBase {
   uint64_t currentNumBytes_{0};
   const size_t targetRows_{0};
   const uint64_t targetBytes_{0};
+  bool runtimeStatsRecorded_{false};
   bool summaryLogged_{false};
 };
 

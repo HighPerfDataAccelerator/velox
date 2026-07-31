@@ -74,6 +74,20 @@ class UcxPartitionedOutput : public exec::Operator,
   // function using the given stream.
   void hashPartition(cudf::table_view tableView, rmm::cuda_stream_view stream);
 
+  void hashPartitionGlobally(
+      cudf::table_view tableView,
+      rmm::cuda_stream_view stream);
+
+  // Routes conditional TopN rows that require ranking by the normal global
+  // hash, while keeping semantic pass-through rows on this peer.
+  void conditionalHashPartition(
+      cudf::table_view tableView,
+      rmm::cuda_stream_view stream);
+
+  void localPassthroughPartition(
+      cudf::table_view tableView,
+      rmm::cuda_stream_view stream);
+
   // Computes a Spark-compatible INT32 partition id from serialized range
   // boundaries, then routes rows by that explicit id.
   void rangePartition(cudf::table_view tableView, rmm::cuda_stream_view stream);
@@ -91,13 +105,30 @@ class UcxPartitionedOutput : public exec::Operator,
       std::vector<cudf::size_type> offsets,
       rmm::cuda_stream_view stream);
 
+  void enqueuePartition(
+      int32_t destination,
+      std::unique_ptr<cudf::packed_columns> data,
+      int32_t numRows);
+
   const std::weak_ptr<UcxOutputQueueManager> queueManager_;
   std::vector<column_index_t> partitionKeyIndices_;
+  std::optional<column_index_t> conditionalMarkerIndex_;
+  int32_t localDestinationBegin_{0};
+  int32_t localDestinationEnd_{0};
+  uint64_t conditionalActiveRows_{0};
+  uint64_t conditionalPassthroughRows_{0};
+  bool conditionalStatsRecorded_{false};
+  uint64_t deviceQueueAdmissionBlockedCount_{0};
+  bool deviceQueueAdmissionStatsRecorded_{false};
+  std::shared_ptr<UcxOutputQueueMemoryManager::Waiter>
+      deviceQueueAdmissionWaiter_;
   std::string rangeBoundsJson_;
   std::unique_ptr<cudf::table> rangeBoundaries_;
   std::vector<cudf::order> rangeOrders_;
   std::vector<cudf::null_order> rangeNullOrders_;
   const size_t numPartitions_;
+  size_t partitionCount_;
+  int32_t fanout_{1};
 
   const int pipelineId_;
   const int driverId_;

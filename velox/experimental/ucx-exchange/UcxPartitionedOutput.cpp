@@ -18,6 +18,9 @@
 #include <algorithm>
 #include <cstdlib>
 #include <limits>
+#include <numeric>
+#include <sstream>
+#include <string_view>
 #include "velox/core/PlanNode.h"
 #include "velox/core/QueryConfig.h"
 #include "velox/exec/Driver.h"
@@ -26,6 +29,7 @@
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
+#include "velox/experimental/ucx-exchange/FanoutPartitionFunction.h"
 #include "velox/experimental/ucx-exchange/RangePartitionFunction.h"
 
 #include <cudf/concatenate.hpp>
@@ -33,7 +37,10 @@
 #include <cudf/copying.hpp>
 #include <cudf/detail/utilities/stream_pool.hpp>
 #include <cudf/partitioning.hpp>
+#include <cudf/reduction.hpp>
 #include <cudf/search.hpp>
+#include <cudf/stream_compaction.hpp>
+#include <cudf/unary.hpp>
 
 using namespace facebook::velox::cudf_velox;
 using facebook::velox::exec::Task;
@@ -50,6 +57,9 @@ constexpr int64_t kDefaultMaxRowsPerHashPartitionCall = 128'000'000;
 // When no reservation can be obtained, cap this driver's estimated transient
 // hash-partition peak so concurrent unadmitted fallbacks remain bounded.
 constexpr uint64_t kMaxUnadmittedHashPartitionPeakBytes = uint64_t{1} << 30;
+constexpr std::string_view kConditionalTopNMarker = "__gluten_mpp_topn_active";
+constexpr std::string_view kMppPeerIndex = "gluten.mpp.peer_index";
+constexpr std::string_view kMppPeerCount = "gluten.mpp.peer_count";
 
 bool containsStructColumn(const cudf::column_view& column) {
   if (column.type().id() == cudf::type_id::STRUCT) {
@@ -130,6 +140,67 @@ int64_t maxRowsPerHashPartitionWindow(const core::QueryConfig& queryConfig) {
       positiveEnvironmentOverride("GLUTEN_UCX_HASH_PARTITION_WINDOW_ROWS");
   return environmentRows > 0 ? environmentRows
                              : queryConfig.ucxHashPartitionWindowRows();
+}
+
+std::optional<std::pair<int32_t, int32_t>> localDestinationRange(
+    int32_t peerIndex,
+    int32_t peerCount,
+    int32_t numPartitions) {
+  VELOX_CHECK_GE(peerIndex, 0);
+  VELOX_CHECK_GT(peerCount, 0);
+  VELOX_CHECK_LT(peerIndex, peerCount);
+  VELOX_CHECK_GT(numPartitions, 0);
+
+  std::vector<double> peerWeights(peerCount, 1.0);
+  if (const auto* weights = std::getenv("GLUTEN_MPP_PEER_WEIGHTS")) {
+    std::stringstream input(weights);
+    std::string token;
+    size_t index = 0;
+    while (std::getline(input, token, ',') && index < peerWeights.size()) {
+      try {
+        peerWeights[index] = std::max(0.01, std::stod(token));
+      } catch (...) {
+        VELOX_FAIL(
+            "Invalid GLUTEN_MPP_PEER_WEIGHTS value '{}' at index {}",
+            token,
+            index);
+      }
+      ++index;
+    }
+    VELOX_CHECK_EQ(
+        index,
+        peerWeights.size(),
+        "GLUTEN_MPP_PEER_WEIGHTS must contain exactly {} values",
+        peerWeights.size());
+  }
+
+  const auto totalWeight =
+      std::accumulate(peerWeights.begin(), peerWeights.end(), 0.0);
+  const auto owner = [&](int32_t destination) {
+    const auto target =
+        (static_cast<double>(destination) + 0.5) * totalWeight / numPartitions;
+    double cumulative = 0;
+    for (int32_t peer = 0; peer < peerCount; ++peer) {
+      cumulative += peerWeights[peer];
+      if (target < cumulative) {
+        return peer;
+      }
+    }
+    return peerCount - 1;
+  };
+
+  int32_t begin = numPartitions;
+  int32_t end = numPartitions;
+  for (int32_t destination = 0; destination < numPartitions; ++destination) {
+    if (owner(destination) == peerIndex) {
+      begin = std::min(begin, destination);
+      end = destination + 1;
+    }
+  }
+  if (begin == end) {
+    return std::nullopt;
+  }
+  return std::pair{begin, end};
 }
 
 bool partialAggregationBehindProjects(
@@ -229,6 +300,7 @@ UcxPartitionedOutput::UcxPartitionedOutput(
           fmt::format("[{}]", planNode->id())),
       queueManager_(UcxOutputQueueManager::getInstanceRef()),
       numPartitions_(planNode->numPartitions()),
+      partitionCount_(planNode->numPartitions()),
       pipelineId_(ctx->pipelineId),
       driverId_(ctx->driverId),
       sourceNeedsOwnerBoundaryBackpressure_(
@@ -241,6 +313,64 @@ UcxPartitionedOutput::UcxPartitionedOutput(
       hashPartitionWindowRows_(
           maxRowsPerHashPartitionWindow(ctx->queryConfig())) {
   this->initPartitionKeys(planNode);
+  if (const auto topN =
+          std::dynamic_pointer_cast<const core::TopNRowNumberNode>(
+              planNode->sources().front());
+      topN != nullptr && topN->emitBatchCandidates() &&
+      topN->conditionalPassthroughKey().has_value()) {
+    const auto channel = *topN->conditionalPassthroughKey();
+    VELOX_CHECK_GE(channel, 0);
+    VELOX_CHECK_LT(
+        static_cast<size_t>(channel), planNode->outputType()->size());
+    conditionalMarkerIndex_ = channel;
+  }
+  const auto peerIndex =
+      ctx->queryConfig().get<int32_t>(std::string(kMppPeerIndex), -1);
+  const auto peerCount =
+      ctx->queryConfig().get<int32_t>(std::string(kMppPeerCount), 1);
+  if (peerIndex >= 0 && peerCount > 1 && partitionCount_ > 1 &&
+      rangeBoundsJson_.empty()) {
+    const auto& rowType = planNode->outputType();
+    if (!conditionalMarkerIndex_.has_value()) {
+      for (const auto channel : partitionKeyIndices_) {
+        const auto& name = rowType->nameOf(channel);
+        if (name.compare(
+                0, kConditionalTopNMarker.size(), kConditionalTopNMarker) ==
+            0) {
+          VELOX_CHECK(
+              !conditionalMarkerIndex_.has_value(),
+              "Conditional MPP hash output has more than one TopN marker");
+          conditionalMarkerIndex_ = channel;
+        }
+      }
+    }
+    if (conditionalMarkerIndex_.has_value()) {
+      const auto channel = *conditionalMarkerIndex_;
+      VELOX_CHECK_EQ(
+          rowType->childAt(channel)->kind(),
+          TypeKind::BOOLEAN,
+          "Conditional TopN marker must be BOOLEAN");
+      const auto localRange = localDestinationRange(
+          peerIndex, peerCount, static_cast<int32_t>(partitionCount_));
+      if (!localRange.has_value()) {
+        LOG(WARNING) << "UcxPartitionedOutput disabling conditional-local "
+                        "routing because peer "
+                     << peerIndex << " owns no destination among "
+                     << partitionCount_ << " partitions";
+        conditionalMarkerIndex_.reset();
+      } else {
+        std::tie(localDestinationBegin_, localDestinationEnd_) = *localRange;
+        LOG(INFO) << "UcxPartitionedOutput enabling conditional-local routing"
+                  << " task=" << taskId()
+                  << " markerChannel=" << *conditionalMarkerIndex_
+                  << " peer=" << peerIndex << "/" << peerCount
+                  << " localDestinations=[" << localDestinationBegin_ << ","
+                  << localDestinationEnd_ << ")";
+      }
+    }
+  } else {
+    conditionalMarkerIndex_.reset();
+  }
   auto sources = planNode->sources();
   std::vector<std::string> inNames, outNames;
   inNames.reserve(planNode->inputType()->size());
@@ -288,9 +418,8 @@ void UcxPartitionedOutput::addInput(RowVectorPtr input) {
 }
 
 void UcxPartitionedOutput::flushPending() {
-  CudaAllocationTraceScope allocationTrace(
-      fmt::format(
-          "UcxPartitionedOutput task={} method=flushPending", taskId()));
+  CudaAllocationTraceScope allocationTrace(fmt::format(
+      "UcxPartitionedOutput task={} method=flushPending", taskId()));
   if (!hasActiveFlush() && pendingInputs_.empty()) {
     return;
   }
@@ -356,7 +485,7 @@ void UcxPartitionedOutput::preparePendingFlush() {
   activeStream_ = stream;
   activeNextRow_ = 0;
   const auto tableRows = activeTableView().num_rows();
-  if (numPartitions_ > 1 && rangeBoundsJson_.empty() &&
+  if (partitionCount_ > 1 && rangeBoundsJson_.empty() &&
       (partitionKeyIndices_.size() > 0 || spec_ == "gather") &&
       hashPartitionInputBatchRows_ > 0) {
     const auto configuredWindowRows = hashPartitionWindowRows_ > 0
@@ -381,7 +510,7 @@ void UcxPartitionedOutput::preparePendingFlush() {
             configuredRows,
             static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))),
         sourceWindowBytes);
-  } else if (numPartitions_ == 1) {
+  } else if (partitionCount_ == 1) {
     // SINGLE/gather exchanges yield after each output-sized chunk as well.
     activeRowsPerWindow_ = rowsPerUcxChunk(
         tableRows,
@@ -468,9 +597,32 @@ void UcxPartitionedOutput::advanceActiveFlush() {
   auto stream = *activeStream_;
   auto rowsThisWindow = std::min<cudf::size_type>(
       activeRowsPerWindow_, tableRows - activeNextRow_);
+  std::optional<UcxOutputQueueMemoryManager::Reservation>
+      outputQueueReservation;
+  uint64_t estimatedOutputBytes = 0;
+  if (tableRows > 0 && activeSourceFlatBytes_ > 0 && rowsThisWindow > 0) {
+    const auto averageRowBytes =
+        activeSourceFlatBytes_ / static_cast<uint64_t>(tableRows) +
+        static_cast<uint64_t>(
+            activeSourceFlatBytes_ % static_cast<uint64_t>(tableRows) != 0);
+    estimatedOutputBytes =
+        averageRowBytes * static_cast<uint64_t>(rowsThisWindow);
+  }
+  if (sharedQueueManager()->reserveDeviceQueueBytes(
+          estimatedOutputBytes,
+          taskId(),
+          &future_,
+          outputQueueReservation,
+          deviceQueueAdmissionWaiter_)) {
+    ++deviceQueueAdmissionBlockedCount_;
+    blockingReason_ = exec::BlockingReason::kWaitForConsumer;
+    VLOG(2) << "UcxPartitionedOutput blocked before output window task="
+            << taskId() << " estimatedOutputBytes=" << estimatedOutputBytes;
+    return;
+  }
   std::optional<cudf_velox::DeviceMemoryAdmissionReservation> memoryAdmission;
 
-  if (numPartitions_ > 1 && rangeBoundsJson_.empty() &&
+  if (partitionCount_ > 1 && rangeBoundsJson_.empty() &&
       (partitionKeyIndices_.size() > 0 || spec_ == "gather") &&
       hashPartitionInputBatchRows_ > 0 && rowsThisWindow > 0 &&
       activeSourceFlatBytes_ > 0 && tableRows > 0) {
@@ -481,7 +633,7 @@ void UcxPartitionedOutput::advanceActiveFlush() {
     const auto estimatePeakBytes = [&](uint64_t rows) {
       const auto sourceBytes = averageRowBytes * rows;
       const auto scratchBytes = rows * uint64_t{12} +
-          static_cast<uint64_t>(numPartitions_) * uint64_t{4096};
+          static_cast<uint64_t>(partitionCount_) * uint64_t{4096};
       // activeTableView() already owns the source and headroom excludes that
       // live allocation. Admission reserves only the new partitioned output,
       // hash scratch, and allocator headroom.
@@ -603,7 +755,7 @@ void UcxPartitionedOutput::advanceActiveFlush() {
 
   auto partitionInput = slices[0];
   std::unique_ptr<cudf::table> materializedPartitionInput;
-  if (numPartitions_ > 1 && containsStructColumn(partitionInput)) {
+  if (partitionCount_ > 1 && containsStructColumn(partitionInput)) {
     // libcudf partition requires STRUCT children to align with their sliced
     // parent. Materialize this bounded window to normalize nested offsets.
     materializedPartitionInput = std::make_unique<cudf::table>(
@@ -611,7 +763,7 @@ void UcxPartitionedOutput::advanceActiveFlush() {
     partitionInput = materializedPartitionInput->view();
   }
 
-  if (numPartitions_ > 1) {
+  if (partitionCount_ > 1) {
     if (!rangeBoundsJson_.empty()) {
       rangePartition(partitionInput, stream);
     } else if (partitionKeyIndices_.size() > 0 || spec_ == "gather") {
@@ -627,8 +779,7 @@ void UcxPartitionedOutput::advanceActiveFlush() {
     stream.synchronize();
     auto packedColsPtr = std::make_unique<cudf::packed_columns>(
         std::move(packedCols.metadata), std::move(packedCols.gpu_data));
-    sharedQueueManager()->enqueue(
-        this->taskId(), 0, std::move(packedColsPtr), slices[0].num_rows());
+    enqueuePartition(0, std::move(packedColsPtr), slices[0].num_rows());
   }
 
   activeNextRow_ = end;
@@ -674,6 +825,22 @@ RowVectorPtr UcxPartitionedOutput::getOutput() {
   // its future has been moved by isBlocked() and resumed by the Driver.
   if (noMoreInput_ && !hasActiveFlush() && pendingInputs_.empty() &&
       blockingReason_ == exec::BlockingReason::kNotBlocked) {
+    if (conditionalMarkerIndex_.has_value() && !conditionalStatsRecorded_) {
+      auto lockedStats = stats_.wlock();
+      lockedStats->addRuntimeStat(
+          "conditionalHashActiveRows", RuntimeCounter(conditionalActiveRows_));
+      lockedStats->addRuntimeStat(
+          "conditionalHashLocalPassthroughRows",
+          RuntimeCounter(conditionalPassthroughRows_));
+      conditionalStatsRecorded_ = true;
+    }
+    if (!deviceQueueAdmissionStatsRecorded_) {
+      auto lockedStats = stats_.wlock();
+      lockedStats->addRuntimeStat(
+          "deviceQueueAdmissionBlockedCount",
+          RuntimeCounter(deviceQueueAdmissionBlockedCount_));
+      deviceQueueAdmissionStatsRecorded_ = true;
+    }
     sharedQueueManager()->noMoreData(this->taskId());
     finished_ = true;
   }
@@ -710,6 +877,21 @@ void UcxPartitionedOutput::initPartitionKeys(
 
   // Get partition function specification string
   spec_ = planNode->partitionFunctionSpec().toString();
+
+  if (auto* fanoutFunctionSpec =
+          dynamic_cast<const FanoutPartitionFunctionSpec*>(
+              &planNode->partitionFunctionSpec())) {
+    partitionKeyIndices_ = fanoutFunctionSpec->keyChannels();
+    partitionCount_ = fanoutFunctionSpec->basePartitions();
+    fanout_ = fanoutFunctionSpec->fanout();
+    VELOX_CHECK_EQ(numPartitions_, partitionCount_ * fanout_);
+    LOG(INFO) << "UcxPartitionedOutput enabling packed fanout task=" << taskId()
+              << " basePartitions=" << partitionCount_ << " fanout=" << fanout_
+              << " mode="
+              << (partitionKeyIndices_.empty() ? "round-robin" : "hash")
+              << " physicalDestinations=" << numPartitions_;
+    return;
+  }
 
   if (auto* rangeFunctionSpec = dynamic_cast<const RangePartitionFunctionSpec*>(
           &planNode->partitionFunctionSpec())) {
@@ -757,6 +939,102 @@ void UcxPartitionedOutput::initPartitionKeys(
 void UcxPartitionedOutput::hashPartition(
     cudf::table_view tableView,
     rmm::cuda_stream_view stream) {
+  if (conditionalMarkerIndex_.has_value()) {
+    conditionalHashPartition(tableView, stream);
+    return;
+  }
+  hashPartitionGlobally(tableView, stream);
+}
+
+void UcxPartitionedOutput::conditionalHashPartition(
+    cudf::table_view tableView,
+    rmm::cuda_stream_view stream) {
+  VELOX_CHECK(conditionalMarkerIndex_.has_value());
+  const auto marker = tableView.column(*conditionalMarkerIndex_);
+  VELOX_CHECK(
+      marker.type().id() == cudf::type_id::BOOL8,
+      "Conditional TopN marker must be BOOL8");
+  VELOX_CHECK_EQ(
+      marker.null_count(), 0, "Conditional TopN marker cannot contain nulls");
+
+  auto anyActiveScalar = cudf::reduce(
+      marker,
+      *cudf::make_any_aggregation<cudf::reduce_aggregation>(),
+      cudf::data_type(cudf::type_id::BOOL8),
+      stream,
+      cudf::get_current_device_resource_ref());
+  const auto* anyActive =
+      static_cast<const cudf::scalar_type_t<bool>*>(anyActiveScalar.get());
+  if (!anyActive->is_valid(stream) || !anyActive->value(stream)) {
+    conditionalPassthroughRows_ += tableView.num_rows();
+    localPassthroughPartition(tableView, stream);
+    return;
+  }
+
+  auto allActiveScalar = cudf::reduce(
+      marker,
+      *cudf::make_all_aggregation<cudf::reduce_aggregation>(),
+      cudf::data_type(cudf::type_id::BOOL8),
+      stream,
+      cudf::get_current_device_resource_ref());
+  const auto* allActive =
+      static_cast<const cudf::scalar_type_t<bool>*>(allActiveScalar.get());
+  if (allActive->is_valid(stream) && allActive->value(stream)) {
+    conditionalActiveRows_ += tableView.num_rows();
+    hashPartitionGlobally(tableView, stream);
+    return;
+  }
+
+  auto active = cudf::apply_boolean_mask(
+      tableView, marker, stream, cudf::get_current_device_resource_ref());
+  auto inactiveMask = cudf::unary_operation(
+      marker,
+      cudf::unary_operator::NOT,
+      stream,
+      cudf::get_current_device_resource_ref());
+  auto inactive = cudf::apply_boolean_mask(
+      tableView,
+      inactiveMask->view(),
+      stream,
+      cudf::get_current_device_resource_ref());
+  conditionalActiveRows_ += active->num_rows();
+  conditionalPassthroughRows_ += inactive->num_rows();
+  if (active->num_rows() > 0) {
+    hashPartitionGlobally(active->view(), stream);
+  }
+  if (inactive->num_rows() > 0) {
+    localPassthroughPartition(inactive->view(), stream);
+  }
+}
+
+void UcxPartitionedOutput::localPassthroughPartition(
+    cudf::table_view tableView,
+    rmm::cuda_stream_view stream) {
+  VELOX_CHECK_LT(localDestinationBegin_, localDestinationEnd_);
+  VELOX_CHECK_LE(localDestinationEnd_, partitionCount_);
+  const auto localPartitions = localDestinationEnd_ - localDestinationBegin_;
+  std::vector<cudf::size_type> offsets;
+  offsets.reserve(partitionCount_ - 1);
+  for (int32_t destination = 0;
+       destination < static_cast<int32_t>(partitionCount_) - 1;
+       ++destination) {
+    cudf::size_type offset = 0;
+    if (destination >= localDestinationEnd_ - 1) {
+      offset = tableView.num_rows();
+    } else if (destination >= localDestinationBegin_) {
+      const auto localBoundary = destination - localDestinationBegin_ + 1;
+      offset = static_cast<cudf::size_type>(
+          static_cast<int64_t>(tableView.num_rows()) * localBoundary /
+          localPartitions);
+    }
+    offsets.push_back(offset);
+  }
+  splitAndEnqueue(tableView, std::move(offsets), stream);
+}
+
+void UcxPartitionedOutput::hashPartitionGlobally(
+    cudf::table_view tableView,
+    rmm::cuda_stream_view stream) {
   const auto maxRows = hashPartitionInputBatchRows_;
   if (maxRows > 0 && tableView.num_rows() > maxRows) {
     VLOG(2) << "UcxPartitionedOutput pre-slicing hash input task=" << taskId()
@@ -771,8 +1049,6 @@ void UcxPartitionedOutput::hashPartition(
       int32_t rows;
       std::unique_ptr<cudf::packed_columns> data;
     };
-    auto queueManager = sharedQueueManager();
-
     // Bound the temporary residency of the safe hash path.  Keeping every
     // 500K-row partitioned chunk for the full input, followed by all 32
     // recombined destinations and all packed buffers, amplified a wide Q10
@@ -809,11 +1085,11 @@ void UcxPartitionedOutput::hashPartition(
         auto [partitionedTable, partitionOffsets] = cudf::hash_partition(
             slices[0],
             partitionKeyIndices,
-            numPartitions_,
+            partitionCount_,
             cudf::hash_id::HASH_MURMUR3,
             cudf::DEFAULT_HASH_SEED,
             stream);
-        VELOX_CHECK_EQ(partitionOffsets.size(), numPartitions_ + 1);
+        VELOX_CHECK_EQ(partitionOffsets.size(), partitionCount_ + 1);
         VELOX_CHECK_EQ(partitionOffsets.front(), 0);
         partitionOffsets.erase(partitionOffsets.begin());
         partitionOffsets.pop_back();
@@ -844,18 +1120,18 @@ void UcxPartitionedOutput::hashPartition(
         auto [partitionedTable, partitionOffsets] = cudf::hash_partition(
             slices[0],
             partitionKeyIndices,
-            numPartitions_,
+            partitionCount_,
             cudf::hash_id::HASH_MURMUR3,
             cudf::DEFAULT_HASH_SEED,
             stream);
-        VELOX_CHECK_EQ(partitionOffsets.size(), numPartitions_ + 1);
+        VELOX_CHECK_EQ(partitionOffsets.size(), partitionCount_ + 1);
         VELOX_CHECK_EQ(partitionOffsets.front(), 0);
         chunks.push_back(
             {std::move(partitionedTable), std::move(partitionOffsets)});
         start = end;
       }
 
-      for (int destination = 0; destination < numPartitions_; ++destination) {
+      for (int destination = 0; destination < partitionCount_; ++destination) {
         std::vector<cudf::table_view> destinationViews;
         destinationViews.reserve(chunks.size());
         for (const auto& chunk : chunks) {
@@ -910,8 +1186,7 @@ void UcxPartitionedOutput::hashPartition(
         // release this destination's concatenate/pack temporaries immediately.
         stream.synchronize();
         for (auto& packed : packedPartitions) {
-          queueManager->enqueue(
-              this->taskId(), destination, std::move(packed.data), packed.rows);
+          enqueuePartition(destination, std::move(packed.data), packed.rows);
         }
       }
     }
@@ -919,7 +1194,7 @@ void UcxPartitionedOutput::hashPartition(
   }
 
   VLOG(3) << "@" << taskId() << "#" << pipelineId_ << "/" << driverId_
-          << " Hashing and partitioning into " << numPartitions_ << " chunks";
+          << " Hashing and partitioning into " << partitionCount_ << " chunks";
 
   // Use cudf hash partitioning
   std::vector<cudf::size_type> partitionKeyIndices;
@@ -930,12 +1205,12 @@ void UcxPartitionedOutput::hashPartition(
   auto [partitionedTable, partitionOffsets] = cudf::hash_partition(
       tableView,
       partitionKeyIndices,
-      numPartitions_,
+      partitionCount_,
       cudf::hash_id::HASH_MURMUR3,
       cudf::DEFAULT_HASH_SEED,
       stream);
 
-  VELOX_CHECK_EQ(partitionOffsets.size(), numPartitions_ + 1);
+  VELOX_CHECK_EQ(partitionOffsets.size(), partitionCount_ + 1);
   VELOX_CHECK_EQ(partitionOffsets[0], 0);
 
   // Erase first element since it's always 0 and we don't need it.
@@ -966,7 +1241,7 @@ void UcxPartitionedOutput::rangePartition(
         cudf::get_current_device_resource_ref());
     VELOX_CHECK_LT(
         rangeBoundaries_->num_rows(),
-        numPartitions_,
+        partitionCount_,
         "RANGE_PID boundary count must be smaller than requested partitions");
   }
 
@@ -995,10 +1270,10 @@ void UcxPartitionedOutput::rangePartition(
   auto [partitionedTable, partitionOffsets] = cudf::partition(
       tableView,
       partitionIds->view(),
-      numPartitions_,
+      partitionCount_,
       stream,
       cudf::get_current_device_resource_ref());
-  normalizePartitionOffsets(partitionOffsets, numPartitions_);
+  normalizePartitionOffsets(partitionOffsets, partitionCount_);
   splitAndEnqueue(partitionedTable->view(), partitionOffsets, stream);
 }
 
@@ -1006,11 +1281,11 @@ void UcxPartitionedOutput::equalPartition(
     cudf::table_view tableView,
     rmm::cuda_stream_view stream) {
   VLOG(3) << "@" << taskId() << "#" << pipelineId_ << "/" << driverId_
-          << " Splitting into " << numPartitions_ << " chunks";
+          << " Splitting into " << partitionCount_ << " chunks";
   std::vector<cudf::size_type> offsets;
   cudf::size_type size = tableView.num_rows();
-  for (int i = 1; i < numPartitions_; ++i) {
-    cudf::size_type idx = size * i / numPartitions_;
+  for (int i = 1; i < partitionCount_; ++i) {
+    cudf::size_type idx = size * i / partitionCount_;
     offsets.push_back(idx);
   }
   splitAndEnqueue(tableView, offsets, stream);
@@ -1029,9 +1304,8 @@ void UcxPartitionedOutput::splitAndEnqueue(
   stream.synchronize();
 
   VELOX_CHECK_EQ(
-      offsets.size() + 1, numPartitions_, "mismatch in numPartitions_");
-  auto queueManager = sharedQueueManager();
-  for (int i = 0; i < numPartitions_; ++i) {
+      offsets.size() + 1, partitionCount_, "mismatch in partitionCount_");
+  for (int i = 0; i < partitionCount_; ++i) {
     auto const& partitionTable = contiguousTables[i];
     const auto partitionRows = partitionTable.table.num_rows();
     if (partitionRows == 0) {
@@ -1065,11 +1339,8 @@ void UcxPartitionedOutput::splitAndEnqueue(
         stream.synchronize();
         auto packedColsPtr = std::make_unique<cudf::packed_columns>(
             std::move(packedCols.metadata), std::move(packedCols.gpu_data));
-        queueManager->enqueue(
-            this->taskId(),
-            i,
-            std::move(packedColsPtr),
-            slicedTables[0].num_rows());
+        enqueuePartition(
+            i, std::move(packedColsPtr), slicedTables[0].num_rows());
       }
       continue;
     }
@@ -1079,12 +1350,27 @@ void UcxPartitionedOutput::splitAndEnqueue(
         std::move(contiguousTables[i].data.gpu_data));
 
     // enqueue partition data on Ucx Output Buffer
-    queueManager->enqueue(
-        this->taskId(),
-        i,
-        std::move(packedColsPtr),
-        partitionTable.table.num_rows());
+    enqueuePartition(
+        i, std::move(packedColsPtr), partitionTable.table.num_rows());
   }
+}
+
+void UcxPartitionedOutput::enqueuePartition(
+    int32_t destination,
+    std::unique_ptr<cudf::packed_columns> data,
+    int32_t numRows) {
+  auto queueManager = sharedQueueManager();
+  if (fanout_ == 1) {
+    queueManager->enqueue(taskId(), destination, std::move(data), numRows);
+    return;
+  }
+  queueManager->enqueueFanout(
+      taskId(),
+      destination,
+      static_cast<int32_t>(partitionCount_),
+      fanout_,
+      std::move(data),
+      numRows);
 }
 
 } // namespace facebook::velox::ucx_exchange

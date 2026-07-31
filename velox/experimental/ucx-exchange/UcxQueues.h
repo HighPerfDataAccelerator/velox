@@ -20,12 +20,125 @@
 #include <deque>
 #include <functional>
 #include <memory>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <unordered_map>
 #include <vector>
 #include "velox/core/PlanNode.h"
 #include "velox/exec/OutputBuffer.h" // for the Stats structure
 #include "velox/exec/Task.h"
 
 namespace facebook::velox::ucx_exchange {
+
+class UcxOutputQueueMemoryManager
+    : public std::enable_shared_from_this<UcxOutputQueueMemoryManager> {
+ public:
+  class Reservation {
+   public:
+    Reservation() = default;
+    ~Reservation();
+
+    Reservation(Reservation&& other) noexcept;
+    Reservation& operator=(Reservation&& other) noexcept;
+
+    Reservation(const Reservation&) = delete;
+    Reservation& operator=(const Reservation&) = delete;
+
+   private:
+    friend class UcxOutputQueueMemoryManager;
+
+    Reservation(
+        std::shared_ptr<UcxOutputQueueMemoryManager> manager,
+        uint64_t bytes,
+        std::string group);
+
+    void release() noexcept;
+
+    std::shared_ptr<UcxOutputQueueMemoryManager> manager_;
+    uint64_t bytes_{0};
+    std::string group_;
+  };
+
+  class Waiter {
+   private:
+    friend class UcxOutputQueueMemoryManager;
+
+    Waiter(uint64_t bytes, std::string group, ContinuePromise promise)
+        : bytes_(bytes),
+          group_(std::move(group)),
+          promise_(std::move(promise)) {}
+
+    Waiter(uint64_t bytes, std::string group, std::function<void()> wakeup)
+        : bytes_(bytes), group_(std::move(group)), wakeup_(std::move(wakeup)) {}
+
+    uint64_t bytes_;
+    std::string group_;
+    std::optional<ContinuePromise> promise_;
+    std::function<void()> wakeup_;
+    std::optional<Reservation> reservation_;
+  };
+
+  explicit UcxOutputQueueMemoryManager(
+      std::optional<uint64_t> capacityBytes = std::nullopt,
+      std::string label = "output queue");
+
+  /// Atomically reserves capacity for one output residency window, or
+  /// installs a future that is fulfilled when queued data releases capacity.
+  bool reserve(
+      uint64_t bytes,
+      std::string_view taskId,
+      ContinueFuture* future,
+      std::optional<Reservation>& reservation,
+      std::shared_ptr<Waiter>& waiter);
+
+  bool reserve(
+      uint64_t bytes,
+      std::string_view taskId,
+      std::function<void()> wakeup,
+      std::optional<Reservation>& reservation,
+      std::shared_ptr<Waiter>& waiter);
+
+  void addQueuedBytes(
+      uint64_t bytes,
+      int64_t packedColumns,
+      std::string_view taskId);
+  void removeQueuedBytes(
+      uint64_t bytes,
+      int64_t packedColumns,
+      std::string_view taskId);
+
+  uint64_t queuedBytes() const;
+  uint64_t capacityBytes() const {
+    return capacityBytes_;
+  }
+
+  uint64_t peakResidentBytes() const;
+
+ private:
+  struct GroupUsage {
+    uint64_t queuedBytes{0};
+    uint64_t reservedBytes{0};
+  };
+
+  void releaseReservation(uint64_t bytes, const std::string& group) noexcept;
+  bool canReserveLocked(uint64_t bytes, const std::string& group) const;
+  void addReservedBytesLocked(uint64_t bytes, const std::string& group);
+  void removeReservedBytesLocked(uint64_t bytes, const std::string& group);
+  std::vector<std::shared_ptr<Waiter>> grantWaitersLocked();
+  void logResidencyLocked(const char* event, std::string_view taskId);
+
+  const uint64_t capacityBytes_;
+  const std::string label_;
+  mutable std::mutex mutex_;
+  uint64_t queuedBytes_{0};
+  uint64_t reservedBytes_{0};
+  uint64_t peakResidentBytes_{0};
+  int64_t queuedPackedColumns_{0};
+  int64_t diagnosticGiBBucket_{0};
+  std::unordered_map<std::string, GroupUsage> groupUsage_;
+  std::deque<std::shared_ptr<Waiter>> waiters_;
+};
 
 /// @brief  Callback function for getting data from the queues.
 /// A nullptr indicates that there is no more data.
@@ -158,7 +271,8 @@ class UcxOutputQueue : public std::enable_shared_from_this<UcxOutputQueue> {
       uint32_t numDestinations,
       uint32_t numDrivers,
       core::PartitionedOutputNode::Kind kind =
-          core::PartitionedOutputNode::Kind::kPartitioned);
+          core::PartitionedOutputNode::Kind::kPartitioned,
+      std::shared_ptr<UcxOutputQueueMemoryManager> memoryManager = nullptr);
 
   /// @brief initializes an unitialized queue. This is needed in order to
   /// support delayed construction, i.e. if a "getData" arrives before the queue
@@ -201,6 +315,15 @@ class UcxOutputQueue : public std::enable_shared_from_this<UcxOutputQueue> {
   /// @param numRows The number of rows in the data.
   void enqueue(
       int destination,
+      std::unique_ptr<cudf::packed_columns> data,
+      int32_t numRows);
+
+  /// Enqueues one physical packed buffer into equally spaced destination
+  /// ranges. All destinations share the same GPU allocation.
+  void enqueueFanout(
+      int destination,
+      int destinationStride,
+      int fanout,
       std::unique_ptr<cudf::packed_columns> data,
       int32_t numRows);
 
@@ -297,6 +420,7 @@ class UcxOutputQueue : public std::enable_shared_from_this<UcxOutputQueue> {
 
   // Reference to the task that owns this UcxQueue.
   std::shared_ptr<exec::Task> task_{nullptr};
+  std::shared_ptr<UcxOutputQueueMemoryManager> memoryManager_;
 
   // The output mode (partitioned, broadcast, etc.)
   core::PartitionedOutputNode::Kind kind_{

@@ -30,7 +30,7 @@ class UcxOutputQueueManager {
   static std::shared_ptr<UcxOutputQueueManager> getInstanceRef();
 
   // no constructor to prevent direct instantiation.
-  UcxOutputQueueManager() = default;
+  UcxOutputQueueManager();
   // no copy constructor.
   UcxOutputQueueManager(const UcxOutputQueueManager&) = delete;
   // no copy assignment.
@@ -81,12 +81,33 @@ class UcxOutputQueueManager {
       std::unique_ptr<cudf::packed_columns> txData,
       int32_t numRows);
 
+  void enqueueFanout(
+      std::string_view taskId,
+      int destination,
+      int destinationStride,
+      int fanout,
+      std::unique_ptr<cudf::packed_columns> txData,
+      int32_t numRows);
+
   /// @brief Checks if the queue for a task is over capacity.
   /// Should be called after enqueueing all partitions for a batch.
   /// @param taskId The unique task Id.
   /// @param future Output parameter - populated with a future if blocked.
   /// @return True if blocked (queue over capacity), false otherwise.
   bool checkBlocked(std::string_view taskId, ContinueFuture* future);
+
+  /// Reserves process-wide device queue capacity before an output operator
+  /// materializes another partition window.
+  bool reserveDeviceQueueBytes(
+      uint64_t bytes,
+      std::string_view taskId,
+      ContinueFuture* future,
+      std::optional<UcxOutputQueueMemoryManager::Reservation>& reservation,
+      std::shared_ptr<UcxOutputQueueMemoryManager::Waiter>& waiter);
+
+  uint64_t deviceQueueResidentBytes() const {
+    return memoryManager_->queuedBytes();
+  }
 
   /// @brief Indicates that no more data will be coming for this task.
   void noMoreData(std::string_view taskId);
@@ -153,6 +174,8 @@ class UcxOutputQueueManager {
   // that exceed the placeholder's undersized queues_ vector.
   folly::Synchronized<std::unordered_set<std::string>, std::mutex>
       removedTasks_;
+
+  std::shared_ptr<UcxOutputQueueMemoryManager> memoryManager_;
 };
 
 } // namespace facebook::velox::ucx_exchange

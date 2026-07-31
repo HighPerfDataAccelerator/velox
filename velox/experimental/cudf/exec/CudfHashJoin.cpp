@@ -27,6 +27,7 @@
 
 #include "velox/common/testutil/TestValue.h"
 #include "velox/core/PlanNode.h"
+#include "velox/core/QueryCtx.h"
 #include "velox/exec/Task.h" // NOLINT(misc-unused-headers)
 #include "velox/type/TypeUtil.h"
 
@@ -57,10 +58,121 @@
 
 #include <algorithm>
 #include <iterator>
+#include <mutex>
+#include <unordered_map>
 
 namespace facebook::velox::cudf_velox {
 
+struct CudfHashJoinCacheEntry {
+  CudfHashJoinCacheEntry(
+      std::string key,
+      std::string builderTaskId,
+      core::PlanNodeId builderPlanNodeId)
+      : key(std::move(key)),
+        builderTaskId(std::move(builderTaskId)),
+        builderPlanNodeId(std::move(builderPlanNodeId)) {}
+
+  const std::string key;
+  const std::string builderTaskId;
+  const core::PlanNodeId builderPlanNodeId;
+  std::optional<CudfHashJoinBridge::hash_type> hashObject;
+  std::optional<rmm::cuda_stream_view> buildStream;
+  std::shared_ptr<CudaEvent> buildReadyEvent;
+  bool buildComplete{false};
+  std::vector<ContinuePromise> buildPromises;
+};
+
 namespace {
+
+class CudfHashJoinCache {
+ public:
+  static CudfHashJoinCache* instance() {
+    static CudfHashJoinCache cache;
+    return &cache;
+  }
+
+  std::shared_ptr<CudfHashJoinCacheEntry> get(
+      const std::string& key,
+      const std::string& taskId,
+      const core::PlanNodeId& planNodeId,
+      core::QueryCtx* queryCtx,
+      ContinueFuture* future) {
+    VELOX_CHECK_NOT_NULL(queryCtx);
+    VELOX_CHECK_NOT_NULL(future);
+
+    std::lock_guard<std::mutex> guard(mutex_);
+    auto it = entries_.find(key);
+    if (it == entries_.end()) {
+      auto entry =
+          std::make_shared<CudfHashJoinCacheEntry>(key, taskId, planNodeId);
+      entries_.emplace(key, entry);
+      queryCtx->addReleaseCallback(
+          [key]() { CudfHashJoinCache::instance()->drop(key); });
+      return entry;
+    }
+
+    auto& entry = it->second;
+    if (!entry->buildComplete &&
+        (entry->builderTaskId != taskId ||
+         entry->builderPlanNodeId != planNodeId)) {
+      auto [promise, cacheFuture] = makeVeloxContinuePromiseContract(
+          fmt::format("CudfHashJoinCache::{}", key));
+      entry->buildPromises.push_back(std::move(promise));
+      *future = std::move(cacheFuture);
+    }
+    return entry;
+  }
+
+  void put(
+      const std::string& key,
+      CudfHashJoinBridge::hash_type hashObject,
+      rmm::cuda_stream_view buildStream,
+      std::shared_ptr<CudaEvent> buildReadyEvent) {
+    std::vector<ContinuePromise> promises;
+    {
+      std::lock_guard<std::mutex> guard(mutex_);
+      auto it = entries_.find(key);
+      VELOX_CHECK(
+          it != entries_.end(),
+          "CUDF hash cache entry '{}' must exist before put",
+          key);
+      auto& entry = it->second;
+      VELOX_CHECK(!entry->buildComplete);
+      entry->hashObject = std::move(hashObject);
+      entry->buildStream = buildStream;
+      entry->buildReadyEvent = std::move(buildReadyEvent);
+      entry->buildComplete = true;
+      promises = std::move(entry->buildPromises);
+    }
+    for (auto& promise : promises) {
+      promise.setValue();
+    }
+  }
+
+  void drop(const std::string& key) {
+    std::shared_ptr<CudfHashJoinCacheEntry> entry;
+    {
+      std::lock_guard<std::mutex> guard(mutex_);
+      auto it = entries_.find(key);
+      if (it == entries_.end()) {
+        return;
+      }
+      entry = std::move(it->second);
+      entries_.erase(it);
+    }
+    auto promises = std::move(entry->buildPromises);
+    entry->hashObject.reset();
+    entry->buildReadyEvent.reset();
+    for (auto& promise : promises) {
+      promise.setValue();
+    }
+  }
+
+ private:
+  std::mutex mutex_;
+  std::unordered_map<std::string, std::shared_ptr<CudfHashJoinCacheEntry>>
+      entries_;
+};
 
 /// Creates extended table view by appending precomputed columns
 cudf::table_view createExtendedTableView(
@@ -189,9 +301,49 @@ CudfHashJoinBuild::CudfHashJoinBuild(
           NvtxMethodFlag::kAll,
           std::nullopt, // spillConfig
           joinNode),
-      joinNode_(joinNode) {}
+      joinNode_(joinNode) {
+  setupHashTableCache();
+}
+
+void CudfHashJoinBuild::setupHashTableCache() {
+  if (!joinNode_->useHashTableCache()) {
+    return;
+  }
+  const auto queryCtx = operatorCtx_->task()->queryCtx();
+  const auto nodeCacheKey = joinNode_->cacheKey().value_or(planNodeId());
+  cacheKey_ = fmt::format("{}:{}", queryCtx->queryId(), nodeCacheKey);
+  cacheEntry_ = CudfHashJoinCache::instance()->get(
+      cacheKey_, taskId(), planNodeId(), queryCtx.get(), &cacheFuture_);
+  VELOX_CHECK_NOT_NULL(cacheEntry_);
+  cacheWaiter_ = cacheEntry_->builderTaskId != taskId() ||
+      cacheEntry_->builderPlanNodeId != planNodeId();
+}
+
+void CudfHashJoinBuild::installCachedHashTable() {
+  VELOX_CHECK(cacheWaiter_);
+  VELOX_CHECK_NOT_NULL(cacheEntry_);
+  VELOX_CHECK(
+      cacheEntry_->buildComplete && cacheEntry_->hashObject.has_value() &&
+          cacheEntry_->buildStream.has_value(),
+      "CUDF hash cache build failed for key '{}'",
+      cacheKey_);
+
+  auto joinBridge = operatorCtx_->task()->getCustomJoinBridge(
+      operatorCtx_->driverCtx()->splitGroupId, planNodeId());
+  auto cudfHashJoinBridge =
+      std::dynamic_pointer_cast<CudfHashJoinBridge>(joinBridge);
+  VELOX_CHECK_NOT_NULL(cudfHashJoinBridge);
+  cudfHashJoinBridge->setBuildStream(cacheEntry_->buildStream.value());
+  cudfHashJoinBridge->setBuildReadyEvent(cacheEntry_->buildReadyEvent);
+  cudfHashJoinBridge->setHashTable(cacheEntry_->hashObject);
+  stats_.wlock()->addRuntimeStat("cudfHashTableCacheHit", RuntimeCounter(1));
+  cacheInstalled_ = true;
+}
 
 void CudfHashJoinBuild::doAddInput(RowVectorPtr input) {
+  if (cacheWaiter_) {
+    return;
+  }
   // Queue inputs, process all at once.
   if (input->size() > 0) {
     auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input);
@@ -218,6 +370,9 @@ RowVectorPtr CudfHashJoinBuild::doGetOutput() {
 
 void CudfHashJoinBuild::doNoMoreInput() {
   Operator::noMoreInput();
+  if (cacheWaiter_) {
+    return;
+  }
   std::vector<ContinuePromise> promises;
   std::vector<std::shared_ptr<exec::Driver>> peers;
   // Only last driver collects all answers
@@ -328,6 +483,14 @@ void CudfHashJoinBuild::doNoMoreInput() {
   for (auto& tbl : tbls) {
     shared_tbls.push_back(std::move(tbl));
   }
+  auto hashObject =
+      std::make_pair(std::move(shared_tbls), std::move(hashObjects));
+  if (useHashTableCache()) {
+    CudfHashJoinCache::instance()->put(
+        cacheKey_, hashObject, stream, buildReadyEvent);
+    stats_.wlock()->addRuntimeStat("cudfHashTableCacheMiss", RuntimeCounter(1));
+  }
+
   // set hash table to CudfHashJoinBridge
   auto joinBridge = operatorCtx_->task()->getCustomJoinBridge(
       operatorCtx_->driverCtx()->splitGroupId, planNodeId());
@@ -336,12 +499,17 @@ void CudfHashJoinBuild::doNoMoreInput() {
 
   cudfHashJoinBridge->setBuildStream(stream);
   cudfHashJoinBridge->setBuildReadyEvent(std::move(buildReadyEvent));
-  cudfHashJoinBridge->setHashTable(
-      std::make_optional(
-          std::make_pair(std::move(shared_tbls), std::move(hashObjects))));
+  cudfHashJoinBridge->setHashTable(std::move(hashObject));
 }
 
 exec::BlockingReason CudfHashJoinBuild::isBlocked(ContinueFuture* future) {
+  if (cacheWaiter_ && noMoreInput_ && !cacheInstalled_) {
+    if (cacheFuture_.valid()) {
+      *future = std::move(cacheFuture_);
+      return exec::BlockingReason::kWaitForJoinBuild;
+    }
+    installCachedHashTable();
+  }
   if (!future_.valid()) {
     return exec::BlockingReason::kNotBlocked;
   }
@@ -350,6 +518,9 @@ exec::BlockingReason CudfHashJoinBuild::isBlocked(ContinueFuture* future) {
 }
 
 bool CudfHashJoinBuild::isFinished() {
+  if (cacheWaiter_) {
+    return cacheInstalled_;
+  }
   return !future_.valid() && noMoreInput_;
 }
 

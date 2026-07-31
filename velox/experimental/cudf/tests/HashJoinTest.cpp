@@ -41,6 +41,7 @@
 #include <re2/re2.h>
 
 #include <atomic>
+#include <chrono>
 
 using namespace facebook::velox;
 using namespace facebook::velox::exec;
@@ -164,6 +165,129 @@ TEST_F(HashJoinTest, countStarOverFullJoinWithZeroColumnOutput) {
 
   auto expected = makeRowVector({makeFlatVector<int64_t>({7})});
   AssertQueryBuilder(plan).assertResults(expected);
+}
+
+TEST_F(HashJoinTest, sharedBuildCache) {
+  auto probe = makeRowVector(
+      {"k", "v"},
+      {makeFlatVector<int32_t>({1, 2, 3, 4}),
+       makeFlatVector<int64_t>({10, 20, 30, 40})});
+  auto build = makeRowVector({"u_k"}, {makeFlatVector<int32_t>({2, 3, 3, 5})});
+
+  auto idGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  auto probeNode = PlanBuilder(idGenerator).values({probe}).planNode();
+  auto buildNode = PlanBuilder(idGenerator).values({build}).planNode();
+  auto joinNode =
+      core::HashJoinNode::Builder()
+          .id(idGenerator->next())
+          .joinType(core::JoinType::kLeftSemiFilter)
+          .nullAware(false)
+          .leftKeys(
+              {std::make_shared<core::FieldAccessTypedExpr>(INTEGER(), "k")})
+          .rightKeys(
+              {std::make_shared<core::FieldAccessTypedExpr>(INTEGER(), "u_k")})
+          .left(probeNode)
+          .right(buildNode)
+          .outputType(asRowType(probe->type()))
+          .useHashTableCache(true)
+          .cacheKey("shared-cudf-build")
+          .build();
+
+  const auto queryId = fmt::format(
+      "sharedCudfBuild_{}",
+      std::chrono::steady_clock::now().time_since_epoch().count());
+  auto queryCtx = core::QueryCtx::create(
+      driverExecutor_.get(),
+      core::QueryConfig({}),
+      std::unordered_map<std::string, std::shared_ptr<config::ConfigBase>>{},
+      cache::AsyncDataCache::getInstance(),
+      nullptr,
+      nullptr,
+      queryId);
+  auto expected = makeRowVector(
+      {"k", "v"},
+      {makeFlatVector<int32_t>({2, 3}), makeFlatVector<int64_t>({20, 30})});
+
+  auto runTask = [&]() {
+    return AssertQueryBuilder(joinNode).queryCtx(queryCtx).assertResults(
+        expected);
+  };
+
+  auto first = runTask();
+  auto firstStats = toOperatorStats(first->taskStats());
+  ASSERT_EQ(
+      firstStats.at("CudfHashJoinBuild")
+          .runtimeStats.at("cudfHashTableCacheMiss")
+          .count,
+      1);
+
+  auto second = runTask();
+  auto secondStats = toOperatorStats(second->taskStats());
+  ASSERT_EQ(
+      secondStats.at("CudfHashJoinBuild")
+          .runtimeStats.at("cudfHashTableCacheHit")
+          .count,
+      1);
+}
+
+TEST_F(HashJoinTest, sharedBuildCacheWithinTask) {
+  auto probe = makeRowVector(
+      {"k", "v"},
+      {makeFlatVector<int32_t>({1, 2, 3, 4}),
+       makeFlatVector<int64_t>({10, 20, 30, 40})});
+  auto build = makeRowVector({"u_k"}, {makeFlatVector<int32_t>({2, 3, 5})});
+
+  auto idGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  auto makeJoin = [&]() {
+    return core::HashJoinNode::Builder()
+        .id(idGenerator->next())
+        .joinType(core::JoinType::kLeftSemiFilter)
+        .nullAware(false)
+        .leftKeys(
+            {std::make_shared<core::FieldAccessTypedExpr>(INTEGER(), "k")})
+        .rightKeys(
+            {std::make_shared<core::FieldAccessTypedExpr>(INTEGER(), "u_k")})
+        .left(PlanBuilder(idGenerator).values({probe}).planNode())
+        .right(PlanBuilder(idGenerator).values({build}).planNode())
+        .outputType(asRowType(probe->type()))
+        .useHashTableCache(true)
+        .cacheKey("shared-cudf-build-within-task")
+        .build();
+  };
+  auto plan =
+      PlanBuilder(idGenerator)
+          .localPartition(std::vector<std::string>{}, {makeJoin(), makeJoin()})
+          .planNode();
+
+  const auto queryId = fmt::format(
+      "sharedCudfBuildWithinTask_{}",
+      std::chrono::steady_clock::now().time_since_epoch().count());
+  auto queryCtx = core::QueryCtx::create(
+      driverExecutor_.get(),
+      core::QueryConfig({}),
+      std::unordered_map<std::string, std::shared_ptr<config::ConfigBase>>{},
+      cache::AsyncDataCache::getInstance(),
+      nullptr,
+      nullptr,
+      queryId);
+  auto expected = makeRowVector(
+      {"k", "v"},
+      {makeFlatVector<int32_t>({2, 3, 2, 3}),
+       makeFlatVector<int64_t>({20, 30, 20, 30})});
+
+  auto task =
+      AssertQueryBuilder(plan).queryCtx(queryCtx).assertResults(expected);
+  auto stats = toOperatorStats(task->taskStats());
+  ASSERT_EQ(
+      stats.at("CudfHashJoinBuild")
+          .runtimeStats.at("cudfHashTableCacheMiss")
+          .count,
+      1);
+  ASSERT_EQ(
+      stats.at("CudfHashJoinBuild")
+          .runtimeStats.at("cudfHashTableCacheHit")
+          .count,
+      1);
 }
 
 TEST_P(MultiThreadedHashJoinTest, bigintArray) {
@@ -1644,8 +1768,7 @@ TEST_P(MultiThreadedHashJoinTest, antiJoin) {
       .run();
 
   std::vector<std::string> filters({
-      "u1 > t1",
-      "u1 * t1 > 0",
+      "u1 > t1", "u1 * t1 > 0",
       // This filter is true on rows without a match. It should not prevent
       // the row from being returned.
       // Disabling this because coalesce is not supported in cudf.
@@ -1673,10 +1796,9 @@ TEST_P(MultiThreadedHashJoinTest, antiJoin) {
         .joinType(core::JoinType::kAnti)
         .joinFilter(filter)
         .joinOutputLayout({"t0", "t1"})
-        .referenceQuery(
-            fmt::format(
-                "SELECT t.* FROM t WHERE NOT EXISTS (SELECT * FROM u WHERE u.u0 = t.t0 AND {})",
-                filter))
+        .referenceQuery(fmt::format(
+            "SELECT t.* FROM t WHERE NOT EXISTS (SELECT * FROM u WHERE u.u0 = t.t0 AND {})",
+            filter))
         .run();
   }
 }
@@ -3449,10 +3571,8 @@ TEST_F(HashJoinTest, semiProjectWithFilter) {
     // null-aware left semi project with filter now supported
     HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
         .planNode(plan)
-        .referenceQuery(
-            fmt::format(
-                "SELECT t0, t1, t0 IN (SELECT u0 FROM u WHERE {}) FROM t",
-                filter))
+        .referenceQuery(fmt::format(
+            "SELECT t0, t1, t0 IN (SELECT u0 FROM u WHERE {}) FROM t", filter))
         .injectSpill(false)
         .run();
 
@@ -3462,10 +3582,9 @@ TEST_F(HashJoinTest, semiProjectWithFilter) {
     // these values.
     HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
         .planNode(plan)
-        .referenceQuery(
-            fmt::format(
-                "SELECT t0, t1, EXISTS (SELECT * FROM u WHERE (u0 is not null OR t0 is not null) AND u0 = t0 AND {}) FROM t",
-                filter))
+        .referenceQuery(fmt::format(
+            "SELECT t0, t1, EXISTS (SELECT * FROM u WHERE (u0 is not null OR t0 is not null) AND u0 = t0 AND {}) FROM t",
+            filter))
         .injectSpill(false)
         .run();
   }
@@ -4380,9 +4499,8 @@ TEST_F(HashJoinTest, DISABLED_lazyVectors) {
       }
       std::vector<exec::Split> buildSplits;
       for (int i = 0; i < buildVectors.size(); ++i) {
-        buildSplits.push_back(
-            exec::Split(makeHiveConnectorSplit(
-                tempFiles[probeSplits.size() + i]->getPath())));
+        buildSplits.push_back(exec::Split(makeHiveConnectorSplit(
+            tempFiles[probeSplits.size() + i]->getPath())));
       }
       SplitInput splits;
       splits.emplace(probeScanId, probeSplits);
@@ -7169,10 +7287,9 @@ TEST_F(HashJoinTest, leftJoinWithMissAtEndOfBatch) {
         .numDrivers(1)
         .config(
             core::QueryConfig::kPreferredOutputBatchRows, std::to_string(10))
-        .referenceQuery(
-            fmt::format(
-                "SELECT t_k1, u_k1 from t left join u on t_k1 = u_k1 and {}",
-                filter))
+        .referenceQuery(fmt::format(
+            "SELECT t_k1, u_k1 from t left join u on t_k1 = u_k1 and {}",
+            filter))
         .run();
   };
 
@@ -7221,10 +7338,9 @@ TEST_F(HashJoinTest, leftJoinWithMissAtEndOfBatchMultipleBuildMatches) {
         .numDrivers(1)
         .config(
             core::QueryConfig::kPreferredOutputBatchRows, std::to_string(10))
-        .referenceQuery(
-            fmt::format(
-                "SELECT t_k1, u_k1 from t left join u on t_k1 = u_k1 and {}",
-                filter))
+        .referenceQuery(fmt::format(
+            "SELECT t_k1, u_k1 from t left join u on t_k1 = u_k1 and {}",
+            filter))
         .run();
   };
 
@@ -7309,9 +7425,8 @@ DEBUG_ONLY_TEST_F(HashJoinTest, minSpillableMemoryReservation) {
                   .planNode();
 
   for (int32_t minSpillableReservationPct : {5, 50, 100}) {
-    SCOPED_TRACE(
-        fmt::format(
-            "minSpillableReservationPct: {}", minSpillableReservationPct));
+    SCOPED_TRACE(fmt::format(
+        "minSpillableReservationPct: {}", minSpillableReservationPct));
 
     SCOPED_TESTVALUE_SET(
         "facebook::velox::exec::HashBuild::addInput",

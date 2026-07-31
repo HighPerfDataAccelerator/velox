@@ -225,7 +225,7 @@ UcxExchangeServer::UcxExchangeServer(
     bool isIntraNodeTransfer)
     : CommElement(communicator, endpointRef),
       partitionKey_(key),
-      partitionKeyHash_(fnv1a_32(partitionKey_.toString())),
+      partitionKeyHash_(partitionKeyHash(partitionKey_.toString())),
       isIntraNodeTransfer_(isIntraNodeTransfer),
       queueMgr_(UcxOutputQueueManager::getInstanceRef()) {
   setState(ServerState::Created);

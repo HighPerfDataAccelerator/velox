@@ -28,14 +28,20 @@ namespace facebook::velox::ucx_exchange {
 /// to allocate its memory. This allows the receiver to reuse the same stream
 /// for subsequent operations on the data.
 struct PackedTableWithStream {
+  // Keeps producer- or receiver-side residency credit alive. The owner moves
+  // into CudfVector together with packedTable.
+  std::shared_ptr<void> residencyOwner;
   std::unique_ptr<cudf::packed_table> packedTable;
   rmm::cuda_stream_view stream;
 
   PackedTableWithStream() = default;
   PackedTableWithStream(
       std::unique_ptr<cudf::packed_table>&& table,
-      rmm::cuda_stream_view s)
-      : packedTable(std::move(table)), stream(s) {}
+      rmm::cuda_stream_view s,
+      std::shared_ptr<void> owner = nullptr)
+      : residencyOwner(std::move(owner)),
+        packedTable(std::move(table)),
+        stream(s) {}
 
   /// Returns the size of the GPU data buffer, or 0 if packedTable is null.
   size_t gpuDataSize() const {

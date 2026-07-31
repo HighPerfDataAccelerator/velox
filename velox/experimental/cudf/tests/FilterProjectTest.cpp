@@ -2085,6 +2085,50 @@ TEST_F(CudfFilterProjectTest, datePlusIntervalConstantLiteral) {
   assertQuery(plan, expected);
 }
 
+TEST_F(CudfFilterProjectTest, sameTypeCastUsesIdentityProjection) {
+  auto data = makeRowVector(
+      {"id", "name", "score"},
+      {makeNullableFlatVector<int32_t>({1, std::nullopt, 3}),
+       makeNullableFlatVector<std::string>({"one", std::nullopt, "three"}),
+       makeFlatVector<double>({1.5, 2.5, 3.5})});
+
+  auto id = std::make_shared<core::FieldAccessTypedExpr>(INTEGER(), "id");
+  auto name = std::make_shared<core::FieldAccessTypedExpr>(VARCHAR(), "name");
+  auto score = std::make_shared<core::FieldAccessTypedExpr>(DOUBLE(), "score");
+  auto plan =
+      PlanBuilder()
+          .values({data})
+          .projectExpressions(
+              {std::make_shared<core::CastTypedExpr>(VARCHAR(), name, false),
+               std::make_shared<core::CastTypedExpr>(INTEGER(), id, true),
+               score})
+          .planNode();
+
+  std::shared_ptr<exec::Task> task;
+  auto actual = AssertQueryBuilder(plan).copyResults(pool(), task);
+  auto expected = makeRowVector(
+      {"p0", "p1", "score"},
+      {makeNullableFlatVector<std::string>({"one", std::nullopt, "three"}),
+       makeNullableFlatVector<int32_t>({1, std::nullopt, 3}),
+       makeFlatVector<double>({1.5, 2.5, 3.5})});
+  assertEqualResults({expected}, {actual});
+
+  uint64_t identityCasts = 0;
+  for (const auto& pipelineStats : task->taskStats().pipelineStats) {
+    for (const auto& operatorStats : pipelineStats.operatorStats) {
+      if (operatorStats.operatorType != "CudfFilterProject") {
+        continue;
+      }
+      const auto stat = operatorStats.runtimeStats.find(
+          "cudfSameTypeCastIdentityProjections");
+      if (stat != operatorStats.runtimeStats.end()) {
+        identityCasts += stat->second.sum;
+      }
+    }
+  }
+  EXPECT_EQ(identityCasts, 2);
+}
+
 TEST_F(CudfFilterProjectTest, switchExpr) {
   auto data = makeRowVector(
       {makeFlatVector<double>({45676567.78, 6789098767.90876, -2.34}),
@@ -2259,42 +2303,44 @@ TEST_F(CudfSimpleFilterProjectTest, castNumericToTimestamp) {
 
 TEST_F(CudfSimpleFilterProjectTest, castIntegralToVarchar) {
   EXPECT_EQ(
-      evaluateOnce<std::string, int32_t>("cast(c0 as varchar)", 12345),
+      (evaluateOnce<std::string, int32_t>("cast(c0 as varchar)", 12345)),
       "12345");
   EXPECT_EQ(
-      evaluateOnce<std::string, int64_t>("cast(c0 as varchar)", 9876543210LL),
+      (evaluateOnce<std::string, int64_t>("cast(c0 as varchar)", 9876543210LL)),
       "9876543210");
   EXPECT_EQ(
-      evaluateOnce<std::string, int16_t>(
-          "cast(c0 as varchar)", static_cast<int16_t>(255)),
+      (evaluateOnce<std::string, int16_t>(
+          "cast(c0 as varchar)", static_cast<int16_t>(255))),
       "255");
   EXPECT_EQ(
-      evaluateOnce<std::string, int8_t>(
-          "try_cast(c0 as varchar)", static_cast<int8_t>(-7)),
+      (evaluateOnce<std::string, int8_t>(
+          "try_cast(c0 as varchar)", static_cast<int8_t>(-7))),
       "-7");
   EXPECT_EQ(
-      evaluateOnce<std::string, int32_t>(
-          "cast(c0 as varchar)", std::optional<int32_t>{}),
+      (evaluateOnce<std::string, int32_t>(
+          "cast(c0 as varchar)", std::optional<int32_t>{})),
       std::nullopt);
 }
 
 TEST_F(CudfSimpleFilterProjectTest, castFloatingPointToVarchar) {
   EXPECT_EQ(
-      evaluateOnce<std::string, double>("cast(c0 as varchar)", 12.5), "12.5");
+      (evaluateOnce<std::string, double>("cast(c0 as varchar)", 12.5)), "12.5");
   EXPECT_EQ(
-      evaluateOnce<std::string, float>(
-          "try_cast(c0 as varchar)", static_cast<float>(-7.25)),
+      (evaluateOnce<std::string, float>(
+          "try_cast(c0 as varchar)", static_cast<float>(-7.25))),
       "-7.25");
   EXPECT_EQ(
-      evaluateOnce<std::string, double>(
-          "cast(c0 as varchar)", std::optional<double>{}),
+      (evaluateOnce<std::string, double>(
+          "cast(c0 as varchar)", std::optional<double>{})),
       std::nullopt);
 }
 
 TEST_F(CudfSimpleFilterProjectTest, castDateToVarchar) {
   EXPECT_EQ(
       evaluateOnce<std::string>(
-          "cast(c0 as varchar)", DATE(), DATE()->toDays("2024-03-15")),
+          "cast(c0 as varchar)",
+          DATE(),
+          std::optional<int32_t>{DATE()->toDays("2024-03-15")}),
       "2024-03-15");
   EXPECT_EQ(
       evaluateOnce<std::string>(

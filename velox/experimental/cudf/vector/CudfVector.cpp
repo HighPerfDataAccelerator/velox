@@ -27,6 +27,8 @@
 #include <cudf/column/column_stream.hpp>
 #include <cudf/table/table.hpp>
 
+#include <algorithm>
+
 namespace facebook::velox::cudf_velox {
 namespace {
 
@@ -164,7 +166,8 @@ CudfVector::CudfVector(
     TypePtr type,
     vector_size_t size,
     std::unique_ptr<cudf::packed_table>&& packedTable,
-    rmm::cuda_stream_view stream)
+    rmm::cuda_stream_view stream,
+    std::shared_ptr<void> residencyOwner)
     : RowVector(
           pool,
           std::move(type),
@@ -172,6 +175,7 @@ CudfVector::CudfVector(
           size,
           std::vector<VectorPtr>(),
           std::nullopt),
+      residencyOwner_{std::move(residencyOwner)},
       tableStorage_{std::move(packedTable)},
       stream_{stream} {
   logDefaultStreamIfNeeded(stream_, "CudfVector(packed_table)");
@@ -247,6 +251,20 @@ bool CudfVector::rebindStream(rmm::cuda_stream_view stream) {
   }
 
   return false;
+}
+
+void CudfVector::addDeviceMemoryAdmissionCredit(
+    DeviceMemoryAdmissionCreditPtr credit) {
+  if (credit == nullptr) {
+    return;
+  }
+  const auto duplicate = std::find_if(
+      deviceMemoryAdmissionCredits_.begin(),
+      deviceMemoryAdmissionCredits_.end(),
+      [&](const auto& existing) { return existing.get() == credit.get(); });
+  if (duplicate == deviceMemoryAdmissionCredits_.end()) {
+    deviceMemoryAdmissionCredits_.push_back(std::move(credit));
+  }
 }
 
 uint64_t CudfVector::estimateFlatSize() const {

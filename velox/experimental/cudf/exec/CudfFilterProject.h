@@ -63,14 +63,7 @@ class CudfFilterProject : public CudfOperatorBase {
  protected:
   void doAddInput(RowVectorPtr input) override;
   RowVectorPtr doGetOutput() override;
-
-  void doClose() override {
-    Operator::close();
-    projectEvaluators_.clear();
-    literalScalars_.clear();
-    nullComplexLiteralProjections_.clear();
-    filterEvaluator_.reset();
-  }
+  void doClose() override;
 
  private:
   struct NullComplexLiteralProjection {
@@ -96,6 +89,7 @@ class CudfFilterProject : public CudfOperatorBase {
   std::vector<std::unique_ptr<cudf::scalar>> literalScalars_;
   std::vector<NullComplexLiteralProjection> nullComplexLiteralProjections_;
   std::vector<velox::exec::IdentityProjection> identityProjections_;
+  uint64_t sameTypeCastIdentityProjections_{0};
 };
 
 bool canBeEvaluatedByCudf(

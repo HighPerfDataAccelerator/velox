@@ -19,6 +19,7 @@
 #include "velox/experimental/cudf/exec/ToCudf.h"
 
 #include "velox/common/base/tests/GTestUtils.h"
+#include "velox/exec/PlanNodeStats.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
 #include "velox/functions/lib/aggregates/tests/utils/AggregationTestBase.h"
 #include "velox/functions/sparksql/aggregates/Register.h"
@@ -44,6 +45,7 @@ class AggregationTest : public AggregationTestBase {
   void TearDown() override {
     cudf_velox::unregisterCudf();
     cudf_velox::unregisterAggregateFunctions();
+    AggregationTestBase::TearDown();
   }
 };
 
@@ -118,13 +120,26 @@ TEST_F(AggregationTest, groupedCollectListOfRow) {
   // Keep two input vectors so partial aggregation consumes multiple batches.
   // Final aggregation must merge its ARRAY<ROW> state without dropping
   // duplicates, nested nulls, or the empty all-null group.
+  core::PlanNodeId partialAggId;
   auto partialFinal =
       PlanBuilder()
           .values({batch1, batch2})
           .partialAggregation({"k"}, {"collect_list(s) AS items"})
+          .capturePlanNodeId(partialAggId)
           .finalAggregation()
           .planNode();
-  assertQuery(partialFinal, expected);
+  auto task = assertQuery(partialFinal, expected);
+  const auto planStats = toPlanStats(task->taskStats());
+  std::string availableStats;
+  for (const auto& [nodeId, nodeStats] : planStats) {
+    for (const auto& [name, unused] : nodeStats.customStats) {
+      availableStats += nodeId + ":" + name + ",";
+    }
+  }
+  const auto& stats = planStats.at(partialAggId).customStats;
+  ASSERT_EQ(stats.count("cudfExpandingPartialAdmissionAcquisitions"), 1)
+      << availableStats;
+  EXPECT_EQ(stats.at("cudfExpandingPartialAdmissionAcquisitions").sum, 2);
 }
 
 } // namespace facebook::velox::exec::sparksql::test

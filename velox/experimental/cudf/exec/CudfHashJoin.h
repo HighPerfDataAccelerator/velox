@@ -39,6 +39,7 @@ namespace facebook::velox::cudf_velox {
 
 class CudaEvent;
 class CudfExpression;
+struct CudfHashJoinCacheEntry;
 
 /**
  * @brief Bridge for transferring build-side hash tables between build and probe
@@ -115,9 +116,22 @@ class CudfHashJoinBuild : public CudfOperatorBase {
   void doNoMoreInput() override;
 
  private:
+  bool useHashTableCache() const {
+    return !cacheKey_.empty();
+  }
+
+  void setupHashTableCache();
+
+  void installCachedHashTable();
+
   std::shared_ptr<const core::HashJoinNode> joinNode_;
   std::vector<CudfVectorPtr> inputs_;
   ContinueFuture future_{ContinueFuture::makeEmpty()};
+  ContinueFuture cacheFuture_{ContinueFuture::makeEmpty()};
+  std::string cacheKey_;
+  std::shared_ptr<CudfHashJoinCacheEntry> cacheEntry_;
+  bool cacheWaiter_{false};
+  bool cacheInstalled_{false};
 };
 
 /**

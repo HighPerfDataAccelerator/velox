@@ -5916,6 +5916,11 @@ class TopNRowNumberNode : public PlanNode {
   /// @param limit Per-partition limit. The number of
   /// rows produced by this node will not exceed this value for any given
   /// partition. Extra rows will be dropped.
+  /// @param emitBatchCandidates If true, the operator may emit independently
+  /// reduced candidates for each input batch. This is valid only as a partial
+  /// result consumed by another TopNRowNumber with the same keys and limit.
+  /// @param conditionalPassthroughKey Optional boolean input channel. Rows
+  /// where this channel is false bypass TopN reduction.
   TopNRowNumberNode(
       PlanNodeId id,
       RankFunction function,
@@ -5924,7 +5929,9 @@ class TopNRowNumberNode : public PlanNode {
       std::vector<SortOrder> sortingOrders,
       const std::optional<std::string>& rowNumberColumnName,
       int32_t limit,
-      PlanNodePtr source);
+      PlanNodePtr source,
+      bool emitBatchCandidates = false,
+      std::optional<int32_t> conditionalPassthroughKey = std::nullopt);
 
   class Builder {
    public:
@@ -5942,6 +5949,8 @@ class TopNRowNumberNode : public PlanNode {
       VELOX_CHECK_EQ(other.sources().size(), 1);
       source_ = other.sources()[0];
       function_ = other.rankFunction();
+      emitBatchCandidates_ = other.emitBatchCandidates();
+      conditionalPassthroughKey_ = other.conditionalPassthroughKey();
     }
 
     Builder& id(PlanNodeId id) {
@@ -5985,6 +5994,17 @@ class TopNRowNumberNode : public PlanNode {
       return *this;
     }
 
+    Builder& emitBatchCandidates(bool emitBatchCandidates) {
+      emitBatchCandidates_ = emitBatchCandidates;
+      return *this;
+    }
+
+    Builder& conditionalPassthroughKey(
+        std::optional<int32_t> conditionalPassthroughKey) {
+      conditionalPassthroughKey_ = conditionalPassthroughKey;
+      return *this;
+    }
+
     std::shared_ptr<TopNRowNumberNode> build() const {
       VELOX_USER_CHECK(id_.has_value(), "TopNRowNumberNode id is not set");
       VELOX_USER_CHECK(
@@ -6011,7 +6031,9 @@ class TopNRowNumberNode : public PlanNode {
           sortingOrders_.value(),
           rowNumberColumnName_.value(),
           limit_.value(),
-          source_.value());
+          source_.value(),
+          emitBatchCandidates_,
+          conditionalPassthroughKey_);
     }
 
    private:
@@ -6023,6 +6045,8 @@ class TopNRowNumberNode : public PlanNode {
     std::optional<std::optional<std::string>> rowNumberColumnName_;
     std::optional<int32_t> limit_;
     std::optional<PlanNodePtr> source_;
+    bool emitBatchCandidates_{false};
+    std::optional<int32_t> conditionalPassthroughKey_;
   };
 
   const std::vector<PlanNodePtr>& sources() const override {
@@ -6068,6 +6092,14 @@ class TopNRowNumberNode : public PlanNode {
     return outputType_->size() > sources_[0]->outputType()->size();
   }
 
+  bool emitBatchCandidates() const {
+    return emitBatchCandidates_;
+  }
+
+  std::optional<int32_t> conditionalPassthroughKey() const {
+    return conditionalPassthroughKey_;
+  }
+
   std::string_view name() const override {
     return "TopNRowNumber";
   }
@@ -6087,6 +6119,8 @@ class TopNRowNumberNode : public PlanNode {
   const std::vector<SortOrder> sortingOrders_;
 
   const int32_t limit_;
+  const bool emitBatchCandidates_;
+  const std::optional<int32_t> conditionalPassthroughKey_;
 
   const std::vector<PlanNodePtr> sources_;
 

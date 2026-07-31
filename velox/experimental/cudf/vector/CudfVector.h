@@ -15,6 +15,8 @@
  */
 #pragma once
 
+#include "velox/experimental/cudf/exec/GpuResources.h"
+
 #include "velox/common/memory/MemoryPool.h"
 #include "velox/vector/ComplexVector.h"
 #include "velox/vector/TypeAliases.h"
@@ -58,7 +60,8 @@ class CudfVector : public RowVector {
       TypePtr type,
       vector_size_t size,
       std::unique_ptr<cudf::packed_table>&& packedTable,
-      rmm::cuda_stream_view stream);
+      rmm::cuda_stream_view stream,
+      std::shared_ptr<void> residencyOwner = nullptr);
 
   rmm::cuda_stream_view stream() const {
     return stream_;
@@ -86,7 +89,19 @@ class CudfVector : public RowVector {
 
   uint64_t estimateFlatSize() const override;
 
+  void addDeviceMemoryAdmissionCredit(DeviceMemoryAdmissionCreditPtr credit);
+
+  const std::vector<DeviceMemoryAdmissionCreditPtr>&
+  deviceMemoryAdmissionCredits() const {
+    return deviceMemoryAdmissionCredits_;
+  }
+
  private:
+  // Optional external residency credit. Declare this before tableStorage_ so
+  // the packed device buffer is destroyed before its credit is released.
+  std::shared_ptr<void> residencyOwner_;
+  std::vector<DeviceMemoryAdmissionCreditPtr> deviceMemoryAdmissionCredits_;
+
   // Storage for either an owned table or packed table.
   // Only one is active at a time - using variant enforces this at compile time.
   using TableStorage = std::variant<

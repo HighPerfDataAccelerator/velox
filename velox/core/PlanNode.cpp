@@ -1173,9 +1173,8 @@ std::vector<TypedExprPtr> flattenExprs(
 
   const auto& sourceType = input->outputType();
   for (auto& name : moreNames) {
-    result.push_back(
-        std::make_shared<FieldAccessTypedExpr>(
-            sourceType->findChild(name), name));
+    result.push_back(std::make_shared<FieldAccessTypedExpr>(
+        sourceType->findChild(name), name));
   }
   return result;
 }
@@ -2932,13 +2931,17 @@ TopNRowNumberNode::TopNRowNumberNode(
     std::vector<SortOrder> sortingOrders,
     const std::optional<std::string>& rowNumberColumnName,
     int32_t limit,
-    PlanNodePtr source)
+    PlanNodePtr source,
+    bool emitBatchCandidates,
+    std::optional<int32_t> conditionalPassthroughKey)
     : PlanNode(std::move(id)),
       function_(function),
       partitionKeys_{std::move(partitionKeys)},
       sortingKeys_{std::move(sortingKeys)},
       sortingOrders_{std::move(sortingOrders)},
       limit_{limit},
+      emitBatchCandidates_{emitBatchCandidates},
+      conditionalPassthroughKey_{conditionalPassthroughKey},
       sources_{std::move(source)},
       outputType_{getOptionalRowNumberOutputType(
           sources_[0]->outputType(),
@@ -2954,14 +2957,33 @@ TopNRowNumberNode::TopNRowNumberNode(
       "Number of sorting keys must be greater than zero");
 
   VELOX_USER_CHECK_GT(limit, 0, "Limit must be greater than zero");
+  VELOX_USER_CHECK(
+      !emitBatchCandidates_ || !rowNumberColumnName.has_value(),
+      "Batch candidate TopNRowNumber cannot generate a rank column");
+  if (conditionalPassthroughKey_.has_value()) {
+    const auto channel = *conditionalPassthroughKey_;
+    VELOX_USER_CHECK_GE(channel, 0);
+    VELOX_USER_CHECK_LT(channel, sources_[0]->outputType()->size());
+    VELOX_USER_CHECK_EQ(
+        sources_[0]->outputType()->childAt(channel)->kind(),
+        TypeKind::BOOLEAN,
+        "Conditional TopNRowNumber pass-through key must be boolean");
+  }
 
   std::unordered_set<std::string> keyNames;
+  bool conditionalKeyIsPartitionKey = !conditionalPassthroughKey_.has_value();
   for (const auto& key : partitionKeys_) {
     VELOX_USER_CHECK(
         keyNames.insert(key->name()).second,
         "Partitioning keys must be unique. Found duplicate key: {}",
         key->name());
+    conditionalKeyIsPartitionKey |= conditionalPassthroughKey_.has_value() &&
+        sources_[0]->outputType()->getChildIdx(key->name()) ==
+            *conditionalPassthroughKey_;
   }
+  VELOX_USER_CHECK(
+      conditionalKeyIsPartitionKey,
+      "Conditional TopNRowNumber pass-through key must be a partition key");
 
   for (const auto& key : sortingKeys_) {
     VELOX_USER_CHECK(
@@ -2985,6 +3007,9 @@ void TopNRowNumberNode::addDetails(std::stringstream& stream) const {
   stream << ") ";
 
   stream << "limit " << limit_;
+  if (emitBatchCandidates_) {
+    stream << " emit batch candidates";
+  }
 }
 
 folly::dynamic TopNRowNumberNode::serialize() const {
@@ -2997,6 +3022,10 @@ folly::dynamic TopNRowNumberNode::serialize() const {
     obj["rowNumberColumnName"] = outputType_->names().back();
   }
   obj["limit"] = limit_;
+  obj["emitBatchCandidates"] = emitBatchCandidates_;
+  if (conditionalPassthroughKey_.has_value()) {
+    obj["conditionalPassthroughKey"] = *conditionalPassthroughKey_;
+  }
   return obj;
 }
 
@@ -3030,7 +3059,12 @@ PlanNodePtr TopNRowNumberNode::create(
       sortingOrders,
       rowNumberColumnName,
       obj["limit"].asInt(),
-      source);
+      source,
+      obj.getDefault("emitBatchCandidates", false).asBool(),
+      obj.count("conditionalPassthroughKey")
+          ? std::make_optional<int32_t>(
+                obj["conditionalPassthroughKey"].asInt())
+          : std::nullopt);
 }
 
 void LocalMergeNode::addDetails(std::stringstream& stream) const {

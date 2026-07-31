@@ -17,42 +17,355 @@
 
 #include "velox/experimental/cudf/exec/GpuResources.h"
 
+#include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <limits>
 #include <sstream>
 
 namespace facebook::velox::ucx_exchange {
 
 namespace {
-std::atomic<int64_t> diagnosticGlobalQueuedBytes{0};
-std::atomic<int64_t> diagnosticGlobalQueuedColumns{0};
-std::atomic<int64_t> diagnosticGlobalQueueGiB{0};
+uint64_t outputQueueCapacityBytes() {
+  if (const char* value = std::getenv("GLUTEN_UCX_MAX_QUEUED_DEVICE_BYTES")) {
+    try {
+      const auto parsed = std::stoull(value);
+      if (parsed > 0) {
+        return parsed;
+      }
+    } catch (...) {
+    }
+  }
 
-void updateDiagnosticGlobalQueue(
-    int64_t bytes,
-    int64_t columns,
+  constexpr uint64_t kMinCapacity = uint64_t{1} << 30;
+  constexpr uint64_t kMaxCapacity = uint64_t{4} << 30;
+  const auto headroom = cudf_velox::captureDeviceAllocationHeadroom();
+  if (!headroom.cudaValid || headroom.totalBytes == 0) {
+    return kMaxCapacity;
+  }
+  return std::clamp(
+      static_cast<uint64_t>(headroom.totalBytes) / uint64_t{8},
+      kMinCapacity,
+      kMaxCapacity);
+}
+
+std::string outputQueueCreditGroup(std::string_view taskId) {
+  const auto replicaSeparator = taskId.rfind("-p");
+  if (replicaSeparator == std::string_view::npos ||
+      replicaSeparator + 2 == taskId.size()) {
+    return std::string(taskId);
+  }
+  return std::string(taskId.substr(0, replicaSeparator));
+}
+} // namespace
+
+UcxOutputQueueMemoryManager::Reservation::Reservation(
+    std::shared_ptr<UcxOutputQueueMemoryManager> manager,
+    uint64_t bytes,
+    std::string group)
+    : manager_(std::move(manager)), bytes_(bytes), group_(std::move(group)) {}
+
+UcxOutputQueueMemoryManager::Reservation::~Reservation() {
+  release();
+}
+
+UcxOutputQueueMemoryManager::Reservation::Reservation(
+    Reservation&& other) noexcept
+    : manager_(std::move(other.manager_)),
+      bytes_(std::exchange(other.bytes_, 0)),
+      group_(std::move(other.group_)) {}
+
+UcxOutputQueueMemoryManager::Reservation&
+UcxOutputQueueMemoryManager::Reservation::operator=(
+    Reservation&& other) noexcept {
+  if (this != &other) {
+    release();
+    manager_ = std::move(other.manager_);
+    bytes_ = std::exchange(other.bytes_, 0);
+    group_ = std::move(other.group_);
+  }
+  return *this;
+}
+
+void UcxOutputQueueMemoryManager::Reservation::release() noexcept {
+  if (manager_ == nullptr || bytes_ == 0) {
+    manager_.reset();
+    bytes_ = 0;
+    return;
+  }
+  auto manager = std::move(manager_);
+  const auto bytes = std::exchange(bytes_, 0);
+  manager->releaseReservation(bytes, group_);
+  group_.clear();
+}
+
+UcxOutputQueueMemoryManager::UcxOutputQueueMemoryManager(
+    std::optional<uint64_t> capacityBytes,
+    std::string label)
+    : capacityBytes_(capacityBytes.value_or(outputQueueCapacityBytes())),
+      label_(std::move(label)) {
+  VLOG(1) << "UCX process-wide device " << label_
+          << " capacity=" << capacityBytes_;
+}
+
+bool UcxOutputQueueMemoryManager::reserve(
+    uint64_t bytes,
+    std::string_view taskId,
+    ContinueFuture* future,
+    std::optional<Reservation>& reservation,
+    std::shared_ptr<Waiter>& waiter) {
+  VELOX_CHECK(!reservation.has_value());
+  std::lock_guard<std::mutex> l(mutex_);
+  if (waiter != nullptr) {
+    VELOX_CHECK(waiter->reservation_.has_value());
+    reservation = std::move(waiter->reservation_);
+    waiter.reset();
+    return false;
+  }
+
+  auto group = outputQueueCreditGroup(taskId);
+  const auto groupIt = groupUsage_.find(group);
+  const bool newProgressGroup = groupIt == groupUsage_.end() ||
+      (groupIt->second.queuedBytes == 0 && groupIt->second.reservedBytes == 0);
+  if (bytes == 0 ||
+      ((waiters_.empty() || newProgressGroup) &&
+       canReserveLocked(bytes, group))) {
+    addReservedBytesLocked(bytes, group);
+    reservation = Reservation(shared_from_this(), bytes, std::move(group));
+    return false;
+  }
+
+  VELOX_CHECK_NOT_NULL(future);
+  ContinuePromise promise{"UcxOutputQueueMemoryManager::reserve"};
+  *future = promise.getSemiFuture();
+  waiter = std::shared_ptr<Waiter>(
+      new Waiter(bytes, std::move(group), std::move(promise)));
+  waiters_.push_back(waiter);
+  if (cudf_velox::deviceMemoryDiagnosticsEnabled()) {
+    LOG(WARNING) << "CUDF_DEVICE_QUEUE_ADMISSION event=blocked"
+                 << " requestedBytes=" << bytes
+                 << " queuedBytes=" << queuedBytes_
+                 << " reservedBytes=" << reservedBytes_
+                 << " capacityBytes=" << capacityBytes_
+                 << " waiters=" << waiters_.size();
+  }
+  return true;
+}
+
+bool UcxOutputQueueMemoryManager::reserve(
+    uint64_t bytes,
+    std::string_view taskId,
+    std::function<void()> wakeup,
+    std::optional<Reservation>& reservation,
+    std::shared_ptr<Waiter>& waiter) {
+  VELOX_CHECK(!reservation.has_value());
+  std::lock_guard<std::mutex> l(mutex_);
+  if (waiter != nullptr && waiter->reservation_.has_value()) {
+    reservation = std::move(waiter->reservation_);
+    waiter.reset();
+    return false;
+  }
+  if (waiter != nullptr) {
+    return true;
+  }
+
+  auto group = outputQueueCreditGroup(taskId);
+  const auto groupIt = groupUsage_.find(group);
+  const bool newProgressGroup = groupIt == groupUsage_.end() ||
+      (groupIt->second.queuedBytes == 0 && groupIt->second.reservedBytes == 0);
+  if (bytes == 0 ||
+      ((waiters_.empty() || newProgressGroup) &&
+       canReserveLocked(bytes, group))) {
+    addReservedBytesLocked(bytes, group);
+    reservation = Reservation(shared_from_this(), bytes, std::move(group));
+    return false;
+  }
+
+  waiter = std::shared_ptr<Waiter>(
+      new Waiter(bytes, std::move(group), std::move(wakeup)));
+  waiters_.push_back(waiter);
+  if (cudf_velox::deviceMemoryDiagnosticsEnabled()) {
+    LOG(WARNING) << "CUDF_DEVICE_QUEUE_ADMISSION event=blocked"
+                 << " label=" << label_ << " requestedBytes=" << bytes
+                 << " queuedBytes=" << queuedBytes_
+                 << " reservedBytes=" << reservedBytes_
+                 << " capacityBytes=" << capacityBytes_
+                 << " waiters=" << waiters_.size();
+  }
+  return true;
+}
+
+void UcxOutputQueueMemoryManager::addQueuedBytes(
+    uint64_t bytes,
+    int64_t packedColumns,
+    std::string_view taskId) {
+  std::lock_guard<std::mutex> l(mutex_);
+  const auto group = outputQueueCreditGroup(taskId);
+  queuedBytes_ += bytes;
+  queuedPackedColumns_ += packedColumns;
+  groupUsage_[group].queuedBytes += bytes;
+  peakResidentBytes_ =
+      std::max(peakResidentBytes_, queuedBytes_ + reservedBytes_);
+  logResidencyLocked("enqueue", taskId);
+}
+
+void UcxOutputQueueMemoryManager::removeQueuedBytes(
+    uint64_t bytes,
+    int64_t packedColumns,
+    std::string_view taskId) {
+  std::vector<std::shared_ptr<Waiter>> grantedWaiters;
+  {
+    std::lock_guard<std::mutex> l(mutex_);
+    VELOX_CHECK_GE(queuedBytes_, bytes);
+    VELOX_CHECK_GE(queuedPackedColumns_, packedColumns);
+    queuedBytes_ -= bytes;
+    queuedPackedColumns_ -= packedColumns;
+    const auto group = outputQueueCreditGroup(taskId);
+    auto groupIt = groupUsage_.find(group);
+    VELOX_CHECK(groupIt != groupUsage_.end());
+    VELOX_CHECK_GE(groupIt->second.queuedBytes, bytes);
+    groupIt->second.queuedBytes -= bytes;
+    if (groupIt->second.queuedBytes == 0 &&
+        groupIt->second.reservedBytes == 0) {
+      groupUsage_.erase(groupIt);
+    }
+    logResidencyLocked("dequeue", taskId);
+    grantedWaiters = grantWaitersLocked();
+  }
+  for (auto& waiter : grantedWaiters) {
+    if (waiter->promise_.has_value()) {
+      waiter->promise_->setValue();
+    } else if (waiter->wakeup_) {
+      waiter->wakeup_();
+    }
+  }
+}
+
+uint64_t UcxOutputQueueMemoryManager::queuedBytes() const {
+  std::lock_guard<std::mutex> l(mutex_);
+  return queuedBytes_;
+}
+
+uint64_t UcxOutputQueueMemoryManager::peakResidentBytes() const {
+  std::lock_guard<std::mutex> l(mutex_);
+  return peakResidentBytes_;
+}
+
+void UcxOutputQueueMemoryManager::releaseReservation(
+    uint64_t bytes,
+    const std::string& group) noexcept {
+  std::vector<std::shared_ptr<Waiter>> grantedWaiters;
+  {
+    std::lock_guard<std::mutex> l(mutex_);
+    removeReservedBytesLocked(bytes, group);
+    grantedWaiters = grantWaitersLocked();
+  }
+  for (auto& waiter : grantedWaiters) {
+    if (waiter->promise_.has_value()) {
+      waiter->promise_->setValue();
+    } else if (waiter->wakeup_) {
+      waiter->wakeup_();
+    }
+  }
+}
+
+bool UcxOutputQueueMemoryManager::canReserveLocked(
+    uint64_t bytes,
+    const std::string& group) const {
+  const auto residentBytes = queuedBytes_ + reservedBytes_;
+  if (residentBytes == 0 ||
+      (bytes <= capacityBytes_ && residentBytes <= capacityBytes_ - bytes)) {
+    return true;
+  }
+
+  const auto groupIt = groupUsage_.find(group);
+  const auto groupResidentBytes = groupIt == groupUsage_.end()
+      ? uint64_t{0}
+      : groupIt->second.queuedBytes + groupIt->second.reservedBytes;
+  // One window per fragment may cross the global limit so a downstream
+  // fragment can keep draining an otherwise credit-saturated MPP DAG.
+  return groupResidentBytes == 0;
+}
+
+void UcxOutputQueueMemoryManager::addReservedBytesLocked(
+    uint64_t bytes,
+    const std::string& group) {
+  if (bytes == 0) {
+    return;
+  }
+  reservedBytes_ += bytes;
+  groupUsage_[group].reservedBytes += bytes;
+  peakResidentBytes_ =
+      std::max(peakResidentBytes_, queuedBytes_ + reservedBytes_);
+}
+
+void UcxOutputQueueMemoryManager::removeReservedBytesLocked(
+    uint64_t bytes,
+    const std::string& group) {
+  if (reservedBytes_ < bytes) {
+    LOG(ERROR) << "UCX device output queue reservation underflow: reserved="
+               << reservedBytes_ << " release=" << bytes;
+    reservedBytes_ = 0;
+  } else {
+    reservedBytes_ -= bytes;
+  }
+
+  auto groupIt = groupUsage_.find(group);
+  if (groupIt == groupUsage_.end() || groupIt->second.reservedBytes < bytes) {
+    LOG(ERROR) << "UCX device output queue group reservation underflow: group="
+               << group << " release=" << bytes;
+    if (groupIt != groupUsage_.end()) {
+      groupIt->second.reservedBytes = 0;
+    }
+  } else {
+    groupIt->second.reservedBytes -= bytes;
+  }
+  if (groupIt != groupUsage_.end() && groupIt->second.queuedBytes == 0 &&
+      groupIt->second.reservedBytes == 0) {
+    groupUsage_.erase(groupIt);
+  }
+}
+
+std::vector<std::shared_ptr<UcxOutputQueueMemoryManager::Waiter>>
+UcxOutputQueueMemoryManager::grantWaitersLocked() {
+  std::vector<std::shared_ptr<Waiter>> grantedWaiters;
+  while (!waiters_.empty()) {
+    auto waiterIt =
+        std::find_if(waiters_.begin(), waiters_.end(), [&](const auto& waiter) {
+          return waiter->bytes_ == 0 ||
+              canReserveLocked(waiter->bytes_, waiter->group_);
+        });
+    if (waiterIt == waiters_.end()) {
+      break;
+    }
+    auto waiter = std::move(*waiterIt);
+    waiters_.erase(waiterIt);
+    addReservedBytesLocked(waiter->bytes_, waiter->group_);
+    waiter->reservation_ =
+        Reservation(shared_from_this(), waiter->bytes_, waiter->group_);
+    grantedWaiters.push_back(std::move(waiter));
+  }
+  return grantedWaiters;
+}
+
+void UcxOutputQueueMemoryManager::logResidencyLocked(
     const char* event,
-    const std::shared_ptr<exec::Task>& task) {
+    std::string_view taskId) {
   if (!cudf_velox::deviceMemoryDiagnosticsEnabled()) {
     return;
   }
-  const auto currentBytes =
-      diagnosticGlobalQueuedBytes.fetch_add(bytes, std::memory_order_relaxed) +
-      bytes;
-  const auto currentColumns = diagnosticGlobalQueuedColumns.fetch_add(
-                                  columns, std::memory_order_relaxed) +
-      columns;
-  const auto gib = currentBytes >> 30;
-  const auto previous =
-      diagnosticGlobalQueueGiB.exchange(gib, std::memory_order_relaxed);
-  if (gib != previous) {
-    LOG(WARNING) << "CUDF_DEVICE_QUEUE_GLOBAL event=" << event
-                 << " task=" << (task ? task->taskId() : "n/a")
-                 << " queuedBytes=" << currentBytes
-                 << " queuedPackedColumns=" << currentColumns;
+  const auto gib = static_cast<int64_t>(queuedBytes_ >> 30);
+  if (gib == diagnosticGiBBucket_) {
+    return;
   }
+  diagnosticGiBBucket_ = gib;
+  LOG(WARNING) << "CUDF_DEVICE_QUEUE_GLOBAL event=" << event
+               << " label=" << label_ << " task=" << taskId
+               << " queuedBytes=" << queuedBytes_
+               << " reservedBytes=" << reservedBytes_
+               << " queuedPackedColumns=" << queuedPackedColumns_
+               << " capacityBytes=" << capacityBytes_;
 }
-} // namespace
 
 void UcxDestinationQueue::Stats::recordEnqueue(
     const cudf::packed_columns* data) {
@@ -258,8 +571,12 @@ UcxOutputQueue::UcxOutputQueue(
     std::shared_ptr<exec::Task> task,
     uint32_t numDestinations,
     uint32_t numDrivers,
-    core::PartitionedOutputNode::Kind kind)
-    : task_(task), kind_(kind), numDrivers_(numDrivers) {
+    core::PartitionedOutputNode::Kind kind,
+    std::shared_ptr<UcxOutputQueueMemoryManager> memoryManager)
+    : task_(task),
+      memoryManager_(std::move(memoryManager)),
+      kind_(kind),
+      numDrivers_(numDrivers) {
   if (task_) {
     maxSize_ = task_->queryCtx()->queryConfig().maxOutputBufferSize();
     continueSize_ = (maxSize_ * kContinuePct) / 100;
@@ -328,7 +645,23 @@ void UcxOutputQueue::enqueue(
   {
     std::lock_guard<std::mutex> l(mutex_);
     auto numBytes = data->gpu_data->size();
-    auto sharedData = std::shared_ptr<cudf::packed_columns>(std::move(data));
+    std::shared_ptr<cudf::packed_columns> sharedData;
+    if (memoryManager_ != nullptr &&
+        kind_ != core::PartitionedOutputNode::Kind::kBroadcast) {
+      auto memoryManager = memoryManager_;
+      auto ownerTaskId = task_->taskId();
+      memoryManager->addQueuedBytes(numBytes, 1, ownerTaskId);
+      sharedData = std::shared_ptr<cudf::packed_columns>(
+          data.release(),
+          [memoryManager = std::move(memoryManager),
+           numBytes,
+           ownerTaskId = std::move(ownerTaskId)](cudf::packed_columns* packed) {
+            delete packed;
+            memoryManager->removeQueuedBytes(numBytes, 1, ownerTaskId);
+          });
+    } else {
+      sharedData = std::shared_ptr<cudf::packed_columns>(std::move(data));
+    }
 
     bool success = false;
     if (kind_ == core::PartitionedOutputNode::Kind::kBroadcast) {
@@ -361,6 +694,63 @@ void UcxOutputQueue::enqueue(
     }
   }
   // Now that data is enqueued, notify blocked readers (outside of mutex.)
+  for (auto& callback : dataAvailableCallbacks) {
+    callback.notify();
+  }
+}
+
+void UcxOutputQueue::enqueueFanout(
+    int destination,
+    int destinationStride,
+    int fanout,
+    std::unique_ptr<cudf::packed_columns> data,
+    int32_t numRows) {
+  VELOX_CHECK_NOT_NULL(data);
+  VELOX_CHECK_NOT_NULL(task_);
+  VELOX_CHECK_EQ(kind_, core::PartitionedOutputNode::Kind::kPartitioned);
+  VELOX_CHECK_GT(destinationStride, 0);
+  VELOX_CHECK_GT(fanout, 1);
+  VELOX_CHECK(
+      task_->isRunning(), "Task is terminated, cannot add data to output.");
+
+  std::vector<UcxDataAvailable> dataAvailableCallbacks;
+  {
+    std::lock_guard<std::mutex> l(mutex_);
+    const auto lastDestination = destination + destinationStride * (fanout - 1);
+    VELOX_CHECK_GE(destination, 0);
+    VELOX_CHECK_LT(lastDestination, queues_.size());
+
+    const auto numBytes = data->gpu_data->size();
+    std::shared_ptr<cudf::packed_columns> sharedData;
+    if (memoryManager_ != nullptr) {
+      auto memoryManager = memoryManager_;
+      auto ownerTaskId = task_->taskId();
+      memoryManager->addQueuedBytes(numBytes, 1, ownerTaskId);
+      sharedData = std::shared_ptr<cudf::packed_columns>(
+          data.release(),
+          [memoryManager = std::move(memoryManager),
+           numBytes,
+           ownerTaskId = std::move(ownerTaskId)](cudf::packed_columns* packed) {
+            delete packed;
+            memoryManager->removeQueuedBytes(numBytes, 1, ownerTaskId);
+          });
+    } else {
+      sharedData = std::shared_ptr<cudf::packed_columns>(std::move(data));
+    }
+
+    for (int ordinal = 0; ordinal < fanout; ++ordinal) {
+      const auto logicalDestination = destination + ordinal * destinationStride;
+      std::vector<UcxDataAvailable> callbacks;
+      if (enqueuePartitionedOutputLocked(
+              logicalDestination, sharedData, callbacks)) {
+        updateStatsWithEnqueuedLocked(numBytes, numRows);
+      }
+      dataAvailableCallbacks.insert(
+          dataAvailableCallbacks.end(),
+          std::make_move_iterator(callbacks.begin()),
+          std::make_move_iterator(callbacks.end()));
+    }
+  }
   for (auto& callback : dataAvailableCallbacks) {
     callback.notify();
   }
@@ -761,7 +1151,6 @@ void UcxOutputQueue::updateStatsWithEnqueuedLocked(
   totalBytesSent_ += bytes;
   totalRowsSent_ += rows;
   totalPackedColumnsSent_++;
-  updateDiagnosticGlobalQueue(bytes, 1, "enqueue", task_);
   logDeviceQueueResidencyLocked("enqueue");
 }
 
@@ -776,7 +1165,6 @@ void UcxOutputQueue::updateStatsWithFreedLocked(
 
   VELOX_CHECK_GE(queuedBytes_, 0);
   VELOX_CHECK_GE(queuedPackedColumns_, 0);
-  updateDiagnosticGlobalQueue(-bytes, -numPackedCols, "dequeue", task_);
   logDeviceQueueResidencyLocked("dequeue");
 
   // Check whether queue is below low-water mark and return outstanding

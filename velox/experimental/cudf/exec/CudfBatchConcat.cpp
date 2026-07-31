@@ -86,6 +86,37 @@ std::string getAggregationStep(
   return aggregation ? fmt::format("{}", aggregation->step()) : "UNKNOWN";
 }
 
+uint64_t clampAggregationTargetBytes(
+    exec::DriverCtx* driverCtx,
+    const std::shared_ptr<const core::PlanNode>& planNode,
+    uint64_t targetBytes) {
+  const auto aggregation =
+      std::dynamic_pointer_cast<const core::AggregationNode>(planNode);
+  if (!aggregation) {
+    return targetBytes;
+  }
+  if (aggregation->step() == core::AggregationNode::Step::kFinal) {
+    const auto exchangeTargetBytes = driverCtx->queryConfig().get<uint64_t>(
+        CudfConfig::kCudfExchangeBatchSizeMinThresholdBytes,
+        CudfConfig::getInstance().exchangeBatchSizeMinThresholdBytes);
+    if (exchangeTargetBytes > 0) {
+      return targetBytes == 0 ? exchangeTargetBytes
+                              : std::min(targetBytes, exchangeTargetBytes);
+    }
+    return targetBytes;
+  }
+  if (targetBytes == 0 ||
+      (aggregation->step() != core::AggregationNode::Step::kPartial &&
+       aggregation->step() != core::AggregationNode::Step::kIntermediate)) {
+    return targetBytes;
+  }
+  const auto partialMemoryBytes =
+      driverCtx->queryConfig().maxPartialAggregationMemoryUsage();
+  return partialMemoryBytes > 0
+      ? std::min<uint64_t>(targetBytes, partialMemoryBytes)
+      : targetBytes;
+}
+
 bool logConcatConfig() {
   const auto* value = std::getenv("GLUTEN_CUDF_BATCH_CONCAT_LOG_CONFIG");
   return value != nullptr && std::string_view(value) != "0" &&
@@ -154,7 +185,8 @@ CudfBatchConcat::CudfBatchConcat(
       driverCtx_(driverCtx),
       aggregationStep_(getAggregationStep(planNode)),
       targetRows_(checkedConcatTargetRows(targetRows)),
-      targetBytes_(targetBytes) {
+      targetBytes_(
+          clampAggregationTargetBytes(driverCtx, planNode, targetBytes)) {
   if (logConcatConfig()) {
     LOG(WARNING) << "CudfBatchConcat configured targetRows=" << targetRows_
                  << ", targetBytes=" << targetBytes_;
@@ -282,6 +314,13 @@ RowVectorPtr CudfBatchConcat::doGetOutput() {
 
 bool CudfBatchConcat::isFinished() {
   const bool finished = noMoreInput_ && buffer_.empty() && outputQueue_.empty();
+  if (finished && !runtimeStatsRecorded_) {
+    runtimeStatsRecorded_ = true;
+    auto lockedStats = stats_.wlock();
+    lockedStats->addRuntimeStat(
+        "cudfBatchConcatTargetBytes",
+        RuntimeCounter(targetBytes_, RuntimeCounter::Unit::kBytes));
+  }
   if (finished && !summaryLogged_ && logConcatConfig()) {
     summaryLogged_ = true;
     LOG(WARNING) << "CudfBatchConcat summary planNode=" << planNodeId()

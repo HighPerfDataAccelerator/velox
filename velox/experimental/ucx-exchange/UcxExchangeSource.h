@@ -24,6 +24,7 @@
 #include "velox/experimental/ucx-exchange/PartitionKey.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeProtocol.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeQueue.h"
+#include "velox/experimental/ucx-exchange/UcxQueues.h"
 
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -126,10 +127,9 @@ class UcxExchangeSource
   // Each source can own a queued device buffer independently of downstream
   // consumption. Without a byte bound these buffers (one UcxExchangeSource per
   // producer peer) scale O(#peers) and collectively exhaust the GPU at 4 peers
-  // (OOM at concurrentGpuTasks=2, deadlock at =1). Remote receives use a
-  // dedicated fresh cudaMalloc resource so UCX writes cannot race with
-  // stream-ordered reuse in the cuDF compute pool. Read once; env-overridable
-  // via
+  // (OOM at concurrentGpuTasks=2, deadlock at =1). Remote receives use the
+  // shared async device resource and retain residency credit with the packed
+  // buffer until downstream releases it. Read once; env-overridable via
   // GLUTEN_UCX_MAX_INFLIGHT_RECV_BYTES (default 8 GiB).
   static int64_t maxInFlightRecvBytes();
 
@@ -163,6 +163,7 @@ class UcxExchangeSource
     MetadataMsg metadata;
     std::unique_ptr<rmm::device_buffer> dataBuf;
     std::shared_ptr<std::vector<uint8_t>> hostData;
+    std::shared_ptr<void> deviceResidencyOwner;
     rmm::cuda_stream_view stream; // The stream used to allocate dataBuf
   };
 
@@ -294,7 +295,7 @@ class UcxExchangeSource
   const std::string taskId_;
 
   const PartitionKey partitionKey_;
-  const uint32_t
+  const uint64_t
       partitionKeyHash_; // A hash of above, used to create unique tags.
 
   std::atomic<ReceiverState> state_;
@@ -332,6 +333,10 @@ class UcxExchangeSource
   std::shared_ptr<DataAndMetadata> pendingReceive_;
   int64_t reservedReceiveBytes_{0};
   int64_t reservedGlobalHostReceiveBytes_{0};
+  std::optional<UcxOutputQueueMemoryManager::Reservation>
+      receiveDeviceReservation_;
+  std::shared_ptr<UcxOutputQueueMemoryManager::Waiter>
+      receiveDeviceReservationWaiter_;
 
   // Some metrics/counters:
   UcxExchangeMetrics metrics_;

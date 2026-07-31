@@ -22,6 +22,7 @@
 #include <folly/synchronization/EventCount.h>
 #include <gtest/gtest.h>
 #include <rmm/device_buffer.hpp>
+#include <array>
 #include <limits>
 #include <memory>
 #include <vector>
@@ -668,6 +669,37 @@ TEST_F(UcxOutputQueueManagerTest, lateTaskCreation) {
   EXPECT_TRUE(task->isFinished());
 }
 
+TEST_F(UcxOutputQueueManagerTest, partitionedFanoutSharesPackedBuffer) {
+  const std::string taskId = "partitionedFanoutSharesPackedBuffer";
+  auto task = initializeTask(taskId, 12, 1);
+  auto packed = makePackedColumns(100);
+  const auto physicalBytes = packed->gpu_data->size();
+  const auto residentBefore = queueManager_->deviceQueueResidentBytes();
+
+  queueManager_->enqueueFanout(taskId, 2, 4, 3, std::move(packed), 100);
+  EXPECT_EQ(
+      queueManager_->deviceQueueResidentBytes(),
+      residentBefore + physicalBytes);
+
+  auto first = fetchV1Data(taskId, 2).data;
+  auto second = fetchV1Data(taskId, 6).data;
+  auto third = fetchV1Data(taskId, 10).data;
+  ASSERT_NE(first, nullptr);
+  EXPECT_EQ(first.get(), second.get());
+  EXPECT_EQ(first.get(), third.get());
+
+  noMoreData(taskId);
+  first.reset();
+  second.reset();
+  third.reset();
+  EXPECT_EQ(queueManager_->deviceQueueResidentBytes(), residentBefore);
+  for (int destination = 0; destination < 12; ++destination) {
+    fetchEndMarker(taskId, destination);
+  }
+  queueManager_->removeTask(taskId);
+  EXPECT_TRUE(task->isFinished());
+}
+
 TEST_F(UcxOutputQueueManagerTest, multiFetchers) {
   const std::vector<bool> earlyTerminations = {false, true};
   for (const auto earlyTermination : earlyTerminations) {
@@ -944,4 +976,198 @@ TEST_F(UcxOutputQueueManagerTest, broadcastEndMarkerToLateDestination) {
 
   EXPECT_TRUE(queueManager_->isFinished(taskId));
   queueManager_->removeTask(taskId);
+}
+
+TEST_F(
+    UcxOutputQueueManagerTest,
+    deviceQueueCreditFollowsPackedColumnsOwnership) {
+  const std::string taskId = "device-residency-owner";
+  auto task = initializeTask(taskId, 1, 1);
+  const auto baseline = queueManager_->deviceQueueResidentBytes();
+
+  auto packed = makePackedColumns(100);
+  const auto bytes = packed->gpu_data->size();
+  queueManager_->enqueue(taskId, 0, std::move(packed), 100);
+  EXPECT_EQ(queueManager_->deviceQueueResidentBytes(), baseline + bytes);
+
+  std::shared_ptr<cudf::packed_columns> heldBySender;
+  queueManager_->getData(
+      taskId,
+      0,
+      [&](std::shared_ptr<cudf::packed_columns> data,
+          std::vector<int64_t> /*remainingBytes*/) {
+        heldBySender = std::move(data);
+      });
+  ASSERT_NE(heldBySender, nullptr);
+  EXPECT_EQ(queueManager_->deviceQueueResidentBytes(), baseline + bytes);
+
+  heldBySender.reset();
+  EXPECT_EQ(queueManager_->deviceQueueResidentBytes(), baseline);
+  queueManager_->removeTask(taskId);
+}
+
+TEST(UcxOutputQueueMemoryManagerTest, queuedBytesAndReservationsShareCapacity) {
+  auto manager = std::make_shared<UcxOutputQueueMemoryManager>();
+  const auto capacity = manager->capacityBytes();
+  ASSERT_GT(capacity, 0);
+
+  manager->addQueuedBytes(capacity, 1, "test");
+  EXPECT_EQ(manager->queuedBytes(), capacity);
+
+  ContinueFuture queuedFuture;
+  std::optional<UcxOutputQueueMemoryManager::Reservation> queuedReservation;
+  std::shared_ptr<UcxOutputQueueMemoryManager::Waiter> queuedWaiter;
+  EXPECT_TRUE(manager->reserve(
+      1, "test", &queuedFuture, queuedReservation, queuedWaiter));
+  EXPECT_FALSE(queuedFuture.isReady());
+
+  manager->removeQueuedBytes(capacity, 1, "test");
+  EXPECT_TRUE(queuedFuture.isReady());
+  EXPECT_FALSE(manager->reserve(
+      1, "test", &queuedFuture, queuedReservation, queuedWaiter));
+  EXPECT_TRUE(queuedReservation.has_value());
+  queuedReservation.reset();
+
+  ContinueFuture unusedFuture;
+  std::optional<UcxOutputQueueMemoryManager::Reservation> fullReservation;
+  std::shared_ptr<UcxOutputQueueMemoryManager::Waiter> fullWaiter;
+  EXPECT_FALSE(manager->reserve(
+      capacity, "test", &unusedFuture, fullReservation, fullWaiter));
+  ASSERT_TRUE(fullReservation.has_value());
+
+  ContinueFuture reservationFuture;
+  std::optional<UcxOutputQueueMemoryManager::Reservation> blockedReservation;
+  std::shared_ptr<UcxOutputQueueMemoryManager::Waiter> blockedWaiter;
+  EXPECT_TRUE(manager->reserve(
+      1, "test", &reservationFuture, blockedReservation, blockedWaiter));
+  EXPECT_FALSE(reservationFuture.isReady());
+
+  fullReservation.reset();
+  EXPECT_TRUE(reservationFuture.isReady());
+  EXPECT_FALSE(manager->reserve(
+      1, "test", &reservationFuture, blockedReservation, blockedWaiter));
+  EXPECT_TRUE(blockedReservation.has_value());
+}
+
+TEST(UcxOutputQueueMemoryManagerTest, grantsOnlyReservedWaiters) {
+  auto manager = std::make_shared<UcxOutputQueueMemoryManager>();
+  const auto capacity = manager->capacityBytes();
+  const auto requestBytes = capacity / 4;
+  ASSERT_GT(requestBytes, 0);
+
+  manager->addQueuedBytes(capacity, 1, "test");
+
+  std::array<ContinueFuture, 3> futures;
+  std::array<std::optional<UcxOutputQueueMemoryManager::Reservation>, 3>
+      reservations;
+  std::array<std::shared_ptr<UcxOutputQueueMemoryManager::Waiter>, 3> waiters;
+  for (size_t i = 0; i < futures.size(); ++i) {
+    EXPECT_TRUE(manager->reserve(
+        requestBytes, "test", &futures[i], reservations[i], waiters[i]));
+    EXPECT_FALSE(futures[i].isReady());
+  }
+
+  manager->removeQueuedBytes(capacity / 2, 1, "test");
+  EXPECT_TRUE(futures[0].isReady());
+  EXPECT_TRUE(futures[1].isReady());
+  EXPECT_FALSE(futures[2].isReady());
+
+  for (size_t i = 0; i < 2; ++i) {
+    EXPECT_FALSE(manager->reserve(
+        requestBytes, "test", &futures[i], reservations[i], waiters[i]));
+    EXPECT_TRUE(reservations[i].has_value());
+  }
+
+  reservations[0].reset();
+  EXPECT_TRUE(futures[2].isReady());
+  EXPECT_FALSE(manager->reserve(
+      requestBytes, "test", &futures[2], reservations[2], waiters[2]));
+  EXPECT_TRUE(reservations[2].has_value());
+
+  reservations[1].reset();
+  reservations[2].reset();
+  manager->removeQueuedBytes(capacity / 2, 0, "test");
+  EXPECT_EQ(manager->queuedBytes(), 0);
+}
+
+TEST(UcxOutputQueueMemoryManagerTest, reservesOneProgressWindowPerFragment) {
+  auto manager = std::make_shared<UcxOutputQueueMemoryManager>();
+  const auto capacity = manager->capacityBytes();
+  const auto requestBytes = capacity / 4;
+  ASSERT_GT(requestBytes, 0);
+
+  manager->addQueuedBytes(capacity, 1, "query-peer-4-p0");
+
+  ContinueFuture progressFuture;
+  std::optional<UcxOutputQueueMemoryManager::Reservation> progressReservation;
+  std::shared_ptr<UcxOutputQueueMemoryManager::Waiter> progressWaiter;
+  EXPECT_FALSE(manager->reserve(
+      requestBytes,
+      "query-peer-3-p0",
+      &progressFuture,
+      progressReservation,
+      progressWaiter));
+  ASSERT_TRUE(progressReservation.has_value());
+
+  ContinueFuture sameFragmentFuture;
+  std::optional<UcxOutputQueueMemoryManager::Reservation>
+      sameFragmentReservation;
+  std::shared_ptr<UcxOutputQueueMemoryManager::Waiter> sameFragmentWaiter;
+  EXPECT_TRUE(manager->reserve(
+      requestBytes,
+      "query-peer-3-p1",
+      &sameFragmentFuture,
+      sameFragmentReservation,
+      sameFragmentWaiter));
+  EXPECT_FALSE(sameFragmentFuture.isReady());
+
+  progressReservation.reset();
+  EXPECT_TRUE(sameFragmentFuture.isReady());
+  EXPECT_FALSE(manager->reserve(
+      requestBytes,
+      "query-peer-3-p1",
+      &sameFragmentFuture,
+      sameFragmentReservation,
+      sameFragmentWaiter));
+  EXPECT_TRUE(sameFragmentReservation.has_value());
+
+  sameFragmentReservation.reset();
+  manager->removeQueuedBytes(capacity, 1, "query-peer-4-p0");
+}
+
+TEST(UcxOutputQueueMemoryManagerTest, callbackWaiterTracksOwnership) {
+  auto manager =
+      std::make_shared<UcxOutputQueueMemoryManager>(100, "test receive");
+
+  std::optional<UcxOutputQueueMemoryManager::Reservation> firstReservation;
+  std::shared_ptr<UcxOutputQueueMemoryManager::Waiter> firstWaiter;
+  EXPECT_FALSE(manager->reserve(
+      100, "query-peer-3-p0", [] {}, firstReservation, firstWaiter));
+
+  bool woke = false;
+  std::optional<UcxOutputQueueMemoryManager::Reservation> blockedReservation;
+  std::shared_ptr<UcxOutputQueueMemoryManager::Waiter> blockedWaiter;
+  EXPECT_TRUE(manager->reserve(
+      25,
+      "query-peer-3-p1",
+      [&] { woke = true; },
+      blockedReservation,
+      blockedWaiter));
+  EXPECT_FALSE(woke);
+
+  std::optional<UcxOutputQueueMemoryManager::Reservation> progressReservation;
+  std::shared_ptr<UcxOutputQueueMemoryManager::Waiter> progressWaiter;
+  EXPECT_FALSE(manager->reserve(
+      25, "query-peer-4-p0", [] {}, progressReservation, progressWaiter));
+  EXPECT_GE(manager->peakResidentBytes(), 125);
+
+  firstReservation.reset();
+  EXPECT_TRUE(woke);
+  EXPECT_FALSE(manager->reserve(
+      25,
+      "query-peer-3-p1",
+      [&] { woke = true; },
+      blockedReservation,
+      blockedWaiter));
+  EXPECT_TRUE(blockedReservation.has_value());
 }

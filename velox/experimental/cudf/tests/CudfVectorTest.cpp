@@ -21,7 +21,9 @@
 #include "velox/common/base/Exceptions.h"
 #include "velox/vector/tests/utils/VectorTestBase.h"
 
+#include <cudf/column/column_factories.hpp>
 #include <cudf/contiguous_split.hpp>
+#include <cudf/strings/strings_column_view.hpp>
 #include <cudf/utilities/error.hpp>
 
 #include <rmm/device_buffer.hpp>
@@ -30,7 +32,9 @@
 #include <cuda_runtime_api.h>
 
 #include <array>
+#include <cstring>
 #include <memory>
+#include <string_view>
 #include <vector>
 
 using namespace facebook::velox;
@@ -82,13 +86,12 @@ std::unique_ptr<cudf::table> makeTable(
       stream.value()));
 
   std::vector<std::unique_ptr<cudf::column>> columns;
-  columns.push_back(
-      std::make_unique<cudf::column>(
-          cudf::data_type{cudf::type_id::INT32},
-          static_cast<cudf::size_type>(values.size()),
-          std::move(data),
-          rmm::device_buffer{},
-          0));
+  columns.push_back(std::make_unique<cudf::column>(
+      cudf::data_type{cudf::type_id::INT32},
+      static_cast<cudf::size_type>(values.size()),
+      std::move(data),
+      rmm::device_buffer{},
+      0));
   return std::make_unique<cudf::table>(std::move(columns));
 }
 
@@ -102,6 +105,91 @@ std::unique_ptr<cudf::packed_table> makePackedTable(
       rmm::to_device_async_resource_ref_checked(&resource));
   // CudfVector does not join producer streams. Synchronize the packing stream
   // before handing the packed table to CudfVector.
+  stream.synchronize();
+  auto tableView = cudf::unpack(packedColumns);
+  return std::make_unique<cudf::packed_table>(
+      cudf::packed_table{tableView, std::move(packedColumns)});
+}
+
+std::unique_ptr<cudf::packed_table> makeRepeatedPackedTable(
+    cudf::size_type rows,
+    rmm::cuda_stream_view stream,
+    RecordingAsyncDeviceResource& resource) {
+  rmm::device_buffer data(
+      static_cast<std::size_t>(rows) * sizeof(int32_t),
+      stream,
+      rmm::to_device_async_resource_ref_checked(&resource));
+  CUDF_CUDA_TRY(cudaMemsetAsync(data.data(), 0, data.size(), stream.value()));
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(std::make_unique<cudf::column>(
+      cudf::data_type{cudf::type_id::INT32},
+      rows,
+      std::move(data),
+      rmm::device_buffer{},
+      0));
+  auto table = std::make_unique<cudf::table>(std::move(columns));
+  auto packedColumns = cudf::pack(
+      table->view(),
+      stream,
+      rmm::to_device_async_resource_ref_checked(&resource));
+  stream.synchronize();
+  auto tableView = cudf::unpack(packedColumns);
+  return std::make_unique<cudf::packed_table>(
+      cudf::packed_table{tableView, std::move(packedColumns)});
+}
+
+std::unique_ptr<cudf::packed_table> makeRepeatedStringPackedTable(
+    cudf::size_type rows,
+    rmm::cuda_stream_view stream,
+    RecordingAsyncDeviceResource& resource) {
+  constexpr std::string_view kValue = "repeated";
+  std::vector<int32_t> offsets(rows + 1);
+  for (cudf::size_type i = 0; i <= rows; ++i) {
+    offsets[i] = i * kValue.size();
+  }
+  rmm::device_buffer offsetsData(
+      offsets.size() * sizeof(int32_t),
+      stream,
+      rmm::to_device_async_resource_ref_checked(&resource));
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+      offsetsData.data(),
+      offsets.data(),
+      offsetsData.size(),
+      cudaMemcpyHostToDevice,
+      stream.value()));
+  auto offsetsColumn = std::make_unique<cudf::column>(
+      cudf::data_type{cudf::type_id::INT32},
+      offsets.size(),
+      std::move(offsetsData),
+      rmm::device_buffer{},
+      0);
+
+  std::vector<char> chars(rows * kValue.size());
+  for (cudf::size_type i = 0; i < rows; ++i) {
+    std::memcpy(chars.data() + i * kValue.size(), kValue.data(), kValue.size());
+  }
+  rmm::device_buffer charsData(
+      chars.size(),
+      stream,
+      rmm::to_device_async_resource_ref_checked(&resource));
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+      charsData.data(),
+      chars.data(),
+      charsData.size(),
+      cudaMemcpyHostToDevice,
+      stream.value()));
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(cudf::make_strings_column(
+      rows,
+      std::move(offsetsColumn),
+      std::move(charsData),
+      0,
+      rmm::device_buffer{}));
+  auto table = std::make_unique<cudf::table>(std::move(columns));
+  auto packedColumns = cudf::pack(
+      table->view(),
+      stream,
+      rmm::to_device_async_resource_ref_checked(&resource));
   stream.synchronize();
   auto tableView = cudf::unpack(packedColumns);
   return std::make_unique<cudf::packed_table>(
@@ -164,6 +252,33 @@ TEST_F(CudfVectorTest, rebindPackedTableDeallocationStream) {
 
   EXPECT_GT(resource.deallocationCount(), 0);
   EXPECT_EQ(resource.lastDeallocationStream(), targetStream.value());
+}
+
+TEST_F(CudfVectorTest, packedResidencyOwnerOutlivesDeviceBuffer) {
+  TestCudaStream stream;
+  RecordingAsyncDeviceResource resource;
+  auto packedTable = makePackedTable(stream.view(), resource);
+  resource.reset();
+
+  bool ownerReleased = false;
+  bool bufferReleasedBeforeOwner = false;
+  auto owner = std::shared_ptr<void>(new int(1), [&](void* value) {
+    ownerReleased = true;
+    bufferReleasedBeforeOwner = resource.deallocationCount() > 0;
+    delete static_cast<int*>(value);
+  });
+  auto vector = std::make_shared<CudfVector>(
+      pool_.get(),
+      ROW({"c0"}, {INTEGER()}),
+      packedTable->table.num_rows(),
+      std::move(packedTable),
+      stream.view(),
+      std::move(owner));
+
+  EXPECT_FALSE(ownerReleased);
+  vector.reset();
+  EXPECT_TRUE(ownerReleased);
+  EXPECT_TRUE(bufferReleasedBeforeOwner);
 }
 
 TEST_F(CudfVectorTest, exposesPackedStorageWithoutMaterializing) {
@@ -238,6 +353,102 @@ TEST_F(CudfVectorTest, packedHostRoundTripDoesNotRepack) {
       stream.value()));
   stream.view().synchronize();
   EXPECT_EQ(actual, (std::array<int32_t, 4>{{1, 2, 3, 4}}));
+}
+
+TEST_F(CudfVectorTest, compressedPackedHostRoundTrip) {
+  TestCudaStream stream;
+  RecordingAsyncDeviceResource resource;
+  constexpr cudf::size_type kRows = 1 << 18;
+  auto packedTable = makeRepeatedPackedTable(kRows, stream.view(), resource);
+  auto vector = std::make_shared<CudfVector>(
+      pool_.get(),
+      ROW({"c0"}, {INTEGER()}),
+      packedTable->table.num_rows(),
+      std::move(packedTable),
+      stream.view());
+
+  PackedTableHostBufferStats stats;
+  auto hostBuffer = PackedTableHostBuffer::fromVector(
+      std::move(vector),
+      pool_.get(),
+      rmm::to_device_async_resource_ref_checked(&resource),
+      stats,
+      true);
+  EXPECT_EQ(stats.hostUncompressedBytes, hostBuffer.uncompressedSize());
+  EXPECT_EQ(stats.hostCompressedBytes, hostBuffer.size());
+  EXPECT_LT(hostBuffer.size(), hostBuffer.uncompressedSize());
+  EXPECT_GT(stats.hostCompressionNanos, 0);
+
+  auto restored = hostBuffer.toVector(
+      pool_.get(),
+      ROW({"c0"}, {INTEGER()}),
+      stream.view(),
+      rmm::to_device_async_resource_ref_checked(&resource),
+      stats);
+  ASSERT_NE(restored->getPackedColumns(), nullptr);
+  EXPECT_EQ(restored->size(), kRows);
+  EXPECT_GT(stats.hostDecompressionNanos, 0);
+  EXPECT_EQ(stats.hostToDeviceBytes, stats.hostUncompressedBytes);
+
+  int32_t lastValue = -1;
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+      &lastValue,
+      restored->getTableView().column(0).data<int32_t>() + kRows - 1,
+      sizeof(lastValue),
+      cudaMemcpyDeviceToHost,
+      stream.value()));
+  stream.view().synchronize();
+  EXPECT_EQ(lastValue, 0);
+}
+
+TEST_F(CudfVectorTest, dictionaryEncodedStringHostRoundTrip) {
+  TestCudaStream stream;
+  RecordingAsyncDeviceResource resource;
+  constexpr cudf::size_type kRows = 1 << 18;
+  auto packedTable =
+      makeRepeatedStringPackedTable(kRows, stream.view(), resource);
+  auto vector = std::make_shared<CudfVector>(
+      pool_.get(),
+      ROW({"c0"}, {VARCHAR()}),
+      packedTable->table.num_rows(),
+      std::move(packedTable),
+      stream.view());
+
+  PackedTableHostBufferStats stats;
+  auto hostBuffer = PackedTableHostBuffer::fromVector(
+      std::move(vector),
+      pool_.get(),
+      rmm::to_device_async_resource_ref_checked(&resource),
+      stats,
+      false,
+      true);
+  EXPECT_EQ(stats.dictionaryCandidateBatches, 1);
+  EXPECT_EQ(stats.dictionaryEncodedBatches, 1);
+  EXPECT_LT(stats.dictionaryOutputBytes, stats.dictionaryInputBytes);
+  EXPECT_EQ(stats.dictionaryOutputBytes, stats.hostUncompressedBytes);
+  EXPECT_EQ(hostBuffer.size(), stats.dictionaryOutputBytes);
+
+  auto restored = hostBuffer.toVector(
+      pool_.get(),
+      ROW({"c0"}, {VARCHAR()}),
+      stream.view(),
+      rmm::to_device_async_resource_ref_checked(&resource),
+      stats);
+  EXPECT_EQ(restored->size(), kRows);
+  EXPECT_EQ(
+      restored->getTableView().column(0).type().id(), cudf::type_id::STRING);
+  EXPECT_GT(stats.dictionaryDecodeNanos, 0);
+
+  cudf::strings_column_view strings(restored->getTableView().column(0));
+  int32_t finalOffset = 0;
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+      &finalOffset,
+      strings.offsets().data<int32_t>() + kRows,
+      sizeof(finalOffset),
+      cudaMemcpyDeviceToHost,
+      stream.value()));
+  stream.view().synchronize();
+  EXPECT_EQ(finalOffset, kRows * std::string_view("repeated").size());
 }
 
 TEST_F(CudfVectorTest, packedTableReleaseUsesMaterializationStream) {

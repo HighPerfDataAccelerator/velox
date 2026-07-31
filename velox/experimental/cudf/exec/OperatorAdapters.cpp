@@ -305,9 +305,8 @@ class FilterProjectAdapter : public OperatorAdapter {
     auto filterPlanNode = filterProjectOp->filterNode();
 
     std::vector<std::unique_ptr<exec::Operator>> result;
-    result.push_back(
-        std::make_unique<CudfFilterProject>(
-            operatorId, ctx, filterPlanNode, projectPlanNode));
+    result.push_back(std::make_unique<CudfFilterProject>(
+        operatorId, ctx, filterPlanNode, projectPlanNode));
     return result;
   }
 };
@@ -373,9 +372,8 @@ class AggregationAdapter : public OperatorAdapter {
 
     std::vector<std::unique_ptr<exec::Operator>> result;
     if (CudfConfig::getInstance().concatOptimizationEnabled) {
-      result.push_back(
-          std::make_unique<CudfBatchConcat>(
-              operatorId, ctx, aggregationPlanNode));
+      result.push_back(std::make_unique<CudfBatchConcat>(
+          operatorId, ctx, aggregationPlanNode));
     }
     if (isGlobal) {
       result.push_back(
@@ -662,9 +660,8 @@ class NestedLoopJoinProbeAdapter : public CudfNestedLoopJoinBaseAdapter {
         std::dynamic_pointer_cast<const core::NestedLoopJoinNode>(planNode);
 
     std::vector<std::unique_ptr<exec::Operator>> result;
-    result.push_back(
-        std::make_unique<CudfNestedLoopJoinProbe>(
-            operatorId, ctx, joinPlanNode));
+    result.push_back(std::make_unique<CudfNestedLoopJoinProbe>(
+        operatorId, ctx, joinPlanNode));
     return result;
   }
 };
@@ -791,6 +788,10 @@ class TopNRowNumberAdapter : public OperatorAdapter {
     return true;
   }
 
+  bool requiresInputBatchPreservation() const override {
+    return true;
+  }
+
   std::vector<std::unique_ptr<exec::Operator>> createReplacements(
       const exec::Operator* /*op*/,
       const core::PlanNodePtr& planNode,
@@ -800,9 +801,8 @@ class TopNRowNumberAdapter : public OperatorAdapter {
         std::dynamic_pointer_cast<const core::TopNRowNumberNode>(planNode);
 
     std::vector<std::unique_ptr<exec::Operator>> result;
-    result.push_back(
-        std::make_unique<CudfTopNRowNumber>(
-            operatorId, ctx, topNRowNumberNode));
+    result.push_back(std::make_unique<CudfTopNRowNumber>(
+        operatorId, ctx, topNRowNumberNode));
     return result;
   }
 };
@@ -893,9 +893,8 @@ class LocalPartitionAdapter : public OperatorAdapter {
         std::dynamic_pointer_cast<const core::LocalPartitionNode>(planNode);
 
     std::vector<std::unique_ptr<exec::Operator>> result;
-    result.push_back(
-        std::make_unique<CudfLocalPartition>(
-            operatorId, ctx, localPartitionPlanNode));
+    result.push_back(std::make_unique<CudfLocalPartition>(
+        operatorId, ctx, localPartitionPlanNode));
     return result;
   }
 
@@ -975,14 +974,13 @@ class AssignUniqueIdAdapter : public OperatorAdapter {
         std::dynamic_pointer_cast<const core::AssignUniqueIdNode>(planNode);
 
     std::vector<std::unique_ptr<exec::Operator>> result;
-    result.push_back(
-        std::make_unique<CudfAssignUniqueId>(
-            operatorId,
-            ctx,
-            assignUniqueIdPlanNode,
-            ctx->task->planFragment().taskUniqueId.value_or(
-                assignUniqueIdPlanNode->taskUniqueId()),
-            ctx->task->uniqueRowIdPool()));
+    result.push_back(std::make_unique<CudfAssignUniqueId>(
+        operatorId,
+        ctx,
+        assignUniqueIdPlanNode,
+        ctx->task->planFragment().taskUniqueId.value_or(
+            assignUniqueIdPlanNode->taskUniqueId()),
+        ctx->task->uniqueRowIdPool()));
     return result;
   }
 };
@@ -1066,9 +1064,8 @@ class MarkDistinctAdapter : public OperatorAdapter {
         std::dynamic_pointer_cast<const core::MarkDistinctNode>(planNode);
 
     std::vector<std::unique_ptr<exec::Operator>> result;
-    result.push_back(
-        std::make_unique<CudfMarkDistinct>(
-            operatorId, ctx, markDistinctPlanNode));
+    result.push_back(std::make_unique<CudfMarkDistinct>(
+        operatorId, ctx, markDistinctPlanNode));
     return result;
   }
 };
@@ -1107,9 +1104,8 @@ class EnforceSingleRowAdapter : public OperatorAdapter {
         std::dynamic_pointer_cast<const core::EnforceSingleRowNode>(planNode);
 
     std::vector<std::unique_ptr<exec::Operator>> result;
-    result.push_back(
-        std::make_unique<CudfEnforceSingleRow>(
-            operatorId, ctx, enforceSingleRowPlanNode));
+    result.push_back(std::make_unique<CudfEnforceSingleRow>(
+        operatorId, ctx, enforceSingleRowPlanNode));
     return result;
   }
 };
@@ -1347,23 +1343,20 @@ class ExchangeAdapter : public OperatorAdapter {
     }
 
     std::vector<std::unique_ptr<exec::Operator>> result;
-    result.push_back(
-        std::make_unique<ucx_exchange::UcxExchange>(
-            operatorId, ctx, planNode, client));
+    result.push_back(std::make_unique<ucx_exchange::UcxExchange>(
+        operatorId, ctx, planNode, client));
     if (CudfConfig::getInstance().concatOptimizationEnabled &&
         CudfConfig::getInstance().exchangeConcatOptimizationEnabled &&
         !preserveOutputBatches) {
-      result.push_back(
-          std::make_unique<CudfBatchConcat>(
-              operatorId,
-              ctx,
-              planNode,
-              planNode->outputType(),
-              CudfConfig::getInstance().exchangeBatchSizeMinThreshold,
-              ctx->queryConfig().get<uint64_t>(
-                  CudfConfig::kCudfExchangeBatchSizeMinThresholdBytes,
-                  CudfConfig::getInstance()
-                      .exchangeBatchSizeMinThresholdBytes)));
+      result.push_back(std::make_unique<CudfBatchConcat>(
+          operatorId,
+          ctx,
+          planNode,
+          planNode->outputType(),
+          CudfConfig::getInstance().exchangeBatchSizeMinThreshold,
+          ctx->queryConfig().get<uint64_t>(
+              CudfConfig::kCudfExchangeBatchSizeMinThresholdBytes,
+              CudfConfig::getInstance().exchangeBatchSizeMinThresholdBytes)));
     }
     return result;
   }
@@ -1433,9 +1426,8 @@ class MergeExchangeAdapter : public OperatorAdapter {
         << " node=" << planNode->id();
 
     std::vector<std::unique_ptr<exec::Operator>> result;
-    result.push_back(
-        std::make_unique<ucx_exchange::UcxExchange>(
-            operatorId, ctx, planNode, nullptr));
+    result.push_back(std::make_unique<ucx_exchange::UcxExchange>(
+        operatorId, ctx, planNode, nullptr));
     auto orderByNode = std::make_shared<core::OrderByNode>(
         mergeExchangeNode->id() + "-ucx-order-by",
         mergeExchangeNode->sortingKeys(),
@@ -1516,9 +1508,8 @@ class PartitionedOutputAdapter : public OperatorAdapter {
         << " operatorId=" << operatorId << " node=" << planNode->id();
 
     std::vector<std::unique_ptr<exec::Operator>> result;
-    result.push_back(
-        std::make_unique<ucx_exchange::UcxPartitionedOutput>(
-            operatorId, ctx, poNode, partitionOp->getEagerFlush()));
+    result.push_back(std::make_unique<ucx_exchange::UcxPartitionedOutput>(
+        operatorId, ctx, poNode, partitionOp->getEagerFlush()));
     return result;
   }
 

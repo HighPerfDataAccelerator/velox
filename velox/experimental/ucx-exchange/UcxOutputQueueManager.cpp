@@ -25,6 +25,9 @@
 
 namespace facebook::velox::ucx_exchange {
 
+UcxOutputQueueManager::UcxOutputQueueManager()
+    : memoryManager_(std::make_shared<UcxOutputQueueMemoryManager>()) {}
+
 /* static */
 std::shared_ptr<UcxOutputQueueManager> UcxOutputQueueManager::getInstanceRef() {
   // In C++11, the static local variable is guaranteed to only be initialized
@@ -44,7 +47,7 @@ void UcxOutputQueueManager::initializeTask(
     auto it = queues.find(taskId);
     if (it == queues.end()) {
       queues[taskId] = std::make_shared<UcxOutputQueue>(
-          std::move(task), numDestinations, numDrivers, kind);
+          std::move(task), numDestinations, numDrivers, kind, memoryManager_);
     } else {
       if (!it->second->initialize(task, numDestinations, numDrivers, kind)) {
         VELOX_CHECK(
@@ -100,10 +103,30 @@ void UcxOutputQueueManager::enqueue(
   getQueue(taskId)->enqueue(destination, std::move(txData), numRows);
 }
 
+void UcxOutputQueueManager::enqueueFanout(
+    std::string_view taskId,
+    int destination,
+    int destinationStride,
+    int fanout,
+    std::unique_ptr<cudf::packed_columns> txData,
+    int numRows) {
+  getQueue(taskId)->enqueueFanout(
+      destination, destinationStride, fanout, std::move(txData), numRows);
+}
+
 bool UcxOutputQueueManager::checkBlocked(
     std::string_view taskId,
     ContinueFuture* future) {
   return getQueue(taskId)->checkBlocked(future);
+}
+
+bool UcxOutputQueueManager::reserveDeviceQueueBytes(
+    uint64_t bytes,
+    std::string_view taskId,
+    ContinueFuture* future,
+    std::optional<UcxOutputQueueMemoryManager::Reservation>& reservation,
+    std::shared_ptr<UcxOutputQueueMemoryManager::Waiter>& waiter) {
+  return memoryManager_->reserve(bytes, taskId, future, reservation, waiter);
 }
 
 void UcxOutputQueueManager::noMoreData(std::string_view taskId) {
@@ -148,7 +171,12 @@ void UcxOutputQueueManager::getData(
       VLOG(2)
           << "[QUEUE-MGR] task=" << taskId << " dest=" << destination
           << " creating placeholder queue (server arrived before task init)";
-      outputQueue = std::make_shared<UcxOutputQueue>(nullptr, destination, 0);
+      outputQueue = std::make_shared<UcxOutputQueue>(
+          nullptr,
+          destination,
+          0,
+          core::PartitionedOutputNode::Kind::kPartitioned,
+          memoryManager_);
       queues[taskIdStr] = outputQueue;
     } else {
       // queue exists.
@@ -187,7 +215,12 @@ void UcxOutputQueueManager::getData(
       VLOG(2)
           << "[QUEUE-MGR] task=" << taskId << " dest=" << destination
           << " creating placeholder queue (server arrived before task init)";
-      outputQueue = std::make_shared<UcxOutputQueue>(nullptr, destination, 0);
+      outputQueue = std::make_shared<UcxOutputQueue>(
+          nullptr,
+          destination,
+          0,
+          core::PartitionedOutputNode::Kind::kPartitioned,
+          memoryManager_);
       queues[taskIdStr] = outputQueue;
     } else {
       outputQueue = it->second;

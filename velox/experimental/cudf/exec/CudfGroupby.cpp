@@ -40,6 +40,7 @@
 #include <cudf/reduction.hpp>
 #include <cudf/unary.hpp>
 
+#include <chrono>
 #include <cstdlib>
 #include <limits>
 #include <mutex>
@@ -91,6 +92,25 @@ constexpr const char* kIntermediateAggregationMaxLevel =
     "cudfIntermediateAggregationMaxLevel";
 constexpr const char* kIntermediateAggregationSerializedMerges =
     "cudfIntermediateAggregationSerializedMerges";
+constexpr const char* kExpandingPartialAdmissionAcquisitions =
+    "cudfExpandingPartialAdmissionAcquisitions";
+constexpr const char* kExpandingPartialBlockingAdmissions =
+    "cudfExpandingPartialBlockingAdmissions";
+constexpr const char* kExpandingPartialAdmissionWaitNanos =
+    "cudfExpandingPartialAdmissionWaitNanos";
+constexpr const char* kExpandingStateAdmissionAcquisitions =
+    "cudfExpandingStateAdmissionAcquisitions";
+constexpr const char* kExpandingStateBlockingAdmissions =
+    "cudfExpandingStateBlockingAdmissions";
+constexpr const char* kExpandingStateAdmissionWaitNanos =
+    "cudfExpandingStateAdmissionWaitNanos";
+constexpr const char* kAbandonedPartialAggregation =
+    "cudfAbandonedPartialAggregation";
+constexpr const char* kPredictivePartialAggregationAbandon =
+    "cudfPredictivePartialAggregationAbandon";
+
+constexpr size_t kExpandingPartialMaxConcurrent = 4;
+constexpr size_t kExpandingStateMaxConcurrent = 8;
 
 bool serializeLargeIntermediateAggregationMergesEnabled() {
   static const bool enabled = [] {
@@ -141,6 +161,27 @@ uint64_t addRepresentedRows(uint64_t left, uint64_t right) {
   return left + right;
 }
 
+bool hasExpandingAggregateState(const core::AggregationNode& aggregationNode) {
+  const auto numKeys = aggregationNode.groupingKeys().size();
+  const auto hasArrayState = [numKeys](const RowTypePtr& type) {
+    return type->size() > numKeys &&
+        std::any_of(
+               type->children().begin() + numKeys,
+               type->children().end(),
+               [](const auto& child) {
+                 return child->kind() == TypeKind::ARRAY;
+               });
+  };
+  return hasArrayState(aggregationNode.outputType()) ||
+      hasArrayState(aggregationNode.sources().front()->outputType());
+}
+
+bool requiresAggregationAdmission(
+    const core::AggregationNode& aggregationNode,
+    bool isPartialOutput) {
+  return !isPartialOutput || hasExpandingAggregateState(aggregationNode);
+}
+
 #define DEFINE_SIMPLE_GROUPBY_AGGREGATOR(Name, name, KIND)                \
   struct Groupby##Name##Aggregator : GroupbyAggregator {                  \
     Groupby##Name##Aggregator(                                            \
@@ -179,6 +220,31 @@ uint64_t addRepresentedRows(uint64_t left, uint64_t right) {
         rmm::cuda_stream_view stream,                                     \
         rmm::device_async_resource_ref mr) override {                     \
       auto col = std::move(results[output_idx].results[0]);               \
+      const auto cudfType = cudf_velox::veloxToCudfDataType(resultType);  \
+      if (col->type() != cudfType) {                                      \
+        col = cudf::cast(*col, cudfType, stream, mr);                     \
+      }                                                                   \
+      return col;                                                         \
+    }                                                                     \
+                                                                          \
+    bool supportsPartialPassthrough() const override {                    \
+      return step == core::AggregationNode::Step::kPartial;               \
+    }                                                                     \
+                                                                          \
+    std::unique_ptr<cudf::column> makePartialPassthroughColumn(           \
+        cudf::table_view const& tbl,                                      \
+        rmm::cuda_stream_view stream,                                     \
+        rmm::device_async_resource_ref mr) override {                     \
+      VELOX_CHECK(supportsPartialPassthrough());                          \
+      std::unique_ptr<cudf::column> col;                                  \
+      if (constant != nullptr) {                                          \
+        auto scalar = cudf_velox::makeScalarFromConstantVector(constant); \
+        col = cudf::make_column_from_scalar(                              \
+            *scalar, tbl.num_rows(), stream, mr);                         \
+      } else {                                                            \
+        col = std::make_unique<cudf::column>(                             \
+            tbl.column(inputIndex), stream, mr);                          \
+      }                                                                   \
       const auto cudfType = cudf_velox::veloxToCudfDataType(resultType);  \
       if (col->type() != cudfType) {                                      \
         col = cudf::cast(*col, cudfType, stream, mr);                     \
@@ -1115,7 +1181,11 @@ CudfGroupby::CudfGroupby(
       isSingleStep_(
           aggregationNode->step() == core::AggregationNode::Step::kSingle),
       maxPartialAggregationMemoryUsage_(
-          driverCtx->queryConfig().maxPartialAggregationMemoryUsage()) {}
+          driverCtx->queryConfig().maxPartialAggregationMemoryUsage()),
+      abandonPartialAggregationMinRows_(
+          driverCtx->queryConfig().abandonPartialAggregationMinRows()),
+      abandonPartialAggregationMinPct_(
+          driverCtx->queryConfig().abandonPartialAggregationMinPct()) {}
 
 void CudfGroupby::initialize() {
   Operator::initialize();
@@ -1161,6 +1231,7 @@ void CudfGroupby::initialize() {
                        aggregate.call->name(), aggregationNode_->step()) ==
                 aggregationNode_->step();
           });
+  initializeExpandingPartialAdmission();
 
   if (deviceMemoryDiagnosticsEnabled()) {
     for (const auto& aggregate : aggregationNode_->aggregates()) {
@@ -1187,6 +1258,12 @@ void CudfGroupby::initialize() {
         bufferedResultType_,
         nullConstants,
         core::AggregationNode::Step::kIntermediate);
+    partialPassthroughSupported_ = isPartialOutput_ && !ignoreNullKeys_ &&
+        std::all_of(aggregators_.begin(),
+                    aggregators_.end(),
+                    [](const auto& aggregator) {
+                      return aggregator->supportsPartialPassthrough();
+                    });
 
     if (isSingleStep_) {
       partialAggregators_ = toGroupbyAggregators(
@@ -1217,6 +1294,106 @@ void CudfGroupby::initialize() {
   aggregationNode_.reset();
 }
 
+void CudfGroupby::initializeExpandingPartialAdmission() {
+  if (!streamingEnabled_ ||
+      !requiresAggregationAdmission(*aggregationNode_, isPartialOutput_)) {
+    return;
+  }
+
+  const auto headroom = captureDeviceAllocationHeadroom();
+  if (!headroom.cudaValid || headroom.totalBytes == 0) {
+    return;
+  }
+
+  expandingPartialAdmissionDevice_ = headroom.device;
+  expandingPartialAdmissionEnabled_ = true;
+  expandingStateAdmissionEnabled_ = !isPartialOutput_;
+  expandingStateAdmissionScope_ =
+      reinterpret_cast<uintptr_t>(aggregationNode_.get());
+}
+
+exec::BlockingReason CudfGroupby::isBlocked(ContinueFuture* future) {
+  if (!expandingPartialAdmissionEnabled_ || !pendingInput_) {
+    return exec::BlockingReason::kNotBlocked;
+  }
+
+  if (expandingStateAdmissionEnabled_ && !expandingStateAdmission_) {
+    auto admission = acquireDeviceConcurrencyAdmissionOrFuture(
+        expandingPartialAdmissionDevice_,
+        kExpandingStateMaxConcurrent,
+        future,
+        DeviceConcurrencyAdmissionDomain::kRetainedState,
+        expandingStateAdmissionScope_);
+    if (!admission) {
+      if (!expandingStateAdmissionWaitStart_) {
+        expandingStateAdmissionWaitStart_ = std::chrono::steady_clock::now();
+        expandingStateAdmissionBlocked_ = true;
+      }
+      return exec::BlockingReason::kWaitForMemory;
+    }
+
+    addRuntimeStat(kExpandingStateAdmissionAcquisitions, RuntimeCounter(1));
+    if (expandingStateAdmissionWaitStart_) {
+      const auto waitNanos =
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() -
+              *expandingStateAdmissionWaitStart_)
+              .count();
+      addRuntimeStat(
+          kExpandingStateAdmissionWaitNanos, RuntimeCounter(waitNanos));
+      expandingStateAdmissionWaitStart_.reset();
+    }
+    if (expandingStateAdmissionBlocked_) {
+      addRuntimeStat(kExpandingStateBlockingAdmissions, RuntimeCounter(1));
+      expandingStateAdmissionBlocked_ = false;
+    }
+    expandingStateAdmission_ = std::move(admission);
+  }
+
+  if (expandingPartialAdmission_) {
+    return exec::BlockingReason::kNotBlocked;
+  }
+
+  auto admission = acquireDeviceConcurrencyAdmissionOrFuture(
+      expandingPartialAdmissionDevice_, kExpandingPartialMaxConcurrent, future);
+  if (!admission) {
+    if (!expandingPartialAdmissionWaitStart_) {
+      expandingPartialAdmissionWaitStart_ = std::chrono::steady_clock::now();
+      currentExpandingPartialAdmissionBlocked_ = true;
+    }
+    return exec::BlockingReason::kWaitForMemory;
+  }
+
+  if (expandingPartialAdmissionWaitStart_) {
+    currentExpandingPartialAdmissionWaitNanos_ =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() -
+            *expandingPartialAdmissionWaitStart_)
+            .count();
+    expandingPartialAdmissionWaitStart_.reset();
+  }
+  expandingPartialAdmission_ = std::move(admission);
+  return exec::BlockingReason::kNotBlocked;
+}
+
+void CudfGroupby::releaseExpandingPartialAdmission() {
+  if (!expandingPartialAdmission_) {
+    return;
+  }
+  releaseDeviceConcurrencyAdmissionAfterStream(
+      std::move(*expandingPartialAdmission_), stateStream_);
+  expandingPartialAdmission_.reset();
+}
+
+void CudfGroupby::releaseExpandingStateAdmission() {
+  if (!expandingStateAdmission_) {
+    return;
+  }
+  releaseDeviceConcurrencyAdmissionAfterStream(
+      std::move(*expandingStateAdmission_), stateStream_);
+  expandingStateAdmission_.reset();
+}
+
 void CudfGroupby::computePartialGroupbyStreaming(CudfVectorPtr tbl) {
   const auto representedRows = static_cast<uint64_t>(tbl->size());
   auto inputTableStream = tbl->stream();
@@ -1237,6 +1414,18 @@ void CudfGroupby::computePartialGroupbyStreaming(CudfVectorPtr tbl) {
       bufferedResultType_,
       inputTableStream,
       get_output_mr());
+
+  if (groupbyOnInput &&
+      shouldAbandonPartialAggregation(
+          static_cast<int64_t>(representedRows), groupbyOnInput->size())) {
+    VELOX_CHECK_NULL(bufferedResult_);
+    abandonedPartialAggregation_ = true;
+    bufferedResult_ = std::move(groupbyOnInput);
+    bufferedResultInputRows_ = static_cast<int64_t>(representedRows);
+    addRuntimeStat(kAbandonedPartialAggregation, RuntimeCounter(1));
+    addRuntimeStat(kPredictivePartialAggregationAbandon, RuntimeCounter(1));
+    return;
+  }
 
   if (groupbyOnInput) {
     addIntermediateAggregationRun(
@@ -1330,9 +1519,8 @@ void CudfGroupby::computeFinalGroupbyStreaming(CudfVectorPtr tbl) {
       VELOX_CHECK_NOT_NULL(aggregation);
       allRequestsSupported &= cudf::groupby::is_streaming_groupby_supported(
           request.values.type(), aggregation->kind);
-      streamingRequests.push_back(
-          cudf::groupby::streaming_aggregation_request{
-              valueIndex, std::move(aggregation)});
+      streamingRequests.push_back(cudf::groupby::streaming_aggregation_request{
+          valueIndex, std::move(aggregation)});
     }
   }
 
@@ -1416,15 +1604,14 @@ void CudfGroupby::computeFinalGroupbyStreaming(CudfVectorPtr tbl) {
   }
   if (deviceMemoryDiagnosticsEnabled() &&
       (finalStreamingBatchCount_ == 1 || finalStreamingBatchCount_ % 64 == 0)) {
-    logDeviceMemorySnapshot(
-        fmt::format(
-            "operator=CudfGroupby node={} state=final_streaming.aggregate "
-            "batch={} inputRows={} distinctKeys={} maxDistinctKeys={}",
-            diagnosticNodeId_,
-            finalStreamingBatchCount_,
-            representedRows,
-            distinctKeys,
-            finalStreamingMaxDistinctKeys_));
+    logDeviceMemorySnapshot(fmt::format(
+        "operator=CudfGroupby node={} state=final_streaming.aggregate "
+        "batch={} inputRows={} distinctKeys={} maxDistinctKeys={}",
+        diagnosticNodeId_,
+        finalStreamingBatchCount_,
+        representedRows,
+        distinctKeys,
+        finalStreamingMaxDistinctKeys_));
   }
 }
 
@@ -1520,20 +1707,19 @@ CudfGroupby::FinalAggregationRun CudfGroupby::mergeFinalAggregationRuns(
   if (deviceMemoryDiagnosticsEnabled() &&
       (finalizing || finalRunMergeCount_ == 1 ||
        finalRunMergeCount_ % 64 == 0)) {
-    logDeviceMemorySnapshot(
-        fmt::format(
-            "operator=CudfGroupby node={} state=final_run.merge phase={} "
-            "level={} merge={} inputRows={} inputBytes={} outputRows={} "
-            "outputBytes={} representedRows={}",
-            diagnosticNodeId_,
-            finalizing ? "finalize" : "online",
-            outputLevel,
-            finalRunMergeCount_,
-            inputRows,
-            inputBytes,
-            output->size(),
-            output->estimateFlatSize(),
-            representedRows));
+    logDeviceMemorySnapshot(fmt::format(
+        "operator=CudfGroupby node={} state=final_run.merge phase={} "
+        "level={} merge={} inputRows={} inputBytes={} outputRows={} "
+        "outputBytes={} representedRows={}",
+        diagnosticNodeId_,
+        finalizing ? "finalize" : "online",
+        outputLevel,
+        finalRunMergeCount_,
+        inputRows,
+        inputBytes,
+        output->size(),
+        output->estimateFlatSize(),
+        representedRows));
   }
 
   return FinalAggregationRun{std::move(output), representedRows};
@@ -1551,17 +1737,16 @@ CudfVectorPtr CudfGroupby::drainFinalAggregationRuns() {
     }
   }
   if (deviceMemoryDiagnosticsEnabled()) {
-    logDeviceMemorySnapshot(
-        fmt::format(
-            "operator=CudfGroupby node={} state=final_runs.drain.begin "
-            "inputRuns={} retainedRuns={} retainedRows={} retainedBytes={} "
-            "onlineMerges={}",
-            diagnosticNodeId_,
-            finalInputRunCount_,
-            retainedRuns,
-            retainedRows,
-            retainedBytes,
-            finalRunMergeCount_));
+    logDeviceMemorySnapshot(fmt::format(
+        "operator=CudfGroupby node={} state=final_runs.drain.begin "
+        "inputRuns={} retainedRuns={} retainedRows={} retainedBytes={} "
+        "onlineMerges={}",
+        diagnosticNodeId_,
+        finalInputRunCount_,
+        retainedRuns,
+        retainedRows,
+        retainedBytes,
+        finalRunMergeCount_));
   }
 
   std::optional<FinalAggregationRun> carry;
@@ -1594,14 +1779,13 @@ CudfVectorPtr CudfGroupby::finalizeStreamingFinalAggregation() {
   VELOX_CHECK_NOT_NULL(finalStreamingGroupby_);
 
   const auto distinctKeys = finalStreamingGroupby_->distinct_keys();
-  logDeviceMemorySnapshot(
-      fmt::format(
-          "operator=CudfGroupby node={} state=final_streaming.finalize.begin "
-          "batches={} distinctKeys={} maxDistinctKeys={}",
-          diagnosticNodeId_,
-          finalStreamingBatchCount_,
-          distinctKeys,
-          finalStreamingMaxDistinctKeys_));
+  logDeviceMemorySnapshot(fmt::format(
+      "operator=CudfGroupby node={} state=final_streaming.finalize.begin "
+      "batches={} distinctKeys={} maxDistinctKeys={}",
+      diagnosticNodeId_,
+      finalStreamingBatchCount_,
+      distinctKeys,
+      finalStreamingMaxDistinctKeys_));
 
   auto [groupKeys, flatResults] =
       finalStreamingGroupby_->finalize(stateStream_, get_output_mr());
@@ -1647,14 +1831,13 @@ CudfVectorPtr CudfGroupby::finalizeStreamingFinalAggregation() {
   // Complete it before destroying that state. Both state and output use the
   // configured async resources; no pool resource or release threshold is used.
   stateStream_.synchronize();
-  logDeviceMemorySnapshot(
-      fmt::format(
-          "operator=CudfGroupby node={} state=final_streaming.finalize.end "
-          "batches={} distinctKeys={} outputRows={}",
-          diagnosticNodeId_,
-          finalStreamingBatchCount_,
-          distinctKeys,
-          outputRows));
+  logDeviceMemorySnapshot(fmt::format(
+      "operator=CudfGroupby node={} state=final_streaming.finalize.end "
+      "batches={} distinctKeys={} outputRows={}",
+      diagnosticNodeId_,
+      finalStreamingBatchCount_,
+      distinctKeys,
+      outputRows));
   finalStreamingGroupby_.reset();
 
   if (outputRows == 0) {
@@ -1812,20 +1995,19 @@ CudfGroupby::mergeIntermediateAggregationRuns(
   if (deviceMemoryDiagnosticsEnabled() &&
       (finalizing || intermediateRunMergeCount_ == 1 ||
        intermediateRunMergeCount_ % 64 == 0)) {
-    logDeviceMemorySnapshot(
-        fmt::format(
-            "operator=CudfGroupby node={} state=intermediate_run.merge "
-            "phase={} level={} merge={} inputRows={} inputBytes={} "
-            "outputRows={} outputBytes={} representedRows={}",
-            diagnosticNodeId_,
-            finalizing ? "finalize" : "online",
-            outputLevel,
-            intermediateRunMergeCount_,
-            inputRows,
-            inputBytes,
-            output->size(),
-            output->estimateFlatSize(),
-            representedRows));
+    logDeviceMemorySnapshot(fmt::format(
+        "operator=CudfGroupby node={} state=intermediate_run.merge "
+        "phase={} level={} merge={} inputRows={} inputBytes={} "
+        "outputRows={} outputBytes={} representedRows={}",
+        diagnosticNodeId_,
+        finalizing ? "finalize" : "online",
+        outputLevel,
+        intermediateRunMergeCount_,
+        inputRows,
+        inputBytes,
+        output->size(),
+        output->estimateFlatSize(),
+        representedRows));
   }
 
   return IntermediateAggregationRun{std::move(output), representedRows};
@@ -1884,8 +2066,30 @@ void CudfGroupby::doAddInput(RowVectorPtr input) {
   VELOX_CHECK_NOT_NULL(cudfInput);
   input.reset();
 
+  if (expandingPartialAdmissionEnabled_) {
+    VELOX_CHECK_NULL(pendingInput_);
+    pendingInput_ = std::move(cudfInput);
+    return;
+  }
+
+  processInput(std::move(cudfInput));
+}
+
+void CudfGroupby::processInput(CudfVectorPtr cudfInput) {
+  VELOX_CHECK_NOT_NULL(cudfInput);
   if (streamingEnabled_) {
     prepareInputForStateStream(cudfInput);
+  }
+
+  if (abandonedPartialAggregation_) {
+    VELOX_CHECK(isPartialOutput_);
+    VELOX_CHECK_NULL(bufferedResult_);
+    bufferedResult_ = makePartialAggregationPassthrough(std::move(cudfInput));
+    bufferedResultInputRows_ = bufferedResult_->size();
+    addRuntimeStat(
+        std::string(exec::HashAggregation::kAbandonedPartialAggregationRows),
+        RuntimeCounter(bufferedResult_->size()));
+    return;
   }
 
   if (streamingEnabled_) {
@@ -1903,6 +2107,48 @@ void CudfGroupby::doAddInput(RowVectorPtr input) {
 
   // Handle non-streaming cases.
   inputs_.push_back(std::move(cudfInput));
+}
+
+CudfVectorPtr CudfGroupby::makePartialAggregationPassthrough(
+    CudfVectorPtr input) {
+  VELOX_CHECK(partialPassthroughSupported_);
+  VELOX_CHECK_NOT_NULL(input);
+  VELOX_CHECK(input->stream().value() == stateStream_.value());
+
+  auto preparedInput = prepareAggregationInput(
+      input->getTableView(),
+      static_cast<cudf::size_type>(input->size()),
+      precomputedInputEvaluators_,
+      stateStream_,
+      get_temp_mr());
+  auto permutedInputView = preparedInput.tableView.select(
+      aggregationInputChannels_.begin(), aggregationInputChannels_.end());
+
+  std::vector<std::unique_ptr<cudf::column>> outputColumns;
+  outputColumns.reserve(
+      groupingKeyOutputChannels_.size() + aggregators_.size());
+  for (const auto keyChannel : groupingKeyOutputChannels_) {
+    outputColumns.push_back(std::make_unique<cudf::column>(
+        permutedInputView.column(keyChannel), stateStream_, get_output_mr()));
+  }
+  for (auto& aggregator : aggregators_) {
+    outputColumns.push_back(aggregator->makePartialPassthroughColumn(
+        permutedInputView, stateStream_, get_output_mr()));
+  }
+
+  auto output = std::make_unique<cudf::table>(std::move(outputColumns));
+  return std::make_shared<CudfVector>(
+      pool(), outputType_, output->num_rows(), std::move(output), stateStream_);
+}
+
+bool CudfGroupby::shouldAbandonPartialAggregation(
+    int64_t numInputRows,
+    int64_t numOutputRows) const {
+  if (!partialPassthroughSupported_ || abandonedPartialAggregation_ ||
+      numInputRows <= abandonPartialAggregationMinRows_) {
+    return false;
+  }
+  return 100 * numOutputRows / numInputRows >= abandonPartialAggregationMinPct_;
 }
 
 CudfVectorPtr CudfGroupby::doGroupByAggregation(
@@ -1958,9 +2204,12 @@ CudfVectorPtr CudfGroupby::doGroupByAggregation(
 }
 
 CudfVectorPtr CudfGroupby::releaseAndResetBufferedResult() {
-  auto numOutputRows = bufferedResult_->size();
+  const auto numOutputRows = bufferedResult_->size();
+  const auto numInputRows =
+      bufferedResultInputRows_ > 0 ? bufferedResultInputRows_ : numInputRows_;
+  VELOX_CHECK_GT(numInputRows, 0);
   const double aggregationPct =
-      numOutputRows == 0 ? 0 : (numOutputRows * 1.0) / numInputRows_ * 100;
+      numOutputRows == 0 ? 0 : (numOutputRows * 1.0) / numInputRows * 100;
   {
     auto lockedStats = stats_.wlock();
     lockedStats->addRuntimeStat(
@@ -1972,14 +2221,47 @@ CudfVectorPtr CudfGroupby::releaseAndResetBufferedResult() {
         std::string(exec::HashAggregation::kPartialAggregationPct),
         RuntimeCounter(aggregationPct));
   }
+  if (shouldAbandonPartialAggregation(numInputRows, numOutputRows)) {
+    abandonedPartialAggregation_ = true;
+    addRuntimeStat(kAbandonedPartialAggregation, RuntimeCounter(1));
+  }
 
-  numInputRows_ = 0;
+  if (bufferedResultInputRows_ > 0) {
+    VELOX_CHECK_GE(numInputRows_, bufferedResultInputRows_);
+    numInputRows_ -= bufferedResultInputRows_;
+    bufferedResultInputRows_ = 0;
+  } else {
+    numInputRows_ = 0;
+  }
   // We're moving bufferedResult_ to the caller because we want it to be null
   // after this call.
   return std::move(bufferedResult_);
 }
 
 RowVectorPtr CudfGroupby::doGetOutput() {
+  if (pendingInput_) {
+    VELOX_CHECK(
+        expandingPartialAdmission_,
+        "Expanding partial aggregation input was not admitted");
+    try {
+      processInput(std::exchange(pendingInput_, nullptr));
+      addRuntimeStat(kExpandingPartialAdmissionAcquisitions, RuntimeCounter(1));
+      if (currentExpandingPartialAdmissionBlocked_) {
+        addRuntimeStat(kExpandingPartialBlockingAdmissions, RuntimeCounter(1));
+        addRuntimeStat(
+            kExpandingPartialAdmissionWaitNanos,
+            RuntimeCounter(currentExpandingPartialAdmissionWaitNanos_));
+      }
+      currentExpandingPartialAdmissionBlocked_ = false;
+      currentExpandingPartialAdmissionWaitNanos_ = 0;
+      releaseExpandingPartialAdmission();
+    } catch (...) {
+      expandingPartialAdmission_.reset();
+      expandingStateAdmission_.reset();
+      throw;
+    }
+  }
+
   // Handle partial streaming groupby.
   if (isPartialOutput_ && streamingEnabled_) {
     if (!bufferedResult_ && maxPartialAggregationMemoryUsage_ > 0 &&
@@ -2024,7 +2306,9 @@ RowVectorPtr CudfGroupby::doGetOutput() {
     if (!isPartialOutput_ && !isSingleStep_ &&
         finalAggregationMode_ == FinalAggregationMode::kStreaming) {
       finished_ = true;
-      return finalizeStreamingFinalAggregation();
+      auto result = finalizeStreamingFinalAggregation();
+      releaseExpandingStateAdmission();
+      return result;
     }
     if (!isPartialOutput_ && !isSingleStep_) {
       VELOX_CHECK_NULL(bufferedResult_);
@@ -2032,17 +2316,17 @@ RowVectorPtr CudfGroupby::doGetOutput() {
     }
     finished_ = true;
     if (!bufferedResult_) {
+      releaseExpandingStateAdmission();
       return nullptr;
     }
     auto& aggs = isSingleStep_ ? finalAggregators_ : aggregators_;
     auto stream = bufferedResult_->stream();
-    logDeviceMemorySnapshot(
-        fmt::format(
-            "operator=CudfGroupby node={} state=finalize.begin bufferedRows={} "
-            "bufferedBytes={}",
-            diagnosticNodeId_,
-            bufferedResult_->size(),
-            bufferedResult_->estimateFlatSize()));
+    logDeviceMemorySnapshot(fmt::format(
+        "operator=CudfGroupby node={} state=finalize.begin bufferedRows={} "
+        "bufferedBytes={}",
+        diagnosticNodeId_,
+        bufferedResult_->size(),
+        bufferedResult_->estimateFlatSize()));
     auto result = doGroupByAggregation(
         bufferedResult_->getTableView(),
         groupingKeyOutputChannels_,
@@ -2051,14 +2335,14 @@ RowVectorPtr CudfGroupby::doGetOutput() {
         stream,
         get_output_mr());
     stream.synchronize();
-    logDeviceMemorySnapshot(
-        fmt::format(
-            "operator=CudfGroupby node={} state=finalize.end outputRows={} "
-            "bufferedBytes={}",
-            diagnosticNodeId_,
-            result == nullptr ? 0 : result->size(),
-            bufferedResult_->estimateFlatSize()));
+    logDeviceMemorySnapshot(fmt::format(
+        "operator=CudfGroupby node={} state=finalize.end outputRows={} "
+        "bufferedBytes={}",
+        diagnosticNodeId_,
+        result == nullptr ? 0 : result->size(),
+        bufferedResult_->estimateFlatSize()));
     bufferedResult_.reset();
+    releaseExpandingStateAdmission();
     return result;
   }
 
@@ -2114,12 +2398,22 @@ void CudfGroupby::doClose() {
   } catch (const std::exception& error) {
     LOG(WARNING) << "CudfGroupby state stream cleanup failed: " << error.what();
   }
+  expandingPartialAdmission_.reset();
+  expandingPartialAdmissionWaitStart_.reset();
+  currentExpandingPartialAdmissionBlocked_ = false;
+  currentExpandingPartialAdmissionWaitNanos_ = 0;
+  expandingStateAdmission_.reset();
+  expandingStateAdmissionWaitStart_.reset();
+  expandingStateAdmissionBlocked_ = false;
+  pendingInput_.reset();
   finalStreamingGroupby_.reset();
   finalStreamingRequestAggregationCounts_.clear();
   intermediateRunLevels_.clear();
   intermediateBufferedBytes_ = 0;
+  abandonedPartialAggregation_ = false;
   finalRunLevels_.clear();
   bufferedResult_.reset();
+  bufferedResultInputRows_ = 0;
   inputs_.clear();
   Operator::close();
 }

@@ -15,6 +15,8 @@
  */
 #pragma once
 
+#include <functional>
+
 #include <cudf/column/column_factories.hpp>
 #include <cudf/contiguous_split.hpp>
 #include <cudf/table/table.hpp>
@@ -94,7 +96,8 @@ std::shared_ptr<facebook::velox::exec::Task> createPartitionedOutputTask(
     const std::vector<std::string>& partitionKeys = {},
     uint64_t kMaxOutputBufferSize = FOUR_GBYTES,
     const std::unordered_map<std::string, std::string>& extraConfig = {},
-    core::PartitionFunctionSpecPtr partitionFunctionSpec = nullptr);
+    core::PartitionFunctionSpecPtr partitionFunctionSpec = nullptr,
+    std::function<core::PlanNodePtr(core::PlanNodePtr)> sourceWrapper = {});
 
 /// @brief Helper function to create a CudfVector for testing.
 /// Uses makeTable when tableGenerator is null, or tableGenerator->makeTable()

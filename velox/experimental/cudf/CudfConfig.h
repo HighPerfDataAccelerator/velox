@@ -80,6 +80,8 @@ struct CudfConfig {
   // a spill, the Task must be configured with an explicit spill root.
   static constexpr const char* kCudfTopNRowNumberCandidateRunBytes{
       "cudf.topn_row_number.candidate_run_bytes"};
+  static constexpr const char* kCudfTopNRowNumberForceSpill{
+      "cudf.topn_row_number.force_spill"};
   // Hard limit for the complete build table retained by CudfNestedLoopJoin.
   // The default is intentionally unbounded for non-MPP callers; Gluten MPP
   // supplies a conservative value for replicated Cartesian joins.
