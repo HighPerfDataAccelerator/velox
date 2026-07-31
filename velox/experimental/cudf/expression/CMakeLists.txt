@@ -25,6 +25,7 @@ add_library(
   PrestoFunctions.cpp
   prestosql/DatePlusIntervalFunction.cpp
   SparkFunctions.cpp
+  StringToDecimal.cu
   sparksql/DateAddFunction.cpp
   sparksql/HashFunction.cpp
   sparksql/SubStringFunction.cpp

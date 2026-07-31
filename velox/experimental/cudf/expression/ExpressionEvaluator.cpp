@@ -19,6 +19,7 @@
 #include "velox/experimental/cudf/expression/DecimalExpressionKernels.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
 #include "velox/experimental/cudf/expression/NullMask.h"
+#include "velox/experimental/cudf/expression/StringToDecimal.h"
 
 #include "velox/common/base/Exceptions.h"
 #include "velox/common/memory/Memory.h"
@@ -536,7 +537,7 @@ bool hasSupportedConstantDecodeCharset(
 }
 
 bool isIntegralNonDecimalVeloxType(const TypePtr& type) {
-  if (type == nullptr || type->isDate()) {
+  if (type == nullptr || type->isDate() || type->isDecimal()) {
     return false;
   }
   switch (type->kind()) {
@@ -768,6 +769,12 @@ bool isPlainCudfCastSupported(
   }
 
   return cudf::is_supported_cast(src, dst);
+}
+
+bool isStringToDecimalTryCast(const std::shared_ptr<velox::exec::Expr>& expr) {
+  return expr->name() == "try_cast" && expr->inputs().size() == 1 &&
+      expr->inputs()[0]->type()->kind() == TypeKind::VARCHAR &&
+      expr->type()->isDecimal();
 }
 
 std::unique_ptr<cudf::column> makeAllNullStringColumn(
@@ -1371,6 +1378,7 @@ class CastFunction : public CudfFunction {
     kFloatToString,
     kStringToInt,
     kStringToFloat,
+    kStringToDecimalTryCast,
     kStringToBool,
     kStringToDate,
     kStringToTimestamp,
@@ -1384,6 +1392,10 @@ class CastFunction : public CudfFunction {
 
     const auto& sourceVeloxType = expr->inputs()[0]->type();
     const auto& targetVeloxType = expr->type();
+    if (targetVeloxType->isDecimal()) {
+      targetDecimalPrecision_ =
+          getDecimalPrecisionScale(*targetVeloxType).first;
+    }
     targetCudfType_ = cudf_velox::veloxToCudfDataType(expr->type());
     auto sourceType =
         cudf_velox::veloxToCudfDataType(expr->inputs()[0]->type());
@@ -1414,6 +1426,8 @@ class CastFunction : public CudfFunction {
         sourceVeloxType->kind() == TypeKind::VARCHAR &&
         isFloatingPointVeloxType(targetVeloxType)) {
       castMode_ = CastMode::kStringToFloat;
+    } else if (isStringToDecimalTryCast(expr)) {
+      castMode_ = CastMode::kStringToDecimalTryCast;
     } else if (isStringToBooleanVeloxCast(sourceVeloxType, targetVeloxType)) {
       castMode_ = CastMode::kStringToBool;
     } else if (isStringToDateVeloxCast(sourceVeloxType, targetVeloxType)) {
@@ -1482,6 +1496,14 @@ class CastFunction : public CudfFunction {
       case CastMode::kStringToFloat:
         return cudf::strings::to_floats(
             cudf::strings_column_view(inputCol), targetCudfType_, stream, mr);
+      case CastMode::kStringToDecimalTryCast:
+        return tryCastStringToDecimal(
+            cudf::strings_column_view(inputCol),
+            targetCudfType_,
+            targetDecimalPrecision_,
+            /*stripWhitespace=*/true,
+            stream,
+            mr);
       case CastMode::kStringToBool: {
         cudf::string_scalar stripChars("", true, stream, mr);
         auto trimmed = cudf::strings::strip(
@@ -1581,6 +1603,7 @@ class CastFunction : public CudfFunction {
   CastMode castMode_{CastMode::kCudfCast};
   bool numericToBoolSourceIsFloating_{false};
   bool numericToTimestampSourceIsFloating_{false};
+  uint8_t targetDecimalPrecision_{0};
 };
 
 class CardinalityFunction : public CudfFunction {
@@ -5512,6 +5535,9 @@ bool FunctionExpression::canEvaluate(std::shared_ptr<velox::exec::Expr> expr) {
   }
 
   if (opName == "cast" || opName == "try_cast") {
+    if (isStringToDecimalTryCast(expr)) {
+      return true;
+    }
     const auto& srcType =
         expr->inputs().empty() ? nullptr : expr->inputs()[0]->type();
     const auto& dstType = expr->type();
