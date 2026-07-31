@@ -40,3 +40,15 @@ velox_add_cudf_test(
     gflags::gflags
   TIMEOUT 3000
 )
+
+velox_add_cudf_test(
+  NAME velox_cudf_spark_string_to_decimal_test
+  SOURCES StringToDecimalTest.cpp Main.cpp
+  LIBS
+    velox_cudf_exec
+    velox_exec_test_lib
+    velox_functions_spark
+    velox_functions_test_lib
+    velox_vector_test_lib
+    gflags::gflags
+)
