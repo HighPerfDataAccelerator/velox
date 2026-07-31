@@ -95,6 +95,7 @@ class CudfTopNRowNumber : public CudfOperatorBase {
   const int32_t limit_;
   const core::TopNRowNumberNode::RankFunction rankFunction_;
   const bool generateRowNumber_;
+  const bool partialOutput_;
   const RowTypePtr inputType_;
   const core::PlanNodeId diagnosticNodeId_;
   const uint64_t candidateRunBytes_;

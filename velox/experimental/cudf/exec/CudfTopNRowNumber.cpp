@@ -144,12 +144,16 @@ CudfTopNRowNumber::CudfTopNRowNumber(
       limit_(node->limit()),
       rankFunction_(node->rankFunction()),
       generateRowNumber_(node->generateRowNumber()),
+      partialOutput_(node->partialOutput()),
       inputType_(node->inputType()),
       diagnosticNodeId_(node->id()),
       candidateRunBytes_(driverCtx->queryConfig().get<uint64_t>(
           CudfConfig::kCudfTopNRowNumberCandidateRunBytes,
           kDefaultCandidateRunBytes)) {
   VELOX_CHECK_EQ(limit_, 1, "CudfTopNRowNumber only supports limit=1");
+  VELOX_CHECK(
+      !partialOutput_ || !generateRowNumber_,
+      "Partial CudfTopNRowNumber cannot generate a rank column");
   VELOX_CHECK_GT(
       candidateRunBytes_,
       0,
@@ -252,6 +256,18 @@ void CudfTopNRowNumber::doAddInput(RowVectorPtr input) {
   auto mr = get_output_mr();
   auto batchCandidates =
       reduceToCandidates(cudfInput->getTableView(), stream, mr);
+  if (partialOutput_) {
+    if (batchCandidates->num_rows() > 0) {
+      passthroughOutputs_.push_back(std::make_shared<CudfVector>(
+          pool(),
+          inputType_,
+          batchCandidates->num_rows(),
+          std::move(batchCandidates),
+          stream));
+    }
+    return;
+  }
+
   if (candidates_ && candidates_->num_rows() > 0) {
     std::vector<cudf::table_view> pieces{
         candidates_->view(), batchCandidates->view()};

@@ -26,6 +26,7 @@
 
 #include <unistd.h>
 
+#include <algorithm>
 #include <filesystem>
 #include <set>
 #include <string>
@@ -100,6 +101,18 @@ bool usedCudfTopNRowNumber(const TaskStats& stats) {
   return false;
 }
 
+std::vector<const OperatorStats*> cudfTopNStats(const TaskStats& stats) {
+  std::vector<const OperatorStats*> result;
+  for (const auto& pipelineStats : stats.pipelineStats) {
+    for (const auto& operatorStats : pipelineStats.operatorStats) {
+      if (operatorStats.operatorType == "CudfTopNRowNumber") {
+        result.push_back(&operatorStats);
+      }
+    }
+  }
+  return result;
+}
+
 class CudfTopNRowNumberTest : public OperatorTestBase {
  protected:
   static constexpr vector_size_t kNumRows = 32;
@@ -161,9 +174,166 @@ class CudfTopNRowNumberTest : public OperatorTestBase {
     return TaskCursor::create(params);
   }
 
+  core::PlanNodePtr makeTopN(
+      core::PlanNodePtr source,
+      core::TopNRowNumberNode::RankFunction function,
+      bool partialOutput) {
+    return std::make_shared<core::TopNRowNumberNode>(
+        partialOutput ? "partial" : "final",
+        function,
+        std::vector<core::FieldAccessTypedExprPtr>{
+            std::make_shared<core::FieldAccessTypedExpr>(BIGINT(), "p")},
+        std::vector<core::FieldAccessTypedExprPtr>{
+            std::make_shared<core::FieldAccessTypedExpr>(BIGINT(), "s")},
+        std::vector<core::SortOrder>{core::SortOrder(false, false)},
+        std::nullopt,
+        1,
+        std::move(source),
+        partialOutput);
+  }
+
+  core::PlanNodePtr makeConditionalTopN(
+      core::PlanNodePtr source,
+      bool partialOutput) {
+    return std::make_shared<core::TopNRowNumberNode>(
+        partialOutput ? "conditional-partial" : "conditional-final",
+        core::TopNRowNumberNode::RankFunction::kRank,
+        std::vector<core::FieldAccessTypedExprPtr>{
+            std::make_shared<core::FieldAccessTypedExpr>(
+                BOOLEAN(), "__gluten_mpp_topn_active"),
+            std::make_shared<core::FieldAccessTypedExpr>(BIGINT(), "p")},
+        std::vector<core::FieldAccessTypedExprPtr>{
+            std::make_shared<core::FieldAccessTypedExpr>(BIGINT(), "s")},
+        std::vector<core::SortOrder>{core::SortOrder(false, false)},
+        std::nullopt,
+        1,
+        std::move(source),
+        partialOutput);
+  }
+
  private:
   bool previousAllowCpuFallback_{true};
 };
+
+TEST_F(CudfTopNRowNumberTest, partialOutputIsBoundedByInputBatch) {
+  auto first = makeRowVector(
+      {"p", "s", "v"},
+      {makeFlatVector<int64_t>({1, 1, 2}),
+       makeFlatVector<int64_t>({10, 11, 1}),
+       makeFlatVector<int64_t>({100, 101, 200})});
+  auto second = makeRowVector(
+      {"p", "s", "v"},
+      {makeFlatVector<int64_t>({1, 2}),
+       makeFlatVector<int64_t>({20, 1}),
+       makeFlatVector<int64_t>({102, 201})});
+
+  auto values = PlanBuilder().values({first, second}).planNode();
+  auto partial =
+      makeTopN(values, core::TopNRowNumberNode::RankFunction::kRowNumber, true);
+
+  CursorParameters params;
+  params.planNode = partial;
+  params.queryConfigs = {
+      {cudf_velox::CudfConfig::kCudfEnabled, "true"},
+      {cudf_velox::CudfConfig::kCudfTopNRowNumberCandidateRunBytes, "1"}};
+  auto [cursor, rows] = readCursor(params);
+
+  assertEqualResults(
+      {makeRowVector(
+          {"p", "s", "v"},
+          {makeFlatVector<int64_t>({1, 2, 1, 2}),
+           makeFlatVector<int64_t>({11, 1, 20, 1}),
+           makeFlatVector<int64_t>({101, 200, 102, 201})})},
+      rows);
+  const auto stats = cudfTopNStats(cursor->task()->taskStats());
+  ASSERT_EQ(stats.size(), 1);
+  EXPECT_EQ(stats.front()->outputVectors, 2);
+  EXPECT_EQ(stats.front()->spilledBytes, 0);
+}
+
+TEST_F(CudfTopNRowNumberTest, partialAndFinalPreserveCrossBatchRankTies) {
+  auto first = makeRowVector(
+      {"p", "s", "v"},
+      {makeFlatVector<int64_t>({1, 1, 2}),
+       makeFlatVector<int64_t>({10, 10, 1}),
+       makeFlatVector<int64_t>({100, 101, 200})});
+  auto second = makeRowVector(
+      {"p", "s", "v"},
+      {makeFlatVector<int64_t>({1, 1, 2}),
+       makeFlatVector<int64_t>({20, 20, 1}),
+       makeFlatVector<int64_t>({102, 103, 201})});
+
+  auto values = PlanBuilder().values({first, second}).planNode();
+  auto partial =
+      makeTopN(values, core::TopNRowNumberNode::RankFunction::kRank, true);
+  auto final =
+      makeTopN(partial, core::TopNRowNumberNode::RankFunction::kRank, false);
+
+  CursorParameters params;
+  params.planNode = final;
+  params.queryConfigs = {
+      {cudf_velox::CudfConfig::kCudfEnabled, "true"},
+      {cudf_velox::CudfConfig::kCudfTopNRowNumberCandidateRunBytes,
+       std::to_string(1ULL << 30)}};
+  auto [cursor, rows] = readCursor(params);
+
+  assertEqualResults(
+      {makeRowVector(
+          {"p", "s", "v"},
+          {makeFlatVector<int64_t>({1, 1, 2, 2}),
+           makeFlatVector<int64_t>({20, 20, 1, 1}),
+           makeFlatVector<int64_t>({102, 103, 200, 201})})},
+      rows);
+  const auto stats = cudfTopNStats(cursor->task()->taskStats());
+  ASSERT_EQ(stats.size(), 2);
+  EXPECT_TRUE(std::any_of(stats.begin(), stats.end(), [](const auto* stat) {
+    return stat->outputVectors == 2;
+  }));
+  EXPECT_TRUE(std::all_of(stats.begin(), stats.end(), [](const auto* stat) {
+    return stat->spilledBytes == 0;
+  }));
+}
+
+TEST_F(CudfTopNRowNumberTest, conditionalPartialPreservesInactiveRows) {
+  auto first = makeRowVector(
+      {"__gluten_mpp_topn_active", "p", "s", "v"},
+      {makeFlatVector<bool>({true, true, false, false}),
+       makeFlatVector<int64_t>({1, 1, 1, 1}),
+       makeFlatVector<int64_t>({10, 20, 100, 200}),
+       makeFlatVector<int64_t>({10, 20, 100, 200})});
+  auto second = makeRowVector(
+      {"__gluten_mpp_topn_active", "p", "s", "v"},
+      {makeFlatVector<bool>({true, false}),
+       makeFlatVector<int64_t>({1, 1}),
+       makeFlatVector<int64_t>({30, 300}),
+       makeFlatVector<int64_t>({30, 300})});
+
+  auto values = PlanBuilder().values({first, second}).planNode();
+  auto partial = makeConditionalTopN(values, true);
+  auto final = makeConditionalTopN(partial, false);
+
+  CursorParameters params;
+  params.planNode = final;
+  params.queryConfigs = {
+      {cudf_velox::CudfConfig::kCudfEnabled, "true"},
+      {cudf_velox::CudfConfig::kCudfTopNRowNumberCandidateRunBytes,
+       std::to_string(1ULL << 30)}};
+  auto [cursor, rows] = readCursor(params);
+
+  assertEqualResults(
+      {makeRowVector(
+          {"__gluten_mpp_topn_active", "p", "s", "v"},
+          {makeFlatVector<bool>({false, false, false, true}),
+           makeFlatVector<int64_t>({1, 1, 1, 1}),
+           makeFlatVector<int64_t>({100, 200, 300, 30}),
+           makeFlatVector<int64_t>({100, 200, 300, 30})})},
+      rows);
+  const auto stats = cudfTopNStats(cursor->task()->taskStats());
+  ASSERT_EQ(stats.size(), 2);
+  EXPECT_TRUE(std::all_of(stats.begin(), stats.end(), [](const auto* stat) {
+    return stat->spilledBytes == 0;
+  }));
+}
 
 TEST_F(CudfTopNRowNumberTest, spillUsesTaskRootAndCleansUp) {
   const auto spillRoot = TempDirectoryPath::create();
