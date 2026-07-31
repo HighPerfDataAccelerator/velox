@@ -211,14 +211,50 @@ TEST_F(CudfFilterProjectTest, arrayExcept) {
   assertExpressionMatchesCpu("array_except(c0, c1)", input, input->rowType());
 }
 
+TEST_F(CudfFilterProjectTest, arraySortDefaultComparator) {
+  using OptionalStringArray =
+      std::optional<std::vector<std::optional<std::string>>>;
+  auto input = makeRowVector(
+      {makeNullableArrayVector<std::string>(std::vector<OptionalStringArray>{
+          std::vector<std::optional<std::string>>{"b", std::nullopt, "a"},
+          std::vector<std::optional<std::string>>{"c", "a", "b"},
+          std::vector<std::optional<std::string>>{},
+          std::nullopt,
+      })});
+
+  assertExpressionMatchesCpu("array_sort(c0)", input, input->rowType());
+
+  auto innerArrays =
+      makeNullableArrayVector<std::string>(std::vector<OptionalStringArray>{
+          std::vector<std::optional<std::string>>{"b", "a"},
+          std::vector<std::optional<std::string>>{"c", std::nullopt, "a"},
+          std::vector<std::optional<std::string>>{"b"},
+      });
+  auto nestedArrays = std::make_shared<ArrayVector>(
+      pool_.get(),
+      ARRAY(ARRAY(VARCHAR())),
+      nullptr,
+      2,
+      makeIndices({0, 2}),
+      makeIndices({2, 1}),
+      innerArrays);
+  auto nestedInput = makeRowVector({nestedArrays});
+
+  assertExpressionMatchesCpu(
+      "array_sort(array_distinct(flatten(c0)))",
+      nestedInput,
+      nestedInput->rowType());
+}
+
 TEST_F(CudfFilterProjectTest, arrayExceptSequence) {
   auto upper = makeNullableFlatVector<int32_t>({5, 3, 1, std::nullopt});
-  auto values = makeNullableArrayVector<int32_t>({
-      {{2, 4}},
-      {{1}},
-      {{}},
-      {{1}},
-  });
+  auto values = makeNullableArrayVector<int32_t>(
+      std::vector<std::vector<std::optional<int32_t>>>{
+          {2, 4},
+          {1},
+          {},
+          {1},
+      });
   auto input = makeRowVector({upper, values});
 
   assertExpressionMatchesCpu(
