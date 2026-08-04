@@ -53,6 +53,14 @@ void configureReaderOptions(
     const std::shared_ptr<const FileConnectorSplit>& fileSplit,
     dwio::common::ReaderOptions& readerOptions);
 
+/// Configures connector-wide IO options that don't depend on a file split.
+/// File readers that don't use FileConnectorSplit (e.g. CudfHive) should call
+/// this overload to stay in sync with the standard file connector path.
+void configureReaderOptions(
+    const std::shared_ptr<const FileConfig>& fileConfig,
+    const ConnectorQueryCtx* connectorQueryCtx,
+    dwio::common::ReaderOptions& readerOptions);
+
 void configureReaderOptions(
     const std::shared_ptr<const FileConfig>& fileConfig,
     const ConnectorQueryCtx* connectorQueryCtx,

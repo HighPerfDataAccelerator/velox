@@ -96,6 +96,11 @@ class CudfHiveConfig {
   static constexpr const char* kUseExperimentalCudfReaderSession =
       "cudf.hive.use_experimental_reader";
 
+  static constexpr const char* kUseCrtS3Reader =
+      "cudf.hive.use-crt-s3-reader";
+  static constexpr const char* kUseCrtS3ReaderSession =
+      "cudf.hive.use_crt_s3_reader";
+
   static constexpr const char* kSelectivePreloadEnabled =
       "cudf.hive.selective-preload-enabled";
   static constexpr const char* kSelectivePreloadEnabledSession =
@@ -108,6 +113,10 @@ class CudfHiveConfig {
   static constexpr const char* kPrefetchThreads = "cudf.hive.prefetch-threads";
   static constexpr const char* kPrefetchThreadsSession =
       "cudf.hive.prefetch_threads";
+  static constexpr const char* kExecutorSplitPrefetchConcurrency =
+      "cudf.hive.executor-split-prefetch-concurrency";
+  static constexpr const char* kExecutorSplitPrefetchConcurrencySession =
+      "cudf.hive.executor_split_prefetch_concurrency";
 
   // Writer config options
 
@@ -183,11 +192,15 @@ class CudfHiveConfig {
   bool useExperimentalCudfReaderSession(
       const config::ConfigBase* session) const;
 
+  bool useCrtS3ReaderSession(const config::ConfigBase* session) const;
+
   bool selectivePreloadEnabledSession(const config::ConfigBase* session) const;
 
   uint64_t prefetchMaxInFlightBytesSession(
       const config::ConfigBase* session) const;
   uint32_t prefetchThreadsSession(const config::ConfigBase* session) const;
+  uint32_t executorSplitPrefetchConcurrencySession(
+      const config::ConfigBase* session) const;
 
   bool immutableFiles() const;
 

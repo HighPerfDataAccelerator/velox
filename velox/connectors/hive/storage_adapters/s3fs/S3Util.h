@@ -21,6 +21,7 @@
 
 #pragma once
 
+#include <aws/core/auth/AWSCredentialsProvider.h>
 #include <aws/s3/S3Errors.h>
 #include <aws/s3/model/HeadObjectResult.h>
 #include <fmt/format.h>
@@ -31,6 +32,17 @@
 #include <aws/core/utils/stream/PreallocatedStreamBuf.h>
 
 namespace facebook::velox::filesystems {
+
+/// Wraps a refreshable AWS credentials provider with synchronized caching.
+///
+/// A refreshable provider chain can invoke the underlying identity provider
+/// once per concurrent S3 signer when an empty or expiring credential is
+/// observed. The wrapper serializes refresh and serves the same credential
+/// snapshot until five minutes before expiration. The underlying provider
+/// remains responsible for normal credential rotation.
+std::shared_ptr<Aws::Auth::AWSCredentialsProvider>
+makeSynchronizedCachingCredentialsProvider(
+    std::shared_ptr<Aws::Auth::AWSCredentialsProvider> source);
 
 namespace {
 static std::string_view kSep{"/"};

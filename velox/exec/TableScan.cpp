@@ -102,6 +102,8 @@ TableScan::TableScan(
       driverCtx_(driverCtx),
       maxSplitPreloadPerDriver_(
           driverCtx_->queryConfig().maxSplitPreloadPerDriver()),
+      maxSplitPreloadPerTask_(
+          driverCtx_->queryConfig().maxSplitPreloadPerTask()),
       maxReadBatchSize_(driverCtx_->queryConfig().maxOutputBatchRows()),
       connectorPool_(driverCtx_->task->addConnectorPoolLocked(
           planNodeId(),
@@ -497,21 +499,29 @@ void TableScan::preload(
 
 void TableScan::checkPreload() {
   auto* ioExecutor = connector_->ioExecutor();
-  if (maxSplitPreloadPerDriver_ == 0 || !ioExecutor ||
+  if ((maxSplitPreloadPerDriver_ == 0 && maxSplitPreloadPerTask_ == 0) ||
+      !ioExecutor ||
       !connector_->supportsSplitPreload()) {
     return;
   }
-  maxPreloadedSplits_ = driverCtx_->task->numDrivers(driverCtx_->driver) *
-      maxSplitPreloadPerDriver_;
+  maxPreloadedSplits_ = maxSplitPreloadPerTask_ > 0
+      ? maxSplitPreloadPerTask_
+      : driverCtx_->task->numDrivers(driverCtx_->driver) *
+          maxSplitPreloadPerDriver_;
   if (!splitPreloader_) {
     splitPreloader_ =
         [ioExecutor,
          this](const std::shared_ptr<connector::ConnectorSplit>& split) {
           preload(split);
-          ioExecutor->add([connectorSplit = split]() mutable {
-            connectorSplit->dataSource->prepare();
-            connectorSplit.reset();
-          });
+          ioExecutor->add(
+              [connectorSplit = split,
+               task = operatorCtx_->task(),
+               splitGroupId = driverCtx_->splitGroupId,
+               planNodeId = planNodeId()]() mutable {
+                connectorSplit->dataSource->prepare();
+                connectorSplit.reset();
+                task->splitPreloadFinished(splitGroupId, planNodeId);
+              });
         };
   }
 }

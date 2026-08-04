@@ -36,6 +36,7 @@ struct SplitEntry {
   std::string key;
   std::vector<SplitPrefetchFile> files;
   uint64_t bytes{0};
+  bool requested{false};
   bool scheduled{false};
   std::shared_ptr<std::promise<std::shared_ptr<SplitPrefetchResult>>> promise{
       std::make_shared<std::promise<std::shared_ptr<SplitPrefetchResult>>>()};
@@ -111,7 +112,13 @@ class QueryPrefetchState
         return nullptr;
       }
       entry = it->second;
+      entry->requested = true;
     }
+    // A ready-byte window can otherwise fill with speculative splits while
+    // every scan driver waits for a different split. Marking demand before
+    // pumping lets the requested split bypass that ready-window head of line.
+    // Active demand is bounded by the scan-driver count.
+    pump();
     auto result = entry->future.get();
     {
       std::lock_guard<std::mutex> lock(mutex_);
@@ -156,23 +163,41 @@ class QueryPrefetchState
     if (!initialized_ || stopped_) {
       return;
     }
-    for (const auto& entry : order_) {
-      if (active_ >= concurrency_) {
-        break;
-      }
-      if (entry->scheduled) {
-        continue;
+    auto schedule = [&](const std::shared_ptr<SplitEntry>& entry) {
+      if (active_ >= concurrency_ || entry->scheduled) {
+        return;
       }
       const bool fits = reservedBytes_ <= maxReadyBytes_ &&
           entry->bytes <= maxReadyBytes_ - reservedBytes_;
-      if (!fits && (active_ > 0 || reservedBytes_ > 0)) {
-        continue;
+      // An oversized speculative split would become the broker's sole
+      // reservation and retain that reservation with its completed buffers.
+      // A demanded oversized split could then block forever in reserve()
+      // while the speculative result waits for a future consumer.
+      if (!fits && !entry->requested) {
+        return;
       }
       entry->scheduled = true;
       ++active_;
       reservedBytes_ += entry->bytes;
       splitExecutor_->add(
           [self = shared_from_this(), entry]() { self->run(entry); });
+    };
+    // Service blocked consumers before speculative lookahead. A demanded
+    // split may exceed maxReadyBytes temporarily to break a dependency cycle;
+    // concurrency_ bounds the number of such exceptions.
+    for (const auto& entry : order_) {
+      if (active_ >= concurrency_) {
+        break;
+      }
+      if (entry->requested) {
+        schedule(entry);
+      }
+    }
+    for (const auto& entry : order_) {
+      if (active_ >= concurrency_) {
+        break;
+      }
+      schedule(entry);
     }
     // Once a split is scheduled, entries_ and the worker closure provide
     // its lifetime. Keeping it in order_ would also keep the shared_future
@@ -191,8 +216,7 @@ class QueryPrefetchState
       pending.reserve(entry->files.size());
 
       for (const auto& file : entry->files) {
-        auto buffer =
-            std::make_shared<PinnedHostBuffer>(file.size, reservation);
+        auto buffer = std::make_shared<PinnedHostBuffer>(file.size);
         std::vector<PrefetchRange> ranges;
         ranges.reserve((file.size + kReadRangeBytes - 1) / kReadRangeBytes);
         for (uint64_t offset = 0; offset < file.size;
@@ -202,10 +226,13 @@ class QueryPrefetchState
                std::min<uint64_t>(kReadRangeBytes, file.size - offset),
                offset});
         }
-        auto future = broker_->readPrepared(
-            [factory = readFactory_, path = file.path, size = file.size]() {
-              return factory(path, size);
-            },
+        auto readFunction = readFactory_(file.path, file.size);
+        VELOX_CHECK(
+            static_cast<bool>(readFunction),
+            "Split prefetch read factory returned an empty function for {}",
+            file.path);
+        auto future = broker_->read(
+            std::move(readFunction),
             file.size,
             std::move(ranges),
             buffer,
@@ -227,6 +254,12 @@ class QueryPrefetchState
       if (failure) {
         std::rethrow_exception(failure);
       }
+      // The broker limits allocation and network I/O in flight. Ready-buffer
+      // residency is accounted separately by reservedBytes_ until the
+      // consumer releases the result. Retaining the broker reservation here
+      // would duplicate that accounting and can deadlock demanded splits
+      // behind a completed result that is waiting for its consumer.
+      reservation.reset();
       std::weak_ptr<QueryPrefetchState> weakSelf = shared_from_this();
       result->release = [weakSelf](uint64_t bytes) {
         if (const auto self = weakSelf.lock()) {

@@ -27,6 +27,7 @@
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
 #include "velox/common/time/Timer.h"
+#include "velox/connectors/hive/FileDataSource.h"
 #include "velox/connectors/hive/FileHandle.h"
 #include "velox/connectors/hive/HiveConnectorSplit.h"
 #include "velox/connectors/hive/HiveConnectorUtil.h"
@@ -424,13 +425,12 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
 std::unordered_map<std::string, RuntimeMetric>
 CudfHiveDataSource::getRuntimeStats() {
   auto result = runtimeStats_.toRuntimeMetricMap();
+  facebook::velox::connector::hive::addIoStatsToRuntimeStats(
+      *ioStatistics_, "", result);
   if (numFilesCoalesced_ > 0) {
     result.emplace("numFilesCoalesced", RuntimeMetric(numFilesCoalesced_));
   }
   result.insert({
-      {std::string(connector::hive::HiveDataSource::kTotalScanTime),
-       RuntimeMetric(
-           ioStatistics_->totalScanTimeNs(), RuntimeCounter::Unit::kNanos)},
       {std::string(Connector::kTotalRemainingFilterTime),
        RuntimeMetric(
            totalRemainingFilterTime_.load(std::memory_order_relaxed),

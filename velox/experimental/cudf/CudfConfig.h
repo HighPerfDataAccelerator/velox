@@ -57,6 +57,12 @@ struct CudfConfig {
       "cudf.concat_optimization_enabled"};
   static constexpr const char* kCudfGroupbyStreamingMaxDistinctKeys{
       "cudf.groupby_streaming_max_distinct_keys"};
+  static constexpr const char* kCudfPartialStreamingGroupby{
+      "cudf.partial_streaming_groupby"};
+  static constexpr const char* kCudfPartialStreamingMaxDistinctKeys{
+      "cudf.partial_streaming_max_distinct_keys"};
+  static constexpr const char* kCudfPartialIdentityAggregation{
+      "cudf.partial_identity_aggregation"};
   static constexpr const char* kCudfOrderBySortedRunBytes{
       "cudf.order_by_sorted_run_bytes"};
   static constexpr const char* kCudfOrderByMergeFanIn{

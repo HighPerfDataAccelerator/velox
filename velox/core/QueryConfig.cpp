@@ -164,6 +164,7 @@ const std::vector<config::ConfigProperty>& QueryConfig::registeredProperties() {
 
     // Split preload.
     VELOX_REGISTER_QUERY_CONFIG(kMaxSplitPreloadPerDriver);
+    VELOX_REGISTER_QUERY_CONFIG(kMaxSplitPreloadPerTask);
 
     // Driver.
     VELOX_REGISTER_QUERY_CONFIG(kDriverCpuTimeSliceLimitMs);

@@ -49,9 +49,10 @@ ContinueFuture SplitsStore::makeFuture() {
   return std::move(future);
 }
 
-Split SplitsStore::getSplit(
+bool SplitsStore::getSplit(
     int maxPreloadSplits,
-    const ConnectorSplitPreloadFunc& preload) {
+    const ConnectorSplitPreloadFunc& preload,
+    Split& split) {
   int readySplitIndex = -1;
   if (maxPreloadSplits > 0) {
     for (int i = 0, end = std::min<size_t>(maxPreloadSplits, splits_.size());
@@ -72,12 +73,19 @@ Split SplitsStore::getSplit(
         preloadingSplits_->erase(connectorSplit);
       }
     }
+    // Do not bind a scan driver to an arbitrary in-flight preload. The
+    // completion path wakes a waiter, which retries and takes whichever split
+    // is ready first. This keeps I/O and compute pipelined without
+    // head-of-line blocking on the queue front.
+    if (readySplitIndex == -1) {
+      return false;
+    }
   }
   if (readySplitIndex == -1) {
     readySplitIndex = 0;
   }
   VELOX_CHECK(!splits_.empty());
-  auto split = std::move(splits_[readySplitIndex]);
+  split = std::move(splits_[readySplitIndex]);
   splits_.erase(splits_.begin() + readySplitIndex);
   --taskStats_->numQueuedSplits;
   ++taskStats_->numRunningSplits;
@@ -93,7 +101,7 @@ Split SplitsStore::getSplit(
   if (taskStats_->firstSplitStartTimeMs == 0) {
     taskStats_->firstSplitStartTimeMs = taskStats_->lastSplitStartTimeMs;
   }
-  return split;
+  return true;
 }
 
 bool SplitsStore::tryGetBarrier(

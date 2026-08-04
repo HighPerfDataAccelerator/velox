@@ -16,7 +16,10 @@
 
 #pragma once
 
+#include "velox/common/file/File.h"
 #include "velox/dwio/common/BufferedInput.h"
+#include "velox/experimental/cudf/connectors/hive/PinnedHostBuffer.h"
+#include "velox/experimental/cudf/exec/GpuResources.h"
 
 #include <cudf/ast/detail/expression_transformer.hpp>
 #include <cudf/ast/detail/operators.hpp>
@@ -112,6 +115,7 @@ class KvikioS3DataSource final : public cudf::io::datasource {
       const std::string& sessionToken,
       std::optional<std::string> region,
       std::optional<std::string> endpoint,
+      std::shared_ptr<facebook::velox::ReadFile> nativeS3ReadFile,
       std::optional<std::size_t> fileSize = std::nullopt);
 
   [[nodiscard]] size_t size() const override;
@@ -149,12 +153,86 @@ class KvikioS3DataSource final : public cudf::io::datasource {
       size_t size,
       rmm::cuda_stream_view stream) override;
 
+  size_t readRanges(
+      const std::vector<size_t>& offsets,
+      const std::vector<size_t>& sizes,
+      uint8_t* destination,
+      const std::vector<size_t>& destinationOffsets);
+
  private:
   size_t clampedReadSize(size_t offset, size_t requestedSize) const;
 
   kvikio::RemoteHandle handle_;
+  std::string nativeS3Bucket_;
+  std::string nativeS3Key_;
+  std::string nativeS3Url_;
+  std::string nativeAwsSigV4_;
+  std::string nativeUserPassword_;
+  std::string nativeSessionToken_;
+  std::shared_ptr<facebook::velox::ReadFile> nativeS3ReadFile_;
+  const size_t metadataReadAheadBytes_;
+  std::once_flag tailCacheOnce_;
+  size_t tailCacheOffset_{0};
+  std::vector<uint8_t> tailCache_;
 };
+
+/// S3 source backed by the executor-local AWS SDK v2 CRT bridge. Reads land
+/// in host memory; the hybrid reader batches all requested Parquet ranges
+/// before issuing one host-to-device copy.
+class CrtS3DataSource final : public cudf::io::datasource {
+ public:
+  CrtS3DataSource(
+      std::string filePath,
+      std::optional<std::size_t> fileSize = std::nullopt);
+
+  [[nodiscard]] size_t size() const override;
+
+  std::unique_ptr<datasource::buffer> host_read(size_t offset, size_t size)
+      override;
+
+  size_t host_read(size_t offset, size_t size, uint8_t* dst) override;
+
+  std::future<std::unique_ptr<datasource::buffer>> host_read_async(
+      size_t offset,
+      size_t size) override;
+
+  std::future<size_t> host_read_async(
+      size_t offset,
+      size_t size,
+      uint8_t* dst) override;
+
+  [[nodiscard]] bool supports_device_read() const override;
+
+  size_t readRanges(
+      const std::vector<size_t>& offsets,
+      const std::vector<size_t>& sizes,
+      uint8_t* destination,
+      const std::vector<size_t>& destinationOffsets) const;
+
+ private:
+  size_t clampedReadSize(size_t offset, size_t requestedSize) const;
+
+  std::string filePath_;
+  size_t fileSize_;
+  const size_t metadataReadAheadBytes_;
+  std::once_flag tailCacheOnce_;
+  size_t tailCacheOffset_{0};
+  std::vector<uint8_t> tailCache_;
+};
+
+bool crtS3RangeReaderAvailable();
 #endif
+
+/// Projected remote ranges fetched into one final-layout host buffer. This is
+/// deliberately separate from the device allocation so split preload threads
+/// can keep S3 busy without speculatively consuming GPU memory or streams.
+struct PreparedHostByteRanges {
+  std::shared_ptr<PinnedHostBuffer> hostBuffer;
+  std::vector<size_t> hostSourceOffsets;
+  size_t totalSize{0};
+  size_t coalesceGapBytes{0};
+  bool nativeCppHostBatch{false};
+};
 
 /**
  * @brief Hybrid scan reader state
@@ -167,8 +245,32 @@ struct HybridScanState {
 
   std::vector<rmm::device_buffer> columnChunkBuffers_;
   std::vector<cudf::device_span<const uint8_t>> columnChunkData_;
+  std::optional<DeviceMemoryAdmissionReservation> deviceMemoryAdmission_;
+  std::shared_ptr<PreparedHostByteRanges> preparedHostByteRanges_;
+  std::optional<std::vector<cudf::size_type>> rowGroupIndices_;
+  std::optional<std::vector<cudf::io::text::byte_range_info>>
+      columnChunkByteRanges_;
   std::unique_ptr<std::once_flag> isHybridScanSetup_;
 };
+
+using FetchedDeviceByteRanges = std::tuple<
+    std::vector<rmm::device_buffer>,
+    std::vector<cudf::device_span<const uint8_t>>,
+    std::future<void>,
+    std::optional<DeviceMemoryAdmissionReservation>>;
+
+/// Fetch supported packed remote ranges into host memory only. Returns null
+/// for data sources that use the existing direct/device paths.
+std::shared_ptr<PreparedHostByteRanges> prepareByteRangesToHost(
+    std::shared_ptr<cudf::io::datasource> dataSource,
+    cudf::host_span<const cudf::io::text::byte_range_info> byteRanges);
+
+/// Allocate and copy a previously prepared host batch to device memory.
+FetchedDeviceByteRanges copyPreparedByteRangesToDevice(
+    std::shared_ptr<PreparedHostByteRanges> prepared,
+    cudf::host_span<const cudf::io::text::byte_range_info> byteRanges,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr);
 
 /**
  * @brief Fetches a list of byte ranges from a host buffer into device buffers
@@ -181,11 +283,7 @@ struct HybridScanState {
  * @return A tuple containing the device buffers, the device spans of the
  * fetched data, and a future to wait on the read tasks
  */
-std::tuple<
-    std::vector<rmm::device_buffer>,
-    std::vector<cudf::device_span<const uint8_t>>,
-    std::future<void>>
-fetchByteRangesAsync(
+FetchedDeviceByteRanges fetchByteRangesAsync(
     std::shared_ptr<cudf::io::datasource> dataSource,
     cudf::host_span<const cudf::io::text::byte_range_info> byteRanges,
     rmm::cuda_stream_view stream,

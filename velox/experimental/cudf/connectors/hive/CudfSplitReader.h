@@ -131,6 +131,14 @@ class CudfSplitReader : public NvtxHelper {
   // Requires exactly one footer.
   void createExperimentalReader();
 
+  // Resolve row groups and fetch projected byte ranges for the experimental
+  // reader. This is safe to call from split preparation or first next().
+  void setupExperimentalScan();
+
+  // Resolve projected ranges and fetch them into host memory during split
+  // preload, leaving device allocation, H2D, and reader setup to the driver.
+  void prepareExperimentalHostRead();
+
   // Whether to use the experimental cuDF reader.
   bool useExperimentalCudfReader() const;
 
