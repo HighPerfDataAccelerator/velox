@@ -53,8 +53,8 @@ class PinnedHostBufferPool {
       }
     }
     void* allocation = nullptr;
-    if (cudaHostAlloc(
-            &allocation, capacity, cudaHostAllocPortable) != cudaSuccess) {
+    if (cudaHostAlloc(&allocation, capacity, cudaHostAllocPortable) !=
+        cudaSuccess) {
       cudaGetLastError();
       return {nullptr, 0};
     }
@@ -104,9 +104,8 @@ class PinnedHostBufferPool {
     }
     char* end = nullptr;
     const auto parsed = std::strtoull(value, &end, 10);
-    return end != value && *end == '\0'
-        ? static_cast<size_t>(parsed)
-        : kDefault;
+    return end != value && *end == '\0' ? static_cast<size_t>(parsed)
+                                        : kDefault;
   }
 
   PinnedHostBufferPool() : maxCachedBytes_(maxCachedBytes()) {}

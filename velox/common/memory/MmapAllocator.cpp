@@ -186,6 +186,49 @@ MachinePageCount MmapAllocator::unmap(MachinePageCount targetPages) {
   return numAdvised;
 }
 
+std::shared_ptr<void> MmapAllocator::protectMappedPages(
+    const Allocation& allocation) {
+  auto descriptor = std::make_unique<Allocation>();
+  for (int32_t i = 0; i < allocation.numRuns(); ++i) {
+    const auto run = allocation.runAt(i);
+    descriptor->append(run.data(), run.numPages());
+  }
+  setMappedPageProtection(*descriptor, true);
+  return std::shared_ptr<void>(
+      descriptor.release(), [this](void* opaque) noexcept {
+        std::unique_ptr<Allocation> owned(static_cast<Allocation*>(opaque));
+        try {
+          setMappedPageProtection(*owned, false);
+        } catch (const std::exception& error) {
+          VELOX_MEM_LOG(ERROR)
+              << "Failed to clear mapped-page protection: " << error.what();
+        } catch (...) {
+          VELOX_MEM_LOG(ERROR) << "Failed to clear mapped-page protection";
+        }
+        // This Allocation only describes addresses owned by size classes; it
+        // must not attempt to free them and must be empty at destruction.
+        owned->clear();
+      });
+}
+
+std::shared_ptr<void> MmapAllocator::protectMappedRange(
+    void* address,
+    MachinePageCount numPages) {
+  Allocation allocation;
+  allocation.append(static_cast<uint8_t*>(address), numPages);
+  auto protection = protectMappedPages(allocation);
+  allocation.clear();
+  return protection;
+}
+
+void MmapAllocator::setMappedPageProtection(
+    const Allocation& allocation,
+    bool protectedFromAdvise) {
+  for (auto& sizeClass : sizeClasses_) {
+    sizeClass->setMappedPageProtection(allocation, protectedFromAdvise);
+  }
+}
+
 MachinePageCount MmapAllocator::freeNonContiguousInternal(
     Allocation& allocation) {
   MachinePageCount numFreed{0};
@@ -534,7 +577,8 @@ MmapAllocator::SizeClass::SizeClass(size_t capacity, MachinePageCount unitSize)
       // Min 8 words + 1 bit for every 512 bits in 'pageAllocated_'.
       mappedFreeLookup_((capacity_ / kPagesPerLookupBit / 64) + kSimdTail),
       pageAllocated_(pageBitmapSize_ + kSimdTail),
-      pageMapped_(pageBitmapSize_ + kSimdTail) {
+      pageMapped_(pageBitmapSize_ + kSimdTail),
+      pageProtected_(pageBitmapSize_ + kSimdTail) {
   VELOX_CHECK_EQ(
       capacity_ % 64,
       0,
@@ -792,25 +836,73 @@ void MmapAllocator::SizeClass::allocateFromMappedFree(
 
 MachinePageCount MmapAllocator::SizeClass::adviseAway(
     MachinePageCount numPages) {
-  // Allocate as many mapped free pages as needed and advise them away.
+  // Allocate as many unprotected mapped free pages as needed and advise them
+  // away. Externally registered pages remain allocatable but must retain their
+  // physical backing until their registration lifetime ends.
   ClassPageCount target = bits::roundUp(numPages, unitSize_) / unitSize_;
   Allocation allocation;
+  ClassPageCount selected = 0;
   {
     std::lock_guard<std::mutex> l(mutex_);
     if (numMappedFreePages_ == 0) {
       return 0;
     }
     target = std::min(target, numMappedFreePages_);
-    allocateLocked(target, nullptr, allocation);
-    VELOX_CHECK_EQ(allocation.numPages(), target * unitSize_);
-    numAllocatedMapped_ -= target;
-    numAdvisedAway_ += target;
+    selected = allocateUnprotectedMappedFree(target, allocation);
+    if (selected == 0) {
+      return 0;
+    }
+    numMappedFreePages_ -= selected;
+    numAllocatedMapped_ -= selected;
+    numAdvisedAway_ += selected;
   }
   // Outside of 'mutex_'.
   adviseAway(allocation);
   free(allocation);
   allocation.clear();
-  return unitSize_ * target;
+  return unitSize_ * selected;
+}
+
+ClassPageCount MmapAllocator::SizeClass::allocateUnprotectedMappedFree(
+    ClassPageCount numPages,
+    Allocation& allocation) {
+  ClassPageCount selected = 0;
+  for (int32_t word = 0; word < pageBitmapSize_ && selected < numPages;
+       ++word) {
+    uint64_t candidates =
+        ~pageAllocated_[word] & pageMapped_[word] & ~pageProtected_[word];
+    while (candidates != 0 && selected < numPages) {
+      const auto bit = count_trailing_zeros(candidates);
+      const auto page = word * 64 + bit;
+      bits::setBit(pageAllocated_.data(), page);
+      allocation.append(
+          address_ + AllocationTraits::pageBytes(page * unitSize_), unitSize_);
+      ++selected;
+      candidates &= candidates - 1;
+    }
+  }
+
+  // The selected pages are temporarily marked allocated while adviseAway()
+  // drops their physical backing outside mutex_. Keep the coarse lookup in
+  // sync before releasing mutex_: another allocator thread may otherwise
+  // follow a stale group bit, find no mapped-free page, and return a short
+  // allocation. Protected mapped-free pages remain valid candidates and keep
+  // their groups set.
+  constexpr int32_t kWordsPerGroup = kPagesPerLookupBit / 64;
+  for (int32_t firstWord = 0; firstWord < pageBitmapSize_;
+       firstWord += kWordsPerGroup) {
+    bool hasMappedFree = false;
+    const auto endWord = std::min(pageBitmapSize_, firstWord + kWordsPerGroup);
+    for (int32_t word = firstWord; word < endWord; ++word) {
+      if ((~pageAllocated_[word] & pageMapped_[word]) != 0) {
+        hasMappedFree = true;
+        break;
+      }
+    }
+    bits::setBit(
+        mappedFreeLookup_.data(), firstWord / kWordsPerGroup, hasMappedFree);
+  }
+  return selected;
 }
 
 bool MmapAllocator::SizeClass::isInRange(uint8_t* ptr) const {
@@ -834,6 +926,31 @@ void MmapAllocator::SizeClass::setAllMapped(
     }
     std::lock_guard<std::mutex> l(mutex_);
     setMappedBits(run, value);
+  }
+}
+
+void MmapAllocator::SizeClass::setMappedPageProtection(
+    const Allocation& allocation,
+    bool protectedFromAdvise) {
+  for (int32_t i = 0; i < allocation.numRuns(); ++i) {
+    const auto run = allocation.runAt(i);
+    if (!isInRange(run.data())) {
+      continue;
+    }
+    std::lock_guard<std::mutex> l(mutex_);
+    const auto firstBit = (run.data<uint8_t>() - address_) /
+        AllocationTraits::pageBytes(unitSize_);
+    const auto numPages = run.numPages() / unitSize_;
+    for (auto page = firstBit; page < firstBit + numPages; ++page) {
+      VELOX_CHECK(
+          bits::isBitSet(pageMapped_.data(), page),
+          "Cannot protect an unmapped size-class page");
+      VELOX_CHECK_EQ(
+          bits::isBitSet(pageProtected_.data(), page),
+          !protectedFromAdvise,
+          "Mismatched mapped-page protection lifetime");
+      bits::setBit(pageProtected_.data(), page, protectedFromAdvise);
+    }
   }
 }
 

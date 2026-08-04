@@ -16,8 +16,8 @@
 
 #include "velox/exec/Task.h"
 #include <folly/ScopeGuard.h>
-#include "folly/synchronization/EventCount.h"
 #include <folly/synchronization/Baton.h>
+#include "folly/synchronization/EventCount.h"
 #include "velox/common/base/tests/GTestUtils.h"
 #include "velox/common/file/tests/FaultyFileSystem.h"
 #include "velox/common/future/VeloxPromise.h"
@@ -898,8 +898,7 @@ TEST_F(TaskTest, preloadedSplitsAreConsumedInReadyOrder) {
             std::dynamic_pointer_cast<connector::hive::HiveConnectorSplit>(
                 connectorSplit);
         ASSERT_NE(hiveSplit, nullptr);
-        auto* allow =
-            hiveSplit->filePath == slowPath ? &allowSlow : &allowFast;
+        auto* allow = hiveSplit->filePath == slowPath ? &allowSlow : &allowFast;
         connectorSplit->dataSource =
             std::make_unique<AsyncSource<connector::DataSource>>(
                 [allow]() -> std::unique_ptr<connector::DataSource> {

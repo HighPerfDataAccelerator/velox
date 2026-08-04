@@ -84,6 +84,17 @@ class MmapAllocator : public MemoryAllocator {
 
   MachinePageCount unmap(MachinePageCount targetPages) override;
 
+  /// Protects size-class backing pages from MADV_DONTNEED while leaving them
+  /// available for ordinary allocations. The returned lifetime clears the
+  /// protection when released and must be destroyed before this allocator.
+  std::shared_ptr<void> protectMappedPages(const Allocation& allocation);
+
+  /// Protects one reusable size-class range. The address and page count must
+  /// describe a currently allocated size-class run owned by this allocator.
+  std::shared_ptr<void> protectMappedRange(
+      void* address,
+      MachinePageCount numPages);
+
   void freeBytes(void* p, uint64_t bytes) noexcept override;
 
   /// Checks internal consistency of allocation data structures. Returns true if
@@ -181,6 +192,12 @@ class MmapAllocator : public MemoryAllocator {
     // addresses that fall in the range of 'this'
     void setAllMapped(const Allocation& allocation, bool value);
 
+    // Marks mapped pages as unavailable to adviseAway. They remain available
+    // to ordinary allocations.
+    void setMappedPageProtection(
+        const Allocation& allocation,
+        bool protectedFromAdvise);
+
     // Sets the mapped flag for the class pages in 'run' to 'value'
     void setMappedBits(const Allocation::PageRun run, bool value);
 
@@ -224,6 +241,11 @@ class MmapAllocator : public MemoryAllocator {
     // Adds 'numPages' mapped free pages of this size class to 'allocation'. May
     // only be called if 'mappedFreePages_' >= 'numPages'.
     void allocateFromMappedFree(int32_t numPages, Allocation& allocation);
+
+    // Adds up to 'numPages' mapped, free and unprotected size-class pages.
+    ClassPageCount allocateUnprotectedMappedFree(
+        ClassPageCount numPages,
+        Allocation& allocation);
 
     // Marks that 'page' is free and mapped. Called when freeing the page.
     // 'page' is a page number iin this class.
@@ -286,6 +308,10 @@ class MmapAllocator : public MemoryAllocator {
     // Has a 1 bit if the corresponding size class page is backed by memory.
     std::vector<uint64_t> pageMapped_;
 
+    // Has a 1 bit while an external mapping registration requires this page's
+    // physical backing to survive allocator balancing.
+    std::vector<uint64_t> pageProtected_;
+
     // Cumulative count of allocated pages for which there was backing memory.
     uint64_t numAllocatedMapped_ = 0;
 
@@ -343,6 +369,10 @@ class MmapAllocator : public MemoryAllocator {
   MachinePageCount freeNonContiguousInternal(Allocation& allocation);
 
   void markAllMapped(const Allocation& allocation);
+
+  void setMappedPageProtection(
+      const Allocation& allocation,
+      bool protectedFromAdvise);
 
   // Finds at least  'target' unallocated pages in different size classes and
   // advises them away. Returns the number of pages advised away.

@@ -48,6 +48,31 @@ struct SplitPrefetchResult {
   std::function<void(uint64_t)> release;
 };
 
+struct CacheHintRangeStats {
+  // Logical ranges come directly from the reader planner. Unique ranges are
+  // file-global load-quantum cache keys after canonicalization.
+  uint64_t logicalRanges{0};
+  uint64_t logicalBytes{0};
+  uint64_t uniqueRanges{0};
+  uint64_t uniqueBytes{0};
+  uint64_t overlapBytes{0};
+  uint64_t duplicateSuppressedRanges{0};
+  uint64_t duplicateSuppressedBytes{0};
+  // "Consumed" means the split demanded and waited for the hint. "Unused"
+  // means query cleanup reached a registered hint before its split demanded
+  // it. These counters conserve uniqueRanges/uniqueBytes at final query exit.
+  uint64_t consumedRanges{0};
+  uint64_t consumedBytes{0};
+  uint64_t unusedRanges{0};
+  uint64_t unusedBytes{0};
+};
+
+struct CachePrefetchPlanStats {
+  uint64_t hits{0};
+  uint64_t misses{0};
+  uint64_t entries{0};
+};
+
 /// Executor-scoped, cross-split prefetch queue. MPP registers all physical
 /// file groups before starting Velox tasks. The first reader initializes a
 /// shared source factory, after which a dedicated scheduler keeps multiple
@@ -55,6 +80,8 @@ struct SplitPrefetchResult {
 /// waiting for a wave-wide barrier.
 class ExecutorSplitPrefetch {
  public:
+  using CacheHintLoad = std::function<void()>;
+
   static void registerSplit(
       folly::Executor* executor,
       const std::string& queryId,
@@ -78,6 +105,44 @@ class ExecutorSplitPrefetch {
       folly::Executor* executor,
       const std::string& queryId,
       const std::string& splitKey);
+
+  /// Registers a best-effort cache population hint discovered while a future
+  /// split reader parses its footer. Hints are bounded by the same query-level
+  /// ready-byte window semantics as whole-split prefetch.
+  static void registerCacheHint(
+      folly::Executor* executor,
+      const std::string& queryId,
+      const std::string& splitKey,
+      uint64_t plannedBytes,
+      CacheHintLoad load,
+      uint32_t concurrency,
+      uint64_t maxReadyBytes);
+
+  static void registerCacheHint(
+      folly::Executor* executor,
+      const std::string& queryId,
+      const std::string& splitKey,
+      CacheHintRangeStats rangeStats,
+      CacheHintLoad load,
+      uint32_t concurrency,
+      uint64_t maxReadyBytes);
+
+  /// Marks a cache hint as demanded and waits for it. Failures are swallowed:
+  /// the regular reader demand path remains the correctness fallback.
+  static void takeCacheHint(
+      folly::Executor* executor,
+      const std::string& queryId,
+      const std::string& splitKey);
+
+  static void recordCacheHintFallback();
+
+  static void recordCachePrefetchPlanLookup(bool hit);
+
+  static void recordCachePrefetchPlanEntries(uint64_t entries);
+
+  static CachePrefetchPlanStats cachePrefetchPlanStatsForTest();
+
+  static CacheHintRangeStats cacheHintRangeStatsForTest();
 
   static void eraseQuery(folly::Executor* executor, const std::string& queryId);
 

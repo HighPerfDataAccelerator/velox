@@ -38,7 +38,8 @@ CacheInputStream::CacheInputStream(
     std::shared_ptr<ScanTracker> tracker,
     TrackingId trackingId,
     uint64_t groupId,
-    int32_t loadQuantum)
+    int32_t loadQuantum,
+    std::shared_ptr<CacheRegionPlan> cacheRegionPlan)
     : bufferedInput_(bufferedInput),
       cache_(bufferedInput_->cache()),
       cacheable_(cacheable),
@@ -48,6 +49,7 @@ CacheInputStream::CacheInputStream(
       trackingId_(trackingId),
       groupId_(groupId),
       loadQuantum_(loadQuantum),
+      cacheRegionPlan_(std::move(cacheRegionPlan)),
       ioStats_(ioStats),
       input_(std::move(input)) {}
 
@@ -73,7 +75,9 @@ void CacheInputStream::makeCacheEvictable() {
     const auto nextRegion = nextQuantizedLoadRegion(position);
     const cache::RawFileCacheKey key{fileNum_, nextRegion.offset};
     cache_->makeEvictable(key);
-    position = nextRegion.offset + nextRegion.length;
+    position = cacheRegionPlan_
+        ? nextRegion.offset + nextRegion.length - region_.offset
+        : nextRegion.offset + nextRegion.length;
   }
 }
 
@@ -102,7 +106,8 @@ bool CacheInputStream::Next(const void** buffer, int32_t* size) {
   }
   offsetInRun_ += *size;
 
-  if (!preloaded_ && prefetchPct_ < 100) {
+  if (!preloaded_ && !cacheRegionPlan_ && prefetchPct_ < 100) {
+    const auto absolutePosition = region_.offset + position_;
     const auto offsetInQuantum = position_ % loadQuantum_;
     const auto nextQuantumOffset = position_ - offsetInQuantum + loadQuantum_;
     const auto prefetchThreshold = loadQuantum_ * prefetchPct_ / 100;
@@ -217,11 +222,16 @@ void CacheInputStream::loadSync(const Region& region) {
     }
 
     auto* entry = pin_.checkedEntry();
-    if (!entry->getAndClearFirstUseFlag()) {
+    const bool firstUse = entry->getAndClearFirstUseFlag();
+    const bool sizeMismatch = entry->size() != region.length;
+    if (!firstUse) {
       // Hit memory cache.
       ioStats_->ramHit().increment(hitSize);
     }
     if (!entry->isExclusive()) {
+      if (cacheRegionPlan_) {
+        cacheRegionPlan_->recordDemand(region, true, sizeMismatch);
+      }
       return;
     }
 
@@ -230,7 +240,13 @@ void CacheInputStream::loadSync(const Region& region) {
     entry->setGroupId(groupId_);
     entry->setTrackingId(trackingId_);
     if (loadFromSsd(region, *entry)) {
+      if (cacheRegionPlan_) {
+        cacheRegionPlan_->recordDemand(region, true, sizeMismatch);
+      }
       return;
+    }
+    if (cacheRegionPlan_) {
+      cacheRegionPlan_->recordDemand(region, false, sizeMismatch);
     }
     const auto ranges = entry->dataRanges(region.length);
     uint64_t storageReadUs{0};
@@ -394,6 +410,10 @@ void CacheInputStream::loadPosition() {
 
 velox::common::Region CacheInputStream::nextQuantizedLoadRegion(
     uint64_t prevLoadedPosition) const {
+  if (cacheRegionPlan_) {
+    return cacheRegionPlan_->regionForPosition(
+        region_, region_.offset + prevLoadedPosition);
+  }
   auto nextRegion = region_;
   // Quantize position to previous multiple of 'loadQuantum_'.
   nextRegion.offset += (prevLoadedPosition / loadQuantum_) * loadQuantum_;

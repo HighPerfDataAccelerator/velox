@@ -43,7 +43,8 @@ if(VELOX_ENABLE_S3)
   )
   velox_include_directories(velox_cudf_hive_connector PRIVATE ${AWSSDK_INCLUDE_DIRS})
   target_link_libraries(
-    velox_cudf_hive_connector PRIVATE velox_s3fs ${AWSSDK_LIBRARIES} CURL::libcurl
+    velox_cudf_hive_connector
+    PRIVATE velox_s3fs ${AWSSDK_LIBRARIES} CURL::libcurl
   )
 endif()
 

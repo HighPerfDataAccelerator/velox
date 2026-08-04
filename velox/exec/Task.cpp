@@ -2320,8 +2320,7 @@ void Task::splitPreloadFinished(
     if (stateIt == splitsStates_.end()) {
       return;
     }
-    const auto storeIt =
-        stateIt->second.groupSplitsStores.find(splitGroupId);
+    const auto storeIt = stateIt->second.groupSplitsStores.find(splitGroupId);
     if (storeIt == stateIt->second.groupSplitsStores.end() ||
         storeIt->second == nullptr) {
       return;

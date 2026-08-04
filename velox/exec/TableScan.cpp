@@ -500,8 +500,7 @@ void TableScan::preload(
 void TableScan::checkPreload() {
   auto* ioExecutor = connector_->ioExecutor();
   if ((maxSplitPreloadPerDriver_ == 0 && maxSplitPreloadPerTask_ == 0) ||
-      !ioExecutor ||
-      !connector_->supportsSplitPreload()) {
+      !ioExecutor || !connector_->supportsSplitPreload()) {
     return;
   }
   maxPreloadedSplits_ = maxSplitPreloadPerTask_ > 0
@@ -513,15 +512,14 @@ void TableScan::checkPreload() {
         [ioExecutor,
          this](const std::shared_ptr<connector::ConnectorSplit>& split) {
           preload(split);
-          ioExecutor->add(
-              [connectorSplit = split,
-               task = operatorCtx_->task(),
-               splitGroupId = driverCtx_->splitGroupId,
-               planNodeId = planNodeId()]() mutable {
-                connectorSplit->dataSource->prepare();
-                connectorSplit.reset();
-                task->splitPreloadFinished(splitGroupId, planNodeId);
-              });
+          ioExecutor->add([connectorSplit = split,
+                           task = operatorCtx_->task(),
+                           splitGroupId = driverCtx_->splitGroupId,
+                           planNodeId = planNodeId()]() mutable {
+            connectorSplit->dataSource->prepare();
+            connectorSplit.reset();
+            task->splitPreloadFinished(splitGroupId, planNodeId);
+          });
         };
   }
 }

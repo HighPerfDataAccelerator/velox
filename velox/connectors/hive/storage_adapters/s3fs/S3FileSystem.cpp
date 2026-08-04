@@ -25,9 +25,9 @@
 #include "velox/connectors/hive/storage_adapters/s3fs/S3WriteFile.h"
 #include "velox/dwio/common/DataBuffer.h"
 
+#include <curl/curl.h>
 #include <fmt/format.h>
 #include <glog/logging.h>
-#include <curl/curl.h>
 #include <cstdlib>
 #include <memory>
 #include <stdexcept>

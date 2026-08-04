@@ -333,9 +333,7 @@ if(VELOX_ENABLE_S3)
   if(AWSSDK_ROOT_DIR)
     list(APPEND CMAKE_PREFIX_PATH ${AWSSDK_ROOT_DIR})
   endif()
-  find_package(
-    AWSSDK 1.11.654 REQUIRED COMPONENTS s3;identity-management;s3-crt
-  )
+  find_package(AWSSDK 1.11.654 REQUIRED COMPONENTS s3;identity-management;s3-crt)
   add_definitions(-DVELOX_ENABLE_S3)
 endif()
 

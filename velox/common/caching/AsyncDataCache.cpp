@@ -48,6 +48,8 @@ AsyncDataCacheEntry::~AsyncDataCacheEntry() {
 
 void AsyncDataCacheEntry::freeData() {
   auto* cache = shard_->cache();
+  // The external registration must never outlive ownership of its runs.
+  backingRegistration_.reset();
   const auto nonContiguousPages = nonContiguousData_.numPages();
   if (nonContiguousPages > 0) {
     VELOX_CHECK_NULL(
@@ -75,6 +77,37 @@ void AsyncDataCacheEntry::freeData() {
 
 void AsyncDataCacheEntry::setExclusiveToShared(bool ssdSavable) {
   VELOX_CHECK(isExclusive());
+  const auto& options = shard_->cache()->opts_;
+  if (!nonContiguousData_.empty() && options.registerBackingRuns) {
+    try {
+      backingRegistration_ = options.registerBackingRuns(nonContiguousData_);
+    } catch (const std::exception& error) {
+      VELOX_CACHE_LOG(WARNING)
+          << "Cache backing registration failed; using pageable memory: "
+          << error.what();
+      backingRegistration_.reset();
+    } catch (...) {
+      VELOX_CACHE_LOG(WARNING)
+          << "Cache backing registration failed; using pageable memory";
+      backingRegistration_.reset();
+    }
+  } else if (contiguousData_ != nullptr && options.registerBackingBytes) {
+    try {
+      backingRegistration_ =
+          options.registerBackingBytes(contiguousData_, size_);
+    } catch (const std::exception& error) {
+      VELOX_CACHE_LOG(WARNING)
+          << "Contiguous cache backing registration failed; using pageable "
+             "memory: "
+          << error.what();
+      backingRegistration_.reset();
+    } catch (...) {
+      VELOX_CACHE_LOG(WARNING)
+          << "Contiguous cache backing registration failed; using pageable "
+             "memory";
+      backingRegistration_.reset();
+    }
+  }
   numPins_ = 1;
   std::unique_ptr<folly::SharedPromise<bool>> promise;
   {
@@ -449,11 +482,19 @@ void CoalescedLoad::setEndState(State endState) {
 
 std::unique_ptr<folly::SharedPromise<bool>> CacheShard::removeEntry(
     AsyncDataCacheEntry* entry) {
-  std::lock_guard<std::mutex> l(mutex_);
-  removeEntryLocked(entry);
-  // After the entry is removed from the hash table, a promise can no longer
-  // be made. It is safe to move the promise and realize it.
-  return entry->movePromiseLocked();
+  auto registration = std::move(entry->backingRegistration_);
+  std::unique_ptr<folly::SharedPromise<bool>> promise;
+  {
+    std::lock_guard<std::mutex> l(mutex_);
+    removeEntryLocked(entry);
+    // After the entry is removed from the hash table, a promise can no longer
+    // be made. It is safe to move the promise and realize it.
+    promise = entry->movePromiseLocked();
+  }
+  // External registration release can block; never invoke it while holding
+  // the cache shard mutex.
+  registration.reset();
+  return promise;
 }
 
 void CacheShard::removeEntryLocked(AsyncDataCacheEntry* entry) {
@@ -481,7 +522,11 @@ void CacheShard::acquireEvictedData(
     AcquiredMemory& acquired,
     AcquiredMemory& toFree,
     int64_t& largeEvicted,
-    int64_t& tinyEvicted) {
+    int64_t& tinyEvicted,
+    std::vector<std::shared_ptr<void>>& registrationsToRelease) {
+  if (entry->backingRegistration_) {
+    registrationsToRelease.push_back(std::move(entry->backingRegistration_));
+  }
   if (entry->contiguousData_ != nullptr) {
     VELOX_CHECK(entry->tinyData_.empty());
     VELOX_CHECK(entry->nonContiguousData_.empty());
@@ -524,6 +569,7 @@ uint64_t CacheShard::evict(
       (ssdCache != nullptr) && ssdCache->writeInProgress();
   auto now = accessTime();
   AcquiredMemory toFree;
+  std::vector<std::shared_ptr<void>> registrationsToRelease;
   int64_t tinyEvicted = 0;
   int64_t largeEvicted = 0;
   int32_t evictSaveableSkipped = 0;
@@ -579,7 +625,8 @@ uint64_t CacheShard::evict(
             acquired,
             toFree,
             largeEvicted,
-            tinyEvicted);
+            tinyEvicted,
+            registrationsToRelease);
 
         removeEntryLocked(candidate);
         emptySlots_.push_back(entryIndex);
@@ -594,6 +641,10 @@ uint64_t CacheShard::evict(
       }
     }
   }
+
+  // Release registrations before the runs are handed to another allocator
+  // user or freed, and do so outside the shard lock.
+  registrationsToRelease.clear();
 
   ClockTimer t(allocClocks_);
   toFree.free(cache_->allocator());
@@ -731,6 +782,7 @@ bool CacheShard::removeFileEntries(
   int32_t numRemoved = 0;
   int64_t pagesRemoved = 0;
   AcquiredMemory toFree;
+  std::vector<std::shared_ptr<void>> registrationsToRelease;
   {
     std::lock_guard<std::mutex> l(mutex_);
 
@@ -757,6 +809,10 @@ bool CacheShard::removeFileEntries(
         cacheEntry->contiguousData_ = nullptr;
       } else {
         pagesRemoved += cacheEntry->nonContiguousData().numPages();
+        if (cacheEntry->backingRegistration_) {
+          registrationsToRelease.push_back(
+              std::move(cacheEntry->backingRegistration_));
+        }
         toFree.nonContiguousAllocs.appendMove(cacheEntry->nonContiguousData());
       }
       removeEntryLocked(cacheEntry.get());
@@ -767,6 +823,8 @@ bool CacheShard::removeFileEntries(
   }
   VELOX_CACHE_LOG(INFO) << "Removed " << numRemoved
                         << " AsyncDataCache entries.";
+
+  registrationsToRelease.clear();
 
   ClockTimer t(allocClocks_);
   toFree.free(cache_->allocator());
@@ -874,7 +932,8 @@ CachePin AsyncDataCache::findOrCreate(
     bool contiguous,
     folly::SemiFuture<bool>* wait) {
   const int shard = std::hash<RawFileCacheKey>()(key) & shardMask_;
-  return shards_[shard]->findOrCreate(key, size, contiguous, wait);
+  return shards_[shard]->findOrCreate(
+      key, size, contiguous || opts_.forceContiguousEntries, wait);
 }
 
 std::optional<CachePin> AsyncDataCache::find(

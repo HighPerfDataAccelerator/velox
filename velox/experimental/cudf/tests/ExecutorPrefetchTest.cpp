@@ -14,16 +14,25 @@
  * limitations under the License.
  */
 
+#include "velox/experimental/cudf/connectors/hive/CudfHiveConfig.h"
+#include "velox/experimental/cudf/connectors/hive/CudfSplitReaderHelpers.h"
 #include "velox/experimental/cudf/connectors/hive/ExecutorReadBroker.h"
 #include "velox/experimental/cudf/connectors/hive/ExecutorSplitPrefetch.h"
-#include "velox/experimental/cudf/connectors/hive/CudfHiveConfig.h"
 
+#include "velox/common/caching/FileIds.h"
+#include "velox/common/file/tests/TestUtils.h"
+#include "velox/common/memory/MallocAllocator.h"
+#include "velox/dwio/common/CachedBufferedInput.h"
+
+#include <folly/ScopeGuard.h>
 #include <folly/executors/CPUThreadPoolExecutor.h>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <future>
 #include <mutex>
@@ -31,10 +40,604 @@
 #include <thread>
 #include <vector>
 
+#ifdef VELOX_ENABLE_S3
+extern "C" bool glutenCrtS3RangeReaderAvailable() {
+  return false;
+}
+
+extern "C" uint64_t glutenCrtS3ObjectSize(const char*) {
+  return 0;
+}
+
+extern "C" uint64_t glutenCrtS3ReadRanges(
+    const char*,
+    uint8_t*,
+    const uint64_t*,
+    const uint64_t*,
+    const uint64_t*,
+    size_t) {
+  return 0;
+}
+#endif
+
 namespace facebook::velox::cudf_velox::connector::hive {
 namespace {
 
 using namespace std::chrono_literals;
+
+class CacheHintRangeStatsTest : public testing::Test {
+ protected:
+  static void SetUpTestSuite() {
+    memory::MemoryManager::testingSetInstance(memory::MemoryManager::Options{});
+  }
+
+  void SetUp() override {
+    pool_ = memory::memoryManager()->addLeafPool();
+    allocator_ = std::make_shared<memory::MallocAllocator>(
+        memory::MemoryAllocator::Options{
+            .capacity = 64 << 20, .reservationByteLimit = 0});
+    cache_ = cache::AsyncDataCache::create(allocator_.get());
+  }
+
+  void TearDown() override {
+    cache_->shutdown();
+    cache_.reset();
+    allocator_.reset();
+    pool_.reset();
+  }
+
+  std::shared_ptr<memory::MemoryPool> pool_;
+  std::shared_ptr<memory::MallocAllocator> allocator_;
+  std::shared_ptr<cache::AsyncDataCache> cache_;
+};
+
+class TrackingArrayInputStream final
+    : public dwio::common::SeekableArrayInputStream {
+ public:
+  TrackingArrayInputStream(
+      const char* data,
+      uint64_t size,
+      uint64_t blockSize,
+      std::shared_ptr<std::atomic<uint64_t>> backedUpBytes,
+      std::shared_ptr<std::atomic<bool>> destroyed)
+      : SeekableArrayInputStream(data, size, blockSize),
+        backedUpBytes_(std::move(backedUpBytes)),
+        destroyed_(std::move(destroyed)) {}
+
+  ~TrackingArrayInputStream() override {
+    destroyed_->store(true, std::memory_order_release);
+  }
+
+  void BackUp(int32_t count) override {
+    backedUpBytes_->fetch_add(count, std::memory_order_relaxed);
+    SeekableArrayInputStream::BackUp(count);
+  }
+
+ private:
+  const std::shared_ptr<std::atomic<uint64_t>> backedUpBytes_;
+  const std::shared_ptr<std::atomic<bool>> destroyed_;
+};
+
+class FakeCachedBufferedInput final : public dwio::common::BufferedInput {
+ public:
+  FakeCachedBufferedInput(
+      std::string content,
+      memory::MemoryPool& pool,
+      folly::Executor* executor,
+      uint64_t blockSize,
+      std::shared_ptr<std::atomic<uint64_t>> backedUpBytes,
+      std::shared_ptr<std::atomic<bool>> streamDestroyed)
+      : BufferedInput(std::make_shared<InMemoryReadFile>(content), pool),
+        content_(std::move(content)),
+        executor_(executor),
+        blockSize_(blockSize),
+        backedUpBytes_(std::move(backedUpBytes)),
+        streamDestroyed_(std::move(streamDestroyed)) {}
+
+  bool hasCache() const override {
+    return true;
+  }
+
+  folly::Executor* executor() const override {
+    return executor_;
+  }
+
+  std::unique_ptr<dwio::common::SeekableInputStream> read(
+      uint64_t offset,
+      uint64_t /*length*/,
+      dwio::common::LogType /*logType*/) const override {
+    VELOX_CHECK_LT(offset, content_.size());
+    return std::make_unique<TrackingArrayInputStream>(
+        content_.data() + offset,
+        content_.size() - offset,
+        blockSize_,
+        backedUpBytes_,
+        streamDestroyed_);
+  }
+
+  const char* contentBegin() const {
+    return content_.data();
+  }
+
+  const char* contentEnd() const {
+    return content_.data() + content_.size();
+  }
+
+ private:
+  const std::string content_;
+  folly::Executor* const executor_;
+  const uint64_t blockSize_;
+  const std::shared_ptr<std::atomic<uint64_t>> backedUpBytes_;
+  const std::shared_ptr<std::atomic<bool>> streamDestroyed_;
+};
+
+TEST_F(CacheHintRangeStatsTest, countsPhysicalChunkRelativeKeys) {
+  constexpr uint64_t kQuantum = 1024;
+  std::string content(4 * kQuantum, 'x');
+  auto readFile = std::make_shared<tests::utils::CountingReadFile>(content);
+  auto ioStats = std::make_shared<io::IoStatistics>();
+  io::ReaderOptions options(pool_.get());
+  options.setDataIoStats(ioStats);
+  options.setMetadataIoStats(ioStats);
+  options.setLoadQuantum(kQuantum);
+  auto& ids = fileIds();
+  StringIdLease fileId(ids, "cacheHintRangeStats");
+  StringIdLease groupId(ids, "cacheHintRangeStatsGroup");
+  auto input = std::make_shared<dwio::common::CachedBufferedInput>(
+      readFile,
+      dwio::common::MetricsLog::voidLog(),
+      std::move(fileId),
+      cache_.get(),
+      nullptr,
+      std::move(groupId),
+      ioStats,
+      nullptr,
+      nullptr,
+      options);
+  BufferedInputDataSource source(input);
+
+  const auto stats =
+      source.canonicalCacheStats({{100, 1000}, {1100, 300}, {2048, 100}});
+  EXPECT_EQ(stats.logicalRanges, 3);
+  EXPECT_EQ(stats.logicalBytes, 1400);
+  EXPECT_EQ(stats.uniqueRanges, 3);
+  EXPECT_EQ(stats.uniqueBytes, 1400);
+  EXPECT_EQ(stats.overlapBytes, 0);
+  EXPECT_EQ(stats.duplicateSuppressedRanges, 0);
+  EXPECT_EQ(stats.duplicateSuppressedBytes, 0);
+
+  EXPECT_ANY_THROW(source.canonicalCacheStats({{100, 1000}, {900, 300}}));
+}
+
+TEST_F(CacheHintRangeStatsTest, directCachePageH2dAvoidsHostStaging) {
+  ASSERT_EQ(setenv("GLUTEN_CUDF_CACHE_H2D_INLINE", "1", 1), 0);
+  SCOPE_EXIT {
+    unsetenv("GLUTEN_CUDF_CACHE_H2D_INLINE");
+  };
+  const auto callerThread = std::this_thread::get_id();
+  std::thread::id copyThread;
+  constexpr size_t kBlockSize = 1024;
+  constexpr size_t kOffset = 137;
+  constexpr size_t kReadSize = 2500;
+  std::string content(4 * kBlockSize, '\0');
+  for (size_t i = 0; i < content.size(); ++i) {
+    content[i] = static_cast<char>(i % 251);
+  }
+  folly::CPUThreadPoolExecutor executor(1);
+  auto backedUpBytes = std::make_shared<std::atomic<uint64_t>>(0);
+  auto streamDestroyed = std::make_shared<std::atomic<bool>>(false);
+  auto input = std::make_shared<FakeCachedBufferedInput>(
+      content, *pool_, &executor, kBlockSize, backedUpBytes, streamDestroyed);
+
+  std::vector<const void*> copySources;
+  std::vector<size_t> copySizes;
+  std::vector<std::shared_ptr<void>> retained;
+  std::weak_ptr<void> retainedWeak;
+  BufferedInputDeviceCopyHooks hooks{
+      .copy =
+          [&](uint8_t* destination,
+              const void* source,
+              size_t bytes,
+              rmm::cuda_stream_view /*stream*/) {
+            copyThread = std::this_thread::get_id();
+            copySources.push_back(source);
+            copySizes.push_back(bytes);
+            std::memcpy(destination, source, bytes);
+          },
+      .retainUntilComplete =
+          [&retained, &retainedWeak](
+              std::shared_ptr<void> stream,
+              rmm::cuda_stream_view /*cudaStream*/) {
+            retainedWeak = stream;
+            retained.push_back(std::move(stream));
+          }};
+  BufferedInputDataSource source(input, std::move(hooks));
+  std::vector<uint8_t> fakeDevice(kReadSize);
+  const auto statsBefore = directCachePageH2dStats();
+  EXPECT_EQ(
+      source
+          .device_read_async(
+              kOffset, kReadSize, fakeDevice.data(), rmm::cuda_stream_view{})
+          .get(),
+      kReadSize);
+  EXPECT_EQ(copyThread, callerThread);
+
+  EXPECT_EQ(
+      std::string_view(
+          reinterpret_cast<const char*>(fakeDevice.data()), fakeDevice.size()),
+      std::string_view(content).substr(kOffset, kReadSize));
+  ASSERT_EQ(copySizes.size(), 3);
+  EXPECT_THAT(copySizes, testing::ElementsAre(1024, 1024, 452));
+  for (const auto* copySource : copySources) {
+    const auto* sourceBytes = static_cast<const char*>(copySource);
+    EXPECT_GE(sourceBytes, input->contentBegin());
+    EXPECT_LT(sourceBytes, input->contentEnd());
+  }
+  EXPECT_EQ(backedUpBytes->load(), 572);
+  EXPECT_FALSE(streamDestroyed->load(std::memory_order_acquire));
+  EXPECT_FALSE(retainedWeak.expired());
+
+  const auto statsAfter = directCachePageH2dStats();
+  EXPECT_EQ(statsAfter.copies - statsBefore.copies, 3);
+  EXPECT_EQ(statsAfter.bytes - statsBefore.bytes, kReadSize);
+
+  retained.clear();
+  EXPECT_TRUE(retainedWeak.expired());
+  EXPECT_TRUE(streamDestroyed->load(std::memory_order_acquire));
+}
+
+TEST_F(CacheHintRangeStatsTest, boundedCachePageRegistrationFallsBack) {
+  memory::Allocation allocation;
+  ASSERT_TRUE(allocator_->allocateNonContiguous(3, allocation));
+  ASSERT_GE(allocation.numRuns(), 2);
+  const auto bytes = allocation.byteSize();
+  std::vector<void*> registered;
+  std::vector<void*> unregistered;
+  auto registration = makeBoundedCachePageRegistration(
+      bytes,
+      CachePageHostRegistrationHooks{
+          .registerRun =
+              [&registered](void* address, size_t /*bytes*/) {
+                registered.push_back(address);
+                return true;
+              },
+          .unregisterRun =
+              [&unregistered](void* address) {
+                unregistered.push_back(address);
+              }});
+  const auto before = cachePageRegistrationStats();
+  auto token = registration.registerBackingRuns(allocation);
+  ASSERT_NE(token, nullptr);
+  EXPECT_EQ(registered.size(), allocation.numRuns());
+
+  EXPECT_EQ(registration.registerBackingRuns(allocation), nullptr);
+  const auto during = cachePageRegistrationStats();
+  EXPECT_EQ(during.successes - before.successes, 1);
+  EXPECT_EQ(during.failures - before.failures, 1);
+  EXPECT_EQ(during.currentBytes - before.currentBytes, bytes);
+
+  token.reset();
+  const auto after = cachePageRegistrationStats();
+  EXPECT_EQ(unregistered.size(), allocation.numRuns());
+  EXPECT_EQ(after.currentBytes, before.currentBytes);
+  EXPECT_EQ(after.unregisteredBytes - before.unregisteredBytes, bytes);
+
+  uint64_t registerCalls = 0;
+  std::vector<void*> rolledBack;
+  auto failingRegistration = makeBoundedCachePageRegistration(
+      bytes,
+      CachePageHostRegistrationHooks{
+          .registerRun = [&registerCalls](
+                             void*, size_t) { return ++registerCalls != 2; },
+          .unregisterRun =
+              [&rolledBack](void* address) { rolledBack.push_back(address); }});
+  const auto beforeFailure = cachePageRegistrationStats();
+  EXPECT_EQ(failingRegistration.registerBackingRuns(allocation), nullptr);
+  const auto afterFailure = cachePageRegistrationStats();
+  EXPECT_EQ(afterFailure.failures - beforeFailure.failures, 1);
+  EXPECT_EQ(afterFailure.currentBytes, before.currentBytes);
+  EXPECT_EQ(rolledBack.size(), 1);
+  allocator_->freeNonContiguous(allocation);
+}
+
+TEST_F(CacheHintRangeStatsTest, prewarmsProtectedLargestSizeClassBacking) {
+  memory::MemoryAllocator::Options options;
+  options.capacity = 64ULL << 20;
+  auto allocator = std::make_shared<memory::MmapAllocator>(options);
+  std::vector<std::pair<void*, size_t>> registered;
+  std::vector<void*> unregistered;
+  auto registration = makeBoundedCachePageRegistration(
+      48ULL << 20,
+      CachePageHostRegistrationHooks{
+          .registerRun =
+              [&registered](void* address, size_t bytes) {
+                registered.emplace_back(address, bytes);
+                return true;
+              },
+          .unregisterRun =
+              [&unregistered](void* address) {
+                unregistered.push_back(address);
+              }});
+  const auto before = cachePageRegistrationStats();
+  auto prewarm = registration.prewarmLargestSizeClass(*allocator, 32ULL << 20);
+  ASSERT_NE(prewarm, nullptr);
+  const auto afterPrewarm = cachePageRegistrationStats();
+  EXPECT_EQ(afterPrewarm.prewarmSuccesses - before.prewarmSuccesses, 1);
+  EXPECT_EQ(afterPrewarm.prewarmBytes - before.prewarmBytes, 32ULL << 20);
+  EXPECT_EQ(afterPrewarm.currentBytes - before.currentBytes, 32ULL << 20);
+  EXPECT_FALSE(registered.empty());
+
+  // The backing is free for AsyncDataCache use, but is already registered.
+  memory::Allocation reuse;
+  ASSERT_TRUE(allocator->allocateNonContiguous(
+      memory::AllocationTraits::numPages(16ULL << 20),
+      reuse,
+      nullptr,
+      allocator->largestSizeClass()));
+  const auto registerCalls = registered.size();
+  auto entryLifetime = registration.registerBackingRuns(reuse);
+  ASSERT_NE(entryLifetime, nullptr);
+  EXPECT_EQ(registered.size(), registerCalls);
+  const auto covered = cachePageRegistrationStats();
+  EXPECT_GT(covered.prewarmCoveredBytes - before.prewarmCoveredBytes, 0);
+  entryLifetime.reset();
+  EXPECT_TRUE(unregistered.empty());
+  allocator->freeNonContiguous(reuse);
+
+  prewarm.reset();
+  EXPECT_EQ(unregistered.size(), registered.size());
+  const auto after = cachePageRegistrationStats();
+  EXPECT_EQ(after.currentBytes, before.currentBytes);
+  EXPECT_EQ(after.unregisteredBytes - before.unregisteredBytes, 32ULL << 20);
+}
+
+TEST_F(CacheHintRangeStatsTest, boundedCacheRangeRegistrationOwnsLifetime) {
+  memory::Allocation allocation;
+  ASSERT_TRUE(allocator_->allocateNonContiguous(1, allocation));
+  ASSERT_EQ(allocation.numRuns(), 1);
+  const auto run = allocation.runAt(0);
+  std::vector<std::pair<void*, size_t>> registered;
+  std::vector<void*> unregistered;
+  auto registration = makeBoundedCachePageRegistration(
+      run.numBytes(),
+      CachePageHostRegistrationHooks{
+          .registerRun =
+              [&registered](void* address, size_t bytes) {
+                registered.emplace_back(address, bytes);
+                return true;
+              },
+          .unregisterRun =
+              [&unregistered](void* address) {
+                unregistered.push_back(address);
+              }});
+
+  const auto before = cachePageRegistrationStats();
+  auto token =
+      registration.registerBackingRange(run.data<void>(), run.numBytes());
+  ASSERT_NE(token, nullptr);
+  ASSERT_THAT(
+      registered,
+      testing::ElementsAre(
+          std::pair<void*, size_t>{run.data<void>(), run.numBytes()}));
+  EXPECT_EQ(
+      cachePageRegistrationStats().currentBytes - before.currentBytes,
+      run.numBytes());
+
+  token.reset();
+  EXPECT_THAT(unregistered, testing::ElementsAre(run.data<void>()));
+  EXPECT_EQ(cachePageRegistrationStats().currentBytes, before.currentBytes);
+  allocator_->freeNonContiguous(allocation);
+}
+
+TEST_F(
+    CacheHintRangeStatsTest,
+    persistentRangeRegistrationSurvivesEntryEviction) {
+  memory::MmapAllocator::Options options;
+  options.capacity = 16ULL << 20;
+  auto allocator = std::make_shared<memory::MmapAllocator>(options);
+  std::vector<std::pair<void*, size_t>> registered;
+  std::vector<void*> unregistered;
+  auto registration = makeBoundedCachePageRegistration(
+      4ULL << 20,
+      CachePageHostRegistrationHooks{
+          .registerRun =
+              [&registered](void* address, size_t bytes) {
+                registered.emplace_back(address, bytes);
+                return true;
+              },
+          .unregisterRun =
+              [&unregistered](void* address) {
+                unregistered.push_back(address);
+              }});
+  constexpr uint64_t kBytes = 1ULL << 20;
+  auto* address = allocator->allocateBytes(kBytes);
+  ASSERT_NE(address, nullptr);
+  const auto before = cachePageRegistrationStats();
+  auto first =
+      registration.registerPersistentBackingRange(*allocator, address, kBytes);
+  ASSERT_NE(first, nullptr);
+  ASSERT_THAT(
+      registered,
+      testing::ElementsAre(std::pair<void*, size_t>{address, kBytes}));
+
+  // Multiple cache entries referring to the same reusable allocator backing
+  // share one CUDA registration. Dropping entry tokens does not unregister it.
+  auto covered =
+      registration.registerPersistentBackingRange(*allocator, address, kBytes);
+  ASSERT_NE(covered, nullptr);
+  EXPECT_EQ(registered.size(), 1);
+  first.reset();
+  covered.reset();
+  EXPECT_TRUE(unregistered.empty());
+  allocator->freeBytes(address, kBytes);
+
+  registration.persistentLifetime.reset();
+  EXPECT_THAT(unregistered, testing::ElementsAre(address));
+  const auto after = cachePageRegistrationStats();
+  EXPECT_EQ(after.currentBytes, before.currentBytes);
+  EXPECT_EQ(after.unregisteredBytes - before.unregisteredBytes, kBytes);
+}
+
+TEST_F(CacheHintRangeStatsTest, cacheBackingRegistrationTracksEntryLifetime) {
+  auto allocator = std::make_shared<memory::MallocAllocator>(
+      memory::MemoryAllocator::Options{
+          .capacity = 1 << 20, .reservationByteLimit = 0});
+  std::atomic<uint64_t> registrations{0};
+  std::atomic<uint64_t> releases{0};
+  cache::AsyncDataCache::Options options;
+  options.registerBackingRuns = [&](const memory::Allocation& allocation) {
+    EXPECT_GT(allocation.numRuns(), 0);
+    registrations.fetch_add(1, std::memory_order_relaxed);
+    return std::shared_ptr<void>(new uint8_t, [&releases](void* value) {
+      delete static_cast<uint8_t*>(value);
+      releases.fetch_add(1, std::memory_order_relaxed);
+    });
+  };
+  auto cache = cache::AsyncDataCache::create(allocator.get(), nullptr, options);
+  StringIdLease file(fileIds(), "cacheBackingRegistrationLifecycle");
+  auto pin = cache->findOrCreate(
+      cache::RawFileCacheKey{file.id(), 0}, 16 << 10, /*contiguous=*/false);
+  pin.checkedEntry()->setExclusiveToShared();
+  EXPECT_TRUE(pin.checkedEntry()->hasBackingRegistration());
+  EXPECT_EQ(registrations.load(std::memory_order_relaxed), 1);
+  EXPECT_EQ(releases.load(std::memory_order_relaxed), 0);
+
+  pin.clear();
+  EXPECT_GT(cache->shrink(1), 0);
+  EXPECT_EQ(releases.load(std::memory_order_relaxed), 1);
+  cache->shutdown();
+  EXPECT_EQ(releases.load(std::memory_order_relaxed), 1);
+  cache.reset();
+  allocator.reset();
+}
+
+#ifdef VELOX_ENABLE_S3
+class RecordingReadFile final : public ReadFile {
+ public:
+  std::string_view pread(
+      uint64_t offset,
+      uint64_t length,
+      void* buffer,
+      const FileIoContext& context) const override {
+    auto* destination = static_cast<char*>(buffer);
+    for (uint64_t index = 0; index < length; ++index) {
+      destination[index] = static_cast<char>(offset + index);
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    offsets_.push_back(offset);
+    destinations_.push_back(destination);
+    contextMarkers_.push_back(context.fileOpts.at("marker"));
+    return {destination, static_cast<size_t>(length)};
+  }
+
+  bool shouldCoalesce() const override {
+    return false;
+  }
+
+  uint64_t size() const override {
+    return 1024;
+  }
+
+  uint64_t memoryUsage() const override {
+    return sizeof(*this);
+  }
+
+  std::string getName() const override {
+    return "s3://test-bucket/test-key";
+  }
+
+  uint64_t getNaturalReadSize() const override {
+    return 8;
+  }
+
+  std::vector<uint64_t> offsets() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return offsets_;
+  }
+
+  std::vector<char*> destinations() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return destinations_;
+  }
+
+  std::vector<std::string> contextMarkers() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return contextMarkers_;
+  }
+
+ private:
+  mutable std::mutex mutex_;
+  mutable std::vector<uint64_t> offsets_;
+  mutable std::vector<char*> destinations_;
+  mutable std::vector<std::string> contextMarkers_;
+};
+
+TEST(ExecutorPrefetchTest, nativeScheduledReadWritesScatterBuffersDirectly) {
+  ASSERT_EQ(setenv("GLUTEN_CPP_S3_AWS_SDK", "1", 1), 0);
+  ASSERT_EQ(unsetenv("GLUTEN_CPP_S3_CRT"), 0);
+  auto base = std::make_shared<RecordingReadFile>();
+  auto scheduled =
+      makeNativeScheduledS3ReadFile(base, "s3://test-bucket/test-key");
+
+  std::array<char, 3> first{};
+  std::array<char, 2> second{};
+  const std::vector<folly::Range<char*>> buffers{
+      {first.data(), first.size()},
+      {nullptr, 3},
+      {second.data(), second.size()}};
+  FileIoContext context;
+  context.fileOpts["marker"] = "cache-miss";
+
+  EXPECT_EQ(scheduled->preadv(10, buffers, context), 8);
+  EXPECT_THAT(base->offsets(), testing::UnorderedElementsAre(10, 16));
+  EXPECT_THAT(
+      base->destinations(),
+      testing::UnorderedElementsAre(first.data(), second.data()));
+  EXPECT_THAT(
+      base->contextMarkers(), testing::ElementsAre("cache-miss", "cache-miss"));
+  EXPECT_THAT(first, testing::ElementsAre(10, 11, 12));
+  EXPECT_THAT(second, testing::ElementsAre(16, 17));
+  EXPECT_EQ(scheduled->bytesRead(), first.size() + second.size());
+}
+
+TEST(ExecutorPrefetchTest, nativeScatterGroupsOnlySplitAtLogicalGaps) {
+  std::array<char, 3> first{};
+  std::array<char, 4> second{};
+  std::array<char, 2> third{};
+  const std::vector<folly::Range<char*>> destinations{
+      {first.data(), first.size()},
+      {second.data(), second.size()},
+      {nullptr, 5},
+      {third.data(), third.size()}};
+
+  const auto groups = groupNativeS3ReadDestinations(10, destinations);
+  ASSERT_EQ(groups.size(), 2);
+  EXPECT_EQ(groups[0].offset, 10);
+  EXPECT_EQ(groups[0].size, first.size() + second.size());
+  ASSERT_EQ(groups[0].destinations.size(), 2);
+  EXPECT_EQ(groups[0].destinations[0].data(), first.data());
+  EXPECT_EQ(groups[0].destinations[1].data(), second.data());
+  EXPECT_EQ(groups[1].offset, 10 + first.size() + second.size() + 5);
+  EXPECT_EQ(groups[1].size, third.size());
+  ASSERT_EQ(groups[1].destinations.size(), 1);
+  EXPECT_EQ(groups[1].destinations[0].data(), third.data());
+}
+
+TEST(ExecutorPrefetchTest, nativeScatterStreamWritesExactDestinations) {
+  std::array<char, 2> first{};
+  std::array<char, 4> second{};
+  NativeS3ScatterWriteStream stream(
+      {{first.data(), first.size()}, {second.data(), second.size()}});
+
+  stream.write("abcdef", 6);
+
+  EXPECT_TRUE(stream.good());
+  EXPECT_EQ(stream.bytesWritten(), 6);
+  EXPECT_FALSE(stream.overflowed());
+  EXPECT_THAT(first, testing::ElementsAre('a', 'b'));
+  EXPECT_THAT(second, testing::ElementsAre('c', 'd', 'e', 'f'));
+}
+#endif
 
 TEST(ExecutorPrefetchTest, reservesBytesBeforeAllocation) {
   folly::CPUThreadPoolExecutor executor(1);
@@ -162,8 +765,7 @@ TEST(ExecutorPrefetchTest, reusesOneReadSourceAcrossRangesOfFile) {
   EXPECT_EQ(factoryCount.load(), 1);
   EXPECT_EQ(rangeCount.load(), 2);
   EXPECT_THAT(sourceIds, testing::ElementsAre(1, 1));
-  EXPECT_THAT(
-      offsets, testing::UnorderedElementsAre(0, kRangeBytes));
+  EXPECT_THAT(offsets, testing::UnorderedElementsAre(0, kRangeBytes));
   EXPECT_EQ(result->buffers.front()->data()[0], 1);
   EXPECT_EQ(result->buffers.front()->data()[kFileBytes - 1], 1);
 
@@ -207,8 +809,7 @@ TEST(ExecutorPrefetchTest, requestedSplitBypassesFullReadyWindow) {
       1);
 
   ASSERT_EQ(
-      firstReadCompleted.get_future().wait_for(5s),
-      std::future_status::ready);
+      firstReadCompleted.get_future().wait_for(5s), std::future_status::ready);
   // The first completed result still owns the entire ready window. It must
   // not also retain the broker's full I/O budget: a demand for the second
   // split has to make progress without first consuming the ready result.
@@ -287,6 +888,124 @@ TEST(ExecutorPrefetchTest, oversizedSpeculationWaitsForDemand) {
   ExecutorSplitPrefetch::eraseQuery(&executor, "query-oversized-demand");
   ExecutorReadBroker::erase(&executor);
   broker.reset();
+}
+
+TEST(ExecutorPrefetchTest, cacheHintDemandBypassesReadyByteWindow) {
+  folly::CPUThreadPoolExecutor executor(2);
+  std::promise<void> firstCompleted;
+  std::atomic<uint32_t> firstCount{0};
+  std::atomic<uint32_t> secondCount{0};
+
+  ExecutorSplitPrefetch::registerCacheHint(
+      &executor,
+      "query-cache-demand",
+      "first",
+      1,
+      [&] {
+        ++firstCount;
+        firstCompleted.set_value();
+      },
+      2,
+      1);
+  ExecutorSplitPrefetch::registerCacheHint(
+      &executor,
+      "query-cache-demand",
+      "second",
+      1,
+      [&] { ++secondCount; },
+      2,
+      1);
+
+  ASSERT_EQ(
+      firstCompleted.get_future().wait_for(5s), std::future_status::ready);
+  std::this_thread::sleep_for(50ms);
+  EXPECT_EQ(firstCount.load(), 1);
+  EXPECT_EQ(secondCount.load(), 0);
+
+  auto demanded = std::async(std::launch::async, [&] {
+    ExecutorSplitPrefetch::takeCacheHint(
+        &executor, "query-cache-demand", "second");
+  });
+  EXPECT_EQ(demanded.wait_for(5s), std::future_status::ready);
+  demanded.get();
+  EXPECT_EQ(secondCount.load(), 1);
+
+  ExecutorSplitPrefetch::takeCacheHint(
+      &executor, "query-cache-demand", "first");
+  ExecutorSplitPrefetch::eraseQuery(&executor, "query-cache-demand");
+}
+
+TEST(ExecutorPrefetchTest, cacheHintFailureFallsBackToDemand) {
+  folly::CPUThreadPoolExecutor executor(1);
+  ExecutorSplitPrefetch::registerCacheHint(
+      &executor,
+      "query-cache-fallback",
+      "broken",
+      1,
+      [] { throw std::runtime_error("expected cache hint failure"); },
+      1,
+      1);
+
+  EXPECT_NO_THROW(
+      ExecutorSplitPrefetch::takeCacheHint(
+          &executor, "query-cache-fallback", "broken"));
+  ExecutorSplitPrefetch::eraseQuery(&executor, "query-cache-fallback");
+}
+
+TEST(ExecutorPrefetchTest, cacheHintAccountsConsumedAndUnusedRanges) {
+  folly::CPUThreadPoolExecutor executor(1);
+  const auto before = ExecutorSplitPrefetch::cacheHintRangeStatsForTest();
+  const CacheHintRangeStats consumed{
+      .logicalRanges = 3,
+      .logicalBytes = 30,
+      .uniqueRanges = 2,
+      .uniqueBytes = 20,
+      .overlapBytes = 5,
+      .duplicateSuppressedRanges = 1,
+      .duplicateSuppressedBytes = 10};
+  const CacheHintRangeStats unused{
+      .logicalRanges = 2,
+      .logicalBytes = 25,
+      .uniqueRanges = 1,
+      .uniqueBytes = 15,
+      .duplicateSuppressedRanges = 1,
+      .duplicateSuppressedBytes = 10};
+
+  ExecutorSplitPrefetch::registerCacheHint(
+      &executor, "query-cache-range-stats", "consumed", consumed, [] {}, 1, 64);
+  ExecutorSplitPrefetch::registerCacheHint(
+      &executor, "query-cache-range-stats", "unused", unused, [] {}, 1, 64);
+  ExecutorSplitPrefetch::takeCacheHint(
+      &executor, "query-cache-range-stats", "consumed");
+  ExecutorSplitPrefetch::eraseQuery(&executor, "query-cache-range-stats");
+
+  const auto after = ExecutorSplitPrefetch::cacheHintRangeStatsForTest();
+  EXPECT_EQ(after.logicalRanges - before.logicalRanges, 5);
+  EXPECT_EQ(after.logicalBytes - before.logicalBytes, 55);
+  EXPECT_EQ(after.uniqueRanges - before.uniqueRanges, 3);
+  EXPECT_EQ(after.uniqueBytes - before.uniqueBytes, 35);
+  EXPECT_EQ(after.overlapBytes - before.overlapBytes, 5);
+  EXPECT_EQ(
+      after.duplicateSuppressedRanges - before.duplicateSuppressedRanges, 2);
+  EXPECT_EQ(
+      after.duplicateSuppressedBytes - before.duplicateSuppressedBytes, 20);
+  EXPECT_EQ(after.consumedRanges - before.consumedRanges, 2);
+  EXPECT_EQ(after.consumedBytes - before.consumedBytes, 20);
+  EXPECT_EQ(after.unusedRanges - before.unusedRanges, 1);
+  EXPECT_EQ(after.unusedBytes - before.unusedBytes, 15);
+}
+
+TEST(ExecutorPrefetchTest, cachePrefetchPlanStatsTrackReuseAndBound) {
+  const auto before = ExecutorSplitPrefetch::cachePrefetchPlanStatsForTest();
+  ExecutorSplitPrefetch::recordCachePrefetchPlanLookup(false);
+  ExecutorSplitPrefetch::recordCachePrefetchPlanLookup(true);
+  ExecutorSplitPrefetch::recordCachePrefetchPlanLookup(true);
+  ExecutorSplitPrefetch::recordCachePrefetchPlanEntries(37);
+
+  const auto after = ExecutorSplitPrefetch::cachePrefetchPlanStatsForTest();
+  EXPECT_EQ(after.hits - before.hits, 2);
+  EXPECT_EQ(after.misses - before.misses, 1);
+  EXPECT_EQ(after.entries, 37);
 }
 
 TEST(ExecutorPrefetchTest, stopsBeforeErasingQueryState) {

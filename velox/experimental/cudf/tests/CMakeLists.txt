@@ -260,7 +260,7 @@ velox_add_cudf_test(
 velox_add_cudf_test(
   NAME velox_cudf_executor_prefetch_test
   SOURCES Main.cpp ExecutorPrefetchTest.cpp
-  LIBS velox_cudf_hive_connector
+  LIBS velox_cudf_hive_connector velox_cudf_exec GTest::gmock
 )
 
 # Disabling writer tests until we re-add writing ability to CudfHiveConnector

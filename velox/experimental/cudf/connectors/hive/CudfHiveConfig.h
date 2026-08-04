@@ -96,8 +96,7 @@ class CudfHiveConfig {
   static constexpr const char* kUseExperimentalCudfReaderSession =
       "cudf.hive.use_experimental_reader";
 
-  static constexpr const char* kUseCrtS3Reader =
-      "cudf.hive.use-crt-s3-reader";
+  static constexpr const char* kUseCrtS3Reader = "cudf.hive.use-crt-s3-reader";
   static constexpr const char* kUseCrtS3ReaderSession =
       "cudf.hive.use_crt_s3_reader";
 

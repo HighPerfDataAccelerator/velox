@@ -853,6 +853,48 @@ TEST_P(AsyncDataCacheTest, contiguousPin) {
   }
 }
 
+TEST_P(AsyncDataCacheTest, forcedContiguousPinRegistersBacking) {
+  int32_t registrations = 0;
+  int32_t releases = 0;
+  void* registeredAddress = nullptr;
+  uint64_t registeredBytes = 0;
+  AsyncDataCache::Options options;
+  options.forceContiguousEntries = true;
+  options.registerBackingBytes = [&](void* address,
+                                     uint64_t bytes) -> std::shared_ptr<void> {
+    ++registrations;
+    registeredAddress = address;
+    registeredBytes = bytes;
+    return std::shared_ptr<void>(new int32_t(1), [&](void* value) {
+      ++releases;
+      delete static_cast<int32_t*>(value);
+    });
+  };
+  initializeCache(1 << 20, 0, 0, false, options);
+
+  StringIdLease file(fileIds(), "forced_contiguous_registration");
+  folly::SemiFuture<bool> wait(false);
+  constexpr uint64_t kSize = 25'000;
+  auto pin = cache_->findOrCreate(
+      RawFileCacheKey{file.id(), 0},
+      kSize,
+      /*contiguous=*/false,
+      &wait);
+  ASSERT_FALSE(pin.empty());
+  auto* entry = pin.checkedEntry();
+  ASSERT_TRUE(entry->hasContiguousData());
+  ASSERT_TRUE(entry->nonContiguousData().empty());
+  entry->setExclusiveToShared();
+  EXPECT_TRUE(entry->hasBackingRegistration());
+  EXPECT_EQ(registrations, 1);
+  EXPECT_EQ(registeredAddress, entry->contiguousData());
+  EXPECT_EQ(registeredBytes, kSize);
+
+  pin.clear();
+  cache_->clear();
+  EXPECT_EQ(releases, 1);
+}
+
 TEST_P(AsyncDataCacheTest, nonContiguousPin) {
   initializeCache(1 << 20);
 

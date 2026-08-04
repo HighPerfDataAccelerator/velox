@@ -16,10 +16,13 @@
 
 #pragma once
 
-#include "velox/common/file/File.h"
-#include "velox/dwio/common/BufferedInput.h"
+#include "velox/experimental/cudf/connectors/hive/ExecutorSplitPrefetch.h"
 #include "velox/experimental/cudf/connectors/hive/PinnedHostBuffer.h"
-#include "velox/experimental/cudf/exec/GpuResources.h"
+
+#include "velox/common/file/File.h"
+#include "velox/common/memory/Allocation.h"
+#include "velox/common/memory/MmapAllocator.h"
+#include "velox/dwio/common/BufferedInput.h"
 
 #include <cudf/ast/detail/expression_transformer.hpp>
 #include <cudf/ast/detail/operators.hpp>
@@ -40,11 +43,83 @@
 #endif
 
 #include <algorithm>
+#include <functional>
 #include <future>
+#include <iostream>
 #include <optional>
+#include <streambuf>
 #include <vector>
 
 namespace facebook::velox::cudf_velox::connector::hive {
+
+struct DirectCachePageH2dStats {
+  uint64_t copies{0};
+  uint64_t bytes{0};
+  uint64_t pinnedCopies{0};
+  uint64_t pinnedBytes{0};
+};
+
+DirectCachePageH2dStats directCachePageH2dStats();
+
+struct CachePageRegistrationStats {
+  uint64_t attempts{0};
+  uint64_t successes{0};
+  uint64_t failures{0};
+  uint64_t budgetRejectedBytes{0};
+  uint64_t registeredRuns{0};
+  uint64_t registeredBytes{0};
+  uint64_t currentBytes{0};
+  uint64_t peakBytes{0};
+  uint64_t unregisteredRuns{0};
+  uint64_t unregisteredBytes{0};
+  uint64_t prewarmAttempts{0};
+  uint64_t prewarmSuccesses{0};
+  uint64_t prewarmFailures{0};
+  uint64_t prewarmRuns{0};
+  uint64_t prewarmBytes{0};
+  uint64_t prewarmCoveredRuns{0};
+  uint64_t prewarmCoveredBytes{0};
+  uint64_t registrationWallNanos{0};
+  uint64_t prewarmWallNanos{0};
+};
+
+CachePageRegistrationStats cachePageRegistrationStats();
+
+struct CachePageHostRegistrationHooks {
+  std::function<bool(void*, size_t)> registerRun;
+  std::function<void(void*)> unregisterRun;
+};
+
+struct BoundedCachePageRegistration {
+  std::function<std::shared_ptr<void>(const memory::Allocation&)>
+      registerBackingRuns;
+  // Registers one page-aligned contiguous cache allocation. 'bytes' is the
+  // physical allocation size rather than the logical cache-entry length.
+  std::function<std::shared_ptr<void>(void*, uint64_t)> registerBackingRange;
+  // Permanently registers size-class backing on first use. The registration
+  // follows the physical allocator page instead of a cache-entry lifetime, so
+  // eviction and reuse do not churn cudaHostRegister/cudaHostUnregister.
+  std::function<std::shared_ptr<void>(memory::MmapAllocator&, void*, uint64_t)>
+      registerPersistentBackingRange;
+  // Releases persistent registrations and mapped-page protections. Destroy
+  // this after AsyncDataCache shutdown and before its MmapAllocator.
+  std::shared_ptr<void> persistentLifetime;
+  // Pre-registers largest-size-class backing and returns its RAII lifetime.
+  // The lifetime must be released before the allocator is destroyed.
+  std::function<std::shared_ptr<void>(memory::MmapAllocator&, uint64_t)>
+      prewarmLargestSizeClass;
+};
+
+BoundedCachePageRegistration makeBoundedCachePageRegistration(
+    uint64_t maxRegisteredBytes,
+    std::optional<CachePageHostRegistrationHooks> hooks = std::nullopt);
+
+struct BufferedInputDeviceCopyHooks {
+  std::function<void(uint8_t*, const void*, size_t, rmm::cuda_stream_view)>
+      copy;
+  std::function<void(std::shared_ptr<void>, rmm::cuda_stream_view)>
+      retainUntilComplete;
+};
 
 constexpr std::size_t kDefaultMultiFileChunkReadLimit = 256UL << 20;
 
@@ -64,7 +139,9 @@ inline std::size_t multiFileChunkReadLimit(
 class BufferedInputDataSource : public cudf::io::datasource {
  public:
   explicit BufferedInputDataSource(
-      std::shared_ptr<facebook::velox::dwio::common::BufferedInput> input);
+      std::shared_ptr<facebook::velox::dwio::common::BufferedInput> input,
+      std::optional<BufferedInputDeviceCopyHooks> deviceCopyHooks =
+          std::nullopt);
 
   [[nodiscard]] size_t size() const override;
 
@@ -94,11 +171,25 @@ class BufferedInputDataSource : public cudf::io::datasource {
   // loads and copies to device.
   void load(rmm::cuda_stream_view stream);
 
+  /// Populates AsyncDataCache for projected ranges without allocating device
+  /// memory. Returns false when this data source is not cache-backed.
+  bool prefetchToCache(
+      const std::vector<cudf::io::text::byte_range_info>& byteRanges);
+
+  uint64_t canonicalCacheBytes(
+      const std::vector<cudf::io::text::byte_range_info>& byteRanges) const;
+
+  CacheHintRangeStats canonicalCacheStats(
+      const std::vector<cudf::io::text::byte_range_info>& byteRanges) const;
+
+  std::optional<uint64_t> cacheFileNum() const;
+
  private:
   void readContiguous(size_t offset, size_t size, uint8_t* dst);
 
   std::shared_ptr<facebook::velox::dwio::common::BufferedInput> input_;
   const size_t fileSize_;
+  const BufferedInputDeviceCopyHooks deviceCopyHooks_;
   std::vector<std::function<void(rmm::cuda_stream_view stream)>>
       pendingDeviceLoads_;
 };
@@ -196,10 +287,8 @@ class CrtS3DataSource final : public cudf::io::datasource {
       size_t offset,
       size_t size) override;
 
-  std::future<size_t> host_read_async(
-      size_t offset,
-      size_t size,
-      uint8_t* dst) override;
+  std::future<size_t> host_read_async(size_t offset, size_t size, uint8_t* dst)
+      override;
 
   [[nodiscard]] bool supports_device_read() const override;
 
@@ -221,6 +310,76 @@ class CrtS3DataSource final : public cudf::io::datasource {
 };
 
 bool crtS3RangeReaderAvailable();
+
+/// Returns true when the executor-global native AWS SDK scheduler is selected
+/// for S3 reads.
+bool nativeS3ScheduledReadEnabled();
+
+struct NativeS3ReadGroup {
+  uint64_t offset{0};
+  uint64_t size{0};
+  std::vector<folly::Range<char*>> destinations;
+};
+
+/// Groups caller-owned destinations into the minimum number of contiguous
+/// file ranges. Null destinations represent logical gaps and split groups.
+std::vector<NativeS3ReadGroup> groupNativeS3ReadDestinations(
+    uint64_t offset,
+    const std::vector<folly::Range<char*>>& destinations);
+
+class NativeS3ScatterWriteStreamBuf : public std::streambuf {
+ public:
+  explicit NativeS3ScatterWriteStreamBuf(
+      std::vector<folly::Range<char*>> destinations);
+
+  uint64_t bytesWritten() const {
+    return bytesWritten_;
+  }
+
+  bool overflowed() const {
+    return overflowed_;
+  }
+
+ protected:
+  std::streamsize xsputn(const char* source, std::streamsize count) override;
+  int_type overflow(int_type value) override;
+
+ private:
+  size_t writeBytes(const char* source, size_t count);
+
+  std::vector<folly::Range<char*>> destinations_;
+  size_t destinationIndex_{0};
+  size_t destinationOffset_{0};
+  uint64_t bytesWritten_{0};
+  bool overflowed_{false};
+};
+
+/// AWS response stream that scatters a single Range GET body directly across
+/// caller-owned cache page destinations.
+class NativeS3ScatterWriteStream : private NativeS3ScatterWriteStreamBuf,
+                                   public std::iostream {
+ public:
+  explicit NativeS3ScatterWriteStream(
+      std::vector<folly::Range<char*>> destinations)
+      : NativeS3ScatterWriteStreamBuf(std::move(destinations)),
+        std::iostream(static_cast<NativeS3ScatterWriteStreamBuf*>(this)) {}
+
+  uint64_t bytesWritten() const {
+    return NativeS3ScatterWriteStreamBuf::bytesWritten();
+  }
+
+  bool overflowed() const {
+    return NativeS3ScatterWriteStreamBuf::overflowed();
+  }
+};
+
+/// Wraps an S3 ReadFile so caller-owned destinations, including
+/// AsyncDataCache pages, are filled directly by the executor-global native
+/// AWS SDK scheduler. The wrapper retains 'readFile' and preserves its file
+/// identity and metadata.
+std::shared_ptr<facebook::velox::ReadFile> makeNativeScheduledS3ReadFile(
+    std::shared_ptr<facebook::velox::ReadFile> readFile,
+    const std::string& filePath);
 #endif
 
 /// Projected remote ranges fetched into one final-layout host buffer. This is
@@ -245,7 +404,6 @@ struct HybridScanState {
 
   std::vector<rmm::device_buffer> columnChunkBuffers_;
   std::vector<cudf::device_span<const uint8_t>> columnChunkData_;
-  std::optional<DeviceMemoryAdmissionReservation> deviceMemoryAdmission_;
   std::shared_ptr<PreparedHostByteRanges> preparedHostByteRanges_;
   std::optional<std::vector<cudf::size_type>> rowGroupIndices_;
   std::optional<std::vector<cudf::io::text::byte_range_info>>
@@ -256,8 +414,7 @@ struct HybridScanState {
 using FetchedDeviceByteRanges = std::tuple<
     std::vector<rmm::device_buffer>,
     std::vector<cudf::device_span<const uint8_t>>,
-    std::future<void>,
-    std::optional<DeviceMemoryAdmissionReservation>>;
+    std::future<void>>;
 
 /// Fetch supported packed remote ranges into host memory only. Returns null
 /// for data sources that use the existing direct/device paths.

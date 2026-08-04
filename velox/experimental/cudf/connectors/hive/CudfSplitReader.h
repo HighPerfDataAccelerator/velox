@@ -139,6 +139,12 @@ class CudfSplitReader : public NvtxHelper {
   // preload, leaving device allocation, H2D, and reader setup to the driver.
   void prepareExperimentalHostRead();
 
+  // Registers metadata-only projected ranges as a best-effort AsyncDataCache
+  // hint for a future regular-reader split.
+  void setupCachePrefetchHint();
+
+  void waitForCachePrefetchHint();
+
   // Whether to use the experimental cuDF reader.
   bool useExperimentalCudfReader() const;
 
@@ -177,6 +183,8 @@ class CudfSplitReader : public NvtxHelper {
   CudfHybridScanReaderPtr exptSplitReader_;
   std::unique_ptr<HybridScanState> hybridScanState_;
   bool useExperimentalCudfReader_;
+  std::optional<std::string> cachePrefetchHintKey_;
+  bool cachePrefetchHintWaited_{false};
 
   dwio::common::ReaderOptions baseReaderOpts_;
   cudf::ast::expression const* subfieldFilterExpr_;

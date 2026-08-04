@@ -52,8 +52,7 @@ class SynchronizedCachingCredentialsProvider final
 
  private:
   static bool isUsable(const Aws::Auth::AWSCredentials& credentials) {
-    return !credentials.IsEmpty() &&
-        !credentials.ExpiresSoon(5 * 60 * 1000);
+    return !credentials.IsEmpty() && !credentials.ExpiresSoon(5 * 60 * 1000);
   }
 
   void refresh() {

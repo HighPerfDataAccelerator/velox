@@ -437,6 +437,108 @@ TEST_F(CachedBufferedInputTest, duplicateRegionsShareCoalescedSsdRead) {
   testDuplicateRegionsShareCoalescedRead(true);
 }
 
+TEST_F(CachedBufferedInputTest, physicalChunkPlanMatchesMergedDemand) {
+  constexpr uint64_t kQuantum = 1 << 20;
+  constexpr uint64_t kContentSize = 4 * kQuantum;
+  std::string content(kContentSize, '\0');
+  for (uint64_t i = 0; i < content.size(); ++i) {
+    content[i] = static_cast<char>(i % 251);
+  }
+  auto readFile = std::make_shared<tests::utils::CountingReadFile>(content);
+
+  io::ReaderOptions readerOptions(pool_.get());
+  readerOptions.setDataIoStats(dataIoStats_);
+  readerOptions.setMetadataIoStats(metadataIoStats_);
+  readerOptions.setLoadQuantum(kQuantum);
+
+  auto& ids = fileIds();
+  StringIdLease fileId(ids, "physicalChunkPlanMatchesDemand");
+  StringIdLease groupId(ids, "physicalChunkPlanMatchesDemandGroup");
+  const auto fileNum = fileId.id();
+
+  CachedBufferedInput input(
+      readFile,
+      MetricsLog::voidLog(),
+      std::move(fileId),
+      cache_.get(),
+      tracker_,
+      std::move(groupId),
+      dataIoStats_,
+      nullptr,
+      executor_.get(),
+      readerOptions);
+  EXPECT_EQ(input.cacheFileNum(), fileNum);
+
+  // Two adjacent physical chunks. Their cache identity is relative to each
+  // chunk even though libcudf reads them as one merged range.
+  const std::vector<common::Region> hintRegions{
+      {kQuantum / 2, kQuantum}, {3 * kQuantum / 2, kQuantum}};
+  const auto plan = input.makeCacheRegionPlan(hintRegions);
+  ASSERT_EQ(plan->cacheRegions().size(), 2);
+  EXPECT_EQ(plan->cacheRegions()[0].offset, kQuantum / 2);
+  EXPECT_EQ(plan->cacheRegions()[0].length, kQuantum);
+  EXPECT_EQ(plan->cacheRegions()[1].offset, 3 * kQuantum / 2);
+  EXPECT_EQ(plan->cacheRegions()[1].length, kQuantum);
+
+  const auto statsBefore = cache_->refreshStats();
+  input.prefetchSync(hintRegions);
+  const auto readsAfterHint = readFile->numReads();
+  EXPECT_GT(readsAfterHint, 0);
+
+  const auto statsAfterHint = cache_->refreshStats();
+  EXPECT_EQ(
+      statsAfterHint.numEntries - statsBefore.numEntries,
+      plan->cacheRegions().size());
+  EXPECT_EQ(
+      statsAfterHint.numNew - statsBefore.numNew, plan->cacheRegions().size());
+  EXPECT_TRUE(cache_->exists({fileNum, kQuantum / 2}));
+  EXPECT_TRUE(cache_->exists({fileNum, 3 * kQuantum / 2}));
+
+  // One regular libcudf range spans both physical chunks and must hit both
+  // prefetched keys without another storage read.
+  auto stream = input.read(kQuantum / 2, 2 * kQuantum, LogType::TEST);
+  std::string result(2 * kQuantum, '\0');
+  stream->readFully(result.data(), result.size());
+  EXPECT_EQ(
+      result, std::string_view(content).substr(kQuantum / 2, 2 * kQuantum));
+  EXPECT_EQ(readFile->numReads(), readsAfterHint);
+  EXPECT_EQ(cache_->refreshStats().numEntries, statsAfterHint.numEntries);
+
+  // A narrower projection beginning at the same physical chunk offset uses
+  // the same key and size (RawFileCacheKey intentionally has no length).
+  auto narrow = input.read(kQuantum / 2, kQuantum / 4, LogType::TEST);
+  std::string narrowResult(kQuantum / 4, '\0');
+  narrow->readFully(narrowResult.data(), narrowResult.size());
+  EXPECT_EQ(
+      narrowResult,
+      std::string_view(content).substr(kQuantum / 2, kQuantum / 4));
+  EXPECT_EQ(readFile->numReads(), readsAfterHint);
+
+  // Header/footer metadata outside the physical plan stays exact and is not
+  // expanded to a file-global load quantum.
+  auto metadata = input.read(0, 4, LogType::TEST);
+  std::string magic(4, '\0');
+  metadata->readFully(magic.data(), magic.size());
+  auto metadataPin = cache_->find({fileNum, 0});
+  ASSERT_TRUE(metadataPin.has_value());
+  ASSERT_FALSE(metadataPin->empty());
+  EXPECT_EQ(metadataPin->checkedEntry()->size(), 4);
+}
+
+TEST_F(CachedBufferedInputTest, invalidPhysicalChunkPlanFallsBack) {
+  constexpr uint64_t kQuantum = 1024;
+  auto plan = CacheRegionPlan::create({{100, 200}}, 4096, kQuantum);
+  const auto metadata = plan->regionForPosition({0, 4}, 0);
+  EXPECT_EQ(metadata.offset, 0);
+  EXPECT_EQ(metadata.length, 4);
+  const auto beforePlan = plan->regionForPosition({50, 300}, 50);
+  EXPECT_EQ(beforePlan.offset, 50);
+  EXPECT_EQ(beforePlan.length, 50);
+  VELOX_ASSERT_THROW(
+      CacheRegionPlan::create({{100, 200}, {250, 100}}, 4096, kQuantum),
+      "Overlapping cache plan regions");
+}
+
 TEST_F(CachedBufferedInputTest, readAfterReset) {
   constexpr int32_t kContentSize = 4 << 20; // 4MB
   std::string content;

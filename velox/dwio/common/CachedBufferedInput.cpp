@@ -21,11 +21,144 @@
 #include "velox/common/time/Timer.h"
 #include "velox/dwio/common/CacheInputStream.h"
 
+#include <folly/container/F14Set.h>
+
 DECLARE_int32(cache_prefetch_min_pct);
 
 using ::facebook::velox::common::Region;
 
 namespace facebook::velox::dwio::common {
+
+namespace {
+std::atomic<uint64_t> hintDemandFirstHitRanges{0};
+std::atomic<uint64_t> hintDemandFirstHitBytes{0};
+std::atomic<uint64_t> hintDemandMissRanges{0};
+std::atomic<uint64_t> hintDemandMissBytes{0};
+std::atomic<uint64_t> hintDemandRemoteDuplicateRanges{0};
+std::atomic<uint64_t> hintDemandRemoteDuplicateBytes{0};
+std::atomic<uint64_t> hintDemandSizeMismatchRanges{0};
+std::atomic<uint64_t> hintDemandSizeMismatchBytes{0};
+} // namespace
+
+CacheHintDemandStats cacheHintDemandStats() {
+  return {
+      hintDemandFirstHitRanges.load(std::memory_order_relaxed),
+      hintDemandFirstHitBytes.load(std::memory_order_relaxed),
+      hintDemandMissRanges.load(std::memory_order_relaxed),
+      hintDemandMissBytes.load(std::memory_order_relaxed),
+      hintDemandRemoteDuplicateRanges.load(std::memory_order_relaxed),
+      hintDemandRemoteDuplicateBytes.load(std::memory_order_relaxed),
+      hintDemandSizeMismatchRanges.load(std::memory_order_relaxed),
+      hintDemandSizeMismatchBytes.load(std::memory_order_relaxed)};
+}
+
+std::shared_ptr<CacheRegionPlan> CacheRegionPlan::create(
+    std::vector<velox::common::Region> regions,
+    uint64_t fileSize,
+    uint64_t loadQuantum) {
+  VELOX_CHECK_GT(loadQuantum, 0);
+  std::erase_if(regions, [](const auto& region) { return region.length == 0; });
+  VELOX_CHECK(!regions.empty(), "Cache region plan is empty");
+  std::sort(regions.begin(), regions.end(), [](const auto& a, const auto& b) {
+    return std::tie(a.offset, a.length) < std::tie(b.offset, b.length);
+  });
+  uint64_t previousEnd = 0;
+  bool first = true;
+  std::vector<velox::common::Region> keys;
+  for (const auto& region : regions) {
+    VELOX_CHECK_LE(region.offset, fileSize);
+    VELOX_CHECK_LE(region.length, fileSize - region.offset);
+    VELOX_CHECK(
+        first || region.offset >= previousEnd,
+        "Overlapping cache plan regions: previous end {}, next offset {}",
+        previousEnd,
+        region.offset);
+    first = false;
+    previousEnd = region.offset + region.length;
+    for (uint64_t offset = 0; offset < region.length; offset += loadQuantum) {
+      keys.push_back(
+          {region.offset + offset,
+           std::min<uint64_t>(loadQuantum, region.length - offset)});
+    }
+  }
+  return std::shared_ptr<CacheRegionPlan>(
+      new CacheRegionPlan(std::move(regions), std::move(keys), loadQuantum));
+}
+
+velox::common::Region CacheRegionPlan::regionForPosition(
+    const velox::common::Region& demandRegion,
+    uint64_t absolutePosition) const {
+  VELOX_CHECK_GE(absolutePosition, demandRegion.offset);
+  VELOX_CHECK_LT(absolutePosition, demandRegion.offset + demandRegion.length);
+  const auto it = std::upper_bound(
+      regions_.begin(),
+      regions_.end(),
+      absolutePosition,
+      [](uint64_t position, const auto& region) {
+        return position < region.offset;
+      });
+  if (it != regions_.begin()) {
+    const auto& planned = *std::prev(it);
+    const auto plannedEnd = planned.offset + planned.length;
+    if (absolutePosition < plannedEnd) {
+      const auto offset = planned.offset +
+          ((absolutePosition - planned.offset) / loadQuantum_) * loadQuantum_;
+      return {offset, std::min<uint64_t>(loadQuantum_, plannedEnd - offset)};
+    }
+  }
+  // Metadata and any unplanned demand stay exact. Do not expand these reads to
+  // a file-global quantum. Stop at the next planned boundary so a merged
+  // regular read can switch to stable planned keys when it reaches one.
+  auto end = demandRegion.offset + demandRegion.length;
+  if (it != regions_.end()) {
+    end = std::min(end, it->offset);
+  }
+  return {absolutePosition, end - absolutePosition};
+}
+
+bool CacheRegionPlan::isPlannedKey(const velox::common::Region& region) const {
+  const auto it = std::lower_bound(
+      cacheRegions_.begin(),
+      cacheRegions_.end(),
+      region.offset,
+      [](const auto& candidate, uint64_t offset) {
+        return candidate.offset < offset;
+      });
+  return it != cacheRegions_.end() && it->offset == region.offset &&
+      it->length == region.length;
+}
+
+void CacheRegionPlan::recordDemand(
+    const velox::common::Region& region,
+    bool cacheHit,
+    bool sizeMismatch) const {
+  if (!isPlannedKey(region)) {
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> lock(demandMutex_);
+    if (!observedDemandKeys_.insert(region.offset).second) {
+      return;
+    }
+  }
+  if (sizeMismatch) {
+    hintDemandSizeMismatchRanges.fetch_add(1, std::memory_order_relaxed);
+    hintDemandSizeMismatchBytes.fetch_add(
+        region.length, std::memory_order_relaxed);
+  }
+  if (cacheHit && !sizeMismatch) {
+    hintDemandFirstHitRanges.fetch_add(1, std::memory_order_relaxed);
+    hintDemandFirstHitBytes.fetch_add(region.length, std::memory_order_relaxed);
+    return;
+  }
+  hintDemandMissRanges.fetch_add(1, std::memory_order_relaxed);
+  hintDemandMissBytes.fetch_add(region.length, std::memory_order_relaxed);
+  if (prefetchComplete_.load(std::memory_order_acquire)) {
+    hintDemandRemoteDuplicateRanges.fetch_add(1, std::memory_order_relaxed);
+    hintDemandRemoteDuplicateBytes.fetch_add(
+        region.length, std::memory_order_relaxed);
+  }
+}
 
 using cache::CachePin;
 using cache::CoalescedLoad;
@@ -62,7 +195,8 @@ std::unique_ptr<SeekableInputStream> CachedBufferedInput::enqueue(
       tracker_,
       id,
       groupId_.id(),
-      options_.loadQuantum());
+      options_.loadQuantum(),
+      *cacheRegionPlan_.rlock());
   if (preloaded()) {
     // Data is already in cache. Give the stream its own pin copy so it can
     // outlive this CachedBufferedInput and skip all loading/prefetch logic.
@@ -294,7 +428,10 @@ std::vector<int32_t> CachedBufferedInput::groupRequests(
   if (requests.empty() || (requests.size() < 2 && !prefetch)) {
     return {};
   }
-  const int32_t maxDistance = kSsd ? 20'000 : options_.maxCoalesceDistance();
+  const int32_t maxDistance = kSsd
+      ? 20'000
+      : (*cacheRegionPlan_.rlock() != nullptr ? 0
+                                              : options_.maxCoalesceDistance());
 
   // Combine adjacent short reads.
   int64_t coalescedBytes = 0;
@@ -648,7 +785,8 @@ std::unique_ptr<SeekableInputStream> CachedBufferedInput::read(
       nullptr,
       TrackingId(),
       0,
-      options_.loadQuantum());
+      options_.loadQuantum(),
+      *cacheRegionPlan_.rlock());
   if (preloaded()) {
     stream->setPreloadedPin(preloadPin_);
   }
@@ -666,6 +804,93 @@ bool CachedBufferedInput::prefetch(Region region) {
   // cache entry will be accessed.
   coalescedLoad(stream.get());
   return true;
+}
+
+void CachedBufferedInput::prefetchSync(const std::vector<Region>& regions) {
+  auto plan = makeCacheRegionPlan(regions);
+  {
+    auto locked = cacheRegionPlan_.wlock();
+    if (*locked) {
+      const auto& existing = (*locked)->cacheRegions();
+      const auto& replacement = plan->cacheRegions();
+      VELOX_CHECK_EQ(
+          existing.size(),
+          replacement.size(),
+          "Cached input received incompatible cache region plans");
+      for (size_t i = 0; i < existing.size(); ++i) {
+        VELOX_CHECK(
+            existing[i].offset == replacement[i].offset &&
+                existing[i].length == replacement[i].length,
+            "Cached input received incompatible cache region plans");
+      }
+    }
+    *locked = plan;
+  }
+  const auto& canonical = plan->cacheRegions();
+  std::vector<std::unique_ptr<SeekableInputStream>> streams;
+  streams.reserve(canonical.size());
+  for (const auto& region : canonical) {
+    if (region.length == 0) {
+      continue;
+    }
+    streams.push_back(enqueue(region, nullptr));
+  }
+  if (streams.empty()) {
+    return;
+  }
+
+  load(LogType::FILE);
+  std::vector<std::shared_ptr<cache::CoalescedLoad>> loads;
+  loads.reserve(streams.size());
+  folly::F14FastSet<cache::CoalescedLoad*> seen;
+  for (const auto& stream : streams) {
+    auto pending = coalescedLoad(stream.get());
+    if (pending && seen.insert(pending.get()).second) {
+      loads.push_back(std::move(pending));
+    }
+  }
+  for (const auto& pending : loads) {
+    folly::SemiFuture<bool> waitFuture(false);
+    if (!pending->loadOrFuture(&waitFuture, options_.cacheable())) {
+      std::move(waitFuture).wait();
+    }
+  }
+  plan->markPrefetchComplete();
+}
+
+std::shared_ptr<CacheRegionPlan> CachedBufferedInput::makeCacheRegionPlan(
+    const std::vector<Region>& regions) const {
+  return CacheRegionPlan::create(regions, fileSize_, options_.loadQuantum());
+}
+
+std::vector<Region> CachedBufferedInput::canonicalizeRegions(
+    const std::vector<Region>& regions) const {
+  const uint64_t quantum = options_.loadQuantum();
+  VELOX_CHECK_GT(quantum, 0);
+  std::vector<uint64_t> offsets;
+  for (const auto& region : regions) {
+    VELOX_CHECK_LE(region.offset, fileSize_);
+    VELOX_CHECK_LE(region.length, fileSize_ - region.offset);
+    if (region.length == 0) {
+      continue;
+    }
+    auto offset = (region.offset / quantum) * quantum;
+    const auto end = region.offset + region.length;
+    while (offset < end) {
+      offsets.push_back(offset);
+      offset += quantum;
+    }
+  }
+  std::sort(offsets.begin(), offsets.end());
+  offsets.erase(std::unique(offsets.begin(), offsets.end()), offsets.end());
+
+  std::vector<Region> canonical;
+  canonical.reserve(offsets.size());
+  for (const auto offset : offsets) {
+    canonical.push_back(
+        {offset, std::min<uint64_t>(quantum, fileSize_ - offset)});
+  }
+  return canonical;
 }
 
 void CachedBufferedInput::cacheRegion(

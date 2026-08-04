@@ -19,6 +19,7 @@
 
 #include "velox/common/Casts.h"
 #include "velox/dwio/common/BufferedInput.h"
+#include "velox/dwio/common/CachedBufferedInput.h"
 
 #include <cudf/detail/utilities/integer_utils.hpp>
 #include <cudf/io/datasource.hpp>
@@ -29,9 +30,8 @@
 #include <cuda/iterator>
 #include <cuda/std/tuple>
 
-#include <folly/futures/Future.h>
-
 #include <curl/curl.h>
+#include <folly/futures/Future.h>
 
 #ifdef VELOX_ENABLE_S3
 #include "velox/connectors/hive/storage_adapters/s3fs/S3Util.h"
@@ -46,8 +46,8 @@
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
-#include <cstring>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <future>
 #include <iterator>
@@ -71,6 +71,508 @@ extern "C" uint64_t glutenCrtS3ReadRanges(
     size_t count);
 
 namespace {
+
+using facebook::velox::cudf_velox::connector::hive::
+    BufferedInputDeviceCopyHooks;
+using facebook::velox::cudf_velox::connector::hive::
+    CachePageHostRegistrationHooks;
+using BufferedInputStream = facebook::velox::dwio::common::SeekableInputStream;
+
+struct DirectCachePageH2dLifetime {
+  std::shared_ptr<BufferedInputStream> inputStream;
+  std::vector<facebook::velox::cache::CachePin> cachePins;
+};
+
+std::atomic<uint64_t> directCachePageH2dCopies{0};
+std::atomic<uint64_t> directCachePageH2dBytes{0};
+std::atomic<uint64_t> directCachePageH2dPinnedCopies{0};
+std::atomic<uint64_t> directCachePageH2dPinnedBytes{0};
+std::atomic<uint64_t> cachePageRegistrationAttempts{0};
+std::atomic<uint64_t> cachePageRegistrationSuccesses{0};
+std::atomic<uint64_t> cachePageRegistrationFailures{0};
+std::atomic<uint64_t> cachePageRegistrationBudgetRejectedBytes{0};
+std::atomic<uint64_t> cachePageRegisteredRuns{0};
+std::atomic<uint64_t> cachePageRegisteredBytes{0};
+std::atomic<uint64_t> cachePageCurrentRegisteredBytes{0};
+std::atomic<uint64_t> cachePagePeakRegisteredBytes{0};
+std::atomic<uint64_t> cachePageUnregisteredRuns{0};
+std::atomic<uint64_t> cachePageUnregisteredBytes{0};
+std::atomic<uint64_t> cachePagePrewarmAttempts{0};
+std::atomic<uint64_t> cachePagePrewarmSuccesses{0};
+std::atomic<uint64_t> cachePagePrewarmFailures{0};
+std::atomic<uint64_t> cachePagePrewarmRuns{0};
+std::atomic<uint64_t> cachePagePrewarmBytes{0};
+std::atomic<uint64_t> cachePagePrewarmCoveredRuns{0};
+std::atomic<uint64_t> cachePagePrewarmCoveredBytes{0};
+std::atomic<uint64_t> cachePageRegistrationWallNanos{0};
+std::atomic<uint64_t> cachePagePrewarmWallNanos{0};
+
+class AtomicWallTimer {
+ public:
+  explicit AtomicWallTimer(std::atomic<uint64_t>& counter)
+      : counter_(counter), start_(std::chrono::steady_clock::now()) {}
+
+  ~AtomicWallTimer() {
+    counter_.fetch_add(
+        static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - start_)
+                .count()),
+        std::memory_order_relaxed);
+  }
+
+ private:
+  std::atomic<uint64_t>& counter_;
+  const std::chrono::steady_clock::time_point start_;
+};
+
+class BoundedCachePageRegistrationState
+    : public std::enable_shared_from_this<BoundedCachePageRegistrationState> {
+ public:
+  struct Run {
+    void* address;
+    size_t bytes;
+    bool prewarmed;
+  };
+
+  struct PrewarmLifetime {
+    std::vector<Run> runs;
+    std::shared_ptr<void> mappedPageProtection;
+  };
+
+  BoundedCachePageRegistrationState(
+      uint64_t maxBytes,
+      CachePageHostRegistrationHooks hooks)
+      : maxBytes_(maxBytes), hooks_(std::move(hooks)) {}
+
+  std::shared_ptr<void> registerAllocation(
+      const facebook::velox::memory::Allocation& allocation) {
+    AtomicWallTimer timer(cachePageRegistrationWallNanos);
+    cachePageRegistrationAttempts.fetch_add(1, std::memory_order_relaxed);
+    if (allocation.empty()) {
+      return nullptr;
+    }
+
+    std::vector<Run> candidates;
+    candidates.reserve(allocation.numRuns());
+    for (int32_t i = 0; i < allocation.numRuns(); ++i) {
+      const auto run = allocation.runAt(i);
+      candidates.push_back(Run{run.data<void>(), run.numBytes(), false});
+    }
+    return registerRuns(candidates);
+  }
+
+  std::shared_ptr<void> registerRange(void* address, uint64_t bytes) {
+    AtomicWallTimer timer(cachePageRegistrationWallNanos);
+    cachePageRegistrationAttempts.fetch_add(1, std::memory_order_relaxed);
+    if (address == nullptr || bytes == 0) {
+      return nullptr;
+    }
+    return registerRuns({Run{address, bytes, false}});
+  }
+
+  std::shared_ptr<void> registerPersistentRange(
+      facebook::velox::memory::MmapAllocator& allocator,
+      void* address,
+      uint64_t bytes) {
+    AtomicWallTimer timer(cachePageRegistrationWallNanos);
+    cachePageRegistrationAttempts.fetch_add(1, std::memory_order_relaxed);
+    if (address == nullptr || bytes == 0) {
+      return nullptr;
+    }
+    const auto pages =
+        facebook::velox::memory::AllocationTraits::numPages(bytes);
+    // Contiguous allocations above the largest size class are individually
+    // mmapped and disappear on free. Only retain registration for reusable
+    // size-class backing.
+    if (pages > allocator.largestSizeClass()) {
+      return nullptr;
+    }
+    const Run run{address, bytes, true};
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (isCoveredLocked(run)) {
+      cachePagePrewarmCoveredRuns.fetch_add(1, std::memory_order_relaxed);
+      cachePagePrewarmCoveredBytes.fetch_add(bytes, std::memory_order_relaxed);
+      return std::shared_ptr<void>(shared_from_this(), address);
+    }
+    if (overlapsLocked(run)) {
+      cachePageRegistrationFailures.fetch_add(1, std::memory_order_relaxed);
+      return nullptr;
+    }
+    if (!reserve(bytes)) {
+      cachePageRegistrationBudgetRejectedBytes.fetch_add(
+          bytes, std::memory_order_relaxed);
+      return nullptr;
+    }
+    bool registered = false;
+    std::shared_ptr<void> protection;
+    try {
+      registered = hooks_.registerRun(address, bytes);
+      if (registered) {
+        protection = allocator.protectMappedRange(address, pages);
+      }
+    } catch (...) {
+      registered = false;
+    }
+    if (!registered || !protection) {
+      if (registered) {
+        try {
+          hooks_.unregisterRun(address);
+        } catch (...) {
+        }
+      }
+      releaseReservation(bytes);
+      cachePageRegistrationFailures.fetch_add(1, std::memory_order_relaxed);
+      return nullptr;
+    }
+    registry_.emplace(reinterpret_cast<uintptr_t>(address), run);
+    persistentRuns_.push_back(run);
+    persistentProtections_.push_back(std::move(protection));
+    cachePageRegistrationSuccesses.fetch_add(1, std::memory_order_relaxed);
+    cachePageRegisteredRuns.fetch_add(1, std::memory_order_relaxed);
+    cachePageRegisteredBytes.fetch_add(bytes, std::memory_order_relaxed);
+    return std::shared_ptr<void>(shared_from_this(), address);
+  }
+
+  void releasePersistent() noexcept {
+    std::vector<Run> runs;
+    std::vector<std::shared_ptr<void>> protections;
+    uint64_t bytes = 0;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      runs.swap(persistentRuns_);
+      protections.swap(persistentProtections_);
+      for (const auto& run : runs) {
+        bytes += run.bytes;
+      }
+      unregisterLocked(runs);
+    }
+    // CUDA registration must be removed before mapped pages may be advised.
+    protections.clear();
+    if (bytes != 0) {
+      cachePageUnregisteredRuns.fetch_add(
+          runs.size(), std::memory_order_relaxed);
+      cachePageUnregisteredBytes.fetch_add(bytes, std::memory_order_relaxed);
+      releaseReservation(bytes);
+    }
+  }
+
+  std::shared_ptr<void> prewarmLargestSizeClass(
+      facebook::velox::memory::MmapAllocator& allocator,
+      uint64_t requestedBytes) {
+    AtomicWallTimer timer(cachePagePrewarmWallNanos);
+    cachePagePrewarmAttempts.fetch_add(1, std::memory_order_relaxed);
+    const auto classPages = allocator.largestSizeClass();
+    const auto requestedPages =
+        facebook::velox::memory::AllocationTraits::numPages(requestedBytes);
+    const auto pages = (requestedPages / classPages) * classPages;
+    const uint64_t bytes =
+        facebook::velox::memory::AllocationTraits::pageBytes(pages);
+    if (pages == 0 || bytes > maxBytes_ || !reserve(bytes)) {
+      cachePagePrewarmFailures.fetch_add(1, std::memory_order_relaxed);
+      return nullptr;
+    }
+
+    facebook::velox::memory::Allocation allocation;
+    if (!allocator.allocateNonContiguous(
+            pages, allocation, nullptr, classPages)) {
+      releaseReservation(bytes);
+      cachePagePrewarmFailures.fetch_add(1, std::memory_order_relaxed);
+      return nullptr;
+    }
+    std::vector<Run> runs;
+    runs.reserve(allocation.numRuns());
+    for (int32_t i = 0; i < allocation.numRuns(); ++i) {
+      const auto run = allocation.runAt(i);
+      runs.push_back(Run{run.data<void>(), run.numBytes(), true});
+    }
+
+    bool registered = true;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      for (const auto& run : runs) {
+        if (overlapsLocked(run)) {
+          registered = false;
+          break;
+        }
+        try {
+          if (!hooks_.registerRun(run.address, run.bytes)) {
+            registered = false;
+            break;
+          }
+        } catch (...) {
+          registered = false;
+          break;
+        }
+        registry_.emplace(reinterpret_cast<uintptr_t>(run.address), run);
+      }
+      if (!registered) {
+        unregisterLocked(runs);
+      }
+    }
+    if (!registered) {
+      allocator.freeNonContiguous(allocation);
+      releaseReservation(bytes);
+      cachePagePrewarmFailures.fetch_add(1, std::memory_order_relaxed);
+      return nullptr;
+    }
+
+    std::shared_ptr<void> mappedPageProtection;
+    try {
+      mappedPageProtection = allocator.protectMappedPages(allocation);
+    } catch (...) {
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        unregisterLocked(runs);
+      }
+      allocator.freeNonContiguous(allocation);
+      releaseReservation(bytes);
+      cachePagePrewarmFailures.fetch_add(1, std::memory_order_relaxed);
+      return nullptr;
+    }
+    allocator.freeNonContiguous(allocation);
+
+    cachePageRegistrationSuccesses.fetch_add(1, std::memory_order_relaxed);
+    cachePageRegisteredRuns.fetch_add(runs.size(), std::memory_order_relaxed);
+    cachePageRegisteredBytes.fetch_add(bytes, std::memory_order_relaxed);
+    cachePagePrewarmSuccesses.fetch_add(1, std::memory_order_relaxed);
+    cachePagePrewarmRuns.fetch_add(runs.size(), std::memory_order_relaxed);
+    cachePagePrewarmBytes.fetch_add(bytes, std::memory_order_relaxed);
+    auto self = shared_from_this();
+    return std::shared_ptr<void>(
+        new PrewarmLifetime{std::move(runs), std::move(mappedPageProtection)},
+        [self, bytes](void* opaque) noexcept {
+          std::unique_ptr<PrewarmLifetime> owned(
+              static_cast<PrewarmLifetime*>(opaque));
+          // Keep allocator backing protected until CUDA registration is gone.
+          self->release(owned->runs, bytes);
+          owned->mappedPageProtection.reset();
+        });
+  }
+
+ private:
+  std::shared_ptr<void> registerRuns(const std::vector<Run>& candidates) {
+    std::vector<Run> uncovered;
+    uint64_t uncoveredBytes = 0;
+    uint64_t coveredBytes = 0;
+    uint64_t coveredRuns = 0;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      for (const auto& candidate : candidates) {
+        if (isCoveredLocked(candidate)) {
+          ++coveredRuns;
+          coveredBytes += candidate.bytes;
+        } else if (overlapsLocked(candidate)) {
+          cachePageRegistrationFailures.fetch_add(1, std::memory_order_relaxed);
+          return nullptr;
+        } else {
+          uncoveredBytes += candidate.bytes;
+          uncovered.push_back(candidate);
+        }
+      }
+    }
+    cachePagePrewarmCoveredRuns.fetch_add(
+        coveredRuns, std::memory_order_relaxed);
+    cachePagePrewarmCoveredBytes.fetch_add(
+        coveredBytes, std::memory_order_relaxed);
+
+    if (!reserve(uncoveredBytes)) {
+      cachePageRegistrationBudgetRejectedBytes.fetch_add(
+          uncoveredBytes, std::memory_order_relaxed);
+      return nullptr;
+    }
+
+    std::vector<Run> registered;
+    registered.reserve(uncovered.size());
+    bool success = true;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      for (const auto& candidate : uncovered) {
+        if (overlapsLocked(candidate)) {
+          success = false;
+          break;
+        }
+        try {
+          if (!hooks_.registerRun(candidate.address, candidate.bytes)) {
+            success = false;
+            break;
+          }
+        } catch (...) {
+          success = false;
+          break;
+        }
+        registry_.emplace(
+            reinterpret_cast<uintptr_t>(candidate.address), candidate);
+        registered.push_back(candidate);
+      }
+      if (!success) {
+        unregisterLocked(registered);
+      }
+    }
+    if (!success) {
+      cachePageRegistrationFailures.fetch_add(1, std::memory_order_relaxed);
+      releaseReservation(uncoveredBytes);
+      return nullptr;
+    }
+
+    cachePageRegistrationSuccesses.fetch_add(1, std::memory_order_relaxed);
+    cachePageRegisteredRuns.fetch_add(
+        registered.size(), std::memory_order_relaxed);
+    cachePageRegisteredBytes.fetch_add(
+        uncoveredBytes, std::memory_order_relaxed);
+    auto self = shared_from_this();
+    return std::shared_ptr<void>(
+        new std::vector<Run>(std::move(registered)),
+        [self, uncoveredBytes](void* opaque) {
+          std::unique_ptr<std::vector<Run>> runs(
+              static_cast<std::vector<Run>*>(opaque));
+          self->release(*runs, uncoveredBytes);
+        });
+  }
+
+  bool isCoveredLocked(const Run& run) const {
+    const auto begin = reinterpret_cast<uintptr_t>(run.address);
+    const auto end = begin + run.bytes;
+    auto it = registry_.upper_bound(begin);
+    if (it == registry_.begin()) {
+      return false;
+    }
+    --it;
+    if (!it->second.prewarmed || it->first > begin ||
+        it->first + it->second.bytes <= begin) {
+      return false;
+    }
+    auto coveredEnd = it->first + it->second.bytes;
+    while (coveredEnd < end) {
+      ++it;
+      if (it == registry_.end() || !it->second.prewarmed ||
+          it->first != coveredEnd) {
+        return false;
+      }
+      coveredEnd = it->first + it->second.bytes;
+    }
+    return true;
+  }
+
+  bool overlapsLocked(const Run& run) const {
+    const auto begin = reinterpret_cast<uintptr_t>(run.address);
+    const auto end = begin + run.bytes;
+    auto it = registry_.lower_bound(begin);
+    if (it != registry_.end() && it->first < end) {
+      return true;
+    }
+    if (it != registry_.begin()) {
+      --it;
+      return it->first + it->second.bytes > begin;
+    }
+    return false;
+  }
+
+  bool reserve(uint64_t bytes) {
+    if (bytes == 0) {
+      return true;
+    }
+    auto current =
+        cachePageCurrentRegisteredBytes.load(std::memory_order_relaxed);
+    while (bytes <= maxBytes_ && current <= maxBytes_ - bytes) {
+      if (cachePageCurrentRegisteredBytes.compare_exchange_weak(
+              current,
+              current + bytes,
+              std::memory_order_acq_rel,
+              std::memory_order_relaxed)) {
+        auto peak =
+            cachePagePeakRegisteredBytes.load(std::memory_order_relaxed);
+        while (peak < current + bytes &&
+               !cachePagePeakRegisteredBytes.compare_exchange_weak(
+                   peak,
+                   current + bytes,
+                   std::memory_order_relaxed,
+                   std::memory_order_relaxed)) {
+        }
+        return true;
+      }
+    }
+    return false;
+  }
+
+  void releaseReservation(uint64_t bytes) {
+    if (bytes == 0) {
+      return;
+    }
+    const auto previous = cachePageCurrentRegisteredBytes.fetch_sub(
+        bytes, std::memory_order_acq_rel);
+    VELOX_CHECK_GE(previous, bytes);
+  }
+
+  void unregisterLocked(const std::vector<Run>& runs) noexcept {
+    for (auto iter = runs.rbegin(); iter != runs.rend(); ++iter) {
+      const auto key = reinterpret_cast<uintptr_t>(iter->address);
+      const auto found = registry_.find(key);
+      if (found != registry_.end()) {
+        // A failed prewarm may pass the complete requested run vector after a
+        // prefix was registered. Only unregister that prefix.
+        try {
+          hooks_.unregisterRun(iter->address);
+        } catch (...) {
+          // A lifetime deleter must not throw. Registry removal still makes a
+          // duplicate unregister impossible within this manager.
+        }
+        registry_.erase(found);
+      }
+    }
+  }
+
+  void release(const std::vector<Run>& runs, uint64_t bytes) noexcept {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      unregisterLocked(runs);
+    }
+    cachePageUnregisteredRuns.fetch_add(runs.size(), std::memory_order_relaxed);
+    cachePageUnregisteredBytes.fetch_add(bytes, std::memory_order_relaxed);
+    releaseReservation(bytes);
+  }
+
+  const uint64_t maxBytes_;
+  CachePageHostRegistrationHooks hooks_;
+  std::mutex mutex_;
+  std::map<uintptr_t, Run> registry_;
+  std::vector<Run> persistentRuns_;
+  std::vector<std::shared_ptr<void>> persistentProtections_;
+};
+
+BufferedInputDeviceCopyHooks defaultBufferedInputDeviceCopyHooks() {
+  return {
+      .copy =
+          [](uint8_t* destination,
+             const void* source,
+             size_t bytes,
+             rmm::cuda_stream_view stream) {
+            CUDF_CUDA_TRY(cudaMemcpyAsync(
+                destination,
+                source,
+                bytes,
+                cudaMemcpyHostToDevice,
+                stream.value()));
+          },
+      .retainUntilComplete =
+          [](std::shared_ptr<void> lifetime, rmm::cuda_stream_view stream) {
+            using Completion = std::shared_ptr<void>;
+            auto completion = std::make_unique<Completion>(std::move(lifetime));
+            const auto status = cudaLaunchHostFunc(
+                stream.value(),
+                [](void* opaque) { delete static_cast<Completion*>(opaque); },
+                completion.get());
+            if (status != cudaSuccess) {
+              // Some copies might already be queued. Keep their source pages
+              // pinned until the stream is quiescent before propagating the
+              // callback submission failure. The callback itself intentionally
+              // invokes no CUDA API.
+              CUDF_CUDA_TRY(cudaStreamSynchronize(stream.value()));
+              CUDF_CUDA_TRY(status);
+            }
+            completion.release();
+          }};
+}
 
 #ifdef VELOX_ENABLE_S3
 kvikio::RemoteHandle makeKvikioS3Handle(
@@ -124,6 +626,19 @@ std::size_t envBytesOrZero(const char* name) {
   return static_cast<std::size_t>(parsed);
 }
 
+bool envFlagEnabled(const char* name) {
+  const auto* value = std::getenv(name);
+  return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+}
+
+void updateAtomicMax(std::atomic<uint64_t>& maximum, uint64_t value) {
+  auto current = maximum.load(std::memory_order_relaxed);
+  while (value > current &&
+         !maximum.compare_exchange_weak(
+             current, value, std::memory_order_relaxed)) {
+  }
+}
+
 class NativeS3H2dGate {
  public:
   static NativeS3H2dGate& instance() {
@@ -157,8 +672,7 @@ class NativeS3H2dGate {
   }
 
  private:
-  NativeS3H2dGate()
-      : capacity_(envBytesOrZero("GLUTEN_CPP_S3_H2D_SLOTS")) {}
+  NativeS3H2dGate() : capacity_(envBytesOrZero("GLUTEN_CPP_S3_H2D_SLOTS")) {}
 
   const size_t capacity_;
   size_t active_{0};
@@ -210,11 +724,8 @@ class NativeS3MultiScheduler {
     return scheduler;
   }
 
-  std::future<size_t> submit(
-      const Auth& auth,
-      size_t offset,
-      size_t size,
-      uint8_t* destination) {
+  std::future<size_t>
+  submit(const Auth& auth, size_t offset, size_t size, uint8_t* destination) {
     auto request = std::make_shared<Request>();
     request->auth = auth;
     request->offset = offset;
@@ -222,8 +733,9 @@ class NativeS3MultiScheduler {
     request->destination = destination;
     auto future = request->promise.get_future();
 
-    auto& shard = *shards_[
-        nextShard_.fetch_add(1, std::memory_order_relaxed) % shards_.size()];
+    auto& shard = *shards_
+                      [nextShard_.fetch_add(1, std::memory_order_relaxed) %
+                       shards_.size()];
     {
       std::lock_guard<std::mutex> lock(shard.mutex);
       if (size <= metadataPriorityBytes_) {
@@ -292,8 +804,7 @@ class NativeS3MultiScheduler {
     if (request->written + bytes > request->size) {
       return CURL_WRITEFUNC_ERROR;
     }
-    std::memcpy(
-        request->destination + request->written, data, bytes);
+    std::memcpy(request->destination + request->written, data, bytes);
     request->written += bytes;
     return bytes;
   }
@@ -314,11 +825,9 @@ class NativeS3MultiScheduler {
             envOrDefault("GLUTEN_CPP_S3_RETRY_BASE_DELAY_MS", 50)),
         retryMaxDelayMs_(
             envOrDefault("GLUTEN_CPP_S3_RETRY_MAX_DELAY_MS", 1'000)),
-        diagnostics_(
-            envBytesOrZero("GLUTEN_CPP_S3_DIAGNOSTICS") != 0),
+        diagnostics_(envBytesOrZero("GLUTEN_CPP_S3_DIAGNOSTICS") != 0),
         started_(std::chrono::steady_clock::now()) {
-    const auto shardCount =
-        envOrDefault("GLUTEN_CPP_S3_SHARDS", 8);
+    const auto shardCount = envOrDefault("GLUTEN_CPP_S3_SHARDS", 8);
     VELOX_CHECK_GT(shardCount, 0);
     VELOX_CHECK_GT(concurrencyPerShard_, 0);
     VELOX_CHECK_GT(rangeBytes_, 0);
@@ -368,28 +877,20 @@ class NativeS3MultiScheduler {
     request->range = std::to_string(request->offset) + "-" +
         std::to_string(request->offset + request->size - 1);
     if (!request->auth.sessionToken.empty()) {
-      const auto header =
-          "x-amz-security-token: " + request->auth.sessionToken;
-      request->headers =
-          curl_slist_append(request->headers, header.c_str());
+      const auto header = "x-amz-security-token: " + request->auth.sessionToken;
+      request->headers = curl_slist_append(request->headers, header.c_str());
       VELOX_CHECK_NOT_NULL(request->headers);
     }
-    curl_easy_setopt(
-        request->easy, CURLOPT_URL, request->auth.url.c_str());
+    curl_easy_setopt(request->easy, CURLOPT_URL, request->auth.url.c_str());
     curl_easy_setopt(
         request->easy, CURLOPT_AWS_SIGV4, request->auth.awsSigV4.c_str());
     curl_easy_setopt(
-        request->easy,
-        CURLOPT_USERPWD,
-        request->auth.userPassword.c_str());
+        request->easy, CURLOPT_USERPWD, request->auth.userPassword.c_str());
     if (request->headers != nullptr) {
-      curl_easy_setopt(
-          request->easy, CURLOPT_HTTPHEADER, request->headers);
+      curl_easy_setopt(request->easy, CURLOPT_HTTPHEADER, request->headers);
     }
-    curl_easy_setopt(
-        request->easy, CURLOPT_RANGE, request->range.c_str());
-    curl_easy_setopt(
-        request->easy, CURLOPT_WRITEFUNCTION, writeCallback);
+    curl_easy_setopt(request->easy, CURLOPT_RANGE, request->range.c_str());
+    curl_easy_setopt(request->easy, CURLOPT_WRITEFUNCTION, writeCallback);
     curl_easy_setopt(request->easy, CURLOPT_WRITEDATA, request.get());
     curl_easy_setopt(request->easy, CURLOPT_PRIVATE, request.get());
     curl_easy_setopt(request->easy, CURLOPT_FAILONERROR, 1L);
@@ -417,9 +918,8 @@ class NativeS3MultiScheduler {
           request = std::move(shard.retryQueue.begin()->second);
           shard.retryQueue.erase(shard.retryQueue.begin());
         } else {
-          auto* source = !shard.priorityQueue.empty()
-              ? &shard.priorityQueue
-              : &shard.queue;
+          auto* source = !shard.priorityQueue.empty() ? &shard.priorityQueue
+                                                      : &shard.queue;
           if (source->empty()) {
             return;
           }
@@ -436,9 +936,8 @@ class NativeS3MultiScheduler {
       long responseCode,
       size_t written,
       size_t expected) {
-    if (responseCode == 408 || responseCode == 429 ||
-        responseCode == 500 || responseCode == 502 ||
-        responseCode == 503 || responseCode == 504) {
+    if (responseCode == 408 || responseCode == 429 || responseCode == 500 ||
+        responseCode == 502 || responseCode == 503 || responseCode == 504) {
       return true;
     }
     if (responseCode == 206 && written != expected) {
@@ -470,10 +969,7 @@ class NativeS3MultiScheduler {
         std::min(capped + jitter, retryMaxDelayMs_));
   }
 
-  void finishRequest(
-      Shard& shard,
-      CURL* easy,
-      CURLcode result) {
+  void finishRequest(Shard& shard, CURL* easy, CURLcode result) {
     auto active = shard.active.find(easy);
     VELOX_CHECK(active != shard.active.end());
     auto request = std::move(active->second);
@@ -501,13 +997,10 @@ class NativeS3MultiScheduler {
     startTransferTimeUs_.fetch_add(
         startTransferTimeUs, std::memory_order_relaxed);
 
-    const auto succeeded =
-        result == CURLE_OK && responseCode == 206 &&
+    const auto succeeded = result == CURLE_OK && responseCode == 206 &&
         request->written == request->size;
-    if (!succeeded &&
-        request->retryCount < maxRetries_ &&
-        isRetryable(
-            result, responseCode, request->written, request->size)) {
+    if (!succeeded && request->retryCount < maxRetries_ &&
+        isRetryable(result, responseCode, request->written, request->size)) {
       ++request->retryCount;
       const auto delay = retryDelay(*request);
       retryAttempts_.fetch_add(1, std::memory_order_relaxed);
@@ -523,8 +1016,7 @@ class NativeS3MultiScheduler {
       {
         std::lock_guard<std::mutex> lock(shard.mutex);
         shard.retryQueue.emplace(
-            std::chrono::steady_clock::now() + delay,
-            std::move(request));
+            std::chrono::steady_clock::now() + delay, std::move(request));
       }
       shard.condition.notify_one();
       curl_multi_wakeup(shard.multi);
@@ -538,37 +1030,30 @@ class NativeS3MultiScheduler {
     }
     inflightRequests_.fetch_sub(1, std::memory_order_relaxed);
     if (diagnostics_ && completed % 256 == 0) {
-      const auto elapsed =
-          std::chrono::duration<double>(
-              std::chrono::steady_clock::now() - started_)
-              .count();
-      const auto bytes =
-          completedBytes_.load(std::memory_order_relaxed);
-      const auto requests =
-          completedRequests_.load(std::memory_order_relaxed);
-      const auto attempts =
-          completedAttempts_.load(std::memory_order_relaxed);
-      LOG(WARNING) << "CPP_S3_MULTI completed=" << requests
-                << " submitted="
-                << submittedRequests_.load(std::memory_order_relaxed)
-                << " attempts=" << attempts
-                << " retries="
-                << retryAttempts_.load(std::memory_order_relaxed)
-                << " inflight="
-                << inflightRequests_.load(std::memory_order_relaxed)
-                << " peakInflight="
-                << peakInflightRequests_.load(std::memory_order_relaxed)
-                << " bytes=" << bytes
-                << " elapsedSeconds=" << elapsed
-                << " payloadGbps="
-                << (elapsed == 0 ? 0.0 : bytes * 8.0 / elapsed / 1e9)
-                << " avgTotalUs="
-                << totalTimeUs_.load(std::memory_order_relaxed) / attempts
-                << " avgConnectUs="
-                << connectTimeUs_.load(std::memory_order_relaxed) / attempts
-                << " avgStartTransferUs="
-                << startTransferTimeUs_.load(std::memory_order_relaxed) /
-            attempts;
+      const auto elapsed = std::chrono::duration<double>(
+                               std::chrono::steady_clock::now() - started_)
+                               .count();
+      const auto bytes = completedBytes_.load(std::memory_order_relaxed);
+      const auto requests = completedRequests_.load(std::memory_order_relaxed);
+      const auto attempts = completedAttempts_.load(std::memory_order_relaxed);
+      LOG(WARNING) << "CPP_S3_MULTI completed=" << requests << " submitted="
+                   << submittedRequests_.load(std::memory_order_relaxed)
+                   << " attempts=" << attempts << " retries="
+                   << retryAttempts_.load(std::memory_order_relaxed)
+                   << " inflight="
+                   << inflightRequests_.load(std::memory_order_relaxed)
+                   << " peakInflight="
+                   << peakInflightRequests_.load(std::memory_order_relaxed)
+                   << " bytes=" << bytes << " elapsedSeconds=" << elapsed
+                   << " payloadGbps="
+                   << (elapsed == 0 ? 0.0 : bytes * 8.0 / elapsed / 1e9)
+                   << " avgTotalUs="
+                   << totalTimeUs_.load(std::memory_order_relaxed) / attempts
+                   << " avgConnectUs="
+                   << connectTimeUs_.load(std::memory_order_relaxed) / attempts
+                   << " avgStartTransferUs="
+                   << startTransferTimeUs_.load(std::memory_order_relaxed) /
+              attempts;
     }
 
     if (succeeded) {
@@ -577,8 +1062,7 @@ class NativeS3MultiScheduler {
     }
     std::ostringstream message;
     message << "Native S3 curl-multi range failed: curl="
-            << curl_easy_strerror(result)
-            << " http=" << responseCode
+            << curl_easy_strerror(result) << " http=" << responseCode
             << " expected=" << request->size
             << " received=" << request->written;
     request->promise.set_exception(
@@ -625,8 +1109,7 @@ class NativeS3MultiScheduler {
           }
           if (shard.active.empty() && shard.priorityQueue.empty() &&
               shard.queue.empty() && !shard.retryQueue.empty()) {
-            shard.condition.wait_until(
-                lock, shard.retryQueue.begin()->first);
+            shard.condition.wait_until(lock, shard.retryQueue.begin()->first);
             continue;
           }
         }
@@ -638,18 +1121,15 @@ class NativeS3MultiScheduler {
             "curl_multi_perform failed: {}",
             curl_multi_strerror(code));
         int remaining = 0;
-        while (auto* message =
-                   curl_multi_info_read(shard.multi, &remaining)) {
+        while (auto* message = curl_multi_info_read(shard.multi, &remaining)) {
           if (message->msg == CURLMSG_DONE) {
-            finishRequest(
-                shard, message->easy_handle, message->data.result);
+            finishRequest(shard, message->easy_handle, message->data.result);
           }
         }
         fillActive(shard);
         if (!shard.active.empty()) {
           int descriptors = 0;
-          code = curl_multi_poll(
-              shard.multi, nullptr, 0, 100, &descriptors);
+          code = curl_multi_poll(shard.multi, nullptr, 0, 100, &descriptors);
           VELOX_CHECK(
               code == CURLM_OK,
               "curl_multi_poll failed: {}",
@@ -709,18 +1189,22 @@ class NativeS3SdkScheduler {
       std::shared_ptr<facebook::velox::ReadFile> readFile,
       size_t offset,
       size_t size,
-      uint8_t* destination) {
+      uint8_t* destination,
+      const facebook::velox::FileIoContext& context = {},
+      bool directCacheFill = false) {
     VELOX_CHECK_NOT_NULL(readFile);
     auto request = std::make_shared<Request>();
     request->readFile = std::move(readFile);
+    request->context = context;
+    request->directCacheFill = directCacheFill;
     request->offset = offset;
     request->size = size;
     request->destination = destination;
     auto future = request->promise.get_future();
+    recordDirectCacheFillSubmission(*request);
     {
       std::lock_guard<std::mutex> lock(mutex_);
-      auto& queue =
-          size <= metadataPriorityBytes_ ? priorityQueue_ : queue_;
+      auto& queue = size <= metadataPriorityBytes_ ? priorityQueue_ : queue_;
       queue.push_back(std::move(request));
     }
     submittedRequests_.fetch_add(1, std::memory_order_relaxed);
@@ -734,7 +1218,8 @@ class NativeS3SdkScheduler {
       std::string key,
       size_t offset,
       size_t size,
-      uint8_t* destination) {
+      uint8_t* destination,
+      bool directCacheFill = false) {
     VELOX_CHECK(useCrt_);
     auto request = std::make_shared<Request>();
     request->bucket = std::move(bucket);
@@ -742,16 +1227,47 @@ class NativeS3SdkScheduler {
     request->offset = offset;
     request->size = size;
     request->destination = destination;
+    request->directCacheFill = directCacheFill;
     auto future = request->promise.get_future();
     {
       std::lock_guard<std::mutex> lock(mutex_);
-      auto& queue =
-          size <= metadataPriorityBytes_ ? priorityQueue_ : queue_;
+      auto& queue = size <= metadataPriorityBytes_ ? priorityQueue_ : queue_;
       queue.push_back(std::move(request));
     }
     submittedRequests_.fetch_add(1, std::memory_order_relaxed);
     submittedBytes_.fetch_add(size, std::memory_order_relaxed);
     dispatchCrt();
+    return future;
+  }
+
+  std::future<size_t> submitCrtScatter(
+      std::string bucket,
+      std::string key,
+      size_t offset,
+      std::vector<folly::Range<char*>> destinations) {
+    VELOX_CHECK(useCrt_);
+    VELOX_CHECK(!destinations.empty());
+    auto request = std::make_shared<Request>();
+    request->bucket = std::move(bucket);
+    request->key = std::move(key);
+    request->offset = offset;
+    request->directCacheFill = true;
+    for (const auto& destination : destinations) {
+      VELOX_CHECK_NOT_NULL(destination.data());
+      VELOX_CHECK_LE(
+          destination.size(),
+          std::numeric_limits<size_t>::max() - request->size,
+          "Native S3 scatter request size overflow");
+      request->size += destination.size();
+    }
+    request->scatterDestinations = std::move(destinations);
+    auto future = request->promise.get_future();
+    submittedRequests_.fetch_add(1, std::memory_order_relaxed);
+    submittedBytes_.fetch_add(request->size, std::memory_order_relaxed);
+    directCacheFillScatterBuffers_.fetch_add(
+        request->scatterDestinations.size(), std::memory_order_relaxed);
+    recordDirectCacheFillSubmission(*request);
+    enqueueCrt(std::move(request));
     return future;
   }
 
@@ -765,11 +1281,14 @@ class NativeS3SdkScheduler {
  private:
   struct Request {
     std::shared_ptr<facebook::velox::ReadFile> readFile;
+    facebook::velox::FileIoContext context;
     std::string bucket;
     std::string key;
     size_t offset{0};
     size_t size{0};
     uint8_t* destination{nullptr};
+    std::vector<folly::Range<char*>> scatterDestinations;
+    bool directCacheFill{false};
     std::promise<size_t> promise;
   };
 
@@ -778,17 +1297,22 @@ class NativeS3SdkScheduler {
     return parsed == 0 ? defaultValue : parsed;
   }
 
+  void recordDirectCacheFillSubmission(const Request& request) {
+    if (!request.directCacheFill) {
+      return;
+    }
+    directCacheFillSubmittedRequests_.fetch_add(1, std::memory_order_relaxed);
+    directCacheFillSubmittedBytes_.fetch_add(
+        request.size, std::memory_order_relaxed);
+  }
+
   NativeS3SdkScheduler()
       : useCrt_(envBytesOrZero("GLUTEN_CPP_S3_CRT") != 0),
-        concurrency_(
-            envOrDefault("GLUTEN_CPP_S3_SDK_CONCURRENCY", 128)),
-        rangeBytes_(
-            envOrDefault("GLUTEN_CPP_S3_SDK_RANGE_BYTES", 4UL << 20)),
+        concurrency_(envOrDefault("GLUTEN_CPP_S3_SDK_CONCURRENCY", 128)),
+        rangeBytes_(envOrDefault("GLUTEN_CPP_S3_SDK_RANGE_BYTES", 4UL << 20)),
         metadataPriorityBytes_(
-            envOrDefault(
-                "GLUTEN_CPP_S3_METADATA_PRIORITY_BYTES", 64UL << 10)),
-        diagnostics_(
-            envBytesOrZero("GLUTEN_CPP_S3_DIAGNOSTICS") != 0),
+            envOrDefault("GLUTEN_CPP_S3_METADATA_PRIORITY_BYTES", 64UL << 10)),
+        diagnostics_(envBytesOrZero("GLUTEN_CPP_S3_DIAGNOSTICS") != 0),
         started_(std::chrono::steady_clock::now()) {
     VELOX_CHECK_GT(concurrency_, 0);
     VELOX_CHECK_GT(rangeBytes_, 0);
@@ -803,20 +1327,18 @@ class NativeS3SdkScheduler {
       }
       config.throughputTargetGbps = static_cast<double>(
           envOrDefault("GLUTEN_CPP_S3_CRT_TARGET_GBPS", 25));
-      config.partSize =
-          envOrDefault("GLUTEN_CPP_S3_CRT_PART_BYTES", 8UL << 20);
-      config.downloadMemoryUsageWindow = envOrDefault(
-          "GLUTEN_CPP_S3_CRT_DOWNLOAD_WINDOW_BYTES", 1UL << 30);
+      config.partSize = envOrDefault("GLUTEN_CPP_S3_CRT_PART_BYTES", 8UL << 20);
+      config.downloadMemoryUsageWindow =
+          envOrDefault("GLUTEN_CPP_S3_CRT_DOWNLOAD_WINDOW_BYTES", 1UL << 30);
       config.crtRetryStrategyConfig.crtRetryStrategyType =
           Aws::S3Crt::S3CrtClientConfiguration::CrtRetryStrategyConfig::
               CrtRetryStrategyType::EXPONENTIAL_BACKOFF;
       config.crtRetryStrategyConfig.config.maxRetries =
           envOrDefault("GLUTEN_CPP_S3_CRT_MAX_RETRIES", 5);
-      auto credentialsProvider =
-          facebook::velox::filesystems::
-              makeSynchronizedCachingCredentialsProvider(
-                  std::make_shared<
-                      Aws::Auth::DefaultAWSCredentialsProviderChain>());
+      auto credentialsProvider = facebook::velox::filesystems::
+          makeSynchronizedCachingCredentialsProvider(
+              std::make_shared<
+                  Aws::Auth::DefaultAWSCredentialsProviderChain>());
       crtClient_ = std::make_shared<Aws::S3Crt::S3CrtClient>(
           std::move(credentialsProvider), config);
     }
@@ -841,19 +1363,27 @@ class NativeS3SdkScheduler {
     }
   }
 
+  void enqueueCrt(std::shared_ptr<Request> request) {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      auto& queue =
+          request->size <= metadataPriorityBytes_ ? priorityQueue_ : queue_;
+      queue.push_back(std::move(request));
+    }
+    dispatchCrt();
+  }
+
   void dispatchCrt() {
     while (true) {
       std::shared_ptr<Request> request;
       {
         std::lock_guard<std::mutex> lock(mutex_);
         if (stopping_ ||
-            inflightRequests_.load(std::memory_order_relaxed) >=
-                concurrency_ ||
+            inflightRequests_.load(std::memory_order_relaxed) >= concurrency_ ||
             (priorityQueue_.empty() && queue_.empty())) {
           return;
         }
-        auto& source =
-            !priorityQueue_.empty() ? priorityQueue_ : queue_;
+        auto& source = !priorityQueue_.empty() ? priorityQueue_ : queue_;
         request = std::move(source.front());
         source.pop_front();
         const auto inflight =
@@ -865,8 +1395,7 @@ class NativeS3SdkScheduler {
         }
       }
 
-      auto get =
-          std::make_shared<Aws::S3Crt::Model::GetObjectRequest>();
+      auto get = std::make_shared<Aws::S3Crt::Model::GetObjectRequest>();
       get->SetBucket(request->bucket.c_str());
       get->SetKey(request->key.c_str());
       get->SetRange(
@@ -875,13 +1404,21 @@ class NativeS3SdkScheduler {
               request->offset,
               request->offset + request->size - 1)
               .c_str());
-      const auto destination = request->destination;
-      const auto size = request->size;
-      get->SetResponseStreamFactory([destination, size]() {
-        return Aws::New<
-            facebook::velox::filesystems::StringViewStream>(
-            "NativeS3CrtScheduler", destination, size);
-      });
+      if (request->scatterDestinations.empty()) {
+        const auto destination = request->destination;
+        const auto size = request->size;
+        get->SetResponseStreamFactory([destination, size]() {
+          return Aws::New<facebook::velox::filesystems::StringViewStream>(
+              "NativeS3CrtScheduler", destination, size);
+        });
+      } else {
+        const auto destinations = request->scatterDestinations;
+        get->SetResponseStreamFactory([destinations]() {
+          return Aws::New<facebook::velox::cudf_velox::connector::hive::
+                              NativeS3ScatterWriteStream>(
+              "NativeS3CrtScatter", destinations);
+        });
+      }
       const auto started = std::chrono::steady_clock::now();
       crtClient_->GetObjectAsync(
           *get,
@@ -889,8 +1426,7 @@ class NativeS3SdkScheduler {
               const Aws::S3Crt::S3CrtClient*,
               const Aws::S3Crt::Model::GetObjectRequest&,
               Aws::S3Crt::Model::GetObjectOutcome outcome,
-              const std::shared_ptr<
-                  const Aws::Client::AsyncCallerContext>&) {
+              const std::shared_ptr<const Aws::Client::AsyncCallerContext>&) {
             bool succeeded = false;
             try {
               if (outcome.IsSuccess()) {
@@ -903,6 +1439,21 @@ class NativeS3SdkScheduler {
                   request->bucket,
                   request->key,
                   outcome.GetError().GetMessage());
+              if (!request->scatterDestinations.empty()) {
+                auto* stream =
+                    dynamic_cast<facebook::velox::cudf_velox::connector::hive::
+                                     NativeS3ScatterWriteStream*>(
+                        &outcome.GetResult().GetBody());
+                VELOX_CHECK_NOT_NULL(
+                    stream, "Native S3 CRT scatter response stream mismatch");
+                VELOX_CHECK(
+                    !stream->overflowed(),
+                    "Native S3 CRT scatter response exceeded destinations");
+                VELOX_CHECK_EQ(
+                    stream->bytesWritten(),
+                    request->size,
+                    "Short native S3 CRT scatter response");
+              }
               request->promise.set_value(request->size);
               succeeded = true;
             } catch (...) {
@@ -912,17 +1463,18 @@ class NativeS3SdkScheduler {
                 std::chrono::duration_cast<std::chrono::microseconds>(
                     std::chrono::steady_clock::now() - started)
                     .count();
-            totalTimeUs_.fetch_add(
-                elapsedUs, std::memory_order_relaxed);
+            totalTimeUs_.fetch_add(elapsedUs, std::memory_order_relaxed);
             if (succeeded) {
               completedBytes_.fetch_add(
                   request->size, std::memory_order_relaxed);
+              if (request->directCacheFill) {
+                directCacheFillCompletedRequests_.fetch_add(
+                    1, std::memory_order_relaxed);
+              }
             }
             inflightRequests_.fetch_sub(1, std::memory_order_relaxed);
             const auto completed =
-                completedRequests_.fetch_add(
-                    1, std::memory_order_relaxed) +
-                1;
+                completedRequests_.fetch_add(1, std::memory_order_relaxed) + 1;
             logProgress(completed);
             dispatchCrt();
           });
@@ -933,28 +1485,29 @@ class NativeS3SdkScheduler {
     if (!diagnostics_ || completed % 256 != 0) {
       return;
     }
-    const auto elapsed =
-        std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - started_)
-            .count();
+    const auto elapsed = std::chrono::duration<double>(
+                             std::chrono::steady_clock::now() - started_)
+                             .count();
     const auto bytes = completedBytes_.load(std::memory_order_relaxed);
-    LOG(WARNING) << (useCrt_ ? "CPP_S3_CRT" : "CPP_S3_SDK")
-                 << " completed=" << completed
-                 << " submitted="
-                 << submittedRequests_.load(std::memory_order_relaxed)
-                 << " inflight="
-                 << inflightRequests_.load(std::memory_order_relaxed)
-                 << " peakInflight="
-                 << peakInflightRequests_.load(std::memory_order_relaxed)
-                 << " bytes=" << bytes
-                 << " retries="
-                 << retryAttempts_.load(std::memory_order_relaxed)
-                 << " elapsedSeconds=" << elapsed
-                 << " payloadGbps="
-                 << (elapsed == 0 ? 0.0 : bytes * 8.0 / elapsed / 1e9)
-                 << " avgTotalUs="
-                 << totalTimeUs_.load(std::memory_order_relaxed) /
-            completed;
+    LOG(WARNING)
+        << (useCrt_ ? "CPP_S3_CRT" : "CPP_S3_SDK") << " completed=" << completed
+        << " submitted=" << submittedRequests_.load(std::memory_order_relaxed)
+        << " inflight=" << inflightRequests_.load(std::memory_order_relaxed)
+        << " peakInflight="
+        << peakInflightRequests_.load(std::memory_order_relaxed)
+        << " bytes=" << bytes << " directCacheFillSubmitted="
+        << directCacheFillSubmittedRequests_.load(std::memory_order_relaxed)
+        << " directCacheFillCompleted="
+        << directCacheFillCompletedRequests_.load(std::memory_order_relaxed)
+        << " directCacheFillBytes="
+        << directCacheFillSubmittedBytes_.load(std::memory_order_relaxed)
+        << " directCacheFillScatterBuffers="
+        << directCacheFillScatterBuffers_.load(std::memory_order_relaxed)
+        << " retries=" << retryAttempts_.load(std::memory_order_relaxed)
+        << " elapsedSeconds=" << elapsed
+        << " payloadGbps=" << (elapsed == 0 ? 0.0 : bytes * 8.0 / elapsed / 1e9)
+        << " avgTotalUs="
+        << totalTimeUs_.load(std::memory_order_relaxed) / completed;
   }
 
   void run() {
@@ -968,8 +1521,7 @@ class NativeS3SdkScheduler {
         if (stopping_ && priorityQueue_.empty() && queue_.empty()) {
           return;
         }
-        auto& source =
-            !priorityQueue_.empty() ? priorityQueue_ : queue_;
+        auto& source = !priorityQueue_.empty() ? priorityQueue_ : queue_;
         request = std::move(source.front());
         source.pop_front();
       }
@@ -985,7 +1537,10 @@ class NativeS3SdkScheduler {
       bool succeeded = false;
       try {
         const auto view = request->readFile->pread(
-            request->offset, request->size, request->destination);
+            request->offset,
+            request->size,
+            request->destination,
+            request->context);
         VELOX_CHECK_EQ(
             view.size(), request->size, "Short AWS SDK S3 range read");
         request->promise.set_value(view.size());
@@ -1000,6 +1555,10 @@ class NativeS3SdkScheduler {
       totalTimeUs_.fetch_add(elapsedUs, std::memory_order_relaxed);
       if (succeeded) {
         completedBytes_.fetch_add(request->size, std::memory_order_relaxed);
+        if (request->directCacheFill) {
+          directCacheFillCompletedRequests_.fetch_add(
+              1, std::memory_order_relaxed);
+        }
       }
       inflightRequests_.fetch_sub(1, std::memory_order_relaxed);
       const auto completed =
@@ -1023,12 +1582,145 @@ class NativeS3SdkScheduler {
   std::shared_ptr<Aws::S3Crt::S3CrtClient> crtClient_;
   std::atomic<uint64_t> submittedRequests_{0};
   std::atomic<uint64_t> submittedBytes_{0};
+  std::atomic<uint64_t> directCacheFillSubmittedRequests_{0};
+  std::atomic<uint64_t> directCacheFillCompletedRequests_{0};
+  std::atomic<uint64_t> directCacheFillSubmittedBytes_{0};
+  std::atomic<uint64_t> directCacheFillScatterBuffers_{0};
   std::atomic<uint64_t> completedRequests_{0};
   std::atomic<uint64_t> completedBytes_{0};
   std::atomic<uint64_t> inflightRequests_{0};
   std::atomic<uint64_t> peakInflightRequests_{0};
   std::atomic<uint64_t> totalTimeUs_{0};
   std::atomic<uint64_t> retryAttempts_{0};
+};
+
+class NativeScheduledS3ReadFile final : public facebook::velox::ReadFile {
+ public:
+  NativeScheduledS3ReadFile(
+      std::shared_ptr<facebook::velox::ReadFile> readFile,
+      const std::string& filePath)
+      : readFile_(std::move(readFile)) {
+    VELOX_CHECK_NOT_NULL(readFile_);
+    VELOX_CHECK(
+        filePath.starts_with("s3://"),
+        "Native scheduled S3 ReadFile requires an S3 path: {}",
+        filePath);
+    auto bucketAndObject = kvikio::S3Endpoint::parse_s3_url(filePath);
+    bucket_ = std::move(bucketAndObject.first);
+    key_ = std::move(bucketAndObject.second);
+  }
+
+  std::string_view pread(
+      uint64_t offset,
+      uint64_t length,
+      void* buffer,
+      const facebook::velox::FileIoContext& context) const override {
+    VELOX_CHECK_NOT_NULL(buffer);
+    readRanges(
+        offset,
+        {folly::Range<char*>(
+            static_cast<char*>(buffer), static_cast<size_t>(length))},
+        context);
+    return {static_cast<char*>(buffer), static_cast<size_t>(length)};
+  }
+
+  uint64_t preadv(
+      uint64_t offset,
+      const std::vector<folly::Range<char*>>& buffers,
+      const facebook::velox::FileIoContext& context) const override {
+    return readRanges(offset, buffers, context);
+  }
+
+  bool shouldCoalesce() const override {
+    return readFile_->shouldCoalesce();
+  }
+
+  uint64_t size() const override {
+    return readFile_->size();
+  }
+
+  uint64_t memoryUsage() const override {
+    return sizeof(*this) + bucket_.capacity() + key_.capacity();
+  }
+
+  std::string getName() const override {
+    return readFile_->getName();
+  }
+
+  uint64_t getNaturalReadSize() const override {
+    return readFile_->getNaturalReadSize();
+  }
+
+ private:
+  uint64_t readRanges(
+      uint64_t offset,
+      const std::vector<folly::Range<char*>>& buffers,
+      const facebook::velox::FileIoContext& context) const {
+    auto& scheduler = NativeS3SdkScheduler::instance();
+    const auto useCrt = envBytesOrZero("GLUTEN_CPP_S3_CRT") != 0;
+    std::vector<std::future<size_t>> pending;
+    uint64_t logicalOffset = offset;
+    uint64_t logicalBytes = 0;
+    uint64_t submittedBytes = 0;
+    if (useCrt) {
+      auto groups = facebook::velox::cudf_velox::connector::hive::
+          groupNativeS3ReadDestinations(offset, buffers);
+      pending.reserve(groups.size());
+      for (auto& group : groups) {
+        submittedBytes += group.size;
+        pending.emplace_back(scheduler.submitCrtScatter(
+            bucket_, key_, group.offset, std::move(group.destinations)));
+      }
+      for (const auto& buffer : buffers) {
+        VELOX_CHECK_LE(
+            buffer.size(),
+            std::numeric_limits<uint64_t>::max() - logicalBytes,
+            "Native scheduled S3 read size overflow");
+        logicalBytes += buffer.size();
+      }
+    } else {
+      for (const auto& buffer : buffers) {
+        VELOX_CHECK_LE(
+            buffer.size(),
+            std::numeric_limits<uint64_t>::max() - logicalBytes,
+            "Native scheduled S3 read size overflow");
+        logicalBytes += buffer.size();
+        if (buffer.data() != nullptr) {
+          size_t scheduled = 0;
+          while (scheduled < buffer.size()) {
+            const auto chunkSize =
+                std::min(scheduler.rangeBytes(), buffer.size() - scheduled);
+            pending.emplace_back(scheduler.submit(
+                readFile_,
+                logicalOffset + scheduled,
+                chunkSize,
+                reinterpret_cast<uint8_t*>(buffer.data() + scheduled),
+                context,
+                /*directCacheFill=*/true));
+            submittedBytes += chunkSize;
+            scheduled += chunkSize;
+          }
+        }
+        VELOX_CHECK_LE(
+            buffer.size(),
+            std::numeric_limits<uint64_t>::max() - logicalOffset,
+            "Native scheduled S3 read offset overflow");
+        logicalOffset += buffer.size();
+      }
+    }
+    uint64_t completedBytes = 0;
+    for (auto& future : pending) {
+      completedBytes += future.get();
+    }
+    VELOX_CHECK_EQ(
+        completedBytes, submittedBytes, "Short executor-global native S3 read");
+    bytesRead_.fetch_add(submittedBytes, std::memory_order_relaxed);
+    return logicalBytes;
+  }
+
+  const std::shared_ptr<facebook::velox::ReadFile> readFile_;
+  std::string bucket_;
+  std::string key_;
 };
 #endif
 
@@ -1051,9 +1743,190 @@ std::future<T> toStdFuture(folly::Future<T> follyFuture) {
 
 namespace facebook::velox::cudf_velox::connector::hive {
 
+DirectCachePageH2dStats directCachePageH2dStats() {
+  return {
+      directCachePageH2dCopies.load(std::memory_order_relaxed),
+      directCachePageH2dBytes.load(std::memory_order_relaxed),
+      directCachePageH2dPinnedCopies.load(std::memory_order_relaxed),
+      directCachePageH2dPinnedBytes.load(std::memory_order_relaxed)};
+}
+
+CachePageRegistrationStats cachePageRegistrationStats() {
+  return {
+      cachePageRegistrationAttempts.load(std::memory_order_relaxed),
+      cachePageRegistrationSuccesses.load(std::memory_order_relaxed),
+      cachePageRegistrationFailures.load(std::memory_order_relaxed),
+      cachePageRegistrationBudgetRejectedBytes.load(std::memory_order_relaxed),
+      cachePageRegisteredRuns.load(std::memory_order_relaxed),
+      cachePageRegisteredBytes.load(std::memory_order_relaxed),
+      cachePageCurrentRegisteredBytes.load(std::memory_order_relaxed),
+      cachePagePeakRegisteredBytes.load(std::memory_order_relaxed),
+      cachePageUnregisteredRuns.load(std::memory_order_relaxed),
+      cachePageUnregisteredBytes.load(std::memory_order_relaxed),
+      cachePagePrewarmAttempts.load(std::memory_order_relaxed),
+      cachePagePrewarmSuccesses.load(std::memory_order_relaxed),
+      cachePagePrewarmFailures.load(std::memory_order_relaxed),
+      cachePagePrewarmRuns.load(std::memory_order_relaxed),
+      cachePagePrewarmBytes.load(std::memory_order_relaxed),
+      cachePagePrewarmCoveredRuns.load(std::memory_order_relaxed),
+      cachePagePrewarmCoveredBytes.load(std::memory_order_relaxed),
+      cachePageRegistrationWallNanos.load(std::memory_order_relaxed),
+      cachePagePrewarmWallNanos.load(std::memory_order_relaxed)};
+}
+
+BoundedCachePageRegistration makeBoundedCachePageRegistration(
+    uint64_t maxRegisteredBytes,
+    std::optional<CachePageHostRegistrationHooks> hooks) {
+  if (maxRegisteredBytes == 0) {
+    return {};
+  }
+  auto effectiveHooks = hooks.value_or(
+      CachePageHostRegistrationHooks{
+          .registerRun =
+              [](void* address, size_t bytes) {
+                // Portable makes the registration visible to every CUDA context
+                // in this executor. No-device/driver errors are ordinary
+                // fallback.
+                return cudaHostRegister(
+                           address, bytes, cudaHostRegisterPortable) ==
+                    cudaSuccess;
+              },
+          .unregisterRun =
+              [](void* address) {
+                const auto status = cudaHostUnregister(address);
+                if (status != cudaSuccess) {
+                  LOG(WARNING) << "cudaHostUnregister failed for cache run: "
+                               << cudaGetErrorString(status);
+                }
+              }});
+  VELOX_CHECK(effectiveHooks.registerRun);
+  VELOX_CHECK(effectiveHooks.unregisterRun);
+  auto manager = std::make_shared<BoundedCachePageRegistrationState>(
+      maxRegisteredBytes, std::move(effectiveHooks));
+  return {
+      .registerBackingRuns =
+          [manager](const memory::Allocation& allocation) {
+            return manager->registerAllocation(allocation);
+          },
+      .registerBackingRange =
+          [manager](void* address, uint64_t bytes) {
+            return manager->registerRange(address, bytes);
+          },
+      .registerPersistentBackingRange =
+          [manager](
+              memory::MmapAllocator& allocator, void* address, uint64_t bytes) {
+            return manager->registerPersistentRange(allocator, address, bytes);
+          },
+      .persistentLifetime = std::shared_ptr<void>(
+          new uint8_t,
+          [manager](void* opaque) noexcept {
+            delete static_cast<uint8_t*>(opaque);
+            manager->releasePersistent();
+          }),
+      .prewarmLargestSizeClass =
+          [manager](memory::MmapAllocator& allocator, uint64_t bytes) {
+            return manager->prewarmLargestSizeClass(allocator, bytes);
+          }};
+}
+
 #ifdef VELOX_ENABLE_S3
+std::vector<NativeS3ReadGroup> groupNativeS3ReadDestinations(
+    uint64_t offset,
+    const std::vector<folly::Range<char*>>& destinations) {
+  std::vector<NativeS3ReadGroup> groups;
+  uint64_t logicalOffset = offset;
+  for (const auto& destination : destinations) {
+    VELOX_CHECK_LE(
+        destination.size(),
+        std::numeric_limits<uint64_t>::max() - logicalOffset,
+        "Native S3 scatter offset overflow");
+    if (destination.data() == nullptr) {
+      logicalOffset += destination.size();
+      continue;
+    }
+    if (groups.empty() ||
+        groups.back().offset + groups.back().size != logicalOffset) {
+      groups.push_back(NativeS3ReadGroup{.offset = logicalOffset});
+    }
+    auto& group = groups.back();
+    VELOX_CHECK_LE(
+        destination.size(),
+        std::numeric_limits<uint64_t>::max() - group.size,
+        "Native S3 scatter size overflow");
+    group.size += destination.size();
+    group.destinations.push_back(destination);
+    logicalOffset += destination.size();
+  }
+  return groups;
+}
+
+NativeS3ScatterWriteStreamBuf::NativeS3ScatterWriteStreamBuf(
+    std::vector<folly::Range<char*>> destinations)
+    : destinations_(std::move(destinations)) {
+  for (const auto& destination : destinations_) {
+    VELOX_CHECK_NOT_NULL(destination.data());
+  }
+}
+
+size_t NativeS3ScatterWriteStreamBuf::writeBytes(
+    const char* source,
+    size_t count) {
+  size_t written = 0;
+  while (written < count && destinationIndex_ < destinations_.size()) {
+    auto& destination = destinations_[destinationIndex_];
+    const auto available = destination.size() - destinationOffset_;
+    const auto copySize = std::min(available, count - written);
+    if (copySize != 0) {
+      std::memcpy(
+          destination.data() + destinationOffset_, source + written, copySize);
+      destinationOffset_ += copySize;
+      written += copySize;
+      bytesWritten_ += copySize;
+    }
+    if (destinationOffset_ == destination.size()) {
+      ++destinationIndex_;
+      destinationOffset_ = 0;
+    }
+  }
+  if (written != count) {
+    overflowed_ = true;
+  }
+  return written;
+}
+
+std::streamsize NativeS3ScatterWriteStreamBuf::xsputn(
+    const char* source,
+    std::streamsize count) {
+  if (count <= 0) {
+    return 0;
+  }
+  return static_cast<std::streamsize>(
+      writeBytes(source, static_cast<size_t>(count)));
+}
+
+NativeS3ScatterWriteStreamBuf::int_type NativeS3ScatterWriteStreamBuf::overflow(
+    int_type value) {
+  if (traits_type::eq_int_type(value, traits_type::eof())) {
+    return traits_type::not_eof(value);
+  }
+  const auto character = traits_type::to_char_type(value);
+  return writeBytes(&character, 1) == 1 ? value : traits_type::eof();
+}
+
 bool crtS3RangeReaderAvailable() {
   return glutenCrtS3RangeReaderAvailable();
+}
+
+bool nativeS3ScheduledReadEnabled() {
+  return envBytesOrZero("GLUTEN_CPP_S3_CRT") != 0 ||
+      envBytesOrZero("GLUTEN_CPP_S3_AWS_SDK") != 0;
+}
+
+std::shared_ptr<facebook::velox::ReadFile> makeNativeScheduledS3ReadFile(
+    std::shared_ptr<facebook::velox::ReadFile> readFile,
+    const std::string& filePath) {
+  return std::make_shared<NativeScheduledS3ReadFile>(
+      std::move(readFile), filePath);
 }
 
 CrtS3DataSource::CrtS3DataSource(
@@ -1071,9 +1944,8 @@ CrtS3DataSource::CrtS3DataSource(
       "AWS CRT S3 range bridge is not available");
 }
 
-size_t CrtS3DataSource::clampedReadSize(
-    size_t offset,
-    size_t requestedSize) const {
+size_t CrtS3DataSource::clampedReadSize(size_t offset, size_t requestedSize)
+    const {
   if (offset >= fileSize_) {
     return 0;
   }
@@ -1095,10 +1967,8 @@ std::unique_ptr<cudf::io::datasource::buffer> CrtS3DataSource::host_read(
   return cudf::io::datasource::buffer::create(std::move(data));
 }
 
-size_t CrtS3DataSource::host_read(
-    size_t offset,
-    size_t requestedSize,
-    uint8_t* dst) {
+size_t
+CrtS3DataSource::host_read(size_t offset, size_t requestedSize, uint8_t* dst) {
   const auto readSize = clampedReadSize(offset, requestedSize);
   if (readSize == 0) {
     return 0;
@@ -1128,8 +1998,7 @@ size_t CrtS3DataSource::host_read(
         readSize,
         tailCache_.size() - (offset - tailCacheOffset_),
         "AWS CRT S3 metadata read exceeds tail cache");
-    std::memcpy(
-        dst, tailCache_.data() + offset - tailCacheOffset_, readSize);
+    std::memcpy(dst, tailCache_.data() + offset - tailCacheOffset_, readSize);
     return readSize;
   }
   return readRanges({offset}, {readSize}, dst, {0});
@@ -1147,8 +2016,7 @@ std::future<size_t> CrtS3DataSource::host_read_async(
     size_t requestedSize,
     uint8_t* dst) {
   return std::async(
-      std::launch::deferred,
-      [this, offset, requestedSize, dst]() {
+      std::launch::deferred, [this, offset, requestedSize, dst]() {
         return host_read(offset, requestedSize, dst);
       });
 }
@@ -1202,15 +2070,12 @@ KvikioS3DataSource::KvikioS3DataSource(
   nativeS3Bucket_ = bucketAndObject.first;
   nativeS3Key_ = bucketAndObject.second;
   nativeS3Url_ = kvikio::S3Endpoint::url_from_bucket_and_object(
-      bucketAndObject.first,
-      bucketAndObject.second,
-      region,
-      endpoint);
+      bucketAndObject.first, bucketAndObject.second, region, endpoint);
   std::string resolvedRegion;
   if (region.has_value()) {
     resolvedRegion = region.value();
-  } else if (const auto* environmentRegion =
-                 std::getenv("AWS_DEFAULT_REGION")) {
+  } else if (
+      const auto* environmentRegion = std::getenv("AWS_DEFAULT_REGION")) {
     resolvedRegion = environmentRegion;
   }
   VELOX_CHECK(
@@ -1272,8 +2137,7 @@ size_t KvikioS3DataSource::host_read(
         readSize,
         tailCache_.size() - (offset - tailCacheOffset_),
         "Native S3 metadata read exceeds tail cache");
-    std::memcpy(
-        dst, tailCache_.data() + offset - tailCacheOffset_, readSize);
+    std::memcpy(dst, tailCache_.data() + offset - tailCacheOffset_, readSize);
     return readSize;
   }
   return readRanges({offset}, {readSize}, dst, {0});
@@ -1326,33 +2190,25 @@ size_t KvikioS3DataSource::readRanges(
   const auto useAwsSdk =
       !useCrt && envBytesOrZero("GLUTEN_CPP_S3_AWS_SDK") != 0;
   const auto useCurlMulti =
-      !useCrt && !useAwsSdk &&
-      envBytesOrZero("GLUTEN_CPP_S3_CURL_MULTI") != 0;
-  auto* sdkScheduler = (useCrt || useAwsSdk)
-      ? &NativeS3SdkScheduler::instance()
-      : nullptr;
-  auto* scheduler = useCurlMulti
-      ? &NativeS3MultiScheduler::instance()
-      : nullptr;
+      !useCrt && !useAwsSdk && envBytesOrZero("GLUTEN_CPP_S3_CURL_MULTI") != 0;
+  auto* sdkScheduler =
+      (useCrt || useAwsSdk) ? &NativeS3SdkScheduler::instance() : nullptr;
+  auto* scheduler =
+      useCurlMulti ? &NativeS3MultiScheduler::instance() : nullptr;
   const NativeS3MultiScheduler::Auth auth{
-      nativeS3Url_,
-      nativeAwsSigV4_,
-      nativeUserPassword_,
-      nativeSessionToken_};
+      nativeS3Url_, nativeAwsSigV4_, nativeUserPassword_, nativeSessionToken_};
   for (size_t index = 0; index < offsets.size(); ++index) {
     const auto readSize = clampedReadSize(offsets[index], sizes[index]);
     VELOX_CHECK_EQ(
-        readSize,
-        sizes[index],
-        "Native S3 range extends beyond end of object");
+        readSize, sizes[index], "Native S3 range extends beyond end of object");
     if (readSize == 0) {
       continue;
     }
     if (sdkScheduler != nullptr) {
       size_t scheduled = 0;
       while (scheduled < readSize) {
-        const auto chunkSize = std::min(
-            sdkScheduler->rangeBytes(), readSize - scheduled);
+        const auto chunkSize =
+            std::min(sdkScheduler->rangeBytes(), readSize - scheduled);
         if (useCrt) {
           pending.emplace_back(sdkScheduler->submitCrt(
               nativeS3Bucket_,
@@ -1371,14 +2227,12 @@ size_t KvikioS3DataSource::readRanges(
       }
     } else if (scheduler == nullptr) {
       pending.emplace_back(handle_.pread(
-          destination + destinationOffsets[index],
-          readSize,
-          offsets[index]));
+          destination + destinationOffsets[index], readSize, offsets[index]));
     } else {
       size_t scheduled = 0;
       while (scheduled < readSize) {
-        const auto chunkSize = std::min(
-            scheduler->rangeBytes(), readSize - scheduled);
+        const auto chunkSize =
+            std::min(scheduler->rangeBytes(), readSize - scheduled);
         pending.emplace_back(scheduler->submit(
             auth,
             offsets[index] + scheduled,
@@ -1420,30 +2274,25 @@ std::future<size_t> KvikioS3DataSource::device_read_async(
        envBytesOrZero("GLUTEN_CPP_S3_AWS_SDK") != 0 ||
        envBytesOrZero("GLUTEN_CPP_S3_CURL_MULTI") != 0)) {
     auto hostBuffer = std::make_shared<PinnedHostBuffer>(readSize);
-    const auto useCrt =
-        envBytesOrZero("GLUTEN_CPP_S3_CRT") != 0;
+    const auto useCrt = envBytesOrZero("GLUTEN_CPP_S3_CRT") != 0;
     const auto useAwsSdk =
         !useCrt && envBytesOrZero("GLUTEN_CPP_S3_AWS_SDK") != 0;
-    auto* sdkScheduler = (useCrt || useAwsSdk)
-        ? &NativeS3SdkScheduler::instance()
-        : nullptr;
-    auto* scheduler = (useCrt || useAwsSdk)
-        ? nullptr
-        : &NativeS3MultiScheduler::instance();
+    auto* sdkScheduler =
+        (useCrt || useAwsSdk) ? &NativeS3SdkScheduler::instance() : nullptr;
+    auto* scheduler =
+        (useCrt || useAwsSdk) ? nullptr : &NativeS3MultiScheduler::instance();
     const NativeS3MultiScheduler::Auth auth{
         nativeS3Url_,
         nativeAwsSigV4_,
         nativeUserPassword_,
         nativeSessionToken_};
     std::vector<std::future<size_t>> reads;
-    const auto rangeBytes = (useCrt || useAwsSdk)
-        ? sdkScheduler->rangeBytes()
-        : scheduler->rangeBytes();
+    const auto rangeBytes = (useCrt || useAwsSdk) ? sdkScheduler->rangeBytes()
+                                                  : scheduler->rangeBytes();
     reads.reserve((readSize + rangeBytes - 1) / rangeBytes);
     size_t scheduled = 0;
     while (scheduled < readSize) {
-      const auto chunkSize =
-          std::min(rangeBytes, readSize - scheduled);
+      const auto chunkSize = std::min(rangeBytes, readSize - scheduled);
       if (useCrt) {
         reads.emplace_back(sdkScheduler->submitCrt(
             nativeS3Bucket_,
@@ -1482,8 +2331,7 @@ std::future<size_t> KvikioS3DataSource::device_read_async(
             actual += read.get();
           }
           VELOX_CHECK_EQ(actual, readSize, "Short regular native S3 read");
-          if (envBytesOrZero(
-                  "GLUTEN_CPP_S3_REGULAR_STREAM_ORDERED_H2D") != 0) {
+          if (envBytesOrZero("GLUTEN_CPP_S3_REGULAR_STREAM_ORDERED_H2D") != 0) {
             using Completion = std::pair<
                 std::shared_ptr<PinnedHostBuffer>,
                 std::unique_ptr<NativeS3H2dPermit>>;
@@ -1498,9 +2346,7 @@ std::future<size_t> KvikioS3DataSource::device_read_async(
                 stream.value()));
             CUDF_CUDA_TRY(cudaLaunchHostFunc(
                 stream.value(),
-                [](void* opaque) {
-                  delete static_cast<Completion*>(opaque);
-                },
+                [](void* opaque) { delete static_cast<Completion*>(opaque); },
                 completion.get()));
             completion.release();
             return actual;
@@ -1548,8 +2394,18 @@ std::unique_ptr<cudf::io::datasource::buffer> KvikioS3DataSource::device_read(
 #endif
 
 BufferedInputDataSource::BufferedInputDataSource(
-    std::shared_ptr<facebook::velox::dwio::common::BufferedInput> input)
-    : input_(std::move(input)), fileSize_(input_->getReadFile()->size()) {}
+    std::shared_ptr<facebook::velox::dwio::common::BufferedInput> input,
+    std::optional<BufferedInputDeviceCopyHooks> deviceCopyHooks)
+    : input_(std::move(input)),
+      fileSize_(input_->getReadFile()->size()),
+      deviceCopyHooks_(
+          deviceCopyHooks.has_value() ? std::move(deviceCopyHooks.value())
+                                      : defaultBufferedInputDeviceCopyHooks()) {
+  VELOX_CHECK(deviceCopyHooks_.copy, "Device copy hook is not initialized");
+  VELOX_CHECK(
+      deviceCopyHooks_.retainUntilComplete,
+      "Device copy lifetime hook is not initialized");
+}
 
 size_t BufferedInputDataSource::size() const {
   return fileSize_;
@@ -1561,21 +2417,108 @@ void BufferedInputDataSource::enqueueForDevice(
     uint8_t* dst) {
   auto inputStream = input_->enqueue({offset, size});
   std::shared_ptr sharedStream(std::move(inputStream));
-  pendingDeviceLoads_.push_back(
-      [dst, size, sharedStream](rmm::cuda_stream_view stream) {
-        std::vector<uint8_t> buffer(size);
-        sharedStream->readFully(reinterpret_cast<char*>(buffer.data()), size);
-        CUDF_CUDA_TRY(cudaMemcpyAsync(
-            dst, buffer.data(), size, cudaMemcpyHostToDevice, stream.value()));
-      });
+  pendingDeviceLoads_.push_back([dst, size, sharedStream](
+                                    rmm::cuda_stream_view stream) {
+    uint64_t copied = 0;
+    while (copied < size) {
+      const void* buffer = nullptr;
+      int32_t available = 0;
+      VELOX_CHECK(
+          sharedStream->Next(&buffer, &available),
+          "BufferedInput stream ended after {} of {} bytes",
+          copied,
+          size);
+      VELOX_CHECK_GT(available, 0);
+      const auto bytes = std::min<uint64_t>(available, size - copied);
+      CUDF_CUDA_TRY(cudaMemcpyAsync(
+          dst + copied, buffer, bytes, cudaMemcpyHostToDevice, stream.value()));
+      copied += bytes;
+      if (bytes < static_cast<uint64_t>(available)) {
+        sharedStream->BackUp(available - bytes);
+      }
+    }
+  });
 }
 
 void BufferedInputDataSource::load(rmm::cuda_stream_view stream) {
   input_->load(velox::dwio::common::LogType::FILE);
-  std::lock_guard<std::mutex> lock(ioBatchMutex());
+  // The cache load above is already complete and pendingDeviceLoads_ belongs
+  // exclusively to this data source. Avoid serializing cache-to-device copies
+  // from independent scan drivers on the process-global remote-IO mutex.
   for (auto& deviceLoad : pendingDeviceLoads_) {
     deviceLoad(stream);
   }
+}
+
+bool BufferedInputDataSource::prefetchToCache(
+    const std::vector<cudf::io::text::byte_range_info>& byteRanges) {
+  auto* cached =
+      dynamic_cast<facebook::velox::dwio::common::CachedBufferedInput*>(
+          input_.get());
+  if (cached == nullptr) {
+    return false;
+  }
+  std::vector<facebook::velox::common::Region> regions;
+  regions.reserve(byteRanges.size());
+  for (const auto& range : byteRanges) {
+    regions.push_back(
+        {static_cast<uint64_t>(range.offset()),
+         static_cast<uint64_t>(range.size())});
+  }
+  cached->prefetchSync(regions);
+  return true;
+}
+
+uint64_t BufferedInputDataSource::canonicalCacheBytes(
+    const std::vector<cudf::io::text::byte_range_info>& byteRanges) const {
+  return canonicalCacheStats(byteRanges).uniqueBytes;
+}
+
+CacheHintRangeStats BufferedInputDataSource::canonicalCacheStats(
+    const std::vector<cudf::io::text::byte_range_info>& byteRanges) const {
+  auto* cached =
+      dynamic_cast<facebook::velox::dwio::common::CachedBufferedInput*>(
+          input_.get());
+  if (cached == nullptr) {
+    return {};
+  }
+  std::vector<facebook::velox::common::Region> regions;
+  regions.reserve(byteRanges.size());
+  CacheHintRangeStats stats;
+  for (const auto& range : byteRanges) {
+    VELOX_CHECK_GE(range.offset(), 0);
+    VELOX_CHECK_GE(range.size(), 0);
+    if (range.size() == 0) {
+      continue;
+    }
+    regions.push_back(
+        {static_cast<uint64_t>(range.offset()),
+         static_cast<uint64_t>(range.size())});
+    ++stats.logicalRanges;
+    stats.logicalBytes += static_cast<uint64_t>(range.size());
+  }
+  if (regions.empty()) {
+    return stats;
+  }
+
+  // CacheRegionPlan validates that physical chunks do not overlap. This is a
+  // correctness fallback: an unexpected layout disables the best-effort hint
+  // instead of creating ambiguous offset-only cache identities.
+  const auto plan = cached->makeCacheRegionPlan(regions);
+  const auto& unique = plan->cacheRegions();
+  stats.uniqueRanges = unique.size();
+  for (const auto& region : unique) {
+    stats.uniqueBytes += region.length;
+  }
+  return stats;
+}
+
+std::optional<uint64_t> BufferedInputDataSource::cacheFileNum() const {
+  auto* cached =
+      dynamic_cast<facebook::velox::dwio::common::CachedBufferedInput*>(
+          input_.get());
+  return cached == nullptr ? std::nullopt
+                           : std::optional<uint64_t>(cached->cacheFileNum());
 }
 
 std::unique_ptr<cudf::io::datasource::buffer>
@@ -1621,9 +2564,103 @@ std::future<size_t> BufferedInputDataSource::device_read_async(
     uint8_t* dst,
     rmm::cuda_stream_view stream) {
   VELOX_CHECK(input_->executor() != nullptr, "IO executor is not initialized");
+  const auto readSize =
+      offset >= fileSize_ ? 0 : std::min(size, fileSize_ - offset);
+  if (readSize == 0) {
+    return std::async(std::launch::deferred, []() { return size_t{0}; });
+  }
+  if (input_->hasCache()) {
+    auto input = input_;
+    auto hooks = deviceCopyHooks_;
+    auto* executor = input_->executor();
+    const bool retainCachePins =
+        dynamic_cast<facebook::velox::dwio::common::CachedBufferedInput*>(
+            input_.get()) != nullptr;
+    auto copyFromCache = [input = std::move(input),
+                          hooks = std::move(hooks),
+                          offset,
+                          readSize,
+                          dst,
+                          stream,
+                          retainCachePins]() mutable {
+      using facebook::velox::dwio::common::LogType;
+      auto ownedStream = input->read(offset, readSize, LogType::FILE);
+      VELOX_CHECK_NOT_NULL(ownedStream, "read() returned null stream");
+      std::shared_ptr sharedStream(std::move(ownedStream));
+      auto lifetime = std::make_shared<DirectCachePageH2dLifetime>();
+      lifetime->inputStream = sharedStream;
+      auto* cacheStream =
+          dynamic_cast<facebook::velox::dwio::common::CacheInputStream*>(
+              sharedStream.get());
+      VELOX_CHECK(
+          !retainCachePins || cacheStream != nullptr,
+          "Cached input returned a non-cache stream");
+      size_t copied = 0;
+      uint64_t copies = 0;
+      uint64_t pinnedCopies = 0;
+      uint64_t pinnedBytes = 0;
+      try {
+        while (copied < readSize) {
+          const void* source = nullptr;
+          int32_t available = 0;
+          VELOX_CHECK(
+              sharedStream->Next(&source, &available),
+              "BufferedInput stream ended after {} of {} bytes",
+              copied,
+              readSize);
+          VELOX_CHECK_GT(available, 0);
+          const auto bytes = std::min<size_t>(
+              static_cast<size_t>(available), readSize - copied);
+          if (cacheStream != nullptr) {
+            lifetime->cachePins.push_back(cacheStream->retainCurrentCachePin());
+            if (cacheStream->currentCachePageHasBackingRegistration()) {
+              ++pinnedCopies;
+              pinnedBytes += bytes;
+            }
+          }
+          hooks.copy(dst + copied, source, bytes, stream);
+          ++copies;
+          copied += bytes;
+          if (bytes < static_cast<size_t>(available)) {
+            sharedStream->BackUp(
+                static_cast<int32_t>(static_cast<size_t>(available) - bytes));
+          }
+        }
+      } catch (...) {
+        const auto error = std::current_exception();
+        if (copies > 0) {
+          hooks.retainUntilComplete(lifetime, stream);
+        }
+        std::rethrow_exception(error);
+      }
+      hooks.retainUntilComplete(lifetime, stream);
+      directCachePageH2dCopies.fetch_add(copies, std::memory_order_relaxed);
+      directCachePageH2dBytes.fetch_add(copied, std::memory_order_relaxed);
+      directCachePageH2dPinnedCopies.fetch_add(
+          pinnedCopies, std::memory_order_relaxed);
+      directCachePageH2dPinnedBytes.fetch_add(
+          pinnedBytes, std::memory_order_relaxed);
+      return copied;
+    };
+    if (envFlagEnabled("GLUTEN_CUDF_CACHE_H2D_INLINE")) {
+      std::promise<size_t> promise;
+      auto future = promise.get_future();
+      try {
+        promise.set_value(copyFromCache());
+      } catch (...) {
+        promise.set_exception(std::current_exception());
+      }
+      return future;
+    }
+    auto future = folly::via(executor).thenValue(
+        [copyFromCache = std::move(copyFromCache)](auto&&) mutable {
+          return copyFromCache();
+        });
+    return toStdFuture(std::move(future));
+  }
   auto future = folly::via(input_->executor())
-                    .thenValue([this, offset, size, dst, stream](auto&&) {
-                      auto hostBuffer = this->host_read(offset, size);
+                    .thenValue([this, offset, readSize, dst, stream](auto&&) {
+                      auto hostBuffer = this->host_read(offset, readSize);
                       CUDF_CUDA_TRY(cudaMemcpyAsync(
                           dst,
                           hostBuffer->data(),
@@ -1663,29 +2700,26 @@ std::shared_ptr<PreparedHostByteRanges> prepareByteRangesToHost(
   const char* pageableHostBufferEnv = nullptr;
   bool nativeCppHostBatch = false;
   if (auto* crtSource = dynamic_cast<CrtS3DataSource*>(dataSource.get())) {
-    packedHostRead =
-        [crtSource](
-            const std::vector<size_t>& offsets,
-            const std::vector<size_t>& sizes,
-            uint8_t* destination,
-            const std::vector<size_t>& destinationOffsets) {
-          return crtSource->readRanges(
-              offsets, sizes, destination, destinationOffsets);
-        };
+    packedHostRead = [crtSource](
+                         const std::vector<size_t>& offsets,
+                         const std::vector<size_t>& sizes,
+                         uint8_t* destination,
+                         const std::vector<size_t>& destinationOffsets) {
+      return crtSource->readRanges(
+          offsets, sizes, destination, destinationOffsets);
+    };
     pageableHostBufferEnv = "GLUTEN_CRT_S3_PAGEABLE_HOST_BUFFER";
-  } else if (
-      envBytesOrZero("GLUTEN_CPP_S3_HOST_BATCH") != 0) {
+  } else if (envBytesOrZero("GLUTEN_CPP_S3_HOST_BATCH") != 0) {
     if (auto* nativeSource =
             dynamic_cast<KvikioS3DataSource*>(dataSource.get())) {
-      packedHostRead =
-          [nativeSource](
-              const std::vector<size_t>& offsets,
-              const std::vector<size_t>& sizes,
-              uint8_t* destination,
-              const std::vector<size_t>& destinationOffsets) {
-            return nativeSource->readRanges(
-                offsets, sizes, destination, destinationOffsets);
-          };
+      packedHostRead = [nativeSource](
+                           const std::vector<size_t>& offsets,
+                           const std::vector<size_t>& sizes,
+                           uint8_t* destination,
+                           const std::vector<size_t>& destinationOffsets) {
+        return nativeSource->readRanges(
+            offsets, sizes, destination, destinationOffsets);
+      };
       pageableHostBufferEnv = "GLUTEN_CPP_S3_PAGEABLE_HOST_BUFFER";
       nativeCppHostBatch = true;
     }
@@ -1754,14 +2788,9 @@ std::shared_ptr<PreparedHostByteRanges> prepareByteRangesToHost(
 
   VELOX_CHECK_NOT_NULL(pageableHostBufferEnv);
   prepared->hostBuffer = std::make_shared<PinnedHostBuffer>(
-      hostBufferSize,
-      nullptr,
-      envBytesOrZero(pageableHostBufferEnv) == 0);
+      hostBufferSize, nullptr, envBytesOrZero(pageableHostBufferEnv) == 0);
   const auto bytes = packedHostRead(
-      ioOffsets,
-      ioSizes,
-      prepared->hostBuffer->data(),
-      destinationOffsets);
+      ioOffsets, ioSizes, prepared->hostBuffer->data(), destinationOffsets);
   const auto expected =
       std::accumulate(ioSizes.begin(), ioSizes.end(), size_t{0});
   VELOX_CHECK_EQ(bytes, expected, "Short packed S3 range batch");
@@ -1785,56 +2814,11 @@ FetchedDeviceByteRanges copyPreparedByteRangesToDevice(
   NativeS3H2dPermit h2dPermit(prepared->nativeCppHostBatch);
   const auto allocationBytes = cudf::util::round_up_safe<size_t>(
       prepared->totalSize, kBufferPaddingMultiple);
-  std::optional<DeviceMemoryAdmissionReservation> deviceMemoryAdmission;
-  const auto admissionCapacity =
-      envBytesOrZero("GLUTEN_CRT_S3_DEVICE_ADMISSION_BYTES");
-  if (admissionCapacity != 0) {
-    VELOX_CHECK_LE(
-        allocationBytes,
-        admissionCapacity,
-        "S3 device allocation {} exceeds admission capacity {}",
-        allocationBytes,
-        admissionCapacity);
-    int device = -1;
-    CUDF_CUDA_TRY(cudaGetDevice(&device));
-    const auto reserveBytes =
-        envBytesOrZero("GLUTEN_CRT_S3_DEVICE_HEADROOM_BYTES");
-    const auto started = std::chrono::steady_clock::now();
-    constexpr auto kAdmissionTimeout = std::chrono::seconds(120);
-    for (;;) {
-      const auto headroom = captureDeviceAllocationHeadroom();
-      const auto requiredHeadroom =
-          allocationBytes >
-              std::numeric_limits<std::size_t>::max() - reserveBytes
-          ? std::numeric_limits<std::size_t>::max()
-          : allocationBytes + reserveBytes;
-      if (headroom.cudaValid &&
-          headroom.allocatableBytes() >= requiredHeadroom) {
-        deviceMemoryAdmission = tryAcquireDeviceMemoryAdmission(
-            device, allocationBytes, admissionCapacity);
-        if (deviceMemoryAdmission.has_value()) {
-          break;
-        }
-      }
-      if (std::chrono::steady_clock::now() - started >=
-          kAdmissionTimeout) {
-        VELOX_FAIL(
-            "Timed out waiting for S3 device admission: bytes={}, "
-            "capacityBytes={}, reserveBytes={}, allocatableBytes={}",
-            allocationBytes,
-            admissionCapacity,
-            reserveBytes,
-            headroom.allocatableBytes());
-      }
-      std::this_thread::sleep_for(std::chrono::milliseconds(2));
-    }
-  }
 
   std::vector<rmm::device_buffer> columnChunkBuffers;
   columnChunkBuffers.emplace_back(allocationBytes, stream, mr);
   const auto allocationDone = std::chrono::steady_clock::now();
-  auto* bufferData =
-      static_cast<uint8_t*>(columnChunkBuffers.back().data());
+  auto* bufferData = static_cast<uint8_t*>(columnChunkBuffers.back().data());
   std::vector<cudf::device_span<const uint8_t>> columnChunkData;
   columnChunkData.reserve(byteRanges.size());
   size_t deviceOffset = 0;
@@ -1844,8 +2828,7 @@ FetchedDeviceByteRanges copyPreparedByteRangesToDevice(
     if (prepared->coalesceGapBytes != 0 && chunkSize != 0) {
       std::memmove(
           prepared->hostBuffer->data() + deviceOffset,
-          prepared->hostBuffer->data() +
-              prepared->hostSourceOffsets[chunk],
+          prepared->hostBuffer->data() + prepared->hostSourceOffsets[chunk],
           chunkSize);
     }
     deviceOffset += chunkSize;
@@ -1891,25 +2874,22 @@ FetchedDeviceByteRanges copyPreparedByteRangesToDevice(
           recycleDone - totalStart)
           .count(),
       std::memory_order_relaxed);
-  if (envBytesOrZero("GLUTEN_CPP_S3_DIAGNOSTICS") != 0 &&
-      count % 64 == 0) {
-    LOG(WARNING)
-        << "CPP_S3_H2D completed=" << count
-        << " bytes=" << bytes.load(std::memory_order_relaxed)
-        << " avgAllocationMs="
-        << allocationNanos.load(std::memory_order_relaxed) / count / 1e6
-        << " avgCopySyncMs="
-        << copyNanos.load(std::memory_order_relaxed) / count / 1e6
-        << " avgRecycleMs="
-        << recycleNanos.load(std::memory_order_relaxed) / count / 1e6
-        << " avgTotalMs="
-        << totalNanos.load(std::memory_order_relaxed) / count / 1e6;
+  if (envBytesOrZero("GLUTEN_CPP_S3_DIAGNOSTICS") != 0 && count % 64 == 0) {
+    LOG(WARNING) << "CPP_S3_H2D completed=" << count
+                 << " bytes=" << bytes.load(std::memory_order_relaxed)
+                 << " avgAllocationMs="
+                 << allocationNanos.load(std::memory_order_relaxed) / count /
+            1e6 << " avgCopySyncMs="
+                 << copyNanos.load(std::memory_order_relaxed) / count / 1e6
+                 << " avgRecycleMs="
+                 << recycleNanos.load(std::memory_order_relaxed) / count / 1e6
+                 << " avgTotalMs="
+                 << totalNanos.load(std::memory_order_relaxed) / count / 1e6;
   }
   return {
       std::move(columnChunkBuffers),
       std::move(columnChunkData),
-      std::async(std::launch::deferred, [] {}),
-      std::move(deviceMemoryAdmission)};
+      std::async(std::launch::deferred, [] {})};
 }
 
 FetchedDeviceByteRanges fetchByteRangesAsync(
@@ -1946,29 +2926,26 @@ FetchedDeviceByteRanges fetchByteRangesAsync(
   const char* pageableHostBufferEnv = nullptr;
   bool nativeCppHostBatch = false;
   if (auto* crtSource = dynamic_cast<CrtS3DataSource*>(dataSource.get())) {
-    packedHostRead =
-        [crtSource](
-            const std::vector<size_t>& offsets,
-            const std::vector<size_t>& sizes,
-            uint8_t* destination,
-            const std::vector<size_t>& destinationOffsets) {
-          return crtSource->readRanges(
-              offsets, sizes, destination, destinationOffsets);
-        };
+    packedHostRead = [crtSource](
+                         const std::vector<size_t>& offsets,
+                         const std::vector<size_t>& sizes,
+                         uint8_t* destination,
+                         const std::vector<size_t>& destinationOffsets) {
+      return crtSource->readRanges(
+          offsets, sizes, destination, destinationOffsets);
+    };
     pageableHostBufferEnv = "GLUTEN_CRT_S3_PAGEABLE_HOST_BUFFER";
-  } else if (
-      envBytesOrZero("GLUTEN_CPP_S3_HOST_BATCH") != 0) {
+  } else if (envBytesOrZero("GLUTEN_CPP_S3_HOST_BATCH") != 0) {
     if (auto* nativeSource =
             dynamic_cast<KvikioS3DataSource*>(dataSource.get())) {
-      packedHostRead =
-          [nativeSource](
-              const std::vector<size_t>& offsets,
-              const std::vector<size_t>& sizes,
-              uint8_t* destination,
-              const std::vector<size_t>& destinationOffsets) {
-            return nativeSource->readRanges(
-                offsets, sizes, destination, destinationOffsets);
-          };
+      packedHostRead = [nativeSource](
+                           const std::vector<size_t>& offsets,
+                           const std::vector<size_t>& sizes,
+                           uint8_t* destination,
+                           const std::vector<size_t>& destinationOffsets) {
+        return nativeSource->readRanges(
+            offsets, sizes, destination, destinationOffsets);
+      };
       pageableHostBufferEnv = "GLUTEN_CPP_S3_PAGEABLE_HOST_BUFFER";
       nativeCppHostBatch = true;
     }
@@ -2001,8 +2978,7 @@ FetchedDeviceByteRanges fetchByteRangesAsync(
             std::numeric_limits<size_t>::max() - ioOffset,
             "CRT S3 coalesced range end overflow");
         const auto ioEnd = ioOffset + ioSize;
-        if (nextOffset < ioEnd ||
-            nextOffset - ioEnd > coalesceGapBytes) {
+        if (nextOffset < ioEnd || nextOffset - ioEnd > coalesceGapBytes) {
           break;
         }
         VELOX_CHECK_LE(
@@ -2029,8 +3005,7 @@ FetchedDeviceByteRanges fetchByteRangesAsync(
     }
 
     VELOX_CHECK_NOT_NULL(pageableHostBufferEnv);
-    const auto preferPinned =
-        envBytesOrZero(pageableHostBufferEnv) == 0;
+    const auto preferPinned = envBytesOrZero(pageableHostBufferEnv) == 0;
     auto hostBuffer = std::make_shared<PinnedHostBuffer>(
         hostBufferSize, nullptr, preferPinned);
     const auto bytes = packedHostRead(
@@ -2045,74 +3020,12 @@ FetchedDeviceByteRanges fetchByteRangesAsync(
     // The permit ends immediately after H2D synchronization; it is not held
     // through parquet decode or the lifetime of the returned device buffer.
     NativeS3H2dPermit h2dPermit(nativeCppHostBatch);
-    const auto allocationBytes = cudf::util::round_up_safe<size_t>(
-        totalSize, kBufferPaddingMultiple);
-    std::optional<DeviceMemoryAdmissionReservation> deviceMemoryAdmission;
-    const auto admissionCapacity =
-        envBytesOrZero("GLUTEN_CRT_S3_DEVICE_ADMISSION_BYTES");
-    if (admissionCapacity != 0) {
-      VELOX_CHECK_LE(
-          allocationBytes,
-          admissionCapacity,
-          "CRT S3 device allocation {} exceeds admission capacity {}",
-          allocationBytes,
-          admissionCapacity);
-      int device = -1;
-      CUDF_CUDA_TRY(cudaGetDevice(&device));
-      const auto reserveBytes =
-          envBytesOrZero("GLUTEN_CRT_S3_DEVICE_HEADROOM_BYTES");
-      const auto started = std::chrono::steady_clock::now();
-      constexpr auto kAdmissionTimeout = std::chrono::seconds(120);
-      for (;;) {
-        const auto headroom = captureDeviceAllocationHeadroom();
-        const auto requiredHeadroom =
-            allocationBytes >
-                std::numeric_limits<std::size_t>::max() - reserveBytes
-            ? std::numeric_limits<std::size_t>::max()
-            : allocationBytes + reserveBytes;
-        if (headroom.cudaValid &&
-            headroom.allocatableBytes() >= requiredHeadroom) {
-          deviceMemoryAdmission = tryAcquireDeviceMemoryAdmission(
-              device, allocationBytes, admissionCapacity);
-          if (deviceMemoryAdmission.has_value()) {
-            const auto waitedMs =
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::steady_clock::now() - started)
-                    .count();
-            if (waitedMs > 0) {
-              LOG(INFO) << "CRT_S3_DEVICE_ADMISSION acquired bytes="
-                        << allocationBytes
-                        << " capacityBytes=" << admissionCapacity
-                        << " reserveBytes=" << reserveBytes
-                        << " waitedMs=" << waitedMs
-                        << " allocatableBytes="
-                        << headroom.allocatableBytes();
-            }
-            break;
-          }
-        }
-        if (std::chrono::steady_clock::now() - started >=
-            kAdmissionTimeout) {
-          VELOX_FAIL(
-              "Timed out waiting {} ms for CRT S3 device admission: "
-              "bytes={}, capacityBytes={}, reserveBytes={}, "
-              "allocatableBytes={}",
-              std::chrono::duration_cast<std::chrono::milliseconds>(
-                  kAdmissionTimeout)
-                  .count(),
-              allocationBytes,
-              admissionCapacity,
-              reserveBytes,
-              headroom.allocatableBytes());
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
-      }
-    }
+    const auto allocationBytes =
+        cudf::util::round_up_safe<size_t>(totalSize, kBufferPaddingMultiple);
 
     std::vector<rmm::device_buffer> columnChunkBuffers;
     columnChunkBuffers.emplace_back(allocationBytes, stream, mr);
-    auto* bufferData =
-        static_cast<uint8_t*>(columnChunkBuffers.back().data());
+    auto* bufferData = static_cast<uint8_t*>(columnChunkBuffers.back().data());
     std::vector<cudf::device_span<const uint8_t>> columnChunkData;
     columnChunkData.reserve(byteRanges.size());
     size_t deviceOffset = 0;
@@ -2143,8 +3056,7 @@ FetchedDeviceByteRanges fetchByteRangesAsync(
     return {
         std::move(columnChunkBuffers),
         std::move(columnChunkData),
-        std::async(std::launch::deferred, [] {}),
-        std::move(deviceMemoryAdmission)};
+        std::async(std::launch::deferred, [] {})};
   }
 
   // Allocate single device buffer for all column chunks
@@ -2193,8 +3105,7 @@ FetchedDeviceByteRanges fetchByteRangesAsync(
     return {
         std::move(columnChunkBuffers),
         std::move(columnChunkData),
-        std::async(std::launch::deferred, syncFunction, dataSource, stream),
-        std::nullopt};
+        std::async(std::launch::deferred, syncFunction, dataSource, stream)};
   }
 
   // KvikIO dataSource: Impl borrowed from `fetch_byte_ranges_to_device_async()`
@@ -2296,8 +3207,7 @@ FetchedDeviceByteRanges fetchByteRangesAsync(
           std::launch::deferred,
           std::move(syncFunction),
           std::move(hostReadTasks),
-          std::move(deviceReadTasks)),
-      std::nullopt};
+          std::move(deviceReadTasks))};
 }
 
 } // namespace facebook::velox::cudf_velox::connector::hive
