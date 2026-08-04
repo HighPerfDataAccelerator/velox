@@ -18,6 +18,8 @@
 #include "velox/experimental/ucx-exchange/UcxExchangeQueue.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeSource.h"
 
+#include <unordered_set>
+
 namespace facebook::velox::ucx_exchange {
 
 // Handle for a set of producers. This may be shared by multiple UcxExchanges,

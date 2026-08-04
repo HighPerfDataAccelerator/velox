@@ -15,6 +15,8 @@
  */
 #include "velox/common/process/ThreadDebugInfo.h"
 #include "velox/experimental/cudf/CudfConfig.h"
+#include "velox/experimental/ucx-exchange/Communicator.h"
+#include "velox/type/Type.h"
 
 #include <folly/Unit.h>
 #include <folly/init/Init.h>
@@ -32,7 +34,9 @@ int main(int argc, char** argv) {
   // Signal handler required for ThreadDebugInfoTest
   facebook::velox::process::addDefaultFatalSignalHandler();
   folly::Init init(&argc, &argv, false);
+  facebook::velox::Type::registerSerDe();
   facebook::velox::cudf_velox::CudfConfig::getInstance().exchangeLogLevel =
       FLAGS_exchange_log_level;
+  facebook::velox::cudf_velox::CudfConfig::getInstance().exchange = true;
   return RUN_ALL_TESTS();
 }

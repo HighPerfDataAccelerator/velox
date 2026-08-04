@@ -15,6 +15,7 @@
  */
 #include "velox/experimental/ucx-exchange/Communicator.h"
 #include <cuda_runtime.h>
+#include <folly/system/ThreadName.h>
 #include <ucxx/api.h>
 #include <ucxx/utils/ucx.h>
 #include <algorithm>
@@ -31,10 +32,14 @@
 
 using namespace facebook::velox::cudf_velox;
 
+DEFINE_bool(velox_ucx_exchange, false, "Enable Velox UCX exchange.");
+
 namespace facebook::velox::ucx_exchange {
 
 // static
 std::once_flag Communicator::onceFlag;
+std::mutex Communicator::instanceMutex_;
+std::mutex Communicator::shutdownMutex_;
 std::shared_ptr<Communicator> Communicator::instancePtr_ = nullptr;
 
 /* static */
@@ -42,21 +47,21 @@ std::shared_ptr<Communicator> Communicator::initAndGet(
     uint16_t port,
     std::string_view coordinatorURL,
     ContinueFuture* future) {
-  if (!FLAGS_velox_ucx_exchange) {
+  if (!CudfConfig::getInstance().exchange) {
     return nullptr;
   }
   std::call_once(onceFlag, [&] {
-    instancePtr_ = std::shared_ptr<Communicator>(new Communicator());
-    instancePtr_->port_ = port;
-    instancePtr_->coordinatorURL_ = coordinatorURL;
+    auto instance = std::shared_ptr<Communicator>(new Communicator());
+    instance->port_ = port;
+    instance->coordinatorURL_ = coordinatorURL;
     // Generate a random unique worker ID for same-process detection.
     // std::random_device reads from /dev/urandom on Linux (non-blocking).
     // A 64-bit random value has negligible collision probability.
     std::random_device rd;
     std::mt19937_64 gen(rd());
     std::uniform_int_distribution<uint64_t> dist;
-    instancePtr_->workerId_ = dist(gen);
-    LOG(INFO) << "Communicator workerId=" << instancePtr_->workerId_;
+    instance->workerId_ = dist(gen);
+    LOG(INFO) << "Communicator workerId=" << instance->workerId_;
     auto logLevel = CudfConfig::getInstance().exchangeLogLevel;
     LOG(INFO) << "ucx-exchange VLOG level set to " << logLevel;
     if (logLevel > 0) {
@@ -67,46 +72,211 @@ std::shared_ptr<Communicator> Communicator::initAndGet(
       }
     }
     if (future) {
-      *future = instancePtr_->promise_.getSemiFuture();
+      *future = instance->promise_.getSemiFuture();
+    }
+    {
+      std::lock_guard<std::mutex> lock(instanceMutex_);
+      instancePtr_ = std::move(instance);
     }
   });
+  auto instance = tryGetInstance();
+  VELOX_CHECK_NOT_NULL(
+      instance,
+      "Communicator was shut down and cannot be reinitialized in this process");
   VELOX_CHECK_EQ(
-      instancePtr_->port_,
+      instance->port_,
       port,
       "Cannot initialize communicator again with different port");
-  return instancePtr_;
+  return instance;
 }
 
 /* static */
 std::shared_ptr<Communicator> Communicator::getInstance() {
+  auto instance = tryGetInstance();
   VELOX_CHECK_NOT_NULL(
-      instancePtr_, "Communicator not initialized. Call init(port) first.");
+      instance, "Communicator not initialized or already shut down.");
+  return instance;
+}
+
+/* static */
+std::shared_ptr<Communicator> Communicator::tryGetInstance() {
+  std::lock_guard<std::mutex> lock(instanceMutex_);
   return instancePtr_;
+}
+
+/* static */
+void Communicator::shutdown() {
+  std::lock_guard<std::mutex> shutdownLock(shutdownMutex_);
+  auto instance = tryGetInstance();
+  if (!instance) {
+    return;
+  }
+  if (!instance->releaseResourcesAfterRun()) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(instanceMutex_);
+  if (instancePtr_ == instance) {
+    instancePtr_.reset();
+  }
 }
 
 /* static */ void Communicator::cStyleListenerCallback(
     ucp_conn_request_h conn_request,
     void* arg) {
-  // cast the argument back to our instance variable:
-  Communicator* instance = static_cast<Communicator*>(arg);
-  instance->listenerCallback(conn_request);
+  try {
+    // Cast the argument back to our instance variable. Never let an exception
+    // cross the UCX C callback boundary during terminal cancellation.
+    Communicator* instance = static_cast<Communicator*>(arg);
+    if (instance == nullptr || instance->isShuttingDown()) {
+      return;
+    }
+    instance->listenerCallback(conn_request);
+  } catch (const std::exception& e) {
+    LOG(ERROR) << "Ignoring UCX listener callback during shutdown: "
+               << e.what();
+  } catch (...) {
+    LOG(ERROR) << "Ignoring unknown UCX listener callback failure during "
+                  "shutdown";
+  }
 }
 
 Communicator::~Communicator() {
+  // Normal owners call shutdown() after joining run(). Keep destruction safe
+  // during partial initialization and static finalization as a last resort.
+  (void)releaseResourcesAfterRun();
+  VLOG(3) << "Communicator destructed";
+}
+
+bool Communicator::releaseResourcesAfterRun() {
+  if (running_.load(std::memory_order_acquire)) {
+    LOG(ERROR) << "Communicator resources cannot be released before the "
+                  "progress thread is stopped and joined";
+    return false;
+  }
+  if (resourcesReleased_.load(std::memory_order_acquire)) {
+    return true;
+  }
+  shuttingDown_.store(true, std::memory_order_release);
+
+  // Stop accepting connections before releasing any element or endpoint. The
+  // worker remains alive until all UCXX-backed children have been released.
   listener_.reset();
-  // Note: worker_->flush() was removed - it only applies to RMA (Remote Memory
-  // Access) operations like ucp_put/ucp_get, which this code doesn't use.
-  // This code only uses tag send/recv and active messages.
-  worker_->progressWorkerEvent(100);
+
+  // Drop every parent-to-child reference while the singleton/local caller
+  // still keeps this Communicator alive. CommElement holds only a weak
+  // back-reference, so clearing these containers cannot re-enter this
+  // destructor.
+  std::set<std::shared_ptr<CommElement>, PtrAddressLess> elements;
+  {
+    std::lock_guard<std::mutex> lock(elemMutex_);
+    elements.swap(elements_);
+    numCommElements_.store(0, std::memory_order_relaxed);
+  }
+  for (const auto& element : elements) {
+    try {
+      element->close();
+    } catch (const std::exception& e) {
+      LOG(ERROR) << "Ignoring CommElement close failure during terminal UCX "
+                    "shutdown: "
+                 << e.what();
+    } catch (...) {
+      LOG(ERROR) << "Ignoring unknown CommElement close failure during "
+                    "terminal UCX shutdown";
+    }
+  }
+
+  workQueue_.closeAndDrain();
+  deferredEndpointCleanup_.closeAndDrain();
+  elements.clear();
+
+  std::vector<std::shared_ptr<EndpointRef>> pendingEndpoints;
+  pendingEndpoints.swap(pendingEndpointRemoval_);
+  std::map<HostPort, std::shared_ptr<EndpointRef>> endpoints;
+  {
+    std::lock_guard<std::recursive_mutex> lock(endpointsMutex_);
+    endpoints.swap(endpoints_);
+  }
+  std::map<ucp_ep_h, std::shared_ptr<EndpointRef>> acceptedEndpoints;
+  acceptedEndpoints.swap(acceptor_.handleToEndpointRef_);
+
+  // Endpoint installs a close callback whose shared callback argument is its
+  // EndpointRef, while EndpointRef owns Endpoint. Explicitly close every
+  // referenced endpoint to execute and clear that callback, breaking the
+  // ownership cycle; closeBlocking() is idempotent for duplicates.
+  // Do this outside the original maps: closeBlocking() progresses UCX and can
+  // invoke callbacks, but shutdown/status gates turn them into no-ops without
+  // re-entering a container being mutated.
+  auto closeEndpoint = [&](const std::shared_ptr<EndpointRef>& endpoint) {
+    if (!endpoint) {
+      return;
+    }
+    try {
+      if (endpoint->endpoint_ && endpoint->endpoint_->isAlive()) {
+        endpoint->endpoint_->closeBlocking();
+      }
+    } catch (const std::exception& e) {
+      LOG(ERROR) << "Ignoring endpoint close failure during terminal UCX "
+                    "shutdown: "
+                 << e.what();
+    } catch (...) {
+      LOG(ERROR) << "Ignoring unknown endpoint close failure during terminal "
+                    "UCX shutdown";
+    }
+  };
+  for (const auto& endpoint : pendingEndpoints) {
+    closeEndpoint(endpoint);
+  }
+  for (const auto& [_, endpoint] : endpoints) {
+    closeEndpoint(endpoint);
+  }
+  for (const auto& [_, endpoint] : acceptedEndpoints) {
+    closeEndpoint(endpoint);
+  }
+  pendingEndpoints.clear();
+  endpoints.clear();
+  acceptedEndpoints.clear();
+
+  if (worker_) {
+    // close() above canceled element-owned requests. Cancel any additional
+    // worker-owned AM/tag requests, then progress their callbacks while all
+    // callback payloads in deferredRequests_ are still alive.
+    try {
+      worker_->cancelInflightRequests(3'000'000'000, 3);
+      for (int attempt = 0; attempt < 3; ++attempt) {
+        worker_->progress();
+      }
+    } catch (const std::exception& e) {
+      LOG(ERROR) << "Ignoring worker cancellation failure during terminal "
+                    "UCX shutdown: "
+                 << e.what();
+    } catch (...) {
+      LOG(ERROR) << "Ignoring unknown worker cancellation failure during "
+                    "terminal UCX shutdown";
+    }
+  }
+  const auto incompleteRequests = std::count_if(
+      deferredRequests_.begin(),
+      deferredRequests_.end(),
+      [](const auto& request) { return !request->isCompleted(); });
+  if (incompleteRequests > 0) {
+    LOG(WARNING) << "UCX terminal shutdown retained " << incompleteRequests
+                 << " incomplete request(s) until worker destruction";
+  }
+  deferredRequests_.clear();
+
   worker_.reset();
   context_.reset();
-  VLOG(3) << "Communicator destructed";
+  resourcesReleased_.store(true, std::memory_order_release);
+  return true;
 }
 
 /// @brief Run doesn't return until stop() is called.
 /// All operations of the communicator will be carried out in the thread
 /// that calls run.
 void Communicator::run() {
+  // Name the UCX progress thread so it is identifiable in nsys / thread dumps
+  // (it carries all cross-peer send/recv progress and the rendezvous waits).
+  folly::setThreadName("ucx-progress");
   VLOG(3) << "Using error handling mode: "
           << CudfConfig::getInstance().ucxxErrorHandling << std::endl;
   VLOG(3) << "Using blocking progress mode: "
@@ -126,6 +296,11 @@ void Communicator::run() {
   } else {
     context_ = ucxx::createContext({}, UCP_FEATURE_TAG | UCP_FEATURE_AM);
   }
+  LOG(INFO) << "UCX CUDA transport support="
+            << (context_->hasCudaSupport() ? "enabled" : "disabled")
+            << "; remote transfers will use "
+            << (context_->hasCudaSupport() ? "direct device buffers"
+                                           : "host staging");
 
   worker_ = context_->createWorker();
 
@@ -189,6 +364,8 @@ void Communicator::run() {
                 << " workItemsProcessed=" << workItemsProcessed_
                 << " GPU=" << gpuUsedMB << "/" << gpuTotalMB << "MB"
                 << " (free=" << gpuFreeMB << "MB)";
+        VELOX_DCHECK_EQ(
+            numCommElements_.load(std::memory_order_relaxed), elements_.size());
         workItemsProcessed_ = 0;
         lastHeartbeat_ = now;
       }
@@ -199,11 +376,12 @@ void Communicator::run() {
       // this main loop via deferEndpointCleanup().
       while (auto ep = deferredEndpointCleanup_.pop()) {
         VLOG(3) << "Processing deferred endpoint cleanup";
-        // First, close all communicators associated with this endpoint.
-        // This must happen before removeEndpointRef() which may destroy
-        // the endpoint.
+        // Ask all communication elements to close, but don't closeBlocking()
+        // the endpoint yet. Source close() schedules cleanUp() on the work
+        // queue; closing the endpoint first turns those cleanups into
+        // connection resets and hides the original producer-side error.
         ep->closeAndDrainCommunicators();
-        removeEndpointRef(ep);
+        pendingEndpointRemoval_.push_back(std::move(ep));
       }
 
       // Process the work queue. Make sure that communication is progressed
@@ -218,6 +396,13 @@ void Communicator::run() {
         worker_->progress();
       }
 
+      if (!pendingEndpointRemoval_.empty()) {
+        for (auto& ep : pendingEndpointRemoval_) {
+          removeEndpointRef(ep);
+        }
+        pendingEndpointRemoval_.clear();
+      }
+
       // Clean up deferred requests that UCX has fully processed.
       // These are cancelled requests whose GPU buffers needed to stay
       // alive until UCX finished any in-flight operations on them.
@@ -229,13 +414,21 @@ void Communicator::run() {
                 [](const auto& req) { return req->isCompleted(); }),
             deferredRequests_.end());
       }
-
       // All queues are drained. Now wait for UCXX network events.
       // In blocking mode, this will block until a UCXX event arrives
       // or worker_->signal() is called (from addToWorkQueue,
       // deferEndpointCleanup, or stop).
       if (blockingMode) {
-        worker_->progressWorkerEvent(0);
+        // CUDA IPC/copy completions are not guaranteed to signal the UCX
+        // worker event fd. Busy-progress while an exchange or a deferred
+        // request is active; otherwise a rendezvous can sleep until an
+        // unrelated signal arrives and serialize large GPU shuffles. Once the
+        // communicator is idle, retain the indefinite wait to avoid burning a
+        // CPU core per executor.
+        const bool needsBusyProgress =
+            numCommElements_.load(std::memory_order_relaxed) > 0 ||
+            !deferredRequests_.empty();
+        worker_->progressWorkerEvent(needsBusyProgress ? 0 : -1);
       } else {
         worker_->progress();
       }
@@ -249,20 +442,28 @@ void Communicator::run() {
 
 /// @brief Stops the communicator, called from an outside thread.
 void Communicator::stop() {
+  shuttingDown_.store(true, std::memory_order_release);
   running_.store(false);
   signalWorker();
   // Only log fields that are safe to read from an outside thread.
   // endpoints_ is only accessed from the Communicator thread, so reading
   // it here would be a data race.
   VLOG(3) << "In Communicator::stop "
-          << " elements_.size(): " << elements_.size()
+          << " elements: " << numCommElements_.load(std::memory_order_relaxed)
           << " workQueue_.size(): " << workQueue_.size();
 }
 
 void Communicator::registerCommElement(std::shared_ptr<CommElement> comms) {
+  if (shuttingDown_.load(std::memory_order_acquire)) {
+    return;
+  }
   std::lock_guard<std::mutex> lock(elemMutex_);
+  if (shuttingDown_.load(std::memory_order_acquire)) {
+    return;
+  }
   auto ret = elements_.insert(comms);
   VELOX_CHECK(ret.second, "CommElement already registered!");
+  numCommElements_.fetch_add(1, std::memory_order_relaxed);
   // Also put the comms element into the work queue.
   workQueue_.push(comms);
   signalWorker();
@@ -275,7 +476,7 @@ void Communicator::signalWorker() {
 }
 
 void Communicator::addToWorkQueue(std::shared_ptr<CommElement> comms) {
-  if (!comms) {
+  if (!comms || shuttingDown_.load(std::memory_order_acquire)) {
     return;
   }
   workQueue_.push(comms);
@@ -288,12 +489,19 @@ void Communicator::unregister(std::shared_ptr<CommElement> comms) {
     return;
   }
   workQueue_.erase(comms);
-  elements_.erase(comms);
+  if (elements_.erase(comms) > 0) {
+    const auto previous =
+        numCommElements_.fetch_sub(1, std::memory_order_relaxed);
+    VELOX_DCHECK_GT(previous, 0);
+  }
 }
 
 std::shared_ptr<EndpointRef> Communicator::assocEndpointRef(
     std::shared_ptr<CommElement> comms,
     HostPort hostPort) {
+  if (shuttingDown_.load(std::memory_order_acquire)) {
+    return nullptr;
+  }
   std::lock_guard<std::recursive_mutex> lock(endpointsMutex_);
   auto it = endpoints_.find(hostPort);
   if (it != endpoints_.end()) {
@@ -308,7 +516,8 @@ std::shared_ptr<EndpointRef> Communicator::assocEndpointRef(
       CudfConfig::getInstance().ucxxErrorHandling);
   std::shared_ptr<EndpointRef> epRef = nullptr;
   if (ep != nullptr) {
-    epRef = std::make_shared<EndpointRef>(ep);
+    epRef = std::make_shared<EndpointRef>(
+        ep, hostPort.hostname, std::to_string(hostPort.port));
     epRef->addCommElem(comms);
     if (CudfConfig::getInstance().ucxxErrorHandling) {
       ep->setCloseCallback(EndpointRef::onClose, epRef);
@@ -320,8 +529,10 @@ std::shared_ptr<EndpointRef> Communicator::assocEndpointRef(
 
 void Communicator::removeEndpointRef(std::shared_ptr<EndpointRef> ep) {
   std::lock_guard<std::recursive_mutex> lock(endpointsMutex_);
-  VLOG(3) << "In Communicator::removeEndpointRef for Communicator with port = "
-          << Communicator::getInstance()->port_;
+  VLOG(2) << "[UCX-COMM-REMOVE-ENDPOINT] listenerPort=" << port_
+          << " peer=" << (ep ? ep->getPeerAddress() : "(unknown)")
+          << " endpointAlive="
+          << (ep && ep->endpoint_ && ep->endpoint_->isAlive());
 
   // Close the endpoint if it's still alive.
   // NOTE: This calls closeBlocking() which progresses the worker internally,
@@ -339,6 +550,14 @@ void Communicator::removeEndpointRef(std::shared_ptr<EndpointRef> ep) {
       ++it;
     }
   }
+  for (auto it = acceptor_.handleToEndpointRef_.begin();
+       it != acceptor_.handleToEndpointRef_.end();) {
+    if (it->second == ep) {
+      it = acceptor_.handleToEndpointRef_.erase(it);
+    } else {
+      ++it;
+    }
+  }
   VLOG(3) << "- Communicator::removeEndpointRef";
 }
 
@@ -346,13 +565,21 @@ void Communicator::deferEndpointCleanup(std::shared_ptr<EndpointRef> ep) {
   // This method is safe to call from UCX callbacks because it doesn't
   // call any blocking/progress functions. The actual cleanup happens
   // in the main run() loop.
-  VLOG(3) << "Deferring endpoint cleanup to main loop";
+  VLOG(2) << "[UCX-COMM-DEFER-ENDPOINT-CLEANUP] peer="
+          << (ep ? ep->getPeerAddress() : "(unknown)") << " endpointAlive="
+          << (ep && ep->endpoint_ && ep->endpoint_->isAlive());
+  if (shuttingDown_.load(std::memory_order_acquire)) {
+    return;
+  }
   deferredEndpointCleanup_.push(ep);
   signalWorker();
 }
 
 void Communicator::deferRequestCleanup(std::shared_ptr<ucxx::Request> request) {
-  if (request) {
+  // Terminal element close() also deposits canceled requests here after the
+  // progress thread has joined. Keep their callback payloads alive until the
+  // finalizer has progressed worker cancellation.
+  if (request && worker_) {
     deferredRequests_.push_back(std::move(request));
   }
 }
@@ -386,6 +613,9 @@ uint16_t Communicator::getListenerPort() const {
 
 /// @brief The callback method that is invoked when a client connects.
 void Communicator::listenerCallback(ucp_conn_request_h conn_request) {
+  if (shuttingDown_.load(std::memory_order_acquire)) {
+    return;
+  }
   char ip_str[INET6_ADDRSTRLEN];
   char port_str[INET6_ADDRSTRLEN];
   ucp_conn_request_attr_t attr{};
@@ -404,8 +634,9 @@ void Communicator::listenerCallback(ucp_conn_request_h conn_request) {
   // outgoing endpoints are represented using the EndpointRef.
   auto endpoint = listener_->createEndpointFromConnRequest(
       conn_request, CudfConfig::getInstance().ucxxErrorHandling);
-  // Pass the peer's actual IP to EndpointRef for reliable intra-node detection.
-  auto epRef = std::make_shared<EndpointRef>(endpoint, std::string(ip_str));
+  // Pass the peer's actual address to EndpointRef for diagnostics.
+  auto epRef = std::make_shared<EndpointRef>(
+      endpoint, std::string(ip_str), std::string(port_str));
   if (CudfConfig::getInstance().ucxxErrorHandling) {
     endpoint->setCloseCallback(EndpointRef::onClose, epRef);
   }

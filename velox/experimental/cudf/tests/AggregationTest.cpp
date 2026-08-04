@@ -16,17 +16,46 @@
 
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/AggregationRegistry.h"
+#include "velox/experimental/cudf/exec/CudfGroupby.h"
+#include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/PrestoAggregateFunctions.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
+#include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
+#include "velox/experimental/cudf/tests/utils/CudfStreamTestUtils.h"
+#include "velox/experimental/cudf/vector/CudfVector.h"
 
 #include "velox/dwio/common/tests/utils/BatchMaker.h"
+#include "velox/exec/Driver.h"
 #include "velox/exec/PlanNodeStats.h"
+#include "velox/exec/Task.h"
 #include "velox/exec/tests/utils/AssertQueryBuilder.h"
 #include "velox/exec/tests/utils/OperatorTestBase.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
 #include "velox/type/Timestamp.h"
 
+#include <cudf/contiguous_split.hpp>
+
+#include <rmm/cuda_stream.hpp>
+#include <rmm/resource_ref.hpp>
+
 #include <cmath>
+
+namespace facebook::velox::cudf_velox::test {
+
+class CudfGroupbyTestHelper {
+ public:
+  static rmm::cuda_stream_view stateStream(const CudfGroupby& groupby) {
+    return groupby.stateStream_;
+  }
+
+  static void prepareInputForStateStream(
+      CudfGroupby& groupby,
+      const CudfVectorPtr& input) {
+    groupby.prepareInputForStateStream(input);
+  }
+};
+
+} // namespace facebook::velox::cudf_velox::test
 
 namespace facebook::velox::exec::test {
 
@@ -990,7 +1019,160 @@ TEST_F(AggregationTest, partialAggregationMemoryLimit) {
           .customStats.count("flushRowCount"));
 }
 
-TEST_F(AggregationTest, finalAggregationStreamsOnAddInput) {
+TEST_F(AggregationTest, partialAggregationUsesBalancedRunMerges) {
+  std::vector<RowVectorPtr> vectors;
+  constexpr int32_t kBatches = 8;
+  constexpr int32_t kRowsPerBatch = 100;
+  for (int32_t batch = 0; batch < kBatches; ++batch) {
+    vectors.push_back(makeRowVector(
+        {makeFlatVector<int64_t>(
+             kRowsPerBatch,
+             [batch](vector_size_t row) {
+               return static_cast<int64_t>(batch) * kRowsPerBatch + row;
+             }),
+         makeFlatVector<int64_t>(
+             kRowsPerBatch, [](vector_size_t row) { return row + 1; })}));
+  }
+  createDuckDbTable(vectors);
+
+  core::PlanNodeId partialAggId;
+  auto task = AssertQueryBuilder(duckDbQueryRunner_)
+                  .maxDrivers(1)
+                  .plan(
+                      PlanBuilder()
+                          .values(vectors)
+                          .partialAggregation({"c0"}, {"sum(c1)"})
+                          .capturePlanNodeId(partialAggId)
+                          .finalAggregation()
+                          .planNode())
+                  .assertResults("SELECT c0, sum(c1) FROM tmp GROUP BY c0");
+
+  const auto planStats = toPlanStats(task->taskStats());
+  const auto& stats = planStats.at(partialAggId).customStats;
+  std::string availableStats;
+  for (const auto& [nodeId, nodeStats] : planStats) {
+    for (const auto& [statName, unused] : nodeStats.customStats) {
+      availableStats += nodeId + ":" + statName + ",";
+    }
+  }
+  for (const auto* statName :
+       {"cudfIntermediateAggregationInputRuns",
+        "cudfIntermediateAggregationRunMerges",
+        "cudfIntermediateAggregationMergeRows"}) {
+    ASSERT_EQ(stats.count(statName), 1)
+        << "Missing runtime stat: " << statName
+        << "; available stats: " << availableStats;
+  }
+  EXPECT_EQ(stats.at("cudfIntermediateAggregationInputRuns").sum, kBatches);
+  EXPECT_EQ(stats.at("cudfIntermediateAggregationRunMerges").sum, kBatches - 1);
+  // With disjoint keys, balanced merges process 800 rows at each of the three
+  // levels. Repeatedly merging the complete accumulated state would process
+  // 3,500 rows for the same eight pages.
+  EXPECT_EQ(stats.at("cudfIntermediateAggregationMergeRows").sum, 2400);
+  EXPECT_EQ(stats.count("cudfIntermediateAggregationFinalizeMerges"), 0);
+}
+
+class FinalAggregationStreamingTest : public AggregationTest {
+ protected:
+  class ScopedStreamingCapacity {
+   public:
+    explicit ScopedStreamingCapacity(int32_t capacity)
+        : previousCapacity_(
+              cudf_velox::CudfConfig::getInstance()
+                  .groupbyStreamingMaxDistinctKeys) {
+      cudf_velox::CudfConfig::getInstance().groupbyStreamingMaxDistinctKeys =
+          capacity;
+    }
+
+    ~ScopedStreamingCapacity() {
+      cudf_velox::CudfConfig::getInstance().groupbyStreamingMaxDistinctKeys =
+          previousCapacity_;
+    }
+
+   private:
+    const int32_t previousCapacity_;
+  };
+
+  template <typename Stats>
+  void assertStreamingFinalStats(const Stats& finalStats) {
+    EXPECT_GT(finalStats.at("cudfFinalStreamingBatches").sum, 1);
+    EXPECT_GT(finalStats.at("cudfFinalStreamingInputRows").sum, 0);
+    EXPECT_GT(finalStats.at("cudfFinalStreamingDistinctKeys").sum, 0);
+    EXPECT_GT(finalStats.at("cudfFinalStreamingOutputRows").sum, 0);
+    EXPECT_EQ(finalStats.count("cudfFinalAggregationInputRuns"), 0);
+  }
+
+  // These tests have at most 1,000 input rows. Keep the capacity small so they
+  // exercise persistent streaming state without changing the singleton for
+  // any other test. The member destructor restores the prior value even when
+  // a fatal assertion or exception exits a test early.
+  ScopedStreamingCapacity streamingCapacity_{4096};
+};
+
+TEST_F(
+    FinalAggregationStreamingTest,
+    finalAggregationRebindsPackedInputWithMatchingLogicalStream) {
+  auto rawInput = makeRowVector(
+      {makeFlatVector<int64_t>({1, 2}), makeFlatVector<int64_t>({10, 20})});
+  auto plan = PlanBuilder()
+                  .values({rawInput})
+                  .partialAggregation({"c0"}, {"count(c1)"})
+                  .finalAggregation()
+                  .planNode();
+  auto finalNode = std::dynamic_pointer_cast<const core::AggregationNode>(plan);
+  ASSERT_NE(finalNode, nullptr);
+
+  auto task = Task::create(
+      "final-aggregation-packed-input-stream",
+      core::PlanFragment{plan},
+      0,
+      core::QueryCtx::create(executor_.get()),
+      Task::ExecutionMode::kParallel);
+  DriverCtx driverCtx(task, 0, 0, 0, 0);
+  cudf_velox::CudfGroupby groupby(1, &driverCtx, finalNode);
+  const auto stateStream =
+      cudf_velox::test::CudfGroupbyTestHelper::stateStream(groupby);
+
+  rmm::cuda_stream allocationStream{rmm::cuda_stream::flags::non_blocking};
+  ASSERT_NE(allocationStream.value(), stateStream.value());
+  const auto inputType = finalNode->sources()[0]->outputType();
+  auto intermediateInput = makeRowVector(
+      inputType->names(),
+      {makeFlatVector<int64_t>({1, 2}), makeFlatVector<int64_t>({3, 4})});
+  auto table = cudf_velox::with_arrow::toCudfTable(
+      intermediateInput,
+      pool(),
+      allocationStream.view(),
+      cudf_velox::get_output_mr());
+
+  cudf_velox::test::RecordingAsyncDeviceResource recordingResource{
+      /*deferDeallocations=*/true};
+  auto packedColumns = cudf::pack(
+      table->view(),
+      allocationStream.view(),
+      rmm::to_device_async_resource_ref_checked(&recordingResource));
+  allocationStream.synchronize();
+  auto packedView = cudf::unpack(packedColumns);
+  auto packedTable = std::make_unique<cudf::packed_table>(
+      cudf::packed_table{packedView, std::move(packedColumns)});
+  auto packedInput = std::make_shared<cudf_velox::CudfVector>(
+      pool(),
+      inputType,
+      packedTable->table.num_rows(),
+      std::move(packedTable),
+      stateStream);
+  recordingResource.reset();
+
+  cudf_velox::test::CudfGroupbyTestHelper::prepareInputForStateStream(
+      groupby, packedInput);
+  packedInput.reset();
+  stateStream.synchronize();
+  EXPECT_GT(recordingResource.deallocationCount(), 0);
+  EXPECT_EQ(recordingResource.lastDeallocationStream(), stateStream.value());
+  recordingResource.releaseDeferred();
+}
+
+TEST_F(FinalAggregationStreamingTest, finalAggregationStreamsOnAddInput) {
   auto vectors = {
       makeRowVector({makeFlatVector<int32_t>(
           100, [](auto row) { return row; }, nullEvery(5))}),
@@ -1022,9 +1204,86 @@ TEST_F(AggregationTest, finalAggregationStreamsOnAddInput) {
   const auto planStats = toPlanStats(task->taskStats());
   EXPECT_GT(planStats.at(partialAggId).customStats.at("flushRowCount").sum, 0);
   EXPECT_GT(planStats.at(finalAggId).outputRows, 0);
+  assertStreamingFinalStats(planStats.at(finalAggId).customStats);
 }
 
-TEST_F(AggregationTest, finalAggregationStreamingMixedAggs) {
+TEST_F(FinalAggregationStreamingTest, finalAggregationLevelledRuns) {
+  ScopedStreamingCapacity levelledCapacity{0};
+  auto vectors = {
+      makeRowVector(
+          {makeFlatVector<int32_t>(100, [](auto row) { return row % 17; })}),
+      makeRowVector({makeFlatVector<int32_t>(
+          110, [](auto row) { return (row + 7) % 17; })}),
+      makeRowVector({makeFlatVector<int32_t>(
+          90, [](auto row) { return (row + 13) % 17; })}),
+  };
+  createDuckDbTable(vectors);
+
+  core::PlanNodeId finalAggId;
+  auto task = AssertQueryBuilder(duckDbQueryRunner_)
+                  .config(QueryConfig::kMaxPartialAggregationMemory, 1)
+                  .plan(
+                      PlanBuilder()
+                          .values(vectors)
+                          .partialAggregation({"c0"}, {"sum(c0)"})
+                          .finalAggregation()
+                          .capturePlanNodeId(finalAggId)
+                          .planNode())
+                  .assertResults("SELECT c0, sum(c0) FROM tmp GROUP BY c0");
+
+  const auto planStats = toPlanStats(task->taskStats());
+  const auto finalStatsIt =
+      std::find_if(planStats.begin(), planStats.end(), [](const auto& entry) {
+        return entry.second.customStats.contains(
+            "cudfFinalAggregationInputRuns");
+      });
+  ASSERT_NE(finalStatsIt, planStats.end());
+  const auto& finalStats = finalStatsIt->second.customStats;
+  ASSERT_TRUE(finalStats.contains("cudfFinalAggregationRunMerges"));
+  EXPECT_GT(finalStats.at("cudfFinalAggregationInputRuns").sum, 1);
+  EXPECT_GT(finalStats.at("cudfFinalAggregationRunMerges").sum, 0);
+  EXPECT_EQ(finalStats.count("cudfFinalStreamingBatches"), 0);
+}
+
+TEST_F(
+    FinalAggregationStreamingTest,
+    companionFinalAggregationUsesLevelledRuns) {
+  ScopedStreamingCapacity levelledCapacity{0};
+  auto vectors = {
+      makeRowVector(
+          {makeFlatVector<int64_t>(100, [](auto row) { return row % 17; }),
+           makeFlatVector<int64_t>(100, [](auto row) { return row + 1; })}),
+      makeRowVector(
+          {makeFlatVector<int64_t>(110, [](auto row) { return row % 17; }),
+           makeFlatVector<int64_t>(110, [](auto row) { return row + 101; })}),
+      makeRowVector(
+          {makeFlatVector<int64_t>(90, [](auto row) { return row % 17; }),
+           makeFlatVector<int64_t>(90, [](auto row) { return row + 211; })}),
+  };
+  createDuckDbTable(vectors);
+
+  core::PlanNodeId finalAggId;
+  auto task =
+      AssertQueryBuilder(duckDbQueryRunner_)
+          .config(QueryConfig::kMaxPartialAggregationMemory, 1)
+          .plan(
+              PlanBuilder()
+                  .values(vectors)
+                  .partialAggregation({"c0"}, {"sum_partial(c1)"})
+                  .finalAggregation(
+                      {"c0"}, {"sum_merge_extract_BIGINT(a0)"}, {{BIGINT()}})
+                  .capturePlanNodeId(finalAggId)
+                  .planNode())
+          .assertResults("SELECT c0, sum(c1) FROM tmp GROUP BY c0");
+
+  const auto planStats = toPlanStats(task->taskStats());
+  const auto& finalStats = planStats.at(finalAggId).customStats;
+  EXPECT_GT(finalStats.at("cudfFinalAggregationInputRuns").sum, 1);
+  EXPECT_GT(finalStats.at("cudfFinalAggregationRunMerges").sum, 0);
+  EXPECT_EQ(finalStats.count("cudfFinalStreamingBatches"), 0);
+}
+
+TEST_F(FinalAggregationStreamingTest, finalAggregationStreamingMixedAggs) {
   auto vectors = makeVectors(rowType_, 10, 100);
   createDuckDbTable(vectors);
 
@@ -1046,9 +1305,10 @@ TEST_F(AggregationTest, finalAggregationStreamingMixedAggs) {
 
   const auto planStats = toPlanStats(task->taskStats());
   EXPECT_GT(planStats.at(finalAggId).outputRows, 0);
+  assertStreamingFinalStats(planStats.at(finalAggId).customStats);
 }
 
-TEST_F(AggregationTest, finalAggregationStreamingMultiKey) {
+TEST_F(FinalAggregationStreamingTest, finalAggregationStreamingMultiKey) {
   auto vectors = makeVectors(rowType_, 10, 100);
   createDuckDbTable(vectors);
 
@@ -1070,6 +1330,7 @@ TEST_F(AggregationTest, finalAggregationStreamingMultiKey) {
 
   const auto planStats = toPlanStats(task->taskStats());
   EXPECT_GT(planStats.at(finalAggId).outputRows, 0);
+  assertStreamingFinalStats(planStats.at(finalAggId).customStats);
 }
 
 class EmptyInputAggregationTest : public AggregationTest {

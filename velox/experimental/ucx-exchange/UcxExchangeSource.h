@@ -32,8 +32,8 @@
 
 #include <rmm/cuda_stream_pool.hpp>
 #include <rmm/cuda_stream_view.hpp>
+#include <rmm/device_buffer.hpp>
 #include <rmm/mr/cuda_memory_resource.hpp>
-#include <rmm/mr/device_memory_resource.hpp>
 #include <rmm/mr/pool_memory_resource.hpp>
 
 namespace facebook::velox::ucx_exchange {
@@ -70,6 +70,7 @@ class UcxExchangeSource
     WaitingForHandshakeResponse,
     ReadyToReceive,
     WaitingForMetadata,
+    WaitingForReceiveCredit,
     WaitingForData,
     WaitingForIntraNodeData,
     Done,
@@ -99,6 +100,11 @@ class UcxExchangeSource
   /// once it received enough data.
   void close();
 
+  /// Fails a live source because its transport endpoint closed unexpectedly,
+  /// then schedules the ordinary source cleanup. Unlike close(), this records
+  /// an exchange error so a rejected handshake cannot look like an empty input.
+  void closeWithError(std::string error);
+
   /// @brief Marks this source as registered with the exchange queue.
   /// Must be called after addSourceLocked() increments numSources_ for this
   /// source. Without this, deliverEndMarker() will not enqueue the nullptr
@@ -115,6 +121,17 @@ class UcxExchangeSource
   // Backpressure thresholds. Public so UcxExchangeClient can use them.
   static constexpr int32_t kBackpressureHighWaterMark = 32;
   static constexpr int32_t kBackpressureLowWaterMark = 16;
+
+  // Aggregate in-flight RECEIVE byte cap (in addition to the count caps above).
+  // Each source can own a queued device buffer independently of downstream
+  // consumption. Without a byte bound these buffers (one UcxExchangeSource per
+  // producer peer) scale O(#peers) and collectively exhaust the GPU at 4 peers
+  // (OOM at concurrentGpuTasks=2, deadlock at =1). Remote receives use a
+  // dedicated fresh cudaMalloc resource so UCX writes cannot race with
+  // stream-ordered reuse in the cuDF compute pool. Read once; env-overridable
+  // via
+  // GLUTEN_UCX_MAX_INFLIGHT_RECV_BYTES (default 8 GiB).
+  static int64_t maxInFlightRecvBytes();
 
   // Returns runtime statistics. ExchangeSource is expected to report
   // background CPU time by including a runtime metric named
@@ -145,8 +162,22 @@ class UcxExchangeSource
   struct DataAndMetadata {
     MetadataMsg metadata;
     std::unique_ptr<rmm::device_buffer> dataBuf;
+    std::shared_ptr<std::vector<uint8_t>> hostData;
     rmm::cuda_stream_view stream; // The stream used to allocate dataBuf
   };
+
+  // Metadata receives are strictly serial for a source. Reuse one fixed-size
+  // receive buffer instead of allocating a new 1 MiB mapping per packet.
+  // Some UCXX request internals outlive the user callback, so per-packet
+  // buffers otherwise accumulate until exchange teardown.
+  std::shared_ptr<std::vector<uint8_t>> metadataReceiveBuffer_;
+
+  // Data receives are also strictly serial for a source. Keep one pageable
+  // staging allocation and use synchronous CUDA copies. Explicit pinned
+  // allocations trigger a PCI SERR on this host, while async copies from
+  // pageable per-packet buffers make the CUDA runtime retain implicit pinned
+  // staging mappings.
+  std::shared_ptr<std::vector<uint8_t>> dataReceiveBuffer_;
 
   /// @brief The constructor is private in order to ensure that exchange sources
   /// are always generated through a shared pointer. This ensures that
@@ -172,8 +203,12 @@ class UcxExchangeSource
   /// @return A shared pointer to itself.
   std::shared_ptr<UcxExchangeSource> getSelfPtr();
 
+  /// Re-enqueues this source if the Communicator is still accepting work.
+  /// Safe for UCXX and registry callbacks during shutdown.
+  void wakeCommunicator();
+
   // Put the received data into the exchange queue.
-  void enqueue(PackedTableWithStreamPtr data);
+  void enqueue(PackedTableWithStreamPtr data, int64_t reservedReceiveBytes = 0);
 
   /// @brief Sets the endpoint for this receiver.
   void setEndpoint(std::shared_ptr<EndpointRef> endpointRef);
@@ -194,6 +229,12 @@ class UcxExchangeSource
   /// @param arg the serialized form of the metadata
   void onMetadata(ucs_status_t status, std::shared_ptr<void> arg);
 
+  /// @brief Reserves receive credit and posts the data receive for a metadata
+  /// packet that has already arrived.
+  bool tryStartDataReceive(
+      const std::shared_ptr<DataAndMetadata>& ptr,
+      ReceiverState expectedState);
+
   /// @brief Called by the transport layer when data is available
   /// @param status indication by transport layer of transfer status
   /// @param arg
@@ -213,7 +254,10 @@ class UcxExchangeSource
   /// @brief For intra-node transfer: handles data retrieved from registry.
   /// @param data The packed_columns from registry (nullptr if atEnd or error)
   /// @param atEnd True if this is end-of-stream
-  void onIntraNodeData(std::shared_ptr<cudf::packed_columns> data, bool atEnd);
+  void onIntraNodeData(
+      std::shared_ptr<cudf::packed_columns> data,
+      rmm::cuda_stream_view producerStream,
+      bool atEnd);
 
   /// @brief Sets the new state of this exchange source using
   /// sequential consistency. Logs transitions at VLOG(2).
@@ -234,6 +278,8 @@ class UcxExchangeSource
   /// Returns early without enqueuing if the source was never registered
   /// with the queue (i.e., registered_ is false).
   void deliverEndMarker();
+
+  void releaseReceiveReservation();
 
   /// @brief Sets the state to "desired" if and only if the current
   /// state is "expected".
@@ -283,6 +329,9 @@ class UcxExchangeSource
   // goes dormant. The consumer thread wakes it via resumeFromBackpressure()
   // when the queue drains to kBackpressureLowWaterMark.
   std::atomic<bool> backpressureActive_{false};
+  std::shared_ptr<DataAndMetadata> pendingReceive_;
+  int64_t reservedReceiveBytes_{0};
+  int64_t reservedGlobalHostReceiveBytes_{0};
 
   // Some metrics/counters:
   UcxExchangeMetrics metrics_;
@@ -292,6 +341,13 @@ class UcxExchangeSource
   // NOTE: The request owns/holds a reference to the upcall function
   // and must therefore exist until the upcall is done.
   std::shared_ptr<ucxx::Request> request_{nullptr};
+
+  // Keep the active-message payload alive until the peer acknowledges the
+  // handshake.  UCXX reports local AM completion before the receiver callback
+  // has necessarily copied an eager payload under a large burst of sources.
+  // Releasing this at local completion can therefore let the allocator reuse
+  // the buffer while the peer is still decoding it.
+  std::shared_ptr<HandshakeMsg> handshakeRequestBuffer_{nullptr};
 
   // Completed UCXX requests are kept alive here to prevent use-after-free.
   // UCP's ucp_wireup_replay_pending_requests can fire callbacks on already-

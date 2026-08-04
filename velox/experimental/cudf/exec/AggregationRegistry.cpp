@@ -248,6 +248,10 @@ void registerCommonAggregationFunctions(
 
   auto minMaxSignatures = std::vector<exec::FunctionSignaturePtr>{
       FunctionSignatureBuilder()
+          .returnType("boolean")
+          .argumentType("boolean")
+          .build(),
+      FunctionSignatureBuilder()
           .returnType("tinyint")
           .argumentType("tinyint")
           .build(),

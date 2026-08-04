@@ -81,8 +81,47 @@ using facebook::velox::cudf_velox::validateIntermediateColumnType;
   };
 
 DEFINE_SIMPLE_REDUCE_AGGREGATOR(Sum, sum)
-DEFINE_SIMPLE_REDUCE_AGGREGATOR(Min, min)
-DEFINE_SIMPLE_REDUCE_AGGREGATOR(Max, max)
+
+std::unique_ptr<cudf::column> reduceMinMaxWithInputType(
+    cudf::column_view inputCol,
+    const cudf::reduce_aggregation& aggRequest,
+    TypePtr const& outputType,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) {
+  auto const resultScalar = cudf::reduce(
+      inputCol, aggRequest, inputCol.type(), stream, get_temp_mr());
+  auto resultCol = cudf::make_column_from_scalar(*resultScalar, 1, stream, mr);
+  auto const cudfOutputType = cudf_velox::veloxToCudfDataType(outputType);
+  if (resultCol->type() != cudfOutputType) {
+    resultCol = cudf::cast(resultCol->view(), cudfOutputType, stream, mr);
+  }
+  return resultCol;
+}
+
+#define DEFINE_MIN_MAX_REDUCE_AGGREGATOR(Name, name)                      \
+  struct Reduce##Name##Aggregator : ReduceAggregator {                    \
+    Reduce##Name##Aggregator(                                             \
+        core::AggregationNode::Step step,                                 \
+        uint32_t inputIndex,                                              \
+        VectorPtr constant,                                               \
+        const TypePtr& resultType)                                        \
+        : ReduceAggregator(step, inputIndex, constant, resultType) {}     \
+                                                                          \
+    std::unique_ptr<cudf::column> doReduce(                               \
+        cudf::table_view const& input,                                    \
+        TypePtr const& outputType,                                        \
+        vector_size_t /* inputRowCount */,                                \
+        rmm::cuda_stream_view stream,                                     \
+        rmm::device_async_resource_ref mr) override {                     \
+      auto const aggRequest =                                             \
+          cudf::make_##name##_aggregation<cudf::reduce_aggregation>();    \
+      return reduceMinMaxWithInputType(                                   \
+          input.column(inputIndex), *aggRequest, outputType, stream, mr); \
+    }                                                                     \
+  };
+
+DEFINE_MIN_MAX_REDUCE_AGGREGATOR(Min, min)
+DEFINE_MIN_MAX_REDUCE_AGGREGATOR(Max, max)
 
 struct ReduceCountAggregator : ReduceAggregator {
   ReduceCountAggregator(
@@ -826,6 +865,8 @@ void CudfReduce::initialize() {
   auto aggregationInput = buildAggregationInputChannels(
       *aggregationNode_, *operatorCtx_, inputRowSchema, emptyKeys);
   aggregationInputChannels_ = std::move(aggregationInput.channels);
+  precomputedInputEvaluators_ = createAggregationInputEvaluators(
+      aggregationInput.precomputedInputs, *operatorCtx_, inputRowSchema);
   aggregators_ = toReduceAggregators(
       *aggregationNode_,
       aggregationNode_->step(),
@@ -897,9 +938,15 @@ RowVectorPtr CudfReduce::doGetOutput() {
 
   VELOX_CHECK_NOT_NULL(tbl);
 
-  auto tableView = tbl->view().num_columns() == 0
-      ? tbl->view()
-      : tbl->view().select(
+  auto preparedInput = prepareAggregationInput(
+      tbl->view(),
+      tbl->num_rows(),
+      precomputedInputEvaluators_,
+      stream,
+      get_temp_mr());
+  auto tableView = preparedInput.tableView.num_columns() == 0
+      ? preparedInput.tableView
+      : preparedInput.tableView.select(
             aggregationInputChannels_.begin(), aggregationInputChannels_.end());
   auto output = doGlobalAggregation(tableView, stream, get_output_mr());
   if (isPartialOutput_ && !noMoreInput_) {

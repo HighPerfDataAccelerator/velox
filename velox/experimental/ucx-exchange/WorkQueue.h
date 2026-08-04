@@ -29,10 +29,15 @@ class WorkQueue {
   WorkQueue(const WorkQueue&) = delete;
   WorkQueue& operator=(const WorkQueue&) = delete;
 
-  // push always succeeds; never blocks
-  void push(std::shared_ptr<T> item) {
+  // Push never blocks. It returns false after terminal shutdown has closed the
+  // queue, preventing a check-then-push race with closeAndDrain().
+  bool push(std::shared_ptr<T> item) {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (closed_) {
+      return false;
+    }
     queue_.emplace_back(std::move(item));
+    return true;
   }
 
   // pop never blocks; returns nullptr if empty
@@ -47,16 +52,25 @@ class WorkQueue {
     return item;
   }
 
-  // remove an element from the queue.
+  // Remove all copies of an element from the queue. Work items can be queued
+  // repeatedly, so removing only the first leaves a hidden owning reference.
   bool erase(std::shared_ptr<T> item) {
-    bool erased = false;
     std::lock_guard<std::mutex> lock(mutex_);
-    auto it = std::find(queue_.begin(), queue_.end(), item);
-    if (it != queue_.end()) {
-      queue_.erase(it);
-      erased = true;
+    const auto oldSize = queue_.size();
+    queue_.remove(item);
+    return queue_.size() != oldSize;
+  }
+
+  // Permanently close the queue and remove every queued reference. Swap under
+  // the mutex and release shared_ptrs after unlocking so item destruction
+  // cannot re-enter this queue while its mutex is held.
+  void closeAndDrain() {
+    std::list<std::shared_ptr<T>> items;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      closed_ = true;
+      items.swap(queue_);
     }
-    return erased;
   }
 
   // helpers
@@ -73,4 +87,5 @@ class WorkQueue {
  private:
   mutable std::mutex mutex_;
   std::list<std::shared_ptr<T>> queue_;
+  bool closed_{false};
 };

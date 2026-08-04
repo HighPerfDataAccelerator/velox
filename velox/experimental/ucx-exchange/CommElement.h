@@ -15,7 +15,7 @@
  */
 #pragma once
 
-#include <stdexcept>
+#include <memory>
 
 // The CommElement is the abstract base class of both the
 // per-client context on the exchange server side as well as the
@@ -46,7 +46,15 @@ class CommElement {
   virtual void close() = 0;
 
  protected:
-  const std::shared_ptr<Communicator> communicator_;
+  /// Locks the non-owning back-reference for one complete operation. The
+  /// Communicator owns CommElements through its registry/work queue, so a
+  /// shared_ptr here would form a cycle and can re-enter Communicator
+  /// destruction during process shutdown.
+  [[nodiscard]] std::shared_ptr<Communicator> tryCommunicator() const {
+    return communicator_.lock();
+  }
+
+  const std::weak_ptr<Communicator> communicator_;
   std::shared_ptr<EndpointRef> endpointRef_;
 };
 } // namespace facebook::velox::ucx_exchange

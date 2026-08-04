@@ -151,18 +151,18 @@ class UcxTestData : public BaseTableGenerator {
     return strings_;
   }
 
-  std::shared_ptr<std::vector<uint32_t>> getIntegers() {
+  std::shared_ptr<std::vector<int32_t>> getIntegers() {
     return integers_;
   }
 
-  std::shared_ptr<std::vector<float>> getFloats() {
+  std::shared_ptr<std::vector<double>> getFloats() {
     return floats_;
   }
 
   /// @brief Sets the data directly (used for creating partitioned test data).
   void setData(
-      std::shared_ptr<std::vector<uint32_t>> integers,
-      std::shared_ptr<std::vector<float>> floats,
+      std::shared_ptr<std::vector<int32_t>> integers,
+      std::shared_ptr<std::vector<double>> floats,
       std::shared_ptr<std::vector<std::string>> strings) {
     integers_ = std::move(integers);
     floats_ = std::move(floats);
@@ -172,8 +172,9 @@ class UcxTestData : public BaseTableGenerator {
 
  protected:
   std::shared_ptr<std::vector<std::string>> strings_;
-  std::shared_ptr<std::vector<uint32_t>> integers_;
-  std::shared_ptr<std::vector<float>> floats_;
+  // Must match kTestColumnTypes: INTEGER() -> INT32, DOUBLE() -> FLOAT64.
+  std::shared_ptr<std::vector<int32_t>> integers_;
+  std::shared_ptr<std::vector<double>> floats_;
   size_t numRows_ = 0;
 };
 
@@ -183,16 +184,13 @@ class UcxTestData : public BaseTableGenerator {
 /// WideComplexTestTable for those.
 class WideTestTable : public BaseTableGenerator {
  public:
-  // Column names for the wide table (numeric types only)
+  // Column names for numeric types shared by Velox and cuDF. cuDF unsigned
+  // integers are excluded because Velox has no matching logical types.
   inline static const std::vector<std::string> kColumnNames = {
       "int8_col", // INT8
       "int16_col", // INT16
       "int32_col", // INT32
       "int64_col", // INT64
-      "uint8_col", // UINT8
-      "uint16_col", // UINT16
-      "uint32_col", // UINT32
-      "uint64_col", // UINT64
       "float32_col", // FLOAT32
       "float64_col", // FLOAT64
       "bool_col" // BOOL8
@@ -204,10 +202,6 @@ class WideTestTable : public BaseTableGenerator {
       SMALLINT(), // INT16
       INTEGER(), // INT32
       BIGINT(), // INT64
-      TINYINT(), // UINT8 (mapped to TINYINT)
-      SMALLINT(), // UINT16 (mapped to SMALLINT)
-      INTEGER(), // UINT32 (mapped to INTEGER)
-      BIGINT(), // UINT64 (mapped to BIGINT)
       REAL(), // FLOAT32
       DOUBLE(), // FLOAT64
       BOOLEAN()}; // BOOL8
@@ -259,10 +253,6 @@ class WideTestTable : public BaseTableGenerator {
   std::vector<int16_t> int16Data_;
   std::vector<int32_t> int32Data_;
   std::vector<int64_t> int64Data_;
-  std::vector<uint8_t> uint8Data_;
-  std::vector<uint16_t> uint16Data_;
-  std::vector<uint32_t> uint32Data_;
-  std::vector<uint64_t> uint64Data_;
   std::vector<float> float32Data_;
   std::vector<double> float64Data_;
   std::vector<int8_t> boolData_; // stored as int8_t for BOOL8
@@ -281,10 +271,6 @@ class WideComplexTestTable : public WideTestTable {
       "int16_col", // INT16
       "int32_col", // INT32
       "int64_col", // INT64
-      "uint8_col", // UINT8
-      "uint16_col", // UINT16
-      "uint32_col", // UINT32
-      "uint64_col", // UINT64
       "float32_col", // FLOAT32
       "float64_col", // FLOAT64
       "bool_col", // BOOL8
@@ -298,10 +284,6 @@ class WideComplexTestTable : public WideTestTable {
       SMALLINT(), // INT16
       INTEGER(), // INT32
       BIGINT(), // INT64
-      TINYINT(), // UINT8 (mapped to TINYINT)
-      SMALLINT(), // UINT16 (mapped to SMALLINT)
-      INTEGER(), // UINT32 (mapped to INTEGER)
-      BIGINT(), // UINT64 (mapped to BIGINT)
       REAL(), // FLOAT32
       DOUBLE(), // FLOAT64
       BOOLEAN(), // BOOL8

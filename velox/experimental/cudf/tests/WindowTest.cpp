@@ -20,6 +20,8 @@
 #include "velox/experimental/cudf/exec/ToCudf.h"
 
 #include "velox/common/base/tests/GTestUtils.h"
+#include "velox/common/file/FileSystems.h"
+#include "velox/common/testutil/TempDirectoryPath.h"
 #include "velox/core/Expressions.h"
 #include "velox/core/PlanNode.h"
 #include "velox/core/QueryConfig.h"
@@ -38,9 +40,11 @@
 #include "velox/vector/tests/utils/VectorTestBase.h"
 
 #include <fmt/format.h>
+#include <folly/ScopeGuard.h>
 #include <folly/String.h>
 #include <gtest/gtest.h>
 
+#include <filesystem>
 #include <limits>
 #include <sstream>
 
@@ -2196,6 +2200,45 @@ TEST_F(CudfWindowTest, castInWindowArgFallsBack) {
         AssertQueryBuilder(plan).copyResults(pool()),
         "Replacement with cuDF operator failed");
   }
+}
+
+TEST_F(CudfWindowTest, externalSortKeepsPartitionsComplete) {
+  filesystems::registerLocalFileSystem();
+  const auto spillRoot =
+      facebook::velox::common::testutil::TempDirectoryPath::create();
+
+  auto& config = cudf_velox::CudfConfig::getInstance();
+  const auto originalRunBytes = config.windowSortedRunBytes;
+  SCOPE_EXIT {
+    config.windowSortedRunBytes = originalRunBytes;
+  };
+  // Force one sorted run per input batch.
+  config.windowSortedRunBytes = 1;
+
+  std::vector<RowVectorPtr> input{
+      makeRowVector(
+          {"id", "val"},
+          {makeFlatVector<int32_t>({2, 1, 2}),
+           makeFlatVector<int64_t>({30, 20, 10})}),
+      makeRowVector(
+          {"id", "val"},
+          {makeFlatVector<int32_t>({1, 2, 1}),
+           makeFlatVector<int64_t>({10, 20, 30})})};
+
+  auto plan = PlanBuilder()
+                  .values(input)
+                  .window({"row_number() over (partition by id order by val)"})
+                  .planNode();
+  auto expected = makeRowVector(
+      {"id", "val", "w0"},
+      {makeFlatVector<int32_t>({1, 1, 1, 2, 2, 2}),
+       makeFlatVector<int64_t>({10, 20, 30, 10, 20, 30}),
+       makeFlatVector<int64_t>({1, 2, 3, 1, 2, 3})});
+
+  AssertQueryBuilder(plan)
+      .spillDirectory(spillRoot->getPath())
+      .assertResults(expected);
+  EXPECT_TRUE(std::filesystem::is_empty(spillRoot->getPath()));
 }
 
 } // namespace

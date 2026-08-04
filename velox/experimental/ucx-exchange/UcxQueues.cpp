@@ -15,9 +15,44 @@
  */
 #include "velox/experimental/ucx-exchange/UcxQueues.h"
 
+#include "velox/experimental/cudf/exec/GpuResources.h"
+
 #include <atomic>
+#include <limits>
+#include <sstream>
 
 namespace facebook::velox::ucx_exchange {
+
+namespace {
+std::atomic<int64_t> diagnosticGlobalQueuedBytes{0};
+std::atomic<int64_t> diagnosticGlobalQueuedColumns{0};
+std::atomic<int64_t> diagnosticGlobalQueueGiB{0};
+
+void updateDiagnosticGlobalQueue(
+    int64_t bytes,
+    int64_t columns,
+    const char* event,
+    const std::shared_ptr<exec::Task>& task) {
+  if (!cudf_velox::deviceMemoryDiagnosticsEnabled()) {
+    return;
+  }
+  const auto currentBytes =
+      diagnosticGlobalQueuedBytes.fetch_add(bytes, std::memory_order_relaxed) +
+      bytes;
+  const auto currentColumns = diagnosticGlobalQueuedColumns.fetch_add(
+                                  columns, std::memory_order_relaxed) +
+      columns;
+  const auto gib = currentBytes >> 30;
+  const auto previous =
+      diagnosticGlobalQueueGiB.exchange(gib, std::memory_order_relaxed);
+  if (gib != previous) {
+    LOG(WARNING) << "CUDF_DEVICE_QUEUE_GLOBAL event=" << event
+                 << " task=" << (task ? task->taskId() : "n/a")
+                 << " queuedBytes=" << currentBytes
+                 << " queuedPackedColumns=" << currentColumns;
+  }
+}
+} // namespace
 
 void UcxDestinationQueue::Stats::recordEnqueue(
     const cudf::packed_columns* data) {
@@ -69,9 +104,61 @@ void UcxDestinationQueue::enqueueFront(
 
 UcxDestinationQueue::Data UcxDestinationQueue::getData(
     UcxDataAvailableCallback notify) {
+  return getData(
+      std::numeric_limits<uint64_t>::max(),
+      sequence_,
+      [notify = std::move(notify)](
+          std::shared_ptr<cudf::packed_columns> data,
+          int64_t /*sequence*/,
+          std::vector<int64_t> remainingBytes) mutable {
+        if (notify) {
+          notify(std::move(data), std::move(remainingBytes));
+        }
+      });
+}
+
+UcxDestinationQueue::Data UcxDestinationQueue::getData(
+    uint64_t maxBytes,
+    int64_t sequence,
+    UcxDataAvailableCallbackV2 notify) {
+  if (sequence < sequence_) {
+    // A retried/duplicate UCX connection can race with task abort after the
+    // original server has already advanced this destination queue.  Treat
+    // that request as stale instead of throwing on the communicator thread
+    // (an uncaught VeloxException there terminates the whole Spark executor).
+    // Returning the current sequence lets UcxExchangeServer identify and
+    // close only the stale connection without dequeuing or clearing data.
+    LOG(WARNING) << "Ignoring stale UCX queue request: requestedSequence="
+                 << sequence << " acknowledgedSequence=" << sequence_;
+    return {nullptr, sequence_, {}, true};
+  }
+  if (notifyV2_ != nullptr && notify != nullptr) {
+    // A second server for the same task/destination/sequence must not replace
+    // the active server's waiter.  Return a deliberately different sequence
+    // so the duplicate UcxExchangeServer follows its stale-connection close
+    // path while the original callback remains installed.
+    LOG(WARNING) << "Ignoring duplicate UCX queue waiter: sequence=" << sequence
+                 << " acknowledgedSequence=" << sequence_;
+    return {nullptr, sequence_ + 1, {}, true};
+  }
+  VELOX_CHECK(
+      notify_ == nullptr && notifyV2_ == nullptr,
+      "UcxDestinationQueue already has a pending data notification");
+  if (sequence > sequence_) {
+    // Minimal V2 implementation only supports in-order requests. The full
+    // Presto-style ack path can skip prefixes later; for now, install the
+    // notify and wait for the requested sequence to become available.
+    notifyV2_ = std::move(notify);
+    notifySequence_ = sequence;
+    notifyMaxBytes_ = maxBytes;
+    return {};
+  }
+
   if (queue_.empty()) {
     // delay notification.
-    notify_ = std::move(notify);
+    notifyV2_ = std::move(notify);
+    notifySequence_ = sequence;
+    notifyMaxBytes_ = maxBytes;
     return {};
   }
 
@@ -79,21 +166,19 @@ UcxDestinationQueue::Data UcxDestinationQueue::getData(
   auto data = std::move(queue_.front());
   queue_.pop_front();
   stats_.recordDequeue(data.get());
+  const auto resultSequence = sequence_;
+  ++sequence_;
 
+  // The current rendezvous protocol does not use the legacy Presto
+  // remaining-bytes credit list (UcxExchangeServer sends an empty list in its
+  // MetadataMsg). Building it here is O(queue size) for every dequeued packet.
+  // A finely chunked shuffle can therefore allocate hundreds of MiB per
+  // packet and do O(N^2) work even though the list is immediately discarded.
   std::vector<int64_t> remainingBytes;
-  remainingBytes.reserve(queue_.size());
-  // fill in the remainingbytes vector.
-  for (std::size_t i = 0; i < queue_.size(); ++i) {
-    if (queue_[i] == nullptr) {
-      VELOX_CHECK_EQ(i, queue_.size() - 1, "null marker found in the middle");
-      break;
-    }
-    remainingBytes.push_back(queue_[i]->gpu_data->size());
-  }
-  return {std::move(data), std::move(remainingBytes), true};
+  return {std::move(data), resultSequence, std::move(remainingBytes), true};
 }
 
-void UcxDestinationQueue::deleteResults() {
+UcxDataAvailable UcxDestinationQueue::deleteResults() {
   for (auto i = 0; i < queue_.size(); ++i) {
     if (queue_[i] == nullptr) {
       VELOX_CHECK_EQ(i, queue_.size() - 1, "null marker found in the middle");
@@ -101,27 +186,56 @@ void UcxDestinationQueue::deleteResults() {
     }
   }
   queue_.clear();
+
+  UcxDataAvailable result;
+  result.callback = std::move(notify_);
+  result.callbackV2 = std::move(notifyV2_);
+  result.sequence = notifySequence_;
+  clearNotify();
+  return result;
 }
 
 UcxDataAvailable UcxDestinationQueue::getAndClearNotify() {
-  if (notify_ == nullptr) {
+  if (notify_ == nullptr && notifyV2_ == nullptr) {
     return UcxDataAvailable();
   }
+  auto savedV1 = std::move(notify_);
+  auto savedV2 = std::move(notifyV2_);
+  const auto savedSequence = notifySequence_;
+  const auto savedMaxBytes = notifyMaxBytes_;
+  clearNotify();
+
+  auto data = getData(
+      savedMaxBytes == 0 ? std::numeric_limits<uint64_t>::max() : savedMaxBytes,
+      savedSequence,
+      nullptr);
+  if (!data.immediate) {
+    notify_ = std::move(savedV1);
+    notifyV2_ = std::move(savedV2);
+    notifySequence_ = savedSequence;
+    notifyMaxBytes_ = savedMaxBytes;
+    return UcxDataAvailable();
+  }
+
   UcxDataAvailable result;
-  result.callback = notify_;
-  auto data = getData(nullptr);
+  result.callback = std::move(savedV1);
+  result.callbackV2 = std::move(savedV2);
+  result.sequence = data.sequence;
   result.data = std::move(data.data);
   result.remainingBytes = std::move(data.remainingBytes);
-  clearNotify();
   return result;
 }
 
 void UcxDestinationQueue::clearNotify() {
   notify_ = nullptr;
+  notifyV2_ = nullptr;
+  notifySequence_ = 0;
+  notifyMaxBytes_ = 0;
 }
 
 void UcxDestinationQueue::finish() {
   VELOX_CHECK_NULL(notify_, "notify must be cleared before finish");
+  VELOX_CHECK_NULL(notifyV2_, "V2 notify must be cleared before finish");
   VELOX_CHECK(queue_.empty(), "data must be fetched before finish");
 }
 
@@ -132,6 +246,8 @@ UcxDestinationQueue::Stats UcxDestinationQueue::stats() const {
 std::string UcxDestinationQueue::toString() {
   std::stringstream out;
   out << "[available: " << queue_.size() << ", "
+      << "sequence: " << sequence_ << ", "
+      << (notifyV2_ ? "notifyV2 registered, " : "")
       << (notify_ ? "notify registered, " : "") << this << "]";
   return out.str();
 }
@@ -312,7 +428,7 @@ void UcxOutputQueue::getData(int destination, UcxDataAvailableCallback notify) {
         updateStatsWithFreedLocked(data.data->gpu_data->size(), 1L, promises);
       }
     } else {
-      data = UcxDestinationQueue::Data{nullptr, {}, true};
+      data = UcxDestinationQueue::Data{nullptr, 0, {}, true};
     }
   }
   // outside lock: If we have data, then return it immediately.
@@ -324,6 +440,63 @@ void UcxOutputQueue::getData(int destination, UcxDataAvailableCallback notify) {
             << " server waiting for data (callback installed)";
   }
   // wake up any producers that are waiting for queue to become less full.
+  for (auto& promise : promises) {
+    promise.setValue();
+  }
+}
+
+void UcxOutputQueue::getData(
+    int destination,
+    uint64_t maxBytes,
+    int64_t sequence,
+    UcxDataAvailableCallbackV2 notify) {
+  UcxDestinationQueue::Data data;
+  std::vector<ContinuePromise> promises;
+  {
+    std::lock_guard<std::mutex> l(mutex_);
+    for (int i = queues_.size(); i <= destination; ++i) {
+      queues_.emplace_back(std::make_unique<UcxDestinationQueue>());
+    }
+    auto* queue = queues_[destination].get();
+    if (queue) {
+      std::weak_ptr<UcxOutputQueue> weakSelf = shared_from_this();
+      data = queue->getData(
+          maxBytes,
+          sequence,
+          [notify, weakSelf](
+              std::shared_ptr<cudf::packed_columns> data,
+              int64_t sequence,
+              std::vector<int64_t> remainingBytes) {
+            std::vector<ContinuePromise> promises;
+            int64_t bytes = data ? data->gpu_data->size() : -1L;
+            notify(std::move(data), sequence, std::move(remainingBytes));
+            if (bytes >= 0L) {
+              auto self = weakSelf.lock();
+              if (!self) {
+                return;
+              }
+              std::lock_guard<std::mutex> l(self->mutex_);
+              self->updateStatsWithFreedLocked(bytes, 1L, promises);
+            }
+            for (auto& promise : promises) {
+              promise.setValue();
+            }
+          });
+      if (data.data) {
+        updateStatsWithFreedLocked(data.data->gpu_data->size(), 1L, promises);
+      }
+    } else {
+      data = UcxDestinationQueue::Data{nullptr, sequence, {}, true};
+    }
+  }
+  if (data.immediate) {
+    notify(std::move(data.data), data.sequence, std::move(data.remainingBytes));
+  } else {
+    VLOG(2) << "[QUEUE] task=" << (task_ ? task_->taskId() : "n/a")
+            << " dest=" << destination
+            << " server waiting for V2 data (callback installed)"
+            << " sequence=" << sequence << " maxBytes=" << maxBytes;
+  }
   for (auto& promise : promises) {
     promise.setValue();
   }
@@ -499,13 +672,16 @@ void UcxOutputQueue::deleteResults(int destination) {
     // remember destination queue fill stats
     int64_t bytes = queue->stats().bytesQueued;
     int64_t packedCols = queue->stats().packedColumnsQueued;
-    queue->deleteResults();
-    dataAvailable = queue->getAndClearNotify();
+    dataAvailable = queue->deleteResults();
     queue->finish();
     queues_[destination] = nullptr;
     isFinished = isFinishedLocked();
     // update UcxOutputQueue stats
-    updateStatsWithFreedLocked(bytes, packedCols, promises);
+    if (bytes > 0 || packedCols > 0) {
+      updateStatsWithFreedLocked(bytes, packedCols, promises);
+    } else {
+      promises = std::move(promises_);
+    }
   }
 
   // Outside of mutex.
@@ -585,6 +761,8 @@ void UcxOutputQueue::updateStatsWithEnqueuedLocked(
   totalBytesSent_ += bytes;
   totalRowsSent_ += rows;
   totalPackedColumnsSent_++;
+  updateDiagnosticGlobalQueue(bytes, 1, "enqueue", task_);
+  logDeviceQueueResidencyLocked("enqueue");
 }
 
 void UcxOutputQueue::updateStatsWithFreedLocked(
@@ -598,6 +776,8 @@ void UcxOutputQueue::updateStatsWithFreedLocked(
 
   VELOX_CHECK_GE(queuedBytes_, 0);
   VELOX_CHECK_GE(queuedPackedColumns_, 0);
+  updateDiagnosticGlobalQueue(-bytes, -numPackedCols, "dequeue", task_);
+  logDeviceQueueResidencyLocked("dequeue");
 
   // Check whether queue is below low-water mark and return outstanding
   // promises
@@ -608,6 +788,23 @@ void UcxOutputQueue::updateStatsWithFreedLocked(
             << " continueSize=" << continueSize_;
     promises = std::move(promises_);
   }
+}
+
+void UcxOutputQueue::logDeviceQueueResidencyLocked(const char* event) {
+  if (!cudf_velox::deviceMemoryDiagnosticsEnabled()) {
+    return;
+  }
+  constexpr int64_t kBucketBytes = 256LL << 20;
+  const auto bucket = queuedBytes_ / kBucketBytes;
+  if (bucket == diagnosticQueueBucket_) {
+    return;
+  }
+  diagnosticQueueBucket_ = bucket;
+  LOG(WARNING) << "CUDF_DEVICE_QUEUE event=" << event
+               << " task=" << (task_ ? task_->taskId() : "n/a")
+               << " queuedBytes=" << queuedBytes_
+               << " queuedPackedColumns=" << queuedPackedColumns_
+               << " maxSize=" << maxSize_ << " continueSize=" << continueSize_;
 }
 
 void UcxOutputQueue::updateTotalQueuedBytesMsLocked() {

@@ -16,9 +16,13 @@
 #pragma once
 
 #include <ucxx/api.h>
+#include <atomic>
+#include <cstddef>
 #include <memory>
 #include <mutex>
 #include <set>
+#include <string>
+#include <utility>
 
 #include "velox/experimental/ucx-exchange/CommElement.h"
 
@@ -34,8 +38,12 @@ class EndpointRef : public std::enable_shared_from_this<EndpointRef> {
  public:
   EndpointRef(
       const std::shared_ptr<ucxx::Endpoint> endpoint,
-      std::string peerIp = "")
-      : endpoint_{endpoint}, peerIp_{std::move(peerIp)}, communicators_{} {}
+      std::string peerIp = "",
+      std::string peerPort = "")
+      : endpoint_{endpoint},
+        peerIp_{std::move(peerIp)},
+        peerPort_{std::move(peerPort)},
+        communicators_{} {}
 
   /// @brief Static method that is called when the underlying UCXX system closes
   /// the endpoint. In this case, all communication elements are informed that
@@ -71,12 +79,27 @@ class EndpointRef : public std::enable_shared_from_this<EndpointRef> {
     return peerIp_;
   }
 
+  const std::string& getPeerPort() const {
+    return peerPort_;
+  }
+
+  std::string getPeerAddress() const {
+    if (peerIp_.empty()) {
+      return "(unknown)";
+    }
+    if (peerPort_.empty()) {
+      return peerIp_;
+    }
+    return peerIp_ + ":" + peerPort_;
+  }
+
   const std::shared_ptr<ucxx::Endpoint> endpoint_;
 
  private:
   /// The peer's actual IP address extracted from the connection request.
   /// Used for server-side intra-node detection instead of client-reported IPs.
   std::string peerIp_;
+  std::string peerPort_;
   void cleanup(); // cleans up expired communication elements.
 
   std::set<
@@ -84,5 +107,6 @@ class EndpointRef : public std::enable_shared_from_this<EndpointRef> {
       std::owner_less<std::weak_ptr<CommElement>>>
       communicators_;
   std::mutex commMutex_; // Protects communicators_
+  std::atomic<size_t> commElementCount_{0};
 };
 } // namespace facebook::velox::ucx_exchange

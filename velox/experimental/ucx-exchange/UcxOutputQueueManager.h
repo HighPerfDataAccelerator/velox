@@ -58,6 +58,17 @@ class UcxOutputQueueManager {
       int numBuffers,
       bool noMoreBuffers);
 
+  /// Same as updateOutputBuffers(), but returns false instead of failing when
+  /// the UCX output queue has not been created for this task.
+  bool updateOutputBuffersIfExists(
+      std::string_view taskId,
+      int numBuffers,
+      bool noMoreBuffers);
+
+  bool updateNumDriversIfExists(
+      std::string_view taskId,
+      uint32_t newNumDrivers);
+
   /// @brief Enqueues a cudf packed column into the queue.
   /// @param taskId The unique task Id.
   /// @param destination The destination (partition, queue number) into which
@@ -101,12 +112,19 @@ class UcxOutputQueueManager {
       int destination,
       UcxDataAvailableCallback notify);
 
+  void getData(
+      std::string_view taskId,
+      int destination,
+      uint64_t maxBytes,
+      int64_t sequence,
+      UcxDataAvailableCallbackV2 notify);
+
   /// Returns true if the given task can use intra-node transfer.
-  /// Returns false if the task is not yet initialized (placeholder queue
-  /// from early sink connections) or if the task uses broadcast mode
-  /// (broadcast shares packed_columns across destinations — the intra-node
-  /// source's destructive move would corrupt data for other servers).
+  /// Returns false until the task queue is initialized. Initialized broadcast
+  /// queues are safe because shared pages are cloned by UcxExchangeSource.
   bool canUseIntraNode(std::string_view taskId);
+
+  std::string describeQueueForIntraNode(std::string_view taskId);
 
   /// @brief Removes the queue for the given task from the queue manager.
   /// Calls "terminate" on the queue to awake waiting producers.

@@ -553,6 +553,47 @@ TEST_F(TableScanTest, filterPushdown) {
 #endif
 }
 
+TEST_F(TableScanTest, filterPushdownWithSplitPreload) {
+  auto rowType =
+      ROW({"c0", "c1", "c2", "c3"}, {TINYINT(), BIGINT(), DOUBLE(), BOOLEAN()});
+  auto filePaths = makeFilePaths(10);
+  auto vectors = makeVectors(10, 1'000, rowType);
+  for (int32_t i = 0; i < vectors.size(); i++) {
+    writeToFile(filePaths[i]->getPath(), vectors[i]);
+  }
+  createDuckDbTable(vectors);
+
+  auto tableHandle = makeTableHandle(
+      "parquet_table",
+      rowType,
+      common::test::SubfieldFiltersBuilder()
+          .add(
+              "c1",
+              std::make_unique<common::BigintRange>(
+                  int64_t(0), std::numeric_limits<int64_t>::max(), true))
+          .add("c3", std::make_unique<common::BoolValue>(true, false))
+          .build(),
+      nullptr);
+  auto assignments =
+      facebook::velox::exec::test::HiveConnectorTestBase::allRegularColumns(
+          rowType);
+  auto plan =
+      PlanBuilder()
+          .startTableScan()
+          .outputType(ROW({"c1", "c3", "c0"}, {BIGINT(), BOOLEAN(), TINYINT()}))
+          .tableHandle(tableHandle)
+          .assignments(assignments)
+          .endTableScan()
+          .planNode();
+
+  auto task =
+      AssertQueryBuilder(plan, duckDbQueryRunner_)
+          .config(core::QueryConfig::kMaxSplitPreloadPerDriver, "2")
+          .splits(makeCudfHiveConnectorSplits(filePaths))
+          .assertResults("SELECT c1, c3, c0 FROM tmp WHERE (c1 >= 0) AND c3");
+  EXPECT_GT(getTableScanStats(task).customStats.at("preloadedSplits").sum, 0);
+}
+
 // Disable this test and the one below for now, pending a CUDF fix.
 // simoneves 2/25/26
 // @TODO simoneves/mattgara re-enable once fixed.
@@ -747,6 +788,53 @@ TEST_F(TableScanTest, splitOffsetAndLength) {
       tableScanNode(),
       makeCudfHiveConnectorSplit(filePath->getPath(), fileSize),
       "SELECT * FROM tmp LIMIT 0");
+}
+
+TEST_F(TableScanTest, splitStartingAtZeroPreloadsPhysicalFileSize) {
+  auto vectors = makeVectors(10, 1'000);
+  auto filePath = TempFilePath::create();
+  writeToFile(filePath->getPath(), vectors);
+  createDuckDbTable(vectors);
+
+  const auto halfFileSize = fs::file_size(filePath->getPath()) / 2;
+  AssertQueryBuilder(tableScanNode(), duckDbQueryRunner_)
+      .connectorSessionProperty(
+          kCudfHiveConnectorId,
+          cudf_velox::connector::hive::CudfHiveConfig::
+              kSelectivePreloadEnabledSession,
+          "true")
+      .splits({Split(
+          makeCudfHiveConnectorSplit(filePath->getPath(), 0, halfFileSize))})
+      .assertResults("SELECT * FROM tmp OFFSET 0 LIMIT 6000");
+}
+
+TEST_F(TableScanTest, splitOffsetAndLengthWithChunkedOutput) {
+  auto vectors = makeVectors(10, 1'000);
+  auto filePath = TempFilePath::create();
+  writeToFile(filePath->getPath(), vectors);
+  createDuckDbTable(vectors);
+
+  const auto halfFileSize = fs::file_size(filePath->getPath()) / 2;
+  auto plan = tableScanNode();
+  AssertQueryBuilder(plan, duckDbQueryRunner_)
+      .connectorSessionProperty(
+          kCudfHiveConnectorId,
+          cudf_velox::connector::hive::CudfHiveConfig::
+              kMaxChunkReadLimitSession,
+          "1024")
+      .splits({Split(
+          makeCudfHiveConnectorSplit(filePath->getPath(), 0, halfFileSize))})
+      .assertResults("SELECT * FROM tmp OFFSET 0 LIMIT 6000");
+
+  AssertQueryBuilder(plan, duckDbQueryRunner_)
+      .connectorSessionProperty(
+          kCudfHiveConnectorId,
+          cudf_velox::connector::hive::CudfHiveConfig::
+              kMaxChunkReadLimitSession,
+          "1024")
+      .splits({Split(
+          makeCudfHiveConnectorSplit(filePath->getPath(), halfFileSize))})
+      .assertResults("SELECT * FROM tmp OFFSET 6000 LIMIT 4000");
 }
 
 // Verify that extractFiltersFromRemainingFilter extracts simple single-column

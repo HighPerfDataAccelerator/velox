@@ -44,8 +44,9 @@ gh_api() {
   while [ "$attempt" -le "$max_attempts" ]; do
     if gh api "$@"; then
       return 0
+    else
+      exit_code=$?
     fi
-    exit_code=$?
     if [ "$attempt" -lt "$max_attempts" ]; then
       local wait_secs=$((sleep_base ** attempt))
       echo "::warning::gh api attempt ${attempt}/${max_attempts} failed (exit ${exit_code}); retrying in ${wait_secs}s" >&2

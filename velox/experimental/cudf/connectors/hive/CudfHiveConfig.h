@@ -44,6 +44,14 @@ class CudfHiveConfig {
   static constexpr const char* kMaxPassReadLimitSession =
       "parquet.reader.pass_read_limit";
 
+  // Whether simple filters are passed into libcudf's Parquet statistics
+  // reader.  Disabling this keeps the same filter in the post-scan cuDF
+  // expression path; it does not enable a CPU fallback.
+  static constexpr const char* kParquetFilterPushdownEnabled =
+      "parquet.reader.filter-pushdown-enabled";
+  static constexpr const char* kParquetFilterPushdownEnabledSession =
+      "parquet.reader.filter_pushdown_enabled";
+
   // Whether to store string data as categorical type
   static constexpr const char* kConvertStringsToCategories =
       "parquet.reader.convert-strings-to-categories";
@@ -87,6 +95,19 @@ class CudfHiveConfig {
       "cudf.hive.use-experimental-reader";
   static constexpr const char* kUseExperimentalCudfReaderSession =
       "cudf.hive.use_experimental_reader";
+
+  static constexpr const char* kSelectivePreloadEnabled =
+      "cudf.hive.selective-preload-enabled";
+  static constexpr const char* kSelectivePreloadEnabledSession =
+      "cudf.hive.selective_preload_enabled";
+
+  static constexpr const char* kPrefetchMaxInFlightBytes =
+      "cudf.hive.prefetch-max-inflight-bytes";
+  static constexpr const char* kPrefetchMaxInFlightBytesSession =
+      "cudf.hive.prefetch_max_inflight_bytes";
+  static constexpr const char* kPrefetchThreads = "cudf.hive.prefetch-threads";
+  static constexpr const char* kPrefetchThreadsSession =
+      "cudf.hive.prefetch_threads";
 
   // Writer config options
 
@@ -135,6 +156,9 @@ class CudfHiveConfig {
   std::size_t maxPassReadLimit() const;
   std::size_t maxPassReadLimitSession(const config::ConfigBase* session) const;
 
+  bool parquetFilterPushdownEnabledSession(
+      const config::ConfigBase* session) const;
+
   bool isConvertStringsToCategories() const;
   bool isConvertStringsToCategoriesSession(
       const config::ConfigBase* session) const;
@@ -158,6 +182,12 @@ class CudfHiveConfig {
   bool useExperimentalCudfReader() const;
   bool useExperimentalCudfReaderSession(
       const config::ConfigBase* session) const;
+
+  bool selectivePreloadEnabledSession(const config::ConfigBase* session) const;
+
+  uint64_t prefetchMaxInFlightBytesSession(
+      const config::ConfigBase* session) const;
+  uint32_t prefetchThreadsSession(const config::ConfigBase* session) const;
 
   bool immutableFiles() const;
 

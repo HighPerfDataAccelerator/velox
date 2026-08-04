@@ -21,14 +21,11 @@
 #include <random>
 #include <string>
 #include <string_view>
+#include <vector>
 #include "velox/common/future/VeloxPromise.h"
 #include "velox/experimental/ucx-exchange/Acceptor.h"
 #include "velox/experimental/ucx-exchange/CommElement.h"
 #include "velox/experimental/ucx-exchange/WorkQueue.h"
-
-#include <gflags/gflags.h>
-
-DECLARE_bool(velox_ucx_exchange);
 
 namespace facebook::velox::ucx_exchange {
 
@@ -67,6 +64,15 @@ class Communicator {
 
   /// @brief Method to get the Communicator reference
   static std::shared_ptr<Communicator> getInstance();
+
+  /// Returns the singleton if it is still live. Callback teardown paths use
+  /// this instead of throwing after shutdown has begun.
+  static std::shared_ptr<Communicator> tryGetInstance();
+
+  /// Releases the singleton after run() has returned and its owner has joined
+  /// the progress thread. This operation is idempotent and cannot be followed
+  /// by reinitialization in the same process.
+  static void shutdown();
 
   /// @brief Destructor.
   ~Communicator();
@@ -144,6 +150,18 @@ class Communicator {
     return workerId_;
   }
 
+  bool isShuttingDown() const {
+    return shuttingDown_.load(std::memory_order_acquire);
+  }
+
+  /// Returns true when the active UCX context can transfer CUDA memory with
+  /// the configured transports. UCXX derives this from both the UCP-supported
+  /// memory types and UCX_TLS, so callers can safely choose a device receive
+  /// buffer instead of inferring transport support from environment strings.
+  bool hasCudaTransport() const {
+    return context_ != nullptr && context_->hasCudaSupport();
+  }
+
   /// Looks up the EndpointRef associated with a raw UCP endpoint handle.
   /// Used by the Acceptor's active-message callback to resolve the endpoint
   /// that received a handshake request.
@@ -167,14 +185,21 @@ class Communicator {
       void* arg);
 
   static std::once_flag onceFlag; // Flag for thread-safe initialization
+  static std::mutex instanceMutex_;
+  static std::mutex shutdownMutex_;
   static std::shared_ptr<Communicator> instancePtr_;
+
+  // Called by shutdown() only after the progress thread has returned.
+  bool releaseResourcesAfterRun();
 
   std::shared_ptr<ucxx::Context> context_;
   std::shared_ptr<ucxx::Worker> worker_;
   std::shared_ptr<ucxx::Listener> listener_;
   uint16_t port_;
   std::string coordinatorURL_;
-  std::atomic<bool> running_;
+  std::atomic<bool> running_{false};
+  std::atomic<bool> shuttingDown_{false};
+  std::atomic<bool> resourcesReleased_{false};
   Acceptor acceptor_;
   ContinuePromise promise_{"Communicator::run"};
 
@@ -195,6 +220,9 @@ class Communicator {
   // protect elements_ by a mutex. Needs to be mutable if called from a const
   // function.
   std::mutex elemMutex_;
+  // Mirrors elements_.size() without putting a mutex acquisition in the UCX
+  // progress hot loop. Registrations are paired with worker_->signal().
+  std::atomic<size_t> numCommElements_{0};
 
   // The work queue for communication elements that need to do things on
   // the communicator thread.
@@ -223,10 +251,15 @@ class Communicator {
   // so they defer cleanup to the main loop via this queue.
   WorkQueue<EndpointRef> deferredEndpointCleanup_;
 
-  // Cancelled UCXX requests whose GPU buffers may still be referenced by
-  // UCX internals. Held alive here until isCompleted() returns true,
-  // ensuring the GPU buffers (owned via the request's arg shared_ptr)
-  // are not freed prematurely.
+  // Endpoints whose communication elements have been asked to close. The
+  // actual closeBlocking()/map removal happens after the work queue has run,
+  // giving sources and servers a chance to cancel/defer UCX requests first.
+  std::vector<std::shared_ptr<EndpointRef>> pendingEndpointRemoval_;
+
+  /// Cancelled UCXX requests whose GPU buffers may still be referenced by
+  /// UCX internals. Held alive here until isCompleted() returns true,
+  /// ensuring the GPU buffers (owned via the request's arg shared_ptr)
+  /// are not freed prematurely.
   std::vector<std::shared_ptr<ucxx::Request>> deferredRequests_;
 
   // Heartbeat state for diagnostic logging.

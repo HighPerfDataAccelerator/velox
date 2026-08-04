@@ -51,6 +51,13 @@ std::size_t CudfHiveConfig::maxPassReadLimitSession(
       config_->get<std::size_t>(kMaxPassReadLimit, 0));
 }
 
+bool CudfHiveConfig::parquetFilterPushdownEnabledSession(
+    const config::ConfigBase* session) const {
+  return session->get<bool>(
+      kParquetFilterPushdownEnabledSession,
+      config_->get<bool>(kParquetFilterPushdownEnabled, true));
+}
+
 bool CudfHiveConfig::isConvertStringsToCategories() const {
   return config_->get<bool>(kConvertStringsToCategories, false);
 }
@@ -141,6 +148,26 @@ bool CudfHiveConfig::useExperimentalCudfReaderSession(
   return session->get<bool>(
       kUseExperimentalCudfReaderSession,
       config_->get<bool>(kUseExperimentalCudfReader, false));
+}
+
+bool CudfHiveConfig::selectivePreloadEnabledSession(
+    const config::ConfigBase* session) const {
+  return session->get<bool>(
+      kSelectivePreloadEnabledSession,
+      config_->get<bool>(kSelectivePreloadEnabled, false));
+}
+
+uint64_t CudfHiveConfig::prefetchMaxInFlightBytesSession(
+    const config::ConfigBase* session) const {
+  return session->get<uint64_t>(
+      kPrefetchMaxInFlightBytesSession,
+      config_->get<uint64_t>(kPrefetchMaxInFlightBytes, 4ULL << 30));
+}
+
+uint32_t CudfHiveConfig::prefetchThreadsSession(
+    const config::ConfigBase* session) const {
+  return session->get<uint32_t>(
+      kPrefetchThreadsSession, config_->get<uint32_t>(kPrefetchThreads, 128));
 }
 
 bool CudfHiveConfig::immutableFiles() const {

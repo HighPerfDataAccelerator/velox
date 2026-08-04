@@ -222,6 +222,15 @@ TEST_F(RegexFunctionsTest, allowSimpleConstantRegex) {
   EXPECT_EQ(rlike(std::nullopt, "a*"), std::nullopt);
 }
 
+TEST_F(RegexFunctionsTest, regexpReplaceLeadingZeroPreserveOne) {
+  EXPECT_EQ(testRegexpReplace("000123", "^0+(?!$)", ""), "123");
+  EXPECT_EQ(testRegexpReplace("000", "^0+(?!$)", ""), "0");
+  EXPECT_EQ(testRegexpReplace("0", "^0+(?!$)", ""), "0");
+  EXPECT_EQ(testRegexpReplace("120", "^0+(?!$)", ""), "120");
+  EXPECT_EQ(testRegexpReplace("", "^0+(?!$)", ""), "");
+  EXPECT_EQ(testRegexpReplace("000123", "^0+(?!$)", "", {1}), "123");
+}
+
 TEST_F(RegexFunctionsTest, blockUnsupportedEdgeCases) {
   // Non-constant pattern.
   EXPECT_THROW(

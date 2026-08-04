@@ -47,6 +47,13 @@ using PackedTableWithStreamPtr = std::unique_ptr<PackedTableWithStream>;
 
 class UcxExchangeQueue {
  public:
+  struct BackpressureStats {
+    int32_t queueSize{0};
+    int64_t queuedBytes{0};
+    int64_t pendingReceiveBytes{0};
+    int64_t inFlightBytes{0};
+  };
+
   explicit UcxExchangeQueue(int32_t numberOfConsumers)
       : numberOfConsumers_{numberOfConsumers} {
     VELOX_CHECK_GE(numberOfConsumers, 1);
@@ -72,7 +79,8 @@ class UcxExchangeQueue {
   /// not completed serving data, no 'promises' will be added and returned.
   void enqueueLocked(
       PackedTableWithStreamPtr&& data,
-      std::vector<ContinuePromise>& promises);
+      std::vector<ContinuePromise>& promises,
+      int64_t reservedReceiveBytes = 0);
 
   /// If data is permanently not available, e.g. the source cannot be
   /// contacted, this registers an error message and causes the reading
@@ -97,13 +105,43 @@ class UcxExchangeQueue {
       ContinuePromise* stalePromise);
 
   int32_t size() const {
+    std::lock_guard<std::mutex> l(mutex_);
+    return sizeLocked();
+  }
+
+  int32_t sizeLocked() const {
     return queue_.size();
   }
 
   /// Returns the total bytes held by packed tables in 'this'.
   int64_t totalBytes() const {
+    std::lock_guard<std::mutex> l(mutex_);
+    return totalBytesLocked();
+  }
+
+  int64_t totalBytesLocked() const {
     return totalBytes_;
   }
+
+  BackpressureStats backpressureStatsLocked() const {
+    return BackpressureStats{
+        sizeLocked(),
+        totalBytes_,
+        pendingReceiveBytes_,
+        totalBytes_ + pendingReceiveBytes_};
+  }
+
+  bool shouldPauseReceive(
+      int32_t highWaterMark,
+      int64_t maxInFlightBytes,
+      BackpressureStats* stats = nullptr) const;
+
+  bool tryReserveReceive(
+      int64_t bytes,
+      int64_t maxInFlightBytes,
+      BackpressureStats* stats = nullptr);
+
+  void releaseReservedReceive(int64_t bytes);
 
   /// Returns the maximum value of total bytes.
   uint64_t peakBytes() const {
@@ -133,6 +171,7 @@ class UcxExchangeQueue {
  private:
   std::vector<ContinuePromise> closeLocked() {
     queue_.clear();
+    totalBytes_ = 0;
     return clearAllPromisesLocked();
   }
 
@@ -183,7 +222,7 @@ class UcxExchangeQueue {
   bool noMoreSources_{false};
   bool atEnd_{false};
 
-  std::mutex mutex_;
+  mutable std::mutex mutex_;
   std::deque<PackedTableWithStreamPtr> queue_;
   // The map from consumer id to the waiting promise
   folly::F14FastMap<int, ContinuePromise> promises_;
@@ -193,6 +232,8 @@ class UcxExchangeQueue {
   std::string error_;
   // Total size of packed tables in queue.
   int64_t totalBytes_{0};
+  // Bytes reserved for posted UCX receives that have not been enqueued yet.
+  int64_t pendingReceiveBytes_{0};
   // Number of packed tables received.
   int64_t receivedTables_{0};
   // Total size of packed tables received. Used to calculate an average

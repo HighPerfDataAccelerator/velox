@@ -16,6 +16,7 @@
 #pragma once
 
 #include "velox/experimental/cudf/exec/AggregationRegistry.h"
+#include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
 #include "velox/exec/Operator.h"
@@ -82,6 +83,7 @@ std::vector<ResolvedAggregateInfo> resolveAggregateInfos(
 struct AggregationInputChannels {
   std::vector<column_index_t> channels;
   std::vector<VectorPtr> constants;
+  std::vector<core::TypedExprPtr> precomputedInputs;
 };
 
 // Build the input channel permutation for an aggregation node.  The returned
@@ -95,12 +97,31 @@ AggregationInputChannels buildAggregationInputChannels(
     RowTypePtr const& inputRowSchema,
     std::vector<column_index_t> const& groupingKeyInputChannels);
 
+std::vector<CudfExpressionPtr> createAggregationInputEvaluators(
+    const std::vector<core::TypedExprPtr>& precomputedInputs,
+    exec::OperatorCtx const& operatorCtx,
+    RowTypePtr const& inputRowSchema);
+
+struct PreparedAggregationInput {
+  std::vector<ColumnOrView> precomputedColumns;
+  cudf::table_view tableView;
+};
+
+PreparedAggregationInput prepareAggregationInput(
+    cudf::table_view input,
+    cudf::size_type inputRowCount,
+    const std::vector<CudfExpressionPtr>& precomputedInputEvaluators,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr);
+
 bool isCountFunctionName(std::string_view kind);
 
 bool hasOnlyConstantArguments(const core::CallTypedExpr& call);
 
 // Returns true if the aggregation node contains companion aggregates
-// (e.g. _merge, _partial, _merge_extract suffixes), which disables streaming.
+// (e.g. _merge, _partial, _merge_extract suffixes). Kept for callers that need
+// to inspect the external plan shape; CudfGroupby streaming supports companion
+// aggregates by forcing its internal compaction step to kIntermediate.
 bool hasCompanionAggregates(
     std::vector<core::AggregationNode::Aggregate> const& aggregates);
 

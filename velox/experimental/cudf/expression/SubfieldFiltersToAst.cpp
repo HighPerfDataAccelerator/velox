@@ -368,6 +368,21 @@ cudf::ast::expression const& createAstFromSubfieldFilter(
   auto mr = get_temp_mr();
 
   switch (filter.kind()) {
+    case common::FilterKind::kAlwaysFalse:
+    case common::FilterKind::kAlwaysTrue: {
+      // These filters are constants, including for null input values.  Do not
+      // synthesize `column == column`: that evaluates to null for a null row
+      // and is not semantically equivalent to AlwaysTrue.
+      const bool value = filter.kind() == common::FilterKind::kAlwaysTrue;
+      scalars.emplace_back(
+          std::make_unique<cudf::numeric_scalar<bool>>(
+              value, true, stream, mr));
+      stream.synchronize();
+      return tree.push(
+          cudf::ast::literal{
+              *static_cast<cudf::numeric_scalar<bool>*>(scalars.back().get())});
+    }
+
     case common::FilterKind::kBigintRange: {
       auto const& columnType = inputRowSchema->childAt(columnIndex);
       auto result = VELOX_DYNAMIC_TYPE_DISPATCH(

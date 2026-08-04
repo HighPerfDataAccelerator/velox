@@ -22,10 +22,12 @@
 #include <folly/synchronization/EventCount.h>
 #include <gtest/gtest.h>
 #include <rmm/device_buffer.hpp>
+#include <limits>
 #include <memory>
 #include <vector>
 #include "velox/common/memory/MemoryPool.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
+#include "velox/experimental/ucx-exchange/UcxExchangeQueue.h"
 #include "velox/experimental/ucx-exchange/tests/UcxTestHelpers.h"
 
 using namespace facebook::velox::ucx_exchange;
@@ -104,6 +106,52 @@ class UcxOutputQueueManagerTest : public testing::Test {
           receivedData = true;
         });
     ASSERT_TRUE(receivedData) << "for destination " << destination;
+  }
+
+  struct FetchResponse {
+    std::shared_ptr<cudf::packed_columns> data;
+    int64_t sequence{-1};
+    std::vector<int64_t> remainingBytes;
+  };
+
+  FetchResponse fetchV1Data(const std::string& taskId, int destination) {
+    bool received = false;
+    FetchResponse response;
+    queueManager_->getData(
+        taskId,
+        destination,
+        [&](std::shared_ptr<cudf::packed_columns> data,
+            std::vector<int64_t> remainingBytes) {
+          received = true;
+          response =
+              FetchResponse{std::move(data), -1, std::move(remainingBytes)};
+        });
+    EXPECT_TRUE(received) << "for destination " << destination;
+    return response;
+  }
+
+  FetchResponse fetchV2Data(
+      const std::string& taskId,
+      int destination,
+      uint64_t maxBytes,
+      int64_t sequence) {
+    bool received = false;
+    FetchResponse response;
+    queueManager_->getData(
+        taskId,
+        destination,
+        maxBytes,
+        sequence,
+        [&](std::shared_ptr<cudf::packed_columns> data,
+            int64_t receivedSequence,
+            std::vector<int64_t> remainingBytes) {
+          received = true;
+          response = FetchResponse{
+              std::move(data), receivedSequence, std::move(remainingBytes)};
+        });
+    EXPECT_TRUE(received) << "for destination " << destination << " sequence "
+                          << sequence;
+    return response;
   }
 
   UcxDataAvailableCallback receiveEndMarker(
@@ -293,6 +341,234 @@ TEST_F(UcxOutputQueueManagerTest, basicPartitioned) {
   EXPECT_TRUE(task->isFinished());
 }
 
+TEST_F(UcxOutputQueueManagerTest, v1RepeatedFetchAdvancesQueue) {
+  const std::string taskId = "v1RepeatedFetch";
+  const int destination = 0;
+
+  initializeTask(taskId, 1 /* numDestinations */, 1 /* numDrivers */);
+
+  enqueue(taskId, destination, 10);
+  enqueue(taskId, destination, 20);
+  noMoreData(taskId);
+
+  auto first = fetchV1Data(taskId, destination);
+  ASSERT_NE(first.data, nullptr);
+  // Count-only flow leaves remainingBytes empty; advancement is via later
+  // fetches.
+  EXPECT_TRUE(first.remainingBytes.empty());
+
+  auto second = fetchV1Data(taskId, destination);
+  ASSERT_NE(second.data, nullptr);
+  EXPECT_TRUE(second.remainingBytes.empty());
+
+  auto end = fetchV1Data(taskId, destination);
+  EXPECT_EQ(end.data, nullptr);
+  EXPECT_TRUE(end.remainingBytes.empty());
+
+  queueManager_->deleteResults(taskId, destination);
+  EXPECT_TRUE(queueManager_->isFinished(taskId));
+  queueManager_->removeTask(taskId);
+}
+
+TEST_F(UcxOutputQueueManagerTest, v2FetchesSequencesZeroAndOne) {
+  const std::string taskId = "v2SeqZeroOne";
+  const int destination = 0;
+  const auto maxBytes = std::numeric_limits<uint64_t>::max();
+
+  initializeTask(taskId, 1 /* numDestinations */, 1 /* numDrivers */);
+
+  enqueue(taskId, destination, 10);
+  enqueue(taskId, destination, 20);
+  noMoreData(taskId);
+
+  auto first = fetchV2Data(taskId, destination, maxBytes, 0);
+  ASSERT_NE(first.data, nullptr);
+  EXPECT_EQ(first.sequence, 0);
+  // Count-only flow leaves remainingBytes empty; advancement is via sequence
+  // fetches.
+  EXPECT_TRUE(first.remainingBytes.empty());
+
+  auto second = fetchV2Data(taskId, destination, maxBytes, 1);
+  ASSERT_NE(second.data, nullptr);
+  EXPECT_EQ(second.sequence, 1);
+  EXPECT_TRUE(second.remainingBytes.empty());
+
+  auto end = fetchV2Data(taskId, destination, maxBytes, 2);
+  EXPECT_EQ(end.data, nullptr);
+  EXPECT_EQ(end.sequence, 2);
+  EXPECT_TRUE(end.remainingBytes.empty());
+
+  queueManager_->deleteResults(taskId, destination);
+  EXPECT_TRUE(queueManager_->isFinished(taskId));
+  queueManager_->removeTask(taskId);
+}
+
+TEST_F(UcxOutputQueueManagerTest, v2OversizeRequestReturnsOneChunk) {
+  const std::string taskId = "v2OversizeReturnsOneChunk";
+  const int destination = 0;
+  const vector_size_t rows = 100;
+
+  initializeTask(taskId, 1 /* numDestinations */, 1 /* numDrivers */);
+
+  auto firstData = makePackedColumns(rows);
+  const auto firstBytes = firstData->gpu_data->size();
+  ASSERT_GT(firstBytes, 1);
+
+  queueManager_->enqueue(taskId, destination, std::move(firstData), rows);
+  enqueue(taskId, destination, rows);
+  noMoreData(taskId);
+
+  const uint64_t maxBytes = firstBytes - 1;
+  auto first = fetchV2Data(taskId, destination, maxBytes, 0);
+  ASSERT_NE(first.data, nullptr);
+  EXPECT_EQ(first.sequence, 0);
+  EXPECT_EQ(first.data->gpu_data->size(), firstBytes);
+  // Count-only flow leaves remainingBytes empty; chunking is checked via
+  // size/sequence.
+  EXPECT_TRUE(first.remainingBytes.empty());
+
+  auto second =
+      fetchV2Data(taskId, destination, std::numeric_limits<uint64_t>::max(), 1);
+  ASSERT_NE(second.data, nullptr);
+  EXPECT_EQ(second.sequence, 1);
+
+  auto end =
+      fetchV2Data(taskId, destination, std::numeric_limits<uint64_t>::max(), 2);
+  EXPECT_EQ(end.data, nullptr);
+  EXPECT_EQ(end.sequence, 2);
+
+  queueManager_->deleteResults(taskId, destination);
+  EXPECT_TRUE(queueManager_->isFinished(taskId));
+  queueManager_->removeTask(taskId);
+}
+
+TEST_F(UcxOutputQueueManagerTest, v2StaleSequenceDoesNotDequeue) {
+  const std::string taskId = "v2StaleSequence";
+  const int destination = 0;
+  const auto maxBytes = std::numeric_limits<uint64_t>::max();
+
+  initializeTask(taskId, 1 /* numDestinations */, 1 /* numDrivers */);
+
+  enqueue(taskId, destination, 10);
+  enqueue(taskId, destination, 20);
+  noMoreData(taskId);
+
+  auto first = fetchV2Data(taskId, destination, maxBytes, 0);
+  ASSERT_NE(first.data, nullptr);
+  EXPECT_EQ(first.sequence, 0);
+
+  // Simulate a duplicate server reconnecting from sequence zero. It should
+  // be told that sequence one is current, without consuming sequence one.
+  auto stale = fetchV2Data(taskId, destination, maxBytes, 0);
+  EXPECT_EQ(stale.data, nullptr);
+  EXPECT_EQ(stale.sequence, 1);
+
+  auto second = fetchV2Data(taskId, destination, maxBytes, 1);
+  ASSERT_NE(second.data, nullptr);
+  EXPECT_EQ(second.sequence, 1);
+
+  auto end = fetchV2Data(taskId, destination, maxBytes, 2);
+  EXPECT_EQ(end.data, nullptr);
+  EXPECT_EQ(end.sequence, 2);
+
+  queueManager_->deleteResults(taskId, destination);
+  EXPECT_TRUE(queueManager_->isFinished(taskId));
+  queueManager_->removeTask(taskId);
+}
+
+TEST_F(UcxOutputQueueManagerTest, v2DuplicateWaiterPreservesOriginal) {
+  const std::string taskId = "v2DuplicateWaiter";
+  const int destination = 0;
+  const auto maxBytes = std::numeric_limits<uint64_t>::max();
+
+  initializeTask(taskId, 1 /* numDestinations */, 1 /* numDrivers */);
+
+  bool originalFired = false;
+  std::shared_ptr<cudf::packed_columns> originalData;
+  queueManager_->getData(
+      taskId,
+      destination,
+      maxBytes,
+      0,
+      [&](std::shared_ptr<cudf::packed_columns> data,
+          int64_t sequence,
+          std::vector<int64_t>) {
+        EXPECT_EQ(sequence, 0);
+        originalData = std::move(data);
+        originalFired = true;
+      });
+  EXPECT_FALSE(originalFired);
+
+  bool duplicateFired = false;
+  queueManager_->getData(
+      taskId,
+      destination,
+      maxBytes,
+      0,
+      [&](std::shared_ptr<cudf::packed_columns> data,
+          int64_t sequence,
+          std::vector<int64_t>) {
+        EXPECT_EQ(data, nullptr);
+        EXPECT_EQ(sequence, 1);
+        duplicateFired = true;
+      });
+  EXPECT_TRUE(duplicateFired);
+  EXPECT_FALSE(originalFired);
+
+  enqueue(taskId, destination, 10);
+  EXPECT_TRUE(originalFired);
+  EXPECT_NE(originalData, nullptr);
+
+  noMoreData(taskId);
+  auto end = fetchV2Data(taskId, destination, maxBytes, 1);
+  EXPECT_EQ(end.data, nullptr);
+  EXPECT_EQ(end.sequence, 1);
+
+  queueManager_->deleteResults(taskId, destination);
+  EXPECT_TRUE(queueManager_->isFinished(taskId));
+  queueManager_->removeTask(taskId);
+}
+
+TEST_F(UcxOutputQueueManagerTest, v2RemovedTaskReturnsNullAtRequestedSequence) {
+  const std::string taskId = "v2RemovedTask";
+  const int destination = 0;
+  const int64_t requestedSequence = 7;
+
+  auto task =
+      initializeTask(taskId, 1 /* numDestinations */, 1 /* numDrivers */);
+  task->requestAbort().wait();
+  queueManager_->removeTask(taskId);
+
+  auto response = fetchV2Data(
+      taskId,
+      destination,
+      std::numeric_limits<uint64_t>::max(),
+      requestedSequence);
+
+  EXPECT_EQ(response.data, nullptr);
+  EXPECT_EQ(response.sequence, requestedSequence);
+  EXPECT_TRUE(response.remainingBytes.empty());
+}
+
+TEST_F(UcxOutputQueueManagerTest, exchangeQueueCloseWakesWaitingConsumer) {
+  UcxExchangeQueue queue(1);
+  bool atEnd = false;
+  ContinueFuture future;
+  ContinuePromise stalePromise = ContinuePromise::makeEmpty();
+
+  {
+    std::lock_guard<std::mutex> l(queue.mutex());
+    auto data = queue.dequeueLocked(0, &atEnd, &future, &stalePromise);
+    EXPECT_EQ(data, nullptr);
+    EXPECT_FALSE(atEnd);
+  }
+  EXPECT_FALSE(stalePromise.valid());
+
+  queue.close();
+  future.wait();
+  EXPECT_TRUE(future.isReady());
+}
+
 TEST_F(UcxOutputQueueManagerTest, basicAsyncFetch) {
   const vector_size_t size = 10;
   const std::string taskId = "t0";
@@ -335,14 +611,13 @@ TEST_F(UcxOutputQueueManagerTest, basicAsyncFetch) {
 
 TEST_F(UcxOutputQueueManagerTest, lateTaskCreation) {
   const vector_size_t size = 10;
-  const std::string taskId = "t0";
+  // Task IDs are unique in production. Do not reuse "t0" from
+  // basicAsyncFetch: removeTask intentionally retains its tombstone so stale
+  // UCX fetches cannot recreate a removed task.
+  const std::string taskId = "lateTaskCreation";
   int numPartitions = 1;
   bool earlyTermination = false;
   int destination = 0;
-
-  // Clear stale state from prior tests (removeTask on a non-existing queue
-  // clears the removedTasks_ set, allowing getData to create a placeholder).
-  queueManager_->removeTask(taskId);
 
   // Fetch data from a non-existing task.
   struct Response {

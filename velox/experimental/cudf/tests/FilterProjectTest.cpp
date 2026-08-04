@@ -902,6 +902,26 @@ TEST_F(CudfFilterProjectTest, timestampLiteralComparisons) {
   }
 }
 
+TEST_F(CudfFilterProjectTest, timestampNullPredicates) {
+  std::vector<std::optional<Timestamp>> timestamps = {
+      Timestamp(1735689599, 0), // 2024-12-31 23:59:59
+      std::nullopt,
+      Timestamp(1735689600, 0), // 2025-01-01 00:00:00
+      Timestamp(1736942400, 0), // 2025-01-15 12:00:00
+      std::nullopt,
+      Timestamp(1738367999, 0) // 2025-01-31 23:59:59
+  };
+
+  auto data = makeRowVector(
+      {"event_id", "event_ts"},
+      {makeFlatVector<int32_t>({1, 2, 3, 4, 5, 6}),
+       makeNullableFlatVector<Timestamp>(timestamps, TIMESTAMP())});
+  std::vector<RowVectorPtr> vectors{data};
+
+  assertFilterIds(vectors, "event_ts IS NULL", {2, 5});
+  assertFilterIds(vectors, "event_ts IS NOT NULL", {1, 3, 4, 6});
+}
+
 // Comparing a timestamp column against a timestamp literal must work under
 // every value cudf.timestamp_unit accepts. Regression test for the
 // millisecond and second units, whose constant scalars previously fell
@@ -1632,6 +1652,24 @@ TEST_F(CudfFilterProjectTest, round) {
   AssertQueryBuilder(plan).assertResults(expected);
 }
 
+TEST_F(CudfFilterProjectTest, roundFloating) {
+  auto data = makeRowVector({
+      makeFlatVector<double>({41.2389, -45.6789, 100.0}),
+      makeFlatVector<double>({2.0, 3.0, 0.02}),
+  });
+  parse::ParseOptions options;
+  options.parseIntegerAsBigint = false;
+
+  auto plan = PlanBuilder()
+                  .setParseOptions(options)
+                  .values({data})
+                  .project({"round(c0 * c1, 2) as c1"})
+                  .planNode();
+  auto expected =
+      makeRowVector({makeFlatVector<double>({82.48, -137.04, 2.0})});
+  AssertQueryBuilder(plan).assertResults(expected);
+}
+
 TEST_F(CudfFilterProjectTest, roundDecimal) {
   parse::ParseOptions options;
   options.parseIntegerAsBigint = false;
@@ -1898,6 +1936,23 @@ TEST_F(CudfFilterProjectTest, mixedLiteralProjection) {
   testMixedLiteralProjection(vectors);
 }
 
+TEST_F(CudfFilterProjectTest, zeroColumnValuesConstantProjection) {
+  std::vector<RowVectorPtr> input = {makeRowVector(ROW({}), 1)};
+  auto plan = PlanBuilder()
+                  .values(input)
+                  .project(
+                      {"CAST(-1001 AS BIGINT) AS id",
+                       "'--' AS label",
+                       "CAST(-1001 AS BIGINT) AS parent_id"})
+                  .planNode();
+
+  auto expected = makeRowVector(
+      {makeFlatVector<int64_t>({-1001}),
+       makeFlatVector<std::string>({"--"}),
+       makeFlatVector<int64_t>({-1001})});
+  assertQuery(plan, expected);
+}
+
 TEST_F(CudfFilterProjectTest, dereference) {
   auto rowType = ROW(
       {"c0", "c1", "c2", "c3"}, {BIGINT(), INTEGER(), SMALLINT(), DOUBLE()});
@@ -1933,6 +1988,19 @@ TEST_F(CudfFilterProjectTest, dereferenceWithLiteralAndNullFields) {
           .planNode();
 
   assertQuery(plan, "SELECT c0, CAST(NULL AS INTEGER), 'x' FROM tmp");
+}
+
+TEST_F(CudfFilterProjectTest, rowConstructorWithUntypedNullField) {
+  auto vectors = makeVectors(rowType_, 2, 128);
+  createDuckDbTable(vectors);
+
+  auto plan = PlanBuilder()
+                  .values(vectors)
+                  .project({"row_constructor(c0, null) AS r"})
+                  .project({"r.c1"})
+                  .planNode();
+
+  assertQuery(plan, "SELECT c0 FROM tmp");
 }
 
 TEST_F(CudfFilterProjectTest, cardinality) {
@@ -2064,6 +2132,27 @@ TEST_F(CudfFilterProjectTest, substrWithLength) {
       makeFlatVector<std::string>({
           "hel",
           "sec",
+      }),
+  });
+  facebook::velox::test::assertEqualVectors(
+      substrResults, calculatedSubstrResults);
+}
+
+TEST_F(CudfFilterProjectTest, substringWithIntegerBounds) {
+  auto input =
+      makeFlatVector<std::string>({"hellobutlonghello", "secondstring"});
+  auto data = makeRowVector({input});
+  auto substrPlan = PlanBuilder()
+                        .values({data})
+                        .project({"substring(c0, cast(1 as integer), "
+                                  "cast(2 as integer)) AS c0"})
+                        .planNode();
+  auto substrResults = AssertQueryBuilder(substrPlan).copyResults(pool());
+
+  auto calculatedSubstrResults = makeRowVector({
+      makeFlatVector<std::string>({
+          "he",
+          "se",
       }),
   });
   facebook::velox::test::assertEqualVectors(
@@ -2319,6 +2408,98 @@ TEST_F(CudfSimpleFilterProjectTest, castToSmallInt) {
   auto tryCast =
       evaluateOnce<int16_t, int32_t>("try_cast(c0 as smallint)", -214);
   EXPECT_EQ(tryCast, -214);
+}
+
+TEST_F(CudfSimpleFilterProjectTest, castNumericToBoolean) {
+  auto input = makeRowVector({
+      makeNullableFlatVector<int64_t>({0, 1, -7, std::nullopt}),
+      makeNullableFlatVector<bool>({true, false, true, false}),
+      makeNullableFlatVector<double>({
+          0.0,
+          0.5,
+          std::numeric_limits<double>::quiet_NaN(),
+          std::nullopt,
+      }),
+  });
+
+  for (const auto& expression : {
+           "cast(c0 as boolean)",
+           "try_cast(c0 as boolean)",
+           "coalesce(try_cast(c0 as boolean), c1)",
+           "try_cast(c2 as boolean)",
+       }) {
+    SCOPED_TRACE(expression);
+    assertExpressionMatchesCpu(expression, input, input->rowType());
+  }
+}
+
+TEST_F(CudfSimpleFilterProjectTest, castNumericToTimestamp) {
+  auto input = makeRowVector({
+      makeNullableFlatVector<double>({
+          1767225600.0,
+          1767225600.123,
+          std::nullopt,
+      }),
+      makeNullableFlatVector<int64_t>({
+          1767225600000,
+          1767225600123,
+          std::nullopt,
+      }),
+  });
+
+  for (const auto& expression : {
+           "cast(c0 as timestamp)",
+           "try_cast(c0 as timestamp)",
+           "try_cast(divide(try_cast(c1 as double), 1000.0) as timestamp)",
+       }) {
+    SCOPED_TRACE(expression);
+    assertExpressionMatchesCpu(expression, input, input->rowType());
+  }
+}
+
+TEST_F(CudfSimpleFilterProjectTest, castIntegralToVarchar) {
+  EXPECT_EQ(
+      evaluateOnce<std::string, int32_t>("cast(c0 as varchar)", 12345),
+      "12345");
+  EXPECT_EQ(
+      evaluateOnce<std::string, int64_t>("cast(c0 as varchar)", 9876543210LL),
+      "9876543210");
+  EXPECT_EQ(
+      evaluateOnce<std::string, int16_t>(
+          "cast(c0 as varchar)", static_cast<int16_t>(255)),
+      "255");
+  EXPECT_EQ(
+      evaluateOnce<std::string, int8_t>(
+          "try_cast(c0 as varchar)", static_cast<int8_t>(-7)),
+      "-7");
+  EXPECT_EQ(
+      evaluateOnce<std::string, int32_t>(
+          "cast(c0 as varchar)", std::optional<int32_t>{}),
+      std::nullopt);
+}
+
+TEST_F(CudfSimpleFilterProjectTest, castFloatingPointToVarchar) {
+  EXPECT_EQ(
+      evaluateOnce<std::string, double>("cast(c0 as varchar)", 12.5), "12.5");
+  EXPECT_EQ(
+      evaluateOnce<std::string, float>(
+          "try_cast(c0 as varchar)", static_cast<float>(-7.25)),
+      "-7.25");
+  EXPECT_EQ(
+      evaluateOnce<std::string, double>(
+          "cast(c0 as varchar)", std::optional<double>{}),
+      std::nullopt);
+}
+
+TEST_F(CudfSimpleFilterProjectTest, castDateToVarchar) {
+  EXPECT_EQ(
+      evaluateOnce<std::string>(
+          "cast(c0 as varchar)", DATE(), DATE()->toDays("2024-03-15")),
+      "2024-03-15");
+  EXPECT_EQ(
+      evaluateOnce<std::string>(
+          "try_cast(c0 as varchar)", DATE(), std::optional<int32_t>{}),
+      std::nullopt);
 }
 
 TEST_F(CudfSimpleFilterProjectTest, rowConstructorAndDereference) {

@@ -27,6 +27,7 @@
 
 #include <algorithm>
 #include <numeric>
+#include <unordered_map>
 
 namespace facebook::velox::cudf_velox {
 
@@ -111,6 +112,71 @@ bool isSupportedZeroColumnAggregation(
                return isCountFunctionName(aggregate.call->name());
              });
 }
+
+core::TypedExprPtr rewriteProjectAliases(
+    const core::TypedExprPtr& expr,
+    const std::unordered_map<std::string, core::TypedExprPtr>& mapping) {
+  auto current = expr;
+  for (size_t depth = 0; depth <= mapping.size(); ++depth) {
+    auto next = current->rewriteInputNames(mapping);
+    if (*next == *current) {
+      return next;
+    }
+    current = std::move(next);
+  }
+  return current;
+}
+
+bool fieldReferencesResolve(
+    const core::TypedExprPtr& expr,
+    const RowTypePtr& inputRowSchema) {
+  if (auto field =
+          std::dynamic_pointer_cast<const core::FieldAccessTypedExpr>(expr)) {
+    if (field->inputs().empty() &&
+        !inputRowSchema->getChildIdxIfExists(field->name()).has_value()) {
+      return false;
+    }
+  }
+
+  for (const auto& input : expr->inputs()) {
+    if (!fieldReferencesResolve(input, inputRowSchema)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+core::TypedExprPtr normalizeProjectInputReferences(
+    const core::TypedExprPtr& expr,
+    const core::PlanNode* sourceNode,
+    const RowTypePtr& inputRowSchema) {
+  if (fieldReferencesResolve(expr, inputRowSchema)) {
+    return expr;
+  }
+
+  auto projectNode = dynamic_cast<const core::ProjectNode*>(sourceNode);
+  if (!projectNode) {
+    return expr;
+  }
+
+  std::unordered_map<std::string, core::TypedExprPtr> reverseMapping;
+  const auto& projections = projectNode->projections();
+  const auto& names = projectNode->names();
+  reverseMapping.reserve(names.size());
+  for (size_t i = 0; i < names.size(); ++i) {
+    auto field = std::dynamic_pointer_cast<const core::FieldAccessTypedExpr>(
+        projections[i]);
+    if (field && field->inputs().empty()) {
+      reverseMapping.emplace(
+          field->name(),
+          std::make_shared<core::FieldAccessTypedExpr>(
+              projections[i]->type(), names[i]));
+    }
+  }
+
+  auto rewritten = rewriteProjectAliases(expr, reverseMapping);
+  return fieldReferencesResolve(rewritten, inputRowSchema) ? rewritten : expr;
+}
 } // namespace
 
 bool hasCompanionAggregates(
@@ -169,6 +235,9 @@ AggregationInputChannels buildAggregationInputChannels(
 
   const auto fallbackChannel =
       groupingKeyInputChannels.empty() ? 0 : groupingKeyInputChannels.front();
+  const core::PlanNode* sourceNode = aggregationNode.sources().empty()
+      ? nullptr
+      : aggregationNode.sources()[0].get();
 
   for (auto i = 0; i < aggregationNode.aggregates().size(); ++i) {
     auto const& aggregate = aggregationNode.aggregates()[i];
@@ -176,14 +245,46 @@ AggregationInputChannels buildAggregationInputChannels(
     for (auto const& arg : aggregate.call->inputs()) {
       if (auto const field =
               dynamic_cast<core::FieldAccessTypedExpr const*>(arg.get())) {
-        aggInputs.push_back(inputRowSchema->getChildIdx(field->name()));
+        if (field->inputs().empty()) {
+          auto channel = inputRowSchema->getChildIdxIfExists(field->name());
+          VELOX_CHECK(
+              channel.has_value(),
+              "Aggregation input column not found: {}",
+              field->name());
+          aggInputs.push_back(*channel);
+          continue;
+        }
+
+        auto expandedArg =
+            normalizeProjectInputReferences(arg, sourceNode, inputRowSchema);
+        if (auto const expandedField =
+                dynamic_cast<core::FieldAccessTypedExpr const*>(
+                    expandedArg.get())) {
+          if (expandedField->inputs().empty()) {
+            auto channel =
+                inputRowSchema->getChildIdxIfExists(expandedField->name());
+            VELOX_CHECK(
+                channel.has_value(),
+                "Aggregation input column not found: {}",
+                expandedField->name());
+            aggInputs.push_back(*channel);
+            continue;
+          }
+        }
+
+        aggInputs.push_back(
+            inputRowSchema->size() + result.precomputedInputs.size());
+        result.precomputedInputs.push_back(std::move(expandedArg));
       } else if (
           auto constant =
               dynamic_cast<const core::ConstantTypedExpr*>(arg.get())) {
         result.constants[i] = constant->toConstantVector(operatorCtx.pool());
         aggInputs.push_back(fallbackChannel);
       } else {
-        VELOX_NYI("Constants and lambdas not yet supported");
+        aggInputs.push_back(
+            inputRowSchema->size() + result.precomputedInputs.size());
+        result.precomputedInputs.push_back(
+            normalizeProjectInputReferences(arg, sourceNode, inputRowSchema));
       }
     }
 
@@ -199,6 +300,58 @@ AggregationInputChannels buildAggregationInputChannels(
     result.channels.push_back(aggInputs[0]);
   }
 
+  return result;
+}
+
+std::vector<CudfExpressionPtr> createAggregationInputEvaluators(
+    const std::vector<core::TypedExprPtr>& precomputedInputs,
+    exec::OperatorCtx const& operatorCtx,
+    RowTypePtr const& inputRowSchema) {
+  if (precomputedInputs.empty()) {
+    return {};
+  }
+
+  bool lazyDereference = false;
+  std::vector<core::TypedExprPtr> exprs = precomputedInputs;
+  auto exprSet = std::make_unique<exec::ExprSet>(
+      exprs,
+      operatorCtx.execCtx(),
+      /*enableConstantFolding=*/false,
+      lazyDereference);
+
+  std::vector<CudfExpressionPtr> evaluators;
+  evaluators.reserve(exprSet->exprs().size());
+  for (const auto& expr : exprSet->exprs()) {
+    evaluators.push_back(createCudfExpression(
+        expr, inputRowSchema, &operatorCtx.driverCtx()->queryConfig()));
+  }
+  return evaluators;
+}
+
+PreparedAggregationInput prepareAggregationInput(
+    cudf::table_view input,
+    cudf::size_type inputRowCount,
+    const std::vector<CudfExpressionPtr>& precomputedInputEvaluators,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) {
+  PreparedAggregationInput result;
+  if (precomputedInputEvaluators.empty()) {
+    result.tableView = input;
+    return result;
+  }
+
+  const auto inputViews = tableViewToColumnViews(input);
+  auto allViews = inputViews;
+  allViews.reserve(input.num_columns() + precomputedInputEvaluators.size());
+  result.precomputedColumns.reserve(precomputedInputEvaluators.size());
+
+  for (const auto& evaluator : precomputedInputEvaluators) {
+    result.precomputedColumns.push_back(
+        evaluator->eval(inputViews, inputRowCount, stream, mr, true));
+    allViews.push_back(asView(result.precomputedColumns.back()));
+  }
+
+  result.tableView = cudf::table_view(allViews);
   return result;
 }
 
@@ -307,10 +460,6 @@ bool canAggregationBeEvaluatedByRegistry(
     return true;
   }
 
-  if (hasOnlyConstantArguments(call)) {
-    return false;
-  }
-
   // Validate against step-specific signatures from registry.
   return matchTypedCallAgainstSignatures(call, stepIt->second);
 }
@@ -331,6 +480,21 @@ bool canBeEvaluatedByCudf(
   bool isGlobal = aggregationNode.groupingKeys().empty();
   bool isDistinct = !isGlobal && aggregationNode.aggregates().empty();
 
+  // Grouped aggregation materializes constant inputs on the GPU.  Global reduce
+  // operators still consume a real input channel, so keep non-count constant
+  // reductions on the CPU path until their adapter gains the same
+  // materialization support.
+  if (isGlobal &&
+      std::any_of(
+          aggregationNode.aggregates().begin(),
+          aggregationNode.aggregates().end(),
+          [](const auto& aggregate) {
+            return !isCountFunctionName(aggregate.call->name()) &&
+                hasOnlyConstantArguments(*aggregate.call);
+          })) {
+    return false;
+  }
+
   if (isDistinct) {
     return canGroupingKeysBeEvaluatedByCudf(
         aggregationNode.groupingKeys(), sourceNode, queryCtx, pool);
@@ -344,25 +508,11 @@ bool canBeEvaluatedByCudf(
 core::TypedExprPtr expandFieldReference(
     const core::TypedExprPtr& expr,
     const core::PlanNode* sourceNode) {
-  // If this is a field reference and we have a source projection, expand it
-  if (expr->kind() == core::ExprKind::kFieldAccess && sourceNode) {
-    auto projectNode = dynamic_cast<const core::ProjectNode*>(sourceNode);
-    if (projectNode) {
-      auto fieldExpr =
-          std::dynamic_pointer_cast<const core::FieldAccessTypedExpr>(expr);
-      if (fieldExpr) {
-        // Find the corresponding projection expression
-        const auto& projections = projectNode->projections();
-        const auto& names = projectNode->names();
-        for (size_t i = 0; i < names.size(); ++i) {
-          if (names[i] == fieldExpr->name()) {
-            return projections[i];
-          }
-        }
-      }
-    }
+  if (!sourceNode) {
+    return expr;
   }
-  return expr;
+  return normalizeProjectInputReferences(
+      expr, sourceNode, asRowType(sourceNode->outputType()));
 }
 
 bool canGroupingKeysBeEvaluatedByCudf(

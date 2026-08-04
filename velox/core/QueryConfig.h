@@ -340,6 +340,64 @@ class QueryConfig {
       2UL << 20,
       "Minimum bytes to accumulate before unblocking an exchange consumer.")
 
+  /// Target number of rows in a CudfPartitionedOutput exchange chunk. Small
+  /// inputs are accumulated to this threshold, while larger outputs are split
+  /// into bounded slices. Set to 0 to disable accumulation and slicing.
+  VELOX_QUERY_CONFIG(
+      kUcxPartitionedOutputBatchRows,
+      ucxPartitionedOutputBatchRows,
+      "cudf.partitioned_output_batch_rows",
+      int64_t,
+      10'000,
+      "Target rows per CudfPartitionedOutput exchange chunk.")
+
+  /// Maximum input rows for one libcudf hash_partition call in UCX output.
+  /// Zero keeps the normal single-call path. This is query-scoped so a query
+  /// that needs the libcudf safety bound does not regress every other query.
+  VELOX_QUERY_CONFIG(
+      kUcxHashPartitionInputBatchRows,
+      ucxHashPartitionInputBatchRows,
+      "cudf.hash_partition_input_batch_rows",
+      int64_t,
+      0,
+      "Maximum input rows per UCX hash_partition call; 0 disables slicing.")
+
+  /// Maximum source rows whose safely sliced hash results are recombined at
+  /// once. Zero derives the window from cudf.partitioned_output_batch_rows.
+  VELOX_QUERY_CONFIG(
+      kUcxHashPartitionWindowRows,
+      ucxHashPartitionWindowRows,
+      "cudf.hash_partition_window_rows",
+      int64_t,
+      0,
+      "Maximum source rows per sliced UCX hash recombination window; 0 uses "
+      "the partitioned-output batch row setting.")
+
+  /// Query-boundary cudaMallocAsync trim policy. Values >= 0 trim unused pool
+  /// memory to the requested retained bytes; -1 explicitly disables trim for
+  /// this query; -2 preserves the executor-environment fallback. This allows
+  /// benchmark hot iterations to reuse the pool while retaining deterministic
+  /// release before a following high-peak query.
+  VELOX_QUERY_CONFIG(
+      kCudfAsyncQueryEndTrimBytes,
+      cudfAsyncQueryEndTrimBytes,
+      "cudf.async_query_end_trim_bytes",
+      int64_t,
+      -2,
+      "cudaMallocAsync bytes to retain at query end; -1 disables and -2 uses "
+      "the executor environment fallback.")
+
+  /// Target bytes to accumulate before flushing CudfPartitionedOutput and the
+  /// maximum approximate payload bytes per destination chunk. Set to 0 to
+  /// disable byte-based accumulation and chunking.
+  VELOX_QUERY_CONFIG(
+      kUcxPartitionedOutputBatchBytes,
+      ucxPartitionedOutputBatchBytes,
+      "cudf.partitioned_output_batch_bytes",
+      uint64_t,
+      0,
+      "Target bytes per CudfPartitionedOutput exchange chunk.")
+
   VELOX_QUERY_CONFIG(
       kMaxPartialAggregationMemory,
       maxPartialAggregationMemoryUsage,
@@ -837,6 +895,47 @@ class QueryConfig {
       uint64_t,
       96L << 20,
       "Minimum memory footprint to reclaim from a file writer by flushing.")
+
+  /// If true, Spark function behavior is ANSI-compliant, e.g. throws runtime
+  /// exception instead of returning null on invalid inputs. It affects only
+  /// functions explicitly marked as ANSI compliant.
+  static constexpr const char* kSparkAnsiEnabled = "spark.ansi_enabled";
+
+  /// The default number of expected items for the Spark bloom filter.
+  static constexpr const char* kSparkBloomFilterExpectedNumItems =
+      "spark.bloom_filter.expected_num_items";
+
+  /// The default number of bits to use for the Spark bloom filter.
+  static constexpr const char* kSparkBloomFilterNumBits =
+      "spark.bloom_filter.num_bits";
+
+  /// The max number of bits to use for the Spark bloom filter.
+  static constexpr const char* kSparkBloomFilterMaxNumBits =
+      "spark.bloom_filter.max_num_bits";
+
+  /// The max number of items to use for the Spark bloom filter.
+  static constexpr const char* kSparkBloomFilterMaxNumItems =
+      "spark.bloom_filter.max_num_items";
+
+  /// The current Spark partition id.
+  static constexpr const char* kSparkPartitionId = "spark.partition_id";
+
+  /// If true, simple date formatter is used for time formatting and parsing.
+  static constexpr const char* kSparkLegacyDateFormatter =
+      "spark.legacy_date_formatter";
+
+  /// If true, Spark statistical aggregation functions return NaN instead of
+  /// null when dividing by zero during expression evaluation.
+  static constexpr const char* kSparkLegacyStatisticalAggregate =
+      "spark.legacy_statistical_aggregate";
+
+  /// If true, ignore null fields when generating JSON string.
+  static constexpr const char* kSparkJsonIgnoreNullFields =
+      "spark.json_ignore_null_fields";
+
+  /// If true, collect_list aggregate function ignores nulls in the input.
+  static constexpr const char* kSparkCollectListIgnoreNulls =
+      "spark.collect_list.ignore_nulls";
 
   /// The number of local parallel table writer operators per task.
   VELOX_QUERY_CONFIG(
@@ -1530,6 +1629,54 @@ class QueryConfig {
     constexpr uint8_t kMaxBits = 3;
     return std::min(
         kMaxBits, get<uint8_t>(kSpillNumPartitionBits, kDefaultBits));
+  }
+
+  bool sparkAnsiEnabled() const {
+    return get<bool>(kSparkAnsiEnabled, false);
+  }
+
+  int64_t sparkBloomFilterExpectedNumItems() const {
+    constexpr int64_t kDefault = 1'000'000L;
+    return get<int64_t>(kSparkBloomFilterExpectedNumItems, kDefault);
+  }
+
+  int64_t sparkBloomFilterNumBits() const {
+    constexpr int64_t kDefault = 8'388'608L;
+    return get<int64_t>(kSparkBloomFilterNumBits, kDefault);
+  }
+
+  int64_t sparkBloomFilterMaxNumBits() const {
+    constexpr int64_t kDefault = 67'108'864L;
+    return get<int64_t>(kSparkBloomFilterMaxNumBits, kDefault);
+  }
+
+  int64_t sparkBloomFilterMaxNumItems() const {
+    constexpr int64_t kDefault = 4'000'000L;
+    return get<int64_t>(kSparkBloomFilterMaxNumItems, kDefault);
+  }
+
+  int32_t sparkPartitionId() const {
+    auto id = get<int32_t>(kSparkPartitionId);
+    VELOX_CHECK(id.has_value(), "Spark partition id is not set.");
+    auto value = id.value();
+    VELOX_CHECK_GE(value, 0, "Invalid Spark partition id.");
+    return value;
+  }
+
+  bool sparkLegacyDateFormatter() const {
+    return get<bool>(kSparkLegacyDateFormatter, false);
+  }
+
+  bool sparkLegacyStatisticalAggregate() const {
+    return get<bool>(kSparkLegacyStatisticalAggregate, false);
+  }
+
+  bool sparkJsonIgnoreNullFields() const {
+    return get<bool>(kSparkJsonIgnoreNullFields, true);
+  }
+
+  bool sparkCollectListIgnoreNulls() const {
+    return get<bool>(kSparkCollectListIgnoreNulls, true);
   }
 
   uint32_t taskPartitionedWriterCount() const {

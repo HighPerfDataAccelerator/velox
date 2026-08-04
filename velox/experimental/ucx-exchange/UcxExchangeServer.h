@@ -22,6 +22,7 @@
 #include <velox/exec/Task.h>
 #include <velox/experimental/ucx-exchange/UcxOutputQueueManager.h>
 #include <chrono>
+#include <functional>
 #include <future>
 #include <memory>
 #include <tuple>
@@ -40,6 +41,7 @@ class UcxExchangeServer
   enum class ServerState : uint32_t {
     Created,
     ReadyToTransfer,
+    DataRequestReady,
     WaitingForDataFromQueue,
     DataReady,
     WaitingForSendComplete,
@@ -86,6 +88,10 @@ class UcxExchangeServer
   /// @return A shared pointer to itself.
   std::shared_ptr<UcxExchangeServer> getSelfPtr();
 
+  /// Re-enqueues this server if the Communicator is still accepting work.
+  /// Safe for UCXX and registry callbacks during shutdown.
+  void wakeCommunicator();
+
   /// @brief Sends metadata and data to the connected receiver.
   void sendData();
 
@@ -95,6 +101,10 @@ class UcxExchangeServer
   /// @brief Completion handler for intra-node transfer after source retrieves
   /// data.
   void onIntraNodeRetrieveComplete();
+
+  /// Registers a one-shot wakeup for the server after a published intra-node
+  /// entry is retrieved by the source.
+  std::function<void()> makeIntraNodeRetrieveWakeup();
 
   /// @brief Sets the new state of this exchange server using
   /// sequential consistency. Logs transitions at VLOG(2).
@@ -123,6 +133,10 @@ class UcxExchangeServer
   /// thread while the lock is still held.
   std::recursive_mutex dataMutex_;
   std::atomic<bool> closed_{false};
+  // A duplicate server may reconnect at an already-acknowledged sequence.
+  // Its close must not clear the destination queue owned by the active
+  // server.
+  std::atomic<bool> skipQueueDeleteOnClose_{false};
 
   /// Future for intra-node transfer - signaled when source retrieves data.
   std::future<void> intraNodeRetrieveFuture_;

@@ -14,8 +14,10 @@
  * limitations under the License.
  */
 
+#include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 
+#include "velox/common/base/tests/GTestUtils.h"
 #include "velox/exec/tests/utils/AssertQueryBuilder.h"
 #include "velox/exec/tests/utils/HiveConnectorTestBase.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
@@ -66,6 +68,43 @@ TEST_F(CudfNestedLoopJoinTest, crossJoin) {
                   .planNode();
 
   // Cross join produces 3 * 2 = 6 rows
+  assertQuery(plan, "SELECT * FROM t, u");
+}
+
+// The replicated MPP path retains the complete build table on every GPU.
+// Reject the next device batch before retaining it when the runtime cap is
+// exceeded, then verify a fresh task can reuse the same plan successfully.
+TEST_F(CudfNestedLoopJoinTest, buildByteLimitAndCleanup) {
+  auto probeVectors = {makeRowVector({sequence<int32_t>(3)})};
+  // The first batch fits and is retained; the second one crosses the cap. This
+  // exercises close-time release of already-accounted build data, rather than
+  // rejecting before the bridge owns anything.
+  std::vector<RowVectorPtr> buildVectors{
+      makeRowVector({sequence<int32_t>(1)}),
+      makeRowVector({sequence<int32_t>(128)})};
+
+  createDuckDbTable("t", {probeVectors});
+  createDuckDbTable("u", {buildVectors});
+
+  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  auto plan = PlanBuilder(planNodeIdGenerator)
+                  .values({probeVectors})
+                  .nestedLoopJoin(
+                      PlanBuilder(planNodeIdGenerator)
+                          .values({buildVectors})
+                          .project({"c0 AS u_c0"})
+                          .planNode(),
+                      {"c0", "u_c0"})
+                  .planNode();
+
+  VELOX_ASSERT_THROW(
+      AssertQueryBuilder(plan)
+          .config(
+              cudf_velox::CudfConfig::kCudfNestedLoopJoinMaxBuildBytes, "16")
+          .copyResults(pool()),
+      "CudfNestedLoopJoin build exceeds configured device-memory limit");
+
+  // A rejected task must release all retained build vectors on close.
   assertQuery(plan, "SELECT * FROM t, u");
 }
 
@@ -182,6 +221,39 @@ TEST_F(CudfNestedLoopJoinTest, innerJoinWithFilter) {
                   .planNode();
 
   assertQuery(plan, "SELECT t.c0, u.c0 FROM t INNER JOIN u ON t.c0 < u.c0");
+}
+
+TEST_F(CudfNestedLoopJoinTest, innerJoinWithTimestampFilter) {
+  auto probeVectors = {makeRowVector(
+      {"p_id", "p_ts"},
+      {makeFlatVector<int32_t>({1, 2, 3}),
+       makeFlatVector<Timestamp>(
+           {Timestamp(10, 0), Timestamp(20, 0), Timestamp(30, 0)},
+           TIMESTAMP())})};
+
+  auto buildVectors = {makeRowVector(
+      {"b_id", "b_ts"},
+      {makeFlatVector<int32_t>({10, 11}),
+       makeFlatVector<Timestamp>(
+           {Timestamp(15, 0), Timestamp(25, 0)}, TIMESTAMP())})};
+
+  createDuckDbTable("t", {probeVectors});
+  createDuckDbTable("u", {buildVectors});
+
+  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  auto plan = PlanBuilder(planNodeIdGenerator)
+                  .values({probeVectors})
+                  .nestedLoopJoin(
+                      PlanBuilder(planNodeIdGenerator)
+                          .values({buildVectors})
+                          .planNode(),
+                      "p_ts > b_ts",
+                      {"p_id", "b_id"},
+                      core::JoinType::kInner)
+                  .planNode();
+
+  assertQuery(
+      plan, "SELECT t.p_id, u.b_id FROM t INNER JOIN u ON t.p_ts > u.b_ts");
 }
 
 // Test 6: Multiple batches (tests streaming behavior)
