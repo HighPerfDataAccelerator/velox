@@ -2537,6 +2537,45 @@ TEST_P(AsyncDataCacheTest, removeFileEntries) {
   }
 }
 
+TEST_P(
+    AsyncDataCacheTest,
+    removeFileEntriesReleasesContiguousRegistrationOutsideShardLock) {
+  int32_t registrations = 0;
+  int32_t releases = 0;
+  AsyncDataCache::Options options;
+  options.forceContiguousEntries = true;
+  options.registerBackingBytes = [&](void* /*address*/, uint64_t /*bytes*/) {
+    ++registrations;
+    return std::shared_ptr<void>(new int32_t(1), [&](void* value) {
+      ++releases;
+      delete static_cast<int32_t*>(value);
+
+      // Re-enter every cache shard. This deadlocks if the registration is
+      // destroyed while removeFileEntries still holds a shard mutex.
+      EXPECT_EQ(cache_->refreshStats().numEntries, 0);
+    });
+  };
+  initializeCache(1 << 20, 0, 0, false, options);
+
+  auto pin = cache_->findOrCreate(
+      RawFileCacheKey{filenames_[0].id(), 0},
+      8'192,
+      /*contiguous=*/false);
+  ASSERT_FALSE(pin.empty());
+  ASSERT_TRUE(pin.checkedEntry()->hasContiguousData());
+  pin.checkedEntry()->setExclusiveToShared();
+  pin.clear();
+  ASSERT_EQ(registrations, 1);
+  ASSERT_EQ(releases, 0);
+
+  folly::F14FastSet<uint64_t> filesToRemove{filenames_[0].id()};
+  folly::F14FastSet<uint64_t> filesRetained;
+  EXPECT_TRUE(cache_->removeFileEntries(filesToRemove, filesRetained));
+  EXPECT_TRUE(filesRetained.empty());
+  EXPECT_EQ(registrations, 1);
+  EXPECT_EQ(releases, 1);
+}
+
 TEST_P(AsyncDataCacheTest, mixedBufferFuzz) {
   constexpr uint64_t kRamBytes = 256UL << 20;
   constexpr int32_t kNumThreads = 8;

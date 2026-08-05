@@ -802,6 +802,10 @@ bool CacheShard::removeFileEntries(
 
       ++numAgedOut_;
       ++numRemoved;
+      if (cacheEntry->backingRegistration_) {
+        registrationsToRelease.push_back(
+            std::move(cacheEntry->backingRegistration_));
+      }
       if (cacheEntry->contiguousData_ != nullptr) {
         pagesRemoved += memory::AllocationTraits::numPages(cacheEntry->size_);
         toFree.byteAllocations.emplace_back(
@@ -809,10 +813,6 @@ bool CacheShard::removeFileEntries(
         cacheEntry->contiguousData_ = nullptr;
       } else {
         pagesRemoved += cacheEntry->nonContiguousData().numPages();
-        if (cacheEntry->backingRegistration_) {
-          registrationsToRelease.push_back(
-              std::move(cacheEntry->backingRegistration_));
-        }
         toFree.nonContiguousAllocs.appendMove(cacheEntry->nonContiguousData());
       }
       removeEntryLocked(cacheEntry.get());
