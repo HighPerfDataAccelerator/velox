@@ -224,13 +224,6 @@ static std::unique_ptr<cudf::scalar> createCudfScalar(
       vector->type(), vector->value(), vector->isNullAt(0), toType, stream);
 }
 
-inline std::unique_ptr<cudf::scalar> makeScalarFromConstantVector(
-    const velox::VectorPtr& value,
-    std::optional<cudf::type_id> toType = std::nullopt) {
-  return VELOX_DYNAMIC_SCALAR_TYPE_DISPATCH(
-      createCudfScalar, value->typeKind(), value, toType);
-}
-
 inline std::unique_ptr<cudf::scalar> makeScalarFromConstantExpr(
     const core::TypedExprPtr& expr,
     memory::MemoryPool* pool,
@@ -323,26 +316,6 @@ inline bool containsAstUnsupportedType(const core::TypedExprPtr& expr) {
       if (isAstUnsupportedType(input)) {
         return true;
       }
-    }
-  }
-  return false;
-}
-
-/// Returns true if expr's output type or any descendant output type is DECIMAL.
-/// Decimal expressions are handled by FunctionExpression today; selecting
-/// AST/JIT for a boolean parent can otherwise reach decimal literals during AST
-/// construction.
-inline bool containsDecimalTypeRecursive(
-    const std::shared_ptr<velox::exec::Expr>& expr) {
-  if (!expr) {
-    return false;
-  }
-  if (expr->type() && expr->type()->isDecimal()) {
-    return true;
-  }
-  for (const auto& input : expr->inputs()) {
-    if (containsDecimalTypeRecursive(input)) {
-      return true;
     }
   }
   return false;

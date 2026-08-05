@@ -707,7 +707,8 @@ std::vector<ColumnOrView> precomputeSubexpressions(
          ins_name,
          new_column_index,
          nested_dependent_column_indices,
-         cudf_expression] = instruction;
+         cudf_expression,
+         expected_type] = instruction;
 
     // If a compiled cudf node is available, evaluate it directly.
     if (cudf_expression) {

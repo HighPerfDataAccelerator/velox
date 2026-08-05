@@ -44,6 +44,7 @@
 #include <cudf/fixed_point/fixed_point.hpp>
 #include <cudf/hashing.hpp>
 #include <cudf/lists/count_elements.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/replace.hpp>
 #include <cudf/round.hpp>
@@ -1962,13 +1963,25 @@ class ConcatFunction : public CudfFunction {
   size_t numInputs_{0};
 };
 
+enum class RowParentNullPolicy {
+  kNever,
+  kAnyInputNull,
+};
+
 class RowConstructorFunction : public CudfFunction {
  public:
   RowConstructorFunction(
       const core::TypedExprPtr& expr,
-      memory::MemoryPool* pool) {
+      memory::MemoryPool* pool,
+      RowParentNullPolicy parentNullPolicy = RowParentNullPolicy::kNever,
+      std::string functionName = "row_constructor")
+      : parentNullPolicy_(parentNullPolicy),
+        functionName_(std::move(functionName)) {
     VELOX_CHECK_GE(
-        expr->inputs().size(), 1, "row_constructor expects at least 1 input");
+        expr->inputs().size(),
+        1,
+        "{} expects at least 1 input",
+        functionName_);
     numInputs_ = expr->inputs().size();
     bool hasNonLiteralInput = false;
     literals_.reserve(numInputs_);
@@ -1981,7 +1994,7 @@ class RowConstructorFunction : public CudfFunction {
       }
     }
     if (!hasNonLiteralInput) {
-      VELOX_NYI("row_constructor with only literal inputs is not supported");
+      VELOX_NYI("{} with only literal inputs is not supported", functionName_);
     }
   }
 
@@ -2010,8 +2023,25 @@ class RowConstructorFunction : public CudfFunction {
     }
 
     VELOX_CHECK_EQ(nextInputColumnIndex, inputColumns.size());
+    if (parentNullPolicy_ == RowParentNullPolicy::kNever) {
+      return cudf::make_structs_column(
+          outputSize, std::move(children), 0, rmm::device_buffer{}, stream, mr);
+    }
+
+    std::vector<cudf::column_view> childViews;
+    childViews.reserve(children.size());
+    for (const auto& child : children) {
+      childViews.push_back(child->view());
+    }
+    auto [nullMask, nullCount] =
+        cudf::bitmask_and(cudf::table_view(childViews), stream, mr);
     return cudf::make_structs_column(
-        outputSize, std::move(children), 0, rmm::device_buffer{}, stream, mr);
+        outputSize,
+        std::move(children),
+        nullCount,
+        std::move(nullMask),
+        stream,
+        mr);
   }
 
  private:
@@ -2021,6 +2051,8 @@ class RowConstructorFunction : public CudfFunction {
       rmm::device_async_resource_ref mr);
 
   std::vector<std::unique_ptr<cudf::scalar>> literals_;
+  RowParentNullPolicy parentNullPolicy_;
+  std::string functionName_;
   size_t numInputs_{0};
 };
 
@@ -2150,6 +2182,16 @@ bool registerBuiltinFunctions(const std::string& prefix) {
          const core::TypedExprPtr& expr,
          memory::MemoryPool* pool) {
         return std::make_shared<RowConstructorFunction>(expr, pool);
+      },
+      {});
+
+  registerCudfFunction(
+      "row_constructor_with_null",
+      [](const std::string& name,
+         const core::TypedExprPtr& expr,
+         memory::MemoryPool* pool) {
+        return std::make_shared<RowConstructorFunction>(
+            expr, pool, RowParentNullPolicy::kAnyInputNull, name);
       },
       {});
 

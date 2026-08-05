@@ -194,6 +194,14 @@ CudfSplitReader::CudfSplitReader(
   baseReaderOpts_.setMetadataIoStats(ioStatistics_);
 }
 
+void CudfSplitReader::setDataSourceContext(
+    const ConnectorQueryCtx* connectorQueryCtx,
+    dwio::common::RuntimeStatistics& /*runtimeStats*/,
+    cudf::ast::expression const* subfieldFilterExpr) {
+  connectorQueryCtx_ = connectorQueryCtx;
+  subfieldFilterExpr_ = subfieldFilterExpr;
+}
+
 void CudfSplitReader::setupReader() {
   if (useExperimentalCudfReader_) {
     createExperimentalReader();

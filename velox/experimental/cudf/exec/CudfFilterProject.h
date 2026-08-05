@@ -50,8 +50,7 @@ class CudfFilterProject : public CudfOperatorBase {
 
   std::vector<std::unique_ptr<cudf::column>> project(
       std::vector<std::unique_ptr<cudf::column>>& inputTableColumns,
-      rmm::cuda_stream_view stream,
-      vector_size_t outputSize);
+      rmm::cuda_stream_view stream);
 
   exec::BlockingReason isBlocked(ContinueFuture* /*future*/) override {
     return exec::BlockingReason::kNotBlocked;

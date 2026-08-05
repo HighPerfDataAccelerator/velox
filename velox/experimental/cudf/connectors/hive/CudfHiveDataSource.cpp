@@ -177,9 +177,12 @@ std::unique_ptr<CudfSplitReader> CudfHiveDataSource::createCudfSplitReader() {
 }
 
 void CudfHiveDataSource::convertSplit(std::shared_ptr<ConnectorSplit> split) {
-  // Dynamic cast split to `CudfHiveConnectorSplit`
-  if (std::dynamic_pointer_cast<CudfHiveConnectorSplit>(split)) {
-    split_ = std::dynamic_pointer_cast<CudfHiveConnectorSplit>(split);
+  // The cuDF connector receives CudfHiveConnectorSplit instances from the
+  // Gluten split builders (including the MPP coordinator). Keep the cast
+  // free of RTTI for the same reason as the async DataSource handoff below.
+  if (split->connectorId == "cudf-hive") {
+    split_ = std::static_pointer_cast<CudfHiveConnectorSplit>(split);
+    VELOX_CHECK_NOT_NULL(split_, "Null CudfHiveConnectorSplit");
     return;
   }
 
@@ -238,6 +241,45 @@ void CudfHiveDataSource::addSplit(std::shared_ptr<ConnectorSplit> split) {
     // Unable to get the file size, log a warning and continue
     LOG(WARNING) << "Failed to get file size for " << split_->filePath << ": "
                  << e.what();
+  }
+}
+
+void CudfHiveDataSource::setFromDataSource(
+    std::unique_ptr<DataSource> sourceUnique) {
+  // The TableScan preloader creates this DataSource through the same
+  // CudfHiveConnector instance, so the source type is fixed by the connector
+  // factory. Avoid RTTI here: this handoff runs across the async preload
+  // boundary, and the combined Gluten/Velox build can load incompatible RTTI
+  // metadata for this connector.
+  VELOX_CHECK_NOT_NULL(sourceUnique, "Null DataSource");
+  auto* source = static_cast<CudfHiveDataSource*>(sourceUnique.get());
+
+  split_ = std::move(source->split_);
+  runtimeStats_ = std::move(source->runtimeStats_);
+  completedRows_ += source->completedRows_;
+  completedBytes_ += source->completedBytes_;
+  cudfSplitReader_ = std::move(source->cudfSplitReader_);
+  optimizedRemainingFilter_ = std::move(source->optimizedRemainingFilter_);
+  cudfRemainingFilterExpression_ =
+      std::move(source->cudfRemainingFilterExpression_);
+  // The preloaded reader keeps a non-owning pointer into the source's AST
+  // tree. Move the owning tree and scalars together with the reader so those
+  // pointers remain valid after the preloaded DataSource is destroyed.
+  subfieldTree_ = std::move(source->subfieldTree_);
+  subfieldScalars_ = std::move(source->subfieldScalars_);
+  subfieldFilterExpr_ = source->subfieldFilterExpr_;
+  totalRemainingFilterTime_.fetch_add(
+      source->totalRemainingFilterTime_.load(std::memory_order_relaxed),
+      std::memory_order_relaxed);
+
+  source->ioStatistics_->merge(*ioStatistics_);
+  ioStatistics_ = std::move(source->ioStatistics_);
+  source->ioStats_->merge(*ioStats_);
+  ioStats_ = std::move(source->ioStats_);
+
+  if (cudfSplitReader_) {
+    cudfSplitReader_->setDataSourceContext(
+        connectorQueryCtx_, runtimeStats_, subfieldFilterExpr_);
   }
 }
 

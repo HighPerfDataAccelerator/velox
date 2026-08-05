@@ -23,6 +23,7 @@
 #include "velox/core/Expressions.h"
 #include "velox/exec/Aggregate.h"
 #include "velox/exec/AggregateFunctionRegistry.h"
+#include "velox/expression/Expr.h"
 #include "velox/expression/SignatureBinder.h"
 
 #include <algorithm>
@@ -311,19 +312,11 @@ std::vector<CudfExpressionPtr> createAggregationInputEvaluators(
     return {};
   }
 
-  bool lazyDereference = false;
-  std::vector<core::TypedExprPtr> exprs = precomputedInputs;
-  auto exprSet = std::make_unique<exec::ExprSet>(
-      exprs,
-      operatorCtx.execCtx(),
-      /*enableConstantFolding=*/false,
-      lazyDereference);
-
   std::vector<CudfExpressionPtr> evaluators;
-  evaluators.reserve(exprSet->exprs().size());
-  for (const auto& expr : exprSet->exprs()) {
+  evaluators.reserve(precomputedInputs.size());
+  for (const auto& expr : precomputedInputs) {
     evaluators.push_back(createCudfExpression(
-        expr, inputRowSchema, &operatorCtx.driverCtx()->queryConfig()));
+        expr, inputRowSchema, operatorCtx.pool()));
   }
   return evaluators;
 }
@@ -347,7 +340,7 @@ PreparedAggregationInput prepareAggregationInput(
 
   for (const auto& evaluator : precomputedInputEvaluators) {
     result.precomputedColumns.push_back(
-        evaluator->eval(inputViews, inputRowCount, stream, mr, true));
+        evaluator->eval(inputViews, stream, mr, true));
     allViews.push_back(asView(result.precomputedColumns.back()));
   }
 

@@ -47,6 +47,14 @@ add_library(
   VeloxCudfInterop.cpp
 )
 
+# CudfLocalPartition and Gluten's UCX shuffle bridge use the partition
+# function and transport implementations from the UCX exchange module. Keep
+# those objects in the cuDF archive so the combined libgluten.so exports the
+# complete cuDF/UCX ABI.
+if(TARGET velox_ucx_exchange)
+  target_sources(velox_cudf_exec PRIVATE $<TARGET_OBJECTS:velox_ucx_exchange>)
+endif()
+
 target_link_libraries(
   velox_cudf_exec
   PUBLIC cudf::cudf nvtx3::nvtx3-cpp
@@ -62,5 +70,9 @@ target_link_libraries(
     velox_exec
     velox_test_util
 )
+
+if(TARGET velox_ucx_exchange)
+  target_link_libraries(velox_cudf_exec PRIVATE velox_ucx_exchange)
+endif()
 
 target_compile_options(velox_cudf_exec PRIVATE -Wno-missing-field-initializers)
