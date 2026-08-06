@@ -48,6 +48,19 @@ TEST_F(QueryConfigTest, setConfig) {
   EXPECT_EQ(config.requestDataSizesMaxWaitSec(), 12);
 }
 
+TEST_F(QueryConfigTest, taskWideSplitPreloadConfig) {
+  auto defaultQueryCtx = QueryCtx::create(nullptr, QueryConfig{{}});
+  EXPECT_EQ(defaultQueryCtx->queryConfig().maxSplitPreloadPerTask(), 0);
+
+  std::unordered_map<std::string, std::string> configData(
+      {{QueryConfig::kMaxSplitPreloadPerDriver, "7"},
+       {QueryConfig::kMaxSplitPreloadPerTask, "19"}});
+  auto queryCtx = QueryCtx::create(nullptr, QueryConfig{std::move(configData)});
+  const auto& config = queryCtx->queryConfig();
+  EXPECT_EQ(config.maxSplitPreloadPerDriver(), 7);
+  EXPECT_EQ(config.maxSplitPreloadPerTask(), 19);
+}
+
 TEST_F(QueryConfigTest, invalidConfig) {
   std::unordered_map<std::string, std::string> configData(
       {{QueryConfig::kSessionTimezone, "invalid"}});

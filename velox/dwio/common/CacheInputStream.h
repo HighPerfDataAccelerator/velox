@@ -26,6 +26,7 @@
 namespace facebook::velox::dwio::common {
 
 class CachedBufferedInput;
+class CacheRegionPlan;
 
 class CacheInputStream : public SeekableInputStream {
  public:
@@ -39,7 +40,8 @@ class CacheInputStream : public SeekableInputStream {
       std::shared_ptr<cache::ScanTracker> tracker,
       cache::TrackingId trackingId,
       uint64_t groupId,
-      int32_t loadQuantum);
+      int32_t loadQuantum,
+      std::shared_ptr<CacheRegionPlan> cacheRegionPlan = nullptr);
 
   ~CacheInputStream() override;
 
@@ -76,7 +78,8 @@ class CacheInputStream : public SeekableInputStream {
         tracker_,
         trackingId_,
         groupId_,
-        loadQuantum_);
+        loadQuantum_,
+        cacheRegionPlan_);
     copy->position_ = position_;
     if (preloaded_) {
       copy->setPreloadedPin(pin_);
@@ -111,6 +114,18 @@ class CacheInputStream : public SeekableInputStream {
 
   bool testingCacheable() const {
     return cacheable_;
+  }
+
+  /// Retains the cache entry backing the most recent Next() result. This is
+  /// required when its raw pointer is consumed after a later Next() call.
+  cache::CachePin retainCurrentCachePin() const {
+    VELOX_CHECK(!pin_.empty(), "No current cache entry to retain");
+    return pin_;
+  }
+
+  bool currentCachePageHasBackingRegistration() const {
+    VELOX_CHECK(!pin_.empty(), "No current cache entry");
+    return pin_.checkedEntry()->hasBackingRegistration();
   }
 
  private:
@@ -156,6 +171,7 @@ class CacheInputStream : public SeekableInputStream {
   // Maximum number of bytes read from 'input' at a time. This gives the maximum
   // pin_.entry()->size().
   const int32_t loadQuantum_;
+  const std::shared_ptr<CacheRegionPlan> cacheRegionPlan_;
 
   IoStatistics* const ioStats_;
   const std::shared_ptr<ReadFileInputStream> input_;

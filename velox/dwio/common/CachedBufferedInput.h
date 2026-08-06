@@ -17,7 +17,10 @@
 #pragma once
 
 #include <folly/Executor.h>
+#include <folly/container/F14Set.h>
 
+#include <atomic>
+#include <mutex>
 #include "velox/common/caching/FileGroupStats.h"
 #include "velox/common/caching/ScanTracker.h"
 #include "velox/common/caching/SsdCache.h"
@@ -28,6 +31,66 @@
 #include "velox/dwio/common/InputStream.h"
 
 namespace facebook::velox::dwio::common {
+
+struct CacheHintDemandStats {
+  uint64_t firstHitRanges{0};
+  uint64_t firstHitBytes{0};
+  uint64_t missRanges{0};
+  uint64_t missBytes{0};
+  uint64_t remoteDuplicateRanges{0};
+  uint64_t remoteDuplicateBytes{0};
+  uint64_t sizeMismatchRanges{0};
+  uint64_t sizeMismatchBytes{0};
+};
+
+CacheHintDemandStats cacheHintDemandStats();
+
+/// Immutable physical-column boundaries shared by hint and demand streams.
+/// Cache keys are load-quantum pieces relative to each physical chunk, not to
+/// the file. This makes the identity stable across projections while avoiding
+/// file-global head and tail padding.
+class CacheRegionPlan {
+ public:
+  static std::shared_ptr<CacheRegionPlan> create(
+      std::vector<velox::common::Region> regions,
+      uint64_t fileSize,
+      uint64_t loadQuantum);
+
+  const std::vector<velox::common::Region>& cacheRegions() const {
+    return cacheRegions_;
+  }
+
+  velox::common::Region regionForPosition(
+      const velox::common::Region& demandRegion,
+      uint64_t absolutePosition) const;
+
+  bool isPlannedKey(const velox::common::Region& region) const;
+
+  void markPrefetchComplete() {
+    prefetchComplete_.store(true, std::memory_order_release);
+  }
+
+  void recordDemand(
+      const velox::common::Region& region,
+      bool cacheHit,
+      bool sizeMismatch) const;
+
+ private:
+  CacheRegionPlan(
+      std::vector<velox::common::Region> regions,
+      std::vector<velox::common::Region> cacheRegions,
+      uint64_t loadQuantum)
+      : regions_(std::move(regions)),
+        cacheRegions_(std::move(cacheRegions)),
+        loadQuantum_(loadQuantum) {}
+
+  const std::vector<velox::common::Region> regions_;
+  const std::vector<velox::common::Region> cacheRegions_;
+  const uint64_t loadQuantum_;
+  std::atomic<bool> prefetchComplete_{false};
+  mutable std::mutex demandMutex_;
+  mutable folly::F14FastSet<uint64_t> observedDemandKeys_;
+};
 
 struct CacheRequest {
   CacheRequest(
@@ -140,6 +203,22 @@ class CachedBufferedInput : public BufferedInput {
   /// Schedules load of 'region' on 'executor_'. Fails silently if no memory or
   /// if shouldPreload() is false.
   bool prefetch(velox::common::Region region);
+
+  /// Loads a group of best-effort prefetch hints and waits until all loads
+  /// which were admitted by the cache have completed. Grouping the regions in
+  /// one load preserves normal cache coalescing and the underlying ReadFile's
+  /// executor-wide I/O admission policy.
+  void prefetchSync(const std::vector<velox::common::Region>& regions);
+
+  std::vector<velox::common::Region> canonicalizeRegions(
+      const std::vector<velox::common::Region>& regions) const;
+
+  std::shared_ptr<CacheRegionPlan> makeCacheRegionPlan(
+      const std::vector<velox::common::Region>& regions) const;
+
+  uint64_t cacheFileNum() const {
+    return fileNum_.id();
+  }
 
   bool shouldPreload(int32_t numPages = 0) override;
 
@@ -274,6 +353,7 @@ class CachedBufferedInput : public BufferedInput {
   folly::Executor* const executor_;
   const uint64_t fileSize_;
   const io::ReaderOptions options_;
+  folly::Synchronized<std::shared_ptr<CacheRegionPlan>> cacheRegionPlan_;
 
   // Regions that are candidates for loading.
   std::vector<CacheRequest> requests_;

@@ -25,6 +25,7 @@
 #include "velox/connectors/hive/storage_adapters/s3fs/S3WriteFile.h"
 #include "velox/dwio/common/DataBuffer.h"
 
+#include <curl/curl.h>
 #include <fmt/format.h>
 #include <glog/logging.h>
 #include <cstdlib>
@@ -186,6 +187,15 @@ struct AwsInstance {
     // This option allows the AWS SDK C++ to catch the SIGPIPE signal and
     // log a message.
     awsOptions_.httpOptions.installSigPipeHandler = true;
+    // libgluten also has non-AWS curl users (including Velox and cuDF). Letting
+    // the AWS SDK run process-global curl cleanup while those components are
+    // still alive can hang or crash executor teardown. Initialize curl once
+    // for the process and deliberately leave its global state alive until the
+    // process exits; ShutdownAPI still tears down the AWS SDK itself.
+    VELOX_CHECK_EQ(
+        static_cast<int>(curl_global_init(CURL_GLOBAL_ALL)),
+        static_cast<int>(CURLE_OK));
+    awsOptions_.httpOptions.initAndCleanupCurl = false;
     Aws::InitAPI(awsOptions_);
   }
 
@@ -197,8 +207,12 @@ struct AwsInstance {
 
 // Singleton to initialize AWS S3.
 AwsInstance* getAwsInstance() {
-  static auto instance = std::make_unique<AwsInstance>();
-  return instance.get();
+  // Executor processes are terminal owners of this process-global SDK state.
+  // Deliberately keep it alive until process termination: calling
+  // Aws::ShutdownAPI from a JVM shutdown hook can block, while calling it from
+  // a static destructor can race AWS/curl static destruction and crash.
+  static auto* instance = new AwsInstance();
+  return instance;
 }
 
 bool initializeS3(
@@ -325,7 +339,8 @@ class S3FileSystem::Impl {
   // Return a default AWSCredentialsProvider.
   std::shared_ptr<Aws::Auth::AWSCredentialsProvider>
   getDefaultCredentialsProvider() const {
-    return std::make_shared<Aws::Auth::DefaultAWSCredentialsProviderChain>();
+    return makeSynchronizedCachingCredentialsProvider(
+        std::make_shared<Aws::Auth::DefaultAWSCredentialsProviderChain>());
   }
 
   // Configure and return an AWSCredentialsProvider with S3 IAM Role.

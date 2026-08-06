@@ -47,6 +47,7 @@ add_library(velox_ucx_exchange OBJECT ${UCX_EXCHANGE_SOURCES})
 
 target_include_directories(velox_ucx_exchange PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 
+find_package(ucxx CONFIG REQUIRED)
 find_package(ucx REQUIRED)
 
 target_link_libraries(

@@ -1036,6 +1036,18 @@ class QueryConfig {
       2,
       "Maximum number of splits to preload. 0 disables preloading.")
 
+  /// Optional task-wide cap for split preloading. If positive, this replaces
+  /// max_split_preload_per_driver * scan driver count. Zero preserves the
+  /// legacy per-driver behavior.
+  VELOX_QUERY_CONFIG(
+      kMaxSplitPreloadPerTask,
+      maxSplitPreloadPerTask,
+      "max_split_preload_per_task",
+      int32_t,
+      0,
+      "Task-wide maximum number of splits to preload. 0 uses the legacy "
+      "per-driver limit.")
+
   /// If not zero, specifies the cpu time slice limit in ms that a driver thread
   /// can continuously run without yielding.
   VELOX_QUERY_CONFIG(

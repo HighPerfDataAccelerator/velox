@@ -527,6 +527,12 @@ class Task : public std::enable_shared_from_this<Task> {
       exec::Split& split,
       ContinueFuture& future);
 
+  /// Notifies scan drivers that an asynchronously preloaded split has
+  /// completed and ready-first split selection should be retried.
+  void splitPreloadFinished(
+      uint32_t splitGroupId,
+      const core::PlanNodeId& planNodeId);
+
   /// Returns the scaled scan controller for a given table scan node if the
   /// query has configured.
   std::shared_ptr<ScaledScanController> getScaledScanControllerLocked(

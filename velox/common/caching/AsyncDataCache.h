@@ -204,6 +204,12 @@ class AsyncDataCacheEntry {
     return contiguousData_ != nullptr || !tinyData_.empty();
   }
 
+  /// True when every run backing this entry is held by the optional external
+  /// registration lifetime configured on AsyncDataCache.
+  bool hasBackingRegistration() const {
+    return backingRegistration_ != nullptr;
+  }
+
   uint64_t contiguousDataSize() const {
     return size_;
   }
@@ -341,6 +347,10 @@ class AsyncDataCacheEntry {
 
   // The data being cached (non-contiguous page runs).
   memory::Allocation nonContiguousData_;
+
+  // Optional lifetime returned by Options::registerBackingRuns. This must be
+  // released before nonContiguousData_ is freed or transferred elsewhere.
+  std::shared_ptr<void> backingRegistration_;
 
   // Contiguous bytes allocated via allocateBytes. Populated when the entry is
   // created with contiguous=true and size >= kTinyDataSize.
@@ -745,7 +755,8 @@ class CacheShard {
       AcquiredMemory& acquired,
       AcquiredMemory& toFree,
       int64_t& largeEvicted,
-      int64_t& tinyEvicted);
+      int64_t& tinyEvicted,
+      std::vector<std::shared_ptr<void>>& registrationsToRelease);
 
   AsyncDataCache* const cache_;
   const double maxWriteRatio_;
@@ -805,12 +816,15 @@ class AsyncDataCache : public memory::Cache {
         double _ssdSavableRatio = 0.125,
         int32_t _minSsdSavableBytes = 1 << 24,
         int32_t _numShards = kDefaultNumShards,
-        uint64_t _ssdFlushThresholdBytes = 0)
+        uint64_t _ssdFlushThresholdBytes = 0,
+        std::function<std::shared_ptr<void>(const memory::Allocation&)>
+            _registerBackingRuns = nullptr)
         : maxWriteRatio(_maxWriteRatio),
           ssdSavableRatio(_ssdSavableRatio),
           minSsdSavableBytes(_minSsdSavableBytes),
           numShards(_numShards),
-          ssdFlushThresholdBytes(_ssdFlushThresholdBytes) {}
+          ssdFlushThresholdBytes(_ssdFlushThresholdBytes),
+          registerBackingRuns(std::move(_registerBackingRuns)) {}
 
     /// The max ratio of the number of in-memory cache entries being written to
     /// SSD cache over the total number of cache entries. This is to control SSD
@@ -839,6 +853,22 @@ class AsyncDataCache : public memory::Cache {
     /// accumulated SSD-savable bytes exceed this value, a flush to SSD is
     /// triggered. Set to 0 to disable this threshold (default).
     uint64_t ssdFlushThresholdBytes;
+
+    /// Optional registration factory for the actual page runs backing a cache
+    /// entry. A non-null return value is retained while the entry owns those
+    /// runs and is destroyed before they are freed or transferred. Exceptions
+    /// are caught and treated as an unregistered fallback.
+    std::function<std::shared_ptr<void>(const memory::Allocation&)>
+        registerBackingRuns;
+
+    /// Optional registration factory for a contiguous byte allocation backing
+    /// a cache entry. The returned lifetime follows the same ownership rules
+    /// as registerBackingRuns.
+    std::function<std::shared_ptr<void>(void*, uint64_t)> registerBackingBytes;
+
+    /// Allocate every new non-tiny cache entry as one contiguous byte region,
+    /// even when the caller did not explicitly request contiguous storage.
+    bool forceContiguousEntries{false};
   };
 
   AsyncDataCache(

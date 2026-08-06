@@ -140,6 +140,7 @@ class TableScan : public SourceOperator {
   const connector::ColumnHandleMap columnHandles_;
   DriverCtx* const driverCtx_;
   const int32_t maxSplitPreloadPerDriver_{0};
+  const int32_t maxSplitPreloadPerTask_{0};
   const vector_size_t maxReadBatchSize_;
   memory::MemoryPool* const connectorPool_;
   const std::shared_ptr<connector::Connector> connector_;

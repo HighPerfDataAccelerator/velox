@@ -42,7 +42,10 @@ if(VELOX_ENABLE_S3)
     PUBLIC KVIKIO_CUFILE_FOUND KVIKIO_CUFILE_VERSION_API_FOUND KVIKIO_LIBCURL_FOUND
   )
   velox_include_directories(velox_cudf_hive_connector PRIVATE ${AWSSDK_INCLUDE_DIRS})
-  target_link_libraries(velox_cudf_hive_connector PRIVATE velox_s3fs ${AWSSDK_LIBRARIES})
+  target_link_libraries(
+    velox_cudf_hive_connector
+    PRIVATE velox_s3fs ${AWSSDK_LIBRARIES} CURL::libcurl
+  )
 endif()
 
 add_subdirectory(iceberg)

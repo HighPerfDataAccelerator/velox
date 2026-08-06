@@ -16,6 +16,7 @@
 
 #include "velox/exec/Task.h"
 #include <folly/ScopeGuard.h>
+#include <folly/synchronization/Baton.h>
 #include "folly/synchronization/EventCount.h"
 #include "velox/common/base/tests/GTestUtils.h"
 #include "velox/common/file/tests/FaultyFileSystem.h"
@@ -869,6 +870,103 @@ TEST_F(TaskTest, stateChangeFutureNotFiredWhenNoMoreSplits) {
   EXPECT_EQ(task->taskStats().numQueuedTableScanSplits, 0);
   EXPECT_FALSE(future.isReady());
 
+  task->requestCancel().wait();
+}
+
+TEST_F(TaskTest, preloadedSplitsAreConsumedInReadyOrder) {
+  auto data = makeRowVector({makeFlatVector<int32_t>({1, 2, 3})});
+  auto task = Task::create(
+      "task-ready-preload",
+      PlanBuilder().tableScan(asRowType(data->type())).planFragment(),
+      0,
+      core::QueryCtx::create(),
+      Task::ExecutionMode::kSerial,
+      exec::Consumer{});
+
+  const std::string slowPath = "file:/tmp/slow";
+  const std::string fastPath = "file:/tmp/fast";
+  task->addSplit("0", exec::Split(makeHiveConnectorSplit(slowPath)));
+  task->addSplit("0", exec::Split(makeHiveConnectorSplit(fastPath)));
+  task->noMoreSplits("0");
+
+  folly::Baton<> allowSlow;
+  folly::Baton<> allowFast;
+  std::vector<std::thread> preloadThreads;
+  ConnectorSplitPreloadFunc preload =
+      [&](const std::shared_ptr<connector::ConnectorSplit>& connectorSplit) {
+        const auto hiveSplit =
+            std::dynamic_pointer_cast<connector::hive::HiveConnectorSplit>(
+                connectorSplit);
+        ASSERT_NE(hiveSplit, nullptr);
+        auto* allow = hiveSplit->filePath == slowPath ? &allowSlow : &allowFast;
+        connectorSplit->dataSource =
+            std::make_unique<AsyncSource<connector::DataSource>>(
+                [allow]() -> std::unique_ptr<connector::DataSource> {
+                  allow->wait();
+                  VELOX_FAIL("Test preload completion");
+                });
+        preloadThreads.emplace_back([task, connectorSplit]() {
+          connectorSplit->dataSource->prepare();
+          task->splitPreloadFinished(kUngroupedGroupId, "0");
+        });
+      };
+
+  exec::Split split;
+  ContinueFuture splitFuture = ContinueFuture::makeEmpty();
+  EXPECT_EQ(
+      task->getSplitOrFuture(
+          /*driverId=*/0,
+          kUngroupedGroupId,
+          "0",
+          /*maxPreloadSplits=*/2,
+          preload,
+          split,
+          splitFuture),
+      BlockingReason::kWaitForSplit);
+  EXPECT_FALSE(splitFuture.isReady());
+
+  // A second driver can start waiting after preloads have already been
+  // launched. One readiness transition must wake every current waiter so
+  // accumulated ready work cannot be stranded after the last completion.
+  exec::Split secondSplit;
+  ContinueFuture secondSplitFuture = ContinueFuture::makeEmpty();
+  EXPECT_EQ(
+      task->getSplitOrFuture(
+          /*driverId=*/1,
+          kUngroupedGroupId,
+          "0",
+          /*maxPreloadSplits=*/2,
+          preload,
+          secondSplit,
+          secondSplitFuture),
+      BlockingReason::kWaitForSplit);
+  EXPECT_FALSE(secondSplitFuture.isReady());
+
+  allowFast.post();
+  std::move(splitFuture).wait();
+  EXPECT_TRUE(secondSplitFuture.isReady());
+
+  splitFuture = ContinueFuture::makeEmpty();
+  EXPECT_EQ(
+      task->getSplitOrFuture(
+          /*driverId=*/0,
+          kUngroupedGroupId,
+          "0",
+          /*maxPreloadSplits=*/2,
+          preload,
+          split,
+          splitFuture),
+      BlockingReason::kNotBlocked);
+  const auto readyHiveSplit =
+      std::dynamic_pointer_cast<connector::hive::HiveConnectorSplit>(
+          split.connectorSplit);
+  ASSERT_NE(readyHiveSplit, nullptr);
+  EXPECT_EQ(readyHiveSplit->filePath, fastPath);
+
+  allowSlow.post();
+  for (auto& thread : preloadThreads) {
+    thread.join();
+  }
   task->requestCancel().wait();
 }
 

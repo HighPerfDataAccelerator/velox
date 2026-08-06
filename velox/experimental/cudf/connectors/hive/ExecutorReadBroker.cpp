@@ -187,11 +187,9 @@ std::future<void> ExecutorReadBroker::readPrepared(
       static_cast<bool>(readFactory),
       "ExecutorReadBroker requires a range-read factory");
   VELOX_CHECK_NOT_NULL(destination);
-  uint64_t totalBytes = 0;
   for (const auto& range : ranges) {
     VELOX_CHECK_LE(range.bufferOffset + range.size, destination->size());
     VELOX_CHECK_LE(range.fileOffset + range.size, sourceSize);
-    totalBytes += range.size;
   }
 
   auto promise = std::make_shared<std::promise<void>>();
@@ -201,39 +199,49 @@ std::future<void> ExecutorReadBroker::readPrepared(
     return future;
   }
 
-  readExecutor_->add([self = shared_from_this(),
-                      readFactory = std::move(readFactory),
-                      ranges = std::move(ranges),
-                      destination = std::move(destination),
-                      promise,
-                      totalBytes,
-                      reservation = std::move(reservation)]() mutable {
-    if (!reservation) {
-      self->acquire(totalBytes);
-    }
-    try {
-      auto readFunction = readFactory();
-      VELOX_CHECK(
-          static_cast<bool>(readFunction),
-          "Range-read factory returned an empty function");
-      for (const auto& range : ranges) {
+  auto remaining = std::make_shared<std::atomic<size_t>>(ranges.size());
+  auto failure = std::make_shared<std::exception_ptr>();
+  auto failureMutex = std::make_shared<std::mutex>();
+  for (const auto range : ranges) {
+    readExecutor_->add([self = shared_from_this(),
+                        readFactory,
+                        destination,
+                        range,
+                        remaining,
+                        failure,
+                        failureMutex,
+                        promise,
+                        reservation]() {
+      if (!reservation) {
+        self->acquire(range.size);
+      }
+      try {
+        auto readFunction = readFactory();
+        VELOX_CHECK(
+            static_cast<bool>(readFunction),
+            "Range-read factory returned an empty function");
         readFunction(
             range.fileOffset,
             range.size,
             destination->data() + range.bufferOffset);
+      } catch (...) {
+        std::lock_guard<std::mutex> lock(*failureMutex);
+        if (!*failure) {
+          *failure = std::current_exception();
+        }
       }
-    } catch (...) {
       if (!reservation) {
-        self->release(totalBytes);
+        self->release(range.size);
       }
-      promise->set_exception(std::current_exception());
-      return;
-    }
-    if (!reservation) {
-      self->release(totalBytes);
-    }
-    promise->set_value();
-  });
+      if (remaining->fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        if (*failure) {
+          promise->set_exception(*failure);
+        } else {
+          promise->set_value();
+        }
+      }
+    });
+  }
   return future;
 }
 

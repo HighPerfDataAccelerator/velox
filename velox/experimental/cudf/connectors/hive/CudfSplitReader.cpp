@@ -25,7 +25,9 @@
 #include "velox/common/caching/CacheTTLController.h"
 #include "velox/common/time/Timer.h"
 #include "velox/connectors/hive/BufferedInputBuilder.h"
+#include "velox/connectors/hive/FileConnectorUtil.h"
 #include "velox/connectors/hive/FileHandle.h"
+#include "velox/connectors/hive/HiveConfig.h"
 #include "velox/connectors/hive/HiveConnectorSplit.h"
 #include "velox/connectors/hive/HiveDataSource.h"
 #include "velox/connectors/hive/TableHandle.h"
@@ -48,8 +50,16 @@
 #include <cuda_runtime.h>
 #include <nvtx3/nvtx3.hpp>
 
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
+#include <deque>
 #include <future>
 #include <memory>
+#include <mutex>
+#include <sstream>
+#include <string_view>
+#include <unordered_map>
 
 namespace facebook::velox::cudf_velox::connector::hive {
 
@@ -69,12 +79,125 @@ std::size_t multiFileChunkReadLimit(
       configuredLimit, batchTarget);
 }
 
+bool experimentalPrepareIoEnabled() {
+  const auto* value = std::getenv("GLUTEN_CUDF_EXPERIMENTAL_PREPARE_IO");
+  return value != nullptr && std::string_view(value) == "1";
+}
+
+bool experimentalPrepareHostOnlyEnabled() {
+  const auto* value = std::getenv("GLUTEN_CPP_S3_PREPARE_HOST_ONLY");
+  return value != nullptr && std::string_view(value) == "1";
+}
+
+#ifdef VELOX_ENABLE_S3
+std::shared_ptr<ReadFile> openNativeS3ReadFile(
+    const std::shared_ptr<filesystems::S3FileSystem>& fileSystem,
+    const std::string& path,
+    std::optional<std::size_t> fileSize) {
+  filesystems::FileOptions options;
+  if (fileSize.has_value()) {
+    options.fileSize = static_cast<int64_t>(fileSize.value());
+  }
+  return std::shared_ptr<ReadFile>(fileSystem->openFileForRead(path, options));
+}
+#endif
+
 } // namespace
 
 using namespace facebook::velox::connector;
 using namespace facebook::velox::connector::hive;
 
 namespace {
+
+struct CachedPrefetchPlan {
+  std::vector<cudf::io::text::byte_range_info> ranges;
+  CacheHintRangeStats rangeStats;
+};
+
+class CachePrefetchPlanCache {
+ public:
+  static CachePrefetchPlanCache& instance() {
+    static CachePrefetchPlanCache cache;
+    return cache;
+  }
+
+  bool enabled() const {
+    return maxEntries_ > 0;
+  }
+
+  std::shared_ptr<const CachedPrefetchPlan> get(const std::string& key) {
+    if (maxEntries_ == 0) {
+      return nullptr;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto found = plans_.find(key);
+    if (found == plans_.end()) {
+      ExecutorSplitPrefetch::recordCachePrefetchPlanLookup(false);
+      return nullptr;
+    }
+    ExecutorSplitPrefetch::recordCachePrefetchPlanLookup(true);
+    return found->second;
+  }
+
+  std::shared_ptr<const CachedPrefetchPlan> putIfAbsent(
+      std::string key,
+      std::shared_ptr<const CachedPrefetchPlan> plan) {
+    if (maxEntries_ == 0) {
+      return plan;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (const auto found = plans_.find(key); found != plans_.end()) {
+      return found->second;
+    }
+    while (plans_.size() >= maxEntries_ && !insertionOrder_.empty()) {
+      plans_.erase(insertionOrder_.front());
+      insertionOrder_.pop_front();
+    }
+    insertionOrder_.push_back(key);
+    plans_.emplace(std::move(key), plan);
+    ExecutorSplitPrefetch::recordCachePrefetchPlanEntries(plans_.size());
+    return plan;
+  }
+
+ private:
+  CachePrefetchPlanCache()
+      : maxEntries_([] {
+          const auto* value =
+              std::getenv("GLUTEN_CUDF_CACHE_PREFETCH_PLAN_CACHE_ENTRIES");
+          if (value == nullptr || *value == '\0') {
+            return size_t{0};
+          }
+          try {
+            size_t parsedCharacters{0};
+            const auto parsed = std::stoull(value, &parsedCharacters);
+            if (value[parsedCharacters] != '\0') {
+              return size_t{0};
+            }
+            return static_cast<size_t>(parsed);
+          } catch (...) {
+            return size_t{0};
+          }
+        }()) {}
+
+  const size_t maxEntries_;
+  std::mutex mutex_;
+  std::unordered_map<std::string, std::shared_ptr<const CachedPrefetchPlan>>
+      plans_;
+  std::deque<std::string> insertionOrder_;
+};
+
+std::string cachePrefetchPlanKey(
+    const CudfHiveConnectorSplit& split,
+    const HiveTableHandle& tableHandle,
+    const std::vector<std::string>& readColumnNames) {
+  std::ostringstream key;
+  key << split.filePath << '\0' << split.start << '\0' << split.length << '\0'
+      << tableHandle.toString();
+  for (const auto& column : readColumnNames) {
+    key << '\0' << column;
+  }
+  return key.str();
+}
 
 // Checks whether the `path` uses an ABFS scheme
 bool isAbfsPath([[maybe_unused]] const std::string_view path) {
@@ -120,6 +243,11 @@ CudfSplitReader::CudfSplitReader(
       subfieldFilterExpr_(subfieldFilterExpr) {
   baseReaderOpts_.setDataIoStats(ioStatistics_);
   baseReaderOpts_.setMetadataIoStats(ioStatistics_);
+  facebook::velox::connector::hive::configureReaderOptions(
+      std::make_shared<facebook::velox::connector::hive::HiveConfig>(
+          cudfHiveConfig_->config()),
+      connectorQueryCtx_,
+      baseReaderOpts_);
 }
 
 void CudfSplitReader::prepareSplit(
@@ -133,6 +261,13 @@ void CudfSplitReader::prepareSplit(
   // Create a cuDF split reader
   if (useExperimentalCudfReader_) {
     createExperimentalReader();
+    if (split_->filePath.starts_with("s3://")) {
+      if (experimentalPrepareHostOnlyEnabled()) {
+        prepareExperimentalHostRead();
+      } else if (experimentalPrepareIoEnabled()) {
+        setupExperimentalScan();
+      }
+    }
   } else {
     createCudfReader();
   }
@@ -173,6 +308,7 @@ std::optional<std::unique_ptr<cudf::table>> CudfSplitReader::next(
 
 std::optional<std::unique_ptr<cudf::table>> CudfSplitReader::readNextChunk() {
   if (!useExperimentalCudfReader_) {
+    waitForCachePrefetchHint();
     // Read table using the regular cudf parquet reader
     VELOX_CHECK_NOT_NULL(splitReader_, "cudf parquet reader not present");
 
@@ -183,32 +319,181 @@ std::optional<std::unique_ptr<cudf::table>> CudfSplitReader::readNextChunk() {
     return std::move(splitReader_->read_chunk().tbl);
   }
 
-  auto output_mr = determineCudfMemoryResource();
-
   // Read table using the experimental parquet reader
   VELOX_CHECK_NOT_NULL(exptSplitReader_, "cuDF hybrid scan reader not present");
   VELOX_CHECK_NOT_NULL(hybridScanState_, "hybrid scan state not present");
 
-  std::call_once(*hybridScanState_->isHybridScanSetup_, [&]() {
-    auto rowGroupIndices = exptSplitReader_->all_row_groups(readerOptions_);
+  setupExperimentalScan();
 
-    // Filter row groups using row group byte ranges
-    if (readerOptions_.get_skip_bytes() > 0 or
-        readerOptions_.get_num_bytes().has_value()) {
-      rowGroupIndices = exptSplitReader_->filter_row_groups_with_byte_range(
+  if (!exptSplitReader_->has_next_table_chunk()) {
+    return std::nullopt;
+  }
+
+  return std::move(exptSplitReader_->materialize_all_columns_chunk().tbl);
+}
+
+void CudfSplitReader::setupCachePrefetchHint() {
+#ifdef VELOX_ENABLE_S3
+  if (useExperimentalCudfReader_ || !split_->coalescedFiles.empty() ||
+      !split_->filePath.starts_with("s3://") ||
+      connectorQueryCtx_->cache() == nullptr ||
+      !cudfHiveConfig_->useBufferedInputSession(
+          connectorQueryCtx_->sessionProperties()) ||
+      fileMetaData_.size() != 1 || readColumnNames_.empty()) {
+    return;
+  }
+  auto buffered =
+      std::dynamic_pointer_cast<BufferedInputDataSource>(dataSource_);
+  if (!buffered) {
+    return;
+  }
+
+  try {
+    auto& planCache = CachePrefetchPlanCache::instance();
+    std::string planKey;
+    std::shared_ptr<const CachedPrefetchPlan> cachedPlan;
+    if (planCache.enabled()) {
+      planKey = cachePrefetchPlanKey(*split_, *tableHandle_, readColumnNames_);
+      cachedPlan = planCache.get(planKey);
+    }
+    if (cachedPlan == nullptr) {
+      // This reader is a metadata-only planner. It never materializes
+      // columns, allocates device input buffers, or changes the regular
+      // reader's state.
+      CudfHybridScanReader planner(fileMetaData_.front(), readerOptions_);
+      auto rowGroups = planner.all_row_groups(readerOptions_);
+      if (readerOptions_.get_skip_bytes() > 0 ||
+          readerOptions_.get_num_bytes().has_value()) {
+        rowGroups = planner.filter_row_groups_with_byte_range(
+            rowGroups, readerOptions_);
+      }
+      // Match the regular reader's row-group pruning before converting the
+      // projected chunks into cache ranges. A planning failure is safe: the
+      // surrounding best-effort fallback leaves demand reads authoritative.
+      if (readerOptions_.get_filter().has_value()) {
+        rowGroups = planner.filter_row_groups_with_stats(
+            rowGroups, readerOptions_, stream_);
+      }
+      auto plan = std::make_shared<CachedPrefetchPlan>();
+      plan->ranges =
+          planner.all_column_chunks_byte_ranges(rowGroups, readerOptions_);
+      plan->rangeStats = buffered->canonicalCacheStats(plan->ranges);
+      cachedPlan = planCache.enabled()
+          ? planCache.putIfAbsent(planKey, std::move(plan))
+          : std::move(plan);
+    }
+    if (cachedPlan->rangeStats.uniqueBytes == 0) {
+      return;
+    }
+
+    cachePrefetchHintKey_ = fmt::format(
+        "{}:{}:{}:{}",
+        connectorQueryCtx_->scanId(),
+        split_->filePath,
+        split_->start,
+        split_->length);
+    const auto* session = connectorQueryCtx_->sessionProperties();
+    ExecutorSplitPrefetch::registerCacheHint(
+        executor_,
+        connectorQueryCtx_->queryId(),
+        *cachePrefetchHintKey_,
+        cachedPlan->rangeStats,
+        [buffered = std::move(buffered),
+         ranges = cachedPlan->ranges]() mutable {
+          VELOX_CHECK(
+              buffered->prefetchToCache(ranges),
+              "Projected cache hint lost its cache-backed input");
+        },
+        cudfHiveConfig_->executorSplitPrefetchConcurrencySession(session),
+        cudfHiveConfig_->prefetchMaxInFlightBytesSession(session));
+  } catch (const std::exception& e) {
+    ExecutorSplitPrefetch::recordCacheHintFallback();
+    LOG(WARNING) << "Falling back to demand reads after cuDF cache hint "
+                    "planning failed for "
+                 << split_->filePath << ": " << e.what();
+  }
+#endif
+}
+
+void CudfSplitReader::waitForCachePrefetchHint() {
+  if (cachePrefetchHintWaited_ || !cachePrefetchHintKey_) {
+    return;
+  }
+  cachePrefetchHintWaited_ = true;
+  ExecutorSplitPrefetch::takeCacheHint(
+      executor_, connectorQueryCtx_->queryId(), *cachePrefetchHintKey_);
+}
+
+void CudfSplitReader::prepareExperimentalHostRead() {
+  VELOX_CHECK(
+      useExperimentalCudfReader_,
+      "Experimental host preparation requested for the regular cuDF reader");
+  VELOX_CHECK_NOT_NULL(exptSplitReader_, "cuDF hybrid scan reader not present");
+  VELOX_CHECK_NOT_NULL(hybridScanState_, "hybrid scan state not present");
+  VELOX_CHECK(
+      !hybridScanState_->preparedHostByteRanges_,
+      "Experimental host ranges were already prepared");
+
+  auto rowGroupIndices = exptSplitReader_->all_row_groups(readerOptions_);
+  if (readerOptions_.get_skip_bytes() > 0 or
+      readerOptions_.get_num_bytes().has_value()) {
+    rowGroupIndices = exptSplitReader_->filter_row_groups_with_byte_range(
+        rowGroupIndices, readerOptions_);
+  }
+  if (readerOptions_.get_filter().has_value()) {
+    rowGroupIndices = exptSplitReader_->filter_row_groups_with_stats(
+        rowGroupIndices, readerOptions_, stream_);
+  }
+  auto columnChunkByteRanges = exptSplitReader_->all_column_chunks_byte_ranges(
+      rowGroupIndices, readerOptions_);
+  auto prepared = prepareByteRangesToHost(dataSource_, columnChunkByteRanges);
+  VELOX_CHECK_NOT_NULL(
+      prepared,
+      "Host-only experimental preparation requires a packed remote source");
+  hybridScanState_->rowGroupIndices_ = std::move(rowGroupIndices);
+  hybridScanState_->columnChunkByteRanges_ = std::move(columnChunkByteRanges);
+  hybridScanState_->preparedHostByteRanges_ = std::move(prepared);
+}
+
+void CudfSplitReader::setupExperimentalScan() {
+  VELOX_CHECK(
+      useExperimentalCudfReader_,
+      "Experimental scan setup requested for the regular cuDF reader");
+  VELOX_CHECK_NOT_NULL(exptSplitReader_, "cuDF hybrid scan reader not present");
+  VELOX_CHECK_NOT_NULL(hybridScanState_, "hybrid scan state not present");
+
+  std::call_once(*hybridScanState_->isHybridScanSetup_, [&]() {
+    auto output_mr = determineCudfMemoryResource();
+    std::vector<cudf::size_type> rowGroupIndices;
+    std::vector<cudf::io::text::byte_range_info> columnChunkByteRanges;
+    if (hybridScanState_->rowGroupIndices_.has_value()) {
+      VELOX_CHECK(
+          hybridScanState_->columnChunkByteRanges_.has_value(),
+          "Prepared row groups are missing projected byte ranges");
+      rowGroupIndices = std::move(hybridScanState_->rowGroupIndices_.value());
+      columnChunkByteRanges =
+          std::move(hybridScanState_->columnChunkByteRanges_.value());
+      hybridScanState_->rowGroupIndices_.reset();
+      hybridScanState_->columnChunkByteRanges_.reset();
+    } else {
+      rowGroupIndices = exptSplitReader_->all_row_groups(readerOptions_);
+
+      // Filter row groups using row group byte ranges.
+      if (readerOptions_.get_skip_bytes() > 0 or
+          readerOptions_.get_num_bytes().has_value()) {
+        rowGroupIndices = exptSplitReader_->filter_row_groups_with_byte_range(
+            rowGroupIndices, readerOptions_);
+      }
+
+      // Filter row groups using column chunk statistics.
+      if (readerOptions_.get_filter().has_value()) {
+        rowGroupIndices = exptSplitReader_->filter_row_groups_with_stats(
+            rowGroupIndices, readerOptions_, stream_);
+      }
+
+      columnChunkByteRanges = exptSplitReader_->all_column_chunks_byte_ranges(
           rowGroupIndices, readerOptions_);
     }
-
-    // Filter row groups using column chunk statistics
-    if (readerOptions_.get_filter().has_value()) {
-      rowGroupIndices = exptSplitReader_->filter_row_groups_with_stats(
-          rowGroupIndices, readerOptions_, stream_);
-    }
-
-    // Get column chunk byte ranges to fetch
-    const auto columnChunkByteRanges =
-        exptSplitReader_->all_column_chunks_byte_ranges(
-            rowGroupIndices, readerOptions_);
 
     // Fetch column chunk byte ranges
     nvtxRangePush("fetchByteRanges");
@@ -216,8 +501,14 @@ std::optional<std::unique_ptr<cudf::table>> CudfSplitReader::readNextChunk() {
     // Tuple containing a vector of device buffers, a vector of device spans
     // for each input byte range, and a future to wait for all reads to
     // complete
-    auto ioData = fetchByteRangesAsync(
-        dataSource_, columnChunkByteRanges, stream_, get_temp_mr());
+    auto ioData = hybridScanState_->preparedHostByteRanges_
+        ? copyPreparedByteRangesToDevice(
+              std::move(hybridScanState_->preparedHostByteRanges_),
+              columnChunkByteRanges,
+              stream_,
+              get_temp_mr())
+        : fetchByteRangesAsync(
+              dataSource_, columnChunkByteRanges, stream_, get_temp_mr());
 
     // Wait for all pending reads to complete and propagate any I/O failure.
     // Calling wait() alone silently discards exceptions from the deferred
@@ -229,6 +520,7 @@ std::optional<std::unique_ptr<cudf::table>> CudfSplitReader::readNextChunk() {
     hybridScanState_->columnChunkBuffers_ = std::move(std::get<0>(ioData));
     hybridScanState_->columnChunkData_ = std::move(std::get<1>(ioData));
 
+    const auto setupStart = std::chrono::steady_clock::now();
     exptSplitReader_->setup_chunking_for_all_columns(
         cudfHiveConfig_->maxChunkReadLimitSession(
             connectorQueryCtx_->sessionProperties()),
@@ -239,14 +531,23 @@ std::optional<std::unique_ptr<cudf::table>> CudfSplitReader::readNextChunk() {
         readerOptions_,
         stream_,
         output_mr);
+    const auto setupNanos =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - setupStart)
+            .count();
+    static std::atomic<uint64_t> completed{0};
+    static std::atomic<uint64_t> totalSetupNanos{0};
+    const auto count = completed.fetch_add(1, std::memory_order_relaxed) + 1;
+    totalSetupNanos.fetch_add(setupNanos, std::memory_order_relaxed);
+    if (std::getenv("GLUTEN_CPP_S3_DIAGNOSTICS") != nullptr &&
+        count % 64 == 0) {
+      LOG(WARNING) << "CPP_S3_HYBRID_SETUP completed=" << count
+                   << " avgSetupMs="
+                   << totalSetupNanos.load(std::memory_order_relaxed) / count /
+              1e6;
+    }
     // TODO: check remainingFilterExprSet_ flag here to choose mr
   });
-
-  if (!exptSplitReader_->has_next_table_chunk()) {
-    return std::nullopt;
-  }
-
-  return std::move(exptSplitReader_->materialize_all_columns_chunk().tbl);
 }
 
 void CudfSplitReader::resetSplit() {
@@ -310,10 +611,8 @@ void CudfSplitReader::setupSelectivePreloadDataSources() {
   if (split_->filePath.starts_with("s3://") &&
       ExecutorSplitPrefetch::contains(
           executor_, connectorQueryCtx_->queryId(), split_->filePath)) {
-    const auto splitConcurrency = std::max<uint32_t>(
-        1,
-        std::min<uint32_t>(
-            16, cudfHiveConfig_->prefetchThreadsSession(session)));
+    const auto splitConcurrency =
+        cudfHiveConfig_->executorSplitPrefetchConcurrencySession(session);
     const auto maxReadyBytes =
         cudfHiveConfig_->prefetchMaxInFlightBytesSession(session);
     ExecutorSplitPrefetch::initialize(
@@ -336,6 +635,7 @@ void CudfSplitReader::setupSelectivePreloadDataSources() {
               credentials.sessionToken,
               credentials.region,
               credentials.endpoint,
+              openNativeS3ReadFile(s3FileSystem, filePath, fileSize),
               fileSize);
           return PrefetchReadFunction{
               [source = std::move(source), filePath](
@@ -423,6 +723,7 @@ void CudfSplitReader::setupSelectivePreloadDataSources() {
           credentials.sessionToken,
           credentials.region,
           credentials.endpoint,
+          openNativeS3ReadFile(s3FileSystem, path, fileSize),
           fileSize);
     };
   }
@@ -601,6 +902,16 @@ std::shared_ptr<cudf::io::datasource> CudfSplitReader::createCudfDataSource(
   if (not useBufferedInput) {
 #ifdef VELOX_ENABLE_S3
     if (filePath.starts_with("s3://")) {
+      const auto useCrtS3Reader = cudfHiveConfig_->useCrtS3ReaderSession(
+          connectorQueryCtx_->sessionProperties());
+      if (useCrtS3Reader) {
+        VELOX_CHECK(
+            crtS3RangeReaderAvailable(),
+            "AWS CRT S3 reader was requested but its JVM bridge is unavailable");
+        VLOG(1) << fmt::format(
+            "Using AWS CRT S3 data source for file: {}", filePath);
+        return std::make_shared<CrtS3DataSource>(filePath, fileSize);
+      }
       auto fileSystem =
           filesystems::getFileSystem(filePath, cudfHiveConfig_->config());
       auto s3FileSystem =
@@ -619,6 +930,7 @@ std::shared_ptr<cudf::io::datasource> CudfSplitReader::createCudfDataSource(
           credentials.sessionToken,
           credentials.region,
           credentials.endpoint,
+          openNativeS3ReadFile(s3FileSystem, filePath, fileSize),
           fileSize);
     }
 #endif
@@ -663,9 +975,22 @@ std::shared_ptr<cudf::io::datasource> CudfSplitReader::createCudfDataSource(
     cacheTTLController->addOpenFileInfo(fileHandleCachePtr->uuid.id());
   }
 
+  const FileHandle* bufferedFileHandle = fileHandleCachePtr.get();
+#ifdef VELOX_ENABLE_S3
+  std::optional<FileHandle> scheduledFileHandle;
+  if (connectorQueryCtx_->cache() != nullptr && filePath.starts_with("s3://") &&
+      nativeS3ScheduledReadEnabled()) {
+    scheduledFileHandle.emplace(
+        FileHandle{
+            makeNativeScheduledS3ReadFile(bufferedFileHandle->file, filePath),
+            bufferedFileHandle->uuid,
+            bufferedFileHandle->groupId});
+    bufferedFileHandle = &scheduledFileHandle.value();
+  }
+#endif
   auto bufferedInput =
       velox::connector::hive::BufferedInputBuilder::getInstance()->create(
-          *fileHandleCachePtr,
+          *bufferedFileHandle,
           baseReaderOpts_,
           connectorQueryCtx_,
           ioStatistics_,
@@ -777,6 +1102,8 @@ void CudfSplitReader::createCudfReader() {
 
   // Setup reader options
   setupReaderOptions();
+
+  setupCachePrefetchHint();
 
   auto sources = makeDataSourceViews();
 

@@ -52,6 +52,20 @@ struct GroupbyAggregator {
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr) = 0;
 
+  // A high-cardinality PARTIAL aggregation can legally emit one intermediate
+  // state per raw row. FINAL still combines duplicate keys, while PARTIAL
+  // avoids a hash table that provides little or no reduction.
+  virtual bool supportsPartialIdentity() const {
+    return false;
+  }
+
+  virtual std::unique_ptr<cudf::column> makePartialIdentityColumn(
+      cudf::table_view const& /* tbl */,
+      rmm::cuda_stream_view /* stream */,
+      rmm::device_async_resource_ref /* mr */) {
+    VELOX_UNSUPPORTED("Aggregate does not support PARTIAL identity output");
+  }
+
   virtual ~GroupbyAggregator() = default;
 
  protected:
@@ -144,6 +158,7 @@ class CudfGroupby : public CudfOperatorBase {
   void prepareInputForStateStream(const CudfVectorPtr& input);
 
   void computePartialGroupbyStreaming(CudfVectorPtr tbl);
+  void computePartialIdentity(CudfVectorPtr tbl);
   void computeFinalGroupbyStreaming(CudfVectorPtr tbl);
   void computeSingleGroupbyStreaming(CudfVectorPtr tbl);
 
@@ -187,6 +202,8 @@ class CudfGroupby : public CudfOperatorBase {
   // Companion aggregate names encode the Spark plan step. Internal streaming
   // compaction overrides that suffix with the intermediate step.
   bool streamingEnabled_{true};
+  const int32_t groupbyStreamingMaxDistinctKeys_;
+  const bool partialIdentityAggregationEnabled_;
   const int64_t maxPartialAggregationMemoryUsage_;
   int64_t numInputRows_ = 0;
 

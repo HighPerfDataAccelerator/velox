@@ -33,6 +33,13 @@
 
 namespace facebook::velox::connector::hive {
 
+/// Adds the standard file IO counters and latencies to connector runtime
+/// stats. Shared by CPU and cuDF file data sources.
+void addIoStatsToRuntimeStats(
+    io::IoStatistics& ioStats,
+    std::string_view prefix,
+    std::unordered_map<std::string, RuntimeMetric>& runtimeStats);
+
 /// File-specific scan batch event with split metadata.
 struct FileScanBatchEvent : public core::ScanBatchEvent {
   /// Table name from the connector table handle.

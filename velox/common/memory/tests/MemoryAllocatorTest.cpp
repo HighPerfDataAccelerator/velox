@@ -507,6 +507,89 @@ TEST_P(MemoryAllocatorTest, onMapWithArena) {
   allocator->freeContiguous(large);
 }
 
+TEST_P(MemoryAllocatorTest, mappedPageProtectionSurvivesFreeAndAllocation) {
+  if (!useMmap_) {
+    return;
+  }
+  MemoryAllocator::Options options;
+  options.capacity = 64ULL << 20;
+  auto allocator = std::make_shared<MmapAllocator>(options);
+  const auto largest = allocator->largestSizeClass();
+  const auto protectedPages = 32ULL << 20;
+  Allocation prewarm;
+  ASSERT_TRUE(allocator->allocateNonContiguous(
+      AllocationTraits::numPages(protectedPages), prewarm, nullptr, largest));
+  auto protection = allocator->protectMappedPages(prewarm);
+  ASSERT_NE(protection, nullptr);
+  allocator->freeNonContiguous(prewarm);
+
+  // Protected free pages cannot be selected for MADV_DONTNEED.
+  EXPECT_EQ(allocator->unmap(AllocationTraits::numPages(protectedPages)), 0);
+
+  // Protection does not reserve the pages: an ordinary allocation can reuse
+  // the same mapped backing without increasing the mapped-page total.
+  Allocation reuse;
+  ASSERT_TRUE(allocator->allocateNonContiguous(
+      AllocationTraits::numPages(protectedPages), reuse, nullptr, largest));
+  EXPECT_EQ(reuse.byteSize(), protectedPages);
+  allocator->freeNonContiguous(reuse);
+
+  protection.reset();
+  EXPECT_EQ(
+      allocator->unmap(AllocationTraits::numPages(protectedPages)),
+      AllocationTraits::numPages(protectedPages));
+}
+
+TEST_P(MemoryAllocatorTest, mappedFreeLookupSurvivesConcurrentAdvise) {
+  if (!useMmap_) {
+    return;
+  }
+  MemoryAllocator::Options options;
+  options.capacity = 128ULL << 20;
+  options.largestSizeClass = 1024;
+  options.maxMallocBytes = 0;
+  auto allocator = std::make_shared<MmapAllocator>(options);
+
+  // Model a pinned-cache prewarm: half of the allocator remains mapped and
+  // protected after being returned to its largest size class.
+  constexpr uint64_t kProtectedBytes = 64ULL << 20;
+  Allocation prewarm;
+  ASSERT_TRUE(allocator->allocateNonContiguous(
+      AllocationTraits::numPages(kProtectedBytes),
+      prewarm,
+      nullptr,
+      allocator->largestSizeClass()));
+  auto protection = allocator->protectMappedPages(prewarm);
+  allocator->freeNonContiguous(prewarm);
+
+  std::atomic<bool> failed{false};
+  std::vector<std::thread> threads;
+  for (int32_t thread = 0; thread < 16; ++thread) {
+    threads.emplace_back([&, thread]() {
+      for (int32_t iteration = 0; iteration < 500; ++iteration) {
+        const uint64_t bytes = (1ULL << 20) << ((thread + iteration) % 3);
+        try {
+          auto* data = allocator->allocateBytes(bytes);
+          if (data != nullptr) {
+            static_cast<char*>(data)[0] = 1;
+            allocator->freeBytes(data, bytes);
+          }
+        } catch (...) {
+          failed = true;
+          return;
+        }
+      }
+    });
+  }
+  for (auto& thread : threads) {
+    thread.join();
+  }
+
+  EXPECT_FALSE(failed.load());
+  EXPECT_TRUE(allocator->checkConsistency());
+  protection.reset();
+}
+
 TEST_P(MemoryAllocatorTest, allocationPool) {
   const size_t kNumLargeAllocPages = instance_->largestSizeClass() * 2;
   const size_t kLarge = kNumLargeAllocPages * AllocationTraits::kPageSize;
@@ -2159,6 +2242,37 @@ class MmapConfigTest : public testing::Test {
   std::unique_ptr<MemoryManager> memoryManager_;
   MemoryAllocator* allocator_;
 };
+
+TEST(MmapSizeClassConfigTest, largestSizeClassReducesCacheAllocationRuns) {
+  constexpr uint64_t kCapacityBytes = 512ULL << 20;
+  constexpr MachinePageCount kEightMiBPages =
+      (8ULL << 20) / AllocationTraits::kPageSize;
+
+  MemoryAllocator::Options defaultOptions;
+  defaultOptions.capacity = kCapacityBytes;
+  MmapAllocator defaultAllocator(defaultOptions);
+  Allocation defaultAllocation;
+  ASSERT_TRUE(defaultAllocator.allocateNonContiguous(
+      kEightMiBPages, defaultAllocation));
+  EXPECT_EQ(defaultAllocation.numPages(), kEightMiBPages);
+  EXPECT_EQ(defaultAllocation.numRuns(), 8);
+  defaultAllocator.freeNonContiguous(defaultAllocation);
+
+  MemoryAllocator::Options largerOptions;
+  largerOptions.capacity = kCapacityBytes;
+  largerOptions.largestSizeClass = 1024;
+  MmapAllocator largerAllocator(largerOptions);
+  EXPECT_EQ(largerAllocator.largestSizeClass(), 1024);
+  Allocation largerAllocation;
+  ASSERT_TRUE(
+      largerAllocator.allocateNonContiguous(kEightMiBPages, largerAllocation));
+  EXPECT_EQ(largerAllocation.numPages(), kEightMiBPages);
+  EXPECT_EQ(largerAllocation.numRuns(), 2);
+  for (int32_t i = 0; i < largerAllocation.numRuns(); ++i) {
+    EXPECT_EQ(largerAllocation.runAt(i).numPages(), 1024);
+  }
+  largerAllocator.freeNonContiguous(largerAllocation);
+}
 
 TEST_F(MmapConfigTest, sizeClasses) {
   setupAllocator();

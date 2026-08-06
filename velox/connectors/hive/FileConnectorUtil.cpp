@@ -66,9 +66,6 @@ void configureReaderOptions(
 void configureReaderOptions(
     const std::shared_ptr<const FileConfig>& fileConfig,
     const ConnectorQueryCtx* connectorQueryCtx,
-    const RowTypePtr& fileSchema,
-    const std::shared_ptr<const FileConnectorSplit>& fileSplit,
-    const std::unordered_map<std::string, std::string>& /*tableParameters*/,
     dwio::common::ReaderOptions& readerOptions) {
   auto sessionProperties = connectorQueryCtx->sessionProperties();
   VELOX_CHECK_NOT_NULL(sessionProperties, "Session properties are null");
@@ -77,6 +74,18 @@ void configureReaderOptions(
       fileConfig->maxCoalescedBytes(sessionProperties));
   readerOptions.setMaxCoalesceDistance(
       fileConfig->maxCoalescedDistanceBytes(sessionProperties));
+}
+
+void configureReaderOptions(
+    const std::shared_ptr<const FileConfig>& fileConfig,
+    const ConnectorQueryCtx* connectorQueryCtx,
+    const RowTypePtr& fileSchema,
+    const std::shared_ptr<const FileConnectorSplit>& fileSplit,
+    const std::unordered_map<std::string, std::string>& /*tableParameters*/,
+    dwio::common::ReaderOptions& readerOptions) {
+  auto sessionProperties = connectorQueryCtx->sessionProperties();
+  VELOX_CHECK_NOT_NULL(sessionProperties, "Session properties are null");
+  configureReaderOptions(fileConfig, connectorQueryCtx, readerOptions);
   readerOptions.setFileColumnNamesReadAsLowerCase(
       fileConfig->isFileColumnNamesReadAsLowerCase(sessionProperties));
   readerOptions.setAllowEmptyFile(true);

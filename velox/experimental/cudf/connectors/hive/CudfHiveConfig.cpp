@@ -21,6 +21,7 @@
 
 #include <cudf/types.hpp>
 
+#include <algorithm>
 #include <optional>
 
 namespace facebook::velox::cudf_velox::connector::hive {
@@ -150,6 +151,12 @@ bool CudfHiveConfig::useExperimentalCudfReaderSession(
       config_->get<bool>(kUseExperimentalCudfReader, false));
 }
 
+bool CudfHiveConfig::useCrtS3ReaderSession(
+    const config::ConfigBase* session) const {
+  return session->get<bool>(
+      kUseCrtS3ReaderSession, config_->get<bool>(kUseCrtS3Reader, false));
+}
+
 bool CudfHiveConfig::selectivePreloadEnabledSession(
     const config::ConfigBase* session) const {
   return session->get<bool>(
@@ -168,6 +175,18 @@ uint32_t CudfHiveConfig::prefetchThreadsSession(
     const config::ConfigBase* session) const {
   return session->get<uint32_t>(
       kPrefetchThreadsSession, config_->get<uint32_t>(kPrefetchThreads, 128));
+}
+
+uint32_t CudfHiveConfig::executorSplitPrefetchConcurrencySession(
+    const config::ConfigBase* session) const {
+  const auto configured = session->get<uint32_t>(
+      kExecutorSplitPrefetchConcurrencySession,
+      config_->get<uint32_t>(kExecutorSplitPrefetchConcurrency, 0));
+  if (configured > 0) {
+    return configured;
+  }
+  return std::max<uint32_t>(
+      1, std::min<uint32_t>(16, prefetchThreadsSession(session)));
 }
 
 bool CudfHiveConfig::immutableFiles() const {

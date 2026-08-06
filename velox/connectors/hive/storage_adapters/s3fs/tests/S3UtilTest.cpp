@@ -18,7 +18,43 @@
 
 #include "gtest/gtest.h"
 
+#include <atomic>
+#include <chrono>
+#include <thread>
+#include <vector>
+
 namespace facebook::velox::filesystems {
+
+TEST(S3UtilTest, synchronizedCachingCredentialsProvider) {
+  class CountingProvider final : public Aws::Auth::AWSCredentialsProvider {
+   public:
+    Aws::Auth::AWSCredentials GetAWSCredentials() override {
+      const auto call = ++calls;
+      if (call == 1) {
+        return {};
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      return {"access", "secret", "session"};
+    }
+
+    std::atomic<size_t> calls{0};
+  };
+
+  auto source = std::make_shared<CountingProvider>();
+  auto cached = makeSynchronizedCachingCredentialsProvider(source);
+  std::vector<std::thread> threads;
+  for (size_t index = 0; index < 128; ++index) {
+    threads.emplace_back([cached] {
+      EXPECT_EQ(cached->GetAWSCredentials().GetAWSAccessKeyId(), "access");
+    });
+  }
+  for (auto& thread : threads) {
+    thread.join();
+  }
+  // The eager construction attempt is empty. All concurrent callers share
+  // the single subsequent refresh.
+  EXPECT_EQ(source->calls.load(), 2);
+}
 
 // TODO: Each prefix should be implemented as its own filesystem.
 TEST(S3UtilTest, isS3File) {
