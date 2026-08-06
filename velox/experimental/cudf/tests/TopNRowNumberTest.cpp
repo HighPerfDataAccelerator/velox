@@ -13,218 +13,274 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 
-#include "velox/common/file/FileSystems.h"
-#include "velox/common/testutil/TempDirectoryPath.h"
-#include "velox/exec/Cursor.h"
+#include "velox/exec/PlanNodeStats.h"
+#include "velox/exec/tests/utils/AssertQueryBuilder.h"
 #include "velox/exec/tests/utils/OperatorTestBase.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
-#include "velox/exec/tests/utils/QueryAssertions.h"
-
-#include <unistd.h>
-
-#include <filesystem>
-#include <set>
-#include <string>
-#include <string_view>
-#include <vector>
 
 using namespace facebook::velox;
-using namespace facebook::velox::common::testutil;
-using namespace facebook::velox::exec;
 using namespace facebook::velox::exec::test;
 
-namespace {
-
-namespace fs = std::filesystem;
-
-constexpr std::string_view kSpillDirectoryPrefix{"velox-cudf-topn-spill-"};
-
-bool hasSpillDirectoryPrefix(const fs::path& path) {
-  return path.filename().string().rfind(kSpillDirectoryPrefix, 0) == 0;
-}
-
-std::vector<fs::path> findSpillDirectories(const fs::path& root) {
-  std::vector<fs::path> paths;
-  std::error_code error;
-  if (!fs::exists(root, error)) {
-    return paths;
-  }
-
-  fs::recursive_directory_iterator iterator(
-      root, fs::directory_options::skip_permission_denied, error);
-  const fs::recursive_directory_iterator end;
-  while (iterator != end) {
-    if (!error && iterator->is_directory(error) &&
-        hasSpillDirectoryPrefix(iterator->path())) {
-      paths.push_back(iterator->path());
-    }
-    error.clear();
-    iterator.increment(error);
-  }
-  return paths;
-}
-
-std::set<fs::path> findTopLevelProcessSpillDirectories() {
-  const auto processPrefix =
-      std::string(kSpillDirectoryPrefix) + std::to_string(::getpid()) + "-";
-  std::set<fs::path> paths;
-  std::error_code error;
-  fs::directory_iterator iterator(
-      fs::temp_directory_path(),
-      fs::directory_options::skip_permission_denied,
-      error);
-  const fs::directory_iterator end;
-  while (iterator != end) {
-    if (!error && iterator->is_directory(error) &&
-        iterator->path().filename().string().rfind(processPrefix, 0) == 0) {
-      paths.insert(iterator->path());
-    }
-    error.clear();
-    iterator.increment(error);
-  }
-  return paths;
-}
-
-bool usedCudfTopNRowNumber(const TaskStats& stats) {
-  for (const auto& pipelineStats : stats.pipelineStats) {
-    for (const auto& operatorStats : pipelineStats.operatorStats) {
-      if (operatorStats.operatorType == "CudfTopNRowNumber") {
-        return true;
-      }
-    }
-  }
-  return false;
-}
-
-class CudfTopNRowNumberTest : public OperatorTestBase {
- protected:
-  static constexpr vector_size_t kNumRows = 32;
-
+class TopNRowNumberTest : public OperatorTestBase {
+ public:
   void SetUp() override {
     OperatorTestBase::SetUp();
-    filesystems::registerLocalFileSystem();
-    previousAllowCpuFallback_ =
-        cudf_velox::CudfConfig::getInstance().allowCpuFallback;
-    cudf_velox::CudfConfig::getInstance().allowCpuFallback = false;
     cudf_velox::registerCudf();
   }
 
   void TearDown() override {
     cudf_velox::unregisterCudf();
-    cudf_velox::CudfConfig::getInstance().allowCpuFallback =
-        previousAllowCpuFallback_;
     OperatorTestBase::TearDown();
   }
 
-  core::PlanNodePtr makePlan() {
-    auto data = makeRowVector(
-        {"p", "s", "v"},
-        {makeFlatVector<int64_t>(
-             kNumRows, [](vector_size_t row) { return row; }),
-         makeFlatVector<int64_t>(
-             kNumRows, [](vector_size_t row) { return kNumRows - row; }),
-         makeFlatVector<int64_t>(
-             kNumRows, [](vector_size_t row) { return row * 10; })});
-
-    return PlanBuilder()
-        .values({data})
-        .topNRowNumber({"p"}, {"s"}, 1, true)
-        .planNode();
+ protected:
+  static bool wasCudfTopNRowNumberUsed(
+      const std::shared_ptr<exec::Task>& task) {
+    auto stats = task->taskStats();
+    for (const auto& pipelineStats : stats.pipelineStats) {
+      for (const auto& operatorStats : pipelineStats.operatorStats) {
+        if (operatorStats.operatorType == "CudfTopNRowNumber") {
+          return true;
+        }
+      }
+    }
+    return false;
   }
 
-  RowVectorPtr makeExpectedResult() {
-    return makeRowVector(
-        {"p", "s", "v", "row_number"},
-        {makeFlatVector<int64_t>(
-             kNumRows, [](vector_size_t row) { return row; }),
-         makeFlatVector<int64_t>(
-             kNumRows, [](vector_size_t row) { return kNumRows - row; }),
-         makeFlatVector<int64_t>(
-             kNumRows, [](vector_size_t row) { return row * 10; }),
-         makeFlatVector<int64_t>(
-             kNumRows, [](vector_size_t /*row*/) { return 1; })});
+  static bool wasCpuTopNRowNumberUsed(const std::shared_ptr<exec::Task>& task) {
+    auto stats = task->taskStats();
+    for (const auto& pipelineStats : stats.pipelineStats) {
+      for (const auto& operatorStats : pipelineStats.operatorStats) {
+        if (operatorStats.operatorType == "TopNRowNumber") {
+          return true;
+        }
+      }
+    }
+    return false;
   }
 
-  std::unique_ptr<TaskCursor> makeSpillingCursor(const std::string& spillRoot) {
-    CursorParameters params;
-    params.planNode = makePlan();
-    params.maxDrivers = 1;
-    params.serialExecution = true;
-    params.spillDirectory = spillRoot;
-    params.queryConfigs = {
-        {cudf_velox::CudfConfig::kCudfEnabled, "true"},
-        {cudf_velox::CudfConfig::kCudfTopNRowNumberCandidateRunBytes, "1"}};
-    return TaskCursor::create(params);
+  void assertGpuTopNRowNumber(
+      const core::PlanNodePtr& plan,
+      const std::string& duckDbSql) {
+    auto task = assertQuery(plan, duckDbSql);
+    ASSERT_TRUE(wasCudfTopNRowNumberUsed(task));
+    ASSERT_FALSE(wasCpuTopNRowNumberUsed(task));
   }
-
- private:
-  bool previousAllowCpuFallback_{true};
 };
 
-TEST_F(CudfTopNRowNumberTest, spillUsesTaskRootAndCleansUp) {
-  const auto spillRoot = TempDirectoryPath::create();
-  const auto preexistingTopLevelSpills = findTopLevelProcessSpillDirectories();
-  auto cursor = makeSpillingCursor(spillRoot->getPath());
-  ASSERT_TRUE(cursor->moveNext());
+TEST_F(TopNRowNumberTest, basic) {
+  auto data = makeRowVector({
+      makeFlatVector<int64_t>({1, 1, 2, 2, 1, 2, 1}),
+      makeFlatVector<int64_t>({77, 66, 55, 44, 33, 22, 11}),
+      makeFlatVector<int64_t>({10, 20, 30, 40, 50, 60, 70}),
+  });
+  createDuckDbTable({data});
 
-  const fs::path taskSpillRoot(cursor->task()->spillDirectory());
-  EXPECT_EQ(taskSpillRoot.parent_path(), fs::path(spillRoot->getPath()));
+  auto testLimit = [&](int32_t limit) {
+    SCOPED_TRACE(fmt::format("limit={}", limit));
 
-  const auto activeSpillDirectories =
-      findSpillDirectories(spillRoot->getPath());
-  ASSERT_EQ(activeSpillDirectories.size(), 1);
-  EXPECT_EQ(activeSpillDirectories.front().parent_path(), taskSpillRoot);
-  EXPECT_TRUE(hasSpillDirectoryPrefix(activeSpillDirectories.front()));
-  EXPECT_EQ(findTopLevelProcessSpillDirectories(), preexistingTopLevelSpills)
-      << "CudfTopNRowNumber created a spill directory outside the Task root";
+    auto plan = PlanBuilder()
+                    .values({data})
+                    .topNRowNumber({"c0"}, {"c1"}, limit, true)
+                    .planNode();
+    assertGpuTopNRowNumber(
+        plan,
+        fmt::format(
+            "SELECT * FROM (SELECT *, row_number() over (partition by c0 order by c1) as row_number FROM tmp) "
+            "WHERE row_number <= {}",
+            limit));
 
-  std::vector<RowVectorPtr> actualResults{cursor->current()};
-  while (cursor->moveNext()) {
-    actualResults.push_back(cursor->current());
+    plan = PlanBuilder()
+               .values({data})
+               .topNRowNumber({"c0"}, {"c1"}, limit, false)
+               .planNode();
+    assertGpuTopNRowNumber(
+        plan,
+        fmt::format(
+            "SELECT c0, c1, c2 FROM (SELECT *, row_number() over (partition by c0 order by c1) as row_number FROM tmp) "
+            "WHERE row_number <= {}",
+            limit));
+
+    plan = PlanBuilder()
+               .values({data})
+               .topNRowNumber({}, {"c1"}, limit, true)
+               .planNode();
+    assertGpuTopNRowNumber(
+        plan,
+        fmt::format(
+            "SELECT * FROM (SELECT *, row_number() over (order by c1) as row_number FROM tmp) "
+            "WHERE row_number <= {}",
+            limit));
+  };
+
+  testLimit(1);
+  testLimit(2);
+  testLimit(3);
+  testLimit(5);
+}
+
+TEST_F(TopNRowNumberTest, basicWithPeers) {
+  auto data = makeRowVector({
+      makeFlatVector<int64_t>({1, 1, 2, 2, 1, 2, 1, 1, 1, 1, 1}),
+      makeFlatVector<int64_t>({33, 11, 55, 44, 11, 22, 11, 11, 11, 33, 33}),
+      makeFlatVector<int64_t>({10, 50, 30, 40, 50, 60, 50, 50, 50, 10, 10}),
+  });
+  createDuckDbTable({data});
+
+  auto testLimit = [&](int32_t limit) {
+    SCOPED_TRACE(fmt::format("limit={}", limit));
+
+    auto plan = PlanBuilder()
+                    .values({data})
+                    .topNRowNumber({"c0"}, {"c1"}, limit, true)
+                    .planNode();
+    assertGpuTopNRowNumber(
+        plan,
+        fmt::format(
+            "SELECT * FROM (SELECT *, row_number() over (partition by c0 order by c1) as row_number FROM tmp) "
+            "WHERE row_number <= {}",
+            limit));
+  };
+
+  testLimit(1);
+  testLimit(2);
+  testLimit(3);
+  testLimit(5);
+}
+
+TEST_F(TopNRowNumberTest, descendingSort) {
+  auto data = makeRowVector({
+      makeFlatVector<int64_t>({1, 1, 1, 2, 2, 2}),
+      makeFlatVector<int64_t>({10, 20, 30, 40, 50, 60}),
+      makeFlatVector<int64_t>({100, 200, 300, 400, 500, 600}),
+  });
+  createDuckDbTable({data});
+
+  auto plan = PlanBuilder()
+                  .values({data})
+                  .topNRowNumber({"c0"}, {"c1 DESC"}, 2, true)
+                  .planNode();
+  assertGpuTopNRowNumber(
+      plan,
+      "SELECT * FROM (SELECT *, row_number() over (partition by c0 order by c1 DESC) as row_number FROM tmp) "
+      "WHERE row_number <= 2");
+}
+
+TEST_F(TopNRowNumberTest, multiBatch) {
+  const vector_size_t batchSize = 1000;
+  std::vector<RowVectorPtr> vectors;
+  for (int32_t batch = 0; batch < 3; ++batch) {
+    vectors.push_back(makeRowVector({
+        makeFlatVector<int64_t>(
+            batchSize,
+            [&](vector_size_t row) { return (batch * batchSize + row) % 5; }),
+        makeFlatVector<int64_t>(
+            batchSize,
+            [&](vector_size_t row) { return batch * batchSize + row; }),
+        makeFlatVector<int64_t>(
+            batchSize, [&](vector_size_t row) { return row; }),
+    }));
   }
-  assertEqualResults({makeExpectedResult()}, actualResults);
-  EXPECT_TRUE(findSpillDirectories(spillRoot->getPath()).empty());
-  EXPECT_EQ(findTopLevelProcessSpillDirectories(), preexistingTopLevelSpills);
+  createDuckDbTable(vectors);
 
-  auto task = cursor->task();
-  EXPECT_TRUE(usedCudfTopNRowNumber(task->taskStats()));
-
-  actualResults.clear();
-  cursor.reset();
-  task.reset();
-  EXPECT_FALSE(fs::exists(taskSpillRoot));
-  EXPECT_TRUE(fs::is_empty(spillRoot->getPath()));
+  auto plan = PlanBuilder()
+                  .values(vectors)
+                  .topNRowNumber({"c0"}, {"c1"}, 3, false)
+                  .planNode();
+  assertGpuTopNRowNumber(
+      plan,
+      "SELECT c0, c1, c2 FROM (SELECT *, row_number() over (partition by c0 order by c1) as row_number FROM tmp) "
+      "WHERE row_number <= 3");
 }
 
-TEST_F(CudfTopNRowNumberTest, earlyCloseCleansUp) {
-  const auto spillRoot = TempDirectoryPath::create();
-  const auto preexistingTopLevelSpills = findTopLevelProcessSpillDirectories();
-  auto cursor = makeSpillingCursor(spillRoot->getPath());
-  ASSERT_TRUE(cursor->moveNext());
+TEST_F(TopNRowNumberTest, multiBatchWithRowNumber) {
+  // Same shape as multiBatch, but with generateRowNumber=true so the
+  // row_number column must be recomputed correctly across the incremental
+  // merge/prune steps in CudfTopNRowNumber::mergeAndPruneCandidates, not just
+  // the filtered row set.
+  const vector_size_t batchSize = 1000;
+  std::vector<RowVectorPtr> vectors;
+  for (int32_t batch = 0; batch < 3; ++batch) {
+    vectors.push_back(makeRowVector({
+        makeFlatVector<int64_t>(
+            batchSize,
+            [&](vector_size_t row) { return (batch * batchSize + row) % 5; }),
+        makeFlatVector<int64_t>(
+            batchSize,
+            [&](vector_size_t row) { return batch * batchSize + row; }),
+        makeFlatVector<int64_t>(
+            batchSize, [&](vector_size_t row) { return row; }),
+    }));
+  }
+  createDuckDbTable(vectors);
 
-  auto task = cursor->task();
-  const fs::path taskSpillRoot(task->spillDirectory());
-  EXPECT_EQ(taskSpillRoot.parent_path(), fs::path(spillRoot->getPath()));
-  const auto activeSpillDirectories =
-      findSpillDirectories(spillRoot->getPath());
-  ASSERT_EQ(activeSpillDirectories.size(), 1);
-  EXPECT_EQ(activeSpillDirectories.front().parent_path(), taskSpillRoot);
-  EXPECT_EQ(findTopLevelProcessSpillDirectories(), preexistingTopLevelSpills);
-
-  // SingleThreadedTaskCursor synchronously cancels the Task in its destructor.
-  // The Task closes off-thread Drivers before requestCancel().wait() returns.
-  cursor.reset();
-  EXPECT_TRUE(findSpillDirectories(spillRoot->getPath()).empty());
-  EXPECT_EQ(findTopLevelProcessSpillDirectories(), preexistingTopLevelSpills);
-  EXPECT_TRUE(usedCudfTopNRowNumber(task->taskStats()));
-
-  task.reset();
-  EXPECT_FALSE(fs::exists(taskSpillRoot));
-  EXPECT_TRUE(fs::is_empty(spillRoot->getPath()));
+  auto plan = PlanBuilder()
+                  .values(vectors)
+                  .topNRowNumber({"c0"}, {"c1"}, 3, true)
+                  .planNode();
+  assertGpuTopNRowNumber(
+      plan,
+      "SELECT * FROM (SELECT *, row_number() over (partition by c0 order by c1) as row_number FROM tmp) "
+      "WHERE row_number <= 3");
 }
 
-} // namespace
+TEST_F(TopNRowNumberTest, manySmallBatchesStaggeredPartitions) {
+  // Exercises the per-batch merge/prune path many times (one merge per
+  // batch) with partitions that only start appearing partway through the
+  // stream, and with candidate state from earlier batches getting displaced
+  // by later, better-ranked rows within the same partition.
+  const vector_size_t batchSize = 20;
+  const int32_t numBatches = 15;
+  std::vector<RowVectorPtr> vectors;
+  for (int32_t batch = 0; batch < numBatches; ++batch) {
+    // Partition 'batch % 4' only starts contributing rows once 'batch' is at
+    // least that value, e.g. partition 3 first appears in batch 3.
+    vectors.push_back(makeRowVector({
+        makeFlatVector<int64_t>(
+            batchSize, [&](vector_size_t row) { return (batch + row) % 4; }),
+        // Descending c1 so later batches (smaller multiplier applied via
+        // batch-dependent offset) sometimes outrank earlier candidates,
+        // forcing candidates_ to be displaced during merges.
+        makeFlatVector<int64_t>(
+            batchSize,
+            [&](vector_size_t row) {
+              return (numBatches - batch) * 1000 + row;
+            }),
+        makeFlatVector<int64_t>(
+            batchSize, [&](vector_size_t row) { return row; }),
+    }));
+  }
+  createDuckDbTable(vectors);
+
+  auto plan = PlanBuilder()
+                  .values(vectors)
+                  .topNRowNumber({"c0"}, {"c1"}, 4, true)
+                  .planNode();
+  assertGpuTopNRowNumber(
+      plan,
+      "SELECT * FROM (SELECT *, row_number() over (partition by c0 order by c1) as row_number FROM tmp) "
+      "WHERE row_number <= 4");
+}
+
+TEST_F(TopNRowNumberTest, rankFallsBackToCpu) {
+  auto data = makeRowVector({
+      makeFlatVector<int64_t>({1, 1, 2, 2}),
+      makeFlatVector<int64_t>({10, 20, 30, 40}),
+      makeFlatVector<int64_t>({100, 200, 300, 400}),
+  });
+  createDuckDbTable({data});
+
+  auto plan = PlanBuilder()
+                  .values({data})
+                  .topNRank("rank", {"c0"}, {"c1"}, 2, true)
+                  .planNode();
+  auto task = assertQuery(
+      plan,
+      "SELECT * FROM (SELECT *, rank() over (partition by c0 order by c1) as row_number FROM tmp) "
+      "WHERE row_number <= 2");
+  ASSERT_FALSE(wasCudfTopNRowNumberUsed(task));
+  ASSERT_TRUE(wasCpuTopNRowNumberUsed(task));
+}

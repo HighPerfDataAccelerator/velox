@@ -24,6 +24,7 @@
 #include "velox/exec/LocalPartition.h"
 #include "velox/exec/MemoryReclaimer.h"
 #include "velox/exec/MergeSource.h"
+#include "velox/exec/PartitionedOutputFactory.h"
 #include "velox/exec/ScaledScanController.h"
 #include "velox/exec/TaskStats.h"
 #include "velox/exec/TaskStructs.h"
@@ -32,46 +33,7 @@
 
 namespace facebook::velox::exec {
 
-class DefaultOutputBufferManager;
-class Task;
-
-/// Extension point for non-default partitioned-output transports. A Task
-/// selects one registered manager at output initialization and retains it for
-/// the lifetime of that output.
-class PartitionedOutputBufferManager {
- public:
-  virtual ~PartitionedOutputBufferManager() = default;
-
-  virtual bool supports(
-      const core::PartitionedOutputNode& node,
-      const core::QueryConfig& queryConfig) const = 0;
-
-  virtual void initializeTask(
-      std::shared_ptr<Task> task,
-      core::PartitionedOutputNode::Kind kind,
-      int numPartitions,
-      int numOutputDrivers) = 0;
-
-  virtual void updateOutputBuffers(
-      const std::string& taskId,
-      int numBuffers,
-      bool noMoreBuffers) = 0;
-
-  virtual void updateNumDrivers(
-      const std::string& taskId,
-      uint32_t numOutputDrivers) = 0;
-
-  virtual std::optional<OutputBuffer::Stats> stats(
-      const std::string& taskId) = 0;
-
-  virtual void removeTask(const std::string& taskId) = 0;
-};
-
-bool registerPartitionedOutputBufferManager(
-    const std::shared_ptr<PartitionedOutputBufferManager>& manager);
-
-bool unregisterPartitionedOutputBufferManager(
-    const std::shared_ptr<PartitionedOutputBufferManager>& manager);
+class OutputBufferManager;
 
 class HashJoinBridge;
 class IndexLookupJoinBridge;
@@ -204,6 +166,11 @@ class Task : public std::enable_shared_from_this<Task> {
   const trace::TraceCtx* traceCtx() const {
     return traceCtx_.get();
   }
+
+  /// Returns the output buffer manager for the transport named on this task's
+  /// PartitionedOutputNode, or an empty weak_ptr if there is no partitioned
+  /// output. Lock() and null-check before use.
+  std::weak_ptr<OutputBufferManager> outputBufferManager() const;
 
   /// Returns ConsumerSupplier passed in the constructor.
   ConsumerSupplier consumerSupplier() const {
@@ -583,8 +550,8 @@ class Task : public std::enable_shared_from_this<Task> {
       uint32_t splitGroupId,
       const core::PlanNodeId& planNodeId);
 
-  const std::shared_ptr<LocalExchangeMemoryManager>&
-  getLocalExchangeMemoryManager(
+  // Returns by copy because the copy must be made under the task lock.
+  std::shared_ptr<LocalExchangeMemoryManager> getLocalExchangeMemoryManager(
       uint32_t splitGroupId,
       const core::PlanNodeId& planNodeId);
 
@@ -651,10 +618,10 @@ class Task : public std::enable_shared_from_this<Task> {
       uint32_t splitGroupId,
       const std::vector<core::PlanNodeId>& planNodeIds);
 
-  /// Adds custom join bridges for all the specified plan nodes.
+  /// Adds custom join bridges for the specified plan node IDs.
   void addCustomJoinBridgesLocked(
       uint32_t splitGroupId,
-      const std::vector<core::PlanNodePtr>& planNodes);
+      const std::vector<core::PlanNodeId>& planNodeIds);
 
   /// Returns a HashJoinBridge for 'planNodeId'. This is used for synchronizing
   /// start of probe with completion of build for a join that has a
@@ -847,7 +814,7 @@ class Task : public std::enable_shared_from_this<Task> {
   /// folder could not be created.
   const std::string& getOrCreateSpillDirectory();
 
-  /// True if produces output via DefaultOutputBufferManager.
+  /// True if this task has a partitioned-output pipeline.
   bool hasPartitionedOutput() const {
     return numDriversInPartitionedOutput_ > 0;
   }
@@ -1124,8 +1091,7 @@ class Task : public std::enable_shared_from_this<Task> {
   // kRunning state, but no more split groups are commit and all drivers
   // finished processing and all output has been consumed. In other words,
   // returns true if task should transition to kFinished state.
-  bool checkNoMoreSplitGroupsLocked(
-      std::optional<uint32_t>& numPartitionedOutputDrivers);
+  bool checkNoMoreSplitGroupsLocked();
 
   // Notifies listeners that the task is now complete.
   void onTaskCompletion();
@@ -1447,8 +1413,6 @@ class Task : public std::enable_shared_from_this<Task> {
   // Execution mode. In this case we will need to update the number of output
   // drivers in the end. False otherwise.
   bool groupedPartitionedOutput_{false};
-  std::shared_ptr<PartitionedOutputBufferManager>
-      partitionedOutputBufferManager_;
   // The number of splits groups we run concurrently.
   uint32_t concurrentSplitGroups_{1};
 
@@ -1518,7 +1482,18 @@ class Task : public std::enable_shared_from_this<Task> {
   // ungrouped execution we use the [0] entry in this vector.
   std::unordered_map<uint32_t, SplitGroupState> splitGroupStates_;
 
-  std::weak_ptr<DefaultOutputBufferManager> bufferManager_;
+  // Output buffer manager for this task's partitioned output -- the manager for
+  // the transport named on the PartitionedOutputNode. A weak_ptr to break the
+  // reference cycle through OutputBuffer::task_ (which holds a
+  // shared_ptr<Task>). Assigned once under mutex_ when the task starts; read
+  // directly by code already holding mutex_, or via outputBufferManager().
+  std::weak_ptr<OutputBufferManager> bufferManager_;
+
+  // Factory that builds the output operator for the resolved transport, paired
+  // with 'bufferManager_' from the same registry entry. Assigned alongside
+  // 'bufferManager_' under mutex_ and passed to createDriver(); empty if the
+  // task has no partitioned output.
+  PartitionedOutputFactory outputOperatorFactory_;
 
   // Boolean indicating that we have already received no-more-output-buffers
   // message. Subsequent messages will be ignored.

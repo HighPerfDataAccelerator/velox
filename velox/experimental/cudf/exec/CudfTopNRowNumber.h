@@ -18,23 +18,20 @@
 #include "velox/experimental/cudf/exec/CudfOperator.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
-#include "velox/core/PlanNode.h"
-
-#include <cudf/io/parquet.hpp>
-#include <cudf/types.hpp>
-
-#include <cstdint>
-#include <deque>
-#include <optional>
-#include <string>
-#include <vector>
-
 namespace facebook::velox::cudf_velox {
 
-/// GPU TopNRowNumber for limit=1 rank-like windows.
+class CudaEvent;
+
+/// GPU-accelerated TopNRowNumber: partitioned top-N with row_number.
+/// Used when the optimizer rewrites ROW_NUMBER() OVER (...) WHERE rn <= limit
+/// into a TopNRowNumber plan node.
 ///
-/// row_number keeps the single first row in each partition. rank and dense_rank
-/// keep every row in the first peer group in each partition.
+/// Retained state is bounded to O(limit * distinct partitions) rather than
+/// the full input: each input batch is locally reduced to its own top-`limit`
+/// rows per partition, then merged with the running `candidates_` (which
+/// already holds the top-`limit` rows per partition across all prior
+/// batches) and pruned back down to `limit` rows per partition. See
+/// reduceBatchToLocalCandidates() and mergeAndPruneCandidates().
 class CudfTopNRowNumber : public CudfOperatorBase {
  public:
   CudfTopNRowNumber(
@@ -43,97 +40,69 @@ class CudfTopNRowNumber : public CudfOperatorBase {
       const std::shared_ptr<const core::TopNRowNumberNode>& node);
 
   bool needsInput() const override {
-    return !noMoreInput_ && passthroughOutputs_.empty();
+    return !noMoreInput_;
   }
 
   exec::BlockingReason isBlocked(ContinueFuture* /*future*/) override {
     return exec::BlockingReason::kNotBlocked;
   }
 
-  bool isFinished() override {
-    return finished_ && passthroughOutputs_.empty();
-  }
-
-  static bool shouldReplace(
-      const std::shared_ptr<const core::TopNRowNumberNode>& node);
+  bool isFinished() override;
 
  protected:
   void doAddInput(RowVectorPtr input) override;
   RowVectorPtr doGetOutput() override;
   void doNoMoreInput() override;
-  void doClose() override;
 
  private:
-  void spillSortedRun();
-  void compactSortedRunsForMerge();
-  void initializeSortedRunReaders();
-  std::unique_ptr<cudf::table> mergeNextSortedBatch(
-      rmm::cuda_stream_view stream,
-      rmm::device_async_resource_ref mr,
-      bool& finalBatch);
-  std::unique_ptr<cudf::table> takeCompletePartitions(
-      std::unique_ptr<cudf::table> sorted,
-      bool finalBatch,
-      rmm::cuda_stream_view stream,
-      rmm::device_async_resource_ref mr);
-  CudfVectorPtr computeNextSortedOutput();
-  void cleanupSpillFiles();
-
-  CudfVectorPtr computeLimitOneRowNumber(
-      cudf::table_view input,
-      rmm::cuda_stream_view stream,
-      rmm::device_async_resource_ref mr);
-  CudfVectorPtr computeLimitOneRankLike(
-      cudf::table_view input,
-      rmm::cuda_stream_view stream,
-      rmm::device_async_resource_ref mr);
-  std::unique_ptr<cudf::table> reduceToCandidates(
-      cudf::table_view input,
+  /// Reduces a single input batch to its own top-`limit_` rows per
+  /// partition: sorts by partition+ordering keys, computes row_number
+  /// locally, filters the sort permutation to row_number <= limit_, and only
+  /// then gathers the full payload for the surviving rows.
+  CudfVectorPtr reduceBatchToLocalCandidates(
+      const CudfVectorPtr& cudfInput,
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr);
 
+  /// Merges two candidate sets (each already sorted by partition+ordering
+  /// keys and containing at most `limit_` rows per partition) via
+  /// cudf::merge, recomputes row_number over the merged rows, and prunes
+  /// back down to `limit_` rows per partition.
+  CudfVectorPtr mergeAndPruneCandidates(
+      const CudfVectorPtr& previous,
+      const CudfVectorPtr& incoming,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr);
+
+  const std::shared_ptr<const core::TopNRowNumberNode> node_;
   const int32_t limit_;
-  const core::TopNRowNumberNode::RankFunction rankFunction_;
   const bool generateRowNumber_;
-  const RowTypePtr inputType_;
-  const core::PlanNodeId diagnosticNodeId_;
-  const uint64_t candidateRunBytes_;
+  const TypePtr inputType_;
 
-  std::vector<cudf::size_type> partitionKeys_;
-  std::vector<cudf::size_type> sortKeys_;
-  std::vector<cudf::size_type> allKeyIndices_;
-  std::vector<cudf::order> columnOrders_;
+  std::vector<cudf::size_type> partitionKeyIndices_;
+  std::vector<cudf::size_type> sortKeyIndices_;
+  std::vector<cudf::order> sortOrders_;
   std::vector<cudf::null_order> nullOrders_;
 
-  // A boolean partition key whose name starts with this marker makes Top-N
-  // conditional: false rows are known singleton/pass-through partitions and
-  // can be emitted immediately; only true rows enter rank state.  This keeps
-  // one input scan while avoiding state for high-volume unaffected rows.
-  std::optional<cudf::size_type> passthroughKey_;
-  std::deque<CudfVectorPtr> passthroughOutputs_;
+  // Combined partition+ordering sort/merge key (partition keys first, then
+  // ordering keys), precomputed once and reused for every stable_sorted_order
+  // / cudf::merge call.
+  std::vector<cudf::size_type> allSortKeys_;
+  std::vector<cudf::order> allOrders_;
+  std::vector<cudf::null_order> allNullOrders_;
+  // Positions of the partition keys within the narrower key-only table
+  // selected via allSortKeys_ (always the prefix [0, partitionKeyIndices_.
+  // size()), since partition keys are listed first in allSortKeys_).
+  std::vector<cudf::size_type> localPartitionKeyIndices_;
 
-  std::vector<CudfVectorPtr> inputs_;
-  // Incremental per-partition Top-1 state. Every input batch is reduced first,
-  // then merged with this already-reduced state and reduced again. For
-  // row_number this is at most one row per partition; rank/dense_rank retain
-  // only ties for the current best sort key. Device residency therefore
-  // depends on candidate cardinality, not total input rows.
-  std::unique_ptr<cudf::table> candidates_;
-  uint64_t bufferedBytes_{0};
-  uint64_t nextDiagnosticBufferedBytes_{512ULL << 20};
-  struct SortedRun {
-    std::string path;
-    std::unique_ptr<cudf::io::chunked_parquet_reader> reader;
-  };
-  std::vector<SortedRun> sortedRuns_;
-  std::string spillDirectory_;
-  uint64_t spillFileSequence_{0};
-  std::unique_ptr<cudf::table> mergeCarry_;
-  std::unique_ptr<cudf::table> partitionCarry_;
-  bool readersInitialized_{false};
-  bool mergeFinished_{false};
-  bool spilled_{false};
+  // Bounded candidate state: at most `limit_` rows per distinct partition
+  // seen so far, sorted by partition+ordering keys, with the schema of
+  // inputType_ (the row_number column, if any, is only materialized once in
+  // doGetOutput()). Updated incrementally after each input batch instead of
+  // retaining the full input.
+  CudfVectorPtr candidates_;
   bool finished_{false};
+  std::unique_ptr<CudaEvent> cudaEvent_;
 };
 
 } // namespace facebook::velox::cudf_velox

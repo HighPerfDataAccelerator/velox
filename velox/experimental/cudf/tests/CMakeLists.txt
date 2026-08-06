@@ -73,8 +73,8 @@ endif()
 
 velox_add_cudf_test(
   NAME velox_cudf_adapter_operator_test
-  SOURCES Main.cpp AdapterOperatorTest.cpp TaskOutputManagerTest.cpp
-  LIBS ${CUDF_TEST_DEFAULT_LIBS} velox_functions_test_lib velox_window velox_functions_spark_window
+  SOURCES Main.cpp AdapterOperatorTest.cpp
+  LIBS ${CUDF_TEST_DEFAULT_LIBS} velox_functions_test_lib
 )
 
 velox_add_cudf_test(
@@ -289,9 +289,9 @@ velox_add_cudf_test(
 )
 
 velox_add_cudf_test(
-  NAME velox_cudf_top_n_row_number_test
+  NAME velox_cudf_topnrownumber_test
   SOURCES Main.cpp TopNRowNumberTest.cpp
-  LIBS ${CUDF_TEST_DEFAULT_LIBS}
+  LIBS ${CUDF_TEST_DEFAULT_LIBS} fmt::fmt
 )
 
 velox_add_cudf_test(

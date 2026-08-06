@@ -33,8 +33,6 @@ add_library(
   CudfReduce.cpp
   CudfTopN.cpp
   CudfTopNRowNumber.cpp
-  CudfUnnest.cpp
-  CudfValues.cpp
   CudfWindow.cpp
   DebugUtil.cpp
   DecimalAggregationDevice.cu
@@ -48,6 +46,14 @@ add_library(
   Utilities.cpp
   VeloxCudfInterop.cpp
 )
+
+# CudfLocalPartition and Gluten's UCX shuffle bridge use the partition
+# function and transport implementations from the UCX exchange module. Keep
+# those objects in the cuDF archive so the combined libgluten.so exports the
+# complete cuDF/UCX ABI.
+if(TARGET velox_ucx_exchange)
+  target_sources(velox_cudf_exec PRIVATE $<TARGET_OBJECTS:velox_ucx_exchange>)
+endif()
 
 target_link_libraries(
   velox_cudf_exec
@@ -63,7 +69,10 @@ target_link_libraries(
     velox_exception
     velox_exec
     velox_test_util
-    velox_ucx_exchange
 )
+
+if(TARGET velox_ucx_exchange)
+  target_link_libraries(velox_cudf_exec PRIVATE velox_ucx_exchange)
+endif()
 
 target_compile_options(velox_cudf_exec PRIVATE -Wno-missing-field-initializers)

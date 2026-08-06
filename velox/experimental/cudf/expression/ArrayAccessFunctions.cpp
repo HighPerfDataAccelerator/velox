@@ -16,28 +16,26 @@
 
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/expression/ArrayAccessFunctions.h"
-#include "velox/experimental/cudf/expression/AstUtils.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
 
 #include "velox/common/base/Exceptions.h"
-#include "velox/expression/ConstantExpr.h"
+#include "velox/common/memory/Memory.h"
+#include "velox/core/Expressions.h"
 #include "velox/vector/BaseVector.h"
 #include "velox/vector/ComplexVector.h"
+#include "velox/vector/SimpleVector.h"
 
 #include <cudf/aggregation.hpp>
 #include <cudf/binaryop.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/filling.hpp>
-#include <cudf/lists/contains.hpp>
 #include <cudf/lists/count_elements.hpp>
 #include <cudf/lists/extract.hpp>
-#include <cudf/null_mask.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/replace.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
-#include <cudf/structs/structs_column_view.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
 #include <cudf/unary.hpp>
@@ -51,16 +49,20 @@
 namespace facebook::velox::cudf_velox {
 namespace {
 
-int64_t readConstantIntegralValue(const velox::exec::ConstantExpr& expr) {
+int64_t readConstantIntegralValue(
+    const core::ConstantTypedExpr& expr,
+    memory::MemoryPool* pool) {
+  const auto vec =
+      expr.hasValueVector() ? expr.valueVector() : expr.toConstantVector(pool);
   switch (expr.type()->kind()) {
     case TypeKind::TINYINT:
-      return expr.value()->as<SimpleVector<int8_t>>()->valueAt(0);
+      return vec->as<SimpleVector<int8_t>>()->valueAt(0);
     case TypeKind::SMALLINT:
-      return expr.value()->as<SimpleVector<int16_t>>()->valueAt(0);
+      return vec->as<SimpleVector<int16_t>>()->valueAt(0);
     case TypeKind::INTEGER:
-      return expr.value()->as<SimpleVector<int32_t>>()->valueAt(0);
+      return vec->as<SimpleVector<int32_t>>()->valueAt(0);
     case TypeKind::BIGINT:
-      return expr.value()->as<SimpleVector<int64_t>>()->valueAt(0);
+      return vec->as<SimpleVector<int64_t>>()->valueAt(0);
     default:
       VELOX_UNSUPPORTED(
           "Unsupported array access index type {}", expr.type()->toString());
@@ -196,7 +198,7 @@ std::unique_ptr<cudf::column> castSizes(
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr) {
   return indexType.id() == cudf::type_id::INT32
-      ? std::make_unique<cudf::column>(sizesView, stream, mr)
+      ? std::make_unique<cudf::column>(sizesView, stream)
       : cudf::cast(sizesView, indexType, stream, mr);
 }
 
@@ -358,14 +360,13 @@ std::unique_ptr<cudf::column> normalizeAndValidateIndicesTyped(
   } else if (positiveNormalizedColumn != nullptr) {
     normalized = std::move(positiveNormalizedColumn);
   } else {
-    normalized = std::make_unique<cudf::column>(positiveNormalized, stream, mr);
+    normalized = std::make_unique<cudf::column>(positiveNormalized, stream);
   }
 
   std::unique_ptr<cudf::column> invalidMask;
   if (policy.nullOnNegativeIndices) {
     // Spark get returns null, rather than throwing, for negative indices.
-    invalidMask =
-        std::make_unique<cudf::column>(rawLessZero->view(), stream, mr);
+    invalidMask = std::make_unique<cudf::column>(rawLessZero->view(), stream);
   }
 
   if (!policy.allowOutOfBound || std::is_same_v<IndexType, int64_t>) {
@@ -491,11 +492,10 @@ std::unique_ptr<cudf::column> makeRepeatedArrayColumn(
 class ArrayAccessFunction : public CudfFunction {
  public:
   ArrayAccessFunction(
-      const std::shared_ptr<velox::exec::Expr>& expr,
-      ArrayAccessPolicy policy)
+      const core::TypedExprPtr& expr,
+      ArrayAccessPolicy policy,
+      memory::MemoryPool* pool)
       : policy_(policy) {
-    using velox::exec::ConstantExpr;
-
     VELOX_CHECK_EQ(
         expr->inputs().size(), 2, "array access expects exactly 2 inputs");
 
@@ -504,8 +504,11 @@ class ArrayAccessFunction : public CudfFunction {
     // which arises in Q70's ROLLUP bitmask projection. Cache the Velox vector
     // so we can convert it to a cuDF lists column at eval time.
     if (auto constArrayExpr =
-            std::dynamic_pointer_cast<ConstantExpr>(expr->inputs()[0])) {
-      constantArrayVector_ = constArrayExpr->value();
+            std::dynamic_pointer_cast<const core::ConstantTypedExpr>(
+                expr->inputs()[0])) {
+      constantArrayVector_ = constArrayExpr->hasValueVector()
+          ? constArrayExpr->valueVector()
+          : constArrayExpr->toConstantVector(pool);
     }
 
     // Literal indices are not passed as input columns during evaluation. Cache
@@ -514,10 +517,14 @@ class ArrayAccessFunction : public CudfFunction {
     // null behavior returns null for them instead of calling the vector
     // function, so leave constantIndex_ empty and produce an all-null result.
     if (auto indexExpr =
-            std::dynamic_pointer_cast<ConstantExpr>(expr->inputs()[1])) {
+            std::dynamic_pointer_cast<const core::ConstantTypedExpr>(
+                expr->inputs()[1])) {
       indexIsLiteral_ = true;
-      if (!indexExpr->value()->isNullAt(0)) {
-        constantIndex_ = readConstantIntegralValue(*indexExpr);
+      const auto vec = indexExpr->hasValueVector()
+          ? indexExpr->valueVector()
+          : indexExpr->toConstantVector(pool);
+      if (!vec->isNullAt(0)) {
+        constantIndex_ = readConstantIntegralValue(*indexExpr, pool);
       }
     }
   }
@@ -634,118 +641,13 @@ class ArrayAccessFunction : public CudfFunction {
   velox::VectorPtr constantArrayVector_;
 };
 
-class MapElementAtFunction : public CudfFunction {
- public:
-  explicit MapElementAtFunction(
-      const std::shared_ptr<velox::exec::Expr>& expr) {
-    using velox::exec::ConstantExpr;
-
-    VELOX_CHECK_EQ(
-        expr->inputs().size(), 2, "map element_at expects exactly 2 inputs");
-    VELOX_CHECK_EQ(
-        expr->inputs()[0]->type()->kind(),
-        TypeKind::MAP,
-        "map element_at expects a MAP input");
-
-    auto keyExpr = std::dynamic_pointer_cast<ConstantExpr>(expr->inputs()[1]);
-    VELOX_CHECK_NOT_NULL(
-        keyExpr, "cuDF map element_at currently requires a constant key");
-    key_ = makeScalarFromConstantExpr(keyExpr);
-  }
-
-  ColumnOrView eval(
-      std::vector<ColumnOrView>& inputColumns,
-      rmm::cuda_stream_view stream,
-      rmm::device_async_resource_ref mr) const override {
-    VELOX_CHECK_EQ(
-        inputColumns.size(),
-        1,
-        "literal map element_at expects exactly 1 input column");
-
-    auto mapView = cudf::lists_column_view(asView(inputColumns[0]));
-    VELOX_CHECK_EQ(
-        mapView.offset(),
-        0,
-        "cuDF map element_at does not support sliced map columns yet");
-
-    auto entries = mapView.get_sliced_child(stream);
-    VELOX_CHECK(
-        entries.type().id() == cudf::type_id::STRUCT,
-        "cuDF map element_at expects map entries as STRUCT<key,value>");
-    VELOX_CHECK_EQ(entries.num_children(), 2);
-
-    auto structsView = cudf::structs_column_view(entries);
-    auto keyChild = structsView.get_sliced_child(0, stream);
-    auto valueChild = structsView.get_sliced_child(1, stream);
-
-    auto keyLists = makeListsLikeMap(mapView, keyChild, stream, mr);
-    auto positions = cudf::lists::index_of(
-        cudf::lists_column_view(keyLists->view()),
-        *key_,
-        cudf::lists::duplicate_find_option::FIND_FIRST,
-        stream,
-        mr);
-    auto nullablePositions =
-        nullifyMissingPositions(positions->view(), stream, mr);
-
-    auto valueLists = makeListsLikeMap(mapView, valueChild, stream, mr);
-    return cudf::lists::extract_list_element(
-        cudf::lists_column_view(valueLists->view()),
-        nullablePositions->view(),
-        stream,
-        mr);
-  }
-
- private:
-  static std::unique_ptr<cudf::column> makeListsLikeMap(
-      cudf::lists_column_view const& mapView,
-      cudf::column_view child,
-      rmm::cuda_stream_view stream,
-      rmm::device_async_resource_ref mr) {
-    auto offsets =
-        std::make_unique<cudf::column>(mapView.offsets(), stream, mr);
-    auto values = std::make_unique<cudf::column>(child, stream, mr);
-    auto nullMask = cudf::copy_bitmask(mapView.parent(), stream, mr);
-    return cudf::make_lists_column(
-        mapView.size(),
-        std::move(offsets),
-        std::move(values),
-        mapView.null_count(),
-        std::move(nullMask));
-  }
-
-  static std::unique_ptr<cudf::column> nullifyMissingPositions(
-      cudf::column_view positions,
-      rmm::cuda_stream_view stream,
-      rmm::device_async_resource_ref mr) {
-    auto missing = cudf::numeric_scalar<cudf::size_type>(-1, true, stream, mr);
-    auto missingMask = sanitizeBoolMask(
-        cudf::binary_operation(
-            positions,
-            missing,
-            cudf::binary_operator::EQUAL,
-            cudf::data_type{cudf::type_id::BOOL8},
-            stream,
-            mr)
-            ->view(),
-        stream,
-        mr);
-    return applyNullMask(positions, missingMask->view(), stream, mr);
-  }
-
-  std::unique_ptr<cudf::scalar> key_;
-};
-
 } // namespace
 
 std::shared_ptr<CudfFunction> makeArrayAccessFunction(
-    const std::shared_ptr<velox::exec::Expr>& expr,
-    ArrayAccessPolicy policy) {
-  VELOX_CHECK_EQ(expr->inputs().size(), 2, "array access expects 2 inputs");
-  if (expr->inputs()[0]->type()->kind() == TypeKind::MAP) {
-    return std::make_shared<MapElementAtFunction>(expr);
-  }
-  return std::make_shared<ArrayAccessFunction>(expr, policy);
+    const core::TypedExprPtr& expr,
+    ArrayAccessPolicy policy,
+    memory::MemoryPool* pool) {
+  return std::make_shared<ArrayAccessFunction>(expr, policy, pool);
 }
 
 } // namespace facebook::velox::cudf_velox

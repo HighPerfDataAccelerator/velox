@@ -29,13 +29,6 @@ namespace velox_connector = ::facebook::velox::connector;
 namespace velox_hive = ::facebook::velox::connector::hive;
 namespace velox_iceberg = ::facebook::velox::connector::hive::iceberg;
 
-namespace {
-std::string stripFilePrefix(const std::string& path) {
-  constexpr std::string_view prefix{"file:"};
-  return path.rfind(prefix, 0) == 0 ? path.substr(prefix.size()) : path;
-}
-} // namespace
-
 CudfIcebergDataSource::CudfIcebergDataSource(
     const RowTypePtr& outputType,
     const velox_connector::ConnectorTableHandlePtr& tableHandle,
@@ -61,26 +54,8 @@ void CudfIcebergDataSource::convertSplit(
   icebergSplit_ =
       checkedPointerCast<const velox_iceberg::HiveIcebergSplit>(split);
 
-  // CudfSplitReader passes start/length to parquet_reader_options as a byte
-  // range. cuDF then selects the row groups whose starting offsets belong to
-  // that range, matching Spark's row-group-aligned Iceberg splits while
-  // keeping each decoded GPU batch bounded. Positional/equality delete state
-  // still assumes a whole-file base row offset, so reject that uncommon
-  // combination until per-split delete offsets are implemented.
-  if (icebergSplit_->start != 0) {
-    VELOX_CHECK(
-        icebergSplit_->deleteFiles.empty(),
-        "Iceberg byte-range splits with delete files are not yet supported");
-  }
-
   // Convert `ConnectorSplit` to `CudfHiveConnectorSplit`
   CudfHiveDataSource::convertSplit(split);
-
-  split_->coalescedFiles.reserve(icebergSplit_->coalescedFiles.size());
-  for (const auto& file : icebergSplit_->coalescedFiles) {
-    split_->coalescedFiles.push_back(
-        {stripFilePrefix(file.filePath), file.length});
-  }
 }
 
 std::unique_ptr<CudfSplitReader>
@@ -91,7 +66,6 @@ CudfIcebergDataSource::createCudfSplitReader() {
       tableHandle_,
       outputType_,
       readColumnNames_,
-      outputReadColumnNames_,
       fileHandleFactory_,
       executor_,
       connectorQueryCtx_,

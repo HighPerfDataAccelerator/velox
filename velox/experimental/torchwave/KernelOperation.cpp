@@ -580,25 +580,28 @@ KernelOperation::KernelOperation(
   numConstants_ = static_cast<int32_t>(attrOffsets_.size());
   altParamOffset_ = offset;
 
-  // For all-elementwise kernel ops, mark the output as byLargestInput,
-  // unless any input is wholeTensor (its size should not affect the output).
+  // For all-elementwise kernel ops, size the memory-backed output(s) by the
+  // largest input, unless an input is wholeTensor (its size should not affect
+  // the output). A pure elementwise op has a single output. A fused op that
+  // reads a wholeTensor operand (e.g. index_select) also materializes that
+  // operand's producer, so it may have more than one memory-backed output; each
+  // is then sized from its own shape expression rather than byLargestInput, and
+  // callNeedsBarrier orders the producer before the random-access read.
   std::unordered_set<NodeCP> ewVisited;
   if (!outputValues.empty() && isAllElementwise(sg.root, inputs_, ewVisited)) {
-    TORCH_CHECK(
-        outputDescs_.size() == 1,
-        "All-elementwise op should have exactly one output");
-    auto* meta = Registry::metadata(sg.root->target());
-    bool hasWholeTensor = false;
-    if (meta) {
-      for (size_t i = 0; i < meta->argumentMeta.size(); ++i) {
-        if (meta->argumentMeta[i].wholeTensor) {
-          hasWholeTensor = true;
-          break;
-        }
+    // Size each memory-backed output by its largest input, unless the output
+    // declares its own shape expression (reserveShape, e.g. index_select,
+    // slice_scatter, the factory ops), in which case that shape wins.
+    // collectElementwiseLeaves already drops wholeTensor operands from the size
+    // leaves, so an op that reads a wholeTensor but has no reserveShape -- e.g.
+    // searchsorted / bucketize / isin, whose output has the query's shape while
+    // the searched array is the wholeTensor -- is still sized correctly from
+    // its remaining inputs, even when the query is a fused register that a
+    // reserveShape could not read.
+    for (size_t i = 0; i < outputDescs_.size(); ++i) {
+      if (!outputDescs_[i].shapeOnly && !outputDescs_[i].reserveShape) {
+        outputDescs_[i].byLargestInput = true;
       }
-    }
-    if (!hasWholeTensor) {
-      outputDescs_[0].byLargestInput = true;
     }
   }
 
@@ -617,7 +620,19 @@ std::vector<int32_t> KernelOperation::tensorParamOffsets() const {
 
 int32_t KernelOperation::paramOffset(ValueCP value) const {
   auto it = paramOffsets_.find(value);
-  TORCH_CHECK(it != paramOffsets_.end(), "Value not found in paramOffsets");
+  if (it == paramOffsets_.end()) {
+    const auto* producer = value->producer();
+    TORCH_CHECK(
+        false,
+        "Value not found in paramOffsets: value=",
+        value->name(),
+        " id=",
+        value->id(),
+        " kind=",
+        static_cast<int>(value->type().kind()),
+        " producer=",
+        producer ? std::string(producer->target()) : std::string("<none>"));
+  }
   return it->second;
 }
 
@@ -813,7 +828,15 @@ void collectElementwiseLeaves(
     }
     auto* producerMeta = Registry::metadata(producer->target());
     if (producerMeta && producerMeta->elementwise) {
-      collectElementwiseLeaves(producer, subgraphInputs, seen, leafIds);
+      // An op whose output shape is not derivable from its operands
+      // (sizeFromOutput, e.g. index_select) contributes its own output shape to
+      // the broadcast, not its (whole-tensor) operands. Its output is a
+      // shape-only tensor available at launch, so use it as the size leaf.
+      if (producerMeta->sizeFromOutput) {
+        leafIds.push_back(value->id());
+      } else {
+        collectElementwiseLeaves(producer, subgraphInputs, seen, leafIds);
+      }
     } else {
       leafIds.push_back(value->id());
     }
@@ -1184,12 +1207,25 @@ void KernelOperation::setOutputs(
     bool isListOutput =
         outputs[i]->type().kind() == nativert::Type::Kind::TensorList;
     bool needsShapeOnly = !inMemory && isEw && !callerIsElementwise;
+    // An op whose output shape is not derivable from its operands
+    // (sizeFromOutput, e.g. index_select) must expose a shape-only tensor even
+    // when fused into another elementwise, so the enclosing expression can size
+    // its output from this op's shape rather than from its (whole-tensor)
+    // operands.
+    if (!inMemory && isEw && meta->sizeFromOutput &&
+        meta->returnMeta[i].isRegister) {
+      needsShapeOnly = true;
+    }
     if (!meta->returnMeta[i].isRegister || inMemory || needsShapeOnly) {
       OutputDesc desc;
       if (needsShapeOnly && meta->returnMeta[i].isRegister) {
+        if (meta->returnMeta[i].reserveShape) {
+          desc = makeOutputDesc(meta->returnMeta[i], node, subgraphInputs);
+        } else {
+          desc.sizeExpr =
+              makeSizeExpr(node, subgraphInputs, static_cast<int32_t>(i));
+        }
         desc.shapeOnly = true;
-        desc.sizeExpr =
-            makeSizeExpr(node, subgraphInputs, static_cast<int32_t>(i));
       } else if (meta->returnMeta[i].reserveShape) {
         desc = makeOutputDesc(meta->returnMeta[i], node, subgraphInputs);
       } else {

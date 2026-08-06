@@ -16,13 +16,14 @@
 
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/CudfAggregation.h"
-#include "velox/experimental/cudf/exec/CudfFilterProject.h"
 #include "velox/experimental/cudf/exec/CudfGroupby.h"
 #include "velox/experimental/cudf/exec/CudfReduce.h"
+#include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
 
 #include "velox/core/Expressions.h"
 #include "velox/exec/Aggregate.h"
 #include "velox/exec/AggregateFunctionRegistry.h"
+#include "velox/expression/Expr.h"
 #include "velox/expression/SignatureBinder.h"
 
 #include <algorithm>
@@ -311,19 +312,11 @@ std::vector<CudfExpressionPtr> createAggregationInputEvaluators(
     return {};
   }
 
-  bool lazyDereference = false;
-  std::vector<core::TypedExprPtr> exprs = precomputedInputs;
-  auto exprSet = std::make_unique<exec::ExprSet>(
-      exprs,
-      operatorCtx.execCtx(),
-      /*enableConstantFolding=*/false,
-      lazyDereference);
-
   std::vector<CudfExpressionPtr> evaluators;
-  evaluators.reserve(exprSet->exprs().size());
-  for (const auto& expr : exprSet->exprs()) {
+  evaluators.reserve(precomputedInputs.size());
+  for (const auto& expr : precomputedInputs) {
     evaluators.push_back(createCudfExpression(
-        expr, inputRowSchema, &operatorCtx.driverCtx()->queryConfig()));
+        expr, inputRowSchema, operatorCtx.pool()));
   }
   return evaluators;
 }
@@ -347,7 +340,7 @@ PreparedAggregationInput prepareAggregationInput(
 
   for (const auto& evaluator : precomputedInputEvaluators) {
     result.precomputedColumns.push_back(
-        evaluator->eval(inputViews, inputRowCount, stream, mr, true));
+        evaluator->eval(inputViews, stream, mr, true));
     allViews.push_back(asView(result.precomputedColumns.back()));
   }
 
@@ -466,7 +459,8 @@ bool canAggregationBeEvaluatedByRegistry(
 
 bool canBeEvaluatedByCudf(
     const core::AggregationNode& aggregationNode,
-    core::QueryCtx* queryCtx) {
+    core::QueryCtx* queryCtx,
+    memory::MemoryPool* pool) {
   const core::PlanNode* sourceNode = aggregationNode.sources().empty()
       ? nullptr
       : aggregationNode.sources()[0].get();
@@ -496,11 +490,11 @@ bool canBeEvaluatedByCudf(
 
   if (isDistinct) {
     return canGroupingKeysBeEvaluatedByCudf(
-        aggregationNode.groupingKeys(), sourceNode, queryCtx);
+        aggregationNode.groupingKeys(), sourceNode, queryCtx, pool);
   } else if (isGlobal) {
-    return canReduceBeEvaluatedByCudf(aggregationNode, queryCtx);
+    return canReduceBeEvaluatedByCudf(aggregationNode, queryCtx, pool);
   } else {
-    return canGroupbyBeEvaluatedByCudf(aggregationNode, queryCtx);
+    return canGroupbyBeEvaluatedByCudf(aggregationNode, queryCtx, pool);
   }
 }
 
@@ -517,12 +511,12 @@ core::TypedExprPtr expandFieldReference(
 bool canGroupingKeysBeEvaluatedByCudf(
     const std::vector<core::FieldAccessTypedExprPtr>& groupingKeys,
     const core::PlanNode* sourceNode,
-    core::QueryCtx* queryCtx) {
+    core::QueryCtx* queryCtx,
+    memory::MemoryPool* pool) {
   // Check grouping key expressions (with expansion)
   for (const auto& groupingKey : groupingKeys) {
     auto expandedKey = expandFieldReference(groupingKey, sourceNode);
-    std::vector<core::TypedExprPtr> exprs = {expandedKey};
-    if (!canBeEvaluatedByCudf(exprs, queryCtx)) {
+    if (!canExprRunOnGpu(expandedKey, queryCtx, pool)) {
       return false;
     }
   }

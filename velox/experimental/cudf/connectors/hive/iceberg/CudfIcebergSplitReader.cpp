@@ -48,8 +48,8 @@
 
 #include <algorithm>
 #include <cstring>
-#include <deque>
 #include <limits>
+#include <tuple>
 #include <unordered_set>
 
 namespace facebook::velox::cudf_velox::connector::hive::iceberg {
@@ -87,7 +87,6 @@ CudfIcebergSplitReader::CudfIcebergSplitReader(
     std::shared_ptr<const velox_hive::HiveTableHandle> tableHandle,
     const RowTypePtr& outputType,
     const std::vector<std::string>& readColumnNames,
-    const std::vector<std::string>& outputReadColumnNames,
     FileHandleFactory* fileHandleFactory,
     folly::Executor* executor,
     const ::facebook::velox::connector::ConnectorQueryCtx* connectorQueryCtx,
@@ -111,105 +110,42 @@ CudfIcebergSplitReader::CudfIcebergSplitReader(
           useExperimentalCudfReader,
           subfieldFilterExpr),
       icebergSplit_(std::move(icebergSplit)),
-      hiveConfig_(hiveConfig),
-      logicalReadColumnNames_(readColumnNames),
-      outputReadColumnNames_(outputReadColumnNames) {
-  // Selecting only a top-level struct name makes libcudf return every child
-  // in the Parquet file's physical order. Iceberg/Spark may prune and reorder
-  // that ROW in the requested output schema, so positional dereference would
-  // read the wrong child. Request the exact nested leaf paths instead; libcudf
-  // retains the parent struct while pruning its children in selector order.
-  for (size_t i = 0; i < outputType_->size(); ++i) {
-    if (outputType_->childAt(i)->kind() != TypeKind::ROW) {
-      continue;
-    }
-    const auto& readName = i < outputReadColumnNames_.size()
-        ? outputReadColumnNames_[i]
-        : outputType_->nameOf(i);
-    auto it =
-        std::find(readColumnNames_.begin(), readColumnNames_.end(), readName);
-    if (it == readColumnNames_.end()) {
-      continue;
-    }
-    const auto insertAt = std::distance(readColumnNames_.begin(), it);
-    readColumnNames_.erase(it);
-    const auto rowType = asRowType(outputType_->childAt(i));
-    std::vector<std::string> nested;
-    nested.reserve(rowType->size());
-    for (size_t child = 0; child < rowType->size(); ++child) {
-      nested.push_back(fmt::format("{}.{}", readName, rowType->nameOf(child)));
-    }
-    readColumnNames_.insert(
-        readColumnNames_.begin() + insertAt, nested.begin(), nested.end());
-  }
-  initialReadColumnNames_ = readColumnNames_;
+      hiveConfig_(hiveConfig) {}
+
+void CudfIcebergSplitReader::resetSplit() {
+  deletionVectorReader_.reset();
+  positionalDeleteFileReaders_.clear();
+  equalityDeleteFileReaders_.clear();
+  extraEqualityColumns_.clear();
+  injectedColumns_.clear();
+  fileColumnNames_.clear();
+  splitRowCount_ = 0;
+  noColumnsToRead_ = false;
+  syntheticTableProduced_ = false;
+  deferSubfieldFilter_ = false;
+  baseReadOffset_ = 0;
+  deleteBitmap_ = nullptr;
+  deviceBitmap_.reset();
+  deleteMask_.reset();
 }
 
-void CudfIcebergSplitReader::prepareSplit(
+void CudfIcebergSplitReader::setupReader() {
+  if (not noColumnsToRead_) {
+    CudfSplitReader::setupReader();
+  }
+}
+
+cudf::ast::expression const* CudfIcebergSplitReader::pushdownFilter() const {
+  return deferSubfieldFilter_ ? nullptr : subfieldFilter();
+}
+
+void CudfIcebergSplitReader::prepareSplitInternal(
     dwio::common::RuntimeStatistics& runtimeStats) {
-  fallbackSplits_.clear();
-  runtimeStats_ = &runtimeStats;
-
+  // Reset delete readers and column injection
   resetSplit();
-  stream_ = cudfGlobalStreamPool().get_stream();
-  // Iceberg schema adaptation inspects Parquet footer metadata. Set up the
-  // selective preload first so that this inspection reads from the pinned
-  // host spans instead of issuing a remote S3 footer request. Reader creation
-  // invokes the same setup again; CudfSplitReader keeps that call idempotent.
-  setupSelectivePreloadDataSources();
+
+  // Read file metadata and cache schema information
   cacheSchemaFromMetadata();
-
-  if (fileMetaData_.size() > 1) {
-    const auto& primarySchema = fileMetaData_.front().schema;
-    const bool schemasMatch = std::all_of(
-        fileMetaData_.begin() + 1,
-        fileMetaData_.end(),
-        [&](const auto& metadata) { return metadata.schema == primarySchema; });
-    if (!schemasMatch) {
-      VLOG(1) << "Falling back to single-file cuDF readers for an Iceberg "
-                 "multi-file split with schema evolution";
-      fallbackSplits_.push_back(
-          std::make_shared<CudfHiveConnectorSplit>(
-              split_->connectorId,
-              split_->filePath,
-              split_->start,
-              split_->length,
-              split_->splitWeight,
-              split_->infoColumns));
-      for (const auto& file : split_->coalescedFiles) {
-        fallbackSplits_.push_back(
-            std::make_shared<CudfHiveConnectorSplit>(
-                split_->connectorId,
-                file.filePath,
-                0,
-                file.length,
-                split_->splitWeight,
-                split_->infoColumns));
-      }
-      split_ = fallbackSplits_.front();
-      fallbackSplits_.pop_front();
-      resetSplit();
-      setupSelectivePreloadDataSources();
-      cacheSchemaFromMetadata();
-    }
-  }
-
-  prepareCurrentSplit(runtimeStats, true);
-}
-
-void CudfIcebergSplitReader::setDataSourceContext(
-    const ConnectorQueryCtx* connectorQueryCtx,
-    dwio::common::RuntimeStatistics& runtimeStats,
-    cudf::ast::expression const* subfieldFilterExpr) {
-  CudfSplitReader::setDataSourceContext(
-      connectorQueryCtx, runtimeStats, subfieldFilterExpr);
-  runtimeStats_ = &runtimeStats;
-}
-
-void CudfIcebergSplitReader::prepareCurrentSplit(
-    dwio::common::RuntimeStatistics& runtimeStats,
-    bool countProcessedSplit) {
-  readColumnNames_ = initialReadColumnNames_;
 
   // Must setup delete file readers before reader construction so that it
   // can correctly determine the memory resource to construct the cuDF reader.
@@ -226,132 +162,157 @@ void CudfIcebergSplitReader::prepareCurrentSplit(
 
   // Determine if there are no columns to read.
   noColumnsToRead_ = readColumnNames_.empty();
-  const bool coversWholeFile =
-      split_->start == 0 and split_->length >= primaryDataSourceSize();
-  if (noColumnsToRead_ and not coversWholeFile) {
-    VELOX_CHECK(
-        icebergSplit_->deleteFiles.empty(),
-        "Iceberg byte-range splits with injected-only projections and delete "
-        "files are not yet supported");
-    VELOX_CHECK(
-        not fileColumnNames_.empty(),
-        "Cannot select a row-count anchor from an empty parquet schema");
-    readColumnNames_.push_back(*fileColumnNames_.begin());
-    hasRowCountAnchor_ = true;
-  }
 
-  // Defer subfield filter when it cannot evaluate on the physical parquet
-  // table, or when positional deletes are present.
+  // Defer subfield filter when we have injected columns as filter may be
+  // referencing them.
   deferSubfieldFilter_ = CudfSplitReader::subfieldFilter() != nullptr and
-      (noColumnsToRead_ or injectedColumns_.size() or
-       // TODO(mh): Drop positional/DV deferral when cudf PR #23077 merges.
-       deletionVectorReader_ or positionalDeleteFileReaders_.size());
+      (noColumnsToRead_ or injectedColumns_.size());
+
+  // Evaluate if cuDF reader should prepend row index column. Must compute after
+  // `deferSubfieldFilter_` is set.
+  prependRowIndex_ = needPrependedRowIndex();
 
   if (deferSubfieldFilter_) {
-    VLOG(1) << "Subfield filter is deferred to post table read due to missing "
-               "column references and/or positional deletes.";
+    VLOG(1)
+        << "Subfield filter is deferred to post table read due to missing column references.";
   }
 
-  if (countProcessedSplit) {
-    runtimeStats.processedSplits++;
-  }
-
-  // A whole-file injected-only projection can use the footer row count. A
-  // byte-range split uses an anchor column so cuDF selects only this split's
-  // row groups.
-  if (noColumnsToRead_ and not hasRowCountAnchor_) {
-    return;
-  }
-
-  // Create the cuDF reader
-  if (useExperimentalCudfReader()) {
-    VELOX_CHECK(
-        split_->coalescedFiles.empty(),
-        "Iceberg multi-file scan is not supported by the experimental cuDF reader");
-    createExperimentalReader();
-  } else {
-    createCudfReader();
-  }
-}
-
-bool CudfIcebergSplitReader::prepareNextFallbackSplit() {
-  if (fallbackSplits_.empty()) {
-    return false;
-  }
-  VELOX_CHECK_NOT_NULL(runtimeStats_);
-  split_ = fallbackSplits_.front();
-  fallbackSplits_.pop_front();
-  resetSplit();
-  setupSelectivePreloadDataSources();
-  cacheSchemaFromMetadata();
-  prepareCurrentSplit(*runtimeStats_, false);
-  return true;
-}
-
-void CudfIcebergSplitReader::resetSplit() {
-  CudfSplitReader::resetSplit();
-
-  deletionVectorReader_.reset();
-  positionalDeleteFileReaders_.clear();
-  equalityDeleteFileReaders_.clear();
-  extraEqualityColumns_.clear();
-  injectedColumns_.clear();
-  fileColumnNames_.clear();
-  fileRowCount_ = 0;
-  noColumnsToRead_ = false;
-  hasRowCountAnchor_ = false;
-  syntheticTableProduced_ = false;
-  deferSubfieldFilter_ = false;
-  baseReadOffset_ = 0;
-  deleteBitmap_ = nullptr;
-  deviceBitmap_.reset();
-  deleteMask_.reset();
-}
-
-cudf::ast::expression const* CudfIcebergSplitReader::subfieldFilter() {
-  return deferSubfieldFilter_ ? nullptr : CudfSplitReader::subfieldFilter();
+  setupReader();
 }
 
 rmm::device_async_resource_ref
-CudfIcebergSplitReader::determineCudfMemoryResource() {
+CudfIcebergSplitReader::determineCudfMemoryResource() const {
   // Use temporary mr when there are filters beyond table read.
   const auto needsTempMr = deferSubfieldFilter_ or deletionVectorReader_ or
       positionalDeleteFileReaders_.size() or equalityDeleteFileReaders_.size();
   return needsTempMr ? get_temp_mr() : get_output_mr();
 }
 
+bool CudfIcebergSplitReader::needPrependedRowIndex() const {
+  // Not needed when all projected columns are injected.
+  if (noColumnsToRead_) {
+    return false;
+  }
+
+  // Not needed if there are no positional deletes.
+  const bool hasPositionalDeletes =
+      deletionVectorReader_ or positionalDeleteFileReaders_.size();
+  if (not hasPositionalDeletes) {
+    return false;
+  }
+
+  // Needed if a filter is pushed into the data-file reader.
+  return pushdownFilter() != nullptr;
+}
+
+std::unique_ptr<cudf::column> CudfIcebergSplitReader::extractRowIndex(
+    std::unique_ptr<cudf::table>& table) const {
+  VELOX_USER_CHECK_GE(
+      table->num_columns(),
+      2,
+      "cuDF table must contain a row-index column and at least one data column");
+  auto columns = table->release();
+  auto rowIndex = std::move(columns.front());
+  columns.erase(columns.begin());
+  table = std::make_unique<cudf::table>(std::move(columns));
+  return rowIndex;
+}
+
+std::unique_ptr<cudf::column> CudfIcebergSplitReader::makeRowIndex(
+    cudf::size_type numRows) const {
+  auto rowIndex = cudf::make_numeric_column(
+      cudf::data_type{cudf::type_id::UINT64},
+      numRows,
+      cudf::mask_state::UNALLOCATED,
+      stream_,
+      get_temp_mr());
+  fillSequence<uint64_t>(
+      rowIndex->mutable_view(),
+      baseReadOffset_,
+      numRows,
+      stream_,
+      get_temp_mr());
+  return rowIndex;
+}
+
+std::pair<std::size_t, std::size_t> CudfIcebergSplitReader::rowRange(
+    cudf::column_view rowIndex) const {
+  if (not prependRowIndex_) {
+    return {baseReadOffset_, static_cast<std::size_t>(rowIndex.size())};
+  }
+
+  std::size_t startRow{0};
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+      &startRow,
+      rowIndex.begin<uint64_t>(),
+      sizeof(uint64_t),
+      cudaMemcpyDefault,
+      stream_.value()));
+
+  if (pushdownFilter() == nullptr) {
+    stream_.synchronize();
+    return {startRow, static_cast<std::size_t>(rowIndex.size())};
+  }
+
+  std::size_t endRow{0};
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+      &endRow,
+      rowIndex.end<uint64_t>() - 1,
+      sizeof(uint64_t),
+      cudaMemcpyDefault,
+      stream_.value()));
+  stream_.synchronize();
+
+  VELOX_CHECK_LE(startRow, endRow);
+  return {startRow, static_cast<std::size_t>(endRow - startRow + 1)};
+}
+
 std::optional<std::unique_ptr<cudf::table>>
 CudfIcebergSplitReader::readNextChunk() {
   std::unique_ptr<cudf::table> cudfTable;
-  while (!cudfTable) {
-    if (noColumnsToRead_ and not hasRowCountAnchor_) {
-      if (!syntheticTableProduced_) {
-        VELOX_CHECK_LE(
-            fileRowCount_,
-            std::numeric_limits<cudf::size_type>::max(),
-            "File row count exceeds max cudf::size_type value");
-        syntheticTableProduced_ = true;
-        cudfTable = std::make_unique<cudf::table>(
-            std::vector<std::unique_ptr<cudf::column>>{});
-        break;
-      }
-    } else {
-      // Read the next table chunk from the cuDF reader.
-      auto chunkOpt = CudfSplitReader::readNextChunk();
-      if (chunkOpt.has_value()) {
-        cudfTable = std::move(chunkOpt.value());
-        break;
-      }
-    }
-    if (!prepareNextFallbackSplit()) {
+  if (noColumnsToRead_) {
+    if (syntheticTableProduced_) {
       return std::nullopt;
     }
+    syntheticTableProduced_ = true;
+    cudfTable = std::make_unique<cudf::table>(
+        std::vector<std::unique_ptr<cudf::column>>{});
+  } else {
+    // Read the next table chunk from the cuDF reader
+    auto chunkOpt = CudfSplitReader::readNextChunk();
+    if (not chunkOpt.has_value()) {
+      return std::nullopt;
+    }
+    cudfTable = std::move(chunkOpt.value());
   }
 
   // Number of table rows before deletes.
-  const auto numRows = noColumnsToRead_ and not hasRowCountAnchor_
-      ? static_cast<cudf::size_type>(fileRowCount_)
-      : cudfTable->num_rows();
+  const auto numRows = [&]() {
+    // For synthetic tables, return at most 2 billion rows at a time.
+    if (noColumnsToRead_) {
+      if (std::cmp_less_equal(
+              splitRowCount_, std::numeric_limits<cudf::size_type>::max())) {
+        return static_cast<cudf::size_type>(splitRowCount_);
+      } else {
+        // Reset the synthetic table produced flag to allow another chunk.
+        syntheticTableProduced_ = false;
+        splitRowCount_ -= std::numeric_limits<cudf::size_type>::max();
+        return static_cast<cudf::size_type>(
+            std::numeric_limits<cudf::size_type>::max());
+      }
+    } else {
+      return cudfTable->num_rows();
+    }
+  }();
+
+  auto rowIndexColumn = std::unique_ptr<cudf::column>{};
+  if (prependRowIndex_) {
+    rowIndexColumn = extractRowIndex(cudfTable);
+  } else if (
+      numRows > 0 and
+      (deletionVectorReader_ or positionalDeleteFileReaders_.size())) {
+    rowIndexColumn = makeRowIndex(numRows);
+  }
 
   const auto isApplyingDeletes = numRows > 0 and
       (deletionVectorReader_ or positionalDeleteFileReaders_.size() or
@@ -383,11 +344,12 @@ CudfIcebergSplitReader::readNextChunk() {
 
     // Apply deletion vector
     if (deletionVectorReader_) {
-      applyDeletionVector(numRows);
+      applyDeletionVector(rowIndexColumn->view());
     }
     // Apply positional deletes
     if (positionalDeleteFileReaders_.size()) {
-      applyPositionalDeletes(numRows);
+      const auto [startRow, numFileRows] = rowRange(rowIndexColumn->view());
+      applyPositionalDeletes(startRow, numFileRows, rowIndexColumn->view());
     }
     // Apply equality deletes
     if (equalityDeleteFileReaders_.size()) {
@@ -411,15 +373,6 @@ CudfIcebergSplitReader::readNextChunk() {
       cudfTable = cudf::apply_deletion_mask(
           cudfTable->view(), deleteMaskView_, stream_, deleteMr);
     }
-  }
-
-  // The anchor exists only to make cuDF apply this split's byte range and
-  // determine its row count. It is not part of the requested projection.
-  if (hasRowCountAnchor_) {
-    auto columns = cudfTable->release();
-    VELOX_CHECK_EQ(columns.size(), 1, "Unexpected row-count anchor layout");
-    columns.clear();
-    cudfTable = std::make_unique<cudf::table>(std::move(columns));
   }
 
   // Compute the row count override if there are no remaining physical columns.
@@ -463,8 +416,24 @@ CudfIcebergSplitReader::readNextChunk() {
 
 void CudfIcebergSplitReader::setupDeleteFileReaders(
     dwio::common::RuntimeStatistics& runtimeStats) {
-  // TODO(mh): We currently read a data files as a single split.
-  constexpr uint64_t splitOffset = 0;
+  const auto splitOffset = baseReadOffset_;
+
+  // Decodes the position bound from an Iceberg bounds map.
+  const auto decodePositionalDeleteBound =
+      [](const auto& bounds) -> std::optional<uint64_t> {
+    if (auto iter = bounds.find(velox_iceberg::IcebergMetadataColumn::kPosId);
+        iter != bounds.end()) {
+      auto decodedBound = encoding::Base64::decode(iter->second);
+      VELOX_CHECK_EQ(
+          decodedBound.size(),
+          sizeof(uint64_t),
+          "Unexpected decoded size for positional delete bound.");
+      uint64_t bound;
+      std::memcpy(&bound, decodedBound.data(), sizeof(uint64_t));
+      return folly::Endian::little(bound);
+    }
+    return std::nullopt;
+  };
 
   for (const auto& deleteFile : icebergSplit_->deleteFiles) {
     if (deleteFile.content == velox_iceberg::FileContent::kPositionalDeletes) {
@@ -478,26 +447,19 @@ void CudfIcebergSplitReader::setupDeleteFileReaders(
         continue;
       }
 
-      // Skip the delete file if all delete positions are before this split.
-      // TODO: Skip delete files where all positions are after the split, if
-      // split row count becomes available.
-      if (auto iter = deleteFile.upperBounds.find(
-              velox_iceberg::IcebergMetadataColumn::kPosId);
-          iter != deleteFile.upperBounds.end()) {
-        auto decodedBound = encoding::Base64::decode(iter->second);
-        VELOX_CHECK_EQ(
-            decodedBound.size(),
-            sizeof(uint64_t),
-            "Unexpected decoded size for positional delete upper bound.");
-        uint64_t posDeleteUpperBound;
-        std::memcpy(
-            &posDeleteUpperBound, decodedBound.data(), sizeof(uint64_t));
-        posDeleteUpperBound = folly::Endian::little(posDeleteUpperBound);
-        if (posDeleteUpperBound < splitOffset) {
-          continue;
-        }
+      // Prune positional delete files that are before or after the split
+      if (auto upperBound = decodePositionalDeleteBound(deleteFile.upperBounds);
+          upperBound.has_value() && *upperBound < splitOffset) {
+        continue;
+      }
+      if (auto lowerBound = decodePositionalDeleteBound(deleteFile.lowerBounds);
+          lowerBound.has_value() && *lowerBound >= splitOffset &&
+          std::cmp_greater_equal(*lowerBound - splitOffset, splitRowCount_)) {
+        continue;
       }
 
+      // Pass `splitOffset == 0` as `readDeletePositions` now receives absolute
+      // file row positions
       positionalDeleteFileReaders_.push_back(
           std::make_unique<velox_iceberg::PositionalDeleteFileReader>(
               deleteFile,
@@ -509,7 +471,7 @@ void CudfIcebergSplitReader::setupDeleteFileReaders(
               ioStatistics_,
               ioStats_,
               runtimeStats,
-              splitOffset,
+              /*splitOffset=*/0,
               icebergSplit_->connectorId));
     } else if (
         deleteFile.content == velox_iceberg::FileContent::kEqualityDeletes) {
@@ -591,7 +553,7 @@ void CudfIcebergSplitReader::setupDeleteFileReaders(
           not deletionVectorReader_,
           "CudfIcebergSplitReader encountered multiple deletion vector files for the split");
       deletionVectorReader_ =
-          std::make_unique<CudfDeletionVectorReader>(deleteFile, splitOffset);
+          std::make_unique<CudfDeletionVectorReader>(deleteFile);
     } else {
       VELOX_NYI(
           "Unsupported delete file content type: {}",
@@ -600,17 +562,20 @@ void CudfIcebergSplitReader::setupDeleteFileReaders(
   }
 }
 
-void CudfIcebergSplitReader::applyDeletionVector(std::size_t numRows) {
-  // Apply deletion vector into the deleteMask_
+void CudfIcebergSplitReader::applyDeletionVector(cudf::column_view rowIndex) {
   deletionVectorReader_->applyDeletes(
-      deleteMaskView_, baseReadOffset_, numRows, stream_, get_temp_mr());
+      deleteMaskView_, rowIndex, stream_, get_temp_mr());
 }
 
-void CudfIcebergSplitReader::applyPositionalDeletes(std::size_t numRows) {
-  // Apply positional deletes into the deleteMask_
-
-  // Initialize host and device delete bitmaps
-  const auto numWords = cudf::num_bitmask_words(numRows);
+void CudfIcebergSplitReader::readPositionalDeleteBitmap(
+    std::size_t startRow,
+    std::size_t numRows) {
+  VELOX_CHECK_LE(
+      numRows,
+      static_cast<std::size_t>(std::numeric_limits<cudf::size_type>::max()),
+      "Positional-delete bitmap range exceeds cudf::size_type");
+  const auto numWords =
+      cudf::num_bitmask_words(static_cast<cudf::size_type>(numRows));
   const auto numBitmaskBytes = numWords * sizeof(cudf::bitmask_type);
   dwio::common::ensureCapacity<int8_t>(
       deleteBitmap_,
@@ -632,7 +597,7 @@ void CudfIcebergSplitReader::applyPositionalDeletes(std::size_t numRows) {
 
   for (auto iter = positionalDeleteFileReaders_.begin();
        iter != positionalDeleteFileReaders_.end();) {
-    (*iter)->readDeletePositions(baseReadOffset_, numRows, deleteBitmap_);
+    (*iter)->readDeletePositions(startRow, numRows, deleteBitmap_);
     if ((*iter)->noMoreData()) {
       iter = positionalDeleteFileReaders_.erase(iter);
     } else {
@@ -647,11 +612,22 @@ void CudfIcebergSplitReader::applyPositionalDeletes(std::size_t numRows) {
       numBitmaskBytes,
       cudaMemcpyHostToDevice,
       stream_.value()));
+}
 
-  // Apply the deletion bitmap to the row mask
+void CudfIcebergSplitReader::applyPositionalDeletes(
+    std::size_t startRow,
+    std::size_t numRows,
+    cudf::column_view rowIndex) {
+  readPositionalDeleteBitmap(startRow, numRows);
+  const auto numWords =
+      cudf::num_bitmask_words(static_cast<cudf::size_type>(numRows));
+  const auto bitmap = cudf::device_span<const cudf::bitmask_type>(
+      static_cast<const cudf::bitmask_type*>(deviceBitmap_->data()), numWords);
   applyBitmapToMask(
-      cudf::device_span<cudf::bitmask_type>(
-          static_cast<cudf::bitmask_type*>(deviceBitmap_->data()), numWords),
+      bitmap,
+      startRow,
+      numRows,
+      rowIndex,
       deleteMaskView_,
       stream_,
       get_temp_mr());
@@ -720,17 +696,12 @@ void CudfIcebergSplitReader::cacheSchemaFromMetadata() {
 
   VELOX_CHECK_EQ(
       fileMetaData_.size(),
-      1 + split_->coalescedFiles.size(),
-      "Expected one parquet footer per Iceberg data file");
+      1,
+      "Expected a single parquet footer for Iceberg data file");
   const auto& meta = fileMetaData_.front();
   VELOX_CHECK(not meta.schema.empty(), "Parquet footer schema is empty");
   VELOX_CHECK_GE(meta.num_rows, 0, "Parquet footer reports negative row count");
-  fileRowCount_ = 0;
-  for (const auto& fileMeta : fileMetaData_) {
-    VELOX_CHECK_GE(
-        fileMeta.num_rows, 0, "Parquet footer reports negative row count");
-    fileRowCount_ += static_cast<std::size_t>(fileMeta.num_rows);
-  }
+  std::tie(baseReadOffset_, splitRowCount_) = computeSplitRowRange();
 
   const auto& root = meta.schema.front();
   fileColumnNames_.clear();
@@ -744,59 +715,87 @@ void CudfIcebergSplitReader::cacheSchemaFromMetadata() {
   }
 }
 
+std::pair<std::size_t, std::size_t>
+CudfIcebergSplitReader::computeSplitRowRange() const {
+  // Note: This function implements the same logic as cuDF's hybrid scan
+  // reader's `filter_row_groups_with_byte_range()` API
+  const auto rowGroupOffset = [](const auto& rowGroup) {
+    if (rowGroup.file_offset.has_value()) {
+      return rowGroup.file_offset.value();
+    }
+    if (rowGroup.columns.front().file_offset != 0) {
+      return rowGroup.columns.front().file_offset;
+    }
+    const auto& column = rowGroup.columns.front().meta_data;
+    return column.dictionary_page_offset != 0
+        ? std::min(column.dictionary_page_offset, column.data_page_offset)
+        : column.data_page_offset;
+  };
+
+  std::size_t startRow{0};
+  std::size_t numRows{0};
+  for (const auto& rowGroup : fileMetaData_.front().row_groups) {
+    const auto offset = rowGroupOffset(rowGroup);
+    if (offset < split_->start) {
+      startRow += rowGroup.num_rows;
+    } else if (offset - split_->start < split_->size()) {
+      numRows += rowGroup.num_rows;
+    }
+  }
+  return {startRow, numRows};
+}
+
 void CudfIcebergSplitReader::adaptColumns() {
-  // Classify output and filter-only columns using the original top-level
-  // projection. readColumnNames_ may contain multiple nested parquet selector
-  // paths for one ROW column, so its indices are not assembled-table indices.
+  // Skip trailing equality-delete keys and classify output + filter-only
+  // columns only.
+  VELOX_CHECK_GE(
+      readColumnNames_.size(),
+      extraEqualityColumns_.size(),
+      "Column projection must at least include the equality delete keys");
+  const size_t schemaSize =
+      readColumnNames_.size() - extraEqualityColumns_.size();
+
   std::unordered_set<std::string> injectedNames;
-  for (size_t i = 0; i < logicalReadColumnNames_.size(); ++i) {
-    const auto& readName = i < outputReadColumnNames_.size()
-        ? outputReadColumnNames_[i]
-        : logicalReadColumnNames_[i];
+  for (size_t i = 0; i < schemaSize; ++i) {
+    const auto& fieldName = readColumnNames_[i];
     const TypePtr veloxType = [&]() -> TypePtr {
       if (i < outputType_->size()) {
+        VELOX_DCHECK_EQ(fieldName, outputType_->nameOf(i));
         return outputType_->childAt(i);
       }
+      // Filter-only column beyond the output projection.
       const auto& dataColumns = tableHandle_->dataColumns();
       VELOX_CHECK(
-          dataColumns and dataColumns->containsChild(readName),
+          dataColumns and dataColumns->containsChild(fieldName),
           "Filter-only column missing from table schema: {}",
-          readName);
-      return dataColumns->findChild(readName);
+          fieldName);
+      return dataColumns->findChild(fieldName);
     }();
 
-    if (auto iter = split_->infoColumns.find(readName);
+    if (auto iter = split_->infoColumns.find(fieldName);
         iter != split_->infoColumns.end()) {
-      injectedColumns_.push_back({i, readName, iter->second, veloxType});
-      injectedNames.insert(readName);
-    } else if (auto it = icebergSplit_->partitionKeys.find(readName);
+      injectedColumns_.push_back({i, fieldName, iter->second, veloxType});
+      injectedNames.insert(fieldName);
+    } else if (auto it = icebergSplit_->partitionKeys.find(fieldName);
                it != icebergSplit_->partitionKeys.end()) {
       // Partition columns: Hive migrated table. In Hive-written data
       // files, partition column values are stored in partition metadata
       // rather than in the data file itself, following Hive's
       // partitioning convention.
-      injectedColumns_.push_back({i, readName, it->second, veloxType});
-      injectedNames.insert(readName);
-    } else if (not fileColumnNames_.contains(readName)) {
+      injectedColumns_.push_back({i, fieldName, it->second, veloxType});
+      injectedNames.insert(fieldName);
+    } else if (not fileColumnNames_.contains(fieldName)) {
       // Schema evolution: Column was added after the data file was written
       // and doesn't exist in older data files.
-      injectedColumns_.push_back({i, readName, std::nullopt, veloxType});
-      injectedNames.insert(readName);
+      injectedColumns_.push_back({i, fieldName, std::nullopt, veloxType});
+      injectedNames.insert(fieldName);
     }
   }
 
   // Remove all injected columns from readColumnNames_
   if (not injectedColumns_.empty()) {
     std::erase_if(readColumnNames_, [&injectedNames](const auto& name) {
-      return std::any_of(
-          injectedNames.begin(),
-          injectedNames.end(),
-          [&](const auto& injected) {
-            return name == injected or
-                (name.size() > injected.size() and
-                 name.compare(0, injected.size(), injected) == 0 and
-                 name[injected.size()] == '.');
-          });
+      return injectedNames.contains(name);
     });
     // Sort injected columns by assembled-table index once here
     std::sort(
@@ -827,8 +826,11 @@ std::unique_ptr<cudf::scalar> CudfIcebergSplitReader::makeInjectedScalar(
         connectorQueryCtx_->memoryPool(),
         readAsLocalTime,
         isDaysSinceEpoch);
-    return VELOX_DYNAMIC_SCALAR_TYPE_DISPATCH(
-        cudf_velox::createCudfScalar, col.veloxType->kind(), constant);
+    return cudf_velox::makeScalarFromConstantExpr(
+        std::make_shared<core::ConstantTypedExpr>(constant),
+        connectorQueryCtx_->memoryPool(),
+        std::nullopt,
+        stream_);
   } catch (const std::exception& e) {
     VELOX_USER_FAIL(
         "Bad partition value. Column: {}, type: {}, value: {}, error: {}",
@@ -842,7 +844,7 @@ std::unique_ptr<cudf::scalar> CudfIcebergSplitReader::makeInjectedScalar(
 std::unique_ptr<cudf::table> CudfIcebergSplitReader::buildOutputTable(
     std::unique_ptr<cudf::table>&& table,
     rmm::device_async_resource_ref mr,
-    std::optional<cudf::size_type> rowCountOverride) {
+    std::optional<cudf::size_type> rowCountOverride) const {
   const auto numRows = rowCountOverride.value_or(table->num_rows());
   auto columns = rowCountOverride.has_value()
       ? std::vector<std::unique_ptr<cudf::column>>{}
