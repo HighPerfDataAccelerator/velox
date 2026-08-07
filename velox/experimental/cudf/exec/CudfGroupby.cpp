@@ -23,7 +23,7 @@
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
-#include "velox/experimental/cudf/expression/AstUtils.h"
+#include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
 
 #include "velox/exec/Aggregate.h"
 #include "velox/exec/AggregateFunctionRegistry.h"
@@ -1106,9 +1106,38 @@ bool canGroupbyAggregationBeEvaluatedByCudf(
       getGroupbyAggregationRegistry(), call, step, rawInputTypes, queryCtx);
 }
 
+// Simple companion aggregates need no additional in-operator state compaction:
+// PARTIAL can aggregate and emit each incoming page once, while FINAL and
+// SINGLE can concatenate their pages and aggregate once at end of input. This
+// avoids repeatedly regrouping high-cardinality intermediate states. Keep newer
+// aggregate families on the levelled or persistent-streaming paths until their
+// one-shot semantics and memory bounds have been validated here.
+bool canUseOneShotCompanionAggregation(
+    const core::AggregationNode& aggregationNode) {
+  if (aggregationNode.groupingKeys().empty() ||
+      !hasCompanionAggregates(aggregationNode.aggregates())) {
+    return false;
+  }
+
+  const auto prefix = CudfConfig::getInstance().functionNamePrefix;
+  return std::all_of(
+      aggregationNode.aggregates().begin(),
+      aggregationNode.aggregates().end(),
+      [&](const auto& aggregate) {
+        if (aggregate.distinct || aggregate.mask) {
+          return false;
+        }
+        const auto name = getOriginalName(aggregate.call->name());
+        return name == prefix + "sum" || name == prefix + "count" ||
+            name == prefix + "min" || name == prefix + "max" ||
+            name == prefix + "avg";
+      });
+}
+
 bool canGroupbyBeEvaluatedByCudf(
     const core::AggregationNode& aggregationNode,
-    core::QueryCtx* queryCtx) {
+    core::QueryCtx* queryCtx,
+    memory::MemoryPool* pool) {
   const core::PlanNode* sourceNode = aggregationNode.sources().empty()
       ? nullptr
       : aggregationNode.sources()[0].get();
@@ -1143,8 +1172,7 @@ bool canGroupbyBeEvaluatedByCudf(
     // Check input expressions can be evaluated by cuDF, expand the input first.
     for (const auto& input : aggregate.call->inputs()) {
       auto expandedInput = expandFieldReference(input, sourceNode);
-      std::vector<core::TypedExprPtr> exprs = {expandedInput};
-      if (!canBeEvaluatedByCudf(exprs, queryCtx)) {
+      if (!canExprRunOnGpu(expandedInput, queryCtx, pool)) {
         return false;
       }
     }
@@ -1152,7 +1180,7 @@ bool canGroupbyBeEvaluatedByCudf(
 
   // Check grouping key expressions
   if (!canGroupingKeysBeEvaluatedByCudf(
-          aggregationNode.groupingKeys(), sourceNode, queryCtx)) {
+          aggregationNode.groupingKeys(), sourceNode, queryCtx, pool)) {
     return false;
   }
 
@@ -1273,6 +1301,14 @@ void CudfGroupby::initialize() {
                        aggregate.call->name(), aggregationNode_->step()) ==
                 aggregationNode_->step();
           });
+
+  if (streamingEnabled_ &&
+      CudfConfig::getInstance().groupbyStreamingMaxDistinctKeys == 0 &&
+      canUseOneShotCompanionAggregation(*aggregationNode_)) {
+    streamingEnabled_ = false;
+    LOG(INFO) << "CUDF_GROUPBY_STREAMING node=" << diagnosticNodeId_
+              << " state=disabled maxDistinctKeys=0 mode=one_shot_gpu";
+  }
 
   if (partialIdentityAggregationEnabled_) {
     VELOX_USER_CHECK(

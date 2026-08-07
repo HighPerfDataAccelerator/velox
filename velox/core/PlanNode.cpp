@@ -1344,27 +1344,10 @@ void ExchangeNode::addDetails(std::stringstream& stream) const {
   addVectorSerdeKind(serdeKind_, stream);
 }
 
-namespace {
-const auto& exchangeTransportTypeNames() {
-  static const folly::F14FastMap<ExchangeNode::TransportType, std::string_view>
-      kNames = {
-          {ExchangeNode::TransportType::kHttp, "HTTP"},
-          {ExchangeNode::TransportType::kUcx, "UCX"},
-      };
-  return kNames;
-}
-} // namespace
-
-VELOX_DEFINE_EMBEDDED_ENUM_NAME(
-    ExchangeNode,
-    TransportType,
-    exchangeTransportTypeNames)
-
 folly::dynamic ExchangeNode::serialize() const {
   auto obj = PlanNode::serialize();
   obj["outputType"] = ExchangeNode::outputType()->serialize();
   obj["serdeKind"] = serdeKind_;
-  obj["transportType"] = toName(transportType_);
   return obj;
 }
 
@@ -1376,14 +1359,10 @@ void ExchangeNode::accept(
 
 // static
 PlanNodePtr ExchangeNode::create(const folly::dynamic& obj, void* context) {
-  auto transportType = obj.count("transportType")
-      ? toTransportType(obj["transportType"].asString())
-      : TransportType::kHttp;
   return std::make_shared<ExchangeNode>(
       deserializePlanNodeId(obj),
       deserializeRowType(obj["outputType"]),
-      obj["serdeKind"].asString(),
-      transportType);
+      obj["serdeKind"].asString());
 }
 
 UnnestNode::UnnestNode(
@@ -1594,9 +1573,10 @@ void AbstractJoinNode::validate() const {
     VELOX_CHECK(!rightType->containsChild(name));
   }
 
-  // Output of right semi join cannot include columns from the left side.
-  bool outputMayIncludeLeftColumns =
-      !(isRightSemiFilterJoin() || isRightSemiProjectJoin());
+  // Output of right semi and right anti joins cannot include columns from the
+  // left side.
+  bool outputMayIncludeLeftColumns = !(
+      isRightSemiFilterJoin() || isRightSemiProjectJoin() || isRightAntiJoin());
 
   // Output of left semi and anti joins cannot include columns from the right
   // side.
@@ -1665,6 +1645,7 @@ const auto& joinTypeNames() {
       {JoinType::kAnti, "ANTI"},
       {JoinType::kCountingAnti, "COUNTING ANTI"},
       {JoinType::kCountingLeftSemiFilter, "COUNTING LEFT SEMI (FILTER)"},
+      {JoinType::kRightAnti, "RIGHT ANTI"},
   };
   return kNames;
 }
@@ -3354,9 +3335,8 @@ MergeExchangeNode::MergeExchangeNode(
     const RowTypePtr& type,
     const std::vector<FieldAccessTypedExprPtr>& sortingKeys,
     const std::vector<SortOrder>& sortingOrders,
-    std::string serdeKind,
-    TransportType transportType)
-    : ExchangeNode(id, type, serdeKind, transportType),
+    std::string serdeKind)
+    : ExchangeNode(id, type, std::move(serdeKind)),
       sortingKeys_(sortingKeys),
       sortingOrders_(sortingOrders) {}
 
@@ -3372,7 +3352,6 @@ folly::dynamic MergeExchangeNode::serialize() const {
   obj["sortingKeys"] = ISerializable::serialize(sortingKeys_);
   obj["sortingOrders"] = serializeSortingOrders(sortingOrders_);
   obj["serdeKind"] = serdeKind();
-  obj["transportType"] = toName(transportType());
   return obj;
 }
 
@@ -3390,16 +3369,12 @@ PlanNodePtr MergeExchangeNode::create(
   const auto sortingKeys = deserializeFields(obj["sortingKeys"], context);
   const auto sortingOrders = deserializeSortingOrders(obj["sortingOrders"]);
   const auto serdeKind = obj["serdeKind"].asString();
-  auto transportType = obj.count("transportType")
-      ? toTransportType(obj["transportType"].asString())
-      : TransportType::kHttp;
   return std::make_shared<MergeExchangeNode>(
       deserializePlanNodeId(obj),
       outputType,
       sortingKeys,
       sortingOrders,
-      serdeKind,
-      transportType);
+      serdeKind);
 }
 
 void LocalPartitionNode::addDetails(std::stringstream& stream) const {
@@ -3464,8 +3439,8 @@ PartitionedOutputNode::PartitionedOutputNode(
     PartitionFunctionSpecPtr partitionFunctionSpec,
     RowTypePtr outputType,
     std::string serdeKind,
-    PlanNodePtr source,
-    TransportType transportType)
+    std::string transportKind,
+    PlanNodePtr source)
     : PlanNode(id),
       kind_(kind),
       sources_{{std::move(source)}},
@@ -3474,8 +3449,8 @@ PartitionedOutputNode::PartitionedOutputNode(
       replicateNullsAndAny_(replicateNullsAndAny),
       partitionFunctionSpec_(std::move(partitionFunctionSpec)),
       serdeKind_(std::move(serdeKind)),
-      outputType_(std::move(outputType)),
-      transportType_(transportType) {
+      transportKind_(std::move(transportKind)),
+      outputType_(std::move(outputType)) {
   VELOX_USER_CHECK_GT(numPartitions_, 0);
   if (numPartitions_ == 1) {
     VELOX_USER_CHECK(
@@ -3500,8 +3475,8 @@ std::shared_ptr<PartitionedOutputNode> PartitionedOutputNode::broadcast(
     int numPartitions,
     RowTypePtr outputType,
     std::string serdeKind,
-    PlanNodePtr source,
-    TransportType transportType) {
+    std::string transportKind,
+    PlanNodePtr source) {
   std::vector<TypedExprPtr> noKeys;
   return std::make_shared<PartitionedOutputNode>(
       id,
@@ -3512,8 +3487,8 @@ std::shared_ptr<PartitionedOutputNode> PartitionedOutputNode::broadcast(
       std::make_shared<GatherPartitionFunctionSpec>(),
       std::move(outputType),
       serdeKind,
-      std::move(source),
-      transportType);
+      std::move(transportKind),
+      std::move(source));
 }
 
 // static
@@ -3521,8 +3496,8 @@ std::shared_ptr<PartitionedOutputNode> PartitionedOutputNode::arbitrary(
     const PlanNodeId& id,
     RowTypePtr outputType,
     std::string serdeKind,
-    PlanNodePtr source,
-    TransportType transportType) {
+    std::string transportKind,
+    PlanNodePtr source) {
   std::vector<TypedExprPtr> noKeys;
   return std::make_shared<PartitionedOutputNode>(
       id,
@@ -3533,8 +3508,8 @@ std::shared_ptr<PartitionedOutputNode> PartitionedOutputNode::arbitrary(
       std::make_shared<GatherPartitionFunctionSpec>(),
       std::move(outputType),
       serdeKind,
-      std::move(source),
-      transportType);
+      std::move(transportKind),
+      std::move(source));
 }
 
 // static
@@ -3542,8 +3517,8 @@ std::shared_ptr<PartitionedOutputNode> PartitionedOutputNode::single(
     const PlanNodeId& id,
     RowTypePtr outputType,
     std::string serdeKind,
-    PlanNodePtr source,
-    TransportType transportType) {
+    std::string transportKind,
+    PlanNodePtr source) {
   std::vector<TypedExprPtr> noKeys;
   return std::make_shared<PartitionedOutputNode>(
       id,
@@ -3554,8 +3529,8 @@ std::shared_ptr<PartitionedOutputNode> PartitionedOutputNode::single(
       std::make_shared<GatherPartitionFunctionSpec>(),
       std::move(outputType),
       serdeKind,
-      std::move(source),
-      transportType);
+      std::move(transportKind),
+      std::move(source));
 }
 
 void EnforceSingleRowNode::addDetails(std::stringstream& /* stream */) const {
@@ -3594,23 +3569,6 @@ const auto& partitionKindNames() {
 
 VELOX_DEFINE_EMBEDDED_ENUM_NAME(PartitionedOutputNode, Kind, partitionKindNames)
 
-namespace {
-const auto& partitionedOutputTransportTypeNames() {
-  static const folly::
-      F14FastMap<PartitionedOutputNode::TransportType, std::string_view>
-          kNames = {
-              {PartitionedOutputNode::TransportType::kHttp, "HTTP"},
-              {PartitionedOutputNode::TransportType::kUcx, "UCX"},
-          };
-  return kNames;
-}
-} // namespace
-
-VELOX_DEFINE_EMBEDDED_ENUM_NAME(
-    PartitionedOutputNode,
-    TransportType,
-    partitionedOutputTransportTypeNames)
-
 void PartitionedOutputNode::addDetails(std::stringstream& stream) const {
   if (kind_ == Kind::kBroadcast) {
     stream << "BROADCAST";
@@ -3633,6 +3591,7 @@ void PartitionedOutputNode::addDetails(std::stringstream& stream) const {
 
   stream << " ";
   addVectorSerdeKind(serdeKind_, stream);
+  stream << " " << transportKind_;
 }
 
 folly::dynamic PartitionedOutputNode::serialize() const {
@@ -3643,8 +3602,8 @@ folly::dynamic PartitionedOutputNode::serialize() const {
   obj["replicateNullsAndAny"] = replicateNullsAndAny_;
   obj["partitionFunctionSpec"] = partitionFunctionSpec_->serialize();
   obj["serdeKind"] = serdeKind_;
+  obj["transportKind"] = transportKind_;
   obj["outputType"] = outputType_->serialize();
-  obj["transportType"] = toName(transportType_);
   return obj;
 }
 
@@ -3658,9 +3617,6 @@ void PartitionedOutputNode::accept(
 PlanNodePtr PartitionedOutputNode::create(
     const folly::dynamic& obj,
     void* context) {
-  auto transportType = obj.count("transportType")
-      ? toTransportType(obj["transportType"].asString())
-      : TransportType::kHttp;
   return std::make_shared<PartitionedOutputNode>(
       deserializePlanNodeId(obj),
       toKind(obj["kind"].asString()),
@@ -3671,8 +3627,9 @@ PlanNodePtr PartitionedOutputNode::create(
           obj["partitionFunctionSpec"], context),
       deserializeRowType(obj["outputType"]),
       obj["serdeKind"].asString(),
-      deserializeSingleSource(obj, context),
-      transportType);
+      obj.getDefault("transportKind", std::string{TransportKind::kInMemory})
+          .asString(),
+      deserializeSingleSource(obj, context));
 }
 
 SpatialJoinNode::SpatialJoinNode(
@@ -4430,78 +4387,53 @@ PlanNodePtr MixedUnionNode::create(const folly::dynamic& obj, void* context) {
 RPCNode::RPCNode(
     const PlanNodeId& id,
     PlanNodePtr source,
-    std::string functionName,
-    TypePtr functionResultType,
+    core::CallTypedExprPtr call,
     std::string outputColumn,
     RowTypePtr outputType,
-    std::vector<std::string> argumentColumns,
-    std::vector<TypePtr> argumentTypes,
-    std::vector<VectorPtr> constantInputs,
     rpc::RPCStreamingMode streamingMode,
     int32_t dispatchBatchSize)
     : PlanNode(id),
       sources_{std::move(source)},
-      functionName_(std::move(functionName)),
-      resultType_(std::move(functionResultType)),
+      call_(std::move(call)),
       outputColumn_(std::move(outputColumn)),
       outputType_(std::move(outputType)),
-      argumentColumns_(std::move(argumentColumns)),
-      argumentTypes_(std::move(argumentTypes)),
-      constantInputs_(std::move(constantInputs)),
       streamingMode_(streamingMode),
       dispatchBatchSize_(dispatchBatchSize) {
-  VELOX_CHECK_EQ(
-      argumentColumns_.size(),
-      argumentTypes_.size(),
-      "argumentColumns and argumentTypes must have the same size");
-  VELOX_CHECK_EQ(
-      argumentColumns_.size(),
-      constantInputs_.size(),
-      "argumentColumns and constantInputs must have the same size");
+  VELOX_CHECK_NOT_NULL(call_, "RPCNode call must not be null");
   VELOX_CHECK(
       outputType_->containsChild(outputColumn_),
       "RPCNode outputType must contain the RPC result column: {}",
       outputColumn_);
+  VELOX_CHECK(
+      *call_->type() == *outputType_->findChild(outputColumn_),
+      "RPCNode call result type must match the output column type: {} vs {} for column {}",
+      call_->type()->toString(),
+      outputType_->findChild(outputColumn_)->toString(),
+      outputColumn_);
 }
 
 void RPCNode::addDetails(std::stringstream& stream) const {
-  stream << "function: " << functionName_ << ", outputColumn: " << outputColumn_
+  stream << "function: " << call_->name() << ", outputColumn: " << outputColumn_
          << ", streamingMode: "
          << (streamingMode_ == rpc::RPCStreamingMode::kBatch ? "BATCH"
                                                              : "PER_ROW");
   if (dispatchBatchSize_ > 0) {
     stream << ", dispatchBatchSize: " << dispatchBatchSize_;
   }
+  stream << ", args: [";
+  const auto& inputs = call_->inputs();
+  for (size_t i = 0; i < inputs.size(); ++i) {
+    if (i > 0) {
+      stream << ", ";
+    }
+    stream << inputs[i]->toString();
+  }
+  stream << "]";
 }
 
 folly::dynamic RPCNode::serialize() const {
   auto obj = PlanNode::serialize();
-  obj["functionName"] = functionName_;
-  obj["resultType"] = resultType_->serialize();
-
-  // Serialize argument columns (string names).
-  auto colsArray = folly::dynamic::array();
-  for (const auto& col : argumentColumns_) {
-    colsArray.push_back(col);
-  }
-  obj["argumentColumns"] = std::move(colsArray);
-
-  // Serialize argument types.
-  obj["argumentTypes"] = ISerializable::serialize(argumentTypes_);
-
-  // Serialize constant inputs as ConstantTypedExpr for round-trip fidelity.
-  auto constArray = folly::dynamic::array();
-  for (size_t i = 0; i < constantInputs_.size(); ++i) {
-    if (constantInputs_[i]) {
-      auto constExpr =
-          std::make_shared<core::ConstantTypedExpr>(constantInputs_[i]);
-      constArray.push_back(constExpr->serialize());
-    } else {
-      constArray.push_back(nullptr);
-    }
-  }
-  obj["constantInputs"] = std::move(constArray);
-
+  obj["call"] = call_->serialize();
   obj["outputColumn"] = outputColumn_;
   obj["outputType"] = outputType_->serialize();
   obj["streamingMode"] =
@@ -4513,39 +4445,11 @@ folly::dynamic RPCNode::serialize() const {
 // static
 PlanNodePtr RPCNode::create(const folly::dynamic& obj, void* context) {
   auto source = deserializeSingleSource(obj, context);
-  auto functionName = obj["functionName"].asString();
-  auto resultType = ISerializable::deserialize<Type>(obj["resultType"]);
-
-  // Deserialize argument columns.
-  std::vector<std::string> argumentColumns;
-  if (obj.count("argumentColumns")) {
-    for (const auto& col : obj["argumentColumns"]) {
-      argumentColumns.push_back(col.asString());
-    }
-  }
-
-  // Deserialize argument types.
-  auto argumentTypes =
-      ISerializable::deserialize<std::vector<Type>>(obj["argumentTypes"]);
-
-  // Deserialize constant inputs from ConstantTypedExpr.
-  std::vector<VectorPtr> constantInputs;
-  if (obj.count("constantInputs")) {
-    for (const auto& item : obj["constantInputs"]) {
-      if (item.isNull()) {
-        constantInputs.push_back(nullptr);
-      } else {
-        auto constExpr = std::dynamic_pointer_cast<const ConstantTypedExpr>(
-            ISerializable::deserialize<ITypedExpr>(item, context));
-        VELOX_CHECK_NOT_NULL(
-            constExpr, "Expected ConstantTypedExpr for constant input");
-        auto* pool = static_cast<memory::MemoryPool*>(context);
-        constantInputs.push_back(constExpr->toConstantVector(pool));
-      }
-    }
-  }
-
   auto outputColumn = obj["outputColumn"].asString();
+
+  auto call = std::dynamic_pointer_cast<const CallTypedExpr>(
+      ISerializable::deserialize<ITypedExpr>(obj["call"], context));
+  VELOX_CHECK_NOT_NULL(call, "RPCNode 'call' must be a CallTypedExpr");
 
   // Deserialize explicit output type.
   RowTypePtr outputType;
@@ -4564,7 +4468,7 @@ PlanNodePtr RPCNode::create(const folly::dynamic& obj, void* context) {
       }
     }
     names.push_back(outputColumn);
-    types.push_back(resultType);
+    types.push_back(call->type());
     outputType = ROW(std::move(names), std::move(types));
   }
 
@@ -4576,13 +4480,9 @@ PlanNodePtr RPCNode::create(const folly::dynamic& obj, void* context) {
   return std::make_shared<RPCNode>(
       deserializePlanNodeId(obj),
       std::move(source),
-      std::move(functionName),
-      std::move(resultType),
+      std::move(call),
       std::move(outputColumn),
       std::move(outputType),
-      std::move(argumentColumns),
-      std::move(argumentTypes),
-      std::move(constantInputs),
       streamingMode,
       dispatchBatchSize);
 }

@@ -34,6 +34,7 @@
 #include "velox/experimental/cudf/expression/PrestoFunctions.h"
 #include "velox/experimental/cudf/expression/SparkFunctions.h"
 #include "velox/experimental/ucx-exchange/UcxOutputQueueManager.h"
+#include "velox/experimental/ucx-exchange/UcxPartitionedOutput.h"
 
 #include "folly/Conv.h"
 #include "velox/core/PlanNode.h"
@@ -41,6 +42,7 @@
 #include "velox/exec/HashBuild.h"
 #include "velox/exec/NestedLoopJoinBuild.h"
 #include "velox/exec/Operator.h"
+#include "velox/exec/OutputTransportRegistry.h"
 #include "velox/exec/PartitionedOutput.h"
 #include "velox/exec/Task.h"
 #include "velox/exec/Values.h"
@@ -78,8 +80,7 @@ bool isMppFinalOutputBoundary(
   }
 
   return poNode->id().rfind("mpp_output_", 0) == 0 &&
-      poNode->transportType() ==
-      core::PartitionedOutputNode::TransportType::kHttp &&
+      poNode->transportKind() == core::TransportKind::kInMemory &&
       poNode->isPartitioned() && poNode->numPartitions() == 1 &&
       poNode->serdeKind() == "Presto";
 }
@@ -124,20 +125,8 @@ RowTypePtr gpuInputBoundaryType(
   return planNode->sources()[0]->outputType();
 }
 
-class UcxPartitionedOutputBufferManager final
-    : public exec::PartitionedOutputBufferManager {
+class UcxOutputBufferManager final : public exec::OutputBufferManager {
  public:
-  bool supports(
-      const core::PartitionedOutputNode& node,
-      const core::QueryConfig& queryConfig) const override {
-    const auto& config = CudfConfig::getInstance();
-    const auto cudfEnabled =
-        queryConfig.get<bool>(CudfConfig::kCudfEnabled, config.enabled);
-    return cudfEnabled && config.exchange &&
-        node.transportType() ==
-        core::PartitionedOutputNode::TransportType::kUcx;
-  }
-
   void initializeTask(
       std::shared_ptr<exec::Task> task,
       core::PartitionedOutputNode::Kind kind,
@@ -147,21 +136,21 @@ class UcxPartitionedOutputBufferManager final
         std::move(task), kind, numPartitions, numOutputDrivers);
   }
 
-  void updateOutputBuffers(
+  bool updateOutputBuffers(
       const std::string& taskId,
       int numBuffers,
       bool noMoreBuffers) override {
-    ucx_exchange::UcxOutputQueueManager::getInstanceRef()
+    return ucx_exchange::UcxOutputQueueManager::getInstanceRef()
         ->updateOutputBuffersIfExists(taskId, numBuffers, noMoreBuffers);
   }
 
-  void updateNumDrivers(const std::string& taskId, uint32_t numOutputDrivers)
+  bool updateNumDrivers(const std::string& taskId, uint32_t numOutputDrivers)
       override {
-    ucx_exchange::UcxOutputQueueManager::getInstanceRef()
+    return ucx_exchange::UcxOutputQueueManager::getInstanceRef()
         ->updateNumDriversIfExists(taskId, numOutputDrivers);
   }
 
-  std::optional<exec::OutputBuffer::Stats> stats(
+  std::optional<exec::OutputBufferStats> stats(
       const std::string& taskId) override {
     return ucx_exchange::UcxOutputQueueManager::getInstanceRef()->stats(taskId);
   }
@@ -169,13 +158,19 @@ class UcxPartitionedOutputBufferManager final
   void removeTask(const std::string& taskId) override {
     ucx_exchange::UcxOutputQueueManager::getInstanceRef()->removeTask(taskId);
   }
-};
 
-std::shared_ptr<exec::PartitionedOutputBufferManager>&
-ucxPartitionedOutputBufferManagerRegistration() {
-  static std::shared_ptr<exec::PartitionedOutputBufferManager> manager;
-  return manager;
-}
+  std::optional<double> getUtilization(const std::string&) override {
+    return std::nullopt;
+  }
+
+  std::optional<bool> isOverutilized(const std::string&) override {
+    return std::nullopt;
+  }
+
+  std::string toString(const std::string& taskId) override {
+    return "UCX output buffer for task " + taskId;
+  }
+};
 
 } // namespace
 
@@ -238,6 +233,16 @@ bool CompileState::compile(bool allowCpuFallback) {
           props.acceptsGpuInput = true;
           props.producesGpuOutput = true;
         }
+        if (dynamic_cast<const ucx_exchange::UcxPartitionedOutput*>(op) !=
+            nullptr) {
+          // The UCX transport registry constructs this sink directly, before
+          // adapter replacement runs.  Mark it as a GPU sink so CompileState
+          // inserts CudfFromVelox at a CPU fragment boundary instead of
+          // forcing UcxPartitionedOutput to materialize every batch itself.
+          props.canRunOnGPU = true;
+          props.acceptsGpuInput = true;
+          props.producesGpuOutput = false;
+        }
         return props;
       };
 
@@ -260,8 +265,13 @@ bool CompileState::compile(bool allowCpuFallback) {
     const auto& thisOpProps =
         opProps[operatorIndex]; // cached operator properties
 
+    // A fragment can start at an MPP exchange boundary.  In that case the
+    // first operator still receives a Velox RowVector from the external
+    // source, even though the operator itself requires a CudfVector.  Treat
+    // the missing predecessor as a CPU boundary so the normal conversion
+    // insertion below also covers the first operator in such a fragment.
     const bool previousOperatorIsNotGpu =
-        operatorIndex > 0 and !opProps[operatorIndex - 1].producesGpuOutput;
+        operatorIndex == 0 || !opProps[operatorIndex - 1].producesGpuOutput;
     const bool nextOperatorIsNotGpu = (operatorIndex < operators.size() - 1) and
         !opProps[operatorIndex + 1].acceptsGpuInput;
     const bool isLastOperatorOfTask =
@@ -300,6 +310,9 @@ bool CompileState::compile(bool allowCpuFallback) {
     auto keepOperator = 1; // Default: keep original
     const auto& adapter = thisOpProps.adapter;
     bool isPureCpuOperator = true;
+    const bool isUcxOutputOperator =
+        dynamic_cast<const ucx_exchange::UcxPartitionedOutput*>(oper) !=
+        nullptr;
 
     if (adapter) {
       keepOperator = adapter->keepOperator();
@@ -323,7 +336,7 @@ bool CompileState::compile(bool allowCpuFallback) {
       }
     } else {
       // special case for CudfOperator
-      if (isAnyOf<CudfOperator>(oper)) {
+      if (isAnyOf<CudfOperator>(oper) || isUcxOutputOperator) {
         isPureCpuOperator = false;
       } else {
         // CPU operator without adapter
@@ -509,19 +522,30 @@ void registerCudf() {
     registerJitEvaluator(CudfConfig::getInstance().jitExpressionPriority);
   }
 
-  auto outputManager = std::make_shared<UcxPartitionedOutputBufferManager>();
-  VELOX_CHECK(exec::registerPartitionedOutputBufferManager(outputManager));
-  ucxPartitionedOutputBufferManagerRegistration() = std::move(outputManager);
+  auto outputManager = std::make_shared<UcxOutputBufferManager>();
+  auto outputTransport =
+      exec::OutputTransportEntry::make<UcxOutputBufferManager>(
+          outputManager,
+          [](int32_t operatorId,
+             exec::DriverCtx* ctx,
+             const std::shared_ptr<const core::PartitionedOutputNode>& node,
+             bool eagerFlush,
+             const std::shared_ptr<UcxOutputBufferManager>& /*manager*/)
+              -> std::unique_ptr<exec::Operator> {
+            return std::make_unique<ucx_exchange::UcxPartitionedOutput>(
+                operatorId, ctx, node, eagerFlush);
+          });
+  exec::OutputTransportRegistry::global().insert(
+      std::string{core::TransportKind::kUcx},
+      std::move(outputTransport),
+      /*overwrite=*/true);
 
   isCudfRegistered = true;
 }
 
 void unregisterCudf() {
-  auto& outputManager = ucxPartitionedOutputBufferManagerRegistration();
-  if (outputManager != nullptr) {
-    VELOX_CHECK(exec::unregisterPartitionedOutputBufferManager(outputManager));
-    outputManager.reset();
-  }
+  exec::OutputTransportRegistry::global().erase(
+      std::string{core::TransportKind::kUcx});
   output_mr_.reset();
   mr_.reset();
   output_statistics_mr_.reset();

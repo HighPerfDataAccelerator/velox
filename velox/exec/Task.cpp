@@ -27,7 +27,6 @@
 #include "velox/common/memory/CustomMemoryResourceRegistry.h"
 #include "velox/common/testutil/TestValue.h"
 #include "velox/common/time/Timer.h"
-#include "velox/exec/DefaultOutputBufferManager.h"
 #include "velox/exec/Exchange.h"
 #include "velox/exec/HashJoinBridge.h"
 #include "velox/exec/IndexLookupJoinBridge.h"
@@ -37,6 +36,7 @@
 #include "velox/exec/OperatorTraceCtx.h"
 #include "velox/exec/OperatorType.h"
 #include "velox/exec/OperatorUtils.h"
+#include "velox/exec/OutputTransportRegistry.h"
 #include "velox/exec/PlanNodeStats.h"
 #include "velox/exec/SpatialJoinBuild.h"
 #include "velox/exec/TableScan.h"
@@ -102,24 +102,6 @@ splitListenerFactories() {
   static folly::Synchronized<std::vector<std::shared_ptr<SplitListenerFactory>>>
       kListenerFactories;
   return kListenerFactories;
-}
-
-folly::Synchronized<std::shared_ptr<PartitionedOutputBufferManager>>&
-partitionedOutputBufferManagerRegistry() {
-  static folly::Synchronized<std::shared_ptr<PartitionedOutputBufferManager>>
-      kManager;
-  return kManager;
-}
-
-std::shared_ptr<PartitionedOutputBufferManager>
-getRegisteredPartitionedOutputBufferManager(
-    const core::PartitionedOutputNode& node,
-    const core::QueryConfig& queryConfig) {
-  auto manager = partitionedOutputBufferManagerRegistry().withRLock(
-      [](const auto& registered) { return registered; });
-  return manager != nullptr && manager->supports(node, queryConfig)
-      ? std::move(manager)
-      : nullptr;
 }
 
 std::string errorMessageImpl(const std::exception_ptr& exception) {
@@ -226,27 +208,6 @@ std::string makeUuid() {
   return boost::lexical_cast<std::string>(boost::uuids::random_generator()());
 }
 
-bool isUcxExchangePlanNode(
-    const core::PlanNode* planNode,
-    const core::PlanNodeId& planNodeId) {
-  if (planNode == nullptr) {
-    return false;
-  }
-  if (planNode->id() == planNodeId) {
-    const auto* exchangeNode =
-        dynamic_cast<const core::ExchangeNode*>(planNode);
-    return exchangeNode != nullptr &&
-        exchangeNode->transportType() ==
-        core::ExchangeNode::TransportType::kUcx;
-  }
-  for (const auto& source : planNode->sources()) {
-    if (isUcxExchangePlanNode(source.get(), planNodeId)) {
-      return true;
-    }
-  }
-  return false;
-}
-
 // Returns true if an operator is a hash join operator given 'operatorType'.
 bool isHashJoinOperator(const std::string& operatorType) {
   return (operatorType == OperatorType::kHashBuild) ||
@@ -321,31 +282,6 @@ void noMoreSplitsForStore(
 }
 
 } // namespace
-
-bool registerPartitionedOutputBufferManager(
-    const std::shared_ptr<PartitionedOutputBufferManager>& manager) {
-  VELOX_CHECK_NOT_NULL(manager);
-  return partitionedOutputBufferManagerRegistry().withWLock(
-      [&](auto& registered) {
-        if (registered != nullptr) {
-          return false;
-        }
-        registered = manager;
-        return true;
-      });
-}
-
-bool unregisterPartitionedOutputBufferManager(
-    const std::shared_ptr<PartitionedOutputBufferManager>& manager) {
-  return partitionedOutputBufferManagerRegistry().withWLock(
-      [&](auto& registered) {
-        if (registered != manager) {
-          return false;
-        }
-        registered.reset();
-        return true;
-      });
-}
 
 std::string executionModeString(Task::ExecutionMode mode) {
   switch (mode) {
@@ -505,12 +441,8 @@ Task::Task(
       traceCtx_(maybeMakeTraceCtx()),
       consumerSupplier_(std::move(consumerSupplier)),
       onError_(std::move(onError)),
-      splitsStates_(buildSplitStates(planFragment_.planNode)),
-      bufferManager_(DefaultOutputBufferManager::getInstanceRef()) {
+      splitsStates_(buildSplitStates(planFragment_.planNode)) {
   ++numCreatedTasks_;
-  // Validate that any per-node transport type annotations refer to the right
-  // kind of plan node before they are used to select exchange transports.
-  planFragment_.validateTransportTypes();
   // NOTE: the executor must not be folly::InlineLikeExecutor for parallel
   // execution.
   if (mode_ == Task::ExecutionMode::kParallel) {
@@ -1194,11 +1126,11 @@ void Task::start(uint32_t maxDrivers, uint32_t concurrentSplitGroups) {
     VELOX_CHECK_GE(
         maxDrivers,
         1,
-        "maxDrivers parameter must be greater then or equal to 1");
+        "maxDrivers parameter must be greater than or equal to 1");
     VELOX_CHECK_GE(
         concurrentSplitGroups,
         1,
-        "concurrentSplitGroups parameter must be greater then or equal to 1");
+        "concurrentSplitGroups parameter must be greater than or equal to 1");
 
     {
       std::unique_lock<std::timed_mutex> l(mutex_);
@@ -1343,24 +1275,14 @@ void Task::createAndStartDrivers(uint32_t concurrentSplitGroups) {
 }
 
 void Task::initializePartitionOutput() {
-  {
-    std::lock_guard<std::timed_mutex> l(mutex_);
-    VELOX_CHECK(
-        isRunningLocked(),
-        "Task {} has already been terminated before start: {}",
-        taskId_,
-        errorMessageLocked());
-  }
+  VELOX_CHECK(
+      isRunningLocked(),
+      "Task {} has already been terminated before start: {}",
+      taskId_,
+      errorMessageLocked());
 
-  auto bufferManager = bufferManager_.lock();
-  VELOX_CHECK_NOT_NULL(
-      bufferManager,
-      "Unable to initialize task. "
-      "PartitionedOutputBufferManager was already destructed");
   std::shared_ptr<const core::PartitionedOutputNode> partitionedOutputNode{
       nullptr};
-  std::shared_ptr<PartitionedOutputBufferManager>
-      partitionedOutputBufferManager;
   int numOutputDrivers{0};
   {
     std::unique_lock<std::timed_mutex> l(mutex_);
@@ -1381,9 +1303,6 @@ void Task::initializePartitionOutput() {
         if (partitionedOutputNode != nullptr) {
           numDriversInPartitionedOutput_ = factory->numDrivers;
           groupedPartitionedOutput_ = factory->groupedExecution;
-          partitionedOutputBufferManager =
-              getRegisteredPartitionedOutputBufferManager(
-                  *partitionedOutputNode, queryCtx_->queryConfig());
           numOutputDrivers = factory->groupedExecution
               ? factory->numDrivers * planFragment_.numSplitGroups
               : factory->numDrivers;
@@ -1405,45 +1324,29 @@ void Task::initializePartitionOutput() {
   if (partitionedOutputNode != nullptr) {
     VELOX_CHECK(hasPartitionedOutput());
     VELOX_CHECK_GT(numOutputDrivers, 0);
-    VLOG(1) << "initializing OutputBufferManager with "
-            << partitionedOutputNode->numPartitions() << " partitions and "
-            << numOutputDrivers << " drivers";
-    bufferManager->initializeTask(
+    const auto& transport = partitionedOutputNode->transportKind();
+    auto entry = OutputTransportRegistry::tryGet(*queryCtx_, transport);
+    VELOX_CHECK_NOT_NULL(
+        entry,
+        "No output buffer manager registered for transport '{}'",
+        transport);
+    auto manager = entry->manager;
+    {
+      std::lock_guard<std::timed_mutex> l(mutex_);
+      bufferManager_ = manager;
+      outputOperatorFactory_ = entry->makeOutputOperator;
+    }
+    manager->initializeTask(
         shared_from_this(),
         partitionedOutputNode->kind(),
         partitionedOutputNode->numPartitions(),
         numOutputDrivers);
-    if (partitionedOutputBufferManager != nullptr) {
-      try {
-        partitionedOutputBufferManager->initializeTask(
-            shared_from_this(),
-            partitionedOutputNode->kind(),
-            partitionedOutputNode->numPartitions(),
-            numOutputDrivers);
-      } catch (...) {
-        try {
-          partitionedOutputBufferManager->removeTask(taskId_);
-        } catch (...) {
-          LOG(ERROR) << "Failed to clean up partitioned output after "
-                        "initialization failed for task "
-                     << taskId_;
-        }
-        throw;
-      }
-
-      bool keepManager{false};
-      {
-        std::lock_guard<std::timed_mutex> l(mutex_);
-        if (isRunningLocked()) {
-          partitionedOutputBufferManager_ = partitionedOutputBufferManager;
-          keepManager = true;
-        }
-      }
-      if (!keepManager) {
-        partitionedOutputBufferManager->removeTask(taskId_);
-      }
-    }
   }
+}
+
+std::weak_ptr<OutputBufferManager> Task::outputBufferManager() const {
+  std::lock_guard<std::timed_mutex> l(mutex_);
+  return bufferManager_;
 }
 
 // static
@@ -1596,7 +1499,7 @@ void Task::createSplitGroupStateLocked(uint32_t splitGroupId) {
         splitGroupId, factory->needsSpatialJoinBridges());
     addIndexLookupJoinBridgesLocked(
         splitGroupId, factory->needsIndexLookupJoinBridges());
-    addCustomJoinBridgesLocked(splitGroupId, factory->planNodes);
+    addCustomJoinBridgesLocked(splitGroupId, factory->needsCustomJoinBridges());
 
     core::PlanNodeId tableScanNodeId;
     if (queryCtx_->queryConfig().tableScanScaledProcessingEnabled() &&
@@ -1639,6 +1542,7 @@ std::vector<std::shared_ptr<Driver>> Task::createDriversLocked(
               splitGroupId,
               partitionId),
           getExchangeClientLocked(pipeline),
+          outputOperatorFactory_,
           filters,
           [self](size_t i) {
             return i < self->driverFactories_.size()
@@ -1971,9 +1875,6 @@ void Task::noMoreSplits(const core::PlanNodeId& planNodeId) {
   std::vector<ContinuePromise> splitPromises;
   bool allFinished;
   std::shared_ptr<ExchangeClient> exchangeClient;
-  std::shared_ptr<PartitionedOutputBufferManager>
-      partitionedOutputBufferManager;
-  std::optional<uint32_t> numPartitionedOutputDrivers;
   {
     std::lock_guard<std::timed_mutex> l(mutex_);
 
@@ -2014,20 +1915,11 @@ void Task::noMoreSplits(const core::PlanNodeId& planNodeId) {
       }
     }
 
-    allFinished = checkNoMoreSplitGroupsLocked(numPartitionedOutputDrivers);
-
-    if (numPartitionedOutputDrivers.has_value()) {
-      partitionedOutputBufferManager = partitionedOutputBufferManager_;
-    }
+    allFinished = checkNoMoreSplitGroupsLocked();
 
     if (!isRunningLocked()) {
       exchangeClient = getExchangeClientLocked(planNodeId);
     }
-  }
-
-  if (partitionedOutputBufferManager != nullptr) {
-    partitionedOutputBufferManager->updateNumDrivers(
-        taskId_, numPartitionedOutputDrivers.value());
   }
 
   for (auto& promise : splitPromises) {
@@ -2237,8 +2129,7 @@ void Task::dropInputLocked(
   }
 }
 
-bool Task::checkNoMoreSplitGroupsLocked(
-    std::optional<uint32_t>& numPartitionedOutputDrivers) {
+bool Task::checkNoMoreSplitGroupsLocked() {
   if (isUngroupedExecution()) {
     return false;
   }
@@ -2256,11 +2147,10 @@ bool Task::checkNoMoreSplitGroupsLocked(
     numTotalDrivers_ = seenSplitGroups_.size() * numDriversPerSplitGroup_ +
         numDriversUngrouped_;
     if (groupedPartitionedOutput_) {
-      const auto numOutputDrivers =
-          numDriversInPartitionedOutput_ * seenSplitGroups_.size();
-      auto bufferManager = bufferManager_.lock();
-      bufferManager->updateNumDrivers(taskId(), numOutputDrivers);
-      numPartitionedOutputDrivers = numOutputDrivers;
+      if (auto manager = bufferManager_.lock()) {
+        manager->updateNumDrivers(
+            taskId(), numDriversInPartitionedOutput_ * seenSplitGroups_.size());
+      }
     }
 
     return checkIfFinishedLocked();
@@ -2483,31 +2373,20 @@ bool Task::isFinishedLocked() const {
 }
 
 bool Task::updateOutputBuffers(int numBuffers, bool noMoreBuffers) {
-  auto bufferManager = bufferManager_.lock();
-  VELOX_CHECK_NOT_NULL(
-      bufferManager,
-      "Unable to initialize task. "
-      "DefaultOutputBufferManager was already destructed");
-  std::shared_ptr<PartitionedOutputBufferManager>
-      partitionedOutputBufferManager;
   {
     std::lock_guard<std::timed_mutex> l(mutex_);
+    // Ignore messages received after no-more-buffers message.
     if (noMoreOutputBuffers_) {
-      // Ignore messages received after no-more-buffers message.
       return false;
     }
     if (noMoreBuffers) {
       noMoreOutputBuffers_ = true;
     }
-    partitionedOutputBufferManager = partitionedOutputBufferManager_;
   }
-  auto result =
-      bufferManager->updateOutputBuffers(taskId_, numBuffers, noMoreBuffers);
-  if (partitionedOutputBufferManager != nullptr) {
-    partitionedOutputBufferManager->updateOutputBuffers(
-        taskId_, numBuffers, noMoreBuffers);
+  if (auto manager = outputBufferManager().lock()) {
+    return manager->updateOutputBuffers(taskId_, numBuffers, noMoreBuffers);
   }
-  return result;
+  return false;
 }
 
 int Task::getOutputPipelineId() const {
@@ -2649,17 +2528,33 @@ void Task::addHashJoinBridgesLocked(
 
 void Task::addCustomJoinBridgesLocked(
     uint32_t splitGroupId,
-    const std::vector<core::PlanNodePtr>& planNodes) {
+    const std::vector<core::PlanNodeId>& planNodeIds) {
   auto& splitGroupState = splitGroupStates_[splitGroupId];
-  for (const auto& planNode : planNodes) {
+  for (const auto& planNodeId : planNodeIds) {
+    // Unlike built-in bridges (hash, NLJ, etc.) custom bridges need the plan
+    // node to call Operator::joinBridgeFromPlanNode().  The node may belong to
+    // a different factory: in mixed execution mode the ungrouped build factory
+    // must create the bridge, but the plan node lives in the grouped probe
+    // factory.  Search all factories to find it.
+    auto findNode = [&]() -> core::PlanNodePtr {
+      for (const auto& factory : driverFactories_) {
+        for (const auto& planNode : factory->planNodes) {
+          if (planNode->id() == planNodeId) {
+            return planNode;
+          }
+        }
+      }
+      return nullptr;
+    };
+    auto planNode = findNode();
+    VELOX_CHECK_NOT_NULL(
+        planNode, "Plan node {} for custom join bridge not found", planNodeId);
     if (auto joinBridge = Operator::joinBridgeFromPlanNode(planNode)) {
       auto const inserted = splitGroupState.customBridges
-                                .emplace(planNode->id(), std::move(joinBridge))
+                                .emplace(planNodeId, std::move(joinBridge))
                                 .second;
       VELOX_CHECK(
-          inserted,
-          "Join bridge for node {} is already present",
-          planNode->id());
+          inserted, "Join bridge for node {} is already present", planNodeId);
     }
   }
 }
@@ -2932,9 +2827,6 @@ ContinueFuture Task::terminate(TaskState terminalState) {
 
       // Process remaining remote splits.
       if (getExchangeClientLocked(nodeId) != nullptr) {
-        if (isUcxExchangePlanNode(planFragment_.planNode.get(), nodeId)) {
-          continue;
-        }
         std::vector<exec::Split> splits;
         for (auto& [groupId, store] : state.groupSplitsStores) {
           if (!store) {
@@ -3003,47 +2895,14 @@ ContinueFuture Task::terminate(TaskState terminalState) {
 
 void Task::maybeRemoveFromOutputBufferManager() {
   if (hasPartitionedOutput()) {
-    std::shared_ptr<PartitionedOutputBufferManager>
-        partitionedOutputBufferManager;
-    {
-      std::lock_guard<std::timed_mutex> l(mutex_);
-      partitionedOutputBufferManager =
-          std::move(partitionedOutputBufferManager_);
-    }
-    if (auto bufferManager = bufferManager_.lock()) {
-      // Capture output buffer stats before deleting the buffer.
+    if (auto manager = outputBufferManager().lock()) {
       {
         std::lock_guard<std::timed_mutex> l(mutex_);
-        auto optStats = bufferManager->stats(taskId_);
-        if (!taskStats_.outputBufferStats.has_value() && optStats.has_value()) {
-          taskStats_.outputBufferStats = optStats;
+        if (!taskStats_.outputBufferStats.has_value()) {
+          taskStats_.outputBufferStats = manager->stats(taskId_);
         }
       }
-      bufferManager->removeTask(taskId_);
-    }
-    if (partitionedOutputBufferManager != nullptr) {
-      try {
-        auto optStats = partitionedOutputBufferManager->stats(taskId_);
-        if (optStats.has_value() && optStats.value().totalPagesSent > 0) {
-          std::lock_guard<std::timed_mutex> l(mutex_);
-          taskStats_.outputBufferStats = optStats;
-        }
-      } catch (const std::exception& e) {
-        LOG(ERROR) << "Failed to collect partitioned output stats for task "
-                   << taskId_ << ": " << e.what();
-      } catch (...) {
-        LOG(ERROR) << "Failed to collect partitioned output stats for task "
-                   << taskId_ << ": unknown exception";
-      }
-      try {
-        partitionedOutputBufferManager->removeTask(taskId_);
-      } catch (const std::exception& e) {
-        LOG(ERROR) << "Failed to remove partitioned output for task " << taskId_
-                   << ": " << e.what();
-      } catch (...) {
-        LOG(ERROR) << "Failed to remove partitioned output for task " << taskId_
-                   << ": unknown exception";
-      }
+      manager->removeTask(taskId_);
     }
   }
 }
@@ -3202,11 +3061,14 @@ TaskStats Task::taskStats() const {
     }
   }
 
-  auto bufferManager = bufferManager_.lock();
-  taskStats.outputBufferUtilization = bufferManager->getUtilization(taskId_);
-  taskStats.outputBufferOverutilized = bufferManager->isOverutilized(taskId_);
-  if (!taskStats.outputBufferStats.has_value()) {
-    taskStats.outputBufferStats = bufferManager->stats(taskId_);
+  if (auto manager = bufferManager_.lock()) {
+    taskStats.outputBufferUtilization =
+        manager->getUtilization(taskId_).value_or(0);
+    taskStats.outputBufferOverutilized =
+        manager->isOverutilized(taskId_).value_or(false);
+    if (!taskStats.outputBufferStats.has_value()) {
+      taskStats.outputBufferStats = manager->stats(taskId_);
+    }
   }
   return taskStats;
 }
@@ -3466,9 +3328,10 @@ folly::dynamic Task::toJson() const {
   }
   obj["drivers"] = drivers;
 
-  if (auto buffers = bufferManager_.lock()) {
-    if (auto buffer = buffers->getBufferIfExists(taskId_)) {
-      obj["buffer"] = buffer->toString();
+  if (auto manager = bufferManager_.lock()) {
+    auto bufferState = manager->toString(taskId_);
+    if (!bufferState.empty()) {
+      obj["buffer"] = bufferState;
     }
   }
 
@@ -3625,8 +3488,7 @@ Task::getScaleWriterPartitionBalancer(
   return it->second.scaleWriterPartitionBalancer;
 }
 
-const std::shared_ptr<LocalExchangeMemoryManager>&
-Task::getLocalExchangeMemoryManager(
+std::shared_ptr<LocalExchangeMemoryManager> Task::getLocalExchangeMemoryManager(
     uint32_t splitGroupId,
     const core::PlanNodeId& planNodeId) {
   std::lock_guard<std::timed_mutex> l(mutex_);

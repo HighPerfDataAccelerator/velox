@@ -33,7 +33,8 @@
 #include "velox/connectors/hive/HiveConnectorUtil.h"
 #include "velox/connectors/hive/HiveDataSource.h"
 #include "velox/connectors/hive/TableHandle.h"
-#include "velox/expression/FieldReference.h"
+#include "velox/core/QueryCtx.h"
+#include "velox/expression/ExprOptimizer.h"
 
 #include <cudf/stream_compaction.hpp>
 
@@ -41,51 +42,6 @@ namespace facebook::velox::cudf_velox::connector::hive {
 
 using namespace facebook::velox::connector;
 using namespace facebook::velox::connector::hive;
-
-namespace {
-
-bool isSupportedCudfReaderFilterType(const TypePtr& type) {
-  if (type == nullptr) {
-    return false;
-  }
-
-  switch (type->kind()) {
-    case TypeKind::ARRAY:
-    case TypeKind::MAP:
-    case TypeKind::ROW:
-    case TypeKind::UNKNOWN:
-      return false;
-    default:
-      return true;
-  }
-}
-
-bool isStringLikeType(const TypePtr& type) {
-  return type != nullptr &&
-      (type->kind() == TypeKind::VARCHAR ||
-       type->kind() == TypeKind::VARBINARY);
-}
-
-TypePtr topLevelSubfieldType(
-    const hive::HiveTableHandle& tableHandle,
-    const RowTypePtr& outputType,
-    const common::Subfield& field) {
-  if (!field.valid()) {
-    return nullptr;
-  }
-
-  const auto& baseName = field.baseName();
-  if (tableHandle.dataColumns() &&
-      tableHandle.dataColumns()->containsChild(baseName)) {
-    return tableHandle.dataColumns()->findChild(baseName);
-  }
-  if (outputType && outputType->containsChild(baseName)) {
-    return outputType->findChild(baseName);
-  }
-  return nullptr;
-}
-
-} // namespace
 
 CudfHiveDataSource::CudfHiveDataSource(
     const RowTypePtr& outputType,
@@ -106,19 +62,8 @@ CudfHiveDataSource::CudfHiveDataSource(
       outputType_(outputType),
       pool_(connectorQueryCtx->memoryPool()),
       expressionEvaluator_(connectorQueryCtx->expressionEvaluator()) {
-  tableHandle_ =
-      std::dynamic_pointer_cast<const hive::HiveTableHandle>(tableHandle);
-  VELOX_CHECK_NOT_NULL(
-      tableHandle_, "TableHandle must be an instance of HiveTableHandle");
-
-  auto addReadColumn = [&](std::string_view name) {
-    auto readName = toTopLevelReadColumnName(name);
-    if (readColumnSet_.emplace(readName).second) {
-      readColumnNames_.emplace_back(std::move(readName));
-    }
-  };
-
   // Set up column projection if needed
+  auto readColumnTypes = outputType_->children();
   for (const auto& outputName : outputType_->names()) {
     auto it = columnHandles.find(outputName);
     VELOX_CHECK(
@@ -127,10 +72,14 @@ CudfHiveDataSource::CudfHiveDataSource(
         outputName);
 
     auto* handle = static_cast<const hive::HiveColumnHandle*>(it->second.get());
-    auto outputReadName = toTopLevelReadColumnName(handle->name());
-    outputReadColumnNames_.emplace_back(outputReadName);
-    addReadColumn(outputReadName);
+    readColumnSet_.emplace(handle->name());
+    readColumnNames_.emplace_back(handle->name());
   }
+
+  tableHandle_ =
+      std::dynamic_pointer_cast<const hive::HiveTableHandle>(tableHandle);
+  VELOX_CHECK_NOT_NULL(
+      tableHandle_, "TableHandle must be an instance of HiveTableHandle");
 
   // Copy subfield filters.
   for (const auto& [k, v] : tableHandle_->subfieldFilters()) {
@@ -150,74 +99,54 @@ CudfHiveDataSource::CudfHiveDataSource(
 
   // Add fields in the filter to the columns to read if not there
   for (const auto& [field, _] : subfieldFilters_) {
-    addReadColumn(field.toString());
-  }
-
-  // Build a combined AST for subfield filters once. This is query-constant
-  // and doesn't depend on split-specific state. cuDF reader AST currently only
-  // supports scalar column predicates; keep complex columns in the post-scan
-  // remaining filter path to avoid invalid AST operators on MAP/ARRAY/ROW.
-  common::SubfieldFilters readerSubfieldFilters;
-  bool skippedReaderFilter = false;
-  const bool parquetFilterPushdownEnabled =
-      cudfHiveConfig_->parquetFilterPushdownEnabledSession(
-          connectorQueryCtx_->sessionProperties());
-  if (!parquetFilterPushdownEnabled && !subfieldFilters_.empty()) {
-    // libcudf 26.08 can crash in stats_expression_converter when many MPP scan
-    // fragments initialize Parquet statistics filters concurrently.  Keep the
-    // original predicate for the post-scan cuDF evaluator in this mode.
-    skippedReaderFilter = true;
-  } else if (!subfieldFilters_.empty()) {
-    for (const auto& [field, filter] : subfieldFilters_) {
-      if (field.path().size() != 1) {
-        skippedReaderFilter = true;
-        VLOG(1) << "Skipping nested cuDF reader filter pushdown for subfield: "
-                << field.toString();
-        continue;
-      }
-
-      const auto type = topLevelSubfieldType(*tableHandle_, outputType_, field);
-      if (!isSupportedCudfReaderFilterType(type)) {
-        skippedReaderFilter = true;
-        VLOG(1) << "Skipping complex cuDF reader filter pushdown for subfield: "
-                << field.toString();
-        continue;
-      }
-
-      if (isStringLikeType(type)) {
-        skippedReaderFilter = true;
-        VLOG(1) << "Keeping string cuDF reader filter post-scan for subfield: "
-                << field.toString();
-        continue;
-      }
-
-      readerSubfieldFilters.emplace(field.clone(), filter);
+    if (readColumnSet_.count(field.toString()) == 0) {
+      readColumnSet_.emplace(field.toString());
+      readColumnNames_.emplace_back(field.toString());
     }
   }
-
-  const auto& postScanFilter =
-      skippedReaderFilter ? tableHandle_->remainingFilter() : remainingFilter;
-  if (postScanFilter) {
-    remainingFilterExprSet_ = expressionEvaluator_->compile(postScanFilter);
-    for (const auto& field : remainingFilterExprSet_->distinctFields()) {
-      // Add fields in the filter to the columns to read if not there
-      addReadColumn(field->field());
+  // Optimize (rewrites + constant folding) the remaining filter before
+  // evaluator selection so CudfFunctions never see scalar-only operand sets.
+  // TODO: ConnectorQueryCtx does not expose the session QueryCtx, only an
+  // ExpressionEvaluator, so constant folding here runs against a transient
+  // QueryCtx with default query config rather than the session's. Passing the
+  // real session QueryCtx (e.g. by exposing it on ConnectorQueryCtx) should be
+  // figured out later. A local QueryCtx is required because
+  // expression::optimize constant-folds through exec::ExprSet, whose
+  // constructor dereferences the QueryCtx unconditionally; a null QueryCtx
+  // would crash.
+  auto optimizeQueryCtx = core::QueryCtx::create();
+  optimizedRemainingFilter_ = remainingFilter
+      ? expression::optimize(remainingFilter, optimizeQueryCtx.get(), pool_)
+      : nullptr;
+  if (optimizedRemainingFilter_) {
+    // Add fields referenced by the filter to the columns to read. Collect from
+    // the optimized expression since folding may drop branches and the columns
+    // they reference. Read-column order does not affect results: the data
+    // source projects its output to the requested output type.
+    for (const auto& name : referencedInputFields(optimizedRemainingFilter_)) {
+      if (readColumnSet_.count(name) == 0) {
+        readColumnSet_.emplace(name);
+        readColumnNames_.emplace_back(name);
+      }
     }
 
+    // TODO: Prune struct columns to the subfields referenced by the remaining
+    // filter; currently the whole column is read even if only one field is
+    // used.
+
+    // The filter is already optimized and constant folded above, so compile it
+    // directly.
     auto const remainingFilterType = getTableRowType();
-    cudfExpressionEvaluator_ = velox::cudf_velox::createCudfExpression(
-        remainingFilterExprSet_->exprs()[0], remainingFilterType);
-    // TODO(kn): Get column names and subfields from remaining filter and add to
-    // readColumnNames_
+    cudfRemainingFilterExpression_ = createCudfExpression(
+        optimizedRemainingFilter_, remainingFilterType, pool_);
   }
 
-  if (!readerSubfieldFilters.empty()) {
+  // Build a combined AST for all subfield filters once. This is query-constant
+  // and doesn't depend on split-specific state.
+  if (!subfieldFilters_.empty()) {
     auto const readerFilterType = getTableRowType();
     subfieldFilterExpr_ = &createAstFromSubfieldFilters(
-        readerSubfieldFilters,
-        subfieldTree_,
-        subfieldScalars_,
-        readerFilterType);
+        subfieldFilters_, subfieldTree_, subfieldScalars_, readerFilterType);
   }
 
   VELOX_CHECK_NOT_NULL(fileHandleFactory_, "No FileHandleFactory present");
@@ -249,9 +178,12 @@ std::unique_ptr<CudfSplitReader> CudfHiveDataSource::createCudfSplitReader() {
 }
 
 void CudfHiveDataSource::convertSplit(std::shared_ptr<ConnectorSplit> split) {
-  // Dynamic cast split to `CudfHiveConnectorSplit`
-  if (std::dynamic_pointer_cast<CudfHiveConnectorSplit>(split)) {
-    split_ = std::dynamic_pointer_cast<CudfHiveConnectorSplit>(split);
+  // The cuDF connector receives CudfHiveConnectorSplit instances from the
+  // Gluten split builders (including the MPP coordinator). Keep the cast
+  // free of RTTI for the same reason as the async DataSource handoff below.
+  if (split->connectorId == "cudf-hive") {
+    split_ = std::static_pointer_cast<CudfHiveConnectorSplit>(split);
+    VELOX_CHECK_NOT_NULL(split_, "Null CudfHiveConnectorSplit");
     return;
   }
 
@@ -293,10 +225,6 @@ void CudfHiveDataSource::addSplit(std::shared_ptr<ConnectorSplit> split) {
 
   cudfSplitReader_ = createCudfSplitReader();
   cudfSplitReader_->prepareSplit(runtimeStats_);
-  numFilesCoalesced_ += split_->coalescedFiles.size();
-  for (const auto& file : split_->coalescedFiles) {
-    completedBytes_ += file.length;
-  }
 
   // TODO: `completedBytes_` should be updated in `next()` as we read more and
   // more table bytes
@@ -319,49 +247,46 @@ void CudfHiveDataSource::addSplit(std::shared_ptr<ConnectorSplit> split) {
 
 void CudfHiveDataSource::setFromDataSource(
     std::unique_ptr<DataSource> sourceUnique) {
-  auto* source = dynamic_cast<CudfHiveDataSource*>(sourceUnique.get());
-  VELOX_CHECK_NOT_NULL(source, "Bad DataSource type");
+  // The TableScan preloader creates this DataSource through the same
+  // CudfHiveConnector instance, so the source type is fixed by the connector
+  // factory. Avoid RTTI here: this handoff runs across the async preload
+  // boundary, and the combined Gluten/Velox build can load incompatible RTTI
+  // metadata for this connector.
+  VELOX_CHECK_NOT_NULL(sourceUnique, "Null DataSource");
+  auto* source = static_cast<CudfHiveDataSource*>(sourceUnique.get());
 
   split_ = std::move(source->split_);
-  runtimeStats_.skippedSplits += source->runtimeStats_.skippedSplits;
-  runtimeStats_.processedSplits += source->runtimeStats_.processedSplits;
-  runtimeStats_.skippedSplitBytes += source->runtimeStats_.skippedSplitBytes;
+  runtimeStats_ = std::move(source->runtimeStats_);
   completedRows_ += source->completedRows_;
   completedBytes_ += source->completedBytes_;
-  numFilesCoalesced_ += source->numFilesCoalesced_;
+  cudfSplitReader_ = std::move(source->cudfSplitReader_);
+  optimizedRemainingFilter_ = std::move(source->optimizedRemainingFilter_);
+  cudfRemainingFilterExpression_ =
+      std::move(source->cudfRemainingFilterExpression_);
+  // The preloaded reader keeps a non-owning pointer into the source's AST
+  // tree. Move the owning tree and scalars together with the reader so those
+  // pointers remain valid after the preloaded DataSource is destroyed.
+  subfieldTree_ = std::move(source->subfieldTree_);
+  subfieldScalars_ = std::move(source->subfieldScalars_);
+  subfieldFilterExpr_ = source->subfieldFilterExpr_;
   totalRemainingFilterTime_.fetch_add(
       source->totalRemainingFilterTime_.load(std::memory_order_relaxed),
       std::memory_order_relaxed);
 
-  // The prepared reader records IO into the prepared DataSource's counters.
-  // Preserve counters accumulated by earlier splits before adopting them.
   source->ioStatistics_->merge(*ioStatistics_);
   ioStatistics_ = std::move(source->ioStatistics_);
   source->ioStats_->merge(*ioStats_);
   ioStats_ = std::move(source->ioStats_);
 
-  // The prepared reader's parquet_reader_options stores a non-owning pointer
-  // to the filter expression. Adopt the expression storage together with the
-  // reader; otherwise destroying sourceUnique below leaves libcudf with a
-  // dangling AST (and dangling literal scalars) during statistics pruning.
-  subfieldScalars_ = std::move(source->subfieldScalars_);
-  subfieldTree_ = std::move(source->subfieldTree_);
-  subfieldFilterExpr_ = source->subfieldFilterExpr_;
-
-  cudfSplitReader_ = std::move(source->cudfSplitReader_);
-  VELOX_CHECK_NOT_NULL(cudfSplitReader_);
-  cudfSplitReader_->setDataSourceContext(
-      connectorQueryCtx_, runtimeStats_, subfieldFilterExpr_);
+  if (cudfSplitReader_) {
+    cudfSplitReader_->setDataSourceContext(
+        connectorQueryCtx_, runtimeStats_, subfieldFilterExpr_);
+  }
 }
 
 std::optional<RowVectorPtr> CudfHiveDataSource::next(
     uint64_t size,
     velox::ContinueFuture& /* future */) {
-  CudaAllocationTraceScope allocationTrace(
-      fmt::format(
-          "CudfHiveDataSource instance={} reader={} method=next",
-          static_cast<const void*>(this),
-          static_cast<const void*>(cudfSplitReader_.get())));
   VELOX_CHECK_NOT_NULL(split_, "No split present. Call addSplit() first.");
   VELOX_CHECK_NOT_NULL(cudfSplitReader_, "No split to process.");
   auto chunkOpt = cudfSplitReader_->next(size);
@@ -372,7 +297,7 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
   auto stream = cudfSplitReader_->stream();
 
   uint64_t filterTimeUs{0};
-  if (remainingFilterExprSet_) {
+  if (optimizedRemainingFilter_) {
     MicrosecondWallTimer filterTimer(&filterTimeUs);
     auto cudfTableColumns = cudfTable->release();
     std::vector<cudf::column_view> inputViews;
@@ -381,7 +306,7 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
       inputViews.push_back(col->view());
     }
     auto filterResult =
-        cudfExpressionEvaluator_->eval(inputViews, stream, get_temp_mr());
+        cudfRemainingFilterExpression_->eval(inputViews, stream, get_temp_mr());
     auto originalTable =
         std::make_unique<cudf::table>(std::move(cudfTableColumns));
     cudfTable = cudf::apply_boolean_mask(
@@ -460,26 +385,6 @@ const RowTypePtr CudfHiveDataSource::getTableRowType() {
   }
   cachedTableRowType_ = outputType_;
   return cachedTableRowType_;
-}
-
-std::string CudfHiveDataSource::toTopLevelReadColumnName(
-    std::string_view name) const {
-  if (tableHandle_ && tableHandle_->dataColumns()) {
-    const auto& dataColumns = tableHandle_->dataColumns();
-    if (dataColumns->containsChild(name)) {
-      return std::string{name};
-    }
-
-    const auto dot = name.find('.');
-    if (dot != std::string_view::npos) {
-      const auto topLevelName = name.substr(0, dot);
-      if (dataColumns->containsChild(topLevelName)) {
-        return std::string{topLevelName};
-      }
-    }
-  }
-
-  return std::string{name};
 }
 
 } // namespace facebook::velox::cudf_velox::connector::hive

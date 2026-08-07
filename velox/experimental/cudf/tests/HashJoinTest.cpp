@@ -15,6 +15,7 @@
  */
 
 #include "velox/experimental/cudf/CudfConfig.h"
+#include "velox/experimental/cudf/exec/CudfConversion.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/expression/PrestoFunctions.h"
 
@@ -901,8 +902,13 @@ TEST_P(MultiThreadedHashJoinTest, rightSemiJoinFilterWithAsymmetricSchemas) {
       .run();
 }
 
+// Regression test for #18124: an empty right-semi probe must be materialized
+// with the probe schema, not the build/output schema. The probe key sits at
+// ordinal 2, past the build side's column count (2). If doNoMoreInput builds a
+// build-shaped empty table, selecting the key column throws an out-of-range
+// error; a probe-shaped empty table has the column and the join returns empty.
 TEST_P(MultiThreadedHashJoinTest, rightSemiJoinFilterWithEmptyProbe) {
-  auto probeType = ROW({{"t0", INTEGER()}, {"t1", BIGINT()}, {"t2", DOUBLE()}});
+  auto probeType = ROW({{"t0", BIGINT()}, {"t1", DOUBLE()}, {"t2", INTEGER()}});
   auto buildVectors = makeBatches(2, [&](int32_t batch) {
     return makeRowVector(
         {"u0", "u1"},
@@ -917,12 +923,12 @@ TEST_P(MultiThreadedHashJoinTest, rightSemiJoinFilterWithEmptyProbe) {
       .numDrivers(numDrivers_)
       .probeType(probeType)
       .probeVectors(0, 3)
-      .probeKeys({"t0"})
+      .probeKeys({"t2"})
       .buildKeys({"u0"})
       .buildVectors(std::move(buildVectors))
       .joinType(core::JoinType::kRightSemiFilter)
       .joinOutputLayout({"u1"})
-      .referenceQuery("SELECT u.u1 FROM u WHERE u.u0 IN (SELECT t.t0 FROM t)")
+      .referenceQuery("SELECT u.u1 FROM u WHERE u.u0 IN (SELECT t.t2 FROM t)")
       .run();
 }
 
@@ -1807,6 +1813,481 @@ TEST_P(MultiThreadedHashJoinTest, leftJoin) {
         ASSERT_EQ(nullJoinBuildKeyCount, 33 * GetParam().numDrivers);
         ASSERT_EQ(nullJoinProbeKeyCount, 34 * GetParam().numDrivers);
       })
+      .run();
+}
+
+TEST_P(MultiThreadedHashJoinTest, leftJoinBatchedBuild) {
+  // Build side has 3 input vectors of 10 rows each. With batch size max = 10,
+  // each becomes a separate build batch. Only the last batch has keys matching
+  // the probe side. Probe side includes matched keys [0..4], unmatched keys
+  // [100..102], and a null key — testing matched, unmatched, and null-key paths
+  // across multiple build batches.
+  auto& cudfConfig = cudf_velox::CudfConfig::getInstance();
+  auto savedMin = cudfConfig.batchSizeMinThreshold;
+  auto savedMax = cudfConfig.batchSizeMaxThreshold;
+  cudfConfig.batchSizeMinThreshold = 10;
+  cudfConfig.batchSizeMaxThreshold = 10;
+  SCOPE_EXIT {
+    cudfConfig.batchSizeMinThreshold = savedMin;
+    cudfConfig.batchSizeMaxThreshold = savedMax;
+  };
+
+  std::vector<RowVectorPtr> probeVectors = {makeRowVector(
+      {"c0", "c1", "row_number"},
+      {
+          makeNullableFlatVector<int32_t>(
+              {0, 1, 2, 3, 4, 100, 101, 102, std::nullopt}),
+          makeFlatVector<int32_t>({10, 11, 12, 13, 14, 15, 16, 17, 18}),
+          makeFlatVector<int32_t>({0, 1, 2, 3, 4, 5, 6, 7, 8}),
+      })};
+
+  // Build side: 3 batches of 10 rows each. First two batches have keys
+  // [200..219] (no probe match), last batch has keys [0..9] (keys 0-4 match
+  // probe).
+  std::vector<RowVectorPtr> buildVectors =
+      makeBatches(3, [&](int32_t batchIdx) {
+        return makeRowVector({
+            makeFlatVector<int32_t>(
+                10,
+                [batchIdx](auto row) {
+                  return batchIdx < 2 ? 200 + batchIdx * 10 + row : row;
+                }),
+            makeFlatVector<int32_t>(
+                10, [batchIdx](auto row) { return batchIdx * 100 + row; }),
+        });
+      });
+
+  HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
+      .injectSpill(false)
+      .numDrivers(numDrivers_)
+      .probeKeys({"c0"})
+      .probeVectors(std::move(probeVectors))
+      .buildKeys({"u_c0"})
+      .buildVectors(std::move(buildVectors))
+      .buildProjections({"c0 AS u_c0", "c1 AS u_c1"})
+      .joinType(core::JoinType::kLeft)
+      .joinOutputLayout({"row_number", "c0", "c1", "u_c0"})
+      .referenceQuery(
+          "SELECT t.row_number, t.c0, t.c1, u.c0 FROM t LEFT JOIN u ON t.c0 = u.c0")
+      .config(cudf_velox::CudfFromVelox::kGpuBatchSizeRows, "10")
+      .run();
+}
+
+// Probe rows match in different build batches, testing that matchCol
+// accumulates correctly via BITWISE_OR across batches.
+TEST_P(MultiThreadedHashJoinTest, leftJoinBatchedBuildMatchesAcrossBatches) {
+  auto& cudfConfig = cudf_velox::CudfConfig::getInstance();
+  auto savedMin = cudfConfig.batchSizeMinThreshold;
+  auto savedMax = cudfConfig.batchSizeMaxThreshold;
+  cudfConfig.batchSizeMinThreshold = 10;
+  cudfConfig.batchSizeMaxThreshold = 10;
+  SCOPE_EXIT {
+    cudfConfig.batchSizeMinThreshold = savedMin;
+    cudfConfig.batchSizeMaxThreshold = savedMax;
+  };
+
+  // Probe keys [0..9]. Even keys match batch 0, odd keys match batch 1.
+  std::vector<RowVectorPtr> probeVectors = {makeRowVector(
+      {"c0", "c1"},
+      {
+          makeFlatVector<int32_t>(10, [](auto row) { return row; }),
+          makeFlatVector<int32_t>(10, [](auto row) { return row * 10; }),
+      })};
+
+  // Build batch 0: even keys [0, 2, 4, 6, 8, 200..204]
+  // Build batch 1: odd keys [1, 3, 5, 7, 9, 300..304]
+  std::vector<RowVectorPtr> buildVectors =
+      makeBatches(2, [&](int32_t batchIdx) {
+        return makeRowVector({
+            makeFlatVector<int32_t>(
+                10,
+                [batchIdx](auto row) {
+                  return row < 5 ? batchIdx + row * 2
+                                 : (batchIdx + 2) * 100 + row;
+                }),
+            makeFlatVector<int32_t>(
+                10, [batchIdx](auto row) { return batchIdx * 100 + row; }),
+        });
+      });
+
+  HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
+      .injectSpill(false)
+      .numDrivers(numDrivers_)
+      .probeKeys({"c0"})
+      .probeVectors(std::move(probeVectors))
+      .buildKeys({"u_c0"})
+      .buildVectors(std::move(buildVectors))
+      .buildProjections({"c0 AS u_c0", "c1 AS u_c1"})
+      .joinType(core::JoinType::kLeft)
+      .joinOutputLayout({"c0", "c1", "u_c0", "u_c1"})
+      .referenceQuery(
+          "SELECT t.c0, t.c1, u.c0, u.c1 FROM t LEFT JOIN u ON t.c0 = u.c0")
+      .config(cudf_velox::CudfFromVelox::kGpuBatchSizeRows, "10")
+      .run();
+}
+
+// A single probe key matches rows in multiple build batches. Verifies that
+// all matched pairs appear and no spurious unmatched-with-NULL row is emitted.
+TEST_P(MultiThreadedHashJoinTest, leftJoinBatchedBuildDuplicateMatches) {
+  auto& cudfConfig = cudf_velox::CudfConfig::getInstance();
+  auto savedMin = cudfConfig.batchSizeMinThreshold;
+  auto savedMax = cudfConfig.batchSizeMaxThreshold;
+  cudfConfig.batchSizeMinThreshold = 10;
+  cudfConfig.batchSizeMaxThreshold = 10;
+  SCOPE_EXIT {
+    cudfConfig.batchSizeMinThreshold = savedMin;
+    cudfConfig.batchSizeMaxThreshold = savedMax;
+  };
+
+  // Probe has a single key=1.
+  std::vector<RowVectorPtr> probeVectors = {makeRowVector(
+      {"c0", "c1"},
+      {
+          makeFlatVector<int32_t>({1}),
+          makeFlatVector<int32_t>({10}),
+      })};
+
+  // Both build batches contain key=1 (among others).
+  std::vector<RowVectorPtr> buildVectors =
+      makeBatches(2, [&](int32_t batchIdx) {
+        return makeRowVector({
+            makeFlatVector<int32_t>(10, [](auto row) { return row; }),
+            makeFlatVector<int32_t>(
+                10, [batchIdx](auto row) { return batchIdx * 100 + row; }),
+        });
+      });
+
+  HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
+      .injectSpill(false)
+      .numDrivers(numDrivers_)
+      .probeKeys({"c0"})
+      .probeVectors(std::move(probeVectors))
+      .buildKeys({"u_c0"})
+      .buildVectors(std::move(buildVectors))
+      .buildProjections({"c0 AS u_c0", "c1 AS u_c1"})
+      .joinType(core::JoinType::kLeft)
+      .joinOutputLayout({"c0", "c1", "u_c0", "u_c1"})
+      .referenceQuery(
+          "SELECT t.c0, t.c1, u.c0, u.c1 FROM t LEFT JOIN u ON t.c0 = u.c0")
+      .config(cudf_velox::CudfFromVelox::kGpuBatchSizeRows, "10")
+      .run();
+}
+
+// Left join with an AST-compatible filter and multiple build batches.
+TEST_P(MultiThreadedHashJoinTest, leftJoinBatchedBuildWithFilter) {
+  auto& cudfConfig = cudf_velox::CudfConfig::getInstance();
+  auto savedMin = cudfConfig.batchSizeMinThreshold;
+  auto savedMax = cudfConfig.batchSizeMaxThreshold;
+  cudfConfig.batchSizeMinThreshold = 10;
+  cudfConfig.batchSizeMaxThreshold = 10;
+  SCOPE_EXIT {
+    cudfConfig.batchSizeMinThreshold = savedMin;
+    cudfConfig.batchSizeMaxThreshold = savedMax;
+  };
+
+  // Probe keys [0..9] with c1 values.
+  std::vector<RowVectorPtr> probeVectors = {makeRowVector(
+      {"c0", "c1"},
+      {
+          makeFlatVector<int32_t>(10, [](auto row) { return row; }),
+          makeFlatVector<int32_t>(10, [](auto row) { return row; }),
+      })};
+
+  // Build: 3 batches of 10 rows. All batches have keys [0..9] so every
+  // probe row has key matches in every batch. The filter will select only
+  // some of the matched pairs.
+  std::vector<RowVectorPtr> buildVectors =
+      makeBatches(3, [&](int32_t batchIdx) {
+        return makeRowVector({
+            makeFlatVector<int32_t>(10, [](auto row) { return row; }),
+            makeFlatVector<int32_t>(
+                10, [batchIdx](auto row) { return batchIdx * 10 + row; }),
+        });
+      });
+
+  // Filter: (c1 + u_c1) % 2 = 1. Some probe rows will have matches that
+  // pass, some won't. Probe rows whose matches all fail should appear with
+  // NULL build columns.
+  HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
+      .injectSpill(false)
+      .numDrivers(numDrivers_)
+      .probeKeys({"c0"})
+      .probeVectors(std::move(probeVectors))
+      .buildKeys({"u_c0"})
+      .buildVectors(std::move(buildVectors))
+      .buildProjections({"c0 AS u_c0", "c1 AS u_c1"})
+      .joinType(core::JoinType::kLeft)
+      .joinFilter("(c1 + u_c1) % 2 = 1")
+      .joinOutputLayout({"c0", "c1", "u_c1"})
+      .referenceQuery(
+          "SELECT t.c0, t.c1, u.c1 FROM t LEFT JOIN u ON t.c0 = u.c0 "
+          "AND (t.c1 + u.c1) % 2 = 1")
+      .config(cudf_velox::CudfFromVelox::kGpuBatchSizeRows, "10")
+      .run();
+}
+
+// Left join with a non-AST filter (lower() is not supported by cuDF AST)
+// and multiple build batches. Tests the filterFunc lambda match tracking path.
+TEST_P(MultiThreadedHashJoinTest, leftJoinBatchedBuildWithNonAstFilter) {
+  auto& cudfConfig = cudf_velox::CudfConfig::getInstance();
+  auto savedMin = cudfConfig.batchSizeMinThreshold;
+  auto savedMax = cudfConfig.batchSizeMaxThreshold;
+  cudfConfig.batchSizeMinThreshold = 10;
+  cudfConfig.batchSizeMaxThreshold = 10;
+  SCOPE_EXIT {
+    cudfConfig.batchSizeMinThreshold = savedMin;
+    cudfConfig.batchSizeMaxThreshold = savedMax;
+  };
+
+  std::vector<RowVectorPtr> probeVectors = {makeRowVector(
+      {"t0", "t1"},
+      {
+          makeFlatVector<int64_t>(10, [](auto row) { return row; }),
+          makeFlatVector<std::string>(
+              10, [](auto row) { return row % 2 == 0 ? "HELLO" : "world"; }),
+      })};
+
+  // Build: 2 batches. Batch 0 has keys [0..9] with "hello", batch 1 has
+  // keys [0..9] with "WORLD". lower(t1)=lower(u1) matches "HELLO"/"hello"
+  // for even probe rows in batch 0, and "world"/"WORLD" for odd probe rows
+  // in batch 1.
+  std::vector<RowVectorPtr> buildVectors =
+      makeBatches(2, [&](int32_t batchIdx) {
+        return makeRowVector(
+            {"u0", "u1"},
+            {
+                makeFlatVector<int64_t>(10, [](auto row) { return row; }),
+                makeFlatVector<std::string>(
+                    10,
+                    [batchIdx](auto /*row*/) {
+                      return batchIdx == 0 ? "hello" : "WORLD";
+                    }),
+            });
+      });
+
+  HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
+      .injectSpill(false)
+      .numDrivers(numDrivers_)
+      .probeKeys({"t0"})
+      .probeVectors(std::move(probeVectors))
+      .buildKeys({"u0"})
+      .buildVectors(std::move(buildVectors))
+      .joinType(core::JoinType::kLeft)
+      .joinFilter("lower(t1) = lower(u1)")
+      .joinOutputLayout({"t0", "t1", "u0", "u1"})
+      .referenceQuery(
+          "SELECT t.t0, t.t1, u.u0, u.u1 FROM t LEFT JOIN u "
+          "ON t.t0 = u.u0 AND lower(t.t1) = lower(u.u1)")
+      .config(cudf_velox::CudfFromVelox::kGpuBatchSizeRows, "10")
+      .run();
+}
+
+// Full join with multiple build batches. Tests both probe-side and build-side
+// unmatched row emission.
+TEST_P(MultiThreadedHashJoinTest, fullJoinBatchedBuild) {
+  auto& cudfConfig = cudf_velox::CudfConfig::getInstance();
+  auto savedMin = cudfConfig.batchSizeMinThreshold;
+  auto savedMax = cudfConfig.batchSizeMaxThreshold;
+  cudfConfig.batchSizeMinThreshold = 10;
+  cudfConfig.batchSizeMaxThreshold = 10;
+  SCOPE_EXIT {
+    cudfConfig.batchSizeMinThreshold = savedMin;
+    cudfConfig.batchSizeMaxThreshold = savedMax;
+  };
+
+  // Probe keys [0..4, 100..102]. Keys 0-4 match build, 100-102 don't.
+  std::vector<RowVectorPtr> probeVectors = {makeRowVector(
+      {"c0", "c1"},
+      {
+          makeFlatVector<int32_t>({0, 1, 2, 3, 4, 100, 101, 102}),
+          makeFlatVector<int32_t>({10, 11, 12, 13, 14, 15, 16, 17}),
+      })};
+
+  // Build: 3 batches of 10 rows. Batch 0 has keys [200..209] (no probe
+  // match), batch 1 has keys [0..9] (keys 0-4 match probe, 5-9 don't),
+  // batch 2 has keys [300..309] (no probe match). Build keys 5-9, 200-209,
+  // 300-309 are unmatched and should appear with NULL probe columns.
+  std::vector<RowVectorPtr> buildVectors =
+      makeBatches(3, [&](int32_t batchIdx) {
+        return makeRowVector({
+            makeFlatVector<int32_t>(
+                10,
+                [batchIdx](auto row) {
+                  if (batchIdx == 1) {
+                    return static_cast<int32_t>(row);
+                  }
+                  return static_cast<int32_t>(
+                      (batchIdx == 0 ? 200 : 300) + row);
+                }),
+            makeFlatVector<int32_t>(
+                10, [batchIdx](auto row) { return batchIdx * 100 + row; }),
+        });
+      });
+
+  HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
+      .injectSpill(false)
+      .numDrivers(numDrivers_)
+      .probeKeys({"c0"})
+      .probeVectors(std::move(probeVectors))
+      .buildKeys({"u_c0"})
+      .buildVectors(std::move(buildVectors))
+      .buildProjections({"c0 AS u_c0", "c1 AS u_c1"})
+      .joinType(core::JoinType::kFull)
+      .joinOutputLayout({"c0", "c1", "u_c0", "u_c1"})
+      .referenceQuery(
+          "SELECT t.c0, t.c1, u.c0, u.c1 FROM t FULL OUTER JOIN u "
+          "ON t.c0 = u.c0")
+      .config(cudf_velox::CudfFromVelox::kGpuBatchSizeRows, "10")
+      .run();
+}
+
+// Full join with AST filter and multiple build batches.
+TEST_P(MultiThreadedHashJoinTest, fullJoinBatchedBuildWithFilter) {
+  auto& cudfConfig = cudf_velox::CudfConfig::getInstance();
+  auto savedMin = cudfConfig.batchSizeMinThreshold;
+  auto savedMax = cudfConfig.batchSizeMaxThreshold;
+  cudfConfig.batchSizeMinThreshold = 10;
+  cudfConfig.batchSizeMaxThreshold = 10;
+  SCOPE_EXIT {
+    cudfConfig.batchSizeMinThreshold = savedMin;
+    cudfConfig.batchSizeMaxThreshold = savedMax;
+  };
+
+  // Probe keys [0..7].
+  std::vector<RowVectorPtr> probeVectors = {makeRowVector(
+      {"c0", "c1"},
+      {
+          makeFlatVector<int32_t>(8, [](auto row) { return row; }),
+          makeFlatVector<int32_t>(8, [](auto row) { return row; }),
+      })};
+
+  // Build: 2 batches of 10 rows each. Both have keys [0..9]. The filter
+  // will select only some pairs.
+  std::vector<RowVectorPtr> buildVectors =
+      makeBatches(2, [&](int32_t batchIdx) {
+        return makeRowVector({
+            makeFlatVector<int32_t>(10, [](auto row) { return row; }),
+            makeFlatVector<int32_t>(
+                10, [batchIdx](auto row) { return batchIdx * 10 + row; }),
+        });
+      });
+
+  HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
+      .injectSpill(false)
+      .numDrivers(numDrivers_)
+      .probeKeys({"c0"})
+      .probeVectors(std::move(probeVectors))
+      .buildKeys({"u_c0"})
+      .buildVectors(std::move(buildVectors))
+      .buildProjections({"c0 AS u_c0", "c1 AS u_c1"})
+      .joinType(core::JoinType::kFull)
+      .joinFilter("(c1 + u_c1) % 2 = 1")
+      .joinOutputLayout({"c0", "c1", "u_c1"})
+      .referenceQuery(
+          "SELECT t.c0, t.c1, u.c1 FROM t FULL OUTER JOIN u ON t.c0 = u.c0 "
+          "AND (t.c1 + u.c1) % 2 = 1")
+      .config(cudf_velox::CudfFromVelox::kGpuBatchSizeRows, "10")
+      .run();
+}
+
+// Left semi filter join with multiple build batches. A probe key appears in
+// multiple build batches. Without deduplication, the semi-join would emit
+// the probe row once per matching build batch instead of exactly once.
+TEST_P(MultiThreadedHashJoinTest, leftSemiFilterJoinBatchedBuild) {
+  auto& cudfConfig = cudf_velox::CudfConfig::getInstance();
+  auto savedMin = cudfConfig.batchSizeMinThreshold;
+  auto savedMax = cudfConfig.batchSizeMaxThreshold;
+  cudfConfig.batchSizeMinThreshold = 10;
+  cudfConfig.batchSizeMaxThreshold = 10;
+  SCOPE_EXIT {
+    cudfConfig.batchSizeMinThreshold = savedMin;
+    cudfConfig.batchSizeMaxThreshold = savedMax;
+  };
+
+  // Probe: keys [0..4] plus unmatched keys [100, 101].
+  std::vector<RowVectorPtr> probeVectors = {makeRowVector(
+      {"c0", "c1"},
+      {
+          makeFlatVector<int32_t>({0, 1, 2, 3, 4, 100, 101}),
+          makeFlatVector<int32_t>({10, 11, 12, 13, 14, 15, 16}),
+      })};
+
+  // Build: 3 batches of 10 rows each. All three batches contain keys [0..9],
+  // so probe keys 0-4 match in every batch. Without the fix, each matching
+  // probe row would be emitted 3 times.
+  std::vector<RowVectorPtr> buildVectors =
+      makeBatches(3, [&](int32_t batchIdx) {
+        return makeRowVector({
+            makeFlatVector<int32_t>(10, [](auto row) { return row; }),
+            makeFlatVector<int32_t>(
+                10, [batchIdx](auto row) { return batchIdx * 100 + row; }),
+        });
+      });
+
+  HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
+      .injectSpill(false)
+      .numDrivers(numDrivers_)
+      .probeKeys({"c0"})
+      .probeVectors(std::move(probeVectors))
+      .buildKeys({"u_c0"})
+      .buildVectors(std::move(buildVectors))
+      .buildProjections({"c0 AS u_c0", "c1 AS u_c1"})
+      .joinType(core::JoinType::kLeftSemiFilter)
+      .joinOutputLayout({"c0", "c1"})
+      .referenceQuery(
+          "SELECT t.c0, t.c1 FROM t WHERE t.c0 IN (SELECT u.c0 FROM u)")
+      .config(cudf_velox::CudfFromVelox::kGpuBatchSizeRows, "10")
+      .run();
+}
+
+// Left semi filter join with filter and multiple build batches. Probe keys
+// match in multiple build batches but only some pairs pass the filter.
+// Verifies that each probe row appears at most once regardless of how many
+// build batches contain a passing match.
+TEST_P(MultiThreadedHashJoinTest, leftSemiFilterJoinBatchedBuildWithFilter) {
+  auto& cudfConfig = cudf_velox::CudfConfig::getInstance();
+  auto savedMin = cudfConfig.batchSizeMinThreshold;
+  auto savedMax = cudfConfig.batchSizeMaxThreshold;
+  cudfConfig.batchSizeMinThreshold = 10;
+  cudfConfig.batchSizeMaxThreshold = 10;
+  SCOPE_EXIT {
+    cudfConfig.batchSizeMinThreshold = savedMin;
+    cudfConfig.batchSizeMaxThreshold = savedMax;
+  };
+
+  // Probe: keys [0..7].
+  std::vector<RowVectorPtr> probeVectors = {makeRowVector(
+      {"c0", "c1"},
+      {
+          makeFlatVector<int32_t>(8, [](auto row) { return row; }),
+          makeFlatVector<int32_t>(8, [](auto row) { return row; }),
+      })};
+
+  // Build: 2 batches of 10 rows each. Both have keys [0..9].
+  std::vector<RowVectorPtr> buildVectors =
+      makeBatches(2, [&](int32_t batchIdx) {
+        return makeRowVector({
+            makeFlatVector<int32_t>(10, [](auto row) { return row; }),
+            makeFlatVector<int32_t>(
+                10, [batchIdx](auto row) { return batchIdx * 10 + row; }),
+        });
+      });
+
+  HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
+      .injectSpill(false)
+      .numDrivers(numDrivers_)
+      .probeKeys({"c0"})
+      .probeVectors(std::move(probeVectors))
+      .buildKeys({"u_c0"})
+      .buildVectors(std::move(buildVectors))
+      .buildProjections({"c0 AS u_c0", "c1 AS u_c1"})
+      .joinType(core::JoinType::kLeftSemiFilter)
+      .joinFilter("c1 + u_c1 > 5")
+      .joinOutputLayout({"c0", "c1"})
+      .referenceQuery(
+          "SELECT t.c0, t.c1 FROM t WHERE EXISTS "
+          "(SELECT 1 FROM u WHERE t.c0 = u.c0 AND t.c1 + u.c1 > 5)")
+      .config(cudf_velox::CudfFromVelox::kGpuBatchSizeRows, "10")
       .run();
 }
 
@@ -2775,12 +3256,15 @@ TEST_F(HashJoinTest, nullAwareRightSemiProjectOverScan) {
         {buildScanId, {buildFile->getPath()}},
     };
 
-    HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
-        .planNode(plan)
-        .inputSplits(splitPaths)
-        .checkSpillStats(false)
-        .referenceQuery("SELECT u0, u0 IN (SELECT t0 FROM t) FROM u")
-        .run();
+    // right semi project not supported
+    VELOX_ASSERT_THROW(
+        HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
+            .planNode(plan)
+            .inputSplits(splitPaths)
+            .checkSpillStats(false)
+            .referenceQuery("SELECT u0, u0 IN (SELECT t0 FROM t) FROM u")
+            .run(),
+        "Replacement with cuDF operator failed");
   }
 }
 
@@ -2882,156 +3366,6 @@ TEST_F(HashJoinTest, duplicateJoinKeys) {
   }
 }
 
-TEST_P(MultiThreadedHashJoinTest, rightSemiProjectBuildLeft) {
-  auto& cudfConfig = cudf_velox::CudfConfig::getInstance();
-  const auto oldMaxBatchRows = cudfConfig.batchSizeMaxThreshold;
-  SCOPE_EXIT {
-    cudfConfig.batchSizeMaxThreshold = oldMaxBatchRows;
-  };
-  // Force the build into three independently hashed tables. This exercises
-  // flag indexing and final output across multiple build tables without
-  // requiring a cudf::size_type-sized test input.
-  cudfConfig.batchSizeMaxThreshold = 4;
-
-  auto probeVectors = std::vector<RowVectorPtr>{
-      makeRowVector(
-          {makeFlatVector<int64_t>({1, 2, 3, 4}),
-           makeFlatVector<int64_t>({10, 20, 30, 40})}),
-      makeRowVector(
-          {makeFlatVector<int64_t>({3, 4, 5, 6}),
-           makeFlatVector<int64_t>({31, 40, 50, 60})}),
-      makeRowVector(
-          {makeFlatVector<int64_t>({7, 8, 9, 10}),
-           makeFlatVector<int64_t>({70, 80, 90, 100})})};
-  auto buildVectors = std::vector<RowVectorPtr>{
-      makeRowVector(
-          {makeFlatVector<int64_t>({1, 2, 3, 4}),
-           makeFlatVector<int64_t>({10, 21, 30, 41})}),
-      makeRowVector(
-          {makeFlatVector<int64_t>({3, 4, 5, 6}),
-           makeFlatVector<int64_t>({32, 40, 51, 61})}),
-      makeRowVector(
-          {makeFlatVector<int64_t>({7, 8, 11, 12}),
-           makeFlatVector<int64_t>({71, 80, 110, 120})})};
-
-  createDuckDbTable("t", probeVectors);
-  createDuckDbTable("u", buildVectors);
-
-  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
-  core::PlanNodeId joinNodeId;
-  auto plan = PlanBuilder(planNodeIdGenerator)
-                  .values(probeVectors)
-                  .project({"c0 AS t0", "c1 AS t1"})
-                  .hashJoin(
-                      {"t0"},
-                      {"u0"},
-                      PlanBuilder(planNodeIdGenerator)
-                          .values(buildVectors)
-                          .project({"c0 AS u0", "c1 AS u1"})
-                          .planNode(),
-                      "t1 <> u1",
-                      {"u0", "u1", "match"},
-                      core::JoinType::kRightSemiProject)
-                  .capturePlanNodeId(joinNodeId)
-                  .planNode();
-
-  HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
-      .numDrivers(numDrivers_)
-      .injectSpill(false)
-      .checkSpillStats(false)
-      .planNode(plan)
-      .referenceQuery(
-          "SELECT u.c0, u.c1, EXISTS (SELECT * FROM t WHERE t.c0 = u.c0 AND t.c1 <> u.c1) FROM u")
-      .verifier([&](const std::shared_ptr<Task>& task, bool /*unused*/) {
-        // The last probe driver must emit multiple vectors, proving that this
-        // case exercised more than one independently hashed build chunk. The
-        // exact chunk count is an implementation detail of the batch splitter;
-        // DuckDB comparison above still verifies every output row and flag.
-        const auto planStats = toPlanStats(task->taskStats());
-        EXPECT_GT(planStats.at(joinNodeId).outputVectors, 1);
-      })
-      .run();
-}
-
-TEST_P(MultiThreadedHashJoinTest, rightSemiProjectNullableResidual) {
-  auto probeVectors = std::vector<RowVectorPtr>{makeRowVector(
-      {makeFlatVector<int64_t>({1, 1, 2, 2, 3}),
-       makeNullableFlatVector<int64_t>(
-           {10, std::nullopt, 21, std::nullopt, 30})})};
-  auto buildVectors = std::vector<RowVectorPtr>{makeRowVector(
-      {makeFlatVector<int64_t>({1, 1, 2, 2, 3, 4, 4}),
-       makeNullableFlatVector<int64_t>(
-           {10, std::nullopt, 20, std::nullopt, 30, std::nullopt, 41})})};
-
-  createDuckDbTable("t", probeVectors);
-  createDuckDbTable("u", buildVectors);
-
-  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
-  auto plan = PlanBuilder(planNodeIdGenerator)
-                  .values(probeVectors)
-                  .project({"c0 AS t0", "c1 AS t1"})
-                  .hashJoin(
-                      {"t0"},
-                      {"u0"},
-                      PlanBuilder(planNodeIdGenerator)
-                          .values(buildVectors)
-                          .project({"c0 AS u0", "c1 AS u1"})
-                          .planNode(),
-                      "t1 <> u1",
-                      {"u0", "u1", "match"},
-                      core::JoinType::kRightSemiProject)
-                  .planNode();
-
-  HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
-      .numDrivers(numDrivers_)
-      .injectSpill(false)
-      .checkSpillStats(false)
-      .planNode(plan)
-      .referenceQuery(
-          // DuckDB 0.8.1 can return NULL for this correlated EXISTS when the
-          // residual operands are NULL. SQL EXISTS and Velox ExistenceJoin are
-          // non-nullable: UNKNOWN residual rows are non-matches, hence false.
-          "SELECT u.c0, u.c1, COALESCE(EXISTS (SELECT * FROM t WHERE t.c0 = u.c0 AND t.c1 <> u.c1), false) FROM u")
-      .run();
-}
-
-TEST_P(MultiThreadedHashJoinTest, rightSemiProjectEmptyProbe) {
-  auto probeVectors = std::vector<RowVectorPtr>{makeRowVector(
-      {makeFlatVector<int64_t>(std::vector<int64_t>{}),
-       makeFlatVector<int64_t>(std::vector<int64_t>{})})};
-  auto buildVectors = std::vector<RowVectorPtr>{makeRowVector(
-      {makeNullableFlatVector<int64_t>({1, 1, std::nullopt, 2, 2}),
-       makeFlatVector<int64_t>({10, 11, 12, 20, 20})})};
-
-  createDuckDbTable("t", probeVectors);
-  createDuckDbTable("u", buildVectors);
-
-  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
-  auto plan = PlanBuilder(planNodeIdGenerator)
-                  .values(probeVectors)
-                  .project({"c0 AS t0", "c1 AS t1"})
-                  .hashJoin(
-                      {"t0"},
-                      {"u0"},
-                      PlanBuilder(planNodeIdGenerator)
-                          .values(buildVectors)
-                          .project({"c0 AS u0", "c1 AS u1"})
-                          .planNode(),
-                      "",
-                      {"u0", "u1", "match"},
-                      core::JoinType::kRightSemiProject)
-                  .planNode();
-
-  HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
-      .numDrivers(numDrivers_)
-      .injectSpill(false)
-      .checkSpillStats(false)
-      .planNode(plan)
-      .referenceQuery(
-          "SELECT u.c0, u.c1, EXISTS (SELECT * FROM t WHERE t.c0 = u.c0) FROM u")
-      .run();
-}
-
 TEST_F(HashJoinTest, semiProject) {
   // Some keys have multiple rows: 2, 3, 5.
   auto probeVectors = makeBatches(3, [&](int32_t /*unused*/) {
@@ -3078,13 +3412,16 @@ TEST_F(HashJoinTest, semiProject) {
           "SELECT t.c0, t.c1, EXISTS (SELECT * FROM u WHERE t.c0 = u.c0) FROM t")
       .run();
 
-  HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
-      .injectSpill(false)
-      .checkSpillStats(false)
-      .planNode(flipJoinSides(plan))
-      .referenceQuery(
-          "SELECT t.c0, t.c1, EXISTS (SELECT * FROM u WHERE t.c0 = u.c0) FROM t")
-      .run();
+  // right semi project not supported
+  VELOX_ASSERT_THROW(
+      HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
+          .injectSpill(false)
+          .checkSpillStats(false)
+          .planNode(flipJoinSides(plan))
+          .referenceQuery(
+              "SELECT t.c0, t.c1, EXISTS (SELECT * FROM u WHERE t.c0 = u.c0) FROM t")
+          .run(),
+      "Replacement with cuDF operator failed");
 
   // With extra filter.
   planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
@@ -3111,13 +3448,16 @@ TEST_F(HashJoinTest, semiProject) {
           "SELECT t.c0, t.c1, EXISTS (SELECT * FROM u WHERE t.c0 = u.c0 AND t.c1 * 10 <> u.c1) FROM t")
       .run();
 
-  HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
-      .injectSpill(false)
-      .checkSpillStats(false)
-      .planNode(flipJoinSides(plan))
-      .referenceQuery(
-          "SELECT t.c0, t.c1, EXISTS (SELECT * FROM u WHERE t.c0 = u.c0 AND t.c1 * 10 <> u.c1) FROM t")
-      .run();
+  // right semi project not supported
+  VELOX_ASSERT_THROW(
+      HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
+          .injectSpill(false)
+          .checkSpillStats(false)
+          .planNode(flipJoinSides(plan))
+          .referenceQuery(
+              "SELECT t.c0, t.c1, EXISTS (SELECT * FROM u WHERE t.c0 = u.c0 AND t.c1 * 10 <> u.c1) FROM t")
+          .run(),
+      "Replacement with cuDF operator failed");
 
   // Empty build side.
   planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
@@ -3147,16 +3487,19 @@ TEST_F(HashJoinTest, semiProject) {
       // build-side rows have been filtered out.
       .run();
 
-  HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
-      .injectSpill(false)
-      .checkSpillStats(false)
-      .planNode(flipJoinSides(plan))
-      .referenceQuery(
-          "SELECT t.c0, t.c1, EXISTS (SELECT * FROM u WHERE u.c0 < 0 AND t.c0 = u.c0) FROM t")
-      // NOTE: there is no spilling in empty build test case as all the
-      // build-side rows have been filtered out.
-      .checkSpillStats(false)
-      .run();
+  // right semi project not supported
+  VELOX_ASSERT_THROW(
+      HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
+          .injectSpill(false)
+          .checkSpillStats(false)
+          .planNode(flipJoinSides(plan))
+          .referenceQuery(
+              "SELECT t.c0, t.c1, EXISTS (SELECT * FROM u WHERE u.c0 < 0 AND t.c0 = u.c0) FROM t")
+          // NOTE: there is no spilling in empty build test case as all the
+          // build-side rows have been filtered out.
+          .checkSpillStats(false)
+          .run(),
+      "Replacement with cuDF operator failed");
 }
 
 TEST_F(HashJoinTest, semiProjectWithNullKeys) {
@@ -3221,13 +3564,16 @@ TEST_F(HashJoinTest, semiProjectWithNullKeys) {
           "SELECT t0, t1, EXISTS (SELECT * FROM u WHERE u0 = t0) FROM t")
       .run();
 
-  HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
-      .injectSpill(false)
-      .checkSpillStats(false)
-      .planNode(flipJoinSides(plan))
-      .referenceQuery(
-          "SELECT t0, t1, EXISTS (SELECT * FROM u WHERE u0 = t0) FROM t")
-      .run();
+  // right semi project not supported
+  VELOX_ASSERT_THROW(
+      HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
+          .injectSpill(false)
+          .checkSpillStats(false)
+          .planNode(flipJoinSides(plan))
+          .referenceQuery(
+              "SELECT t0, t1, EXISTS (SELECT * FROM u WHERE u0 = t0) FROM t")
+          .run(),
+      "Replacement with cuDF operator failed");
 
   plan = makePlan(true /*nullAware*/);
 
@@ -3239,12 +3585,15 @@ TEST_F(HashJoinTest, semiProjectWithNullKeys) {
       .referenceQuery("SELECT t0, t1, t0 IN (SELECT u0 FROM u) FROM t")
       .run();
 
-  HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
-      .injectSpill(false)
-      .checkSpillStats(false)
-      .planNode(flipJoinSides(plan))
-      .referenceQuery("SELECT t0, t1, t0 IN (SELECT u0 FROM u) FROM t")
-      .run();
+  // null-aware right semi project not supported
+  VELOX_ASSERT_THROW(
+      HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
+          .injectSpill(false)
+          .checkSpillStats(false)
+          .planNode(flipJoinSides(plan))
+          .referenceQuery("SELECT t0, t1, t0 IN (SELECT u0 FROM u) FROM t")
+          .run(),
+      "Replacement with cuDF operator failed");
 
   // Null join keys on build side-only.
   plan = makePlan(false /*nullAware*/, "t0 IS NOT NULL");
@@ -3257,13 +3606,16 @@ TEST_F(HashJoinTest, semiProjectWithNullKeys) {
           "SELECT t0, t1, EXISTS (SELECT * FROM u WHERE u0 = t0) FROM t WHERE t0 IS NOT NULL")
       .run();
 
-  HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
-      .injectSpill(false)
-      .checkSpillStats(false)
-      .planNode(flipJoinSides(plan))
-      .referenceQuery(
-          "SELECT t0, t1, EXISTS (SELECT * FROM u WHERE u0 = t0) FROM t WHERE t0 IS NOT NULL")
-      .run();
+  // right semi project not supported
+  VELOX_ASSERT_THROW(
+      HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
+          .injectSpill(false)
+          .checkSpillStats(false)
+          .planNode(flipJoinSides(plan))
+          .referenceQuery(
+              "SELECT t0, t1, EXISTS (SELECT * FROM u WHERE u0 = t0) FROM t WHERE t0 IS NOT NULL")
+          .run(),
+      "Replacement with cuDF operator failed");
 
   plan = makePlan(true /*nullAware*/, "t0 IS NOT NULL");
 
@@ -3276,13 +3628,16 @@ TEST_F(HashJoinTest, semiProjectWithNullKeys) {
           "SELECT t0, t1, t0 IN (SELECT u0 FROM u) FROM t WHERE t0 IS NOT NULL")
       .run();
 
-  HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
-      .injectSpill(false)
-      .checkSpillStats(false)
-      .planNode(flipJoinSides(plan))
-      .referenceQuery(
-          "SELECT t0, t1, t0 IN (SELECT u0 FROM u) FROM t WHERE t0 IS NOT NULL")
-      .run();
+  // null-aware right semi project not supported
+  VELOX_ASSERT_THROW(
+      HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
+          .injectSpill(false)
+          .checkSpillStats(false)
+          .planNode(flipJoinSides(plan))
+          .referenceQuery(
+              "SELECT t0, t1, t0 IN (SELECT u0 FROM u) FROM t WHERE t0 IS NOT NULL")
+          .run(),
+      "Replacement with cuDF operator failed");
 
   // Null join keys on probe side-only.
   plan = makePlan(false /*nullAware*/, "", "u0 IS NOT NULL");
@@ -3295,13 +3650,16 @@ TEST_F(HashJoinTest, semiProjectWithNullKeys) {
           "SELECT t0, t1, EXISTS (SELECT * FROM u WHERE u0 = t0 AND u0 IS NOT NULL) FROM t")
       .run();
 
-  HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
-      .injectSpill(false)
-      .checkSpillStats(false)
-      .planNode(flipJoinSides(plan))
-      .referenceQuery(
-          "SELECT t0, t1, EXISTS (SELECT * FROM u WHERE u0 = t0 AND u0 IS NOT NULL) FROM t")
-      .run();
+  // right semi project not supported
+  VELOX_ASSERT_THROW(
+      HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
+          .injectSpill(false)
+          .checkSpillStats(false)
+          .planNode(flipJoinSides(plan))
+          .referenceQuery(
+              "SELECT t0, t1, EXISTS (SELECT * FROM u WHERE u0 = t0 AND u0 IS NOT NULL) FROM t")
+          .run(),
+      "Replacement with cuDF operator failed");
 
   plan = makePlan(true /*nullAware*/, "", "u0 IS NOT NULL");
 
@@ -3314,13 +3672,16 @@ TEST_F(HashJoinTest, semiProjectWithNullKeys) {
           "SELECT t0, t1, t0 IN (SELECT u0 FROM u WHERE u0 IS NOT NULL) FROM t")
       .run();
 
-  HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
-      .injectSpill(false)
-      .checkSpillStats(false)
-      .planNode(flipJoinSides(plan))
-      .referenceQuery(
-          "SELECT t0, t1, t0 IN (SELECT u0 FROM u WHERE u0 IS NOT NULL) FROM t")
-      .run();
+  // null-aware right semi project not supported
+  VELOX_ASSERT_THROW(
+      HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
+          .injectSpill(false)
+          .checkSpillStats(false)
+          .planNode(flipJoinSides(plan))
+          .referenceQuery(
+              "SELECT t0, t1, t0 IN (SELECT u0 FROM u WHERE u0 IS NOT NULL) FROM t")
+          .run(),
+      "Replacement with cuDF operator failed");
 
   // Empty build side.
   plan = makePlan(false /*nullAware*/, "", "u0 < 0");
@@ -3333,13 +3694,16 @@ TEST_F(HashJoinTest, semiProjectWithNullKeys) {
           "SELECT t0, t1, EXISTS (SELECT * FROM u WHERE u0 = t0 AND u0 < 0) FROM t")
       .run();
 
-  HashJoinBuilder(*pool_, duckDbQueryRunner_, executor_.get())
-      .planNode(flipJoinSides(plan))
-      .injectSpill(false)
-      .checkSpillStats(false)
-      .referenceQuery(
-          "SELECT t0, t1, EXISTS (SELECT * FROM u WHERE u0 = t0 AND u0 < 0) FROM t")
-      .run();
+  // right semi project not supported
+  VELOX_ASSERT_THROW(
+      HashJoinBuilder(*pool_, duckDbQueryRunner_, executor_.get())
+          .planNode(flipJoinSides(plan))
+          .injectSpill(false)
+          .checkSpillStats(false)
+          .referenceQuery(
+              "SELECT t0, t1, EXISTS (SELECT * FROM u WHERE u0 = t0 AND u0 < 0) FROM t")
+          .run(),
+      "Replacement with cuDF operator failed");
 
   plan = makePlan(true /*nullAware*/, "", "u0 < 0");
 
@@ -3352,13 +3716,16 @@ TEST_F(HashJoinTest, semiProjectWithNullKeys) {
           "SELECT t0, t1, t0 IN (SELECT u0 FROM u WHERE u0 < 0) FROM t")
       .run();
 
-  HashJoinBuilder(*pool_, duckDbQueryRunner_, executor_.get())
-      .planNode(flipJoinSides(plan))
-      .injectSpill(false)
-      .checkSpillStats(false)
-      .referenceQuery(
-          "SELECT t0, t1, t0 IN (SELECT u0 FROM u WHERE u0 < 0) FROM t")
-      .run();
+  // null-aware right semi project not supported
+  VELOX_ASSERT_THROW(
+      HashJoinBuilder(*pool_, duckDbQueryRunner_, executor_.get())
+          .planNode(flipJoinSides(plan))
+          .injectSpill(false)
+          .checkSpillStats(false)
+          .referenceQuery(
+              "SELECT t0, t1, t0 IN (SELECT u0 FROM u WHERE u0 < 0) FROM t")
+          .run(),
+      "Replacement with cuDF operator failed");
 
   // Build side with all rows having null join keys.
   plan = makePlan(false /*nullAware*/, "", "u0 IS NULL");
@@ -3371,13 +3738,16 @@ TEST_F(HashJoinTest, semiProjectWithNullKeys) {
           "SELECT t0, t1, EXISTS (SELECT * FROM u WHERE u0 = t0 AND u0 IS NULL) FROM t")
       .run();
 
-  HashJoinBuilder(*pool_, duckDbQueryRunner_, executor_.get())
-      .planNode(flipJoinSides(plan))
-      .injectSpill(false)
-      .checkSpillStats(false)
-      .referenceQuery(
-          "SELECT t0, t1, EXISTS (SELECT * FROM u WHERE u0 = t0 AND u0 IS NULL) FROM t")
-      .run();
+  // right semi project not supported
+  VELOX_ASSERT_THROW(
+      HashJoinBuilder(*pool_, duckDbQueryRunner_, executor_.get())
+          .planNode(flipJoinSides(plan))
+          .injectSpill(false)
+          .checkSpillStats(false)
+          .referenceQuery(
+              "SELECT t0, t1, EXISTS (SELECT * FROM u WHERE u0 = t0 AND u0 IS NULL) FROM t")
+          .run(),
+      "Replacement with cuDF operator failed");
 
   plan = makePlan(true /*nullAware*/, "", "u0 IS NULL");
 
@@ -3390,13 +3760,16 @@ TEST_F(HashJoinTest, semiProjectWithNullKeys) {
           "SELECT t0, t1, t0 IN (SELECT u0 FROM u WHERE u0 IS NULL) FROM t")
       .run();
 
-  HashJoinBuilder(*pool_, duckDbQueryRunner_, executor_.get())
-      .planNode(flipJoinSides(plan))
-      .injectSpill(false)
-      .checkSpillStats(false)
-      .referenceQuery(
-          "SELECT t0, t1, t0 IN (SELECT u0 FROM u WHERE u0 IS NULL) FROM t")
-      .run();
+  // null-aware right semi project not supported
+  VELOX_ASSERT_THROW(
+      HashJoinBuilder(*pool_, duckDbQueryRunner_, executor_.get())
+          .planNode(flipJoinSides(plan))
+          .injectSpill(false)
+          .checkSpillStats(false)
+          .referenceQuery(
+              "SELECT t0, t1, t0 IN (SELECT u0 FROM u WHERE u0 IS NULL) FROM t")
+          .run(),
+      "Replacement with cuDF operator failed");
 }
 
 TEST_F(HashJoinTest, semiProjectWithFilter) {
@@ -4044,12 +4417,15 @@ TEST_F(HashJoinTest, semiProjectOverLazyVectors) {
       .referenceQuery("SELECT t0, t1, t0 IN (SELECT u0 FROM u) FROM t")
       .run();
 
-  HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
-      .planNode(flipJoinSides(plan))
-      .inputSplits(splitPaths)
-      .checkSpillStats(false)
-      .referenceQuery("SELECT t0, t1, t0 IN (SELECT u0 FROM u) FROM t")
-      .run();
+  // right semi project not supported
+  VELOX_ASSERT_THROW(
+      HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
+          .planNode(flipJoinSides(plan))
+          .inputSplits(splitPaths)
+          .checkSpillStats(false)
+          .referenceQuery("SELECT t0, t1, t0 IN (SELECT u0 FROM u) FROM t")
+          .run(),
+      "Replacement with cuDF operator failed");
 
   // With extra filter.
   planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
@@ -4076,13 +4452,16 @@ TEST_F(HashJoinTest, semiProjectOverLazyVectors) {
           "SELECT t0, t1, t0 IN (SELECT u0 FROM u WHERE (t1 + u1) % 3 = 0) FROM t")
       .run();
 
-  HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
-      .planNode(flipJoinSides(plan))
-      .inputSplits(splitPaths)
-      .checkSpillStats(false)
-      .referenceQuery(
-          "SELECT t0, t1, t0 IN (SELECT u0 FROM u WHERE (t1 + u1) % 3 = 0) FROM t")
-      .run();
+  // right semi project not supported
+  VELOX_ASSERT_THROW(
+      HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
+          .planNode(flipJoinSides(plan))
+          .inputSplits(splitPaths)
+          .checkSpillStats(false)
+          .referenceQuery(
+              "SELECT t0, t1, t0 IN (SELECT u0 FROM u WHERE (t1 + u1) % 3 = 0) FROM t")
+          .run(),
+      "Replacement with cuDF operator failed");
 }
 
 // Tests for join filters that require precomputation (non-AST operations)
@@ -9263,6 +9642,55 @@ TEST_F(HashJoinTest, emptyBuildWithDebugEnabled) {
           "SELECT t_k0, t_data, u_k0, u_data FROM t, u WHERE t_k0 = u_k0")
       .checkSpillStats(false)
       .run();
+}
+
+// Verify that cuDF hash join works correctly with mixed grouped execution.
+// In mixed mode the build runs ungrouped while the probe runs in grouped
+// split groups. Without correct cross-mode bridge handling, the probe hangs
+// waiting on an empty bridge.
+TEST_F(HashJoinTest, mixedGroupedExecution) {
+  auto vectors = makeVectors(probeType_, 4, 20);
+  auto filePath = TempFilePath::create();
+  writeToFile(filePath->getPath(), vectors);
+
+  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  core::PlanNodeId probeScanNodeId;
+  core::PlanNodeId buildScanNodeId;
+
+  auto plan = PlanBuilder(planNodeIdGenerator, pool_.get())
+                  .tableScan(probeType_)
+                  .capturePlanNodeId(probeScanNodeId)
+                  .project({"t_k1 as x"})
+                  .hashJoin(
+                      {"x"},
+                      {"y"},
+                      PlanBuilder(planNodeIdGenerator, pool_.get())
+                          .tableScan(probeType_)
+                          .capturePlanNodeId(buildScanNodeId)
+                          .project({"t_k1 as y"})
+                          .planNode(),
+                      "",
+                      {"x", "y"})
+                  .planNode();
+
+  constexpr int32_t numSplitGroups = 2;
+  std::vector<exec::Split> probeSplits;
+  for (int32_t i = 0; i < numSplitGroups; ++i) {
+    probeSplits.push_back(
+        exec::Split(makeHiveConnectorSplit(filePath->getPath()), i));
+  }
+
+  ASSERT_GT(
+      AssertQueryBuilder(plan)
+          .splits(probeScanNodeId, std::move(probeSplits))
+          .splits(
+              buildScanNodeId, {makeHiveConnectorSplit(filePath->getPath())})
+          .executionStrategy(core::ExecutionStrategy::kGrouped)
+          .groupedExecutionLeafNodeIds({probeScanNodeId})
+          .numSplitGroups(numSplitGroups)
+          .numConcurrentSplitGroups(1)
+          .countResults(),
+      0);
 }
 
 } // namespace

@@ -22,15 +22,14 @@
 #include "velox/experimental/cudf/tests/utils/ExpressionTestUtil.h"
 
 #include "velox/common/base/tests/GTestUtils.h"
-#include "velox/core/Expressions.h"
 #include "velox/dwio/common/tests/utils/BatchMaker.h"
 #include "velox/exec/tests/utils/AssertQueryBuilder.h"
 #include "velox/exec/tests/utils/OperatorTestBase.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
 #include "velox/functions/prestosql/ArrayConstructor.h"
-#include "velox/functions/sparksql/SparkQueryConfig.h"
 #include "velox/functions/sparksql/registration/Register.h"
 #include "velox/parse/TypeResolver.h"
+#include "velox/type/TimestampConversion.h"
 
 using namespace facebook::velox::exec::test;
 using namespace facebook::velox;
@@ -56,15 +55,6 @@ class CudfFilterProjectTest : public CudfFunctionBaseTest {
 
   CudfFilterProjectTest() {
     options_.parseIntegerAsBigint = false;
-  }
-
-  void assertTypedExpressionMatchesCpu(
-      const core::TypedExprPtr& expression,
-      const RowVectorPtr& input) {
-    exec::ExprSet exprSet({expression}, &execCtx_);
-    auto expected = functions::test::FunctionBaseTest::evaluate(exprSet, input);
-    auto actual = evaluate(exprSet, input);
-    facebook::velox::test::assertEqualVectors(expected, actual);
   }
 
   template <typename T>
@@ -165,104 +155,6 @@ TEST_F(CudfFilterProjectTest, hashWithSeed) {
   facebook::velox::test::assertEqualVectors(expected, hashResults);
 }
 
-TEST_F(CudfFilterProjectTest, monotonicallyIncreasingId) {
-  queryCtx_->testingOverrideConfigUnsafe(
-      {{functions::sparksql::SparkQueryConfig::qualify(
-            functions::sparksql::SparkQueryConfig::kPartitionId),
-        "2"}});
-
-  auto data = makeRowVector({makeFlatVector<int32_t>({10, 20, 30})});
-  assertExpressionMatchesCpu(
-      "monotonically_increasing_id()", data, data->rowType());
-}
-
-TEST_F(CudfFilterProjectTest, sequence) {
-  auto input = makeRowVector({
-      makeNullableFlatVector<int32_t>({3, 1, 5, std::nullopt}),
-      makeNullableFlatVector<int32_t>({1, 5, -1, std::nullopt}),
-      makeNullableFlatVector<int32_t>({1, 2, -2, std::nullopt}),
-  });
-
-  for (const auto& expression : {
-           "sequence(1, c0)",
-           "sequence(c0, 1)",
-           "sequence(c1, c0, c2)",
-       }) {
-    SCOPED_TRACE(expression);
-    assertExpressionMatchesCpu(expression, input, input->rowType());
-  }
-}
-
-TEST_F(CudfFilterProjectTest, arrayExcept) {
-  auto left = makeNullableArrayVector<int32_t>({
-      {{1, 2, 2, 3}},
-      {{1, std::nullopt, 4}},
-      std::nullopt,
-      {{5, 6}},
-  });
-  auto right = makeNullableArrayVector<int32_t>({
-      {{2, 4}},
-      {{std::nullopt}},
-      {{1}},
-      std::nullopt,
-  });
-  auto input = makeRowVector({left, right});
-
-  assertExpressionMatchesCpu("array_except(c0, c1)", input, input->rowType());
-}
-
-TEST_F(CudfFilterProjectTest, arrayExceptSequence) {
-  auto upper = makeNullableFlatVector<int32_t>({5, 3, 1, std::nullopt});
-  auto values = makeNullableArrayVector<int32_t>({
-      {{2, 4}},
-      {{1}},
-      {{}},
-      {{1}},
-  });
-  auto input = makeRowVector({upper, values});
-
-  assertExpressionMatchesCpu(
-      "array_except(sequence(1, c0 - 1), c1)", input, input->rowType());
-  assertExpressionMatchesCpu(
-      "concat_ws(', ', cast(array_except(sequence(1, c0 - 1), c1) as "
-      "array(varchar)))",
-      input,
-      input->rowType());
-}
-
-TEST_F(CudfFilterProjectTest, castStringToBoolean) {
-  auto input = makeRowVector({
-      makeNullableFlatVector<std::string>({
-          "true",
-          "FALSE",
-          " 1 ",
-          "0",
-          "yes",
-          " n ",
-          "invalid",
-          std::nullopt,
-      }),
-      makeNullableFlatVector<bool>({
-          false,
-          true,
-          false,
-          true,
-          false,
-          true,
-          true,
-          false,
-      }),
-  });
-
-  for (const auto& expression : {
-           "try_cast(c0 as boolean)",
-           "coalesce(try_cast(c0 as boolean), c1)",
-       }) {
-    SCOPED_TRACE(expression);
-    assertExpressionMatchesCpu(expression, input, input->rowType());
-  }
-}
-
 // TODO: Re-enable after https://github.com/rapidsai/cudf/issues/21720.
 // cuDF's murmurhash3_x86_32 combines columns via hash_combine(h(col0, seed),
 // h(col1, seed)), while Spark instead hashes columns iteratively:
@@ -308,58 +200,36 @@ TEST_F(CudfFilterProjectTest, dateAdd) {
   EXPECT_EQ(parseDate("2020-02-29"), dateAdd("2019-01-30", 395));
 }
 
-TEST_F(CudfFilterProjectTest, dateintTimestampPatterns) {
-  auto dateInts = makeNullableFlatVector<int32_t>({
-      20260101,
-      20260228,
-      20260229,
-      std::nullopt,
-  });
-  auto isoDates = makeNullableFlatVector<std::string>({
-      "2026-01-01",
-      "2026-02-28",
-      "not-a-date",
-      std::nullopt,
-  });
-  auto timestamps = makeNullableFlatVector<Timestamp>({
-      Timestamp(1767225600, 0),
-      Timestamp(1772236800, 0),
-      Timestamp(1772323200, 0),
-      std::nullopt,
-  });
-  auto epochSeconds = makeNullableFlatVector<int64_t>({
-      1767225600,
-      1772236800,
-      -59,
-      std::nullopt,
-  });
-  auto data = makeRowVector({dateInts, isoDates, timestamps, epochSeconds});
+TEST_F(CudfFilterProjectTest, dateTruncTimestamp) {
+  auto parseTs = [](const char* str) {
+    auto result = util::fromTimestampString(
+        StringView(str), util::TimestampParseMode::kLegacyCast);
+    VELOX_CHECK(result.hasValue(), "Bad timestamp: {}", str);
+    return result.value();
+  };
 
-  for (const auto& expression : {
-           "date_format(get_timestamp(cast(c0 as varchar), 'yyyyMMdd'), "
-           "'yyyyMMdd')",
-           "upper(date_format(get_timestamp(cast(c0 as varchar), "
-           "'yyyyMMdd'), 'MMM-yyyy'))",
-           "date_format(cast(add_months(coalesce(try_cast(get_timestamp("
-           "cast(c0 as varchar), 'yyyyMMdd') as date), try_cast(cast(c0 as "
-           "varchar) as date)), 1) as timestamp), 'yyyyMMdd')",
-           "date_format(cast(try_cast(c1 as date) as timestamp), "
-           "'yyyyMMdd')",
-           "try_cast(c1 as timestamp)",
-           "date_format(cast(coalesce(try_cast(get_timestamp(cast(c2 as "
-           "varchar), 'yyyyMMdd') as date), try_cast(cast(c2 as varchar) as "
-           "date)) as timestamp), 'yyyyMMdd')",
-           "unix_timestamp(c2)",
-           "to_unix_timestamp(c2)",
-           "from_unixtime(c3, 'yyyy-MM-dd HH:mm:ss')",
-           "unix_timestamp(cast(from_unixtime(c3, 'yyyy-MM-dd HH:mm:ss') as "
-           "timestamp))",
-           "unix_timestamp(coalesce(c2, cast(from_unixtime(c3, 'yyyy-MM-dd "
-           "HH:mm:ss') as timestamp)))",
-       }) {
-    SCOPED_TRACE(expression);
-    assertExpressionMatchesCpu(expression, data, data->rowType());
-  }
+  const auto dateTrunc = [&](const std::string& unit, Timestamp ts) {
+    return evaluateOnce<Timestamp>(
+        fmt::format("date_trunc('{}', c0)", unit),
+        {TIMESTAMP()},
+        std::optional<Timestamp>(ts));
+  };
+
+  auto ts = parseTs("2025-01-15 12:01:01.123");
+
+  EXPECT_EQ(parseTs("2025-01-15 12:01:01"), dateTrunc("second", ts));
+  EXPECT_EQ(parseTs("2025-01-15 12:01:00"), dateTrunc("minute", ts));
+  EXPECT_EQ(parseTs("2025-01-15 12:00:00"), dateTrunc("hour", ts));
+  EXPECT_EQ(parseTs("2025-01-15 00:00:00"), dateTrunc("day", ts));
+  EXPECT_EQ(parseTs("2025-01-01 00:00:00"), dateTrunc("month", ts));
+  EXPECT_EQ(parseTs("2025-01-01 00:00:00"), dateTrunc("quarter", ts));
+  EXPECT_EQ(parseTs("2025-01-01 00:00:00"), dateTrunc("year", ts));
+
+  auto preEpochTs = parseTs("1969-12-31 20:00:00");
+  EXPECT_EQ(parseTs("1969-12-31 00:00:00"), dateTrunc("day", preEpochTs));
+  EXPECT_EQ(parseTs("1969-12-01 00:00:00"), dateTrunc("month", preEpochTs));
+  EXPECT_EQ(parseTs("1969-10-01 00:00:00"), dateTrunc("quarter", preEpochTs));
+  EXPECT_EQ(parseTs("1969-01-01 00:00:00"), dateTrunc("year", preEpochTs));
 }
 
 TEST_F(CudfFilterProjectTest, substringConstantStartAndLength) {
@@ -547,29 +417,6 @@ TEST_F(CudfFilterProjectTest, getSupportedScalarElementTypes) {
   assertGetElementTypeMatchesCpu("timestamp", timestampArrays);
 }
 
-TEST_F(CudfFilterProjectTest, decimalComparisonAliases) {
-  auto input = makeRowVector({
-      makeNullableFlatVector<int64_t>(
-          {120, 150, 100, std::nullopt}, DECIMAL(10, 2)),
-      makeNullableFlatVector<int64_t>({120, 100, 200, 120}, DECIMAL(10, 2)),
-      makeNullableFlatVector<double>({0.0, 1.25, -1.5, std::nullopt}),
-  });
-
-  for (const auto& expression : {
-           "decimal_equalto(c0, c1)",
-           "decimal_notequalto(c0, c1)",
-           "decimal_greaterthan(c0, c1)",
-           "decimal_greaterthanorequal(c0, c1)",
-           "decimal_lessthan(c0, c1)",
-           "decimal_lessthanorequal(c0, c1)",
-           "decimal_equalto("
-           "try_cast(c2 as decimal(16, 5)), "
-           "cast(0.00000 as decimal(16, 5)))",
-       }) {
-    assertExpressionMatchesCpu(expression, input, input->rowType());
-  }
-}
-
 TEST_F(CudfFilterProjectTest, getSupportedComplexElementTypes) {
   // Cover complex ARRAY element types that cuDF list extraction can return.
   using OptionalIntArray = std::optional<std::vector<std::optional<int32_t>>>;
@@ -684,92 +531,6 @@ TEST_F(CudfFilterProjectTest, getConstantArraySupportedTypes) {
       "row_constructor(1, 'alpha'), "
       "row_constructor(2, 'beta'), "
       "row_constructor(3, 'gamma'))");
-}
-
-TEST_F(CudfFilterProjectTest, getJsonObjectConstantPath) {
-  auto input = makeNullableFlatVector<std::string>({
-      R"({"origin_country_iso_codes":"US","release_year":2024,"entity_quality_score":0.75})",
-      R"({"release_year":"2025","entity_quality_score":"0.5"})",
-      R"({"origin_country_iso_codes":["US","CA"],"entity_quality_score":null})",
-      std::nullopt,
-  });
-  auto data = makeRowVector({input});
-
-  for (const auto& expression : {
-           "get_json_object(c0, '$.origin_country_iso_codes')",
-           "get_json_object(c0, '$.missing')",
-           "get_json_object(c0, cast(null as varchar))",
-           "try_cast(get_json_object(c0, '$.release_year') as integer)",
-           "try_cast(get_json_object(c0, '$.entity_quality_score') as double)",
-       }) {
-    SCOPED_TRACE(expression);
-    assertExpressionMatchesCpu(expression, data, data->rowType());
-  }
-}
-
-TEST_F(CudfFilterProjectTest, fromJsonRowOfStringFields) {
-  auto input = makeNullableFlatVector<std::string>({
-      R"({"id":"10","name":"main","field-name":"v1","payload":"raw"})",
-      R"({"id":7,"payload":[1, 2]})",
-      R"({"name":"secondary","reason":"missing id"})",
-      std::nullopt,
-  });
-  auto data = makeRowVector({input});
-
-  auto outputType =
-      ROW({"id", "name", "reason", "field-name", "payload"},
-          {VARCHAR(), VARCHAR(), VARCHAR(), VARCHAR(), VARCHAR()});
-  auto expression = std::make_shared<const core::CallTypedExpr>(
-      outputType,
-      std::vector<core::TypedExprPtr>{
-          std::make_shared<core::FieldAccessTypedExpr>(VARCHAR(), "c0")},
-      "from_json");
-
-  assertTypedExpressionMatchesCpu(expression, data);
-}
-
-TEST_F(CudfFilterProjectTest, fromJsonNestedRow) {
-  auto input = makeNullableFlatVector<std::string>({
-      R"({"ok":true,"count":7,"score":1.25,"name":"main","items":[1,2]})",
-      R"({"ok":false,"count":null,"score":2.5,"name":"secondary","items":[]})",
-      R"({"name":"missing scalar fields"})",
-      "   ",
-      std::nullopt,
-  });
-  auto data = makeRowVector({input});
-
-  auto outputType =
-      ROW({"ok", "count", "score", "name", "items"},
-          {BOOLEAN(), BIGINT(), DOUBLE(), VARCHAR(), ARRAY(BIGINT())});
-  auto expression = std::make_shared<const core::CallTypedExpr>(
-      outputType,
-      std::vector<core::TypedExprPtr>{
-          std::make_shared<core::FieldAccessTypedExpr>(VARCHAR(), "c0")},
-      "from_json");
-
-  assertTypedExpressionMatchesCpu(expression, data);
-}
-
-TEST_F(CudfFilterProjectTest, fromJsonArrayOfRows) {
-  auto input = makeNullableFlatVector<std::string>({
-      R"([{"bgstart":true,"category":"ui","clienttime":10,"errorcode":"E1","errormsg":"first"},{"bgstart":false,"category":"network","clienttime":20,"errorcode":"E2","errormsg":"second"}])",
-      R"([])",
-      R"([{"category":"missing scalars"}])",
-      "   ",
-      std::nullopt,
-  });
-  auto data = makeRowVector({input});
-
-  auto rowType =
-      ROW({"bgstart", "category", "clienttime", "errorcode", "errormsg"},
-          {BOOLEAN(), VARCHAR(), BIGINT(), VARCHAR(), VARCHAR()});
-  auto expression = std::make_shared<const core::CallTypedExpr>(
-      ARRAY(rowType),
-      std::vector<core::TypedExprPtr>{
-          std::make_shared<core::FieldAccessTypedExpr>(VARCHAR(), "c0")},
-      "from_json");
-
-  assertTypedExpressionMatchesCpu(expression, data);
 }
 
 TEST_F(CudfFilterProjectTest, likeWithEscape) {

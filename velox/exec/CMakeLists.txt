@@ -83,6 +83,7 @@ velox_add_library(
   OrderBy.cpp
   OutputBuffer.cpp
   DefaultOutputBufferManager.cpp
+  OutputTransportRegistry.cpp
   ParallelProject.cpp
   PartitionFunction.cpp
   PartitionedOutput.cpp
@@ -182,10 +183,14 @@ velox_add_library(
   OperatorUtils.h
   OrderBy.h
   OutputBuffer.h
+  OutputBufferStats.h
+  OutputBufferManager.h
   DefaultOutputBufferManager.h
+  OutputTransportRegistry.h
   ParallelProject.h
   PartitionFunction.h
   PartitionedOutput.h
+  PartitionedOutputFactory.h
   PlanNodeStats.h
   PrefixSort.h
   ProbeOperatorState.h

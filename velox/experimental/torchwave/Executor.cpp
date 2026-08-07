@@ -812,9 +812,16 @@ void freeFrameValue(
 // bad and at which free point, to compare against its intended last use.
 void checkValueBeforeFree(
     nativert::ExecutionFrame& frame,
-    nativert::ValueId id) {
+    nativert::ValueId id,
+    const WaveGraph* waveGraph) {
   auto* ref = WaveConfig::get().referenceFrame;
   if (ref == nullptr) {
+    return;
+  }
+  // The input of an elided clone is overwritten in place on purpose, so it no
+  // longer holds what the reference recorded; comparing it reports a bug that
+  // is not there.
+  if (waveGraph != nullptr && waveGraph->isElidedCloneInput(id)) {
     return;
   }
   auto it = ref->find(id);
@@ -825,7 +832,10 @@ void checkValueBeforeFree(
   std::optional<at::Tensor> actual = iv.isTensor()
       ? std::optional<at::Tensor>(iv.toTensor())
       : scalarLikeToTensor(iv);
-  if (!actual || !actual->defined() || actual->numel() == 0) {
+  // A shape-only (meta) tensor carries no data; comparing it would force a
+  // .cpu() copy that throws "Cannot copy out of meta tensor". Skip it.
+  if (!actual || !actual->defined() || actual->numel() == 0 ||
+      actual->is_meta()) {
     return;
   }
   const auto& refTensor = it->second.toTensor();
@@ -910,7 +920,7 @@ void advanceSyncedStages(ExecutionState& state) {
       // free in this same sync (no dedicated sync of their own).
       for (auto id : sv.lastUseIds) {
         traceFree(id, "lastUse", seq, step);
-        checkValueBeforeFree(frame, id);
+        checkValueBeforeFree(frame, id, state.waveGraph);
         freeFrameValue(frame, id, state.stream.get());
       }
     }
@@ -937,9 +947,37 @@ void WaveGraphExecutor::executeWave(
   if (!prevWaveGraph) {
     threadWaveGraph = &waveGraph;
   }
+  auto*& threadConfigOverride = torch::wave::waveConfigOverride();
+  auto* prevConfigOverride = threadConfigOverride;
+  threadConfigOverride = waveGraph.configOverride();
   SCOPE_EXIT {
     threadWaveGraph = prevWaveGraph;
+    threadConfigOverride = prevConfigOverride;
   };
+
+  // When the caller asserts all model inputs, weights, and constants are
+  // contiguous (WaveConfig::inputContiguous), the optimizer marked those
+  // producer-less values contiguous and downstream passes may rely on it.
+  // Verify the assumption here and fail loudly rather than produce silently
+  // wrong results.
+  if (WaveConfig::get().inputContiguous) {
+    for (const auto* value : graph_.values()) {
+      if (value == nullptr || value->producer() != nullptr) {
+        continue;
+      }
+      const auto& iv = frame.getIValue(value->id());
+      if (iv.isTensor()) {
+        const auto& tensor = iv.toTensor();
+        TORCH_CHECK(
+            tensor.is_contiguous(),
+            "input_contiguous is set but producer-less value %",
+            value->id(),
+            " (",
+            value->name(),
+            ") is not contiguous");
+      }
+    }
+  }
 
   Timer w("top exec", WaveConfig::get().printTiming);
   auto* g = globals();
@@ -1166,6 +1204,7 @@ void WaveGraphExecutor::collectDebugInfo(ExecutionState& state) {
         meta.outputBytes = sv.outputBytes;
         meta.currentBytes = sv.currentBytes;
         meta.refCheckUs = sv.refCheckUs;
+        meta.elidedCloneBytes = sv.elidedCloneBytes;
       }
     }
     threadInfo.launchMeta.push_back(std::move(meta));
@@ -1507,6 +1546,11 @@ std::string WaveGraphExecutor::makePerfReport(
             numStandalones,
             facebook::velox::succinctBytes(m.currentBytes),
             m.standaloneUs);
+        if (m.elidedCloneBytes > 0) {
+          ss << fmt::format(
+              "  elided copies={}",
+              facebook::velox::succinctBytes(m.elidedCloneBytes));
+        }
         ss << standaloneBreakdown(m.sequenceNumber, m.stepIdx) << "\n";
         continue;
       }
@@ -1522,6 +1566,11 @@ std::string WaveGraphExecutor::makePerfReport(
           m.inputBytes / 1024.0,
           m.outputBytes / 1024.0,
           gbps);
+      if (m.elidedCloneBytes > 0) {
+        ss << fmt::format(
+            "  elided copies={}",
+            facebook::velox::succinctBytes(m.elidedCloneBytes));
+      }
       ss << fmt::format(
           "  [gather={} grid={} alloc={} fill={} kernel={}]",
           m.gatherUs,

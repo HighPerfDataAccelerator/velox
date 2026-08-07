@@ -18,6 +18,7 @@
 
 #include <thrift/lib/cpp2/protocol/CompactV1Protocol.h>
 #include <thrift/lib/cpp2/protocol/ProtocolReaderWithRefill.h>
+#include <bit>
 
 namespace apache::thrift {
 
@@ -31,10 +32,8 @@ class CompactV1ProtocolReaderWithRefill
     static_assert(sizeof(double) == sizeof(uint64_t));
     static_assert(std::numeric_limits<double>::is_iec559);
     ensureBuffer(sizeof(double));
-    CompactV1ProtocolReader reader;
-    reader.setInput(this->protocol_.getCursor());
-    reader.readDouble(dub);
-    this->protocol_.setInput(reader.getCursor());
+    uint64_t bits = readLEFromBuffer<int64_t>();
+    dub = std::bit_cast<double>(bits);
   }
 };
 
