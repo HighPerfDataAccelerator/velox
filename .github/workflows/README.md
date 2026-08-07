@@ -1,5 +1,25 @@
 # CI Workflows
 
+## HighPerfDataAccelerator Phase 0
+
+Pull requests targeting `dev` in the `HighPerfDataAccelerator/velox` fork use
+`.github/workflows/preliminary_checks.yml` as a lightweight gate with a
+five-minute timeout per job. The workflow exposes these stable check names:
+
+| Check | Purpose |
+|-------|---------|
+| `Velox Phase 0 / Hygiene` | Existing pre-commit formatting, license, lint, and workflow-security checks |
+| `Velox Phase 0 / Unit and Contract Tests` | Change-classifier unit tests and assertions for the Phase 0 workflow contract |
+| `Velox Phase 0 / PR Title Format` | Existing conventional pull-request title check |
+| `Velox Phase 0 / Change Classification` | Classify documentation, workflow, native CPU, Spark-MPP cuDF, Spark-MPP UCX, and dependency changes |
+| `Velox Phase 0 / Gate` | Aggregate the four lightweight jobs into one required-check candidate |
+
+All five jobs run on the repository's `4-core-ubuntu` runner. The classifier
+publishes `classification`, `native_required`, and `spark_mpp` job outputs for
+future in-workflow routing. These outputs describe the change set; they do not
+prove that native builds or tests ran. The gate passes only when all four
+prerequisite jobs succeed.
+
 Velox CI validates builds and tests across Linux (GCC and optionally Clang) and macOS (Apple Clang). Linux workflows run full unit test suites in Docker containers on 32-core runners; macOS workflows verify compilation only. Fuzzer workflows stress-test functions and operators with randomized inputs.
 
 ### Why Docker containers?
@@ -26,7 +46,7 @@ For current build times and performance trends, see the [CI performance metrics]
 | macOS Build | `macos.yml` | push, PRs | Compilation check (debug + release) |
 | Breeze Linux Build | `breeze.yml` | push to main, PRs | Tracing module with sanitizers |
 | Fuzzer Jobs | `scheduled.yml` | PRs, push to main, daily cron, manual | Randomized correctness testing |
-| Run Checks | `preliminary_checks.yml` | PRs | Formatting, linting, PR title |
+| Velox Phase 0 | `preliminary_checks.yml` | PRs targeting dev | Hygiene, self-tests, PR title, change classification, stable aggregate gate |
 | Dependency Graph | `dependency-graph.yml` | push to main | Cache CMake dependency graph artifact |
 | Selective Build Plan | `selective-build-plan.yml` (reusable) | called by Linux Build using GCC | Decide full vs targeted build per PR; uploads plan-comment artifact consumed by Selective Build Comment |
 | CI Failure Comment | `ci-failure-comment.yml` | workflow_run (on Linux Build using GCC / Fuzzer failure) | AI-powered failure analysis on PRs |
@@ -93,9 +113,9 @@ The workflow also includes bias fuzzers that focus specifically on newly added o
 
 ## PR Checks & Feedback
 
-### Run Checks (`preliminary_checks.yml`)
+### Velox Phase 0 (`preliminary_checks.yml`)
 
-Runs early validation on pull requests before the heavier build workflows. Executes `pre-commit run --all-files` to check code formatting (clang-format), linting (yamllint, zizmor), license headers, and other code quality rules. Also validates the PR title against the conventional commits format (`type(scope): description`), which is required for all PRs.
+Runs the lightweight gate described in [HighPerfDataAccelerator Phase 0](#highperfdataaccelerator-phase-0). It preserves the existing pre-commit and conventional-title checks, adds classifier and workflow-contract tests, and publishes a stable aggregate result. Native build and test execution remains separate from this gate.
 
 ### Dependency Graph (`dependency-graph.yml`)
 
