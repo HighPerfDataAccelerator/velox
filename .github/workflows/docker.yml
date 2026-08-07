@@ -15,12 +15,6 @@ name: Build & Push Docker Images
 
 on:
   workflow_dispatch: {}
-  pull_request:
-    paths:
-      - scripts/docker/*.dockerfile
-      - scripts/setup-*.sh
-      - .github/workflows/docker.yml
-      - docker-compose.yml
   push:
     branches: [main]
     paths:

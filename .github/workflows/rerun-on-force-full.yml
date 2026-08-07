@@ -58,10 +58,7 @@
 name: Rerun Linux Build on Force-Full Trigger
 
 on:
-  workflow_run:
-    workflows: [Detect Force-Full Trigger]
-    types:
-      - completed
+  workflow_dispatch: {}
 
 permissions:
   contents: read
@@ -70,12 +67,13 @@ permissions:
 
 jobs:
   rerun:
+    # Suspended during Phase 0 while the inherited Linux PR build is disabled.
+    if: false
     # Filter on conclusion to skip detect invocations whose `if:` was
     # false (non-approving review). The detect job is skipped →
     # workflow conclusion = success-with-skipped or skipped depending
     # on GitHub internals; the meta step exits early either way once
     # it sees the upstream event doesn't match.
-    if: github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     steps:
       # workflow_run-triggered jobs start with an empty workspace; check
