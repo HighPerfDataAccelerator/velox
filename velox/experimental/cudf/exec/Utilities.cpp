@@ -217,7 +217,8 @@ std::vector<std::unique_ptr<cudf::table>> getConcatenatedTableBatched(
     std::vector<CudfVectorPtr>&& tables,
     const TypePtr& tableType,
     rmm::cuda_stream_view stream,
-    rmm::device_async_resource_ref mr) {
+    rmm::device_async_resource_ref mr,
+    std::optional<size_t> maxRowsOverride) {
   std::vector<std::unique_ptr<cudf::table>> concatTables;
   // Check for empty vector
   if (tables.size() == 0) {
@@ -241,7 +242,8 @@ std::vector<std::unique_ptr<cudf::table>> getConcatenatedTableBatched(
 
   try {
     std::vector<std::unique_ptr<cudf::table>> outputTables;
-    auto const maxRows = maxBatchRows();
+    const auto maxRows = maxRowsOverride.value_or(maxBatchRows());
+    VELOX_CHECK_GT(maxRows, 0, "cuDF max batch size must be positive");
     size_t startpos = 0;
     size_t runningRows = 0;
     for (size_t i = 0; i < tableViews.size(); ++i) {

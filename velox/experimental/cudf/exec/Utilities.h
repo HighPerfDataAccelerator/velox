@@ -23,6 +23,7 @@
 #include <rmm/cuda_stream_view.hpp>
 
 #include <memory>
+#include <optional>
 #include <span>
 
 namespace facebook::velox::cudf_velox {
@@ -89,7 +90,8 @@ getConcatenatedTableBatched(
     std::vector<CudfVectorPtr>&& tables,
     const TypePtr& tableType,
     rmm::cuda_stream_view stream,
-    rmm::device_async_resource_ref mr);
+    rmm::device_async_resource_ref mr,
+    std::optional<size_t> maxRowsOverride = std::nullopt);
 
 /**
  * @brief Concatenates multiple CudfVectors into CudfVector output batches.

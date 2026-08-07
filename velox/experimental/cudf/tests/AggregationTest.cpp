@@ -38,6 +38,8 @@
 #include <rmm/cuda_stream.hpp>
 #include <rmm/resource_ref.hpp>
 
+#include <folly/ScopeGuard.h>
+
 #include <cmath>
 
 namespace facebook::velox::cudf_velox::test {
@@ -1070,6 +1072,38 @@ TEST_F(AggregationTest, partialAggregationUsesBalancedRunMerges) {
   // 3,500 rows for the same eight pages.
   EXPECT_EQ(stats.at("cudfIntermediateAggregationMergeRows").sum, 2400);
   EXPECT_EQ(stats.count("cudfIntermediateAggregationFinalizeMerges"), 0);
+}
+
+TEST_F(AggregationTest, partialIdentityUsesQueryScopedStreamingCapacity) {
+  auto& globalCapacity =
+      cudf_velox::CudfConfig::getInstance().groupbyStreamingMaxDistinctKeys;
+  const auto previousCapacity = globalCapacity;
+  SCOPE_EXIT {
+    globalCapacity = previousCapacity;
+  };
+  globalCapacity = 0;
+
+  auto vectors = {
+      makeRowVector(
+          {makeFlatVector<int64_t>({1, 1, 2}),
+           makeFlatVector<int64_t>({10, 20, 30})}),
+      makeRowVector(
+          {makeFlatVector<int64_t>({1, 2, 2}),
+           makeFlatVector<int64_t>({40, 50, 60})}),
+  };
+  createDuckDbTable(vectors);
+
+  auto plan = PlanBuilder()
+                  .values(vectors)
+                  .partialAggregation({"c0"}, {"sum(c1)"})
+                  .finalAggregation()
+                  .planNode();
+  AssertQueryBuilder(duckDbQueryRunner_)
+      .config(
+          cudf_velox::CudfConfig::kCudfGroupbyStreamingMaxDistinctKeys, "4096")
+      .config(cudf_velox::CudfConfig::kCudfPartialIdentityAggregation, "true")
+      .plan(plan)
+      .assertResults("SELECT c0, sum(c1) FROM tmp GROUP BY c0");
 }
 
 class FinalAggregationStreamingTest : public AggregationTest {

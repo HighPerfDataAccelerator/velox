@@ -23,9 +23,58 @@
 #include "velox/experimental/cudf/expression/sparksql/SubStringFunction.h"
 
 #include "velox/expression/FunctionSignature.h"
+#include "velox/functions/sparksql/SparkQueryConfig.h"
+
+#include <cudf/filling.hpp>
+#include <cudf/scalar/scalar.hpp>
 
 namespace facebook::velox::cudf_velox {
 namespace {
+
+class MonotonicallyIncreasingIdFunction : public CudfFunction {
+ public:
+  explicit MonotonicallyIncreasingIdFunction(const core::TypedExprPtr& expr) {
+    VELOX_CHECK_EQ(
+        expr->inputs().size(),
+        0,
+        "monotonically_increasing_id expects no inputs");
+    VELOX_CHECK(
+        expr->type()->kind() == TypeKind::BIGINT,
+        "monotonically_increasing_id output must be BIGINT");
+
+    const auto* queryConfig = currentCudfFunctionQueryConfig();
+    const auto partitionId = queryConfig == nullptr
+        ? 0
+        : functions::sparksql::SparkQueryConfig{*queryConfig}.partitionId();
+    count_ = static_cast<int64_t>(partitionId) << 33;
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    const auto inputRowCount = inputColumns.empty()
+        ? cudf::size_type{0}
+        : asView(inputColumns.front()).size();
+    return eval(inputColumns, inputRowCount, stream, mr);
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      cudf::size_type inputRowCount,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    VELOX_CHECK(inputColumns.empty());
+    cudf::numeric_scalar<int64_t> init(count_, true, stream, mr);
+    cudf::numeric_scalar<int64_t> step(1, true, stream, mr);
+    auto result = cudf::sequence(inputRowCount, init, step, stream, mr);
+    count_ += inputRowCount;
+    return result;
+  }
+
+ private:
+  mutable int64_t count_{0};
+};
 
 void registerSparkArrayAccessFunctions(const std::string& prefix) {
   // Spark get is 0 based and returns NULL for negative or out-of-bounds
@@ -125,6 +174,15 @@ void registerSparkFunctions(const std::string& prefix) {
            .build()},
       true,
       DateTruncFunction::canEvaluate);
+
+  registerCudfFunction(
+      prefix + "monotonically_increasing_id",
+      [](const std::string&,
+         const core::TypedExprPtr& expr,
+         memory::MemoryPool*) {
+        return std::make_shared<MonotonicallyIncreasingIdFunction>(expr);
+      },
+      {FunctionSignatureBuilder().returnType("bigint").build()});
 
   registerSparkArrayAccessFunctions(prefix);
 }
