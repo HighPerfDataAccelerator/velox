@@ -33,6 +33,8 @@ class CudfFromVelox : public CudfOperatorBase {
  public:
   static constexpr const char* kGpuBatchSizeRows =
       "velox.cudf.gpu_batch_size_rows";
+  static constexpr const char* kMaxBatchBytes =
+      "velox.cudf.from_velox.max_batch_bytes";
 
   CudfFromVelox(
       int32_t operatorId,
@@ -41,7 +43,10 @@ class CudfFromVelox : public CudfOperatorBase {
       std::string planNodeId);
 
   bool needsInput() const override {
-    return !finished_;
+    return !finished_ &&
+        (inputs_.empty() ||
+         (currentOutputSize_ < preferredBatchRows() &&
+          currentOutputBytes_ < maxBatchBytes()));
   }
 
   exec::BlockingReason isBlocked(ContinueFuture* /*future*/) override {
@@ -58,9 +63,12 @@ class CudfFromVelox : public CudfOperatorBase {
   void doClose() override;
 
  private:
+  vector_size_t preferredBatchRows() const;
+  uint64_t maxBatchBytes() const;
   const std::optional<std::string> timestampTimeZone_;
   std::vector<RowVectorPtr> inputs_;
   std::size_t currentOutputSize_ = 0;
+  uint64_t currentOutputBytes_ = 0;
   bool finished_ = false;
 };
 
@@ -68,6 +76,12 @@ class CudfToVelox : public CudfOperatorBase {
  public:
   static constexpr const char* kPassthroughMode =
       "velox.cudf.to_velox.passthrough_mode";
+  // Hard byte target for one GPU-to-host conversion. Arrow's regular
+  // StringArray uses signed 32-bit offsets, so converting an arbitrarily
+  // large CudfVector before slicing can fail before a CPU-side slice is even
+  // possible. MPP sets this to its GPU target batch bytes.
+  static constexpr const char* kMaxBatchBytes =
+      "velox.cudf.to_velox.max_batch_bytes";
 
   CudfToVelox(
       int32_t operatorId,
@@ -76,7 +90,10 @@ class CudfToVelox : public CudfOperatorBase {
       std::string planNodeId);
 
   bool needsInput() const override {
-    return !finished_;
+    // Keep at most one upstream CudfVector live. In particular, don't let
+    // downstream backpressure turn this conversion boundary into an
+    // unbounded device/host queue.
+    return !finished_ && !cudfBuffer_ && inputs_.empty();
   }
 
   exec::BlockingReason isBlocked(ContinueFuture* /*future*/) override {
@@ -94,15 +111,15 @@ class CudfToVelox : public CudfOperatorBase {
 
  private:
   bool isPassthroughMode() const;
-  std::optional<uint64_t> averageRowSize();
-  // Convert inputs_.front() to Velox once; slice it CPU-side per batch.
-  RowVectorPtr convertFrontToVelox();
-  std::optional<uint64_t> averageRowSize_;
+  uint64_t maxBatchBytes() const;
+  vector_size_t nextBatchRows() const;
+  RowVectorPtr convertNextSliceToVelox();
   std::deque<CudfVectorPtr> inputs_;
-  // Converted CPU-side buffer being drained by successive doGetOutput() calls.
-  RowVectorPtr veloxBuffer_;
-  // Current offset into veloxBuffer_ for the next slice.
-  vector_size_t veloxOffset_{0};
+  // Keep the device input and drain byte-bounded table views from it. Slicing
+  // after conversion is too late for Arrow string buffers larger than 2 GiB
+  // and retains the complete wide RowVector on host.
+  CudfVectorPtr cudfBuffer_;
+  vector_size_t cudfOffset_{0};
   bool finished_ = false;
 };
 

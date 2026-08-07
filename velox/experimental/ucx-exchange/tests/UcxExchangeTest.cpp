@@ -39,6 +39,7 @@
 #include "velox/exec/tests/utils/PlanBuilder.h"
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
+#include "velox/experimental/cudf/exec/CudfPackedSpill.h"
 #include "velox/experimental/ucx-exchange/Communicator.h"
 #include "velox/experimental/ucx-exchange/RangePartitionFunction.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeProtocol.h"
@@ -1562,6 +1563,9 @@ TEST_P(UcxExchangeTest, batchAccumulationTest) {
     EXPECT_GT(sinkDriver->numChunksReceived(), 1);
     EXPECT_LT(
         sinkDriver->numChunksReceived(), static_cast<uint64_t>(numChunks));
+    EXPECT_TRUE(sinkDriver->allColumnViewsZeroBased())
+        << "every byte-bounded VARCHAR wire page must own zero-based column "
+           "views before consumer-side concat";
     queueManager_->removeTask(srcTaskId);
   }
 }
@@ -1812,6 +1816,102 @@ TEST_P(UcxExchangeTest, hashWindowBackpressureIsResumable) {
   EXPECT_TRUE(finalStats->noMoreData);
   EXPECT_EQ(finalStats->totalRowsSent, kNumDrivers * kRowsPerDriver);
   queueManager_->removeTask(srcTaskId);
+}
+
+// A low-reduction partial TopN can hand PartitionedOutput one source owner
+// much larger than the exchange queue. Once the first bounded window fills
+// the queue, verify that the unconsumed tail moves to the shared packed host
+// tier, remains resumable, and releases its host reservation after delivery.
+TEST_P(UcxExchangeTest, partialTopNTailExternalizesOnBackpressure) {
+  ExchangeTestParams p = GetParam();
+  if (p.numSrcDrivers != 1 || p.numDstDrivers != 1 || p.numPartitions != 1 ||
+      p.numChunks != 100 || p.numUpstreamTasks != 1 ||
+      p.tableType != TableType::NARROW) {
+    GTEST_SKIP()
+        << "partialTopNTailExternalizesOnBackpressure: runs only once";
+  }
+
+  auto& config = cudf_velox::CudfConfig::getInstance();
+  const bool originalIntraNode = config.intraNodeExchange;
+  config.intraNodeExchange = true;
+  SCOPE_EXIT {
+    config.intraNodeExchange = originalIntraNode;
+  };
+
+  ASSERT_EQ(cudf_velox::currentCudfPackedHostMemoryReservedBytes(), 0);
+  constexpr int kRows = 300;
+  constexpr int kWindowRows = 100;
+  constexpr int kHashCallRows = 20;
+  constexpr int kNumPartitions = 2;
+  const std::string taskPrefix = getUniqueTaskPrefix();
+  const std::string sourceTaskId = taskPrefix + "partialTopNSource";
+  auto rowType = WideTestTable::kRowType;
+  auto generator = std::make_shared<WideTestTable>();
+  generator->initialize(kRows);
+
+  std::unordered_map<std::string, std::string> extraConfig{
+      {core::QueryConfig::kUcxPartitionedOutputBatchRows,
+       std::to_string(kRows)},
+      {core::QueryConfig::kUcxHashPartitionInputBatchRows,
+       std::to_string(kHashCallRows)},
+      {core::QueryConfig::kUcxHashPartitionWindowRows,
+       std::to_string(kWindowRows)}};
+  auto sourceTask = createPartitionedOutputTask(
+      sourceTaskId,
+      pool_,
+      rowType,
+      kNumPartitions,
+      {"int32_col"},
+      1,
+      extraConfig,
+      nullptr,
+      true);
+  queueManager_->initializeTask(
+      sourceTask,
+      core::PartitionedOutputNode::Kind::kPartitioned,
+      kNumPartitions,
+      1);
+
+  auto source = std::make_shared<SourceDriverMock>(
+      sourceTask, 1, 1, kRows, generator);
+  source->run();
+
+  bool externalized = false;
+  for (int attempt = 0; attempt < 400; ++attempt) {
+    if (cudf_velox::currentCudfPackedHostMemoryReservedBytes() > 0) {
+      externalized = true;
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  ASSERT_TRUE(externalized)
+      << "partial TopN tail never entered the packed host tier";
+
+  std::vector<std::shared_ptr<SinkDriverMock>> sinks;
+  for (int partition = 0; partition < kNumPartitions; ++partition) {
+    core::PlanNodeId exchangeNodeId;
+    auto sinkTask = createExchangeTask(
+        taskPrefix + "sink" + std::to_string(partition),
+        rowType,
+        partition,
+        exchangeNodeId);
+    auto sink = std::make_shared<SinkDriverMock>(sinkTask, 1);
+    std::vector<exec::Split> splits{
+        remoteSplit(sourceTaskId, partition)};
+    sink->addSplits(splits);
+    sink->run();
+    sinks.push_back(std::move(sink));
+  }
+
+  source->joinThreads();
+  uint64_t receivedRows = 0;
+  for (auto& sink : sinks) {
+    sink->joinThreads();
+    receivedRows += sink->numRows();
+  }
+  EXPECT_EQ(receivedRows, kRows);
+  EXPECT_EQ(cudf_velox::currentCudfPackedHostMemoryReservedBytes(), 0);
+  queueManager_->removeTask(sourceTaskId);
 }
 
 // Regression test: aborting a source task while UCXX tagRecv requests are

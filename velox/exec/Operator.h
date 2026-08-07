@@ -557,7 +557,8 @@ class Operator : public BaseRuntimeStatWriter {
    public:
     static std::unique_ptr<memory::MemoryReclaimer> create(
         DriverCtx* driverCtx,
-        Operator* op);
+        Operator* op,
+        memory::MemoryPool* targetPool = nullptr);
 
     void enterArbitration() override;
 
@@ -577,9 +578,16 @@ class Operator : public BaseRuntimeStatWriter {
         override;
 
    protected:
-    MemoryReclaimer(const std::shared_ptr<Driver>& driver, Operator* op)
-        : memory::MemoryReclaimer(0), driver_(driver), op_(op) {
+    MemoryReclaimer(
+        const std::shared_ptr<Driver>& driver,
+        Operator* op,
+        memory::MemoryPool* targetPool)
+        : memory::MemoryReclaimer(0),
+          driver_(driver),
+          op_(op),
+          targetPool_(targetPool == nullptr ? op->pool() : targetPool) {
       VELOX_CHECK_NOT_NULL(op_);
+      VELOX_CHECK_NOT_NULL(targetPool_);
     }
 
     // Gets the shared pointer to the associated driver to ensure the liveness
@@ -592,6 +600,7 @@ class Operator : public BaseRuntimeStatWriter {
 
     const std::weak_ptr<Driver> driver_;
     Operator* const op_;
+    memory::MemoryPool* const targetPool_;
   };
 
   /// Invoked to setup memory reclaimer for this operator's memory pool if its

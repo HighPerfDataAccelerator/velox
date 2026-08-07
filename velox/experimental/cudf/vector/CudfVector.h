@@ -23,6 +23,7 @@
 #include <cudf/table/table.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
+#include <rmm/cuda_stream.hpp>
 
 #include <memory>
 #include <utility>
@@ -42,6 +43,14 @@ namespace facebook::velox::cudf_velox {
 // constructing or rebinding a CudfVector.
 class CudfVector : public RowVector {
  public:
+  /// Registers an owning stream so vectors constructed with its view retain
+  /// the stream across operator boundaries. Registered asynchronous
+  /// publication streams are process-lifetime resources: exchange and RMM
+  /// cleanup can outlive both the producing operator and the last visible
+  /// vector.
+  static void registerStreamOwner(
+      const std::shared_ptr<rmm::cuda_stream>& owner);
+
   /// Constructs a CudfVector from an owned cudf::table.
   CudfVector(
       velox::memory::MemoryPool* pool,
@@ -60,6 +69,16 @@ class CudfVector : public RowVector {
       std::unique_ptr<cudf::packed_table>&& packedTable,
       rmm::cuda_stream_view stream);
 
+  /// Constructs a non-owning CudfVector over an existing table view.
+  ///
+  /// The caller must keep the view's storage alive for this vector's lifetime.
+  CudfVector(
+      velox::memory::MemoryPool* pool,
+      TypePtr type,
+      vector_size_t size,
+      cudf::table_view tableView,
+      rmm::cuda_stream_view stream);
+
   rmm::cuda_stream_view stream() const {
     return stream_;
   }
@@ -72,6 +91,13 @@ class CudfVector : public RowVector {
   /// If constructed from packed_table, materializes a table from the view
   /// first (which copies the data).
   std::unique_ptr<cudf::table> release();
+
+  /// Transfers an already-packed table without materializing or copying it.
+  ///
+  /// Returns null when this vector owns an ordinary cudf::table. A successful
+  /// call consumes this vector's storage; callers use it only at terminal
+  /// serialization boundaries.
+  std::unique_ptr<cudf::packed_table> releasePacked();
 
   /// Rebinds owned table buffers to use 'stream' for future deallocation.
   /// This only changes future stream/deallocation association. It does not make
@@ -87,6 +113,10 @@ class CudfVector : public RowVector {
   using TableStorage = std::variant<
       std::unique_ptr<cudf::table>,
       std::unique_ptr<cudf::packed_table>>;
+  // Must be declared before tableStorage_: members are destroyed in reverse
+  // declaration order, and device buffers must enqueue their frees before the
+  // owning CUDA stream is destroyed.
+  std::shared_ptr<rmm::cuda_stream> streamOwner_;
   TableStorage tableStorage_;
 
   // Table view - always valid, points to either table_->view() or

@@ -16,6 +16,12 @@
 #include "velox/experimental/ucx-exchange/RangePartitionFunction.h"
 #include "velox/vector/FlatVector.h"
 
+#include <cudf/binaryop.hpp>
+#include <cudf/copying.hpp>
+#include <cudf/filling.hpp>
+#include <cudf/scalar/scalar.hpp>
+#include <cudf/search.hpp>
+
 #include <folly/json.h>
 
 #include <sstream>
@@ -41,7 +47,8 @@ RowVectorPtr buildRangeBoundaryVector(
     const std::vector<column_index_t>& keyChannels,
     memory::MemoryPool* pool,
     std::vector<cudf::order>& orders,
-    std::vector<cudf::null_order>& nullOrders) {
+    std::vector<cudf::null_order>& nullOrders,
+    bool* splitEqualKeys) {
   const auto descriptor = folly::parseJson(boundsJson);
   VELOX_CHECK_EQ(
       descriptor["version"].asInt(),
@@ -55,6 +62,10 @@ RowVectorPtr buildRangeBoundaryVector(
       keys.size(),
       keyChannels.size(),
       "RANGE_PID key metadata/channel mismatch");
+  if (splitEqualKeys != nullptr) {
+    const auto* encoded = descriptor.get_ptr("splitEqualKeys");
+    *splitEqualKeys = encoded != nullptr && encoded->asBool();
+  }
 
   std::vector<std::string> names;
   std::vector<TypePtr> types;
@@ -141,6 +152,62 @@ RowVectorPtr buildRangeBoundaryVector(
     }
   }
   return vector;
+}
+
+std::unique_ptr<cudf::column> makeRangePartitionIds(
+    cudf::table_view boundaries,
+    cudf::table_view keys,
+    const std::vector<cudf::order>& orders,
+    const std::vector<cudf::null_order>& nullOrders,
+    bool splitEqualKeys,
+    int32_t splitStart,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) {
+  auto lower = cudf::lower_bound(
+      boundaries, keys, orders, nullOrders, stream, mr);
+  if (!splitEqualKeys || keys.num_rows() == 0) {
+    return lower;
+  }
+
+  // For a key equal to r repeated boundaries, lower_bound and upper_bound
+  // differ by r. Stripe only that equality span. A non-boundary key has a
+  // zero-width span and therefore keeps its ordinary lower-bound partition.
+  auto upper = cudf::upper_bound(
+      boundaries, keys, orders, nullOrders, stream, mr);
+  const auto int32Type = cudf::data_type{cudf::type_id::INT32};
+  auto widths = cudf::binary_operation(
+      upper->view(),
+      lower->view(),
+      cudf::binary_operator::SUB,
+      int32Type,
+      stream,
+      mr);
+  cudf::numeric_scalar<int32_t> one(1, true, stream, mr);
+  auto hasMultipleDestinations = cudf::binary_operation(
+      widths->view(),
+      one,
+      cudf::binary_operator::GREATER,
+      cudf::data_type{cudf::type_id::BOOL8},
+      stream,
+      mr);
+  auto safeWidths = cudf::copy_if_else(
+      widths->view(), one, hasMultipleDestinations->view(), stream, mr);
+  cudf::numeric_scalar<int32_t> start(splitStart, true, stream, mr);
+  auto rowNumbers = cudf::sequence(keys.num_rows(), start, one, stream, mr);
+  auto offsets = cudf::binary_operation(
+      rowNumbers->view(),
+      safeWidths->view(),
+      cudf::binary_operator::MOD,
+      int32Type,
+      stream,
+      mr);
+  return cudf::binary_operation(
+      lower->view(),
+      offsets->view(),
+      cudf::binary_operator::ADD,
+      int32Type,
+      stream,
+      mr);
 }
 
 std::unique_ptr<core::PartitionFunction> RangePartitionFunctionSpec::create(

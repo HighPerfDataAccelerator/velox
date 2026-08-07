@@ -673,9 +673,11 @@ bool Operator::shouldDropOutput() const {
 
 std::unique_ptr<memory::MemoryReclaimer> Operator::MemoryReclaimer::create(
     DriverCtx* driverCtx,
-    Operator* op) {
+    Operator* op,
+    memory::MemoryPool* targetPool) {
   return std::unique_ptr<memory::MemoryReclaimer>(
-      new Operator::MemoryReclaimer(driverCtx->driver->shared_from_this(), op));
+      new Operator::MemoryReclaimer(
+          driverCtx->driver->shared_from_this(), op, targetPool));
 }
 
 void Operator::MemoryReclaimer::enterArbitration() {
@@ -738,7 +740,7 @@ bool Operator::MemoryReclaimer::reclaimableBytes(
   if (FOLLY_UNLIKELY(driver == nullptr)) {
     return false;
   }
-  VELOX_CHECK_EQ(pool.name(), op_->pool()->name());
+  VELOX_CHECK_EQ(pool.name(), targetPool_->name());
   return op_->reclaimableBytes(reclaimableBytes);
 }
 
@@ -754,7 +756,7 @@ uint64_t Operator::MemoryReclaimer::reclaim(
   if (!op_->canReclaim()) {
     return 0;
   }
-  VELOX_CHECK_EQ(pool->name(), op_->pool()->name());
+  VELOX_CHECK_EQ(pool->name(), targetPool_->name());
   VELOX_CHECK(
       !driver->state().isOnThread() || driver->state().suspended() ||
           driver->state().isTerminated,
@@ -810,7 +812,7 @@ void Operator::MemoryReclaimer::abort(
   if (driver == nullptr) {
     return;
   }
-  VELOX_CHECK_EQ(pool->name(), op_->pool()->name());
+  VELOX_CHECK_EQ(pool->name(), targetPool_->name());
   VELOX_CHECK(
       !driver->state().isOnThread() || driver->state().suspended() ||
       driver->state().isTerminated);

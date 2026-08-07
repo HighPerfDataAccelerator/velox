@@ -16,9 +16,11 @@
 #include "velox/experimental/ucx-exchange/Communicator.h"
 #include <cuda_runtime.h>
 #include <folly/system/ThreadName.h>
+#include <uct/api/uct.h>
 #include <ucxx/api.h>
 #include <ucxx/utils/ucx.h>
 #include <algorithm>
+#include <cstring>
 #include <iostream>
 #include "velox/common/base/Exceptions.h"
 #include "velox/experimental/cudf/CudfConfig.h"
@@ -35,6 +37,35 @@ using namespace facebook::velox::cudf_velox;
 DEFINE_bool(velox_ucx_exchange, false, "Enable Velox UCX exchange.");
 
 namespace facebook::velox::ucx_exchange {
+
+namespace {
+
+bool hasLoadedCudaUctComponent() {
+  uct_component_h* components = nullptr;
+  unsigned numComponents = 0;
+  const auto queryStatus =
+      uct_query_components(&components, &numComponents);
+  if (queryStatus != UCS_OK) {
+    LOG(WARNING) << "Failed to query loaded UCT components: "
+                 << ucs_status_string(queryStatus);
+    return false;
+  }
+
+  bool found = false;
+  for (unsigned index = 0; index < numComponents; ++index) {
+    uct_component_attr_t attributes{};
+    attributes.field_mask = UCT_COMPONENT_ATTR_FIELD_NAME;
+    if (uct_component_query(components[index], &attributes) == UCS_OK &&
+        std::strcmp(attributes.name, "cuda") == 0) {
+      found = true;
+      break;
+    }
+  }
+  uct_release_component_list(components);
+  return found;
+}
+
+} // namespace
 
 // static
 std::once_flag Communicator::onceFlag;
@@ -254,15 +285,20 @@ bool Communicator::releaseResourcesAfterRun() {
                     "terminal UCX shutdown";
     }
   }
+  std::vector<std::shared_ptr<ucxx::Request>> deferredRequests;
+  {
+    std::lock_guard<std::mutex> lock(deferredRequestsMutex_);
+    deferredRequests.swap(deferredRequests_);
+  }
   const auto incompleteRequests = std::count_if(
-      deferredRequests_.begin(),
-      deferredRequests_.end(),
+      deferredRequests.begin(),
+      deferredRequests.end(),
       [](const auto& request) { return !request->isCompleted(); });
   if (incompleteRequests > 0) {
     LOG(WARNING) << "UCX terminal shutdown retained " << incompleteRequests
                  << " incomplete request(s) until worker destruction";
   }
-  deferredRequests_.clear();
+  deferredRequests.clear();
 
   worker_.reset();
   context_.reset();
@@ -296,11 +332,18 @@ void Communicator::run() {
   } else {
     context_ = ucxx::createContext({}, UCP_FEATURE_TAG | UCP_FEATURE_AM);
   }
+  const bool contextSupportsCuda = context_->hasCudaSupport();
+  const bool cudaComponentLoaded = hasLoadedCudaUctComponent();
+  cudaTransportAvailable_.store(
+      contextSupportsCuda && cudaComponentLoaded, std::memory_order_release);
   LOG(INFO) << "UCX CUDA transport support="
-            << (context_->hasCudaSupport() ? "enabled" : "disabled")
+            << (hasCudaTransport() ? "enabled" : "disabled")
+            << " (contextMemoryType="
+            << (contextSupportsCuda ? "yes" : "no")
+            << ", loadedCudaComponent="
+            << (cudaComponentLoaded ? "yes" : "no") << ")"
             << "; remote transfers will use "
-            << (context_->hasCudaSupport() ? "direct device buffers"
-                                           : "host staging");
+            << (hasCudaTransport() ? "direct device buffers" : "host staging");
 
   worker_ = context_->createWorker();
 
@@ -354,13 +397,18 @@ void Communicator::run() {
           std::lock_guard<std::recursive_mutex> lock(endpointsMutex_);
           numEndpoints = endpoints_.size();
         }
+        size_t deferredRequestCount;
+        {
+          std::lock_guard<std::mutex> lock(deferredRequestsMutex_);
+          deferredRequestCount = deferredRequests_.size();
+        }
         VLOG(2) << "[COMM-HEARTBEAT] workQueue=" << workQueue_.size()
                 << " elements=" << elements_.size()
                 << " (servers=" << numServers << " sources=" << numSources
                 << ")"
                 << " endpoints=" << numEndpoints
                 << " deferredCleanup=" << deferredEndpointCleanup_.size()
-                << " deferredRequests=" << deferredRequests_.size()
+                << " deferredRequests=" << deferredRequestCount
                 << " workItemsProcessed=" << workItemsProcessed_
                 << " GPU=" << gpuUsedMB << "/" << gpuTotalMB << "MB"
                 << " (free=" << gpuFreeMB << "MB)";
@@ -406,13 +454,16 @@ void Communicator::run() {
       // Clean up deferred requests that UCX has fully processed.
       // These are cancelled requests whose GPU buffers needed to stay
       // alive until UCX finished any in-flight operations on them.
-      if (!deferredRequests_.empty()) {
+      bool hasDeferredRequests;
+      {
+        std::lock_guard<std::mutex> lock(deferredRequestsMutex_);
         deferredRequests_.erase(
             std::remove_if(
                 deferredRequests_.begin(),
                 deferredRequests_.end(),
                 [](const auto& req) { return req->isCompleted(); }),
             deferredRequests_.end());
+        hasDeferredRequests = !deferredRequests_.empty();
       }
       // All queues are drained. Now wait for UCXX network events.
       // In blocking mode, this will block until a UCXX event arrives
@@ -427,7 +478,7 @@ void Communicator::run() {
         // CPU core per executor.
         const bool needsBusyProgress =
             numCommElements_.load(std::memory_order_relaxed) > 0 ||
-            !deferredRequests_.empty();
+            hasDeferredRequests;
         worker_->progressWorkerEvent(needsBusyProgress ? 0 : -1);
       } else {
         worker_->progress();
@@ -576,10 +627,11 @@ void Communicator::deferEndpointCleanup(std::shared_ptr<EndpointRef> ep) {
 }
 
 void Communicator::deferRequestCleanup(std::shared_ptr<ucxx::Request> request) {
-  // Terminal element close() also deposits canceled requests here after the
-  // progress thread has joined. Keep their callback payloads alive until the
-  // finalizer has progressed worker cancellation.
+  // Source::close() is called by a Velox driver while the progress thread
+  // concurrently reaps completed requests. Serialize both sides so vector
+  // relocation and shared_ptr destruction cannot race.
   if (request && worker_) {
+    std::lock_guard<std::mutex> lock(deferredRequestsMutex_);
     deferredRequests_.push_back(std::move(request));
   }
 }

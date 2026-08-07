@@ -14,6 +14,7 @@
 set(
   UCX_EXCHANGE_SOURCES
   RangePartitionFunction.cpp
+  LocalDeviceOutputQueueManager.cpp
   UcxPartitionedOutput.cpp
   UcxOutputQueueManager.cpp
   UcxQueues.cpp
@@ -57,7 +58,7 @@ find_package(ucx REQUIRED)
 target_link_libraries(
   velox_ucx_exchange
   PUBLIC ucxx::ucxx ucx::ucp
-  PRIVATE cudf::cudf CUDA::cudart CUDA::cuda_driver Folly::folly velox_core ucx::ucs
+  PRIVATE cudf::cudf CUDA::cudart CUDA::cuda_driver Folly::folly velox_core ucx::ucs ucx::uct
 )
 
 if(VELOX_BUILD_TESTING)

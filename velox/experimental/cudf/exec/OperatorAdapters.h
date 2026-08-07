@@ -134,4 +134,12 @@ class OperatorAdapterRegistry {
 /// operator adapters with the registry.
 void registerAllOperatorAdapters();
 
+/// Registers the already-wired remote task URLs with a UCX exchange client
+/// without consuming the Task's RemoteConnectorSplits. Returns false if the
+/// exchange operator has not been created or was not replaced by UCX.
+bool primeUcxExchangeClient(
+    const std::string& taskId,
+    const core::PlanNodeId& planNodeId,
+    const std::vector<std::string>& remoteTaskIds);
+
 } // namespace facebook::velox::cudf_velox

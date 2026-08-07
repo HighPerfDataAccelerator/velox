@@ -619,6 +619,58 @@ TEST(HashJoinBridgeTest, needRightSideJoin) {
   }
 }
 
+TEST(HashJoinBridgeTest, payloadNeutralRecursivePartitionScheduling) {
+  struct MoveOnlyPartition {
+    MoveOnlyPartition(SpillPartitionId id, int payload)
+        : id_(id), payload(payload) {}
+    MoveOnlyPartition(MoveOnlyPartition&&) = default;
+    MoveOnlyPartition& operator=(MoveOnlyPartition&&) = default;
+    MoveOnlyPartition(const MoveOnlyPartition&) = delete;
+    MoveOnlyPartition& operator=(const MoveOnlyPartition&) = delete;
+
+    const SpillPartitionId& id() const {
+      return id_;
+    }
+
+    SpillPartitionId id_;
+    int payload;
+  };
+
+  using Iterator = IterableSpillPartitionSetBase<MoveOnlyPartition, false>;
+  using PartitionSet = Iterator::PartitionSet;
+
+  PartitionSet roots;
+  for (uint32_t i = 0; i < 3; ++i) {
+    auto id = SpillPartitionId(i);
+    roots.emplace(
+        id, std::make_unique<MoveOnlyPartition>(id, 10 + i));
+  }
+
+  Iterator iterator;
+  iterator.insert(std::move(roots));
+  auto root = iterator.next();
+  EXPECT_EQ(root.id(), SpillPartitionId(0));
+  EXPECT_EQ(root.payload, 10);
+
+  PartitionSet children;
+  for (uint32_t i = 0; i < 2; ++i) {
+    auto id = SpillPartitionId(root.id(), i);
+    children.emplace(
+        id, std::make_unique<MoveOnlyPartition>(id, 20 + i));
+  }
+  iterator.insert(std::move(children));
+
+  auto child0 = iterator.next();
+  EXPECT_EQ(child0.id(), SpillPartitionId(root.id(), 0));
+  EXPECT_EQ(child0.payload, 20);
+  auto child1 = iterator.next();
+  EXPECT_EQ(child1.id(), SpillPartitionId(root.id(), 1));
+  EXPECT_EQ(child1.payload, 21);
+  auto root1 = iterator.next();
+  EXPECT_EQ(root1.id(), SpillPartitionId(1));
+  EXPECT_EQ(root1.payload, 11);
+}
+
 TEST_P(HashJoinBridgeTest, hashJoinTableType) {
   core::TypedExprPtr filter{
       std::make_shared<core::ConstantTypedExpr>(BOOLEAN(), true)};

@@ -1307,6 +1307,55 @@ TEST_F(CudfNestedLoopJoinTest, fullJoinNoMatches) {
       plan, "SELECT t.c0, u.c0 FROM t FULL OUTER JOIN u ON t.c0 < u.c0");
 }
 
+TEST_F(CudfNestedLoopJoinTest, fullJoinNestedNullExtension) {
+  // With no matches, FULL JOIN must null-extend both sides. Exercise ARRAY and
+  // MAP payloads because cuDF scalar factories cannot construct LIST scalars.
+  auto probeVectors = {makeRowVector(
+      {"c0", "c1", "c2"},
+      {
+          makeFlatVector<int32_t>({100, 200}),
+          makeArrayVector<int32_t>({{1, 2}, {3}}),
+          makeMapVector<int32_t, int64_t>(
+              2,
+              [](auto /*row*/) { return 1; },
+              [](auto index) { return static_cast<int32_t>(index); },
+              [](auto index) { return static_cast<int64_t>(10 + index); }),
+      })};
+  auto buildVectors = {makeRowVector(
+      {"c0", "c1", "c2"},
+      {
+          makeFlatVector<int32_t>({1, 2}),
+          makeArrayVector<int32_t>({{4}, {5, 6}}),
+          makeMapVector<int32_t, int64_t>(
+              2,
+              [](auto /*row*/) { return 1; },
+              [](auto index) { return static_cast<int32_t>(index + 2); },
+              [](auto index) { return static_cast<int64_t>(20 + index); }),
+      })};
+
+  createDuckDbTable("t", probeVectors);
+  createDuckDbTable("u", buildVectors);
+
+  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  auto plan = PlanBuilder(planNodeIdGenerator)
+                  .values(probeVectors)
+                  .nestedLoopJoin(
+                      PlanBuilder(planNodeIdGenerator)
+                          .values(buildVectors)
+                          .project(
+                              {"c0 AS u_c0", "c1 AS u_c1", "c2 AS u_c2"})
+                          .planNode(),
+                      "c0 < u_c0",
+                      {"c0", "c1", "c2", "u_c0", "u_c1", "u_c2"},
+                      core::JoinType::kFull)
+                  .planNode();
+
+  assertQuery(
+      plan,
+      "SELECT t.c0, t.c1, t.c2, u.c0, u.c1, u.c2 "
+      "FROM t FULL OUTER JOIN u ON t.c0 < u.c0");
+}
+
 // Full join with multiple build batches.
 TEST_F(CudfNestedLoopJoinTest, fullJoinMultipleBatches) {
   std::vector<RowVectorPtr> probeVectors = {

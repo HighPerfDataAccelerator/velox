@@ -212,6 +212,11 @@ TEST_P(ExchangeClientTest, stats) {
       executor());
   client->addRemoteTaskId(taskId);
 
+  // Sampling stats while the exchange is live must not freeze all later
+  // snapshots at this initial empty state.
+  const auto initialStats = client->stats();
+  ASSERT_EQ(0, initialStats.at("numReceivedPages").sum);
+
   // Enqueue 3 pages.
   std::vector<uint64_t> pageBytes;
   uint64_t totalBytes = 0;

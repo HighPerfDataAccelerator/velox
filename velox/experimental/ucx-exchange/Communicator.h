@@ -125,7 +125,7 @@ class Communicator {
   /// @brief Defers cleanup of a cancelled UCXX request to the main loop.
   /// The request (and the GPU buffers it references via its arg) will be
   /// held alive until UCX has fully processed the cancellation.
-  /// Must only be called from the Communicator thread.
+  /// Safe to call from driver and Communicator threads.
   void deferRequestCleanup(std::shared_ptr<ucxx::Request> request);
 
   /// Returns the URL of the coordinator.
@@ -154,12 +154,13 @@ class Communicator {
     return shuttingDown_.load(std::memory_order_acquire);
   }
 
-  /// Returns true when the active UCX context can transfer CUDA memory with
-  /// the configured transports. UCXX derives this from both the UCP-supported
-  /// memory types and UCX_TLS, so callers can safely choose a device receive
-  /// buffer instead of inferring transport support from environment strings.
+  /// Returns true only when the active UCP context reports CUDA-memory support
+  /// and the process actually loaded the CUDA UCT component.  The former alone
+  /// is insufficient: UCX can expose CUDA as a supported memory type while
+  /// warning that cuda_copy/cuda_ipc are unavailable, in which case TCP/SM
+  /// would dereference a device pointer as host memory.
   bool hasCudaTransport() const {
-    return context_ != nullptr && context_->hasCudaSupport();
+    return cudaTransportAvailable_.load(std::memory_order_acquire);
   }
 
   /// Looks up the EndpointRef associated with a raw UCP endpoint handle.
@@ -195,6 +196,7 @@ class Communicator {
   std::shared_ptr<ucxx::Context> context_;
   std::shared_ptr<ucxx::Worker> worker_;
   std::shared_ptr<ucxx::Listener> listener_;
+  std::atomic<bool> cudaTransportAvailable_{false};
   uint16_t port_;
   std::string coordinatorURL_;
   std::atomic<bool> running_{false};
@@ -260,6 +262,7 @@ class Communicator {
   /// UCX internals. Held alive here until isCompleted() returns true,
   /// ensuring the GPU buffers (owned via the request's arg shared_ptr)
   /// are not freed prematurely.
+  std::mutex deferredRequestsMutex_;
   std::vector<std::shared_ptr<ucxx::Request>> deferredRequests_;
 
   // Heartbeat state for diagnostic logging.

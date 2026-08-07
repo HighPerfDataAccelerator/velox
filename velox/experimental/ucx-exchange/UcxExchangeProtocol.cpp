@@ -16,11 +16,122 @@
 
 #include "velox/experimental/ucx-exchange/UcxExchangeProtocol.h"
 
+#include <cuda_runtime.h>
+#include <glog/logging.h>
 #include <cstring>
+#include <mutex>
 #include <stdexcept>
 #include "velox/common/base/Exceptions.h"
 
 namespace facebook::velox::ucx_exchange {
+
+namespace {
+class UcxPinnedBufferPool {
+ public:
+  UcxPinnedBufferPool() {
+    if (const char* value =
+            std::getenv("GLUTEN_UCX_PINNED_BUFFER_COUNT")) {
+      char* end = nullptr;
+      const auto requested = std::strtoull(value, &end, 10);
+      if (end != value && *end == '\0') {
+        maxSlots_ = std::clamp<uint64_t>(requested, 1, 16);
+      }
+    }
+  }
+
+  std::shared_ptr<uint8_t> acquire(uint64_t requiredBytes) {
+    if (requiredBytes == 0) {
+      return {};
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    size_t available = slots_.size();
+    for (size_t i = 0; i < slots_.size(); ++i) {
+      if (!slots_[i]->busy && slots_[i]->capacity >= requiredBytes) {
+        slots_[i]->busy = true;
+        return makeOwner(i);
+      }
+      if (!slots_[i]->busy && available == slots_.size()) {
+        available = i;
+      }
+    }
+    if (available == slots_.size() && slots_.size() < maxSlots_) {
+      slots_.push_back(std::make_unique<Slot>());
+      available = slots_.size() - 1;
+    }
+    if (available == slots_.size()) {
+      return {};
+    }
+
+    auto& slot = *slots_[available];
+    uint8_t* allocation = nullptr;
+    const auto allocationBytes =
+        std::max<uint64_t>(64ULL << 20, requiredBytes);
+    const auto status = cudaHostAlloc(
+        reinterpret_cast<void**>(&allocation),
+        allocationBytes,
+        cudaHostAllocPortable);
+    if (status != cudaSuccess) {
+      cudaGetLastError();
+      LOG(WARNING) << "Could not allocate " << allocationBytes
+                   << " bytes for UCX pinned bounce slot " << available
+                   << ": " << cudaGetErrorString(status)
+                   << "; falling back to pageable staging";
+      return {};
+    }
+    if (slot.data != nullptr) {
+      cudaFreeHost(slot.data);
+    }
+    slot.data = allocation;
+    slot.capacity = allocationBytes;
+    slot.busy = true;
+    return makeOwner(available);
+  }
+
+  ~UcxPinnedBufferPool() {
+    for (auto& slot : slots_) {
+      if (slot->data != nullptr) {
+        cudaFreeHost(slot->data);
+      }
+    }
+  }
+
+ private:
+  struct Slot {
+    uint8_t* data{nullptr};
+    uint64_t capacity{0};
+    bool busy{false};
+  };
+
+  struct Lease {
+    Lease(UcxPinnedBufferPool* pool, size_t slot) : pool(pool), slot(slot) {}
+    ~Lease() {
+      std::lock_guard<std::mutex> lock(pool->mutex_);
+      VELOX_CHECK(pool->slots_[slot]->busy);
+      pool->slots_[slot]->busy = false;
+    }
+    UcxPinnedBufferPool* pool;
+    size_t slot;
+  };
+
+  std::shared_ptr<uint8_t> makeOwner(size_t slot) {
+    auto lease = std::make_shared<Lease>(this, slot);
+    return std::shared_ptr<uint8_t>(lease, slots_[slot]->data);
+  }
+
+  std::mutex mutex_;
+  std::vector<std::unique_ptr<Slot>> slots_;
+  size_t maxSlots_{4};
+};
+
+UcxPinnedBufferPool& ucxPinnedBufferPool() {
+  static UcxPinnedBufferPool pool;
+  return pool;
+}
+} // namespace
+
+std::shared_ptr<uint8_t> acquireUcxPinnedBuffer(uint64_t requiredBytes) {
+  return ucxPinnedBufferPool().acquire(requiredBytes);
+}
 
 uint32_t fnv1a_32(std::string_view s) {
   uint32_t hash = 0x811C9DC5u; // FNV offset basis

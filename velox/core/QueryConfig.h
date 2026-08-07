@@ -348,7 +348,7 @@ class QueryConfig {
       ucxPartitionedOutputBatchRows,
       "cudf.partitioned_output_batch_rows",
       int64_t,
-      10'000,
+      32'000'000,
       "Target rows per CudfPartitionedOutput exchange chunk.")
 
   /// Maximum input rows for one libcudf hash_partition call in UCX output.

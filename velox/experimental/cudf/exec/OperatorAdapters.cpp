@@ -92,6 +92,22 @@ struct TaskPipelineKey {
   };
 };
 
+struct TaskPlanNodeKey {
+  std::string taskId;
+  core::PlanNodeId planNodeId;
+
+  bool operator==(const TaskPlanNodeKey& other) const {
+    return taskId == other.taskId && planNodeId == other.planNodeId;
+  }
+
+  struct Hash {
+    std::size_t operator()(const TaskPlanNodeKey& key) const {
+      return std::hash<std::string>{}(key.taskId) ^
+          (std::hash<std::string>{}(key.planNodeId) << 1);
+    }
+  };
+};
+
 using UcxExchangeClientMap = std::unordered_map<
     TaskPipelineKey,
     std::weak_ptr<ucx_exchange::UcxExchangeClient>,
@@ -102,12 +118,46 @@ UcxExchangeClientMap& getUcxExchangeClientMap() {
   return instance;
 }
 
+using UcxExchangePlanNodeClientMap = std::unordered_map<
+    TaskPlanNodeKey,
+    std::weak_ptr<ucx_exchange::UcxExchangeClient>,
+    TaskPlanNodeKey::Hash>;
+
+UcxExchangePlanNodeClientMap& getUcxExchangePlanNodeClientMap() {
+  static UcxExchangePlanNodeClientMap instance;
+  return instance;
+}
+
 std::mutex& getUcxExchangeClientMapMutex() {
   static std::mutex instance;
   return instance;
 }
 
 } // namespace
+
+bool primeUcxExchangeClient(
+    const std::string& taskId,
+    const core::PlanNodeId& planNodeId,
+    const std::vector<std::string>& remoteTaskIds) {
+  std::shared_ptr<ucx_exchange::UcxExchangeClient> client;
+  {
+    std::lock_guard<std::mutex> lock(getUcxExchangeClientMapMutex());
+    auto& clientMap = getUcxExchangePlanNodeClientMap();
+    const auto it = clientMap.find({taskId, planNodeId});
+    if (it == clientMap.end() || !(client = it->second.lock())) {
+      if (it != clientMap.end()) {
+        clientMap.erase(it);
+      }
+      return false;
+    }
+  }
+
+  for (const auto& remoteTaskId : remoteTaskIds) {
+    client->addRemoteTaskId(remoteTaskId);
+  }
+  client->noMoreRemoteTasks();
+  return true;
+}
 
 /// OperatorAdapterRegistry Implementation
 OperatorAdapterRegistry& OperatorAdapterRegistry::getInstance() {
@@ -723,6 +773,24 @@ class TopNRowNumberAdapter : public OperatorAdapter {
     auto node =
         std::dynamic_pointer_cast<const core::TopNRowNumberNode>(planNode);
     std::vector<std::unique_ptr<exec::Operator>> result;
+    // Exchange and scan sources can deliver tens of thousands of rows per
+    // batch.  Running the grouped Top-1 kernel once for every such batch makes
+    // high-cardinality ROW_NUMBER=1 windows kernel-launch bound and creates
+    // hundreds of packed host chunks.  Coalesce to a bounded device batch
+    // before reducing.  The byte cap is deliberately tied to (and no larger
+    // than) the operator's candidate-run cap, so this does not increase the
+    // peak state that CudfTopNRowNumber is already configured to tolerate.
+    const auto candidateRunBytes = ctx->queryConfig().get<uint64_t>(
+        CudfConfig::kCudfTopNRowNumberCandidateRunBytes,
+        CudfConfig::getInstance().topNRowNumberCandidateRunBytes);
+    result.push_back(
+        std::make_unique<CudfBatchConcat>(
+            operatorId,
+            ctx,
+            planNode,
+            topNRowNumberNode->inputType(),
+            1'000'000,
+            std::min<uint64_t>(candidateRunBytes, 256ULL << 20)));
     result.push_back(
         std::make_unique<CudfTopNRowNumber>(operatorId, ctx, node));
     return result;
@@ -1225,6 +1293,8 @@ class ExchangeAdapter : public OperatorAdapter {
       } else {
         exchangeOp->resetExchangeClient();
       }
+      getUcxExchangePlanNodeClientMap()[{op->taskId(), planNode->id()}] =
+          client;
     }
 
     std::vector<std::unique_ptr<exec::Operator>> result;

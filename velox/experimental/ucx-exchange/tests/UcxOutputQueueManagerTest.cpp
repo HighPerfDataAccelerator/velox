@@ -27,6 +27,7 @@
 #include <vector>
 #include "velox/common/memory/MemoryPool.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
+#include "velox/experimental/ucx-exchange/LocalDeviceOutputQueueManager.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeQueue.h"
 #include "velox/experimental/ucx-exchange/tests/UcxTestHelpers.h"
 
@@ -274,6 +275,91 @@ class UcxOutputQueueManagerTest : public testing::Test {
   std::shared_ptr<facebook::velox::memory::MemoryPool> pool_;
   std::shared_ptr<UcxOutputQueueManager> queueManager_;
 };
+
+TEST_F(
+    UcxOutputQueueManagerTest,
+    localDeviceOutputBudgetIsSharedAcrossRootReplicas) {
+  const std::string taskId1 = "local-device-root-1";
+  const std::string taskId2 = "local-device-root-2";
+  auto localManager = LocalDeviceOutputQueueManager::getInstanceRef();
+  localManager->removeTask(taskId1);
+  localManager->removeTask(taskId2);
+  EXPECT_FALSE(localManager->isDirectOutputTask(taskId1));
+  EXPECT_FALSE(localManager->isDirectOutputTask(taskId2));
+  localManager->registerDirectOutputTask(taskId1);
+  localManager->registerDirectOutputTask(taskId2);
+  EXPECT_TRUE(localManager->isDirectOutputTask(taskId1));
+  EXPECT_TRUE(localManager->isDirectOutputTask(taskId2));
+
+  auto first = makeCudfVector(
+      pool_.get(),
+      1024,
+      UcxTestData::kTestRowType,
+      nullptr,
+      rmm::cuda_stream_default);
+  auto second = makeCudfVector(
+      pool_.get(),
+      1024,
+      UcxTestData::kTestRowType,
+      nullptr,
+      rmm::cuda_stream_default);
+  const auto batchBytes = first->estimateFlatSize();
+  ASSERT_GT(batchBytes, 0);
+  const auto sharedBudget = batchBytes + batchBytes / 2;
+  auto task1 =
+      createSourceTask(taskId1, pool_, UcxTestData::kTestRowType, sharedBudget);
+  auto task2 =
+      createSourceTask(taskId2, pool_, UcxTestData::kTestRowType, sharedBudget);
+  localManager->initializeTask(task1, 1, 1);
+  localManager->initializeTask(task2, 1, 1);
+
+  localManager->enqueue(taskId1, 0, std::move(first));
+  localManager->enqueue(taskId2, 0, std::move(second));
+
+  ContinueFuture future;
+  EXPECT_TRUE(localManager->checkBlocked(taskId2, &future));
+  EXPECT_FALSE(future.isReady());
+
+  auto fetched = localManager->tryGetData(taskId1, 0, 0);
+  ASSERT_TRUE(fetched.ready);
+  ASSERT_FALSE(fetched.atEnd);
+  ASSERT_NE(fetched.data, nullptr);
+  future.wait();
+  EXPECT_TRUE(future.isReady());
+
+  localManager->removeTask(taskId1);
+  localManager->removeTask(taskId2);
+  EXPECT_FALSE(localManager->isDirectOutputTask(taskId1));
+  EXPECT_FALSE(localManager->isDirectOutputTask(taskId2));
+}
+
+TEST_F(
+    UcxOutputQueueManagerTest,
+    localDeviceOutputDeleteMarksPartitionedOutputConsumed) {
+  const std::string taskId = "local-device-root-consumed";
+  auto localManager = LocalDeviceOutputQueueManager::getInstanceRef();
+  localManager->removeTask(taskId);
+
+  auto task = createPartitionedOutputTask(
+      taskId,
+      pool_,
+      UcxTestData::kTestRowType,
+      2,
+      {});
+  localManager->registerDirectOutputTask(taskId);
+  localManager->initializeTask(task, 2, 1);
+
+  EXPECT_TRUE(task->isRunning());
+  localManager->deleteResults(taskId, 0);
+  EXPECT_TRUE(task->isRunning());
+  localManager->deleteResults(taskId, 1);
+  EXPECT_TRUE(task->isFinished());
+
+  // Repeated deletion must not attempt to complete the task twice.
+  localManager->deleteResults(taskId, 1);
+  EXPECT_TRUE(task->isFinished());
+  localManager->removeTask(taskId);
+}
 
 TEST_F(UcxOutputQueueManagerTest, basicPartitioned) {
   vector_size_t size = 100;

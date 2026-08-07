@@ -65,6 +65,8 @@ struct CudfConfig {
       "cudf.partial_identity_aggregation"};
   static constexpr const char* kCudfOrderBySortedRunBytes{
       "cudf.order_by_sorted_run_bytes"};
+  static constexpr const char* kCudfOrderByHostSpillBytes{
+      "cudf.order_by_host_spill_bytes"};
   static constexpr const char* kCudfOrderByMergeFanIn{
       "cudf.order_by_merge_fan_in"};
   static constexpr const char* kCudfWindowSortedRunBytes{
@@ -75,17 +77,72 @@ struct CudfConfig {
       "cudf.order_by_max_output_rows"};
   static constexpr const char* kCudfExchangeConcatOptimizationEnabled{
       "cudf.exchange_concat_optimization_enabled"};
+  static constexpr const char* kCudfHashJoinGraceBuildBytes{
+      "cudf.hash_join.grace_build_bytes"};
+  static constexpr const char* kCudfHashJoinGracePartitions{
+      "cudf.hash_join.grace_partitions"};
+  static constexpr const char* kCudfHashJoinGraceHostBytes{
+      "cudf.hash_join.grace_host_bytes"};
+  static constexpr const char* kCudfHashJoinGraceRestoreBytes{
+      "cudf.hash_join.grace_restore_bytes"};
+  static constexpr const char* kCudfHashJoinGraceProbeRestoreBytes{
+      "cudf.hash_join.grace_probe_restore_bytes"};
   static constexpr const char* kCudfTimestampUnit{"cudf.timestamp_unit"};
   // The value could be either spark or presto.
   static constexpr const char* kCudfFunctionEngine{"cudf.function_engine"};
   /// Query session configs for the cuDF Operators.
   static constexpr const char* kCudfTopNBatchSize{"cudf.topk_batch_size"};
-  // Maximum retained candidate bytes before CudfTopNRowNumber writes a sorted
-  // run. The value must be a plain unsigned decimal byte count with no unit
-  // suffix; the default is 134217728 bytes (128 MiB). If this threshold causes
-  // a spill, the Task must be configured with an explicit spill root.
+  // Maximum retained candidate bytes before CudfTopNRowNumber externalizes a
+  // run. ROW_NUMBER=1 hash-partitions reduced candidates into packed host
+  // memory; rank-like functions retain the sorted-run spill implementation.
+  // The value must be a plain unsigned decimal byte count with no unit suffix;
+  // the default is 1073741824 bytes (1 GiB). This amortizes packed-host
+  // externalization while keeping the device working set bounded.
   static constexpr const char* kCudfTopNRowNumberCandidateRunBytes{
       "cudf.topn_row_number.candidate_run_bytes"};
+  // Number of hash buckets used by the ROW_NUMBER=1 host-memory Top1 state.
+  // A partition key belongs to exactly one bucket, so buckets can be finalized
+  // independently with bounded device memory. The default is 16; must be at
+  // least 2.
+  static constexpr const char* kCudfTopNRowNumberHostPartitions{
+      "cudf.topn_row_number.host_partitions"};
+  // Maximum packed input bytes restored for one ROW_NUMBER=1 finalize unit.
+  // Larger host buckets are re-hash-partitioned a chunk at a time before any
+  // concatenate/reduce kernel is admitted. This bounds restore, input,
+  // output, and kernel scratch independently from the initial hash fan-out.
+  static constexpr const char* kCudfTopNRowNumberFinalizeInputBytes{
+      "cudf.topn_row_number.finalize_input_bytes"};
+  // Maximum packed ROW_NUMBER=1 bucket bytes retained on device after the
+  // operator enters partitioned mode. Zero preserves the legacy all-host
+  // path. Above the limit, the largest resident buckets are externalized
+  // until residency falls to half the limit.
+  static constexpr const char* kCudfTopNRowNumberDeviceResidentBytes{
+      "cudf.topn_row_number.device_resident_bytes"};
+  // Output ownership bounds for ROW_NUMBER=1. Keep these separate from
+  // OrderBy: TopN hands sliced variable-width tables across an exchange,
+  // whereas root OrderBy drains an already ordered result.
+  static constexpr const char* kCudfTopNRowNumberOutputChunkBytes{
+      "cudf.topn_row_number.output_chunk_bytes"};
+  static constexpr const char* kCudfTopNRowNumberMaxOutputRows{
+      "cudf.topn_row_number.max_output_rows"};
+  // Process-wide per-GPU budget shared by cooperating persistent device
+  // states. Zero disables global admission accounting. This is deliberately
+  // separate from the per-operator residency limit: operators may use a high
+  // local limit while the shared budget prevents their aggregate state from
+  // exhausting the device.
+  static constexpr const char* kCudfDeviceResidentCapacityBytes{
+      "cudf.device_resident_capacity_bytes"};
+  // Physical allocation headroom maintained by the executor-wide device
+  // memory arbitrator. Persistent-state admission triggers global spill when
+  // allocatable device memory falls below this watermark. Zero disables the
+  // physical-pressure trigger while preserving logical-capacity arbitration.
+  static constexpr const char* kCudfDeviceMemoryMinHeadroomBytes{
+      "cudf.device_memory.min_headroom_bytes"};
+  // Minimum bytes requested from one physical-pressure arbitration. This
+  // provides hysteresis so a stream of small persistent chunks does not cause
+  // one arbitration per chunk.
+  static constexpr const char* kCudfDeviceMemoryMinReclaimBytes{
+      "cudf.device_memory.min_reclaim_bytes"};
   // Hard limit for the complete build table retained by CudfNestedLoopJoin.
   // The default is intentionally unbounded for non-MPP callers; Gluten MPP
   // supplies a conservative value for replicated Cartesian joins.
@@ -175,12 +232,29 @@ struct CudfConfig {
   /// run.
   uint64_t orderBySortedRunBytes{256ULL << 20};
 
+  /// Process-wide bytes available to packed-cuDF OrderBy runs in host memory.
+  /// Zero disables the host tier and writes runs directly to disk.
+  uint64_t orderByHostSpillBytes{64ULL << 30};
+
   /// Number of sorted runs compacted by one OrderBy merge group.
   int32_t orderByMergeFanIn{8};
 
   /// Approximate bytes buffered before a partitioned Window writes an
   /// independently sorted run.
   uint64_t windowSortedRunBytes{3ULL << 30};
+
+  /// Retained ROW_NUMBER=1 candidate bytes before packed-host
+  /// externalization, and the number of host hash buckets used for that
+  /// bounded state.
+  uint64_t topNRowNumberCandidateRunBytes{1ULL << 30};
+  uint64_t topNRowNumberHostPartitions{16};
+  uint64_t topNRowNumberFinalizeInputBytes{512ULL << 20};
+  uint64_t topNRowNumberDeviceResidentBytes{0};
+  uint64_t topNRowNumberOutputChunkBytes{32ULL << 20};
+  int32_t topNRowNumberMaxOutputRows{262144};
+  uint64_t deviceResidentCapacityBytes{0};
+  uint64_t deviceMemoryMinHeadroomBytes{6ULL << 30};
+  uint64_t deviceMemoryMinReclaimBytes{2ULL << 30};
 
   /// Maximum bytes and rows returned by one OrderBy output batch.
   uint64_t orderByOutputChunkBytes{32ULL << 20};
@@ -193,7 +267,7 @@ struct CudfConfig {
   /// Target rows for CudfBatchConcat immediately after a UCX Exchange. Keep
   /// this below the aggregation target because a fragment can buffer several
   /// inbound exchanges concurrently while its join builds are still live.
-  int32_t exchangeBatchSizeMinThreshold{32000000};
+  int32_t exchangeBatchSizeMinThreshold{100000};
 
   /// Target bytes to accumulate immediately after a UCX Exchange. Zero
   /// disables the exchange-specific byte threshold.
@@ -236,6 +310,30 @@ struct CudfConfig {
   /// This field is intentionally appended so incremental builds that reuse
   /// stable UCX objects preserve the offsets of every pre-existing field.
   bool exchangeConcatOptimizationEnabled{true};
+
+  /// Switch eligible INNER/LEFT/RIGHT hash joins from device-resident build
+  /// accumulation to packed-cuDF host partitions after this many build bytes.
+  /// Zero disables the Grace path.
+  uint64_t hashJoinGraceBuildBytes{0};
+
+  /// Number of same-hash buckets used by the bounded Grace hash join.
+  int32_t hashJoinGracePartitions{8};
+
+  /// Executor-process-wide budget for packed Grace build and probe bytes
+  /// retained in pageable host memory. All concurrent joins share this
+  /// budget; additional packed bytes spill directly from reusable pinned
+  /// staging to a raw local file. Zero keeps all packed bytes in host memory.
+  uint64_t hashJoinGraceHostBytes{0};
+
+  /// Maximum packed build bytes restored into one device hash table. A larger
+  /// partition is recursively split using the next SpillPartitionId level.
+  uint64_t hashJoinGraceRestoreBytes{4ULL << 30};
+
+  /// Maximum packed probe bytes processed as one partition-major drain group.
+  /// Input partitioning remains independently bounded; grouping here reduces
+  /// tiny join/output handoffs while the device arbitrator serializes large
+  /// restore groups when physical headroom is tight.
+  uint64_t hashJoinGraceProbeRestoreBytes{1ULL << 30};
 };
 
 } // namespace facebook::velox::cudf_velox

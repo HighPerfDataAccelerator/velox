@@ -15,6 +15,7 @@
  */
 
 #include <algorithm>
+#include <cstring>
 #include <cstdlib>
 #include <string>
 #include <thread>
@@ -34,27 +35,42 @@ using namespace facebook::velox::exec;
 namespace facebook::velox::ucx_exchange {
 
 namespace {
+std::shared_ptr<uint8_t> allocateHostStagingBuffer(
+    uint64_t bytes,
+    bool& pinned) {
+  if (bytes > static_cast<uint64_t>(kDeviceEagerHostStageBytes)) {
+    auto buffer = acquireUcxPinnedBuffer(bytes);
+    if (buffer != nullptr) {
+      pinned = true;
+      return buffer;
+    }
+  }
+  pinned = false;
+  return std::shared_ptr<uint8_t>(
+      new uint8_t[bytes], std::default_delete<uint8_t[]>());
+}
+
 void retireRequest(
     std::shared_ptr<ucxx::Request>& current,
     std::vector<std::shared_ptr<ucxx::Request>>& inFlight) {
-  // UCXX removes a request from the endpoint/worker inflight collections and
-  // frees its UCP handle before invoking the user completion callback.  A
-  // completed Request therefore does not need to be retained.  Keeping every
-  // completed receive until exchange teardown grows without bound on packet-
-  // heavy shuffles.  Preserve only requests that are genuinely still in
-  // progress, and prune those as soon as a later packet observes completion.
-  inFlight.erase(
-      std::remove_if(
-          inFlight.begin(),
-          inFlight.end(),
-          [](const auto& request) {
-            return request == nullptr || request->isCompleted();
-          }),
-      inFlight.end());
-  if (current != nullptr && !current->isCompleted()) {
+  if (current != nullptr) {
     inFlight.push_back(std::move(current));
-  } else {
-    current.reset();
+  }
+  // Keep a short replay-safety window, including each request's unique receive
+  // buffer. Reusing one buffer while retaining old UCXX requests allows a
+  // wireup replay to overwrite a later packet before its guarded callback is
+  // invoked. Four alternating metadata/data requests retain two full packet
+  // generations without growing for the lifetime of a long exchange.
+  constexpr size_t kRetainedRequestWindow = 4;
+  while (inFlight.size() > kRetainedRequestWindow) {
+    const auto completed = std::find_if(
+        inFlight.begin(), inFlight.end(), [](const auto& request) {
+          return request == nullptr || request->isCompleted();
+        });
+    if (completed == inFlight.end()) {
+      break;
+    }
+    inFlight.erase(completed);
   }
 }
 
@@ -174,6 +190,116 @@ void releaseRecvHostBytes(int64_t bytes) {
   const auto previous =
       inFlightRecvHostBytes.fetch_sub(bytes, std::memory_order_acq_rel);
   VELOX_CHECK_GE(previous, bytes);
+}
+
+bool asyncHostReceiveCopyEnabled() {
+  static const bool enabled = [] {
+    const char* value =
+        std::getenv("GLUTEN_UCX_ASYNC_HOST_RECEIVE_COPY");
+    return value != nullptr && value[0] != '\0' &&
+        !(value[0] == '0' && value[1] == '\0');
+  }();
+  return enabled;
+}
+
+int64_t maxInFlightAsyncHostReceiveCopies() {
+  static const int64_t limit = [] {
+    constexpr int64_t kDefault = 1;
+    const char* value =
+        std::getenv("GLUTEN_UCX_ASYNC_HOST_RECEIVE_MAX_COPIES");
+    if (value == nullptr || value[0] == '\0') {
+      return kDefault;
+    }
+    char* end = nullptr;
+    const auto requested = std::strtoll(value, &end, 10);
+    if (end == value || *end != '\0') {
+      LOG(WARNING) << "Ignoring invalid "
+                      "GLUTEN_UCX_ASYNC_HOST_RECEIVE_MAX_COPIES="
+                   << value << "; using " << kDefault;
+      return kDefault;
+    }
+    return std::clamp<int64_t>(requested, 0, 16);
+  }();
+  return limit;
+}
+
+std::atomic<int64_t> inFlightAsyncHostReceiveCopies{0};
+
+bool tryReserveAsyncHostReceiveCopy() {
+  const auto limit = maxInFlightAsyncHostReceiveCopies();
+  auto current =
+      inFlightAsyncHostReceiveCopies.load(std::memory_order_relaxed);
+  while (current < limit) {
+    if (inFlightAsyncHostReceiveCopies.compare_exchange_weak(
+            current,
+            current + 1,
+            std::memory_order_acq_rel,
+            std::memory_order_relaxed)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void releaseAsyncHostReceiveCopy() noexcept {
+  const auto previous = inFlightAsyncHostReceiveCopies.fetch_sub(
+      1, std::memory_order_acq_rel);
+  if (previous <= 0) {
+    LOG(ERROR) << "UCX async host-copy slot accounting underflow";
+    inFlightAsyncHostReceiveCopies.store(0, std::memory_order_release);
+  }
+}
+
+class AsyncHostCopySlotReservation {
+ public:
+  explicit AsyncHostCopySlotReservation(bool reserve)
+      : reserved_(reserve && tryReserveAsyncHostReceiveCopy()) {}
+
+  ~AsyncHostCopySlotReservation() {
+    if (reserved_) {
+      releaseAsyncHostReceiveCopy();
+    }
+  }
+
+  bool reserved() const {
+    return reserved_;
+  }
+
+  void transferToCallback() {
+    reserved_ = false;
+  }
+
+ private:
+  bool reserved_{false};
+};
+
+// cudaMemcpyAsync requires its host source to remain alive until the copy is
+// complete.  Publishing the packed device buffer before that boundary is safe
+// only if the source owner and its process-wide host credit are anchored to
+// the receive stream.  This context is released by a CUDA host callback queued
+// after H2D; it deliberately performs no CUDA API calls from the callback.
+struct AsyncHostCopyCompletion {
+  std::shared_ptr<uint8_t> hostData;
+  int64_t reservedHostBytes{0};
+  bool reservedAsyncCopySlot{false};
+};
+
+void CUDART_CB releaseAsyncHostCopy(void* opaque) noexcept {
+  std::unique_ptr<AsyncHostCopyCompletion> completion(
+      static_cast<AsyncHostCopyCompletion*>(opaque));
+  try {
+    completion->hostData.reset();
+    releaseRecvHostBytes(completion->reservedHostBytes);
+  } catch (const std::exception& error) {
+    LOG(ERROR) << "UCX async host-copy credit release failed: "
+               << error.what();
+  } catch (...) {
+    LOG(ERROR) << "UCX async host-copy credit release failed with an "
+                  "unknown exception";
+  }
+  if (completion->reservedAsyncCopySlot) {
+    releaseAsyncHostReceiveCopy();
+  }
 }
 } // namespace
 
@@ -414,6 +540,10 @@ void UcxExchangeSource::close() {
           << " state=" << toName(getState()) << " seq=" << sequenceNumber_
           << " hasRequest=" << (request_ != nullptr) << " atEnd=" << atEnd_;
 
+  if (!atEnd_) {
+    sendCancel();
+  }
+
   // Guarantee the end marker is delivered before transitioning to Done.
   deliverEndMarker();
 
@@ -452,6 +582,13 @@ folly::F14FastMap<std::string, RuntimeMetric> UcxExchangeSource::metrics()
   // exchange client.
   map["ucxExchangeSource.numPackedColumns"] = metrics_.numPackedColumns_;
   map["ucxExchangeSource.totalBytes"] = metrics_.totalBytes_;
+  map["ucxExchangeSource.hostStagedBytes"] = metrics_.hostStagedBytes_;
+  map["ucxExchangeSource.asyncHostCopyBytes"] =
+      metrics_.asyncHostCopyBytes_;
+  map["ucxExchangeSource.asyncHostCopyThrottledBytes"] =
+      metrics_.asyncHostCopyThrottledBytes_;
+  map["ucxExchangeSource.hostCopySyncNanos"] =
+      metrics_.hostCopySyncNanos_;
   map["ucxExchangeSource.rttPerRequest"] = metrics_.rttPerRequest_;
   return map;
 }
@@ -585,6 +722,43 @@ void UcxExchangeSource::sendHandshake() {
       handshakeReq);
 }
 
+void UcxExchangeSource::sendCancel() {
+  auto communicator = communicator_.lock();
+  if (!communicator || communicator->isShuttingDown() || !endpointRef_) {
+    return;
+  }
+
+  auto cancel = std::make_shared<HandshakeMsg>();
+  cancel->destination =
+      partitionKey_.destination | kCancelDestinationFlag;
+  strncpy(
+      cancel->taskId,
+      partitionKey_.taskId.c_str(),
+      sizeof(cancel->taskId) - 1);
+  cancel->taskId[sizeof(cancel->taskId) - 1] = '\0';
+  cancel->workerId = communicator->getWorkerId();
+  VLOG(1) << "[UCX-CANCEL] send task=" << partitionKey_.taskId
+          << " destination=" << partitionKey_.destination;
+
+  ucxx::AmReceiverCallbackInfo info(
+      communicator->kAmCallbackOwner, communicator->kAmCallbackId);
+  auto cancelRequest = endpointRef_->endpoint_->amSend(
+      cancel.get(),
+      sizeof(*cancel),
+      UCS_MEMORY_TYPE_HOST,
+      info,
+      false,
+      [key = partitionKey_](ucs_status_t status, std::shared_ptr<void>) {
+        if (status != UCS_OK) {
+          VLOG(1) << "[UCX-CANCEL] failed task=" << key.taskId
+                  << " destination=" << key.destination
+                  << " status=" << ucs_status_string(status);
+        }
+      },
+      cancel);
+  communicator->deferRequestCleanup(std::move(cancelRequest));
+}
+
 void UcxExchangeSource::onHandshake(
     ucs_status_t status,
     std::shared_ptr<void> /*arg*/) {
@@ -631,14 +805,13 @@ void UcxExchangeSource::onHandshake(
 void UcxExchangeSource::getMetadata() {
   // Use kMaxMetaBufSize to support tables with many columns.
   // The sender allocates exact size needed; receiver pre-allocates max. A
-  // source has only one receive in flight, so reuse this buffer for all
-  // packets instead of creating one mmap-backed allocation per request.
-  if (metadataReceiveBuffer_ == nullptr) {
-    metadataReceiveBuffer_ =
-        std::make_shared<std::vector<uint8_t>>(kMaxMetaBufSize);
-  }
-  auto metadataReq = metadataReceiveBuffer_;
-  uint64_t metadataTag = getMetadataTag(partitionKeyHash_, sequenceNumber_);
+  // Each retained UCXX request needs a distinct receive address. An old
+  // request can be replayed during endpoint wireup; sharing this allocation
+  // with the current request would let the transport overwrite new metadata.
+  auto metadataReq =
+      std::make_shared<std::vector<uint8_t>>(kMaxMetaBufSize);
+  const auto expectedSequence = sequenceNumber_;
+  uint64_t metadataTag = getMetadataTag(partitionKeyHash_, expectedSequence);
 
   VLOG(3) << toString()
           << " waiting for metadata for chunk: " << sequenceNumber_
@@ -653,10 +826,11 @@ void UcxExchangeSource::getMetadata() {
       ucxx::Tag{metadataTag},
       ucxx::TagMaskFull,
       false,
-      [weak](ucs_status_t status, std::shared_ptr<void> arg) {
+      [weak, expectedSequence](
+          ucs_status_t status, std::shared_ptr<void> arg) {
         auto metadata = std::static_pointer_cast<std::vector<uint8_t>>(arg);
         if (auto self = weak.lock()) {
-          self->onMetadata(status, metadata);
+          self->onMetadata(status, metadata, expectedSequence);
         }
       },
       metadataReq);
@@ -664,7 +838,8 @@ void UcxExchangeSource::getMetadata() {
 
 void UcxExchangeSource::onMetadata(
     ucs_status_t status,
-    std::shared_ptr<void> arg) {
+    std::shared_ptr<void> arg,
+    uint32_t expectedSequence) {
   // Check if close() was called - avoid processing if we're shutting down
   if (closed_.load(std::memory_order_acquire)) {
     VLOG(2) << "[UCX-SOURCE-METADATA-AFTER-CLOSE] " << toString()
@@ -673,7 +848,14 @@ void UcxExchangeSource::onMetadata(
     deliverEndMarker();
     return;
   }
-  // Guard against replayed callbacks from UCP wireup replay.
+  // Guard against replayed callbacks from UCP wireup replay. State alone is
+  // insufficient because an old metadata callback may arrive while a later
+  // sequence is also WaitingForMetadata and uses the same receive buffer.
+  if (expectedSequence != sequenceNumber_) {
+    VLOG(1) << toString() << " ignoring replayed metadata callback for seq="
+            << expectedSequence << ", currentSeq=" << sequenceNumber_;
+    return;
+  }
   if (getState() != ReceiverState::WaitingForMetadata) {
     VLOG(2) << toString() << " onMetadata called in state "
             << toName(getState()) << ", ignoring (possible UCXX replay)";
@@ -699,6 +881,22 @@ void UcxExchangeSource::onMetadata(
     // arg contains the actual serialized metadata, deserialize the metadata
     std::shared_ptr<std::vector<uint8_t>> metadataMsg =
         std::static_pointer_cast<std::vector<uint8_t>>(arg);
+
+    if (exchangeVariableWidthValidationEnabled()) {
+      uint32_t serializedBytes = 0;
+      std::memcpy(
+          &serializedBytes,
+          metadataMsg->data() + sizeof(kMagicNumber),
+          sizeof(serializedBytes));
+      VELOX_CHECK_LE(serializedBytes, metadataMsg->size());
+      LOG(WARNING) << "UCX receiver metadata key=" << partitionKey_.toString()
+                   << " sequence=" << expectedSequence
+                   << " bytes=" << serializedBytes << " fingerprint=0x"
+                   << std::hex
+                   << diagnosticBufferFingerprint(
+                          metadataMsg->data(), serializedBytes)
+                   << std::dec;
+    }
 
     auto ptr = std::make_shared<DataAndMetadata>();
 
@@ -754,7 +952,8 @@ bool UcxExchangeSource::tryStartDataReceive(
   }
   reservedReceiveBytes_ = ptr->metadata.dataSizeBytes;
 
-  const bool useHostStaging = !communicator->hasCudaTransport();
+  const bool useHostStaging = shouldHostStageDeviceTransfer(
+      communicator->hasCudaTransport(), ptr->metadata.dataSizeBytes);
   if (useHostStaging && !tryReserveRecvHostBytes(ptr->metadata.dataSizeBytes)) {
     queue_->releaseReservedReceive(reservedReceiveBytes_);
     reservedReceiveBytes_ = 0;
@@ -886,19 +1085,22 @@ bool UcxExchangeSource::tryStartDataReceive(
   void* receiveBuffer = ptr->dataBuf->data();
   if (useHostStaging) {
     const auto receiveSize = static_cast<size_t>(ptr->metadata.dataSizeBytes);
-    if (dataReceiveBuffer_ == nullptr) {
-      dataReceiveBuffer_ = std::make_shared<std::vector<uint8_t>>(receiveSize);
-    } else if (dataReceiveBuffer_->size() < receiveSize) {
-      dataReceiveBuffer_->resize(receiveSize);
-    }
-    ptr->hostData = dataReceiveBuffer_;
-    receiveBuffer = ptr->hostData->data();
+    // Keep a unique allocation with this request for the bounded UCXX replay
+    // window. The receive completion callback copies it synchronously to the
+    // final device buffer, but the old request may still be replayed later.
+    ptr->hostData =
+        allocateHostStagingBuffer(receiveSize, ptr->hostDataPinned);
+    receiveBuffer = ptr->hostData.get();
   }
   VLOG(2) << toString() << " posting "
-          << (useHostStaging ? "host-staged" : "direct-device")
+          << (useHostStaging
+                  ? (ptr->hostDataPinned ? "pinned-host-staged"
+                                         : "pageable-host-staged")
+                  : "direct-device")
           << " receive for " << ptr->metadata.dataSizeBytes << " bytes";
 
-  uint64_t dataTag = getDataTag(partitionKeyHash_, sequenceNumber_);
+  const auto expectedSequence = sequenceNumber_;
+  uint64_t dataTag = getDataTag(partitionKeyHash_, expectedSequence);
   VLOG(3) << toString() << " waiting for data for chunk: " << sequenceNumber_
           << " using tag: " << std::hex << dataTag << std::dec;
 
@@ -916,9 +1118,10 @@ bool UcxExchangeSource::tryStartDataReceive(
       ucxx::Tag{dataTag},
       ucxx::TagMaskFull,
       false,
-      [weak](ucs_status_t status, std::shared_ptr<void> arg) {
+      [weak, expectedSequence](
+          ucs_status_t status, std::shared_ptr<void> arg) {
         if (auto self = weak.lock()) {
-          self->onData(status, arg);
+          self->onData(status, arg, expectedSequence);
         }
       },
       ptr);
@@ -926,7 +1129,10 @@ bool UcxExchangeSource::tryStartDataReceive(
   return true;
 }
 
-void UcxExchangeSource::onData(ucs_status_t status, std::shared_ptr<void> arg) {
+void UcxExchangeSource::onData(
+    ucs_status_t status,
+    std::shared_ptr<void> arg,
+    uint32_t expectedSequence) {
   // Check if close() was called - avoid processing if we're shutting down
   if (closed_.load(std::memory_order_acquire)) {
     VLOG(2) << "[UCX-SOURCE-DATA-AFTER-CLOSE] " << toString()
@@ -934,6 +1140,11 @@ void UcxExchangeSource::onData(ucs_status_t status, std::shared_ptr<void> arg) {
             << " status=" << ucs_status_string(status);
     releaseReceiveReservation();
     deliverEndMarker();
+    return;
+  }
+  if (expectedSequence != sequenceNumber_) {
+    VLOG(1) << toString() << " ignoring replayed data callback for seq="
+            << expectedSequence << ", currentSeq=" << sequenceNumber_;
     return;
   }
   // Guard against replayed callbacks from UCP wireup replay.
@@ -968,20 +1179,80 @@ void UcxExchangeSource::onData(ucs_status_t status, std::shared_ptr<void> arg) {
         std::static_pointer_cast<DataAndMetadata>(arg);
 
     if (ptr->hostData != nullptr) {
-      CUDF_CUDA_TRY(cudaMemcpy(
+      metrics_.hostStagedBytes_.addValue(ptr->metadata.dataSizeBytes);
+      if (exchangeVariableWidthValidationEnabled()) {
+        LOG(WARNING) << "UCX receiver staged key="
+                     << partitionKey_.toString()
+                     << " sequence=" << expectedSequence
+                     << " bytes=" << ptr->metadata.dataSizeBytes
+                     << " fingerprint=0x" << std::hex
+                     << diagnosticBufferFingerprint(
+                            ptr->hostData.get(),
+                            ptr->metadata.dataSizeBytes)
+                     << std::dec;
+      }
+      AsyncHostCopySlotReservation asyncCopySlot(
+          asyncHostReceiveCopyEnabled());
+      CUDF_CUDA_TRY(cudaMemcpyAsync(
           ptr->dataBuf->data(),
-          ptr->hostData->data(),
+          ptr->hostData.get(),
           ptr->metadata.dataSizeBytes,
-          cudaMemcpyHostToDevice));
-      ptr->hostData.reset();
-      if (reservedGlobalHostReceiveBytes_ > 0) {
-        releaseRecvHostBytes(reservedGlobalHostReceiveBytes_);
+          cudaMemcpyHostToDevice,
+          ptr->stream.value()));
+
+      bool publishedAsync = false;
+      std::unique_ptr<AsyncHostCopyCompletion> completion;
+      if (asyncCopySlot.reserved()) {
+        completion = std::make_unique<AsyncHostCopyCompletion>();
+        completion->hostData = std::move(ptr->hostData);
+        completion->reservedHostBytes = reservedGlobalHostReceiveBytes_;
+        completion->reservedAsyncCopySlot = true;
         reservedGlobalHostReceiveBytes_ = 0;
+        const auto callbackStatus = cudaLaunchHostFunc(
+            ptr->stream.value(), releaseAsyncHostCopy, completion.get());
+        if (callbackStatus == cudaSuccess) {
+          asyncCopySlot.transferToCallback();
+          completion.release();
+          publishedAsync = true;
+          metrics_.asyncHostCopyBytes_.addValue(
+              ptr->metadata.dataSizeBytes);
+        } else {
+          // cudaLaunchHostFunc was not queued. Preserve the synchronous
+          // ownership boundary before destroying the context and return the
+          // callback error to CUDA's per-thread state only after recording it.
+          LOG(WARNING) << toString()
+                       << " could not queue async host-copy release for "
+                       << ptr->metadata.dataSizeBytes
+                       << " bytes: " << cudaGetErrorString(callbackStatus)
+                       << "; falling back to stream synchronization";
+          cudaGetLastError();
+        }
+      } else if (asyncHostReceiveCopyEnabled()) {
+        metrics_.asyncHostCopyThrottledBytes_.addValue(
+            ptr->metadata.dataSizeBytes);
+      }
+
+      if (!publishedAsync) {
+        // The packed page is consumed on ptr->stream. The fallback preserves
+        // the historical CPU ownership fence when the opt-in is disabled or
+        // CUDA cannot enqueue the completion callback.
+        const auto syncStart = std::chrono::steady_clock::now();
+        CUDF_CUDA_TRY(cudaStreamSynchronize(ptr->stream.value()));
+        metrics_.hostCopySyncNanos_.addValue(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - syncStart)
+                .count());
+        if (completion != nullptr) {
+          completion.reset();
+        } else {
+          ptr->hostData.reset();
+          if (reservedGlobalHostReceiveBytes_ > 0) {
+            releaseRecvHostBytes(reservedGlobalHostReceiveBytes_);
+            reservedGlobalHostReceiveBytes_ = 0;
+          }
+        }
       }
     }
-    // The source-level pageable fallback buffer is intentionally retained and
-    // reused by the next serial host-staged receive.
-
     metrics_.numPackedColumns_.addValue(1);
     metrics_.totalBytes_.addValue(ptr->metadata.dataSizeBytes);
 
@@ -991,6 +1262,21 @@ void UcxExchangeSource::onData(ucs_status_t status, std::shared_ptr<void> arg) {
 
     // Unpack to get the table_view and create a packed_table
     cudf::table_view tableView = cudf::unpack(packedCols);
+    if (exchangeVariableWidthValidationEnabled()) {
+      LOG(WARNING) << "UCX receiver validating remoteTask="
+                   << partitionKey_.taskId
+                   << " destination=" << partitionKey_.destination
+                   << " sequence=" << expectedSequence
+                   << " rows=" << tableView.num_rows()
+                   << " bytes=" << ptr->metadata.dataSizeBytes;
+      LOG(WARNING) << "UCX receiver page remoteTask=" << partitionKey_.taskId
+                   << " destination=" << partitionKey_.destination
+                   << " sequence=" << expectedSequence
+                   << " rows=" << tableView.num_rows()
+                   << " bytes=" << ptr->metadata.dataSizeBytes
+                   << " layout=" << cudf_velox::validateVariableWidthTableLayout(
+                          tableView, ptr->stream);
+    }
     auto packedTable = std::make_unique<cudf::packed_table>(
         cudf::packed_table{tableView, std::move(packedCols)});
 
@@ -1174,28 +1460,24 @@ void UcxExchangeSource::onIntraNodeData(
 
   metrics_.numPackedColumns_.addValue(1);
   metrics_.totalBytes_.addValue(data->gpu_data->size());
-  // Broadcast output can share the same packed_columns across multiple
-  // destinations. Keep the zero-copy path for uniquely owned partitioned
-  // pages, but clone shared pages before moving out of them.
-  const bool sharedPage = data.use_count() > 1;
-  // The received device buffer was allocated on `producerStream`, and with the
-  // stream-ordered async MR its cudaFreeAsync stays bound to that stream. For
-  // the uniquely-owned (partitioned) page we MOVE the buffer out, so tag the
-  // rebuilt vector with `producerStream` itself: the downstream read and the
-  // eventual async free then share one stream, so the free can never recycle
-  // the block under a still-pending consumer read on a different pool stream
-  // (previously seen as flaky garbage on Q17, both high and low). Shared pages
-  // are cloned onto a fresh pool stream (the source buffer stays live in the
-  // shared owner and the producer host-synchronizes before publishing).
-  auto stream = sharedPage
-      ? facebook::velox::cudf_velox::cudfGlobalStreamPool().get_stream()
-      : producerStream;
+  // Make the consumer page independently owned. Moving a uniquely referenced
+  // producer allocation into the consumer looked safe, but under sustained
+  // HASH exchange its stream-ordered allocation was recycled while the page
+  // was still queued: Job 144 consistently observed valid pages 1..84 and a
+  // negative STRING offset in page 85 before concatenate touched it. A
+  // consumer-stream clone is an explicit ownership boundary for both HASH and
+  // BROADCAST pages. Join the producer stream and finish the bounded D2D copy
+  // before releasing the registry's producer allocation.
+  auto stream =
+      facebook::velox::cudf_velox::cudfGlobalStreamPool().get_stream();
+  std::vector<rmm::cuda_stream_view> producerStreams{producerStream};
+  cudf::detail::join_streams(producerStreams, stream);
+  auto consumerData = std::make_unique<rmm::device_buffer>(
+      data->gpu_data->data(), data->gpu_data->size(), stream);
+  stream.synchronize();
   cudf::packed_columns packedCols(
-      sharedPage ? std::make_unique<std::vector<uint8_t>>(*data->metadata)
-                 : std::move(data->metadata),
-      sharedPage ? std::make_unique<rmm::device_buffer>(
-                       data->gpu_data->data(), data->gpu_data->size(), stream)
-                 : std::move(data->gpu_data));
+      std::make_unique<std::vector<uint8_t>>(*data->metadata),
+      std::move(consumerData));
 
   // Unpack to get the table_view and create a packed_table
   cudf::table_view tableView = cudf::unpack(packedCols);

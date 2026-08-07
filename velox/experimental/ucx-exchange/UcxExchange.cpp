@@ -62,10 +62,27 @@ UcxExchange::UcxExchange(
         1 // number of consumers, is always 1.
     );
   }
+
 }
 
 UcxExchange::~UcxExchange() {
   close();
+}
+
+void UcxExchange::initialize() {
+  SourceOperator::initialize();
+
+  // Register remote sources before this source is first pulled. A probe-side
+  // exchange can sit behind hash-build barriers and otherwise not receive an
+  // isBlocked() call until its upstream producer has filled its output queue.
+  //
+  // initialize() runs on the driver thread after Task::start() releases the
+  // Task mutex, but initializes the whole pipeline before barrier processing.
+  // This is early enough to register the reader without recursively acquiring
+  // the Task mutex from inside operator construction.
+  if (processSplits_) {
+    getSplits(&splitFuture_);
+  }
 }
 
 void UcxExchange::addRemoteTaskIds(std::vector<std::string>& remoteTaskIds) {

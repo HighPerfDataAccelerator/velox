@@ -17,6 +17,8 @@
 
 #include "velox/core/PlanNode.h"
 
+#include <cudf/column/column.hpp>
+#include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
 
 namespace facebook::velox::ucx_exchange {
@@ -87,6 +89,24 @@ RowVectorPtr buildRangeBoundaryVector(
     const std::vector<column_index_t>& keyChannels,
     memory::MemoryPool* pool,
     std::vector<cudf::order>& orders,
-    std::vector<cudf::null_order>& nullOrders);
+    std::vector<cudf::null_order>& nullOrders,
+    bool* splitEqualKeys = nullptr);
+
+/**
+ * Returns Spark-compatible RANGE partition ids. When the descriptor contains
+ * repeated full-key boundaries and splitEqualKeys is enabled, rows exactly
+ * equal to those boundaries are striped across only the adjacent partitions
+ * spanned by the repeats. All smaller and larger keys retain their ordinary
+ * lower-bound id, so global key ordering is unchanged.
+ */
+std::unique_ptr<cudf::column> makeRangePartitionIds(
+    cudf::table_view boundaries,
+    cudf::table_view keys,
+    const std::vector<cudf::order>& orders,
+    const std::vector<cudf::null_order>& nullOrders,
+    bool splitEqualKeys,
+    int32_t splitStart,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr);
 
 } // namespace facebook::velox::ucx_exchange

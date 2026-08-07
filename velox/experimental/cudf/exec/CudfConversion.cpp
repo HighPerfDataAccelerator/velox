@@ -27,6 +27,7 @@
 #include "velox/exec/Operator.h"
 #include "velox/vector/ComplexVector.h"
 
+#include <cudf/copying.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
 
@@ -95,7 +96,22 @@ CudfFromVelox::CudfFromVelox(
           result.planNodeId = parentId;
           return std::vector<exec::OperatorStats>{std::move(result)};
         });
-  });
+      });
+}
+
+vector_size_t CudfFromVelox::preferredBatchRows() const {
+  return preferredGpuBatchSizeRows(
+      operatorCtx_->driverCtx()->queryConfig());
+}
+
+uint64_t CudfFromVelox::maxBatchBytes() const {
+  constexpr uint64_t kDefaultMaxBatchBytes = 256ULL << 20;
+  const auto configured =
+      operatorCtx_->driverCtx()->queryConfig().get<uint64_t>(
+          kMaxBatchBytes, kDefaultMaxBatchBytes);
+  VELOX_CHECK_GT(
+      configured, 0, "velox.cudf.from_velox.max_batch_bytes must be > 0");
+  return configured;
 }
 
 void CudfFromVelox::doAddInput(RowVectorPtr input) {
@@ -109,34 +125,67 @@ void CudfFromVelox::doAddInput(RowVectorPtr input) {
     // Accumulate inputs
     inputs_.push_back(input);
     currentOutputSize_ += input->size();
+    currentOutputBytes_ += input->estimateFlatSize();
   }
 }
 
 RowVectorPtr CudfFromVelox::doGetOutput() {
-  const auto targetOutputSize =
-      preferredGpuBatchSizeRows(operatorCtx_->driverCtx()->queryConfig());
+  const auto targetOutputSize = preferredBatchRows();
+  const auto targetOutputBytes = maxBatchBytes();
 
   finished_ = noMoreInput_ && inputs_.empty();
 
   if (finished_ or
-      (currentOutputSize_ < targetOutputSize and not noMoreInput_) or
+      (currentOutputSize_ < targetOutputSize &&
+       currentOutputBytes_ < targetOutputBytes && !noMoreInput_) or
       inputs_.empty()) {
     return nullptr;
   }
 
-  // Select inputs that don't exceed the max vector size limit
+  // Some iterator-backed inputs (for example Gluten's GPU columnar table
+  // cache) already produce a CudfVector.  The source is conservatively
+  // classified as CPU, so ToCudf may still insert this conversion boundary.
+  // Do not feed that vector through mergeRowVectors: CudfVector deliberately
+  // exposes no host RowVector children, and copying it as a regular RowVector
+  // produces an invalid row whose type has columns but whose children list is
+  // empty.  Preserve ordering and ownership by forwarding one device batch
+  // at a time.
+  if (std::dynamic_pointer_cast<CudfVector>(inputs_.front())) {
+    auto input = std::move(inputs_.front());
+    inputs_.erase(inputs_.begin());
+    currentOutputSize_ -= input->size();
+    currentOutputBytes_ -= input->estimateFlatSize();
+    return input;
+  }
+
+  // Select a bounded prefix. The old implementation waited for a row target
+  // and then merged every queued RowVector, which can turn byte-bounded
+  // CudfToVelox slices back into a multi-GiB host allocation.
   std::vector<RowVectorPtr> selectedInputs;
   vector_size_t totalSize = 0;
+  uint64_t totalBytes = 0;
   auto const maxVectorSize = std::numeric_limits<vector_size_t>::max();
 
   for (const auto& input : inputs_) {
-    if (totalSize + input->size() <= maxVectorSize) {
-      selectedInputs.push_back(input);
-      totalSize += input->size();
-    } else {
+    const auto inputSize = static_cast<vector_size_t>(input->size());
+    const auto inputBytes = input->estimateFlatSize();
+    const bool wouldExceedRows =
+        totalSize > 0 &&
+        (totalSize >= targetOutputSize ||
+         inputSize > targetOutputSize - totalSize ||
+         inputSize > maxVectorSize - totalSize);
+    const bool wouldExceedBytes =
+        totalBytes > 0 &&
+        (inputBytes > targetOutputBytes ||
+         totalBytes > targetOutputBytes - inputBytes);
+    if (wouldExceedRows || wouldExceedBytes) {
       break;
     }
+    selectedInputs.push_back(input);
+    totalSize += inputSize;
+    totalBytes += inputBytes;
   }
+  VELOX_CHECK(!selectedInputs.empty());
 
   // Combine selected RowVectors into a single RowVector
   auto input = mergeRowVectors(selectedInputs, inputs_[0]->pool());
@@ -144,6 +193,7 @@ RowVectorPtr CudfFromVelox::doGetOutput() {
   // Remove processed inputs
   inputs_.erase(inputs_.begin(), inputs_.begin() + selectedInputs.size());
   currentOutputSize_ -= totalSize;
+  currentOutputBytes_ -= totalBytes;
 
   // Early return if no input
   if (input->size() == 0) {
@@ -188,6 +238,8 @@ void CudfFromVelox::doClose() {
   cudf::get_default_stream(cudf::allow_default_stream).synchronize();
   Operator::close();
   inputs_.clear();
+  currentOutputSize_ = 0;
+  currentOutputBytes_ = 0;
 }
 
 CudfToVelox::CudfToVelox(
@@ -230,53 +282,66 @@ void CudfToVelox::doAddInput(RowVectorPtr input) {
   }
 }
 
-std::optional<uint64_t> CudfToVelox::averageRowSize() {
-  if (!averageRowSize_) {
-    averageRowSize_ =
-        inputs_.front()->estimateFlatSize() / inputs_.front()->size();
-  }
-  return averageRowSize_;
+uint64_t CudfToVelox::maxBatchBytes() const {
+  constexpr uint64_t kDefaultMaxBatchBytes = 256ULL << 20;
+  // Leave substantial headroom below Arrow's signed 32-bit string-offset
+  // ceiling. estimateFlatSize() is an aggregate estimate and nested columns
+  // may not distribute bytes uniformly across rows.
+  constexpr uint64_t kHardMaxBatchBytes = 1ULL << 30;
+  const auto configured =
+      operatorCtx_->driverCtx()->queryConfig().get<uint64_t>(
+          kMaxBatchBytes, kDefaultMaxBatchBytes);
+  VELOX_CHECK_GT(
+      configured, 0, "velox.cudf.to_velox.max_batch_bytes must be > 0");
+  return std::min(configured, kHardMaxBatchBytes);
 }
 
-// Pop inputs_.front(), convert its GPU table to a Velox RowVector via a
-// single to_arrow_host + synchronize, and return it.  The caller is
-// responsible for any further slicing.
-RowVectorPtr CudfToVelox::convertFrontToVelox() {
-  auto cudfVector = std::move(inputs_.front());
-  inputs_.pop_front();
-  auto stream = cudfVector->stream();
-  auto tableView = cudfVector->getTableView();
+vector_size_t CudfToVelox::nextBatchRows() const {
+  VELOX_CHECK_NOT_NULL(cudfBuffer_);
+  const auto totalRows =
+      static_cast<vector_size_t>(cudfBuffer_->size());
+  VELOX_CHECK_LT(cudfOffset_, totalRows);
+  const auto remaining = totalRows - cudfOffset_;
+  const auto flatBytes =
+      std::max<uint64_t>(cudfBuffer_->estimateFlatSize(), totalRows);
+  // Use a ceiling average so the byte bound is conservative.
+  const auto averageRowBytes =
+      std::max<uint64_t>(1, (flatBytes + totalRows - 1) / totalRows);
+  const auto byteBoundRows = std::max<vector_size_t>(
+      1,
+      std::min<uint64_t>(
+          remaining, maxBatchBytes() / averageRowBytes));
+  if (isPassthroughMode()) {
+    return byteBoundRows;
+  }
+  return std::min(
+      byteBoundRows,
+      outputBatchRows(std::optional<uint64_t>{averageRowBytes}));
+}
+
+// Slice on GPU first, then convert only the bounded view. Converting the
+// complete input and slicing the RowVector afterwards can allocate tens of
+// GiB on host and fails when any Arrow string data buffer exceeds INT32_MAX.
+RowVectorPtr CudfToVelox::convertNextSliceToVelox() {
+  VELOX_CHECK_NOT_NULL(cudfBuffer_);
+  auto stream = cudfBuffer_->stream();
+  const auto rows = nextBatchRows();
+  const auto end = cudfOffset_ + rows;
+  auto slices =
+      cudf::slice(cudfBuffer_->getTableView(), {cudfOffset_, end}, stream);
+  VELOX_CHECK_EQ(slices.size(), 1);
   auto output = with_arrow::toVeloxColumn(
-      tableView, pool(), outputType_, "", stream, get_temp_mr());
+      slices.front(), pool(), outputType_, "", stream, get_temp_mr());
   stream.synchronize();
   output->setType(outputType_);
+  cudfOffset_ = end;
+  if (cudfOffset_ >= cudfBuffer_->size()) {
+    cudfBuffer_.reset();
+    cudfOffset_ = 0;
+  }
   return output;
 }
 
-// Output batching strategy
-// ========================
-// The key constraint is minimising D->H (device-to-host) transfers.
-// Each call to toVeloxColumn / to_arrow_host triggers one D->H copy per
-// column, so calling it once per output batch (rather than once per row
-// or once per input batch) is critical for performance.
-//
-// Two cases arise depending on the size of the front GPU input relative
-// to targetBatchSize:
-//
-//  (A) Front input >= targetBatchSize  (e.g. CudfOrderBy: one large sorted
-//      table).  We convert the whole input to Velox in one shot and then
-//      slice it purely on the CPU using BaseVector::slice().  Subsequent
-//      getOutput() calls return successive CPU slices with no additional
-//      D->H work until veloxBuffer_ is exhausted.
-//
-//  (B) Front input < targetBatchSize  (e.g. CudfFilterProject with high
-//      selectivity: many small GPU batches).  We concatenate inputs on device
-//      until we accumulate targetBatchSize rows, then convert the concat
-//      result to Velox in one shot.  This preserves the GPU-side merge
-//      that avoids emitting many undersized Velox batches downstream.
-//
-// In both cases exactly one toVeloxColumn + stream.synchronize() is issued
-// per output batch, regardless of how many GPU inputs were consumed.
 RowVectorPtr CudfToVelox::doGetOutput() {
   if (finished_) {
     return nullptr;
@@ -298,91 +363,25 @@ RowVectorPtr CudfToVelox::doGetOutput() {
     return BaseVector::create<RowVector>(outputType_, totalSize, pool());
   }
 
-  // Drain veloxBuffer_ (populated on a previous call) before consuming
-  // more GPU inputs.
-  if (!veloxBuffer_) {
+  if (!cudfBuffer_) {
     if (inputs_.empty()) {
       finished_ = noMoreInput_;
       return nullptr;
     }
-
-    // Passthrough mode: emit each GPU input as a single Velox batch with no
-    // re-batching.  Used when the caller knows the batch size is already
-    // correct (e.g. default pipeline without explicit batch-size overrides).
-    if (isPassthroughMode()) {
-      auto output = convertFrontToVelox();
-      finished_ = noMoreInput_ && inputs_.empty();
-      if (output->size() == 0) {
-        return nullptr;
-      }
-      return output;
-    }
-
-    const auto targetBatchSize = outputBatchRows(averageRowSize());
-
-    if (static_cast<vector_size_t>(inputs_.front()->size()) >=
-        targetBatchSize) {
-      // Case A: large input.  Convert once; subsequent calls slice CPU-side.
-      veloxBuffer_ = convertFrontToVelox();
-      veloxOffset_ = 0;
-      averageRowSize_ = std::nullopt; // recompute from next input
-    } else {
-      // Case B: small inputs.  GPU-concat until we reach targetBatchSize,
-      // then convert the merged table in one D->H transfer.
-      auto stream = inputs_.front()->stream();
-      std::vector<CudfVectorPtr> toConcat;
-      vector_size_t accumulated = 0;
-      while (!inputs_.empty() && accumulated < targetBatchSize) {
-        accumulated += static_cast<vector_size_t>(inputs_.front()->size());
-        toConcat.push_back(std::move(inputs_.front()));
-        inputs_.pop_front();
-      }
-      VELOX_CHECK_LE(
-          accumulated,
-          std::numeric_limits<cudf::size_type>::max(),
-          "Accumulated row count exceeds cudf int32 limit");
-      auto concatTable = getConcatenatedTable(
-          std::move(toConcat), outputType_, stream, get_temp_mr());
-      auto tableView = concatTable->view();
-      veloxBuffer_ = with_arrow::toVeloxColumn(
-          tableView, pool(), outputType_, "", stream, get_temp_mr());
-      stream.synchronize();
-      veloxBuffer_->setType(outputType_);
-      veloxOffset_ = 0;
-      averageRowSize_ = std::nullopt;
-    }
+    cudfBuffer_ = std::move(inputs_.front());
+    inputs_.pop_front();
+    cudfOffset_ = 0;
   }
 
-  // Slice veloxBuffer_ on the CPU to produce the next output batch.
-  const auto totalRows = static_cast<vector_size_t>(veloxBuffer_->size());
-  if (veloxOffset_ >= totalRows) {
-    veloxBuffer_.reset();
-    finished_ = noMoreInput_ && inputs_.empty();
-    return nullptr;
-  }
-
-  const auto targetBatchSize = outputBatchRows(
-      veloxBuffer_->estimateFlatSize() /
-      static_cast<uint64_t>(std::max<vector_size_t>(totalRows, 1)));
-  const auto take = std::min(targetBatchSize, totalRows - veloxOffset_);
-
-  auto slice = std::dynamic_pointer_cast<RowVector>(
-      veloxBuffer_->slice(veloxOffset_, take));
-  VELOX_CHECK_NOT_NULL(slice);
-  veloxOffset_ += take;
-
-  if (veloxOffset_ >= totalRows) {
-    veloxBuffer_.reset();
-    finished_ = noMoreInput_ && inputs_.empty();
-  }
-
-  return slice;
+  auto output = convertNextSliceToVelox();
+  finished_ = noMoreInput_ && inputs_.empty() && !cudfBuffer_;
+  return output;
 }
 
 void CudfToVelox::doClose() {
   Operator::close();
   inputs_.clear();
-  veloxBuffer_.reset();
+  cudfBuffer_.reset();
 }
 
 } // namespace facebook::velox::cudf_velox

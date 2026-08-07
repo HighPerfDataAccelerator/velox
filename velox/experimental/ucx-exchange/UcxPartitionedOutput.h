@@ -15,11 +15,14 @@
  */
 #pragma once
 
+#include <deque>
 #include <optional>
 
 #include "velox/exec/Operator.h"
 #include "velox/experimental/cudf/exec/NvtxHelper.h"
+#include "velox/experimental/cudf/exec/CudfPackedRestore.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
+#include "velox/experimental/ucx-exchange/LocalDeviceOutputQueueManager.h"
 #include "velox/experimental/ucx-exchange/UcxOutputQueueManager.h"
 
 namespace facebook::velox::ucx_exchange {
@@ -97,14 +100,23 @@ class UcxPartitionedOutput : public exec::Operator,
   std::unique_ptr<cudf::table> rangeBoundaries_;
   std::vector<cudf::order> rangeOrders_;
   std::vector<cudf::null_order> rangeNullOrders_;
+  bool rangeSplitEqualKeys_{false};
+  size_t rangeSplitCounter_{0};
   const size_t numPartitions_;
+  /// Terminal cache output remains inside this executor process. Transfer the
+  /// owning CudfVector directly instead of packing it for UCX transport.
+  const bool localDeviceRootOutput_;
 
   const int pipelineId_;
   const int driverId_;
-  /// Partial aggregation may need a large transient allocation to produce its
-  /// next batch. Do not retain one of its oversized outputs across a queue
-  /// wait; scan/join producers keep normal mid-source backpressure.
-  const bool sourceNeedsOwnerBoundaryBackpressure_;
+  /// Partial aggregation and low-reduction partial TopN may need a large
+  /// transient allocation to produce their next batch. Do not retain one of
+  /// their oversized outputs across a queue wait; scan/join producers keep
+  /// normal mid-source backpressure.
+  const bool sourceCanExternalizeOnBackpressure_;
+  /// Executor-wide packed host-memory ceiling shared with Grace Join and
+  /// partitioned TopN. This is an accounting limit, not a private UCX pool.
+  const uint64_t packedHostBytesLimit_;
 
   exec::BlockingReason blockingReason_{exec::BlockingReason::kNotBlocked};
   ContinueFuture future_;
@@ -134,7 +146,15 @@ class UcxPartitionedOutput : public exec::Operator,
   void updateBackpressure();
 
   bool hasActiveFlush() const;
+  bool hasActiveDeviceSource() const;
   cudf::table_view activeTableView();
+  /// Converts the unsent tail of a low-reduction partial result into bounded
+  /// host-owned packed pages. This releases the multi-GiB device owner before
+  /// yielding to exchange backpressure.
+  bool externalizeActiveSourceTail();
+  /// Restores exactly one bounded host page for the next exchange work unit.
+  void restoreNextHostSource();
+  void releaseActiveDeviceSource();
   void clearActiveFlush();
 
   /// Accumulated CudfVectors awaiting flush.
@@ -147,14 +167,22 @@ class UcxPartitionedOutput : public exec::Operator,
   /// Ownership and cursor for a flush that yielded between partition windows.
   std::vector<cudf_velox::CudfVectorPtr> activeInputs_;
   std::unique_ptr<cudf::table> activeMergedTable_;
+  std::optional<cudf_velox::CudfBulkPackedRestore> activeRestoredSource_;
   std::optional<rmm::cuda_stream_view> activeStream_;
   uint64_t activeSourceFlatBytes_{0};
   cudf::size_type activeNextRow_{0};
   cudf::size_type activeRowsPerWindow_{0};
-  /// A source larger than the task queue cap must not remain pinned while the
-  /// producer is blocked. Such an oversized, multi-window source is drained
-  /// before observing backpressure so its owner can be released promptly.
-  bool activeDrainBeforeBackpressure_{false};
+  struct HostSourceChunk {
+    std::unique_ptr<std::vector<uint8_t>> metadata;
+    std::shared_ptr<uint8_t> data;
+    std::shared_ptr<void> hostReservation;
+    uint64_t dataBytes{0};
+    cudf::size_type rows{0};
+  };
+  std::deque<HostSourceChunk> activeHostSources_;
+  uint64_t diagnosticHostExternalizedBytes_{0};
+  uint64_t diagnosticHostRestoredBytes_{0};
+  uint64_t diagnosticHostExternalizedChunks_{0};
   /// Task-wide queue byte cap. Normal window sizing uses device headroom;
   /// this supplies only the emergency schema-width fallback under pressure.
   const uint64_t maxOutputBufferSize_;

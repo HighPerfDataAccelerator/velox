@@ -109,6 +109,54 @@ TEST_F(CudfExpressionSelectionTest, functionRoot) {
   ASSERT_NE(functionExpr, nullptr);
 }
 
+TEST_F(CudfExpressionSelectionTest, operatorBatchCacheSharesRepeatedRoot) {
+  auto first = compileExecExpr("lower(name)", rowType_, execCtx_.get());
+  auto second = compileExecExpr("lower(name)", rowType_, execCtx_.get());
+  auto cache = makeCudfExpressionBatchCache({first, second});
+  ASSERT_EQ(cache->cacheableKeyCount(), 1);
+
+  auto firstEvaluator = createCudfExpression(first, rowType_, nullptr, cache);
+  auto secondEvaluator =
+      createCudfExpression(second, rowType_, nullptr, cache);
+  auto input = cudf::make_strings_column(
+      0,
+      cudf::make_numeric_column(
+          cudf::data_type{cudf::type_id::INT32},
+          1,
+          cudf::mask_state::UNALLOCATED),
+      rmm::device_buffer{},
+      0,
+      rmm::device_buffer{});
+  auto a = cudf::make_fixed_width_column(
+      cudf::data_type{cudf::type_id::INT64}, 0);
+  auto b = cudf::make_fixed_width_column(
+      cudf::data_type{cudf::type_id::INT64}, 0);
+  auto c = cudf::make_fixed_width_column(
+      cudf::data_type{cudf::type_id::INT32}, 0);
+  std::vector<cudf::column_view> inputViews{
+      a->view(), b->view(), c->view(), input->view()};
+
+  auto firstResult = firstEvaluator->eval(
+      inputViews,
+      cudf::get_default_stream(),
+      cudf::get_current_device_resource_ref(),
+      true);
+  auto secondResult = secondEvaluator->eval(
+      inputViews,
+      cudf::get_default_stream(),
+      cudf::get_current_device_resource_ref(),
+      true);
+
+  EXPECT_EQ(asView(firstResult).size(), 0);
+  EXPECT_EQ(asView(secondResult).size(), 0);
+  EXPECT_EQ(cache->retained(), 1);
+  EXPECT_EQ(cache->hits(), 1);
+
+  cache->reset();
+  EXPECT_EQ(cache->retained(), 0);
+  EXPECT_EQ(cache->hits(), 0);
+}
+
 TEST_F(CudfExpressionSelectionTest, astTopLevelWithFunctionPrecompute) {
   auto prevAst = CudfConfig::getInstance().astExpressionEnabled;
   auto prevJit = CudfConfig::getInstance().jitExpressionEnabled;

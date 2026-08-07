@@ -27,6 +27,31 @@ using namespace facebook::velox::exec;
 
 namespace facebook::velox::ucx_exchange {
 
+namespace {
+
+bool columnViewsAreZeroBased(const cudf::column_view& column) {
+  if (column.offset() != 0) {
+    return false;
+  }
+  for (cudf::size_type child = 0; child < column.num_children(); ++child) {
+    if (!columnViewsAreZeroBased(column.child(child))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool columnViewsAreZeroBased(const cudf::table_view& table) {
+  for (cudf::size_type column = 0; column < table.num_columns(); ++column) {
+    if (!columnViewsAreZeroBased(table.column(column))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+} // namespace
+
 constexpr int kPipelineId = 0;
 constexpr uint32_t kPartitionId = 0; // not used in tests.
 
@@ -97,6 +122,9 @@ void SinkDriverMock::receiveAllData(UcxExchange* hybridExchange) {
                 res);
         numBytes_.fetch_add(cudfRes->estimateFlatSize());
         const auto rows = cudfRes->getTableView().num_rows();
+        if (!columnViewsAreZeroBased(cudfRes->getTableView())) {
+          allColumnViewsZeroBased_.store(false);
+        }
         const auto startRow = numRows_.fetch_add(rows);
         numChunksReceived_.fetch_add(1);
         // If we have Reference data check the received data is the same

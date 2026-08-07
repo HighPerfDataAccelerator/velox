@@ -136,6 +136,9 @@ block(SCOPE_FOR VARIABLES)
     URL_HASH ${VELOX_cudf_BUILD_SHA256_CHECKSUM}
     SOURCE_SUBDIR
     cpp
+    PATCH_COMMAND
+      patch -p1 -i
+      ${CMAKE_CURRENT_LIST_DIR}/cudf/strings-concatenate-skip-zero-byte-copy.patch
     UPDATE_DISCONNECTED 1
   )
 
