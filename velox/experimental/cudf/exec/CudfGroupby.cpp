@@ -23,6 +23,7 @@
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
+#include "velox/experimental/cudf/expression/AstUtils.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
 
 #include "velox/exec/Aggregate.h"
@@ -177,7 +178,8 @@ uint64_t addRepresentedRows(uint64_t left, uint64_t right) {
       auto& request = requests.emplace_back();                                \
       output_idx = requests.size() - 1;                                       \
       if (constant != nullptr) {                                              \
-        auto scalar = cudf_velox::makeScalarFromConstantVector(constant);     \
+        auto scalar =                                                         \
+            cudf_velox::makeScalarFromConstantVector(constant, {}, stream);   \
         constant_input = cudf::make_column_from_scalar(                       \
             *scalar, tbl.num_rows(), stream, get_temp_mr());                  \
         request.values = constant_input->view();                              \

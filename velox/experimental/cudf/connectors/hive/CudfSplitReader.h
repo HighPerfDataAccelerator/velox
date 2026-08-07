@@ -182,12 +182,6 @@ class CudfSplitReader : public NvtxHelper {
   // Setup the cuDF reader options
   void setupReaderOptions();
 
-  // Create the chunked parquet reader.
-  void createCudfReader();
-
-  // Create the experimental hybrid scan reader.
-  void createExperimentalReader();
-
   std::shared_ptr<CudfHiveConfig> cudfHiveConfig_;
   memory::MemoryPool* pool_;
 

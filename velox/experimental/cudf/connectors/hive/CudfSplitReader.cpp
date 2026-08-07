@@ -29,6 +29,9 @@
 #include "velox/connectors/hive/HiveConnectorSplit.h"
 #include "velox/connectors/hive/HiveDataSource.h"
 #include "velox/connectors/hive/TableHandle.h"
+#ifdef VELOX_ENABLE_S3
+#include "velox/connectors/hive/storage_adapters/s3fs/S3FileSystem.h"
+#endif
 #ifdef VELOX_ENABLE_ABFS
 #include "velox/connectors/hive/storage_adapters/abfs/AbfsUtil.h"
 #endif
@@ -997,13 +1000,13 @@ std::shared_ptr<cudf::io::datasource> CudfSplitReader::createCudfDataSource(
       connectorQueryCtx_->sessionProperties());
 
   VELOX_CHECK(
-      not isAbfsPath(split_->filePath) or useBufferedInput,
+      not isAbfsPath(filePath) or useBufferedInput,
       "ABFS blobs require buffered input data source. "
       "Set the session property '{}' (or connector property '{}') to 'true'. "
       "Blob Path: {}.",
       CudfHiveConfig::kUseBufferedInputSession,
       CudfHiveConfig::kUseBufferedInput,
-      split_->filePath);
+      filePath);
 
   // Use KvikIO data source if we don't want to use the BufferedInput source
   if (not useBufferedInput) {
@@ -1049,7 +1052,7 @@ std::shared_ptr<cudf::io::datasource> CudfSplitReader::createCudfDataSource(
   auto fileHandleCachePtr = FileHandleCachedPtr{};
   try {
     const auto fileHandleKey = FileHandleKey{
-        .filename = split_->filePath,
+        .filename = filePath,
         .tokenProvider = connectorQueryCtx_->fsTokenProvider()};
     auto fileProperties = FileProperties{};
     fileHandleCachePtr = fileHandleFactory_->generate(
@@ -1057,23 +1060,21 @@ std::shared_ptr<cudf::io::datasource> CudfSplitReader::createCudfDataSource(
     VELOX_CHECK_NOT_NULL(fileHandleCachePtr.get());
   } catch (const VeloxRuntimeError& e) {
     // ABFS blobs can not fall back to KvikIO. Throw the original error.
-    if (isAbfsPath(split_->filePath)) {
+    if (isAbfsPath(filePath)) {
       VELOX_USER_FAIL(
           "Failed to generate file handle cache for ABFS blob. Ensure "
           "registerAbfsFileSystem() and registerAzureClientProvider() have "
           "been called and the connector config provides Azure credentials. "
           "Blob path: {}. Error: {}.",
-          split_->filePath,
+          filePath,
           e.what());
     }
 
     LOG(WARNING) << fmt::format(
         "Failed to generate file handle cache for file. Falling back to KvikIO. Path: {}",
-        split_->filePath);
-    dataSource_ = std::move(
-        cudf::io::make_datasources(cudf::io::source_info{split_->filePath})
-            .front());
-    return;
+        filePath);
+    return std::move(
+        cudf::io::make_datasources(cudf::io::source_info{filePath}).front());
   }
 
   // Here we keep adding new entries to CacheTTLController when new
@@ -1107,23 +1108,32 @@ std::shared_ptr<cudf::io::datasource> CudfSplitReader::createCudfDataSource(
           executor_);
   if (not bufferedInput) {
     // ABFS blobs can not fall back to KvikIO
-    if (isAbfsPath(split_->filePath)) {
+    if (isAbfsPath(filePath)) {
       VELOX_USER_FAIL(
           "Failed to create buffered input data source for the ABFS blob. Ensure that the registered "
           "BufferedInputBuilder is ABFS-aware. Blob path: {}.",
-          split_->filePath);
+          filePath);
     }
 
     LOG(WARNING) << fmt::format(
         "Failed to create buffered input data source for file. Falling back to the KvikIO. Path: {}",
-        split_->filePath);
-    dataSource_ = std::move(
-        cudf::io::make_datasources(cudf::io::source_info{split_->filePath})
-            .front());
-    return;
+        filePath);
+    return std::move(
+        cudf::io::make_datasources(cudf::io::source_info{filePath}).front());
   }
-  dataSource_ =
-      std::make_unique<BufferedInputDataSource>(std::move(bufferedInput));
+  return std::make_unique<BufferedInputDataSource>(std::move(bufferedInput));
+}
+
+std::vector<std::unique_ptr<cudf::io::datasource>>
+CudfSplitReader::makeDataSourceViews() {
+  VELOX_CHECK_NOT_NULL(dataSource_);
+  std::vector<std::unique_ptr<cudf::io::datasource>> sources;
+  sources.reserve(1 + coalescedDataSources_.size());
+  sources.push_back(cudf::io::datasource::create(dataSource_.get()));
+  for (const auto& source : coalescedDataSources_) {
+    sources.push_back(cudf::io::datasource::create(source.get()));
+  }
+  return sources;
 }
 
 void CudfSplitReader::setupReaderOptions() {
