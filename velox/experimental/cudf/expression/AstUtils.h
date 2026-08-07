@@ -224,6 +224,27 @@ static std::unique_ptr<cudf::scalar> createCudfScalar(
       vector->type(), vector->value(), vector->isNullAt(0), toType, stream);
 }
 
+template <TypeKind Kind>
+static std::unique_ptr<cudf::scalar> createCudfScalarFromVector(
+    const VectorPtr& value,
+    std::optional<cudf::type_id> toType = std::nullopt,
+    rmm::cuda_stream_view stream =
+        cudf::get_default_stream(cudf::allow_default_stream)) {
+  using T = typename TypeTraits<Kind>::NativeType;
+  auto vector = value->as<ConstantVector<T>>();
+  return makeScalarFromValue<T>(
+      vector->type(), vector->value(), vector->isNullAt(0), toType, stream);
+}
+
+inline std::unique_ptr<cudf::scalar> makeScalarFromConstantVector(
+    const VectorPtr& value,
+    std::optional<cudf::type_id> toType = std::nullopt,
+    rmm::cuda_stream_view stream =
+        cudf::get_default_stream(cudf::allow_default_stream)) {
+  return VELOX_DYNAMIC_SCALAR_TYPE_DISPATCH(
+      createCudfScalarFromVector, value->typeKind(), value, toType, stream);
+}
+
 inline std::unique_ptr<cudf::scalar> makeScalarFromConstantExpr(
     const core::TypedExprPtr& expr,
     memory::MemoryPool* pool,
