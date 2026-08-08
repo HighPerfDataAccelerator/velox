@@ -40,6 +40,9 @@
 namespace facebook::velox::cudf_velox {
 namespace {
 
+constexpr uint64_t kMinOrderByOutputWorkspaceBytes = 512ULL << 20;
+constexpr uint64_t kOrderByOutputFixedWorkspaceBytes = 256ULL << 20;
+
 constexpr uint64_t kMergeChunkBytes = 32ULL << 20;
 constexpr uint64_t kHostPackChunkBytes = 32ULL << 20;
 constexpr size_t kFinalMergeRuns = 2;
@@ -376,6 +379,55 @@ CudfOrderBy::CudfOrderBy(
   }
 }
 
+uint64_t CudfOrderBy::outputWorkspaceBytes() const {
+  // One drain step can restore one bounded chunk from each merge input,
+  // materialize the merged table, and copy one bounded output slice.  Charge
+  // all of those transient owners before getOutput() competes with Ucx/TopN
+  // output work on the same device.
+  const auto mergeInputBytes = sortedRunBytes_ >
+          std::numeric_limits<uint64_t>::max() /
+              std::max<size_t>(mergeFanIn_, 1)
+      ? std::numeric_limits<uint64_t>::max()
+      : sortedRunBytes_ * std::max<size_t>(mergeFanIn_, 1);
+  if (mergeInputBytes >
+          std::numeric_limits<uint64_t>::max() -
+              kOrderByOutputFixedWorkspaceBytes ||
+      outputChunkBytes_ >
+          (std::numeric_limits<uint64_t>::max() - mergeInputBytes -
+           kOrderByOutputFixedWorkspaceBytes) /
+              2) {
+    return std::numeric_limits<uint64_t>::max();
+  }
+  return std::max<uint64_t>(
+      kMinOrderByOutputWorkspaceBytes,
+      mergeInputBytes + outputChunkBytes_ * 2 +
+          kOrderByOutputFixedWorkspaceBytes);
+}
+
+exec::BlockingReason CudfOrderBy::isBlocked(ContinueFuture* future) {
+  if (finished_ || !noMoreInput_ || outputWorkspaceAdmission_.has_value()) {
+    return exec::BlockingReason::kNotBlocked;
+  }
+
+  ContinueFuture workspaceFuture;
+  const auto minHeadroom = std::min<uint64_t>(
+      CudfConfig::getInstance().deviceMemoryMinHeadroomBytes, 1ULL << 30);
+  auto workspace = tryAcquireDeviceMemoryWorkspace(
+      customPool(kCudfDeviceMemoryResourceTag),
+      this,
+      outputWorkspaceBytes(),
+      minHeadroom,
+      DeviceMemoryWorkspacePriority::kOutput,
+      &outputWorkspaceRequest_,
+      &workspaceFuture);
+  if (!workspace.has_value()) {
+    *future = std::move(workspaceFuture);
+    return exec::BlockingReason::kWaitForArbitration;
+  }
+  outputWorkspaceAdmission_.emplace(std::move(workspace.value()));
+  return exec::BlockingReason::kNotBlocked;
+}
+
 void CudfOrderBy::doAddInput(RowVectorPtr input) {
   if (input->size() == 0) {
     return;
@@ -447,6 +499,13 @@ RowVectorPtr CudfOrderBy::doGetOutput() {
   if (finished_ || !noMoreInput_) {
     return nullptr;
   }
+
+  VELOX_CHECK(
+      outputWorkspaceAdmission_.has_value(),
+      "CudfOrderBy drain requires device workspace admission");
+  SCOPE_EXIT {
+    outputWorkspaceAdmission_.reset();
+  };
 
   try {
     if (auto output = takePendingOutput()) {

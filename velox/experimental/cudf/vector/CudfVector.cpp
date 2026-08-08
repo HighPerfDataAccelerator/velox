@@ -207,7 +207,8 @@ CudfVector::CudfVector(
     TypePtr type,
     vector_size_t size,
     std::unique_ptr<cudf::packed_table>&& packedTable,
-    rmm::cuda_stream_view stream)
+    rmm::cuda_stream_view stream,
+    std::shared_ptr<void> lifetimeOwner)
     : RowVector(
           pool,
           std::move(type),
@@ -215,6 +216,7 @@ CudfVector::CudfVector(
           size,
           std::vector<VectorPtr>(),
           std::nullopt),
+      lifetimeOwner_{std::move(lifetimeOwner)},
       streamOwner_{retainRegisteredStreamOwner(stream)},
       tableStorage_{std::move(packedTable)},
       stream_{stream} {
@@ -276,6 +278,9 @@ std::unique_ptr<cudf::table> CudfVector::release() {
 }
 
 std::unique_ptr<cudf::packed_table> CudfVector::releasePacked() {
+  VELOX_CHECK(
+      !lifetimeOwner_,
+      "Cannot detach a packed table from its external lifetime owner");
   auto* packedPtr =
       std::get_if<std::unique_ptr<cudf::packed_table>>(&tableStorage_);
   if (packedPtr == nullptr || !*packedPtr) {

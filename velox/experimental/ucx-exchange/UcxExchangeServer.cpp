@@ -144,6 +144,15 @@ int64_t intraNodeProducerPollRequeueLimit() {
   return limit;
 }
 
+bool intraNodeHostBounceEnabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("GLUTEN_UCX_INTRANODE_HOST_BOUNCE");
+    return value != nullptr && value[0] != '\0' &&
+        !(value[0] == '0' && value[1] == '\0');
+  }();
+  return enabled;
+}
+
 int64_t maxInFlightSendHostBytes() {
   static const int64_t limit = [] {
     if (const char* value =
@@ -516,16 +525,80 @@ void UcxExchangeServer::sendData() {
       IntraNodeTransferKey key{
           partitionKey_.taskId, partitionKey_.destination, sequenceNumber_};
       const auto stream = dataPtr_->gpu_data->stream();
-      // The consumer tags uniquely owned pages with this stream so downstream
-      // reads and stream-ordered async frees remain ordered with the buffer.
-      // dataPtr_ is already a shared_ptr, pass directly to share ownership.
-      intraNodeRetrieveFuture_ =
-          IntraNodeTransferRegistry::getInstance()->publish(
-              key,
-              dataPtr_,
-              stream,
-              /*atEnd=*/false,
-              makeIntraNodeRetrieveWakeup());
+      if (intraNodeHostBounceEnabled()) {
+        // A direct same-node publication keeps the producer device allocation
+        // alive until the downstream source polls and then clones it. Under
+        // multi-driver HASH fan-out, several fragments can each wait for a
+        // consumer while collectively owning all free device memory. Move the
+        // ownership boundary to bounded host storage: D2H completes here, the
+        // producer allocation is released, and the consumer defers H2D until
+        // its Velox Driver has acquired device admission.
+        auto bounce = std::make_shared<DataSendContext>();
+        if (!bounce->reserveHostBytes(static_cast<int64_t>(bytes_))) {
+          wakeCommunicator();
+          return;
+        }
+        bounce->hostDataBytes = bytes_;
+        bounce->hostData =
+            allocateHostStagingBuffer(bytes_, bounce->hostDataPinned);
+        auto metadata =
+            std::make_unique<std::vector<uint8_t>>(*dataPtr_->metadata);
+        const auto copyStream = hostStagingCopyStream();
+        cudf_velox::CudaEvent producerReady{cudaEventDisableTiming};
+        producerReady.recordFrom(stream).waitOn(copyStream);
+        const auto copyStatus = cudaMemcpyAsync(
+            bounce->hostData.get(),
+            dataPtr_->gpu_data->data(),
+            bytes_,
+            cudaMemcpyDeviceToHost,
+            copyStream.value());
+        if (copyStatus != cudaSuccess) {
+          cudf_velox::logDeviceMemorySnapshot(
+              "UcxExchangeServer intra-node bounce D2H error");
+        }
+        CUDF_CUDA_TRY(copyStatus);
+        const auto synchronizeStatus =
+            cudaStreamSynchronize(copyStream.value());
+        if (synchronizeStatus != cudaSuccess) {
+          LOG(ERROR) << "UCX intra-node bounce D2H stream failed task="
+                     << partitionKey_.toString()
+                     << " sequence=" << sequenceNumber_ << " bytes=" << bytes_
+                     << " status=" << cudaGetErrorString(synchronizeStatus);
+          cudf_velox::logDeviceMemorySnapshot(
+              "UcxExchangeServer intra-node bounce D2H stream error");
+        }
+        CUDF_CUDA_TRY(synchronizeStatus);
+
+        // Alias the data pointer to the context so host credit and the pinned
+        // pool lease remain owned by the consumer queue through deferred H2D.
+        auto hostOwner =
+            std::shared_ptr<uint8_t>(bounce, bounce->hostData.get());
+        const bool pinned = bounce->hostDataPinned;
+        intraNodeRetrieveFuture_ =
+            IntraNodeTransferRegistry::getInstance()->publishHost(
+                key,
+                std::move(metadata),
+                std::move(hostOwner),
+                bytes_,
+                pinned,
+                makeIntraNodeRetrieveWakeup());
+        LOG_EVERY_N(WARNING, 128)
+            << "CUDF_UCX_INTRANODE_HOST_BOUNCE task="
+            << partitionKey_.taskId << " destination="
+            << partitionKey_.destination << " sequence=" << sequenceNumber_
+            << " bytes=" << bytes_ << " pinned=" << pinned;
+      } else {
+        // The consumer tags uniquely owned pages with this stream so
+        // downstream reads and stream-ordered async frees remain ordered with
+        // the buffer. dataPtr_ is already shared, so publish it directly.
+        intraNodeRetrieveFuture_ =
+            IntraNodeTransferRegistry::getInstance()->publish(
+                key,
+                dataPtr_,
+                stream,
+                /*atEnd=*/false,
+                makeIntraNodeRetrieveWakeup());
+      }
       dataPtr_.reset();
       intraNodeAtEndPublished_ = false;
 
@@ -741,11 +814,7 @@ void UcxExchangeServer::sendData() {
             cudaMemcpyDeviceToHost,
             copyStream.value());
         if (copyStatus != cudaSuccess) {
-          cudf_velox::logDeviceMemoryPointerAttribution(
-              "UcxExchangeServer host staging D2H error",
-              dataCtx->data->gpu_data->data(),
-              bytes_);
-          cudf_velox::logLiveDeviceMemoryAttribution(
+          cudf_velox::logDeviceMemorySnapshot(
               "UcxExchangeServer host staging D2H error");
         }
         CUDF_CUDA_TRY(copyStatus);
@@ -756,11 +825,7 @@ void UcxExchangeServer::sendData() {
                      << partitionKey_.toString()
                      << " sequence=" << sequenceNumber_ << " bytes=" << bytes_
                      << " status=" << cudaGetErrorString(synchronizeStatus);
-          cudf_velox::logDeviceMemoryPointerAttribution(
-              "UcxExchangeServer host staging D2H stream error",
-              dataCtx->data->gpu_data->data(),
-              bytes_);
-          cudf_velox::logLiveDeviceMemoryAttribution(
+          cudf_velox::logDeviceMemorySnapshot(
               "UcxExchangeServer host staging D2H stream error");
         }
         CUDF_CUDA_TRY(synchronizeStatus);

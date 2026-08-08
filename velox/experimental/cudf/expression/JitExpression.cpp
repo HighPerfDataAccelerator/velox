@@ -29,6 +29,11 @@ void JitExpression::close() {
   expr_.close();
 }
 
+void JitExpression::attachBatchCache(
+    CudfExpressionBatchCachePtr batchCache) {
+  expr_.attachBatchCache(std::move(batchCache));
+}
+
 ColumnOrView JitExpression::eval(
     std::vector<cudf::column_view> inputColumnViews,
     rmm::cuda_stream_view stream,

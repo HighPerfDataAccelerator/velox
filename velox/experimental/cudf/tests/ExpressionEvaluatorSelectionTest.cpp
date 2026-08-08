@@ -31,6 +31,7 @@
 #include "velox/functions/sparksql/registration/Register.h"
 #include "velox/type/Type.h"
 
+#include <cudf/column/column_factories.hpp>
 #include <folly/ScopeGuard.h>
 #include <gtest/gtest.h>
 
@@ -110,14 +111,17 @@ TEST_F(CudfExpressionSelectionTest, functionRoot) {
 }
 
 TEST_F(CudfExpressionSelectionTest, operatorBatchCacheSharesRepeatedRoot) {
-  auto first = compileExecExpr("lower(name)", rowType_, execCtx_.get());
-  auto second = compileExecExpr("lower(name)", rowType_, execCtx_.get());
+  auto first = optimizeTypedExpr(
+      "lower(name)", rowType_, queryCtx_.get(), execCtx_.get());
+  auto second = optimizeTypedExpr(
+      "lower(name)", rowType_, queryCtx_.get(), execCtx_.get());
   auto cache = makeCudfExpressionBatchCache({first, second});
   ASSERT_EQ(cache->cacheableKeyCount(), 1);
 
-  auto firstEvaluator = createCudfExpression(first, rowType_, nullptr, cache);
+  auto firstEvaluator =
+      createCudfExpression(first, rowType_, pool_.get(), cache);
   auto secondEvaluator =
-      createCudfExpression(second, rowType_, nullptr, cache);
+      createCudfExpression(second, rowType_, pool_.get(), cache);
   auto input = cudf::make_strings_column(
       0,
       cudf::make_numeric_column(

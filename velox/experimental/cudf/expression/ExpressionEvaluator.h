@@ -133,10 +133,18 @@ bool registerBuiltinFunctions(const std::string& prefix);
 
 void unregisterFunctions();
 
+class CudfExpressionBatchCache;
+
 class CudfExpression {
  public:
   virtual ~CudfExpression() = default;
   virtual void close() = 0;
+
+  /// Propagates an operator-batch cache through evaluator wrappers such as
+  /// AST/JIT precompute nodes. Evaluators with no recursive native
+  /// expressions keep the default no-op implementation.
+  virtual void attachBatchCache(
+      std::shared_ptr<CudfExpressionBatchCache> /*batchCache*/) {}
 
   virtual ColumnOrView eval(
       std::vector<cudf::column_view> inputColumnViews,
@@ -146,6 +154,48 @@ class CudfExpression {
 };
 
 using CudfExpressionPtr = std::shared_ptr<CudfExpression>;
+
+/// Operator-owned storage for repeated deterministic expression results within
+/// one input batch. The owning FilterProject resets this before evaluating the
+/// next batch, so cached column views never outlive their input-batch scope.
+class CudfExpressionBatchCache {
+ public:
+  explicit CudfExpressionBatchCache(
+      std::unordered_set<std::string> cacheableKeys);
+
+  bool isCacheable(const std::string& key) const;
+  std::optional<cudf::column_view> lookup(const std::string& key);
+  cudf::column_view store(
+      const std::string& key,
+      ColumnOrView result,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr);
+  void reset();
+
+  uint64_t hits() const {
+    return hits_;
+  }
+
+  uint64_t retained() const {
+    return retained_;
+  }
+
+  size_t cacheableKeyCount() const {
+    return cacheableKeys_.size();
+  }
+
+ private:
+  std::unordered_set<std::string> cacheableKeys_;
+  std::unordered_map<std::string, std::unique_ptr<cudf::column>> columns_;
+  uint64_t hits_{0};
+  uint64_t retained_{0};
+};
+
+using CudfExpressionBatchCachePtr =
+    std::shared_ptr<CudfExpressionBatchCache>;
+
+CudfExpressionBatchCachePtr makeCudfExpressionBatchCache(
+    const std::vector<core::TypedExprPtr>& roots);
 
 class FunctionExpression : public CudfExpression {
  public:
@@ -166,6 +216,10 @@ class FunctionExpression : public CudfExpression {
   /// Does not recursively check children.
   static bool canEvaluate(const core::TypedExprPtr& expr);
 
+  /// Installs one operator-batch cache on this recursive FunctionExpression
+  /// tree. Other evaluator kinds remain unchanged.
+  void attachBatchCache(CudfExpressionBatchCachePtr batchCache) override;
+
  private:
   static std::unique_ptr<cudf::column> makeStructChildColumn(
       ColumnOrView& structColumn,
@@ -182,6 +236,8 @@ class FunctionExpression : public CudfExpression {
   int32_t fieldIndex_{-1};
 
   RowTypePtr inputRowSchema_;
+  CudfExpressionBatchCachePtr batchCache_;
+  std::string cseKey_;
 };
 
 /// Create a CudfExpression from a TypedExpr, selecting the best evaluator.
@@ -191,7 +247,8 @@ class FunctionExpression : public CudfExpression {
 std::shared_ptr<CudfExpression> createCudfExpression(
     const core::TypedExprPtr& expr,
     const RowTypePtr& inputRowSchema,
-    memory::MemoryPool* pool);
+    memory::MemoryPool* pool,
+    CudfExpressionBatchCachePtr batchCache = nullptr);
 
 /// Plan-time GPU eligibility for a top-level operator expression, as invoked by
 /// the OperatorAdapters and the aggregation validators. Optimizes the

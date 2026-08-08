@@ -16,6 +16,7 @@
 
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
+#include "velox/experimental/ucx-exchange/LocalDeviceOutputQueueManager.h"
 #include "velox/experimental/ucx-exchange/UcxOutputQueueManager.h"
 
 #include "velox/exec/Task.h"
@@ -58,7 +59,7 @@ class TaskOutputManagerTest : public HiveConnectorTestBase {
 
   std::shared_ptr<Task> startTask(
       const std::string& taskId,
-      core::PartitionedOutputNode::TransportType transport,
+      std::string transport,
       core::QueryConfig queryConfig = core::QueryConfig{{}}) {
     auto output = std::dynamic_pointer_cast<const core::PartitionedOutputNode>(
         PlanBuilder()
@@ -66,7 +67,7 @@ class TaskOutputManagerTest : public HiveConnectorTestBase {
             .partitionedOutputBroadcast()
             .planNode());
     auto plan = core::PartitionedOutputNode::Builder(*output)
-                    .transportType(transport)
+                    .transportKind(std::move(transport))
                     .build();
     auto task = Task::create(
         taskId,
@@ -93,8 +94,8 @@ TEST_F(TaskOutputManagerTest, selectionAndCancellationCleanup) {
   auto cleanup =
       folly::makeGuard([&]() { queueManager->removeTask(ucxTaskId); });
 
-  auto ucxTask =
-      startTask(ucxTaskId, core::PartitionedOutputNode::TransportType::kUcx);
+  auto ucxTask = startTask(
+      ucxTaskId, std::string{core::TransportKind::kUcx});
   ASSERT_TRUE(queueManager->stats(ucxTaskId).has_value());
 
   std::atomic_bool cancellationDelivered{false};
@@ -112,20 +113,54 @@ TEST_F(TaskOutputManagerTest, selectionAndCancellationCleanup) {
   cleanup.dismiss();
 
   const std::string httpTaskId = "http-output-manager-lifecycle";
-  auto httpTask =
-      startTask(httpTaskId, core::PartitionedOutputNode::TransportType::kHttp);
+  auto httpTask = startTask(
+      httpTaskId, std::string{core::TransportKind::kInMemory});
   EXPECT_FALSE(queueManager->stats(httpTaskId).has_value());
   httpTask->requestAbort().wait();
 
   const std::string disabledTaskId = "disabled-ucx-output-manager-lifecycle";
   auto disabledTask = startTask(
       disabledTaskId,
-      core::PartitionedOutputNode::TransportType::kUcx,
+      std::string{core::TransportKind::kUcx},
       core::QueryConfig(
           std::unordered_map<std::string, std::string>{
               {cudf_velox::CudfConfig::kCudfEnabled, "false"}}));
-  EXPECT_FALSE(queueManager->stats(disabledTaskId).has_value());
+  // Transport selection is explicit in the plan. Query-level cuDF disablement
+  // influences planning/operator adaptation, but it does not rewrite an
+  // already selected UCX transport back to in-memory buffering.
+  EXPECT_TRUE(queueManager->stats(disabledTaskId).has_value());
   disabledTask->requestAbort().wait();
+}
+
+TEST_F(TaskOutputManagerTest, localDeviceRootSharesUcxTaskLifecycle) {
+  const std::string taskId = "local-device-root-output-lifecycle";
+  auto ucxManager = ucx_exchange::UcxOutputQueueManager::getInstanceRef();
+  auto localManager =
+      ucx_exchange::LocalDeviceOutputQueueManager::getInstanceRef();
+  ucxManager->removeTask(taskId);
+  localManager->removeTask(taskId);
+  auto cleanup = folly::makeGuard([&]() {
+    ucxManager->removeTask(taskId);
+    localManager->removeTask(taskId);
+  });
+
+  localManager->registerDirectOutputTask(taskId);
+  auto task = startTask(
+      taskId,
+      std::string{core::TransportKind::kUcx},
+      core::QueryConfig(std::unordered_map<std::string, std::string>{
+          {ucx_exchange::LocalDeviceOutputQueueManager::kEnabledConfig,
+           "true"}}));
+
+  EXPECT_TRUE(ucxManager->stats(taskId).has_value());
+  EXPECT_TRUE(localManager->isDirectOutputTask(taskId));
+  const auto initial = localManager->tryGetData(taskId, 0, 0);
+  EXPECT_FALSE(initial.ready);
+
+  task->requestAbort().wait();
+  EXPECT_FALSE(ucxManager->stats(taskId).has_value());
+  EXPECT_FALSE(localManager->isDirectOutputTask(taskId));
+  cleanup.dismiss();
 }
 
 } // namespace

@@ -28,9 +28,9 @@ namespace facebook::velox::ucx_exchange {
 namespace {
 class UcxPinnedBufferPool {
  public:
-  UcxPinnedBufferPool() {
-    if (const char* value =
-            std::getenv("GLUTEN_UCX_PINNED_BUFFER_COUNT")) {
+  UcxPinnedBufferPool(const char* countEnv, const char* label)
+      : label_{label} {
+    if (const char* value = std::getenv(countEnv)) {
       char* end = nullptr;
       const auto requested = std::strtoull(value, &end, 10);
       if (end != value && *end == '\0') {
@@ -73,7 +73,8 @@ class UcxPinnedBufferPool {
     if (status != cudaSuccess) {
       cudaGetLastError();
       LOG(WARNING) << "Could not allocate " << allocationBytes
-                   << " bytes for UCX pinned bounce slot " << available
+                   << " bytes for UCX " << label_
+                   << " pinned bounce slot " << available
                    << ": " << cudaGetErrorString(status)
                    << "; falling back to pageable staging";
       return {};
@@ -121,16 +122,28 @@ class UcxPinnedBufferPool {
   std::mutex mutex_;
   std::vector<std::unique_ptr<Slot>> slots_;
   size_t maxSlots_{4};
+  const char* const label_;
 };
 
 UcxPinnedBufferPool& ucxPinnedBufferPool() {
-  static UcxPinnedBufferPool pool;
+  static UcxPinnedBufferPool pool(
+      "GLUTEN_UCX_PINNED_BUFFER_COUNT", "transport");
+  return pool;
+}
+
+UcxPinnedBufferPool& ucxH2DPinnedBufferPool() {
+  static UcxPinnedBufferPool pool(
+      "GLUTEN_UCX_H2D_PINNED_BUFFER_COUNT", "H2D");
   return pool;
 }
 } // namespace
 
 std::shared_ptr<uint8_t> acquireUcxPinnedBuffer(uint64_t requiredBytes) {
   return ucxPinnedBufferPool().acquire(requiredBytes);
+}
+
+std::shared_ptr<uint8_t> acquireUcxH2DPinnedBuffer(uint64_t requiredBytes) {
+  return ucxH2DPinnedBufferPool().acquire(requiredBytes);
 }
 
 uint32_t fnv1a_32(std::string_view s) {

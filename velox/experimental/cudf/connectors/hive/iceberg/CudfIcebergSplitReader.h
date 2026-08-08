@@ -25,6 +25,7 @@
 #include "velox/connectors/hive/iceberg/IcebergSplit.h"
 #include "velox/connectors/hive/iceberg/PositionalDeleteFileReader.h"
 
+#include <deque>
 #include <list>
 #include <optional>
 #include <string>
@@ -64,6 +65,11 @@ class CudfIcebergSplitReader : public CudfSplitReader {
       bool useExperimentalCudfReader,
       cudf::ast::expression const* subfieldFilterExpr);
 
+  void setDataSourceContext(
+      const ::facebook::velox::connector::ConnectorQueryCtx* connectorQueryCtx,
+      dwio::common::RuntimeStatistics& runtimeStats,
+      cudf::ast::expression const* subfieldFilterExpr) override;
+
  protected:
   // Sets up delete file readers and column projection after base state reset.
   void prepareSplitInternal(
@@ -83,7 +89,15 @@ class CudfIcebergSplitReader : public CudfSplitReader {
 
  private:
   // Clear delete readers and column injection
-  void resetSplit();
+  void resetIcebergState();
+
+  // Prepare one group of Parquet files whose physical column counts are
+  // compatible with one cuDF reader.
+  void prepareCurrentSourceGroup(
+      dwio::common::RuntimeStatistics& runtimeStats);
+
+  // Advance to the next source group after the current reader is exhausted.
+  bool prepareNextSourceGroup();
 
   // Setup delete file readers for positional and equality deletes,
   // and deletion vectors.
@@ -186,6 +200,12 @@ class CudfIcebergSplitReader : public CudfSplitReader {
 
   std::shared_ptr<const velox_iceberg::HiveIcebergSplit> icebergSplit_;
   std::shared_ptr<const velox_hive::HiveConfig> hiveConfig_;
+
+  // adaptColumns() mutates the projection for each physical schema. Restore
+  // the original projection when moving between schema-compatible groups.
+  const std::vector<std::string> initialReadColumnNames_;
+  std::deque<std::shared_ptr<CudfHiveConnectorSplit>> pendingSourceGroups_;
+  dwio::common::RuntimeStatistics* runtimeStats_{nullptr};
 
   // cuDF-accelerated reader for Iceberg V3 deletion vector (Puffin-encoded
   // roaring bitmaps).

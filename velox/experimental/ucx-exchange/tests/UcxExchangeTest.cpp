@@ -50,11 +50,47 @@
 #include "velox/experimental/ucx-exchange/tests/UcxTestData.h"
 #include "velox/experimental/ucx-exchange/tests/UcxTestHelpers.h"
 
+// The cuDF hive connector optionally resolves these callbacks from Gluten.
+// This standalone Velox test does not exercise CRT S3, so provide the same
+// disabled test callbacks used by the cuDF connector tests.
+#ifdef VELOX_ENABLE_S3
+extern "C" bool glutenCrtS3RangeReaderAvailable() {
+  return false;
+}
+
+extern "C" uint64_t glutenCrtS3ObjectSize(const char*) {
+  return 0;
+}
+
+extern "C" uint64_t glutenCrtS3ReadRanges(
+    const char*,
+    uint8_t*,
+    const uint64_t*,
+    const uint64_t*,
+    const uint64_t*,
+    size_t) {
+  return 0;
+}
+#endif
+
 using namespace facebook::velox;
 using namespace facebook::velox::exec;
 using namespace facebook::velox::core;
 
 namespace facebook::velox::ucx_exchange {
+
+TEST(UcxPinnedBufferPoolTest, h2dPoolHasIndependentSharedLease) {
+  auto transport = acquireUcxPinnedBuffer(1);
+  auto h2d = acquireUcxH2DPinnedBuffer(1);
+  ASSERT_NE(transport, nullptr);
+  ASSERT_NE(h2d, nullptr);
+  EXPECT_NE(transport.get(), h2d.get());
+
+  auto retainedTransportOwner = transport;
+  const auto* transportAddress = transport.get();
+  transport.reset();
+  EXPECT_EQ(retainedTransportOwner.get(), transportAddress);
+}
 
 struct ExchangeTestParams {
   int numSrcDrivers;
@@ -938,6 +974,15 @@ TEST_P(UcxExchangeTest, sharedClientSurvivesOneExchangeClose) {
   drainingExchange.close();
 
   EXPECT_EQ(rowsReceived, static_cast<uint64_t>(numChunks) * numRowsPerChunk);
+
+  const auto clientStats = exchangeClient->stats();
+  const auto packedColumns =
+      clientStats.find("ucxExchangeSource.numPackedColumns");
+  ASSERT_NE(packedColumns, clientStats.end());
+  EXPECT_EQ(packedColumns->second.sum, numChunks);
+  const auto totalBytes = clientStats.find("ucxExchangeSource.totalBytes");
+  ASSERT_NE(totalBytes, clientStats.end());
+  EXPECT_GT(totalBytes->second.sum, 0);
 
   queueManager_->removeTask(srcTaskId);
 }

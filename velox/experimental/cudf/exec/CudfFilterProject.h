@@ -50,7 +50,8 @@ class CudfFilterProject : public CudfOperatorBase {
 
   std::vector<std::unique_ptr<cudf::column>> project(
       std::vector<std::unique_ptr<cudf::column>>& inputTableColumns,
-      rmm::cuda_stream_view stream);
+      rmm::cuda_stream_view stream,
+      vector_size_t outputSize);
 
   exec::BlockingReason isBlocked(ContinueFuture* /*future*/) override {
     return exec::BlockingReason::kNotBlocked;
@@ -84,6 +85,8 @@ class CudfFilterProject : public CudfOperatorBase {
   CudfExpressionPtr filterEvaluator_;
   CudfExpressionBatchCachePtr projectExpressionCache_;
   CudfExpressionBatchCachePtr filterExpressionCache_;
+  std::string filterExpressionLabel_;
+  std::vector<std::string> projectExpressionLabels_;
   uint64_t expressionCacheHits_{0};
   uint64_t expressionCacheRetained_{0};
 
@@ -92,6 +95,7 @@ class CudfFilterProject : public CudfOperatorBase {
   std::vector<std::unique_ptr<cudf::scalar>> literalScalars_;
   std::vector<NullComplexLiteralProjection> nullComplexLiteralProjections_;
   std::vector<velox::exec::IdentityProjection> identityProjections_;
+
 };
 
 } // namespace facebook::velox::cudf_velox

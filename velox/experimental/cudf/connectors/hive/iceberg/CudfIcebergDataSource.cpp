@@ -29,6 +29,22 @@ namespace velox_connector = ::facebook::velox::connector;
 namespace velox_hive = ::facebook::velox::connector::hive;
 namespace velox_iceberg = ::facebook::velox::connector::hive::iceberg;
 
+namespace {
+std::string cleanCudfPath(const std::string& path) {
+  constexpr std::string_view kFilePrefix{"file:"};
+  constexpr std::string_view kS3aPrefix{"s3a:"};
+  if (path.starts_with(kFilePrefix)) {
+    return path.substr(kFilePrefix.size());
+  }
+  if (path.starts_with(kS3aPrefix)) {
+    auto cleaned = path;
+    cleaned.erase(kS3aPrefix.size() - 2, 1);
+    return cleaned;
+  }
+  return path;
+}
+} // namespace
+
 CudfIcebergDataSource::CudfIcebergDataSource(
     const RowTypePtr& outputType,
     const velox_connector::ConnectorTableHandlePtr& tableHandle,
@@ -56,6 +72,16 @@ void CudfIcebergDataSource::convertSplit(
 
   // Convert `ConnectorSplit` to `CudfHiveConnectorSplit`
   CudfHiveDataSource::convertSplit(split);
+
+  // HiveIcebergSplit owns the grouped-file list. The generic Hive-to-cuDF
+  // conversion above only copies the primary HiveConnectorSplit fields, so
+  // preserve every additional whole file explicitly. Dropping this list
+  // makes a grouped scan silently read only its primary file.
+  split_->coalescedFiles.reserve(icebergSplit_->coalescedFiles.size());
+  for (const auto& file : icebergSplit_->coalescedFiles) {
+    split_->coalescedFiles.push_back(
+        {cleanCudfPath(file.filePath), file.length});
+  }
 }
 
 std::unique_ptr<CudfSplitReader>

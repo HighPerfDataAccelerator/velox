@@ -655,6 +655,81 @@ TEST_F(UcxOutputQueueManagerTest, exchangeQueueCloseWakesWaitingConsumer) {
   EXPECT_TRUE(future.isReady());
 }
 
+TEST_F(UcxOutputQueueManagerTest, exchangeQueueRetainsLifetimeOwnerUntilReset) {
+  UcxExchangeQueue queue(1);
+  auto owner = std::make_shared<int>(1);
+  std::weak_ptr<int> weakOwner = owner;
+  auto data = std::make_unique<PackedTableWithStream>(
+      nullptr, rmm::cuda_stream_default, owner);
+  owner.reset();
+
+  std::vector<ContinuePromise> promises;
+  {
+    std::lock_guard<std::mutex> l(queue.mutex());
+    queue.enqueueLocked(std::move(data), promises);
+  }
+  EXPECT_FALSE(weakOwner.expired());
+
+  bool atEnd = false;
+  ContinueFuture future;
+  ContinuePromise stalePromise = ContinuePromise::makeEmpty();
+  PackedTableWithStreamPtr dequeued;
+  {
+    std::lock_guard<std::mutex> l(queue.mutex());
+    dequeued =
+        queue.dequeueLocked(0, &atEnd, &future, &stalePromise);
+  }
+  EXPECT_NE(dequeued, nullptr);
+  EXPECT_FALSE(atEnd);
+  EXPECT_FALSE(weakOwner.expired());
+
+  dequeued.reset();
+  EXPECT_TRUE(weakOwner.expired());
+}
+
+TEST_F(UcxOutputQueueManagerTest, exchangeQueueAccountsHostBackedPayload) {
+  UcxExchangeQueue queue(1);
+  constexpr size_t kPayloadBytes = 4096;
+  auto metadata = std::make_unique<std::vector<uint8_t>>(32);
+  auto hostData = std::shared_ptr<uint8_t>(
+      new uint8_t[kPayloadBytes], std::default_delete<uint8_t[]>());
+  auto owner = std::make_shared<int>(1);
+  std::weak_ptr<int> weakOwner = owner;
+  auto data = std::make_unique<PackedTableWithStream>(
+      std::move(metadata),
+      std::move(hostData),
+      kPayloadBytes,
+      true,
+      rmm::cuda_stream_default,
+      owner);
+  owner.reset();
+
+  std::vector<ContinuePromise> promises;
+  {
+    std::lock_guard<std::mutex> l(queue.mutex());
+    queue.enqueueLocked(std::move(data), promises);
+  }
+  EXPECT_EQ(queue.totalBytes(), kPayloadBytes);
+  EXPECT_FALSE(weakOwner.expired());
+
+  bool atEnd = false;
+  ContinueFuture future;
+  ContinuePromise stalePromise = ContinuePromise::makeEmpty();
+  PackedTableWithStreamPtr dequeued;
+  {
+    std::lock_guard<std::mutex> l(queue.mutex());
+    dequeued = queue.dequeueLocked(0, &atEnd, &future, &stalePromise);
+  }
+  ASSERT_NE(dequeued, nullptr);
+  EXPECT_TRUE(dequeued->isHostBacked());
+  EXPECT_EQ(dequeued->dataSize(), kPayloadBytes);
+  EXPECT_EQ(queue.totalBytes(), 0);
+  EXPECT_FALSE(weakOwner.expired());
+
+  dequeued.reset();
+  EXPECT_TRUE(weakOwner.expired());
+}
+
 TEST_F(UcxOutputQueueManagerTest, basicAsyncFetch) {
   const vector_size_t size = 10;
   const std::string taskId = "t0";

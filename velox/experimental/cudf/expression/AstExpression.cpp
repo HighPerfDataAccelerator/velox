@@ -78,6 +78,15 @@ void ASTExpression::close() {
   precomputeInstructions_.clear();
 }
 
+void ASTExpression::attachBatchCache(
+    CudfExpressionBatchCachePtr batchCache) {
+  for (auto& instruction : precomputeInstructions_) {
+    if (instruction.cudf_expression != nullptr) {
+      instruction.cudf_expression->attachBatchCache(batchCache);
+    }
+  }
+}
+
 ColumnOrView ASTExpression::eval(
     std::vector<cudf::column_view> inputColumnViews,
     rmm::cuda_stream_view stream,

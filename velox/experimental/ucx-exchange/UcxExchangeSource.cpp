@@ -17,8 +17,10 @@
 #include <algorithm>
 #include <cstring>
 #include <cstdlib>
+#include <limits>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include <cudf/contiguous_split.hpp>
@@ -26,6 +28,7 @@
 #include <folly/Uri.h>
 #include <rmm/mr/cuda_memory_resource.hpp>
 #include <rmm/mr/statistics_resource_adaptor.hpp>
+#include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/ucx-exchange/IntraNodeTransferRegistry.h"
@@ -35,17 +38,12 @@ using namespace facebook::velox::exec;
 namespace facebook::velox::ucx_exchange {
 
 namespace {
-std::shared_ptr<uint8_t> allocateHostStagingBuffer(
-    uint64_t bytes,
-    bool& pinned) {
-  if (bytes > static_cast<uint64_t>(kDeviceEagerHostStageBytes)) {
-    auto buffer = acquireUcxPinnedBuffer(bytes);
-    if (buffer != nullptr) {
-      pinned = true;
-      return buffer;
-    }
-  }
-  pinned = false;
+std::shared_ptr<uint8_t> allocateReplaySafeHostReceiveBuffer(uint64_t bytes) {
+  // UCXX retains completed requests for wireup replay. The raw receive pointer
+  // therefore cannot come from the reusable pinned pool: once the consumer
+  // releases that lease, replay could overwrite an unrelated later packet.
+  // Keep the transport image pageable and request-owned; UcxExchange uses a
+  // separate short-lived pinned bounce when it performs the deferred H2D.
   return std::shared_ptr<uint8_t>(
       new uint8_t[bytes], std::default_delete<uint8_t[]>());
 }
@@ -151,6 +149,92 @@ int64_t maxInFlightRecvDeviceBytes() {
   return limit;
 }
 
+uint64_t recvConsumerProgressBytes() {
+  static const uint64_t reserve = []() -> uint64_t {
+    constexpr uint64_t kDefault = uint64_t{1} << 30;
+    if (const char* value =
+            std::getenv("GLUTEN_UCX_RECV_CONSUMER_PROGRESS_BYTES")) {
+      try {
+        const auto parsed = std::stoull(value);
+        if (parsed > 0) {
+          return parsed;
+        }
+      } catch (...) {
+      }
+    }
+    return kDefault;
+  }();
+  return reserve;
+}
+
+std::size_t recvAdmissionMinHeadroom() {
+  const auto base = facebook::velox::cudf_velox::CudfConfig::getInstance()
+                        .deviceMemoryMinHeadroomBytes;
+  const auto progress = recvConsumerProgressBytes();
+  const auto maximum = std::numeric_limits<std::size_t>::max();
+  return progress > maximum || base > maximum - progress
+      ? maximum
+      : base + progress;
+}
+
+constexpr auto kRecvWorkspaceProgressAge = std::chrono::seconds(2);
+
+std::mutex recvWorkspaceProgressMutex;
+std::unordered_map<int, uint64_t> recvWorkspaceProgressBytesByDevice;
+
+void releaseRecvWorkspaceProgressBytes(int device, uint64_t bytes) {
+  std::lock_guard<std::mutex> lock(recvWorkspaceProgressMutex);
+  const auto it = recvWorkspaceProgressBytesByDevice.find(device);
+  VELOX_CHECK(it != recvWorkspaceProgressBytesByDevice.end());
+  VELOX_CHECK_GE(it->second, bytes);
+  it->second -= bytes;
+  if (it->second == 0) {
+    recvWorkspaceProgressBytesByDevice.erase(it);
+  }
+}
+
+class RecvWorkspaceProgressLease {
+ public:
+  RecvWorkspaceProgressLease(int device, uint64_t bytes)
+      : device_{device}, bytes_{bytes} {}
+
+  ~RecvWorkspaceProgressLease() {
+    releaseRecvWorkspaceProgressBytes(device_, bytes_);
+  }
+
+ private:
+  const int device_;
+  const uint64_t bytes_;
+};
+
+std::shared_ptr<void> tryAcquireRecvWorkspaceProgressLease(uint64_t bytes) {
+  int device = -1;
+  if (cudaGetDevice(&device) != cudaSuccess || device < 0) {
+    return nullptr;
+  }
+  const auto limit = recvConsumerProgressBytes();
+  if (bytes == 0 || bytes > limit) {
+    return nullptr;
+  }
+  {
+    std::lock_guard<std::mutex> lock(recvWorkspaceProgressMutex);
+    auto& current = recvWorkspaceProgressBytesByDevice[device];
+    if (current > limit - bytes) {
+      if (current == 0) {
+        recvWorkspaceProgressBytesByDevice.erase(device);
+      }
+      return nullptr;
+    }
+    current += bytes;
+  }
+  try {
+    return std::make_shared<RecvWorkspaceProgressLease>(device, bytes);
+  } catch (...) {
+    releaseRecvWorkspaceProgressBytes(device, bytes);
+    throw;
+  }
+}
+
 bool hasRecvDeviceCredit(int64_t bytes) {
   const auto limit = maxInFlightRecvDeviceBytes();
   if (limit <= 0) {
@@ -192,115 +276,6 @@ void releaseRecvHostBytes(int64_t bytes) {
   VELOX_CHECK_GE(previous, bytes);
 }
 
-bool asyncHostReceiveCopyEnabled() {
-  static const bool enabled = [] {
-    const char* value =
-        std::getenv("GLUTEN_UCX_ASYNC_HOST_RECEIVE_COPY");
-    return value != nullptr && value[0] != '\0' &&
-        !(value[0] == '0' && value[1] == '\0');
-  }();
-  return enabled;
-}
-
-int64_t maxInFlightAsyncHostReceiveCopies() {
-  static const int64_t limit = [] {
-    constexpr int64_t kDefault = 1;
-    const char* value =
-        std::getenv("GLUTEN_UCX_ASYNC_HOST_RECEIVE_MAX_COPIES");
-    if (value == nullptr || value[0] == '\0') {
-      return kDefault;
-    }
-    char* end = nullptr;
-    const auto requested = std::strtoll(value, &end, 10);
-    if (end == value || *end != '\0') {
-      LOG(WARNING) << "Ignoring invalid "
-                      "GLUTEN_UCX_ASYNC_HOST_RECEIVE_MAX_COPIES="
-                   << value << "; using " << kDefault;
-      return kDefault;
-    }
-    return std::clamp<int64_t>(requested, 0, 16);
-  }();
-  return limit;
-}
-
-std::atomic<int64_t> inFlightAsyncHostReceiveCopies{0};
-
-bool tryReserveAsyncHostReceiveCopy() {
-  const auto limit = maxInFlightAsyncHostReceiveCopies();
-  auto current =
-      inFlightAsyncHostReceiveCopies.load(std::memory_order_relaxed);
-  while (current < limit) {
-    if (inFlightAsyncHostReceiveCopies.compare_exchange_weak(
-            current,
-            current + 1,
-            std::memory_order_acq_rel,
-            std::memory_order_relaxed)) {
-      return true;
-    }
-  }
-  return false;
-}
-
-void releaseAsyncHostReceiveCopy() noexcept {
-  const auto previous = inFlightAsyncHostReceiveCopies.fetch_sub(
-      1, std::memory_order_acq_rel);
-  if (previous <= 0) {
-    LOG(ERROR) << "UCX async host-copy slot accounting underflow";
-    inFlightAsyncHostReceiveCopies.store(0, std::memory_order_release);
-  }
-}
-
-class AsyncHostCopySlotReservation {
- public:
-  explicit AsyncHostCopySlotReservation(bool reserve)
-      : reserved_(reserve && tryReserveAsyncHostReceiveCopy()) {}
-
-  ~AsyncHostCopySlotReservation() {
-    if (reserved_) {
-      releaseAsyncHostReceiveCopy();
-    }
-  }
-
-  bool reserved() const {
-    return reserved_;
-  }
-
-  void transferToCallback() {
-    reserved_ = false;
-  }
-
- private:
-  bool reserved_{false};
-};
-
-// cudaMemcpyAsync requires its host source to remain alive until the copy is
-// complete.  Publishing the packed device buffer before that boundary is safe
-// only if the source owner and its process-wide host credit are anchored to
-// the receive stream.  This context is released by a CUDA host callback queued
-// after H2D; it deliberately performs no CUDA API calls from the callback.
-struct AsyncHostCopyCompletion {
-  std::shared_ptr<uint8_t> hostData;
-  int64_t reservedHostBytes{0};
-  bool reservedAsyncCopySlot{false};
-};
-
-void CUDART_CB releaseAsyncHostCopy(void* opaque) noexcept {
-  std::unique_ptr<AsyncHostCopyCompletion> completion(
-      static_cast<AsyncHostCopyCompletion*>(opaque));
-  try {
-    completion->hostData.reset();
-    releaseRecvHostBytes(completion->reservedHostBytes);
-  } catch (const std::exception& error) {
-    LOG(ERROR) << "UCX async host-copy credit release failed: "
-               << error.what();
-  } catch (...) {
-    LOG(ERROR) << "UCX async host-copy credit release failed with an "
-                  "unknown exception";
-  }
-  if (completion->reservedAsyncCopySlot) {
-    releaseAsyncHostReceiveCopy();
-  }
-}
 } // namespace
 
 VELOX_DEFINE_EMBEDDED_ENUM_NAME(
@@ -937,6 +912,15 @@ bool UcxExchangeSource::tryStartDataReceive(
   UcxExchangeQueue::BackpressureStats stats;
   if (!queue_->tryReserveReceive(
           ptr->metadata.dataSizeBytes, maxInFlightRecvBytes(), &stats)) {
+    // Publish the dormant receiver state before arming the consumer wake. If
+    // the consumer drained before this transition, the reservation recheck
+    // below observes that credit. If it drains after backpressureActive_ is
+    // armed, resumeFromBackpressure() observes a receiver that is already in
+    // WaitingForReceiveCredit and schedules a useful communicator pass.
+    if (!setStateIf(expectedState, ReceiverState::WaitingForReceiveCredit)) {
+      return false;
+    }
+    expectedState = ReceiverState::WaitingForReceiveCredit;
     if (!backpressureActive_.exchange(true, std::memory_order_acq_rel)) {
       VLOG(1) << "[BACKPRESSURE] [ExSrc " << toString()
               << "] waiting for receive credit, requestedBytes="
@@ -945,10 +929,16 @@ bool UcxExchangeSource::tryStartDataReceive(
               << ", pendingReceiveBytes=" << stats.pendingReceiveBytes
               << " (cap=" << maxInFlightRecvBytes() << ")";
     }
-    if (getState() == expectedState) {
-      setStateIf(expectedState, ReceiverState::WaitingForReceiveCredit);
+
+    // Close the other half of the condition-variable handshake: a consumer
+    // that drained immediately before backpressureActive_ was armed could not
+    // wake this source. Recheck after arming; on failure the active flag stays
+    // published for the next dequeue, and on success this pass owns credit.
+    if (!queue_->tryReserveReceive(
+            ptr->metadata.dataSizeBytes, maxInFlightRecvBytes(), &stats)) {
+      return false;
     }
-    return false;
+    backpressureActive_.store(false, std::memory_order_release);
   }
   reservedReceiveBytes_ = ptr->metadata.dataSizeBytes;
 
@@ -962,7 +952,8 @@ bool UcxExchangeSource::tryStartDataReceive(
     }
     // Global credit is shared across otherwise unrelated ExchangeQueues, so
     // a dequeue from this queue cannot wake us. Retry from the communicator
-    // work loop; completed receives release the process-wide credit below.
+    // work loop; a completed receive releases this transient credit before
+    // publishing the bounce page to its independently bounded queue.
     wakeCommunicator();
     return false;
   }
@@ -970,7 +961,7 @@ bool UcxExchangeSource::tryStartDataReceive(
     reservedGlobalHostReceiveBytes_ = ptr->metadata.dataSizeBytes;
   }
 
-  if (!hasRecvDeviceCredit(ptr->metadata.dataSizeBytes)) {
+  if (!useHostStaging && !hasRecvDeviceCredit(ptr->metadata.dataSizeBytes)) {
     releaseReceiveReservation();
     if (getState() == expectedState) {
       setStateIf(expectedState, ReceiverState::WaitingForReceiveCredit);
@@ -979,6 +970,68 @@ bool UcxExchangeSource::tryStartDataReceive(
     // from the communicator loop instead of waiting on this queue's promise.
     wakeCommunicator();
     return false;
+  }
+
+  // Exchange receive buffers are allocated by the communicator thread, not a
+  // Velox Operator, but they compete with operator kernels for the same async
+  // CUDA pool. Reserve their not-yet-allocated bytes in the shared workspace
+  // domain so four executors cannot all admit against the same physical
+  // headroom snapshot. The reservation is released only after the allocation
+  // stream is synchronized; from then on cudaMemGetInfo/async-pool usage makes
+  // the live buffer visible to subsequent admission decisions. In addition to
+  // the steady-state watermark, preserve one minimum consumer workspace. If
+  // receives consume that last GiB, the Filter/TopN input which must dequeue
+  // them cannot run and both sides wait forever despite a valid byte cap.
+  if (!useHostStaging) {
+    const auto now = std::chrono::steady_clock::now();
+    const bool useProgressHeadroom =
+        receiveWorkspaceBlockedSince_.has_value() &&
+        now - receiveWorkspaceBlockedSince_.value() >=
+            kRecvWorkspaceProgressAge;
+    const auto receiveMinHeadroom = useProgressHeadroom
+        ? facebook::velox::cudf_velox::CudfConfig::getInstance()
+              .deviceMemoryMinHeadroomBytes
+        : recvAdmissionMinHeadroom();
+    auto receiveProgressLease = useProgressHeadroom
+        ? tryAcquireRecvWorkspaceProgressLease(ptr->metadata.dataSizeBytes)
+        : nullptr;
+    if (useProgressHeadroom && receiveProgressLease == nullptr) {
+      releaseReceiveReservation();
+      if (getState() == expectedState) {
+        setStateIf(expectedState, ReceiverState::WaitingForReceiveCredit);
+      }
+      wakeCommunicator();
+      return false;
+    }
+    auto receiveWorkspace =
+        facebook::velox::cudf_velox::
+            tryAcquireBackgroundDeviceMemoryWorkspace(
+                ptr->metadata.dataSizeBytes,
+                receiveMinHeadroom,
+                facebook::velox::cudf_velox::DeviceMemoryWorkspacePriority::
+                    kInput);
+    if (!receiveWorkspace.has_value()) {
+      if (!receiveWorkspaceBlockedSince_.has_value()) {
+        receiveWorkspaceBlockedSince_ = now;
+      }
+      releaseReceiveReservation();
+      if (getState() == expectedState) {
+        setStateIf(expectedState, ReceiverState::WaitingForReceiveCredit);
+      }
+      wakeCommunicator();
+      return false;
+    }
+    if (useProgressHeadroom && !receiveWorkspaceProgressLogged_) {
+      LOG(WARNING) << "CUDF_UCX_RECV_PROGRESS_ADMITTED task=" << taskId_
+                   << " remoteTask=" << partitionKey_.taskId
+                   << " destination=" << partitionKey_.destination
+                   << " bytes=" << ptr->metadata.dataSizeBytes
+                   << " progressLimitBytes=" << recvConsumerProgressBytes()
+                   << " minHeadroomBytes=" << receiveMinHeadroom;
+      receiveWorkspaceProgressLogged_ = true;
+    }
+    receiveWorkspaceBlockedSince_.reset();
+    ptr->receiveWorkspaceProgressLease = std::move(receiveProgressLease);
   }
 
   // REMOTE EXCHANGE PATH: Allocate buffer and receive via UCXX.
@@ -1000,35 +1053,38 @@ bool UcxExchangeSource::tryStartDataReceive(
             recvMemoryResource});
     CUDF_CUDA_TRY(cudaStreamSynchronize(stream.value()));
   };
-  try {
-    allocateReceiveBuffer();
-  } catch (const rmm::bad_alloc& firstError) {
-    // On the allocation-failure slow path, wait for stream-ordered frees and
-    // let the shared async pool reclaim completed blocks, then retry once.
-    cudaGetLastError();
-    const auto syncStatus = cudaDeviceSynchronize();
-    if (syncStatus == cudaSuccess) {
-      try {
-        allocateReceiveBuffer();
-        LOG(WARNING)
-            << toString()
-            << " recovered UCX receive allocation after device synchronize: "
-            << ptr->metadata.dataSizeBytes
-            << " bytes; first error: " << firstError.what();
-      } catch (const rmm::bad_alloc& retryError) {
-        VLOG(0) << toString() << " *** RMM failed to allocate "
-                << ptr->metadata.dataSizeBytes
-                << " bytes after device synchronize retry: "
-                << retryError.what();
+  if (!useHostStaging) {
+    try {
+      allocateReceiveBuffer();
+    } catch (const rmm::bad_alloc& firstError) {
+      // On the allocation-failure slow path, wait for stream-ordered frees and
+      // let the shared async pool reclaim completed blocks, then retry once.
+      cudaGetLastError();
+      const auto syncStatus = cudaDeviceSynchronize();
+      if (syncStatus == cudaSuccess) {
+        try {
+          allocateReceiveBuffer();
+          LOG(WARNING)
+              << toString()
+              << " recovered UCX receive allocation after device synchronize: "
+              << ptr->metadata.dataSizeBytes
+              << " bytes; first error: " << firstError.what();
+        } catch (const rmm::bad_alloc& retryError) {
+          VLOG(0) << toString() << " *** RMM failed to allocate "
+                  << ptr->metadata.dataSizeBytes
+                  << " bytes after device synchronize retry: "
+                  << retryError.what();
+        }
+      } else {
+        VLOG(0) << toString()
+                << " *** cudaDeviceSynchronize failed while recovering "
+                   "receive allocation: "
+                << cudaGetErrorString(syncStatus);
       }
-    } else {
-      VLOG(0) << toString()
-              << " *** cudaDeviceSynchronize failed while recovering "
-                 "receive allocation: "
-              << cudaGetErrorString(syncStatus);
     }
   }
-  if (ptr->dataBuf != nullptr) {
+  if (useHostStaging || ptr->dataBuf != nullptr) {
+    receiveWorkspaceProgressLogged_ = false;
     if (facebook::velox::cudf_velox::deviceMemoryDiagnosticsEnabled()) {
       constexpr int64_t kReportStep = 512LL << 20;
       const auto bytes = recvMemoryResource.get_bytes_counter();
@@ -1046,8 +1102,9 @@ bool UcxExchangeSource::tryStartDataReceive(
           break;
         }
       }
-      if (crossedPeakBucket ||
-          ptr->metadata.dataSizeBytes >= static_cast<uint64_t>(64) << 20) {
+      if (!useHostStaging &&
+          (crossedPeakBucket ||
+           ptr->metadata.dataSizeBytes >= static_cast<uint64_t>(64) << 20)) {
         facebook::velox::cudf_velox::logDeviceMemorySnapshot(
             fmt::format(
                 "operator=UcxExchangeSource state=receive.allocate "
@@ -1067,29 +1124,38 @@ bool UcxExchangeSource::tryStartDataReceive(
       }
     }
   } else {
+    // The pending metadata is retried in place. Do not leave the process-wide
+    // progress lane attached to it after a recoverable allocation failure.
+    ptr->receiveWorkspaceProgressLease.reset();
     releaseReceiveReservation();
-    queue_->setError("Failed to alloc GPU memory");
-    deliverEndMarker();
-    setState(ReceiverState::Done);
+    if (getState() == expectedState) {
+      setStateIf(expectedState, ReceiverState::WaitingForReceiveCredit);
+    }
+    LOG(WARNING) << toString()
+                 << " deferring UCX receive after recoverable GPU allocation "
+                    "pressure: "
+                 << ptr->metadata.dataSizeBytes << " bytes";
     wakeCommunicator();
     return false;
   }
 
   VLOG(3) << toString() << " Allocated " << ptr->metadata.dataSizeBytes
-          << " bytes of device memory";
+          << (useHostStaging ? " bytes of deferred host receive memory"
+                             : " bytes of device memory");
 
   // CUDA-aware transports can receive directly into the final device buffer.
   // Only stage through host memory when the active UCX context has confirmed
   // that no CUDA transport is available; sm/tcp cannot write through a device
   // pointer safely in that configuration.
-  void* receiveBuffer = ptr->dataBuf->data();
+  void* receiveBuffer =
+      useHostStaging ? nullptr : ptr->dataBuf->data();
   if (useHostStaging) {
     const auto receiveSize = static_cast<size_t>(ptr->metadata.dataSizeBytes);
-    // Keep a unique allocation with this request for the bounded UCXX replay
-    // window. The receive completion callback copies it synchronously to the
-    // final device buffer, but the old request may still be replayed later.
-    ptr->hostData =
-        allocateHostStagingBuffer(receiveSize, ptr->hostDataPinned);
+    // Keep this allocation attached to the retained UCXX request for the
+    // bounded replay window. onData publishes a shared alias, never moves the
+    // request's owner away from the raw pointer registered with UCX.
+    ptr->hostData = allocateReplaySafeHostReceiveBuffer(receiveSize);
+    ptr->hostDataPinned = false;
     receiveBuffer = ptr->hostData.get();
   }
   VLOG(2) << toString() << " posting "
@@ -1191,67 +1257,31 @@ void UcxExchangeSource::onData(
                             ptr->metadata.dataSizeBytes)
                      << std::dec;
       }
-      AsyncHostCopySlotReservation asyncCopySlot(
-          asyncHostReceiveCopyEnabled());
-      CUDF_CUDA_TRY(cudaMemcpyAsync(
-          ptr->dataBuf->data(),
-          ptr->hostData.get(),
+      auto data = std::make_unique<PackedTableWithStream>(
+          std::move(ptr->metadata.cudfMetadata),
+          ptr->hostData,
           ptr->metadata.dataSizeBytes,
-          cudaMemcpyHostToDevice,
-          ptr->stream.value()));
-
-      bool publishedAsync = false;
-      std::unique_ptr<AsyncHostCopyCompletion> completion;
-      if (asyncCopySlot.reserved()) {
-        completion = std::make_unique<AsyncHostCopyCompletion>();
-        completion->hostData = std::move(ptr->hostData);
-        completion->reservedHostBytes = reservedGlobalHostReceiveBytes_;
-        completion->reservedAsyncCopySlot = true;
-        reservedGlobalHostReceiveBytes_ = 0;
-        const auto callbackStatus = cudaLaunchHostFunc(
-            ptr->stream.value(), releaseAsyncHostCopy, completion.get());
-        if (callbackStatus == cudaSuccess) {
-          asyncCopySlot.transferToCallback();
-          completion.release();
-          publishedAsync = true;
-          metrics_.asyncHostCopyBytes_.addValue(
-              ptr->metadata.dataSizeBytes);
-        } else {
-          // cudaLaunchHostFunc was not queued. Preserve the synchronous
-          // ownership boundary before destroying the context and return the
-          // callback error to CUDA's per-thread state only after recording it.
-          LOG(WARNING) << toString()
-                       << " could not queue async host-copy release for "
-                       << ptr->metadata.dataSizeBytes
-                       << " bytes: " << cudaGetErrorString(callbackStatus)
-                       << "; falling back to stream synchronization";
-          cudaGetLastError();
-        }
-      } else if (asyncHostReceiveCopyEnabled()) {
-        metrics_.asyncHostCopyThrottledBytes_.addValue(
-            ptr->metadata.dataSizeBytes);
-      }
-
-      if (!publishedAsync) {
-        // The packed page is consumed on ptr->stream. The fallback preserves
-        // the historical CPU ownership fence when the opt-in is disabled or
-        // CUDA cannot enqueue the completion callback.
-        const auto syncStart = std::chrono::steady_clock::now();
-        CUDF_CUDA_TRY(cudaStreamSynchronize(ptr->stream.value()));
-        metrics_.hostCopySyncNanos_.addValue(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now() - syncStart)
-                .count());
-        if (completion != nullptr) {
-          completion.reset();
-        } else {
-          ptr->hostData.reset();
-          if (reservedGlobalHostReceiveBytes_ > 0) {
-            releaseRecvHostBytes(reservedGlobalHostReceiveBytes_);
-            reservedGlobalHostReceiveBytes_ = 0;
-          }
-        }
-      }
+          ptr->hostDataPinned,
+          ptr->stream,
+          nullptr);
+      // The process-wide host credit bounds concurrent UCX receive DMA, not
+      // completed bounce pages. Holding it until H2D creates a cross-edge
+      // dependency inversion: a downstream queue can consume all global
+      // credit while the upstream queue needed to unblock it cannot receive.
+      // Completed pages remain bounded by UcxExchangeQueue's per-edge byte
+      // credit (512 MiB in Job 144), so release the transient global credit
+      // immediately before publishing the page.
+      releaseRecvHostBytes(reservedGlobalHostReceiveBytes_);
+      reservedGlobalHostReceiveBytes_ = 0;
+      metrics_.numPackedColumns_.addValue(1);
+      metrics_.totalBytes_.addValue(ptr->metadata.dataSizeBytes);
+      const int64_t reservedReceiveBytes = reservedReceiveBytes_;
+      enqueue(std::move(data), reservedReceiveBytes);
+      reservedReceiveBytes_ = 0;
+      setStateIf(
+          ReceiverState::WaitingForData, ReceiverState::ReadyToReceive);
+      wakeCommunicator();
+      return;
     }
     metrics_.numPackedColumns_.addValue(1);
     metrics_.totalBytes_.addValue(ptr->metadata.dataSizeBytes);
@@ -1282,7 +1312,9 @@ void UcxExchangeSource::onData(
 
     // Bundle the packed_table with the stream that was used for allocation
     auto data = std::make_unique<PackedTableWithStream>(
-        std::move(packedTable), ptr->stream);
+        std::move(packedTable),
+        ptr->stream,
+        std::move(ptr->receiveWorkspaceProgressLease));
 
     const int64_t reservedReceiveBytes = reservedReceiveBytes_;
     enqueue(std::move(data), reservedReceiveBytes);
@@ -1414,13 +1446,10 @@ void UcxExchangeSource::waitForIntraNodeData() {
   }
 
   intraNodePollCount_ = 0;
-  onIntraNodeData(std::move(result->data), result->stream, result->atEnd);
+  onIntraNodeData(std::move(result.value()));
 }
 
-void UcxExchangeSource::onIntraNodeData(
-    std::shared_ptr<cudf::packed_columns> data,
-    rmm::cuda_stream_view producerStream,
-    bool atEnd) {
+void UcxExchangeSource::onIntraNodeData(IntraNodeTransferResult result) {
   // Check if close() was called
   if (closed_.load(std::memory_order_acquire)) {
     VLOG(3) << toString() << " onIntraNodeData called after close, ignoring";
@@ -1428,7 +1457,7 @@ void UcxExchangeSource::onIntraNodeData(
     return;
   }
 
-  if (atEnd) {
+  if (result.atEnd) {
     // End of stream
     atEnd_ = true;
     VLOG(3) << toString() << " Intra-node transfer: end of stream";
@@ -1439,7 +1468,7 @@ void UcxExchangeSource::onIntraNodeData(
     return;
   }
 
-  if (!data) {
+  if (!result.data && !result.isHostBacked()) {
     // Error - should not happen if atEnd is false
     std::string errorMsg = fmt::format(
         "Intra-node transfer data is null for task {}, dest {}, seq {}",
@@ -1454,12 +1483,38 @@ void UcxExchangeSource::onIntraNodeData(
     return;
   }
 
+  const auto dataBytes = result.isHostBacked()
+      ? result.hostDataSize
+      : result.data->gpu_data->size();
   VLOG(3) << toString()
           << " Intra-node transfer: received data for seq=" << sequenceNumber_
-          << " size=" << data->gpu_data->size();
+          << " size=" << dataBytes
+          << " hostBacked=" << result.isHostBacked();
 
   metrics_.numPackedColumns_.addValue(1);
-  metrics_.totalBytes_.addValue(data->gpu_data->size());
+  metrics_.totalBytes_.addValue(dataBytes);
+  if (result.isHostBacked()) {
+    VELOX_CHECK_NOT_NULL(result.hostMetadata);
+    metrics_.hostStagedBytes_.addValue(dataBytes);
+    auto stream =
+        facebook::velox::cudf_velox::cudfGlobalStreamPool().get_stream();
+    auto tableWithStream = std::make_unique<PackedTableWithStream>(
+        std::move(result.hostMetadata),
+        std::move(result.hostData),
+        result.hostDataSize,
+        result.hostDataPinned,
+        stream,
+        nullptr);
+    enqueue(std::move(tableWithStream));
+
+    this->sequenceNumber_++;
+    setStateIf(
+        ReceiverState::WaitingForIntraNodeData, ReceiverState::ReadyToReceive);
+    wakeCommunicator();
+    return;
+  }
+
+  auto data = std::move(result.data);
   // Make the consumer page independently owned. Moving a uniquely referenced
   // producer allocation into the consumer looked safe, but under sustained
   // HASH exchange its stream-ordered allocation was recycled while the page
@@ -1470,7 +1525,7 @@ void UcxExchangeSource::onIntraNodeData(
   // before releasing the registry's producer allocation.
   auto stream =
       facebook::velox::cudf_velox::cudfGlobalStreamPool().get_stream();
-  std::vector<rmm::cuda_stream_view> producerStreams{producerStream};
+  std::vector<rmm::cuda_stream_view> producerStreams{result.stream};
   cudf::detail::join_streams(producerStreams, stream);
   auto consumerData = std::make_unique<rmm::device_buffer>(
       data->gpu_data->data(), data->gpu_data->size(), stream);

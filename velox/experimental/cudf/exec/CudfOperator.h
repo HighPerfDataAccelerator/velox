@@ -25,10 +25,21 @@
 #include "velox/exec/Operator.h"
 
 #include <glog/logging.h>
+#include <cudf/utilities/error.hpp>
 
+#include <cstdlib>
 #include <type_traits>
 
 namespace facebook::velox::cudf_velox {
+
+inline bool cudfOperatorBoundarySyncEnabled() {
+  static const bool enabled = [] {
+    const auto* value = std::getenv("GLUTEN_CUDF_OPERATOR_BOUNDARY_SYNC");
+    return value != nullptr && std::string_view(value) != "0" &&
+        std::string_view(value) != "false";
+  }();
+  return enabled;
+}
 
 /// Bitmask controlling which operator methods get NVTX profiling ranges.
 /// Operators pass flags for the do* methods they actually override, so
@@ -126,9 +137,29 @@ class CudfOperatorBase : public exec::Operator, public NvtxHelper {
         className_(operatorName),
         planNodeId_(planNodeId),
         operatorId_(operatorId),
-        nvtxMethods_(nvtxMethods) {}
+        nvtxMethods_(nvtxMethods) {
+    // Persistent cuDF state is charged to the operator's custom device pool.
+    // Register the normal Velox reclaimer and the cooperative device-side
+    // registry so physical-pressure arbitration can publish work to the owning
+    // Driver and have it reclaimed at the next operator boundary.
+    if (auto* devicePool = customPool(kCudfDeviceMemoryResourceTag);
+        devicePool != nullptr && devicePool->reclaimer() == nullptr) {
+      devicePool->setReclaimer(exec::Operator::MemoryReclaimer::create(
+          driverCtx, this, devicePool));
+    }
+    if (auto* devicePool = customPool(kCudfDeviceMemoryResourceTag);
+        devicePool != nullptr) {
+      deviceMemoryReclaimer_ =
+          registerDeviceMemoryReclaimer(this, devicePool);
+    }
+  }
 
   void addInput(RowVectorPtr input) final {
+    CudaCallDiagnosticScope callDiagnostic(fmt::format(
+        "operator={} node={} instance={} method=addInput",
+        className_,
+        planNodeId_,
+        static_cast<const void*>(this)));
     VELOX_NVTX_OPERATOR_FUNC_RANGE_IF(
         nvtxMethods_ & NvtxMethodFlag::kAddInput, className_);
     CudaAllocationTraceScope allocationTrace(
@@ -138,12 +169,17 @@ class CudfOperatorBase : public exec::Operator, public NvtxHelper {
             planNodeId_,
             static_cast<const void*>(this)));
     const auto inputRows = input == nullptr ? 0 : input->size();
+    serviceDeviceMemoryReclaimer(
+        deviceMemoryReclaimer_, this, "addInput.before", false);
     const auto sample = shouldSampleDeviceMemory(false);
     if (sample) {
       logDeviceMemory("addInput", "before", inputRows, -1);
     }
     try {
       doAddInput(std::move(input));
+      serviceDeviceMemoryReclaimer(
+          deviceMemoryReclaimer_, this, "addInput.after", false);
+      synchronizeOperatorBoundary("addInput");
       checkCudaErrorInDebug();
       if (sample) {
         logDeviceMemory("addInput", "after", inputRows, -1);
@@ -155,6 +191,11 @@ class CudfOperatorBase : public exec::Operator, public NvtxHelper {
   }
 
   RowVectorPtr getOutput() final {
+    CudaCallDiagnosticScope callDiagnostic(fmt::format(
+        "operator={} node={} instance={} method=getOutput",
+        className_,
+        planNodeId_,
+        static_cast<const void*>(this)));
     VELOX_NVTX_OPERATOR_FUNC_RANGE_IF(
         nvtxMethods_ & NvtxMethodFlag::kGetOutput, className_);
     CudaAllocationTraceScope allocationTrace(
@@ -163,12 +204,17 @@ class CudfOperatorBase : public exec::Operator, public NvtxHelper {
             className_,
             planNodeId_,
             static_cast<const void*>(this)));
+    serviceDeviceMemoryReclaimer(
+        deviceMemoryReclaimer_, this, "getOutput.before", false);
     const auto sample = shouldSampleDeviceMemory(false);
     if (sample) {
       logDeviceMemory("getOutput", "before", -1, -1);
     }
     try {
       auto result = doGetOutput();
+      serviceDeviceMemoryReclaimer(
+          deviceMemoryReclaimer_, this, "getOutput.after", false);
+      synchronizeOperatorBoundary("getOutput");
       checkCudaErrorInDebug();
       if (sample) {
         logDeviceMemory(
@@ -182,14 +228,24 @@ class CudfOperatorBase : public exec::Operator, public NvtxHelper {
   }
 
   void noMoreInput() final {
+    CudaCallDiagnosticScope callDiagnostic(fmt::format(
+        "operator={} node={} instance={} method=noMoreInput",
+        className_,
+        planNodeId_,
+        static_cast<const void*>(this)));
     VELOX_NVTX_OPERATOR_FUNC_RANGE_IF(
         nvtxMethods_ & NvtxMethodFlag::kNoMoreInput, className_);
+    serviceDeviceMemoryReclaimer(
+        deviceMemoryReclaimer_, this, "noMoreInput.before", false);
     const auto sample = shouldSampleDeviceMemory(true);
     if (sample) {
       logDeviceMemory("noMoreInput", "before", -1, -1);
     }
     try {
       doNoMoreInput();
+      serviceDeviceMemoryReclaimer(
+          deviceMemoryReclaimer_, this, "noMoreInput.after", false);
+      synchronizeOperatorBoundary("noMoreInput");
       checkCudaErrorInDebug();
       if (sample) {
         logDeviceMemory("noMoreInput", "after", -1, -1);
@@ -209,6 +265,7 @@ class CudfOperatorBase : public exec::Operator, public NvtxHelper {
     }
     try {
       doClose();
+      deviceMemoryReclaimer_.reset();
       checkCudaErrorInDebug();
       if (sample) {
         logDeviceMemory("close", "after", -1, -1);
@@ -233,6 +290,44 @@ class CudfOperatorBase : public exec::Operator, public NvtxHelper {
   }
 
  private:
+  void synchronizeOperatorBoundary(std::string_view method) const {
+    if (!cudfOperatorBoundarySyncEnabled()) {
+      return;
+    }
+    const auto* filter =
+        std::getenv("GLUTEN_CUDF_OPERATOR_BOUNDARY_SYNC_FILTER");
+    if (filter != nullptr && *filter != '\0') {
+      const std::string_view filters{filter};
+      bool matched = false;
+      size_t begin = 0;
+      while (begin <= filters.size()) {
+        const auto end = filters.find(',', begin);
+        const auto token = filters.substr(
+            begin,
+            end == std::string_view::npos ? filters.size() - begin
+                                          : end - begin);
+        if (!token.empty() && className_.find(token) != std::string::npos) {
+          matched = true;
+          break;
+        }
+        if (end == std::string_view::npos) {
+          break;
+        }
+        begin = end + 1;
+      }
+      if (!matched) {
+        return;
+      }
+    }
+    const auto* methodFilter =
+        std::getenv("GLUTEN_CUDF_OPERATOR_BOUNDARY_SYNC_METHODS");
+    if (methodFilter != nullptr && *methodFilter != '\0' &&
+        std::string_view(methodFilter).find(method) == std::string_view::npos) {
+      return;
+    }
+    CUDF_CUDA_TRY(cudaDeviceSynchronize());
+  }
+
   bool shouldSampleDeviceMemory(bool force) {
     if (!deviceMemoryDiagnosticsEnabled()) {
       return false;
@@ -269,6 +364,7 @@ class CudfOperatorBase : public exec::Operator, public NvtxHelper {
   const core::PlanNodeId planNodeId_;
   const int32_t operatorId_;
   const NvtxMethodFlag nvtxMethods_;
+  DeviceMemoryReclaimerRegistration deviceMemoryReclaimer_;
   uint64_t deviceMemoryCallCount_{0};
 };
 

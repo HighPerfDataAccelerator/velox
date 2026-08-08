@@ -44,6 +44,8 @@ class JitExpression : public CudfExpression {
 
   void close() override;
 
+  void attachBatchCache(CudfExpressionBatchCachePtr batchCache) override;
+
   // Check if this specific operation (not its children) can be evaluated by
   // JitExpression
   static bool canEvaluate(const core::TypedExprPtr& expr);

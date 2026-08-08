@@ -2179,6 +2179,26 @@ TEST_F(CudfFilterProjectTest, coalesceColumnWithLiteral) {
   runTest(plan, "SELECT coalesce(c0, 5) AS result FROM tmp");
 }
 
+TEST_F(CudfFilterProjectTest, coalesceRetainsComputedFirstInputOwner) {
+  auto input = makeRowVector({
+      makeFlatVector<int64_t>({101, 202, 303, 404}),
+      makeNullableFlatVector<StringView>(
+          {StringView("fallback-a"),
+           std::nullopt,
+           StringView("fallback-c"),
+           StringView("fallback-d")})});
+
+  createDuckDbTable({input});
+  auto plan = PlanBuilder()
+                  .values({input})
+                  .project(
+                      {"coalesce(cast(c0 as varchar), c1) AS result"})
+                  .planNode();
+  runTest(
+      plan,
+      "SELECT coalesce(cast(c0 as varchar), c1) AS result FROM tmp");
+}
+
 TEST_F(CudfFilterProjectTest, coalesceLiteralFirst) {
   vector_size_t batchSize = 100;
   auto vectors = makeVectors(rowType_, 1, batchSize);
@@ -2299,6 +2319,25 @@ TEST_F(CudfFilterProjectTest, switchExpr) {
       makeNullableFlatVector<double>(
           {45676567.78 / 123.4, 6789098767.90876 / 124.5, std::nullopt}),
   });
+  facebook::velox::test::assertEqualVectors(expected, result);
+}
+
+TEST_F(CudfFilterProjectTest, multiBranchSwitchExpr) {
+  auto data = makeRowVector(
+      {makeFlatVector<int32_t>({-2, 0, 3, 8}),
+       makeFlatVector<double>({10.0, 20.0, 30.0, 40.0})});
+  auto plan =
+      PlanBuilder()
+          .values({data})
+          .project(
+              {"CASE WHEN c0 < 0 THEN c1 * 2.0 "
+               "WHEN c0 = 0 THEN c1 + 1.0 "
+               "WHEN c0 < 5 THEN c1 - 2.0 ELSE c1 END AS result"})
+          .planNode();
+  auto result = AssertQueryBuilder(plan).copyResults(pool());
+
+  auto expected =
+      makeRowVector({makeFlatVector<double>({20.0, 21.0, 28.0, 40.0})});
   facebook::velox::test::assertEqualVectors(expected, result);
 }
 
@@ -2459,46 +2498,50 @@ TEST_F(CudfSimpleFilterProjectTest, castNumericToTimestamp) {
 
 TEST_F(CudfSimpleFilterProjectTest, castIntegralToVarchar) {
   EXPECT_EQ(
-      evaluateOnce<std::string, int32_t>("cast(c0 as varchar)", 12345),
+      (evaluateOnce<std::string, int32_t>("cast(c0 as varchar)", 12345)),
       "12345");
   EXPECT_EQ(
-      evaluateOnce<std::string, int64_t>("cast(c0 as varchar)", 9876543210LL),
+      (evaluateOnce<std::string, int64_t>(
+          "cast(c0 as varchar)", 9876543210LL)),
       "9876543210");
   EXPECT_EQ(
-      evaluateOnce<std::string, int16_t>(
-          "cast(c0 as varchar)", static_cast<int16_t>(255)),
+      (evaluateOnce<std::string, int16_t>(
+          "cast(c0 as varchar)", static_cast<int16_t>(255))),
       "255");
   EXPECT_EQ(
-      evaluateOnce<std::string, int8_t>(
-          "try_cast(c0 as varchar)", static_cast<int8_t>(-7)),
+      (evaluateOnce<std::string, int8_t>(
+          "try_cast(c0 as varchar)", static_cast<int8_t>(-7))),
       "-7");
   EXPECT_EQ(
-      evaluateOnce<std::string, int32_t>(
-          "cast(c0 as varchar)", std::optional<int32_t>{}),
+      (evaluateOnce<std::string, int32_t>(
+          "cast(c0 as varchar)", std::optional<int32_t>{})),
       std::nullopt);
 }
 
 TEST_F(CudfSimpleFilterProjectTest, castFloatingPointToVarchar) {
   EXPECT_EQ(
-      evaluateOnce<std::string, double>("cast(c0 as varchar)", 12.5), "12.5");
+      (evaluateOnce<std::string, double>("cast(c0 as varchar)", 12.5)),
+      "12.5");
   EXPECT_EQ(
-      evaluateOnce<std::string, float>(
-          "try_cast(c0 as varchar)", static_cast<float>(-7.25)),
+      (evaluateOnce<std::string, float>(
+          "try_cast(c0 as varchar)", static_cast<float>(-7.25))),
       "-7.25");
   EXPECT_EQ(
-      evaluateOnce<std::string, double>(
-          "cast(c0 as varchar)", std::optional<double>{}),
+      (evaluateOnce<std::string, double>(
+          "cast(c0 as varchar)", std::optional<double>{})),
       std::nullopt);
 }
 
 TEST_F(CudfSimpleFilterProjectTest, castDateToVarchar) {
   EXPECT_EQ(
-      evaluateOnce<std::string>(
-          "cast(c0 as varchar)", DATE(), DATE()->toDays("2024-03-15")),
+      (evaluateOnce<std::string, int32_t>(
+          "cast(c0 as varchar)",
+          DATE(),
+          std::optional<int32_t>{DATE()->toDays("2024-03-15")})),
       "2024-03-15");
   EXPECT_EQ(
-      evaluateOnce<std::string>(
-          "try_cast(c0 as varchar)", DATE(), std::optional<int32_t>{}),
+      (evaluateOnce<std::string, int32_t>(
+          "try_cast(c0 as varchar)", DATE(), std::optional<int32_t>{})),
       std::nullopt);
 }
 

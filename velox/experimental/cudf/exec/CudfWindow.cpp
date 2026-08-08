@@ -1050,7 +1050,6 @@ CudfWindow::CudfWindow(
 }
 
 void CudfWindow::doAddInput(RowVectorPtr input) {
-  std::lock_guard<std::mutex> cucoLock(cudfCucoMutex());
   SCOPE_EXIT {
     stateStream_.synchronize();
   };
@@ -2566,7 +2565,6 @@ std::unique_ptr<cudf::column> CudfWindow::computeAggregateColumn(
 }
 
 void CudfWindow::doNoMoreInput() {
-  std::lock_guard<std::mutex> cucoLock(cudfCucoMutex());
   SCOPE_EXIT {
     stateStream_.synchronize();
     if (streamAcquired_ && stream_.value() != stateStream_.value()) {
@@ -3001,7 +2999,6 @@ RowVectorPtr CudfWindow::computeNextSortedOutput() {
 }
 
 RowVectorPtr CudfWindow::doGetOutput() {
-  std::lock_guard<std::mutex> cucoLock(cudfCucoMutex());
   SCOPE_EXIT {
     stateStream_.synchronize();
     if (streamAcquired_ && stream_.value() != stateStream_.value()) {

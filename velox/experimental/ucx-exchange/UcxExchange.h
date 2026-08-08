@@ -19,6 +19,7 @@
 #include "velox/exec/Operator.h"
 #include "velox/exec/Task.h"
 #include "velox/experimental/cudf/exec/NvtxHelper.h"
+#include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeClient.h"
 #include "velox/experimental/ucx-exchange/UcxQueues.h"
 
@@ -97,6 +98,13 @@ class UcxExchange : public SourceOperator, public cudf_velox::NvtxHelper {
 
   // Data returned from exchangeClient_->next().
   PackedTableWithStreamPtr currentData_;
+
+  // A host-backed UCX page is dequeued before it owns any device memory.
+  // Keep its arbitration request and reservation on the consuming operator so
+  // the driver can block without tying up a communicator thread or GPU page.
+  cudf_velox::DeviceMemoryWorkspaceRequest hostCopyWorkspaceRequest_;
+  std::optional<cudf_velox::DeviceMemoryWorkspaceReservation>
+      hostCopyWorkspaceAdmission_;
 
   // Reusable result vector.
   RowVectorPtr result_;

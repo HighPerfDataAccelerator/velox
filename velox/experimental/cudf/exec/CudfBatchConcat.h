@@ -69,8 +69,7 @@ class CudfBatchConcat : public CudfOperatorBase {
  private:
   void flushBufferedInputs();
   void processPendingInput(RowVectorPtr input);
-  uint64_t pendingWorkspaceBytes() const;
-  static uint64_t estimateConcatWorkspaceBytes(uint64_t inputBytes);
+  bool requiresConcatWorkspace() const;
   bool reachedFlushThreshold() const;
 
   exec::DriverCtx* const driverCtx_;
@@ -86,6 +85,8 @@ class CudfBatchConcat : public CudfOperatorBase {
   uint64_t outputBatches_{0};
   uint64_t rebasedBatches_{0};
   uint64_t rebaseMicros_{0};
+  uint64_t largeConcatBypassBatches_{0};
+  uint64_t largeConcatBypassBytes_{0};
   size_t currentNumRows_{0};
   uint64_t currentNumBytes_{0};
   const size_t targetRows_{0};

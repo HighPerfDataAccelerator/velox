@@ -88,6 +88,13 @@ inline bool shouldHostStageDeviceTransfer(
 /// staging.
 std::shared_ptr<uint8_t> acquireUcxPinnedBuffer(uint64_t requiredBytes);
 
+/// Acquires a pinned scratch buffer used only for deferred host-to-device
+/// copies. Remote UCX receive buffers deliberately remain pageable and owned
+/// by their retained Request so a wireup replay cannot overwrite a recycled
+/// pool slot. Keeping this pool separate also prevents long D2H sends from
+/// starving the short-lived H2D copy engine bounce.
+std::shared_ptr<uint8_t> acquireUcxH2DPinnedBuffer(uint64_t requiredBytes);
+
 inline bool exchangeVariableWidthValidationEnabled() {
   const char* value =
       std::getenv("GLUTEN_CUDF_BATCH_CONCAT_VALIDATE_VARIABLE_WIDTH");

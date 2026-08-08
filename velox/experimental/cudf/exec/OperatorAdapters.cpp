@@ -34,6 +34,7 @@
 #include "velox/experimental/cudf/exec/CudfReduce.h"
 #include "velox/experimental/cudf/exec/CudfTopN.h"
 #include "velox/experimental/cudf/exec/CudfTopNRowNumber.h"
+#include "velox/experimental/cudf/exec/CudfUnnest.h"
 #include "velox/experimental/cudf/exec/CudfWindow.h"
 #include "velox/experimental/cudf/exec/OperatorAdapters.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
@@ -66,6 +67,7 @@
 #include "velox/exec/Task.h"
 #include "velox/exec/TopN.h"
 #include "velox/exec/TopNRowNumber.h"
+#include "velox/exec/Unnest.h"
 #include "velox/exec/Values.h"
 #include "velox/exec/Window.h"
 
@@ -304,6 +306,13 @@ class FilterProjectAdapter : public OperatorAdapter {
     // Check projects separately
     if (projectPlanNode) {
       for (const auto& projection : projectPlanNode->projections()) {
+        if (projection->isConstantKind()) {
+          const auto* constant =
+              projection->asUnchecked<core::ConstantTypedExpr>();
+          if (projection->type()->isPrimitiveType() || constant->isNull()) {
+            continue;
+          }
+        }
         if (!canExprRunOnGpu(
                 projection, ctx->task->queryCtx().get(), op->pool())) {
           LOG_FALLBACK(
@@ -421,6 +430,57 @@ class AggregationAdapter : public OperatorAdapter {
   }
 };
 
+class UnnestAdapter : public OperatorAdapter {
+ public:
+  UnnestAdapter() : OperatorAdapter("Unnest") {}
+
+  bool canHandle(const exec::Operator* op) const override {
+    return dynamic_cast<const exec::Unnest*>(op) != nullptr;
+  }
+
+  bool canRunOnGPU(
+      const exec::Operator* op,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* /*ctx*/) const override {
+    if (!canHandle(op)) {
+      LOG_FALLBACK(
+          "UnnestAdapter operator is not Unnest, PlanNode id: {}",
+          planNode->id());
+      return false;
+    }
+
+    auto unnestNode =
+        std::dynamic_pointer_cast<const core::UnnestNode>(planNode);
+    if (!CudfUnnest::canRunOnGPU(unnestNode)) {
+      LOG_FALLBACK(
+          "Unnest shape is not supported by cuDF, PlanNode id: {}",
+          planNode->id());
+      return false;
+    }
+    return true;
+  }
+
+  bool acceptsGpuInput() const override {
+    return true;
+  }
+
+  bool producesGpuOutput() const override {
+    return true;
+  }
+
+  std::vector<std::unique_ptr<exec::Operator>> createReplacements(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* ctx,
+      int32_t operatorId) const override {
+    auto unnestNode =
+        std::dynamic_pointer_cast<const core::UnnestNode>(planNode);
+    std::vector<std::unique_ptr<exec::Operator>> result;
+    result.push_back(std::make_unique<CudfUnnest>(operatorId, ctx, unnestNode));
+    return result;
+  }
+};
+
 class CudfHashJoinBaseAdapter : public OperatorAdapter {
  public:
   using OperatorAdapter::OperatorAdapter;
@@ -533,10 +593,6 @@ class HashJoinProbeAdapter : public CudfHashJoinBaseAdapter {
         std::dynamic_pointer_cast<const core::HashJoinNode>(planNode);
 
     std::vector<std::unique_ptr<exec::Operator>> result;
-    if (CudfConfig::getInstance().concatOptimizationEnabled) {
-      result.push_back(
-          std::make_unique<CudfBatchConcat>(operatorId, ctx, joinPlanNode));
-    }
     result.push_back(
         std::make_unique<CudfHashJoinProbe>(operatorId, ctx, joinPlanNode));
     return result;
@@ -670,8 +726,14 @@ class OrderByAdapter : public OperatorAdapter {
       const exec::Operator* /*op*/,
       const core::PlanNodePtr& planNode,
       exec::DriverCtx* /*ctx*/) const override {
-    return std::dynamic_pointer_cast<const core::OrderByNode>(planNode) !=
-        nullptr;
+    const auto orderByNode =
+        std::dynamic_pointer_cast<const core::OrderByNode>(planNode);
+    if (!CudfOrderBy::isSupported(orderByNode)) {
+      LOG_FALLBACK(
+          "OrderBy external spill schema or sorting key is not supported");
+      return false;
+    }
+    return true;
   }
 
   bool acceptsGpuInput() const override {
@@ -735,7 +797,8 @@ class TopNAdapter : public OperatorAdapter {
   }
 };
 
-/// TopNRowNumberAdapter - Replaces with CudfTopNRowNumber
+/// TopNRowNumberAdapter - Replaces supported limit=1 TopNRowNumber nodes with
+/// the bounded cuDF implementation.
 class TopNRowNumberAdapter : public OperatorAdapter {
  public:
   TopNRowNumberAdapter() : OperatorAdapter("TopNRowNumber") {}
@@ -745,16 +808,21 @@ class TopNRowNumberAdapter : public OperatorAdapter {
   }
 
   bool canRunOnGPU(
-      const exec::Operator* /*op*/,
+      const exec::Operator* op,
       const core::PlanNodePtr& planNode,
       exec::DriverCtx* /*ctx*/) const override {
     auto node =
         std::dynamic_pointer_cast<const core::TopNRowNumberNode>(planNode);
-    if (!node) {
-      return false;
+    const bool canRun = canHandle(op) && CudfTopNRowNumber::shouldReplace(node);
+    if (!canRun) {
+      LOG_FALLBACK(
+          "TopNRowNumberAdapter {}, PlanNode id: {}",
+          !canHandle(op) ? "operator is not TopNRowNumber"
+              : !node ? "planNode is not TopNRowNumberNode"
+                      : "CudfTopNRowNumber::shouldReplace returned false",
+          planNode->id());
     }
-    return node->rankFunction() ==
-        core::TopNRowNumberNode::RankFunction::kRowNumber;
+    return canRun;
   }
 
   bool acceptsGpuInput() const override {
@@ -788,7 +856,7 @@ class TopNRowNumberAdapter : public OperatorAdapter {
             operatorId,
             ctx,
             planNode,
-            topNRowNumberNode->inputType(),
+            node->inputType(),
             1'000'000,
             std::min<uint64_t>(candidateRunBytes, 256ULL << 20)));
     result.push_back(
@@ -1383,6 +1451,7 @@ void registerAllOperatorAdapters() {
   registry.registerAdapter(std::make_unique<TableScanAdapter>());
   registry.registerAdapter(std::make_unique<FilterProjectAdapter>());
   registry.registerAdapter(std::make_unique<AggregationAdapter>());
+  registry.registerAdapter(std::make_unique<UnnestAdapter>());
   registry.registerAdapter(std::make_unique<HashJoinBuildAdapter>());
   registry.registerAdapter(std::make_unique<HashJoinProbeAdapter>());
   registry.registerAdapter(std::make_unique<NestedLoopJoinBuildAdapter>());

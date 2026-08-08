@@ -56,7 +56,7 @@ void UcxExchangeQueue::enqueueLocked(
     return;
   }
 
-  auto dataSize = data->gpuDataSize();
+  auto dataSize = data->dataSize();
   if (reservedReceiveBytes > 0) {
     VELOX_CHECK_GE(pendingReceiveBytes_, reservedReceiveBytes);
     pendingReceiveBytes_ -= reservedReceiveBytes;
@@ -195,7 +195,7 @@ PackedTableWithStreamPtr UcxExchangeQueue::dequeueLocked(
 
   data = std::move(queue_.front());
   queue_.pop_front();
-  totalBytes_ -= data->gpuDataSize();
+  totalBytes_ -= data->dataSize();
 
   return data;
 }

@@ -19,6 +19,7 @@
 #include <optional>
 
 #include "velox/exec/Operator.h"
+#include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/NvtxHelper.h"
 #include "velox/experimental/cudf/exec/CudfPackedRestore.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
@@ -55,7 +56,7 @@ class UcxPartitionedOutput : public exec::Operator,
   /// Do not accept another input while a large input is being partitioned a
   /// window at a time. The driver calls getOutput() to resume that work.
   bool needsInput() const override {
-    return !noMoreInput_ && !hasActiveFlush();
+    return !noMoreInput_ && !pendingFlushReady_ && !hasActiveFlush();
   }
 
   /// Moves the shared output queue's backpressure future to the Driver.
@@ -134,6 +135,9 @@ class UcxPartitionedOutput : public exec::Operator,
   /// between windows.
   void flushPending();
 
+  /// Conservative transient bytes for the next concatenate/hash/pack step.
+  uint64_t flushWorkspaceBytes() const;
+
   /// Moves pending inputs into resumable flush state. For multiple inputs,
   /// owns the concatenated table; for one input, activeInputs_ owns the vector
   /// referenced by the active table view.
@@ -163,7 +167,12 @@ class UcxPartitionedOutput : public exec::Operator,
   int64_t pendingRows_{0};
   /// Source GPU bytes across pendingInputs_, captured before owners are freed.
   uint64_t pendingFlatBytes_{0};
-
+  /// A threshold-crossing input is owned, but its allocation-heavy flush is
+  /// deferred to getOutput() so isBlocked() can obtain bounded GPU workspace.
+  bool pendingFlushReady_{false};
+  cudf_velox::DeviceMemoryWorkspaceRequest flushWorkspaceRequest_;
+  std::optional<cudf_velox::DeviceMemoryWorkspaceReservation>
+      flushWorkspaceAdmission_;
   /// Ownership and cursor for a flush that yielded between partition windows.
   std::vector<cudf_velox::CudfVectorPtr> activeInputs_;
   std::unique_ptr<cudf::table> activeMergedTable_;

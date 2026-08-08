@@ -36,7 +36,12 @@
 #include <rmm/mr/cuda_memory_resource.hpp>
 #include <rmm/mr/pool_memory_resource.hpp>
 
+#include <chrono>
+#include <optional>
+
 namespace facebook::velox::ucx_exchange {
+
+struct IntraNodeTransferResult;
 
 struct UcxExchangeMetrics {
   UcxExchangeMetrics()
@@ -173,6 +178,7 @@ class UcxExchangeSource
     std::shared_ptr<uint8_t> hostData;
     bool hostDataPinned{false};
     rmm::cuda_stream_view stream; // The stream used to allocate dataBuf
+    std::shared_ptr<void> receiveWorkspaceProgressLease;
   };
 
   /// @brief The constructor is private in order to ensure that exchange sources
@@ -258,12 +264,9 @@ class UcxExchangeSource
   void waitForIntraNodeData();
 
   /// @brief For intra-node transfer: handles data retrieved from registry.
-  /// @param data The packed_columns from registry (nullptr if atEnd or error)
-  /// @param atEnd True if this is end-of-stream
-  void onIntraNodeData(
-      std::shared_ptr<cudf::packed_columns> data,
-      rmm::cuda_stream_view producerStream,
-      bool atEnd);
+  /// @param result Device-owned data, a host-backed bounce image, or an end
+  /// marker retrieved from the same-node registry.
+  void onIntraNodeData(IntraNodeTransferResult result);
 
   /// @brief Sets the new state of this exchange source using
   /// sequential consistency. Logs transitions at VLOG(2).
@@ -338,6 +341,15 @@ class UcxExchangeSource
   std::shared_ptr<DataAndMetadata> pendingReceive_;
   int64_t reservedReceiveBytes_{0};
   int64_t reservedGlobalHostReceiveBytes_{0};
+
+  // A receive normally preserves one full consumer workspace above the
+  // steady-state device watermark. If the same pending receive cannot be
+  // admitted for a bounded interval, it may use the steady-state watermark;
+  // the operator workspace scheduler's own progress lane then guarantees that
+  // the received page can be consumed instead of completing a credit cycle.
+  std::optional<std::chrono::steady_clock::time_point>
+      receiveWorkspaceBlockedSince_;
+  bool receiveWorkspaceProgressLogged_{false};
 
   // Some metrics/counters:
   UcxExchangeMetrics metrics_;

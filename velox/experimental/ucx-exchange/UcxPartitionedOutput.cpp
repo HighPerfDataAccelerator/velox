@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <limits>
+#include <mutex>
 #include "velox/core/PlanNode.h"
 #include "velox/core/QueryConfig.h"
 #include "velox/exec/Driver.h"
@@ -55,6 +56,19 @@ constexpr int64_t kDefaultMaxRowsPerHashPartitionCall = 128'000'000;
 // When no reservation can be obtained, cap this driver's estimated transient
 // hash-partition peak so concurrent unadmitted fallbacks remain bounded.
 constexpr uint64_t kMaxUnadmittedHashPartitionPeakBytes = uint64_t{1} << 30;
+constexpr uint64_t kMinPartitionedOutputFlushWorkspaceBytes = 384ULL << 20;
+constexpr uint64_t kPartitionedOutputFlushFixedWorkspaceBytes = 256ULL << 20;
+constexpr uint64_t kPartitionedOutputFlushSourceCopies = 3;
+
+// Cooperative admission reserves the estimated transient peak, but independent
+// cudaMallocAsync streams can still race while converting reusable pool pages
+// into concat/hash/pack outputs. Keep the short synchronous allocation window
+// exclusive; admission is acquired first so a waiter never holds this mutex
+// while waiting for device headroom.
+std::mutex& partitionedOutputFlushMutex() {
+  static std::mutex mutex;
+  return mutex;
+}
 
 bool containsStructColumn(const cudf::column_view& column) {
   if (column.type().id() == cudf::type_id::STRUCT) {
@@ -279,6 +293,12 @@ std::vector<OwningPackedChunk> makeOwningPackedChunks(
     cudf::table_view table,
     cudf::size_type rowsPerChunk,
     rmm::cuda_stream_view stream) {
+  CudaCallDiagnosticScope callDiagnostic(fmt::format(
+      "operator=UcxPartitionedOutput phase=contiguousSplit rows={} "
+      "rowsPerChunk={} stream={}",
+      table.num_rows(),
+      rowsPerChunk,
+      static_cast<const void*>(stream.value())));
   VELOX_CHECK_GT(rowsPerChunk, 0);
   if (table.num_rows() == 0) {
     return {};
@@ -394,6 +414,10 @@ UcxPartitionedOutput::UcxPartitionedOutput(
 }
 
 void UcxPartitionedOutput::addInput(RowVectorPtr input) {
+  CudaCallDiagnosticScope callDiagnostic(fmt::format(
+      "operator=UcxPartitionedOutput task={} method=addInput rows={}",
+      taskId(),
+      input == nullptr ? 0 : input->size()));
   CudaAllocationTraceScope allocationTrace(
       fmt::format("UcxPartitionedOutput task={} method=addInput", taskId()));
   VLOG(3) << "@" << taskId() << "#" << pipelineId_ << "/" << driverId_
@@ -405,6 +429,8 @@ void UcxPartitionedOutput::addInput(RowVectorPtr input) {
       !future_.valid() || future_.hasValue(),
       "addInput with outstanding future!");
   VELOX_CHECK(!hasActiveFlush(), "addInput while a flush is still active");
+  VELOX_CHECK(
+      !pendingFlushReady_, "addInput while a pending flush awaits admission");
 
   const auto inputFlatBytes = input->estimateFlatSize();
   // Record stats per-input (before buffering).
@@ -429,8 +455,9 @@ void UcxPartitionedOutput::addInput(RowVectorPtr input) {
 
   if ((targetRowsPerChunk_ <= 0 && targetBytesPerChunk_ == 0) ||
       (targetRowsPerChunk_ > 0 && pendingRows_ >= targetRowsPerChunk_) ||
-      (targetBytesPerChunk_ > 0 && pendingFlatBytes_ >= targetBytesPerChunk_)) {
-    flushPending();
+      (targetBytesPerChunk_ > 0 &&
+       pendingFlatBytes_ >= targetBytesPerChunk_)) {
+    pendingFlushReady_ = true;
   }
 }
 
@@ -455,12 +482,34 @@ void UcxPartitionedOutput::flushPending() {
     pendingInputs_.clear();
     pendingRows_ = 0;
     pendingFlatBytes_ = 0;
+    pendingFlushReady_ = false;
     clearActiveFlush();
     for (int i = 0; i < numPartitions_; i++) {
       sharedQueueManager()->deleteResults(this->taskId(), i);
     }
     throw;
   }
+}
+
+uint64_t UcxPartitionedOutput::flushWorkspaceBytes() const {
+  // The source owner is already reflected in cudaMemGetInfo.  A threshold
+  // flush can additionally materialize a concatenate result, hash-partition
+  // result, and packed destination buffers before their asynchronous releases
+  // become reusable.  Account from the actual owner instead of a fixed batch
+  // assumption: variable-width TopN output can overshoot the configured byte
+  // threshold by one complete input batch.
+  const auto sourceBytes = hasActiveFlush() ? activeSourceFlatBytes_
+                                            : pendingFlatBytes_;
+  if (sourceBytes >
+      (std::numeric_limits<uint64_t>::max() -
+       kPartitionedOutputFlushFixedWorkspaceBytes) /
+          kPartitionedOutputFlushSourceCopies) {
+    return std::numeric_limits<uint64_t>::max();
+  }
+  return std::max<uint64_t>(
+      kMinPartitionedOutputFlushWorkspaceBytes,
+      sourceBytes * kPartitionedOutputFlushSourceCopies +
+          kPartitionedOutputFlushFixedWorkspaceBytes);
 }
 
 void UcxPartitionedOutput::preparePendingFlush() {
@@ -472,6 +521,7 @@ void UcxPartitionedOutput::preparePendingFlush() {
   pendingInputs_.clear();
   pendingRows_ = 0;
   pendingFlatBytes_ = 0;
+  pendingFlushReady_ = false;
 
   auto stream = activeInputs_.back()->stream();
   if (activeInputs_.size() > 1) {
@@ -569,6 +619,9 @@ cudf::table_view UcxPartitionedOutput::activeTableView() {
 }
 
 bool UcxPartitionedOutput::externalizeActiveSourceTail() {
+  CudaCallDiagnosticScope callDiagnostic(fmt::format(
+      "operator=UcxPartitionedOutput task={} phase=externalizeSourceTail",
+      taskId()));
   if (!sourceCanExternalizeOnBackpressure_ || !hasActiveDeviceSource() ||
       !activeStream_) {
     return false;
@@ -621,6 +674,15 @@ bool UcxPartitionedOutput::externalizeActiveSourceTail() {
         dataBytes == 0 ? nullptr : new uint8_t[static_cast<size_t>(dataBytes)],
         std::default_delete<uint8_t[]>());
     if (dataBytes > 0) {
+      CudaCallDiagnosticScope copyDiagnostic(fmt::format(
+          "operator=UcxPartitionedOutput task={} phase=externalizeD2H "
+          "rows={} bytes={} src={} dst={} stream={}",
+          taskId(),
+          packed.rows,
+          dataBytes,
+          packed.data->gpu_data->data(),
+          static_cast<const void*>(hostData.get()),
+          static_cast<const void*>(stream.value())));
       CUDF_CUDA_TRY(cudaMemcpyAsync(
           hostData.get(),
           packed.data->gpu_data->data(),
@@ -673,6 +735,14 @@ void UcxPartitionedOutput::restoreNextHostSource() {
   activeHostSources_.pop_front();
   const auto dataBytes = chunk.dataBytes;
   const auto rows = chunk.rows;
+  CudaCallDiagnosticScope callDiagnostic(fmt::format(
+      "operator=UcxPartitionedOutput task={} phase=restoreHostSource "
+      "rows={} bytes={} src={} stream={}",
+      taskId(),
+      rows,
+      dataBytes,
+      static_cast<const void*>(chunk.data.get()),
+      static_cast<const void*>(activeStream_->value())));
   std::vector<CudfPackedHostRestoreChunk> restoreChunks;
   restoreChunks.push_back(CudfPackedHostRestoreChunk{
       std::move(chunk.metadata),
@@ -733,6 +803,9 @@ void UcxPartitionedOutput::updateBackpressure() {
 }
 
 void UcxPartitionedOutput::advanceActiveFlush() {
+  CudaCallDiagnosticScope callDiagnostic(fmt::format(
+      "operator=UcxPartitionedOutput task={} method=advanceActiveFlush",
+      taskId()));
   VELOX_CHECK(hasActiveFlush());
   VELOX_CHECK(activeStream_.has_value());
   VELOX_CHECK_EQ(blockingReason_, exec::BlockingReason::kNotBlocked);
@@ -938,10 +1011,33 @@ exec::BlockingReason UcxPartitionedOutput::isBlocked(ContinueFuture* future) {
     blockingReason_ = exec::BlockingReason::kNotBlocked;
     return exec::BlockingReason::kWaitForConsumer;
   }
+
+  const bool needsFlushWork = hasActiveFlush() || pendingFlushReady_ ||
+      (noMoreInput_ && !pendingInputs_.empty());
+  if (needsFlushWork && !flushWorkspaceAdmission_.has_value()) {
+    ContinueFuture workspaceFuture;
+    const auto workspaceBytes = flushWorkspaceBytes();
+    auto workspace = cudf_velox::tryAcquireDeviceMemoryWorkspace(
+        pool(),
+        this,
+        workspaceBytes,
+        cudf_velox::CudfConfig::getInstance().deviceMemoryMinHeadroomBytes,
+        cudf_velox::DeviceMemoryWorkspacePriority::kOutput,
+        &flushWorkspaceRequest_,
+        &workspaceFuture);
+    if (!workspace.has_value()) {
+      *future = std::move(workspaceFuture);
+      return exec::BlockingReason::kWaitForArbitration;
+    }
+    flushWorkspaceAdmission_.emplace(std::move(workspace.value()));
+  }
+
   return exec::BlockingReason::kNotBlocked;
 }
 
 RowVectorPtr UcxPartitionedOutput::getOutput() {
+  CudaCallDiagnosticScope callDiagnostic(fmt::format(
+      "operator=UcxPartitionedOutput task={} method=getOutput", taskId()));
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
   if (finished_) {
     return nullptr;
@@ -951,7 +1047,15 @@ RowVectorPtr UcxPartitionedOutput::getOutput() {
   if (blockingReason_ != exec::BlockingReason::kNotBlocked) {
     return nullptr;
   }
-  if (hasActiveFlush() || (noMoreInput_ && !pendingInputs_.empty())) {
+  if (hasActiveFlush() || pendingFlushReady_ ||
+      (noMoreInput_ && !pendingInputs_.empty())) {
+    VELOX_CHECK(
+        flushWorkspaceAdmission_.has_value(),
+        "Partitioned output flush work requires workspace admission");
+    SCOPE_EXIT {
+      flushWorkspaceAdmission_.reset();
+    };
+    std::lock_guard<std::mutex> flushLock(partitionedOutputFlushMutex());
     flushPending();
   }
   // A final work unit may have completed but filled the queue. Defer EOS until

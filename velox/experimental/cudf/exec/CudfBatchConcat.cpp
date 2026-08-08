@@ -30,6 +30,13 @@
 namespace facebook::velox::cudf_velox {
 namespace {
 
+// Materializing a wide concat retains all input allocations until cuDF has
+// allocated and populated the replacement table. Above this bound the small
+// reduction in vector count is not worth doubling hundreds of MiB of live
+// device data. Keep this above the 256 MiB UCX concat target so that normal
+// exchange coalescing remains enabled.
+constexpr uint64_t kMaxMaterializedConcatEstimatedBytes = 384ULL << 20;
+
 uint64_t concatThresholdFromEnv(const char* name, uint64_t fallback) {
   if (const char* value = std::getenv(name)) {
     try {
@@ -329,96 +336,94 @@ bool CudfBatchConcat::needsInput() const {
       !reachedFlushThreshold();
 }
 
-uint64_t CudfBatchConcat::estimateConcatWorkspaceBytes(uint64_t inputBytes) {
-  constexpr uint64_t kMinimumWorkspaceBytes = 1ULL << 30;
-  constexpr uint64_t kFixedWorkspaceBytes = 256ULL << 20;
-  constexpr uint64_t kWorkspaceCopies = 2;
-  const auto boundedBytes =
-      std::min<uint64_t>(inputBytes, kMaxSafeConcatEstimatedBytes);
-  if (boundedBytes >
-      (std::numeric_limits<uint64_t>::max() - kFixedWorkspaceBytes) /
-          kWorkspaceCopies) {
-    return std::numeric_limits<uint64_t>::max();
-  }
-  return std::max<uint64_t>(
-      kMinimumWorkspaceBytes,
-      boundedBytes * kWorkspaceCopies + kFixedWorkspaceBytes);
-}
-
-uint64_t CudfBatchConcat::pendingWorkspaceBytes() const {
-  if (pendingInput_ == nullptr) {
-    return 0;
-  }
-  const auto cudfVector = std::dynamic_pointer_cast<CudfVector>(pendingInput_);
-  VELOX_CHECK_NOT_NULL(cudfVector, "CudfBatchConcat expects CudfVector input");
-  if (cudfVector->size() == 0) {
-    return 0;
-  }
-
-  const auto inputBytes =
-      static_cast<uint64_t>(cudfVector->estimateFlatSize());
-  uint64_t requiredBytes = rebaseVariableWidthInputs_
-      ? estimateConcatWorkspaceBytes(inputBytes)
-      : 0;
-
-  const bool incompatibleStringLayout =
-      !buffer_.empty() &&
-      !hasSameEmptyStringCharsPattern(
-          buffer_.front()->getTableView(), cudfVector->getTableView());
-  const bool exceedsSafeBytes =
-      !buffer_.empty() &&
-      inputBytes >
-          kMaxSafeConcatEstimatedBytes -
-              std::min(currentNumBytes_, kMaxSafeConcatEstimatedBytes);
-  if (incompatibleStringLayout || exceedsSafeBytes) {
-    // The resident tail is flushed before the pending input is accepted.
-    // A one-vector flush is a zero-copy ownership handoff.
-    if (buffer_.size() > 1) {
-      requiredBytes = std::max(
-          requiredBytes, estimateConcatWorkspaceBytes(currentNumBytes_));
+bool CudfBatchConcat::requiresConcatWorkspace() const {
+  if (pendingInput_ != nullptr) {
+    const auto cudfVector =
+        std::dynamic_pointer_cast<CudfVector>(pendingInput_);
+    VELOX_CHECK_NOT_NULL(
+        cudfVector, "CudfBatchConcat expects CudfVector input");
+    if (cudfVector->size() == 0) {
+      return false;
     }
-    return requiredBytes;
+
+    // Rebasing allocates a new owning table even without a resident tail.
+    if (rebaseVariableWidthInputs_) {
+      return true;
+    }
+
+    // Either pre-admission flush can concatenate the resident tail before
+    // handing off the pending vector.
+    const auto inputBytes =
+        static_cast<uint64_t>(cudfVector->estimateFlatSize());
+    const bool flushResidentTail = !buffer_.empty() &&
+        (!hasSameEmptyStringCharsPattern(
+             buffer_.front()->getTableView(), cudfVector->getTableView()) ||
+         inputBytes >
+             kMaxSafeConcatEstimatedBytes -
+                 std::min(
+                     currentNumBytes_, kMaxSafeConcatEstimatedBytes));
+    if (flushResidentTail && buffer_.size() > 1) {
+      return currentNumBytes_ <= kMaxMaterializedConcatEstimatedBytes;
+    }
+
+    // Otherwise processPendingInput concatenates only if accepting this
+    // vector reaches a row or byte bound and there is already a resident
+    // vector. A one-vector flush is an ownership handoff without GPU work.
+    if (!flushResidentTail && !buffer_.empty()) {
+      const auto combinedRows = currentNumRows_ + cudfVector->size();
+      const auto combinedBytes =
+          currentNumBytes_ >
+              std::numeric_limits<uint64_t>::max() - inputBytes
+          ? std::numeric_limits<uint64_t>::max()
+          : currentNumBytes_ + inputBytes;
+      const bool flushAfterAdmission = combinedRows >= targetRows_ ||
+          combinedBytes >= kMaxSafeConcatEstimatedBytes ||
+          (targetBytes_ != 0 && combinedBytes >= targetBytes_);
+      return flushAfterAdmission &&
+          combinedBytes <= kMaxMaterializedConcatEstimatedBytes;
+    }
+    return false;
   }
 
-  const auto combinedRows = currentNumRows_ + cudfVector->size();
-  const auto combinedBytes = currentNumBytes_ >
-          std::numeric_limits<uint64_t>::max() - inputBytes
-      ? std::numeric_limits<uint64_t>::max()
-      : currentNumBytes_ + inputBytes;
-  const bool flushAfterAdmission = combinedRows >= targetRows_ ||
-      combinedBytes >= kMaxSafeConcatEstimatedBytes ||
-      (targetBytes_ != 0 && combinedBytes >= targetBytes_);
-  if (!buffer_.empty() && flushAfterAdmission) {
-    requiredBytes = std::max(
-        requiredBytes, estimateConcatWorkspaceBytes(combinedBytes));
-  }
-  return requiredBytes;
+  // noMoreInput_ can trigger the final concat without a pending vector.
+  return buffer_.size() > 1 &&
+      currentNumBytes_ <= kMaxMaterializedConcatEstimatedBytes &&
+      (currentNumRows_ >= targetRows_ || reachedFlushThreshold() ||
+       noMoreInput_);
 }
 
 exec::BlockingReason CudfBatchConcat::isBlocked(ContinueFuture* future) {
-  if (pendingInput_ == nullptr || workspaceAdmission_.has_value()) {
-    return exec::BlockingReason::kNotBlocked;
-  }
-  const auto requiredBytes = pendingWorkspaceBytes();
-  if (requiredBytes == 0) {
+  if (!requiresConcatWorkspace() || workspaceAdmission_.has_value()) {
     return exec::BlockingReason::kNotBlocked;
   }
 
+  // Job 144's failing concat requested 281 MiB. Keep enough margin for cuDF
+  // metadata and subsidiary buffers without reproducing the progress failure
+  // caused by a 1 GiB minimum request near the device headroom watermark.
+  constexpr std::size_t kConcatWorkspaceBytes = 512ULL << 20;
   VELOX_CHECK_NOT_NULL(future);
   ContinueFuture workspaceFuture;
-  auto workspaceAdmission = tryAcquireDeviceMemoryWorkspace(
+  auto workspace = tryAcquireDeviceMemoryWorkspace(
       customPool(kCudfDeviceMemoryResourceTag),
       this,
-      requiredBytes,
+      kConcatWorkspaceBytes,
       CudfConfig::getInstance().deviceMemoryMinHeadroomBytes,
-      DeviceMemoryWorkspacePriority::kInput,
+      // Concat owns Exchange receive pages while it waits. Treat the bounded
+      // replacement as drain work so it runs ahead of FilterProject: leaving
+      // both in the transform FIFO can let filters consume the remaining
+      // headroom and form a producer/consumer admission cycle.
+      DeviceMemoryWorkspacePriority::kDrain,
       &workspaceRequest_,
       &workspaceFuture);
-  if (!workspaceAdmission.has_value()) {
+  if (!workspace.has_value()) {
     *future = std::move(workspaceFuture);
     return exec::BlockingReason::kWaitForArbitration;
   }
-  workspaceAdmission_ = std::move(workspaceAdmission.value());
+  workspaceAdmission_.emplace(std::move(workspace.value()));
+  addRuntimeStat(
+      "batchConcatWorkspaceBytes",
+      RuntimeCounter(
+          kConcatWorkspaceBytes, RuntimeCounter::Unit::kBytes));
   return exec::BlockingReason::kNotBlocked;
 }
 
@@ -433,6 +438,19 @@ void CudfBatchConcat::flushBufferedInputs() {
   }
   if (buffer_.size() == 1) {
     outputQueue_.push(std::move(buffer_.front()));
+    buffer_.clear();
+  } else if (currentNumBytes_ > kMaxMaterializedConcatEstimatedBytes) {
+    largeConcatBypassBatches_ += buffer_.size();
+    largeConcatBypassBytes_ += currentNumBytes_;
+    addRuntimeStat(
+        "batchConcatLargeBypassBatches",
+        RuntimeCounter(buffer_.size(), RuntimeCounter::Unit::kNone));
+    addRuntimeStat(
+        "batchConcatLargeBypassBytes",
+        RuntimeCounter(currentNumBytes_, RuntimeCounter::Unit::kBytes));
+    for (auto& vector : buffer_) {
+      outputQueue_.push(std::move(vector));
+    }
     buffer_.clear();
   } else {
     const auto outputStream = buffer_.front()->stream();
@@ -453,16 +471,10 @@ void CudfBatchConcat::flushBufferedInputs() {
 void CudfBatchConcat::doAddInput(RowVectorPtr input) {
   VELOX_CHECK_NULL(
       pendingInput_, "CudfBatchConcat received a second pending input");
-  VELOX_CHECK(
-      !workspaceAdmission_.has_value(),
-      "CudfBatchConcat workspace cannot precede pending input ownership");
   pendingInput_ = std::move(input);
 }
 
 void CudfBatchConcat::processPendingInput(RowVectorPtr input) {
-  SCOPE_EXIT {
-    workspaceAdmission_.reset();
-  };
   auto cudfVector = std::dynamic_pointer_cast<CudfVector>(input);
   VELOX_CHECK_NOT_NULL(cudfVector, "CudfBatchConcat expects CudfVector input");
 
@@ -510,8 +522,9 @@ void CudfBatchConcat::processPendingInput(RowVectorPtr input) {
   const auto inputBytes =
       static_cast<uint64_t>(cudfVector->estimateFlatSize());
   // cuDF 26.06's strings memcpy concatenate path rejects a zero-byte source
-  // when another input supplies chars for the same logical column. Uniform
-  // all-empty groups are safe and still coalesce.
+  // when another input supplies chars for the same logical column. Keep
+  // unlike physical layouts in separate groups. A uniform all-empty group is
+  // safe because libcudf observes total_bytes == 0 and skips the copy loop.
   if (!buffer_.empty() &&
       !hasSameEmptyStringCharsPattern(
           buffer_.front()->getTableView(), cudfVector->getTableView())) {
@@ -547,10 +560,14 @@ void CudfBatchConcat::processPendingInput(RowVectorPtr input) {
 }
 
 RowVectorPtr CudfBatchConcat::doGetOutput() {
+  SCOPE_EXIT {
+    workspaceAdmission_.reset();
+  };
+  VELOX_CHECK(
+      !requiresConcatWorkspace() || workspaceAdmission_.has_value(),
+      "CudfBatchConcat GPU work requires a live device workspace admission");
+
   if (pendingInput_ != nullptr) {
-    VELOX_CHECK(
-        pendingWorkspaceBytes() == 0 || workspaceAdmission_.has_value(),
-        "CudfBatchConcat GPU work requires device workspace admission");
     processPendingInput(std::exchange(pendingInput_, nullptr));
   }
 
@@ -576,6 +593,14 @@ RowVectorPtr CudfBatchConcat::doGetOutput() {
       buffer_.clear();
       currentNumRows_ = 0;
       currentNumBytes_ = 0;
+      ++outputBatches_;
+      return output;
+    }
+    if (currentNumBytes_ > kMaxMaterializedConcatEstimatedBytes) {
+      flushBufferedInputs();
+      VELOX_CHECK(!outputQueue_.empty());
+      auto output = std::move(outputQueue_.front());
+      outputQueue_.pop();
       ++outputBatches_;
       return output;
     }
@@ -635,7 +660,10 @@ bool CudfBatchConcat::isFinished() {
                  << ", inputRows=" << totalInputRows_
                  << ", inputBytes=" << totalInputBytes_
                  << ", rebasedBatches=" << rebasedBatches_
-                 << ", rebaseMicros=" << rebaseMicros_;
+                 << ", rebaseMicros=" << rebaseMicros_
+                 << ", largeConcatBypassBatches="
+                 << largeConcatBypassBatches_
+                 << ", largeConcatBypassBytes=" << largeConcatBypassBytes_;
   }
   return finished;
 }

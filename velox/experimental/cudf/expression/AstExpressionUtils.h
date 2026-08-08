@@ -159,6 +159,7 @@ const std::unordered_map<std::string, Op> sparkBinaryOps = {
     {"multiply", Op::MUL},
     {"divide", Op::DIV},
     {"equalto", Op::EQUAL},
+    {"equalnullsafe", Op::NULL_EQUAL},
     {"lessthan", Op::LESS},
     {"greaterthan", Op::GREATER},
     {"lessthanorequal", Op::LESS_EQUAL},

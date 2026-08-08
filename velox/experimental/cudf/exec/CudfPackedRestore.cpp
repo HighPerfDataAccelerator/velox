@@ -195,6 +195,15 @@ CudfBulkPackedRestore bulkRestoreCudfPackedHostChunks(
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr,
     CudfBulkPackedRestoreOptions options) {
+  uint64_t diagnosticBytes = 0;
+  for (const auto& chunk : chunks) {
+    diagnosticBytes += chunk.dataBytes;
+  }
+  CudaCallDiagnosticScope callDiagnostic(fmt::format(
+      "phase=bulkPackedRestore chunks={} bytes={} stream={}",
+      chunks.size(),
+      diagnosticBytes,
+      static_cast<const void*>(stream.value())));
   CudfBulkPackedRestore result;
   if (chunks.empty()) {
     return result;

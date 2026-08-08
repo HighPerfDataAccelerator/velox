@@ -165,6 +165,27 @@ TEST_F(CudfVectorTest, rebindPackedTableDeallocationStream) {
   EXPECT_EQ(resource.lastDeallocationStream(), targetStream.value());
 }
 
+TEST_F(CudfVectorTest, packedTableRetainsExternalLifetimeOwner) {
+  TestCudaStream stream;
+  RecordingAsyncDeviceResource resource;
+  auto packedTable = makePackedTable(stream.view(), resource);
+  auto owner = std::make_shared<int>(1);
+  std::weak_ptr<int> weakOwner = owner;
+
+  auto vector = std::make_shared<CudfVector>(
+      pool_.get(),
+      ROW({"c0"}, {INTEGER()}),
+      packedTable->table.num_rows(),
+      std::move(packedTable),
+      stream.view(),
+      owner);
+  owner.reset();
+  EXPECT_FALSE(weakOwner.expired());
+
+  vector.reset();
+  EXPECT_TRUE(weakOwner.expired());
+}
+
 TEST_F(CudfVectorTest, packedTableReleaseUsesMaterializationStream) {
   TestCudaStream allocationStream;
   TestCudaStream targetStream;

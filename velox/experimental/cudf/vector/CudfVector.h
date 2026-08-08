@@ -67,7 +67,8 @@ class CudfVector : public RowVector {
       TypePtr type,
       vector_size_t size,
       std::unique_ptr<cudf::packed_table>&& packedTable,
-      rmm::cuda_stream_view stream);
+      rmm::cuda_stream_view stream,
+      std::shared_ptr<void> lifetimeOwner = nullptr);
 
   /// Constructs a non-owning CudfVector over an existing table view.
   ///
@@ -114,8 +115,9 @@ class CudfVector : public RowVector {
       std::unique_ptr<cudf::table>,
       std::unique_ptr<cudf::packed_table>>;
   // Must be declared before tableStorage_: members are destroyed in reverse
-  // declaration order, and device buffers must enqueue their frees before the
-  // owning CUDA stream is destroyed.
+  // declaration order. Device buffers must enqueue their frees before the
+  // owning CUDA stream or any external admission/lifetime token is released.
+  std::shared_ptr<void> lifetimeOwner_;
   std::shared_ptr<rmm::cuda_stream> streamOwner_;
   TableStorage tableStorage_;
 

@@ -14,7 +14,16 @@
  * limitations under the License.
  */
 #include "velox/experimental/ucx-exchange/UcxExchange.h"
+#include "velox/experimental/cudf/CudfConfig.h"
+#include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
+
+#include <cudf/contiguous_split.hpp>
+#include <cudf/utilities/error.hpp>
+#include <rmm/device_buffer.hpp>
+
+#include <chrono>
+#include <cstring>
 
 using facebook::velox::exec::Operator;
 using facebook::velox::exec::RemoteConnectorSplit;
@@ -150,7 +159,35 @@ void UcxExchange::getSplits(ContinueFuture* future) {
 
 BlockingReason UcxExchange::isBlocked(ContinueFuture* future) {
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
-  if (currentData_ || atEnd_) {
+  if (atEnd_ ||
+      (currentData_ &&
+       (!currentData_->isHostBacked() ||
+        hostCopyWorkspaceAdmission_.has_value()))) {
+    return BlockingReason::kNotBlocked;
+  }
+
+  if (currentData_ && currentData_->isHostBacked()) {
+    ContinueFuture workspaceFuture;
+    auto workspace = cudf_velox::tryAcquireDeviceMemoryWorkspace(
+        pool(),
+        this,
+        currentData_->dataSize(),
+        cudf_velox::CudfConfig::getInstance()
+            .deviceMemoryMinHeadroomBytes,
+        // This replaces an already-dequeued host receive page with its device
+        // representation. Admit it ahead of ordinary ingestion so the page
+        // can reach its consumer and release the bounce-buffer credit, while
+        // keeping restore/drain/output work ahead of it. kTransform also uses
+        // a reduced (but still bounded) watermark, which avoids stranding a
+        // small exchange page at the normal 6-GiB input boundary.
+        cudf_velox::DeviceMemoryWorkspacePriority::kTransform,
+        &hostCopyWorkspaceRequest_,
+        &workspaceFuture);
+    if (!workspace.has_value()) {
+      *future = std::move(workspaceFuture);
+      return BlockingReason::kWaitForArbitration;
+    }
+    hostCopyWorkspaceAdmission_.emplace(std::move(workspace.value()));
     return BlockingReason::kNotBlocked;
   }
 
@@ -161,6 +198,11 @@ BlockingReason UcxExchange::isBlocked(ContinueFuture* future) {
 
   ContinueFuture dataFuture = ContinueFuture::makeEmpty();
   currentData_ = exchangeClient_->next(driverId_, &atEnd_, &dataFuture);
+  if (currentData_ && currentData_->isHostBacked()) {
+    // Run the just-dequeued page through the same admission branch above
+    // before Driver calls getOutput(). Recursion is bounded to this one pass.
+    return isBlocked(future);
+  }
   if (currentData_ || atEnd_) {
     // got some data or reached the end.
     if (atEnd_ && noMoreSplits_) {
@@ -197,17 +239,94 @@ RowVectorPtr UcxExchange::getOutputFromPackedTable() {
 
   // Get the packed_table and stream from the PackedTableWithStream
   PackedTableWithStream& data = *currentData_;
+  if (data.isHostBacked()) {
+    VELOX_CHECK(
+        hostCopyWorkspaceAdmission_.has_value(),
+        "Host-backed UCX page reached getOutput without device admission");
+    VELOX_CHECK_NOT_NULL(data.hostMetadata);
+    const auto copyStart = std::chrono::steady_clock::now();
+    auto deviceData = std::make_unique<rmm::device_buffer>(
+        data.hostDataSize,
+        data.stream,
+        cudf_velox::get_temp_mr());
+    auto h2dBounce = data.hostDataPinned ||
+            data.hostDataSize <=
+                static_cast<size_t>(kDeviceEagerHostStageBytes)
+        ? std::shared_ptr<uint8_t>{}
+        : acquireUcxH2DPinnedBuffer(data.hostDataSize);
+    const void* h2dSource = data.hostData.get();
+    bool h2dSourcePinned = data.hostDataPinned;
+    if (h2dBounce != nullptr) {
+      const auto stageStart = std::chrono::steady_clock::now();
+      std::memcpy(h2dBounce.get(), data.hostData.get(), data.hostDataSize);
+      const auto stageNanos =
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - stageStart)
+              .count();
+      h2dSource = h2dBounce.get();
+      h2dSourcePinned = true;
+      addRuntimeStat(
+          "ucxDeferredBounceCopyBytes",
+          RuntimeCounter(data.hostDataSize, RuntimeCounter::Unit::kBytes));
+      addRuntimeStat(
+          "ucxDeferredBounceStageNanos",
+          RuntimeCounter(stageNanos, RuntimeCounter::Unit::kNanos));
+    } else if (!data.hostDataPinned) {
+      addRuntimeStat(
+          "ucxDeferredBounceFallbackBytes",
+          RuntimeCounter(data.hostDataSize, RuntimeCounter::Unit::kBytes));
+    }
+    CUDF_CUDA_TRY(cudaMemcpyAsync(
+        deviceData->data(),
+        h2dSource,
+        data.hostDataSize,
+        cudaMemcpyHostToDevice,
+        data.stream.value()));
+    data.stream.synchronize();
+    const auto copyNanos =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - copyStart)
+            .count();
+    addRuntimeStat(
+        "ucxDeferredHostCopyBytes",
+        RuntimeCounter(data.hostDataSize, RuntimeCounter::Unit::kBytes));
+    addRuntimeStat(
+        h2dSourcePinned ? "ucxDeferredPinnedHostCopyBytes"
+                        : "ucxDeferredPageableHostCopyBytes",
+        RuntimeCounter(data.hostDataSize, RuntimeCounter::Unit::kBytes));
+    addRuntimeStat(
+        "ucxDeferredHostCopyNanos",
+        RuntimeCounter(copyNanos, RuntimeCounter::Unit::kNanos));
+
+    cudf::packed_columns packedColumns(
+        std::move(data.hostMetadata), std::move(deviceData));
+    auto tableView = cudf::unpack(packedColumns);
+    data.packedTable = std::make_unique<cudf::packed_table>(
+        cudf::packed_table{tableView, std::move(packedColumns)});
+    // The explicit fence keeps the bounded H2D scratch lease short-lived. The
+    // replay-safe remote receive owner remains independently retained by its
+    // UCXX Request.
+    data.hostData.reset();
+    data.hostDataSize = 0;
+    data.lifetimeOwner.reset();
+  }
   auto numRows = data.packedTable->table.num_rows();
   auto gpuDataSize = data.gpuDataSize();
 
   // Use the stream that was allocated in UcxExchangeSource::onMetadata
   // and the packed_table constructor of CudfVector to avoid copying data.
   auto result = std::make_shared<cudf_velox::CudfVector>(
-      pool(), outputType_, numRows, std::move(data.packedTable), data.stream);
+      pool(),
+      outputType_,
+      numRows,
+      std::move(data.packedTable),
+      data.stream,
+      std::move(data.lifetimeOwner));
 
   recordInputStats(gpuDataSize, result);
   // free the memory owned by PackedTableWithStream and set it to nullptr;
   currentData_.reset();
+  hostCopyWorkspaceAdmission_.reset();
 
   return result;
 }
@@ -233,6 +352,8 @@ void UcxExchange::close() {
   closed_ = true;
   SourceOperator::close();
   currentData_.reset();
+  hostCopyWorkspaceAdmission_.reset();
+  hostCopyWorkspaceRequest_.reset();
   if (exchangeClient_) {
     recordExchangeClientStats();
     if (closeExchangeClientOnClose_) {

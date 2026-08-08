@@ -59,9 +59,7 @@ class CudfOrderBy : public CudfOperatorBase {
     return !noMoreInput_;
   }
 
-  exec::BlockingReason isBlocked(ContinueFuture* /*future*/) override {
-    return exec::BlockingReason::kNotBlocked;
-  }
+  exec::BlockingReason isBlocked(ContinueFuture* future) override;
 
   bool isFinished() override {
     return finished_;
@@ -166,6 +164,7 @@ class CudfOrderBy : public CudfOperatorBase {
   CudfVectorPtr takePendingOutput();
   void cleanupSpillFiles();
   void cleanupSpillStateAfterFailure(std::string_view context) noexcept;
+  uint64_t outputWorkspaceBytes() const;
 
   std::shared_ptr<const core::OrderByNode> orderByNode_;
   // Inputs, readers, merge cursors and output slices all outlive one Operator
@@ -188,6 +187,8 @@ class CudfOrderBy : public CudfOperatorBase {
   cudf::size_type pendingOutputOffset_{0};
   uint64_t pendingOutputBytes_{0};
   MergeStats outputMergeStats_;
+  DeviceMemoryWorkspaceRequest outputWorkspaceRequest_;
+  std::optional<DeviceMemoryWorkspaceReservation> outputWorkspaceAdmission_;
   bool readersInitialized_{false};
   bool mergeFinished_{false};
   bool spilled_{false};

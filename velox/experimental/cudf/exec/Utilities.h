@@ -40,9 +40,9 @@ inline constexpr uint64_t kMaxSafeConcatEstimatedBytes = 1ULL << 30;
 [[nodiscard]] bool hasEmptyStringChars(const cudf::table_view& table);
 
 /// Returns true when corresponding STRING columns in two tables agree on
-/// whether their chars child is empty. A concatenate group with a uniform
-/// pattern is safe: an all-empty column skips copying entirely, while an
-/// all-non-empty column always has valid copy sources.
+/// whether their chars buffer is absent. CudfBatchConcat keeps unlike layouts
+/// in separate groups. Uniform groups with absent chars buffers are safe to
+/// concatenate because their aggregate chars size is zero.
 [[nodiscard]] bool hasSameEmptyStringCharsPattern(
     const cudf::table_view& left,
     const cudf::table_view& right);
