@@ -20,6 +20,27 @@
 #include <folly/init/Init.h>
 #include <gtest/gtest.h>
 
+// Gluten supplies these CRT S3 bridge symbols in production. Most standalone
+// cuDF tests do not exercise S3, but their common connector link still needs a
+// default implementation. S3-specific tests can override these weak stubs.
+extern "C" bool __attribute__((weak)) glutenCrtS3RangeReaderAvailable() {
+  return false;
+}
+
+extern "C" uint64_t __attribute__((weak)) glutenCrtS3ObjectSize(const char*) {
+  return 0;
+}
+
+extern "C" uint64_t __attribute__((weak)) glutenCrtS3ReadRanges(
+    const char*,
+    uint8_t*,
+    const uint64_t*,
+    const uint64_t*,
+    const uint64_t*,
+    size_t) {
+  return 0;
+}
+
 // This main is needed for some tests on linux.
 int main(int argc, char** argv) {
   testing::InitGoogleTest(&argc, argv);

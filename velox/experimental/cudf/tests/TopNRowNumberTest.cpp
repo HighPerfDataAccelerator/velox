@@ -15,6 +15,7 @@
  */
 
 #include "velox/experimental/cudf/CudfConfig.h"
+#include "velox/experimental/cudf/exec/CudfConversion.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 
 #include "velox/common/file/FileSystems.h"
@@ -895,6 +896,11 @@ TEST_F(
   params.spillDirectory = spillRoot->getPath();
   params.queryConfigs = {
       {cudf_velox::CudfConfig::kCudfEnabled, "true"},
+      // Preserve the two Values vectors as two GPU input batches. The
+      // early-dense probe is deliberately batch-count based; the default
+      // CPU-to-GPU conversion target would merge this small fixture.
+      {cudf_velox::CudfFromVelox::kGpuBatchSizeRows,
+       std::to_string(kRowsPerBatch)},
       {cudf_velox::CudfConfig::kCudfTopNRowNumberCandidateRunBytes, "1"},
       {cudf_velox::CudfConfig::kCudfTopNRowNumberHostPartitions, "4"},
       {cudf_velox::CudfConfig::kCudfTopNRowNumberFinalizeInputBytes,
@@ -980,6 +986,11 @@ TEST_F(
   params.spillDirectory = spillRoot->getPath();
   params.queryConfigs = {
       {cudf_velox::CudfConfig::kCudfEnabled, "true"},
+      // Keep each source vector as an independent packed chunk so this test
+      // exercises multi-chunk bulk restore coalescing, not just recursive
+      // repartitioning of one conversion-merged input.
+      {cudf_velox::CudfFromVelox::kGpuBatchSizeRows,
+       std::to_string(kBatchRows)},
       {cudf_velox::CudfConfig::kCudfTopNRowNumberCandidateRunBytes, "1"},
       {cudf_velox::CudfConfig::kCudfTopNRowNumberHostPartitions, "2"},
       {cudf_velox::CudfConfig::kCudfTopNRowNumberFinalizeInputBytes, "65536"},
