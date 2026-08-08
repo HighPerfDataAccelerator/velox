@@ -623,6 +623,48 @@ TEST(ExecutorPrefetchTest, nativeScatterGroupsOnlySplitAtLogicalGaps) {
   EXPECT_EQ(groups[1].destinations[0].data(), third.data());
 }
 
+TEST(ExecutorPrefetchTest, nativeScatterCoalescesBoundedLogicalGaps) {
+  std::array<char, 3> first{};
+  std::array<char, 4> second{};
+  std::array<char, 2> third{};
+  const std::vector<folly::Range<char*>> destinations{
+      {first.data(), first.size()},
+      {nullptr, 5},
+      {second.data(), second.size()},
+      {nullptr, 6},
+      {third.data(), third.size()}};
+
+  const auto groups = groupNativeS3ReadDestinations(
+      10, destinations, /*maxGapBytes=*/5, /*maxRangeBytes=*/16);
+  ASSERT_EQ(groups.size(), 2);
+  EXPECT_EQ(groups[0].offset, 10);
+  EXPECT_EQ(groups[0].size, first.size() + 5 + second.size());
+  ASSERT_EQ(groups[0].destinations.size(), 3);
+  EXPECT_EQ(groups[0].destinations[0].data(), first.data());
+  EXPECT_EQ(groups[0].destinations[1].data(), nullptr);
+  EXPECT_EQ(groups[0].destinations[1].size(), 5);
+  EXPECT_EQ(groups[0].destinations[2].data(), second.data());
+  EXPECT_EQ(groups[1].offset, 10 + first.size() + 5 + second.size() + 6);
+  EXPECT_EQ(groups[1].size, third.size());
+}
+
+TEST(ExecutorPrefetchTest, nativeScatterRespectsMaximumCoalescedRange) {
+  std::array<char, 8> first{};
+  std::array<char, 8> second{};
+  const std::vector<folly::Range<char*>> destinations{
+      {first.data(), first.size()},
+      {nullptr, 1},
+      {second.data(), second.size()}};
+
+  const auto groups = groupNativeS3ReadDestinations(
+      10, destinations, /*maxGapBytes=*/1, /*maxRangeBytes=*/16);
+  ASSERT_EQ(groups.size(), 2);
+  EXPECT_EQ(groups[0].offset, 10);
+  EXPECT_EQ(groups[0].size, first.size());
+  EXPECT_EQ(groups[1].offset, 10 + first.size() + 1);
+  EXPECT_EQ(groups[1].size, second.size());
+}
+
 TEST(ExecutorPrefetchTest, nativeScatterStreamWritesExactDestinations) {
   std::array<char, 2> first{};
   std::array<char, 4> second{};
@@ -633,6 +675,23 @@ TEST(ExecutorPrefetchTest, nativeScatterStreamWritesExactDestinations) {
 
   EXPECT_TRUE(stream.good());
   EXPECT_EQ(stream.bytesWritten(), 6);
+  EXPECT_FALSE(stream.overflowed());
+  EXPECT_THAT(first, testing::ElementsAre('a', 'b'));
+  EXPECT_THAT(second, testing::ElementsAre('c', 'd', 'e', 'f'));
+}
+
+TEST(ExecutorPrefetchTest, nativeScatterStreamDiscardsGapBytes) {
+  std::array<char, 2> first{};
+  std::array<char, 4> second{};
+  NativeS3ScatterWriteStream stream(
+      {{first.data(), first.size()},
+       {nullptr, 5},
+       {second.data(), second.size()}});
+
+  stream.write("ab12345cdef", 11);
+
+  EXPECT_TRUE(stream.good());
+  EXPECT_EQ(stream.bytesWritten(), 11);
   EXPECT_FALSE(stream.overflowed());
   EXPECT_THAT(first, testing::ElementsAre('a', 'b'));
   EXPECT_THAT(second, testing::ElementsAre('c', 'd', 'e', 'f'));

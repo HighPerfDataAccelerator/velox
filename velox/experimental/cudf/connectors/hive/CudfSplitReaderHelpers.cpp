@@ -1199,6 +1199,7 @@ class NativeS3SdkScheduler {
     request->directCacheFill = directCacheFill;
     request->offset = offset;
     request->size = size;
+    request->logicalSize = size;
     request->destination = destination;
     auto future = request->promise.get_future();
     recordDirectCacheFillSubmission(*request);
@@ -1253,12 +1254,18 @@ class NativeS3SdkScheduler {
     request->offset = offset;
     request->directCacheFill = true;
     for (const auto& destination : destinations) {
-      VELOX_CHECK_NOT_NULL(destination.data());
       VELOX_CHECK_LE(
           destination.size(),
           std::numeric_limits<size_t>::max() - request->size,
           "Native S3 scatter request size overflow");
       request->size += destination.size();
+      if (destination.data() != nullptr) {
+        VELOX_CHECK_LE(
+            destination.size(),
+            std::numeric_limits<size_t>::max() - request->logicalSize,
+            "Native S3 scatter logical size overflow");
+        request->logicalSize += destination.size();
+      }
     }
     request->scatterDestinations = std::move(destinations);
     auto future = request->promise.get_future();
@@ -1275,6 +1282,14 @@ class NativeS3SdkScheduler {
     return rangeBytes_;
   }
 
+  size_t rangeCoalesceGapBytes() const {
+    return rangeCoalesceGapBytes_;
+  }
+
+  size_t maxCoalescedRangeBytes() const {
+    return maxCoalescedRangeBytes_;
+  }
+
   NativeS3SdkScheduler(const NativeS3SdkScheduler&) = delete;
   NativeS3SdkScheduler& operator=(const NativeS3SdkScheduler&) = delete;
 
@@ -1286,6 +1301,7 @@ class NativeS3SdkScheduler {
     std::string key;
     size_t offset{0};
     size_t size{0};
+    size_t logicalSize{0};
     uint8_t* destination{nullptr};
     std::vector<folly::Range<char*>> scatterDestinations;
     bool directCacheFill{false};
@@ -1304,18 +1320,28 @@ class NativeS3SdkScheduler {
     directCacheFillSubmittedRequests_.fetch_add(1, std::memory_order_relaxed);
     directCacheFillSubmittedBytes_.fetch_add(
         request.size, std::memory_order_relaxed);
+    directCacheFillLogicalBytes_.fetch_add(
+        request.logicalSize, std::memory_order_relaxed);
+    directCacheFillGapBytes_.fetch_add(
+        request.size - request.logicalSize, std::memory_order_relaxed);
   }
 
   NativeS3SdkScheduler()
       : useCrt_(envBytesOrZero("GLUTEN_CPP_S3_CRT") != 0),
         concurrency_(envOrDefault("GLUTEN_CPP_S3_SDK_CONCURRENCY", 128)),
         rangeBytes_(envOrDefault("GLUTEN_CPP_S3_SDK_RANGE_BYTES", 4UL << 20)),
+        rangeCoalesceGapBytes_(
+            envBytesOrZero("GLUTEN_CPP_S3_RANGE_COALESCE_GAP_BYTES")),
+        maxCoalescedRangeBytes_(envOrDefault(
+            "GLUTEN_CPP_S3_MAX_COALESCED_RANGE_BYTES",
+            16UL << 20)),
         metadataPriorityBytes_(
             envOrDefault("GLUTEN_CPP_S3_METADATA_PRIORITY_BYTES", 64UL << 10)),
         diagnostics_(envBytesOrZero("GLUTEN_CPP_S3_DIAGNOSTICS") != 0),
         started_(std::chrono::steady_clock::now()) {
     VELOX_CHECK_GT(concurrency_, 0);
     VELOX_CHECK_GT(rangeBytes_, 0);
+    VELOX_CHECK_GT(maxCoalescedRangeBytes_, 0);
     if (useCrt_) {
       Aws::S3Crt::ClientConfiguration config;
       if (const auto* region = std::getenv("AWS_REGION");
@@ -1501,6 +1527,10 @@ class NativeS3SdkScheduler {
         << directCacheFillCompletedRequests_.load(std::memory_order_relaxed)
         << " directCacheFillBytes="
         << directCacheFillSubmittedBytes_.load(std::memory_order_relaxed)
+        << " directCacheFillLogicalBytes="
+        << directCacheFillLogicalBytes_.load(std::memory_order_relaxed)
+        << " directCacheFillGapBytes="
+        << directCacheFillGapBytes_.load(std::memory_order_relaxed)
         << " directCacheFillScatterBuffers="
         << directCacheFillScatterBuffers_.load(std::memory_order_relaxed)
         << " retries=" << retryAttempts_.load(std::memory_order_relaxed)
@@ -1570,6 +1600,8 @@ class NativeS3SdkScheduler {
   const bool useCrt_;
   const size_t concurrency_;
   const size_t rangeBytes_;
+  const size_t rangeCoalesceGapBytes_;
+  const size_t maxCoalescedRangeBytes_;
   const size_t metadataPriorityBytes_;
   const bool diagnostics_;
   const std::chrono::steady_clock::time_point started_;
@@ -1585,6 +1617,8 @@ class NativeS3SdkScheduler {
   std::atomic<uint64_t> directCacheFillSubmittedRequests_{0};
   std::atomic<uint64_t> directCacheFillCompletedRequests_{0};
   std::atomic<uint64_t> directCacheFillSubmittedBytes_{0};
+  std::atomic<uint64_t> directCacheFillLogicalBytes_{0};
+  std::atomic<uint64_t> directCacheFillGapBytes_{0};
   std::atomic<uint64_t> directCacheFillScatterBuffers_{0};
   std::atomic<uint64_t> completedRequests_{0};
   std::atomic<uint64_t> completedBytes_{0};
@@ -1664,7 +1698,11 @@ class NativeScheduledS3ReadFile final : public facebook::velox::ReadFile {
     uint64_t submittedBytes = 0;
     if (useCrt) {
       auto groups = facebook::velox::cudf_velox::connector::hive::
-          groupNativeS3ReadDestinations(offset, buffers);
+          groupNativeS3ReadDestinations(
+              offset,
+              buffers,
+              scheduler.rangeCoalesceGapBytes(),
+              scheduler.maxCoalescedRangeBytes());
       pending.reserve(groups.size());
       for (auto& group : groups) {
         submittedBytes += group.size;
@@ -1832,7 +1870,10 @@ BoundedCachePageRegistration makeBoundedCachePageRegistration(
 #ifdef VELOX_ENABLE_S3
 std::vector<NativeS3ReadGroup> groupNativeS3ReadDestinations(
     uint64_t offset,
-    const std::vector<folly::Range<char*>>& destinations) {
+    const std::vector<folly::Range<char*>>& destinations,
+    uint64_t maxGapBytes,
+    uint64_t maxRangeBytes) {
+  VELOX_CHECK_GT(maxRangeBytes, 0);
   std::vector<NativeS3ReadGroup> groups;
   uint64_t logicalOffset = offset;
   for (const auto& destination : destinations) {
@@ -1844,16 +1885,38 @@ std::vector<NativeS3ReadGroup> groupNativeS3ReadDestinations(
       logicalOffset += destination.size();
       continue;
     }
-    if (groups.empty() ||
-        groups.back().offset + groups.back().size != logicalOffset) {
-      groups.push_back(NativeS3ReadGroup{.offset = logicalOffset});
+    bool startGroup = groups.empty();
+    uint64_t gapBytes = 0;
+    uint64_t coalescedSize = destination.size();
+    if (!startGroup) {
+      const auto& group = groups.back();
+      VELOX_CHECK_LE(
+          group.size,
+          std::numeric_limits<uint64_t>::max() - group.offset,
+          "Native S3 scatter group end overflow");
+      const auto groupEnd = group.offset + group.size;
+      VELOX_CHECK_LE(groupEnd, logicalOffset);
+      gapBytes = logicalOffset - groupEnd;
+      VELOX_CHECK_LE(
+          destination.size(),
+          std::numeric_limits<uint64_t>::max() - logicalOffset,
+          "Native S3 coalesced range end overflow");
+      const auto destinationEnd = logicalOffset + destination.size();
+      coalescedSize = destinationEnd - group.offset;
+      startGroup = gapBytes > maxGapBytes || coalescedSize > maxRangeBytes;
+    }
+    if (startGroup) {
+      groups.push_back(
+          NativeS3ReadGroup{
+              .offset = logicalOffset, .size = 0, .destinations = {}});
+      gapBytes = 0;
+      coalescedSize = destination.size();
     }
     auto& group = groups.back();
-    VELOX_CHECK_LE(
-        destination.size(),
-        std::numeric_limits<uint64_t>::max() - group.size,
-        "Native S3 scatter size overflow");
-    group.size += destination.size();
+    if (gapBytes != 0) {
+      group.destinations.emplace_back(nullptr, gapBytes);
+    }
+    group.size = coalescedSize;
     group.destinations.push_back(destination);
     logicalOffset += destination.size();
   }
@@ -1862,11 +1925,7 @@ std::vector<NativeS3ReadGroup> groupNativeS3ReadDestinations(
 
 NativeS3ScatterWriteStreamBuf::NativeS3ScatterWriteStreamBuf(
     std::vector<folly::Range<char*>> destinations)
-    : destinations_(std::move(destinations)) {
-  for (const auto& destination : destinations_) {
-    VELOX_CHECK_NOT_NULL(destination.data());
-  }
-}
+    : destinations_(std::move(destinations)) {}
 
 size_t NativeS3ScatterWriteStreamBuf::writeBytes(
     const char* source,
@@ -1877,8 +1936,12 @@ size_t NativeS3ScatterWriteStreamBuf::writeBytes(
     const auto available = destination.size() - destinationOffset_;
     const auto copySize = std::min(available, count - written);
     if (copySize != 0) {
-      std::memcpy(
-          destination.data() + destinationOffset_, source + written, copySize);
+      if (destination.data() != nullptr) {
+        std::memcpy(
+            destination.data() + destinationOffset_,
+            source + written,
+            copySize);
+      }
       destinationOffset_ += copySize;
       written += copySize;
       bytesWritten_ += copySize;
