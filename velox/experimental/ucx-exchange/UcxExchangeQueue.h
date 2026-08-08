@@ -175,6 +175,14 @@ class UcxExchangeQueue {
       int64_t maxInFlightBytes,
       BackpressureStats* stats = nullptr) const;
 
+  /// Same as shouldPauseReceive(), but requires mutex() to be held by the
+  /// caller. This lets a receiver publish its dormant flag in the same queue
+  /// critical section in which it observes the pause condition.
+  bool shouldPauseReceiveLocked(
+      int32_t highWaterMark,
+      int64_t maxInFlightBytes,
+      BackpressureStats* stats = nullptr) const;
+
   bool tryReserveReceive(
       int64_t bytes,
       int64_t maxInFlightBytes,

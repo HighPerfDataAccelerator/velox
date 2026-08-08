@@ -405,9 +405,22 @@ void UcxExchangeSource::process() {
       // what bounds the off-pool receive-buffer footprint that otherwise scales
       // O(#peers) and OOMs/deadlocks the GPU at 4 peers (the count cap alone
       // let a few large chunks fill the device before pausing).
-      if (queue_->shouldPauseReceive(
-              kBackpressureHighWaterMark, maxInFlightRecvBytes(), &stats)) {
-        if (!backpressureActive_.exchange(true, std::memory_order_acq_rel)) {
+      bool shouldPause = false;
+      bool newlyBackpressured = false;
+      {
+        // Serialize observing the queue and publishing the dormant flag with
+        // dequeue. A consumer either drains first and makes shouldPause false,
+        // or drains after the flag is armed and resumes this source.
+        std::lock_guard<std::mutex> lock(queue_->mutex());
+        shouldPause = queue_->shouldPauseReceiveLocked(
+            kBackpressureHighWaterMark, maxInFlightRecvBytes(), &stats);
+        if (shouldPause) {
+          newlyBackpressured =
+              !backpressureActive_.exchange(true, std::memory_order_acq_rel);
+        }
+      }
+      if (shouldPause) {
+        if (newlyBackpressured) {
           VLOG(1) << "[BACKPRESSURE] [ExSrc " << toString()
                   << "] pausing, queueSize=" << stats.queueSize
                   << " (high=" << kBackpressureHighWaterMark

@@ -109,6 +109,13 @@ bool UcxExchangeQueue::shouldPauseReceive(
     int64_t maxInFlightBytes,
     BackpressureStats* stats) const {
   std::lock_guard<std::mutex> l(mutex_);
+  return shouldPauseReceiveLocked(highWaterMark, maxInFlightBytes, stats);
+}
+
+bool UcxExchangeQueue::shouldPauseReceiveLocked(
+    int32_t highWaterMark,
+    int64_t maxInFlightBytes,
+    BackpressureStats* stats) const {
   auto current = backpressureStatsLocked();
   if (stats != nullptr) {
     *stats = current;
