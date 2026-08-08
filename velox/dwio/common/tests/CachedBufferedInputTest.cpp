@@ -33,7 +33,10 @@
 #include <folly/io/IOBuf.h>
 #include <folly/synchronization/Baton.h>
 
+#include <condition_variable>
 #include <cstring>
+#include <future>
+#include <mutex>
 #include <thread>
 
 using namespace facebook::velox;
@@ -46,6 +49,101 @@ using facebook::velox::common::testutil::TestValue;
 DECLARE_bool(velox_ssd_odirect);
 
 namespace {
+
+class GatedAsyncReadFile : public InMemoryReadFile {
+ public:
+  using InMemoryReadFile::InMemoryReadFile;
+
+  bool hasPreadvAsync() const override {
+    return true;
+  }
+
+  folly::SemiFuture<uint64_t> preadvAsync(
+      uint64_t offset,
+      const std::vector<folly::Range<char*>>& buffers,
+      const FileIoContext& context = {}) const override {
+    const auto bytes = ReadFile::preadv(offset, buffers, context);
+    auto promise = std::make_unique<folly::Promise<uint64_t>>();
+    auto future = promise->getSemiFuture();
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      pending_.push_back({std::move(promise), bytes});
+    }
+    condition_.notify_all();
+    return future;
+  }
+
+  bool waitForSubmissions(size_t count) const {
+    std::unique_lock<std::mutex> lock(mutex_);
+    return condition_.wait_for(lock, std::chrono::seconds(5), [&] {
+      return pending_.size() >= count;
+    });
+  }
+
+  void completeAll() const {
+    std::vector<Pending> pending;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      pending.swap(pending_);
+    }
+    for (auto& item : pending) {
+      item.promise->setValue(item.bytes);
+    }
+  }
+
+  void completeOne() const {
+    std::unique_ptr<folly::Promise<uint64_t>> promise;
+    uint64_t bytes{0};
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      VELOX_CHECK(!pending_.empty());
+      promise = std::move(pending_.front().promise);
+      bytes = pending_.front().bytes;
+      pending_.erase(pending_.begin());
+    }
+    promise->setValue(bytes);
+  }
+
+ private:
+  struct Pending {
+    std::unique_ptr<folly::Promise<uint64_t>> promise;
+    uint64_t bytes;
+  };
+
+  mutable std::mutex mutex_;
+  mutable std::condition_variable condition_;
+  mutable std::vector<Pending> pending_;
+};
+
+class RecordingPreadvFile : public InMemoryReadFile {
+ public:
+  using InMemoryReadFile::InMemoryReadFile;
+
+  uint64_t preadv(
+      uint64_t offset,
+      const std::vector<folly::Range<char*>>& buffers,
+      const FileIoContext& context = {}) const override {
+    ++preadvCalls_;
+    for (const auto& buffer : buffers) {
+      if (buffer.data() == nullptr) {
+        gapBytes_ += buffer.size();
+      }
+    }
+    return ReadFile::preadv(offset, buffers, context);
+  }
+
+  uint64_t preadvCalls() const {
+    return preadvCalls_;
+  }
+
+  uint64_t gapBytes() const {
+    return gapBytes_;
+  }
+
+ private:
+  mutable std::atomic_uint64_t preadvCalls_{0};
+  mutable std::atomic_uint64_t gapBytes_{0};
+};
 
 std::optional<std::string> getNext(SeekableInputStream& input) {
   const void* buf = nullptr;
@@ -481,7 +579,13 @@ TEST_F(CachedBufferedInputTest, physicalChunkPlanMatchesMergedDemand) {
   EXPECT_EQ(plan->cacheRegions()[1].length, kQuantum);
 
   const auto statsBefore = cache_->refreshStats();
-  input.prefetchSync(hintRegions);
+  // A dedicated cache-hint worker can execute the coalesced load inline
+  // instead of queueing it on the input executor and immediately waiting.
+  auto prepared = input.preparePrefetch(
+      hintRegions, /*inlineLoad=*/true, /*preallocatePins=*/true);
+  EXPECT_EQ(readFile->numReads(), 0);
+  EXPECT_EQ(cache_->refreshStats().numExclusive, plan->cacheRegions().size());
+  prepared();
   const auto readsAfterHint = readFile->numReads();
   EXPECT_GT(readsAfterHint, 0);
 
@@ -523,6 +627,108 @@ TEST_F(CachedBufferedInputTest, physicalChunkPlanMatchesMergedDemand) {
   ASSERT_TRUE(metadataPin.has_value());
   ASSERT_FALSE(metadataPin->empty());
   EXPECT_EQ(metadataPin->checkedEntry()->size(), 4);
+}
+
+TEST_F(CachedBufferedInputTest, physicalChunkPlanCoalescesSmallGap) {
+  constexpr uint64_t kQuantum = 1 << 20;
+  constexpr uint64_t kGap = 64 << 10;
+  constexpr uint64_t kSecondOffset = kQuantum + kGap;
+  std::string content(kSecondOffset + kQuantum, 'x');
+  auto readFile = std::make_shared<RecordingPreadvFile>(content);
+
+  io::ReaderOptions readerOptions(pool_.get());
+  readerOptions.setDataIoStats(dataIoStats_);
+  readerOptions.setMetadataIoStats(metadataIoStats_);
+  readerOptions.setLoadQuantum(kQuantum);
+  // CoalesceIo treats max distance as an exclusive upper bound.
+  readerOptions.setMaxCoalesceDistance(kGap + 1);
+
+  auto& ids = fileIds();
+  StringIdLease fileId(ids, "physicalChunkPlanCoalescesSmallGap");
+  StringIdLease groupId(ids, "physicalChunkPlanCoalescesSmallGapGroup");
+  const auto fileNum = fileId.id();
+  CachedBufferedInput input(
+      readFile,
+      MetricsLog::voidLog(),
+      std::move(fileId),
+      cache_.get(),
+      tracker_,
+      std::move(groupId),
+      dataIoStats_,
+      nullptr,
+      executor_.get(),
+      readerOptions);
+
+  const std::vector<common::Region> regions{
+      {0, kQuantum}, {kSecondOffset, kQuantum}};
+  auto prepared = input.preparePrefetch(
+      regions, /*inlineLoad=*/true, /*preallocatePins=*/true);
+  EXPECT_EQ(readFile->preadvCalls(), 0);
+  prepared();
+
+  // Keep exact cache entries for both physical chunks, but issue one vectored
+  // storage read whose null destination discards the small intervening gap.
+  EXPECT_EQ(readFile->preadvCalls(), 1);
+  EXPECT_EQ(readFile->gapBytes(), kGap);
+  EXPECT_TRUE(cache_->exists({fileNum, 0}));
+  EXPECT_TRUE(cache_->exists({fileNum, kSecondOffset}));
+  EXPECT_FALSE(cache_->exists({fileNum, kQuantum}));
+}
+
+TEST_F(CachedBufferedInputTest, submitsAllPhysicalGroupsBeforeWaiting) {
+  constexpr uint64_t kQuantum = 1 << 20;
+  std::string content(8 * kQuantum, 'x');
+  auto readFile = std::make_shared<GatedAsyncReadFile>(content);
+
+  io::ReaderOptions readerOptions(pool_.get());
+  readerOptions.setDataIoStats(dataIoStats_);
+  readerOptions.setMetadataIoStats(metadataIoStats_);
+  readerOptions.setLoadQuantum(kQuantum);
+
+  auto& ids = fileIds();
+  StringIdLease fileId(ids, "submitsAllPhysicalGroupsBeforeWaiting");
+  StringIdLease groupId(ids, "submitsAllPhysicalGroupsBeforeWaitingGroup");
+  CachedBufferedInput input(
+      readFile,
+      MetricsLog::voidLog(),
+      std::move(fileId),
+      cache_.get(),
+      tracker_,
+      std::move(groupId),
+      dataIoStats_,
+      nullptr,
+      executor_.get(),
+      readerOptions);
+
+  const std::vector<common::Region> regions{
+      {0, kQuantum}, {4 * kQuantum, kQuantum}};
+  std::promise<void> firstLoadReady;
+  auto firstLoadReadyFuture = firstLoadReady.get_future();
+  auto prepared = input.preparePrefetch(
+      regions,
+      /*inlineLoad=*/true,
+      /*preallocatePins=*/true,
+      /*asyncPhysicalGroups=*/true,
+      [&] { firstLoadReady.set_value(); });
+  EXPECT_EQ(cache_->refreshStats().numExclusive, regions.size());
+  auto execution = std::async(std::launch::async, std::move(prepared));
+
+  ASSERT_TRUE(readFile->waitForSubmissions(2));
+  EXPECT_EQ(
+      execution.wait_for(std::chrono::milliseconds(0)),
+      std::future_status::timeout);
+  readFile->completeOne();
+  ASSERT_EQ(
+      firstLoadReadyFuture.wait_for(std::chrono::seconds(5)),
+      std::future_status::ready);
+  EXPECT_EQ(
+      execution.wait_for(std::chrono::milliseconds(0)),
+      std::future_status::timeout);
+  readFile->completeAll();
+  execution.get();
+
+  EXPECT_EQ(cache_->refreshStats().numExclusive, 0);
+  EXPECT_EQ(cache_->refreshStats().numEntries, regions.size());
 }
 
 TEST_F(CachedBufferedInputTest, invalidPhysicalChunkPlanFallsBack) {
