@@ -125,14 +125,18 @@ TEST_F(
            functions::sparksql::SparkQueryConfig::kPartitionId),
        "7"},
   });
-  auto evaluator =
-      createCudfExpression(expr, rowType_, pool_.get(), &queryConfig);
+  auto evaluator = createCudfExpression(
+      expr, rowType_, pool_.get(), &queryConfig, queryCtx_.get());
+  auto peerEvaluator = createCudfExpression(
+      expr, rowType_, pool_.get(), &queryConfig, queryCtx_.get());
   auto stream = cudf::get_default_stream();
   auto mr = cudf::get_current_device_resource_ref();
 
-  auto assertIds = [&](cudf::size_type rows, int64_t first) {
+  auto assertIds = [&](const CudfExpressionPtr& target,
+                       cudf::size_type rows,
+                       int64_t first) {
     std::vector<cudf::column_view> noInputs;
-    auto result = evaluator->eval(noInputs, rows, stream, mr, true);
+    auto result = target->eval(noInputs, rows, stream, mr, true);
     auto resultView = asView(result);
     auto outputType = ROW({"id"}, {BIGINT()});
     auto output = with_arrow::toVeloxColumn(
@@ -152,8 +156,9 @@ TEST_F(
   };
 
   const int64_t partitionBase = int64_t{7} << 33;
-  assertIds(3, partitionBase);
-  assertIds(2, partitionBase + 3);
+  assertIds(evaluator, 3, partitionBase);
+  assertIds(peerEvaluator, 2, partitionBase + 3);
+  assertIds(evaluator, 2, partitionBase + 5);
 }
 
 TEST_F(CudfExpressionSelectionTest, astTopLevelWithFunctionPrecompute) {

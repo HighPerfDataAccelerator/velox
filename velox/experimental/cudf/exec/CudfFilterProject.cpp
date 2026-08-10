@@ -194,7 +194,8 @@ void CudfFilterProject::initialize() {
             expression::optimize(expr, queryCtx, pool),
             inputType,
             pool,
-            queryConfig);
+            queryConfig,
+            queryCtx);
       };
   if (hasFilter_) {
     // First expr is Filter, rest are Project.

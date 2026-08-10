@@ -80,20 +80,27 @@ namespace facebook::velox::cudf_velox {
 namespace {
 
 thread_local const core::QueryConfig* currentFunctionQueryConfig = nullptr;
+thread_local const core::QueryCtx* currentFunctionQueryCtx = nullptr;
 
-class ScopedCudfFunctionQueryConfig {
+class ScopedCudfFunctionQueryContext {
  public:
-  explicit ScopedCudfFunctionQueryConfig(const core::QueryConfig* queryConfig)
-      : previous_(currentFunctionQueryConfig) {
+  ScopedCudfFunctionQueryContext(
+      const core::QueryConfig* queryConfig,
+      const core::QueryCtx* queryCtx)
+      : previousConfig_(currentFunctionQueryConfig),
+        previousCtx_(currentFunctionQueryCtx) {
     currentFunctionQueryConfig = queryConfig;
+    currentFunctionQueryCtx = queryCtx;
   }
 
-  ~ScopedCudfFunctionQueryConfig() {
-    currentFunctionQueryConfig = previous_;
+  ~ScopedCudfFunctionQueryContext() {
+    currentFunctionQueryConfig = previousConfig_;
+    currentFunctionQueryCtx = previousCtx_;
   }
 
  private:
-  const core::QueryConfig* previous_;
+  const core::QueryConfig* previousConfig_;
+  const core::QueryCtx* previousCtx_;
 };
 
 bool decimalScalarIsZero(
@@ -355,6 +362,10 @@ bool canBeEvaluatedByCudf(const core::TypedExprPtr& expr) {
 
 const core::QueryConfig* currentCudfFunctionQueryConfig() {
   return currentFunctionQueryConfig;
+}
+
+const core::QueryCtx* currentCudfFunctionQueryCtx() {
+  return currentFunctionQueryCtx;
 }
 
 void checkAllTrue(
@@ -2862,7 +2873,11 @@ std::shared_ptr<FunctionExpression> FunctionExpression::create(
         // string ops).  Field references are handled as leaf
         // FunctionExpressions.
         node->subexpressions_.push_back(createCudfExpression(
-            input, inputRowSchema, pool, currentCudfFunctionQueryConfig()));
+            input,
+            inputRowSchema,
+            pool,
+            currentCudfFunctionQueryConfig(),
+            currentCudfFunctionQueryCtx()));
       }
     }
   }
@@ -3144,8 +3159,9 @@ std::shared_ptr<CudfExpression> createCudfExpression(
     const core::TypedExprPtr& expr,
     const RowTypePtr& inputRowSchema,
     memory::MemoryPool* pool,
-    const core::QueryConfig* queryConfig) {
-  ScopedCudfFunctionQueryConfig scope(queryConfig);
+    const core::QueryConfig* queryConfig,
+    const core::QueryCtx* queryCtx) {
+  ScopedCudfFunctionQueryContext scope(queryConfig, queryCtx);
   const auto* best = findBestEvaluator(expr);
   VELOX_CHECK_NOT_NULL(
       best, "No cuDF expression evaluator can handle: {}", expr->toString());

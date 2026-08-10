@@ -606,7 +606,9 @@ void CudfHashJoinProbe::initialize() {
   filterEvaluator_ = createCudfExpression(
       optimizedFilter,
       facebook::velox::type::concatRowTypes(filterRowTypes),
-      pool);
+      pool,
+      &operatorCtx_->driverCtx()->queryConfig(),
+      operatorCtx_->execCtx()->queryCtx());
 
   // Check if the filter expression spans both join sides (e.g., switch
   // expressions referencing columns from both probe and build). If so, we

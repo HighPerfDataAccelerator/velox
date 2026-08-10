@@ -140,6 +140,8 @@ std::shared_ptr<CudfFunction> createCudfFunction(
 
 const core::QueryConfig* currentCudfFunctionQueryConfig();
 
+const core::QueryCtx* currentCudfFunctionQueryCtx();
+
 bool registerBuiltinFunctions(const std::string& prefix);
 
 void unregisterFunctions();
@@ -219,7 +221,8 @@ std::shared_ptr<CudfExpression> createCudfExpression(
     const core::TypedExprPtr& expr,
     const RowTypePtr& inputRowSchema,
     memory::MemoryPool* pool,
-    const core::QueryConfig* queryConfig = nullptr);
+    const core::QueryConfig* queryConfig = nullptr,
+    const core::QueryCtx* queryCtx = nullptr);
 
 /// Plan-time GPU eligibility for a top-level operator expression, as invoked by
 /// the OperatorAdapters and the aggregation validators. Optimizes the

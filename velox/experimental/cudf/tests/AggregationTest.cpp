@@ -21,6 +21,7 @@
 #include "velox/experimental/cudf/exec/PrestoAggregateFunctions.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
+#include "velox/experimental/cudf/expression/SparkFunctions.h"
 #include "velox/experimental/cudf/tests/utils/CudfStreamTestUtils.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
@@ -31,6 +32,7 @@
 #include "velox/exec/tests/utils/AssertQueryBuilder.h"
 #include "velox/exec/tests/utils/OperatorTestBase.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
+#include "velox/functions/sparksql/SparkQueryConfig.h"
 #include "velox/type/Timestamp.h"
 
 #include <cudf/contiguous_split.hpp>
@@ -2102,6 +2104,50 @@ TEST_F(AggregationTest, zeroColumnThroughCudfFromVelox) {
       .config(core::QueryConfig::kMaxLocalExchangePartitionCount, "2")
       .plan(plan)
       .assertResults("SELECT count(*) FROM tmp WHERE c0 > 0");
+}
+
+TEST_F(
+    AggregationTest,
+    monotonicIdAggregationInputUsesQueryContextAndRowCount) {
+  cudf_velox::registerSparkFunctions("");
+  SCOPE_EXIT {
+    cudf_velox::unregisterFunctions();
+  };
+
+  auto data = makeRowVector({
+      makeFlatVector<int64_t>({1, 2, 3, 4}),
+  });
+  auto source = PlanBuilder().values({data}).planNode();
+  auto monotonicId = std::make_shared<core::CallTypedExpr>(
+      BIGINT(),
+      std::vector<core::TypedExprPtr>{},
+      "monotonically_increasing_id");
+  core::AggregationNode::Aggregate sum;
+  sum.call = std::make_shared<core::CallTypedExpr>(
+      BIGINT(), std::vector<core::TypedExprPtr>{monotonicId}, "sum");
+  sum.rawInputTypes = {BIGINT()};
+  auto plan = std::make_shared<core::AggregationNode>(
+      "aggregation",
+      core::AggregationNode::Step::kSingle,
+      std::vector<core::FieldAccessTypedExprPtr>{},
+      std::vector<core::FieldAccessTypedExprPtr>{},
+      std::vector<std::string>{"a0"},
+      std::vector<core::AggregationNode::Aggregate>{sum},
+      false,
+      false,
+      source);
+
+  constexpr int64_t kPartitionId = 7;
+  const auto partitionBase = kPartitionId << 33;
+  auto expected = makeRowVector({
+      makeFlatVector<int64_t>({partitionBase * data->size() + 6}),
+  });
+  AssertQueryBuilder(plan)
+      .config(
+          functions::sparksql::SparkQueryConfig::qualify(
+              functions::sparksql::SparkQueryConfig::kPartitionId),
+          std::to_string(kPartitionId))
+      .assertResults({expected});
 }
 
 } // namespace facebook::velox::exec::test
