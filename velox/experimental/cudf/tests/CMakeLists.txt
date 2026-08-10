@@ -338,7 +338,7 @@ velox_add_cudf_test(
 
 velox_add_cudf_test(
   NAME velox_cudf_topnrownumber_test
-  SOURCES Main.cpp TopNRowNumberTest.cpp
+  SOURCES Main.cpp TopNRowNumberTest.cpp SpillableTopNRowNumberTest.cpp
   LIBS ${CUDF_TEST_DEFAULT_LIBS} fmt::fmt
 )
 

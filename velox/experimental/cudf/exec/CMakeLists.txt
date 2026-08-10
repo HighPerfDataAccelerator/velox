@@ -34,6 +34,7 @@ add_library(
   CudfPackedRestore.cpp
   CudfPackedSpill.cpp
   CudfReduce.cpp
+  CudfSpillableTopNRowNumber.cpp
   CudfTopN.cpp
   CudfTopNRowNumber.cpp
   CudfUnnest.cpp
