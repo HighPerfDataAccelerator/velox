@@ -20,6 +20,7 @@
 #include <folly/container/F14Set.h>
 
 #include <atomic>
+#include <functional>
 #include <mutex>
 #include "velox/common/caching/FileGroupStats.h"
 #include "velox/common/caching/ScanTracker.h"
@@ -44,6 +45,25 @@ struct CacheHintDemandStats {
 };
 
 CacheHintDemandStats cacheHintDemandStats();
+
+struct CacheHintAsyncLoadStats {
+  uint64_t makePinsCalls{0};
+  uint64_t makePinsEntries{0};
+  uint64_t makePinsWallNanos{0};
+  uint64_t makePinsActive{0};
+  uint64_t makePinsMaxActive{0};
+  uint64_t submitCalls{0};
+  uint64_t submittedRequests{0};
+  uint64_t submitWallNanos{0};
+  uint64_t submitActive{0};
+  uint64_t submitMaxActive{0};
+  uint64_t waitCalls{0};
+  uint64_t waitWallNanos{0};
+  uint64_t waitActive{0};
+  uint64_t waitMaxActive{0};
+};
+
+CacheHintAsyncLoadStats cacheHintAsyncLoadStats();
 
 /// Immutable physical-column boundaries shared by hint and demand streams.
 /// Cache keys are load-quantum pieces relative to each physical chunk, not to
@@ -208,7 +228,29 @@ class CachedBufferedInput : public BufferedInput {
   /// which were admitted by the cache have completed. Grouping the regions in
   /// one load preserves normal cache coalescing and the underlying ReadFile's
   /// executor-wide I/O admission policy.
-  void prefetchSync(const std::vector<velox::common::Region>& regions);
+  /// If 'inlineLoad' is true, the caller executes each CoalescedLoad instead
+  /// of scheduling it back onto 'executor_'. This is useful when the caller is
+  /// already running on a dedicated prefetch pool and will wait synchronously.
+  void prefetchSync(
+      const std::vector<velox::common::Region>& regions,
+      bool inlineLoad = false);
+
+  /// Builds cache keys and CoalescedLoad objects for 'regions' and returns a
+  /// callable which performs and waits for the physical reads. This allows a
+  /// producer to prepare many independent files before executor workers begin
+  /// blocking on their first S3 request.
+  std::function<void()> preparePrefetch(
+      const std::vector<velox::common::Region>& regions,
+      bool inlineLoad = true,
+      bool preallocatePins = false,
+      bool asyncPhysicalGroups = false);
+
+  std::function<void()> preparePrefetch(
+      const std::vector<velox::common::Region>& regions,
+      bool inlineLoad,
+      bool preallocatePins,
+      bool asyncPhysicalGroups,
+      std::function<void()> firstLoadReady);
 
   std::vector<velox::common::Region> canonicalizeRegions(
       const std::vector<velox::common::Region>& regions) const;
@@ -366,6 +408,10 @@ class CachedBufferedInput : public BufferedInput {
 
   // All distinct coalesced loads.
   std::vector<std::shared_ptr<cache::CoalescedLoad>> coalescedLoads_;
+
+  // Set only while prefetchSync() constructs its loads. CachedBufferedInput is
+  // used sequentially, so this flag does not need cross-thread synchronization.
+  bool inlinePrefetchLoad_{false};
 
   // Holds the whole-file cache entry alive for the lifetime of this input.
   // Set by preload(), used by CacheInputStream to serve sub-region reads.

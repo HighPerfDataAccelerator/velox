@@ -23,6 +23,11 @@
 
 #include <folly/container/F14Set.h>
 
+#include <cerrno>
+#include <chrono>
+#include <condition_variable>
+#include <cstdlib>
+
 DECLARE_int32(cache_prefetch_min_pct);
 
 using ::facebook::velox::common::Region;
@@ -38,6 +43,124 @@ std::atomic<uint64_t> hintDemandRemoteDuplicateRanges{0};
 std::atomic<uint64_t> hintDemandRemoteDuplicateBytes{0};
 std::atomic<uint64_t> hintDemandSizeMismatchRanges{0};
 std::atomic<uint64_t> hintDemandSizeMismatchBytes{0};
+
+std::atomic<uint64_t> hintAsyncMakePinsCalls{0};
+std::atomic<uint64_t> hintAsyncMakePinsEntries{0};
+std::atomic<uint64_t> hintAsyncMakePinsWallNanos{0};
+std::atomic<uint64_t> hintAsyncMakePinsActive{0};
+std::atomic<uint64_t> hintAsyncMakePinsMaxActive{0};
+std::atomic<uint64_t> hintAsyncSubmitCalls{0};
+std::atomic<uint64_t> hintAsyncSubmittedRequests{0};
+std::atomic<uint64_t> hintAsyncSubmitWallNanos{0};
+std::atomic<uint64_t> hintAsyncSubmitActive{0};
+std::atomic<uint64_t> hintAsyncSubmitMaxActive{0};
+std::atomic<uint64_t> hintAsyncWaitCalls{0};
+std::atomic<uint64_t> hintAsyncWaitWallNanos{0};
+std::atomic<uint64_t> hintAsyncWaitActive{0};
+std::atomic<uint64_t> hintAsyncWaitMaxActive{0};
+
+uint32_t hintAsyncMakePinsConcurrency() {
+  static const uint32_t value = [] {
+    constexpr const char* kEnv = "GLUTEN_CUDF_CACHE_HINT_MAKE_PINS_CONCURRENCY";
+    const auto* text = std::getenv(kEnv);
+    if (text == nullptr || text[0] == '\0') {
+      return 1U;
+    }
+    VELOX_CHECK_NE(text[0], '-', "{} must be a positive integer", kEnv);
+    char* end = nullptr;
+    errno = 0;
+    const auto parsed = std::strtoul(text, &end, 10);
+    VELOX_CHECK(
+        errno == 0 && end != text && *end == '\0' && parsed > 0 &&
+            parsed <= 1024,
+        "{} must be in [1, 1024], got '{}'",
+        kEnv,
+        text);
+    return static_cast<uint32_t>(parsed);
+  }();
+  return value;
+}
+
+// AsyncDataCache entry allocation is internally sharded, but hundreds of
+// cache-hint workers entering allocation together cause severe allocator
+// backoff and starve physical-read submission. Bound this stage separately
+// from the much larger pool that waits for network completion.
+class HintAsyncMakePinsGate {
+ public:
+  void acquire() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    condition_.wait(
+        lock, [&] { return active_ < hintAsyncMakePinsConcurrency(); });
+    ++active_;
+  }
+
+  void release() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      VELOX_CHECK_GT(active_, 0);
+      --active_;
+    }
+    condition_.notify_one();
+  }
+
+ private:
+  std::mutex mutex_;
+  std::condition_variable condition_;
+  uint32_t active_{0};
+};
+
+class HintAsyncMakePinsSlot {
+ public:
+  explicit HintAsyncMakePinsSlot(HintAsyncMakePinsGate& gate) : gate_(gate) {
+    gate_.acquire();
+  }
+
+  ~HintAsyncMakePinsSlot() {
+    gate_.release();
+  }
+
+ private:
+  HintAsyncMakePinsGate& gate_;
+};
+
+HintAsyncMakePinsGate hintAsyncMakePinsGate;
+
+void updateMax(std::atomic<uint64_t>& maximum, uint64_t value) {
+  auto current = maximum.load(std::memory_order_relaxed);
+  while (current < value &&
+         !maximum.compare_exchange_weak(
+             current, value, std::memory_order_relaxed)) {
+  }
+}
+
+class AsyncLoadStageTimer {
+ public:
+  AsyncLoadStageTimer(
+      std::atomic<uint64_t>& calls,
+      std::atomic<uint64_t>& wallNanos,
+      std::atomic<uint64_t>& active,
+      std::atomic<uint64_t>& maxActive)
+      : wallNanos_(wallNanos), active_(active) {
+    calls.fetch_add(1, std::memory_order_relaxed);
+    const auto nowActive = active_.fetch_add(1, std::memory_order_relaxed) + 1;
+    updateMax(maxActive, nowActive);
+  }
+
+  ~AsyncLoadStageTimer() {
+    wallNanos_.fetch_add(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - start_)
+            .count(),
+        std::memory_order_relaxed);
+    active_.fetch_sub(1, std::memory_order_relaxed);
+  }
+
+ private:
+  std::atomic<uint64_t>& wallNanos_;
+  std::atomic<uint64_t>& active_;
+  const std::chrono::steady_clock::time_point start_{
+      std::chrono::steady_clock::now()};
+};
 } // namespace
 
 CacheHintDemandStats cacheHintDemandStats() {
@@ -50,6 +173,24 @@ CacheHintDemandStats cacheHintDemandStats() {
       hintDemandRemoteDuplicateBytes.load(std::memory_order_relaxed),
       hintDemandSizeMismatchRanges.load(std::memory_order_relaxed),
       hintDemandSizeMismatchBytes.load(std::memory_order_relaxed)};
+}
+
+CacheHintAsyncLoadStats cacheHintAsyncLoadStats() {
+  return {
+      hintAsyncMakePinsCalls.load(std::memory_order_relaxed),
+      hintAsyncMakePinsEntries.load(std::memory_order_relaxed),
+      hintAsyncMakePinsWallNanos.load(std::memory_order_relaxed),
+      hintAsyncMakePinsActive.load(std::memory_order_relaxed),
+      hintAsyncMakePinsMaxActive.load(std::memory_order_relaxed),
+      hintAsyncSubmitCalls.load(std::memory_order_relaxed),
+      hintAsyncSubmittedRequests.load(std::memory_order_relaxed),
+      hintAsyncSubmitWallNanos.load(std::memory_order_relaxed),
+      hintAsyncSubmitActive.load(std::memory_order_relaxed),
+      hintAsyncSubmitMaxActive.load(std::memory_order_relaxed),
+      hintAsyncWaitCalls.load(std::memory_order_relaxed),
+      hintAsyncWaitWallNanos.load(std::memory_order_relaxed),
+      hintAsyncWaitActive.load(std::memory_order_relaxed),
+      hintAsyncWaitMaxActive.load(std::memory_order_relaxed)};
 }
 
 std::shared_ptr<CacheRegionPlan> CacheRegionPlan::create(
@@ -428,10 +569,7 @@ std::vector<int32_t> CachedBufferedInput::groupRequests(
   if (requests.empty() || (requests.size() < 2 && !prefetch)) {
     return {};
   }
-  const int32_t maxDistance = kSsd
-      ? 20'000
-      : (*cacheRegionPlan_.rlock() != nullptr ? 0
-                                              : options_.maxCoalesceDistance());
+  const int32_t maxDistance = kSsd ? 20'000 : options_.maxCoalesceDistance();
 
   // Combine adjacent short reads.
   int64_t coalescedBytes = 0;
@@ -515,6 +653,12 @@ class DwioCoalescedLoadBase : public cache::CoalescedLoad {
         succinctBytes(total - payload));
   }
 
+  virtual void prepare(bool /*prefetch*/) {}
+
+  virtual std::function<void()> startAsyncLoad(bool /*ssdSavable*/) {
+    return {};
+  }
+
  protected:
   void updateStats(const CoalesceIoStats& stats, bool prefetch, bool ssd) {
     if (ioStatistics_ == nullptr) {
@@ -582,18 +726,111 @@ class DwioCoalescedLoad : public DwioCoalescedLoadBase {
     return false;
   }
 
-  std::vector<CachePin> loadData(bool prefetch) override {
+  void prepare(bool prefetch) override {
+    VELOX_CHECK(!prepared_, "Coalesced cache load prepared more than once");
+    HintAsyncMakePinsSlot slot(hintAsyncMakePinsGate);
+    preparedPins_ = makePins(prefetch, /*asyncHint=*/true);
+    prepared_ = true;
+  }
+
+  std::function<void()> startAsyncLoad(bool ssdSavable) override {
+    if (!input_->hasReadAsync()) {
+      return {};
+    }
     std::vector<CachePin> pins;
-    pins.reserve(keys_.size());
-    cache_.makePins(
-        keys_,
-        [&](int32_t index) { return sizes_[index]; },
-        [&](int32_t /*index*/, CachePin pin) {
-          if (prefetch) {
-            pin.checkedEntry()->setPrefetch(true);
+    if (prepared_) {
+      pins = std::move(preparedPins_);
+    } else {
+      HintAsyncMakePinsSlot slot(hintAsyncMakePinsGate);
+      pins = makePins(/*prefetch=*/false, /*asyncHint=*/true);
+    }
+    prepared_ = false;
+    if (pins.empty()) {
+      return [] {};
+    }
+    struct PendingRead {
+      folly::SemiFuture<uint64_t> future;
+      uint64_t expectedBytes;
+    };
+    std::vector<PendingRead> pending;
+    CoalesceIoStats stats;
+    try {
+      AsyncLoadStageTimer submitTimer(
+          hintAsyncSubmitCalls,
+          hintAsyncSubmitWallNanos,
+          hintAsyncSubmitActive,
+          hintAsyncSubmitMaxActive);
+      stats = cache::readPins(
+          pins,
+          maxCoalesceDistance_,
+          1000,
+          [&](int32_t i) { return pins[i].entry()->offset(); },
+          [&](const std::vector<CachePin>& /*pins*/,
+              int32_t /*begin*/,
+              int32_t /*end*/,
+              uint64_t offset,
+              const std::vector<folly::Range<char*>>& buffers) {
+            uint64_t expectedBytes = 0;
+            for (const auto& buffer : buffers) {
+              expectedBytes += buffer.size();
+            }
+            pending.push_back(
+                {input_->readAsync(buffers, offset, LogType::FILE),
+                 expectedBytes});
+            hintAsyncSubmittedRequests.fetch_add(1, std::memory_order_relaxed);
+          });
+    } catch (...) {
+      const auto failure = std::current_exception();
+      for (auto& read : pending) {
+        try {
+          std::move(read.future).get();
+        } catch (...) {
+        }
+      }
+      std::rethrow_exception(failure);
+    }
+    auto pendingReads =
+        std::make_shared<std::vector<PendingRead>>(std::move(pending));
+    return [this,
+            pins = std::move(pins),
+            pendingReads = std::move(pendingReads),
+            stats = std::move(stats),
+            ssdSavable]() mutable {
+      std::exception_ptr failure;
+      {
+        AsyncLoadStageTimer waitTimer(
+            hintAsyncWaitCalls,
+            hintAsyncWaitWallNanos,
+            hintAsyncWaitActive,
+            hintAsyncWaitMaxActive);
+        for (auto& read : *pendingReads) {
+          try {
+            const auto bytesRead = std::move(read.future).get();
+            VELOX_CHECK_EQ(
+                bytesRead,
+                read.expectedBytes,
+                "Async cache read must return exactly the requested bytes");
+          } catch (...) {
+            if (!failure) {
+              failure = std::current_exception();
+            }
           }
-          pins.push_back(std::move(pin));
-        });
+        }
+      }
+      if (failure) {
+        std::rethrow_exception(failure);
+      }
+      updateStats(stats, /*prefetch=*/false, /*ssd=*/false);
+      for (const auto& pin : pins) {
+        pin.checkedEntry()->setExclusiveToShared(ssdSavable);
+      }
+    };
+  }
+
+  std::vector<CachePin> loadData(bool prefetch) override {
+    auto pins = prepared_ ? std::move(preparedPins_)
+                          : makePins(prefetch, /*asyncHint=*/false);
+    prepared_ = false;
     if (pins.empty()) {
       return pins;
     }
@@ -613,8 +850,41 @@ class DwioCoalescedLoad : public DwioCoalescedLoadBase {
     return pins;
   }
 
+ private:
+  std::vector<CachePin> makePins(bool prefetch, bool asyncHint) {
+    std::optional<AsyncLoadStageTimer> makePinsTimer;
+    if (asyncHint) {
+      makePinsTimer.emplace(
+          hintAsyncMakePinsCalls,
+          hintAsyncMakePinsWallNanos,
+          hintAsyncMakePinsActive,
+          hintAsyncMakePinsMaxActive);
+    }
+    std::vector<CachePin> pins;
+    pins.reserve(keys_.size());
+    cache_.makePins(
+        keys_,
+        [&](int32_t index) { return sizes_[index]; },
+        [&](int32_t /*index*/, CachePin pin) {
+          if (prefetch) {
+            pin.checkedEntry()->setPrefetch(true);
+          }
+          pins.push_back(std::move(pin));
+        });
+    if (asyncHint) {
+      hintAsyncMakePinsEntries.fetch_add(
+          pins.size(), std::memory_order_relaxed);
+    }
+    if (pins.empty()) {
+      return pins;
+    }
+    return pins;
+  }
+
   std::shared_ptr<ReadFileInputStream> input_;
   const int32_t maxCoalesceDistance_;
+  std::vector<CachePin> preparedPins_;
+  bool prepared_{false};
 };
 
 // Represents a CoalescedLoad from local SSD cache.
@@ -713,7 +983,7 @@ void CachedBufferedInput::readRegions(
     requestGroup.clear();
   }
 
-  if (prefetch && executor_) {
+  if (prefetch && executor_ && !inlinePrefetchLoad_) {
     // Only submit the loads created by this call to the executor.
     for (auto i = startIndex; i < coalescedLoads_.size(); ++i) {
       auto& load = coalescedLoads_[i];
@@ -806,7 +1076,36 @@ bool CachedBufferedInput::prefetch(Region region) {
   return true;
 }
 
-void CachedBufferedInput::prefetchSync(const std::vector<Region>& regions) {
+void CachedBufferedInput::prefetchSync(
+    const std::vector<Region>& regions,
+    bool inlineLoad) {
+  auto prepared = preparePrefetch(regions, inlineLoad);
+  prepared();
+}
+
+std::function<void()> CachedBufferedInput::preparePrefetch(
+    const std::vector<Region>& regions,
+    bool inlineLoad,
+    bool preallocatePins,
+    bool asyncPhysicalGroups) {
+  return preparePrefetch(
+      regions,
+      inlineLoad,
+      preallocatePins,
+      asyncPhysicalGroups,
+      /*firstLoadReady=*/{});
+}
+
+std::function<void()> CachedBufferedInput::preparePrefetch(
+    const std::vector<Region>& regions,
+    bool inlineLoad,
+    bool preallocatePins,
+    bool asyncPhysicalGroups,
+    std::function<void()> firstLoadReady) {
+  VELOX_CHECK(
+      inlineLoad || (!preallocatePins && !asyncPhysicalGroups),
+      "Cache-hint pin preallocation and asynchronous physical groups require "
+      "inline loading");
   auto plan = makeCacheRegionPlan(regions);
   {
     auto locked = cacheRegionPlan_.wlock();
@@ -836,10 +1135,24 @@ void CachedBufferedInput::prefetchSync(const std::vector<Region>& regions) {
     streams.push_back(enqueue(region, nullptr));
   }
   if (streams.empty()) {
-    return;
+    return [plan = std::move(plan),
+            firstLoadReady = std::move(firstLoadReady)]() mutable {
+      if (firstLoadReady) {
+        firstLoadReady();
+      }
+      plan->markPrefetchComplete();
+    };
   }
 
-  load(LogType::FILE);
+  VELOX_CHECK(!inlinePrefetchLoad_);
+  inlinePrefetchLoad_ = inlineLoad;
+  try {
+    load(LogType::FILE);
+  } catch (...) {
+    inlinePrefetchLoad_ = false;
+    throw;
+  }
+  inlinePrefetchLoad_ = false;
   std::vector<std::shared_ptr<cache::CoalescedLoad>> loads;
   loads.reserve(streams.size());
   folly::F14FastSet<cache::CoalescedLoad*> seen;
@@ -849,13 +1162,95 @@ void CachedBufferedInput::prefetchSync(const std::vector<Region>& regions) {
       loads.push_back(std::move(pending));
     }
   }
-  for (const auto& pending : loads) {
-    folly::SemiFuture<bool> waitFuture(false);
-    if (!pending->loadOrFuture(&waitFuture, options_.cacheable())) {
-      std::move(waitFuture).wait();
+  if (preallocatePins) {
+    for (const auto& pending : loads) {
+      checkedPointerCast<DwioCoalescedLoadBase>(pending.get())
+          ->prepare(/*prefetch=*/false);
     }
   }
-  plan->markPrefetchComplete();
+  const auto cacheable = options_.cacheable();
+  return [plan = std::move(plan),
+          loads = std::move(loads),
+          cacheable,
+          asyncPhysicalGroups,
+          firstLoadReady = std::move(firstLoadReady)]() mutable {
+    bool firstLoadSignaled = false;
+    auto signalFirstLoad = [&]() {
+      if (!firstLoadSignaled) {
+        firstLoadSignaled = true;
+        if (firstLoadReady) {
+          firstLoadReady();
+        }
+      }
+    };
+    if (asyncPhysicalGroups) {
+      std::vector<std::function<void()>> completions;
+      completions.reserve(loads.size());
+      std::exception_ptr failure;
+      try {
+        for (const auto& pending : loads) {
+          auto completion =
+              checkedPointerCast<DwioCoalescedLoadBase>(pending.get())
+                  ->startAsyncLoad(cacheable);
+          if (completion) {
+            completions.push_back(std::move(completion));
+          } else {
+            // Submit all natively asynchronous remote reads before running
+            // SSD or non-async fallback loads synchronously.
+            completions.push_back([pending, cacheable]() {
+              folly::SemiFuture<bool> waitFuture(false);
+              if (!pending->loadOrFuture(&waitFuture, cacheable)) {
+                std::move(waitFuture).wait();
+              }
+            });
+          }
+        }
+      } catch (...) {
+        failure = std::current_exception();
+      }
+      bool completedOne = false;
+      for (auto& completion : completions) {
+        try {
+          completion();
+          completedOne = true;
+        } catch (...) {
+          if (!failure) {
+            failure = std::current_exception();
+          }
+        }
+        if (completedOne && !firstLoadSignaled) {
+          try {
+            signalFirstLoad();
+          } catch (...) {
+            if (!failure) {
+              failure = std::current_exception();
+            }
+          }
+        }
+      }
+      if (completions.empty() && !failure) {
+        try {
+          signalFirstLoad();
+        } catch (...) {
+          failure = std::current_exception();
+        }
+      }
+      if (failure) {
+        std::rethrow_exception(failure);
+      }
+      plan->markPrefetchComplete();
+      return;
+    }
+    for (const auto& pending : loads) {
+      folly::SemiFuture<bool> waitFuture(false);
+      if (!pending->loadOrFuture(&waitFuture, cacheable)) {
+        std::move(waitFuture).wait();
+      }
+      signalFirstLoad();
+    }
+    signalFirstLoad();
+    plan->markPrefetchComplete();
+  };
 }
 
 std::shared_ptr<CacheRegionPlan> CachedBufferedInput::makeCacheRegionPlan(
