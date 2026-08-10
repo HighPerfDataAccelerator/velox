@@ -618,6 +618,15 @@ void CudfSplitReader::waitForCachePrefetchHint() {
 }
 
 void CudfSplitReader::waitForCachePrefetchHint(bool splitPreload) {
+  // Split preload only proves that this scan can start. When its consumer
+  // becomes active, refill any idle native S3 slots from the executor-global
+  // queue without changing request order.
+  if (!splitPreload && cachePrefetchHintWaited_ &&
+      !cachePrefetchSchedulerRefilled_ && cachePrefetchQueryId_ &&
+      cachePrefetchHintKey_) {
+    cachePrefetchSchedulerRefilled_ = true;
+    refillNativeS3Scheduler();
+  }
   if (cachePrefetchHintWaited_ || !cachePrefetchQueryId_ ||
       !cachePrefetchHintKey_) {
     return;
@@ -653,6 +662,7 @@ void CudfSplitReader::releaseCachePrefetchHint() {
   }
   cachePrefetchQueryId_.reset();
   cachePrefetchHintKey_.reset();
+  cachePrefetchSchedulerRefilled_ = false;
   cachePrefetchNonBlockingRequested_ = false;
   cachePrefetchFirstLoadPolicyEnabled_ = false;
   cachePrefetchFirstLoadReady_ = false;
@@ -793,6 +803,7 @@ void CudfSplitReader::resetSplit() {
   selectivePreloadResult_.reset();
   fileMetaData_.clear();
   cachePrefetchHintWaited_ = false;
+  cachePrefetchSchedulerRefilled_ = false;
 }
 
 cudf::ast::expression const* CudfSplitReader::pushdownFilter() const {

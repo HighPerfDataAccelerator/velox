@@ -1430,6 +1430,8 @@ class NativeS3SdkScheduler {
         << adaptiveWideRangePolicyCalls_.load(std::memory_order_relaxed)
         << " adaptiveGapPolicyCalls="
         << adaptiveGapPolicyCalls_.load(std::memory_order_relaxed)
+        << " consumerRefills="
+        << consumerRefills_.load(std::memory_order_relaxed)
         << " completionKeyContinuityDispatches="
         << completionKeyContinuityDispatches_.load(std::memory_order_relaxed)
         << " retries=" << retryAttempts_.load(std::memory_order_relaxed)
@@ -1438,6 +1440,15 @@ class NativeS3SdkScheduler {
 
   NativeS3SdkScheduler(const NativeS3SdkScheduler&) = delete;
   NativeS3SdkScheduler& operator=(const NativeS3SdkScheduler&) = delete;
+
+  void refill() {
+    consumerRefills_.fetch_add(1, std::memory_order_relaxed);
+    if (useCrt_) {
+      dispatchCrt();
+    } else {
+      condition_.notify_all();
+    }
+  }
 
  private:
   struct Request {
@@ -1844,6 +1855,7 @@ class NativeS3SdkScheduler {
   std::atomic<uint64_t> adaptiveRangePolicyCalls_{0};
   std::atomic<uint64_t> adaptiveWideRangePolicyCalls_{0};
   std::atomic<uint64_t> adaptiveGapPolicyCalls_{0};
+  std::atomic<uint64_t> consumerRefills_{0};
   std::atomic<uint64_t> completionKeyContinuityDispatches_{0};
   std::atomic<uint64_t> completedRequests_{0};
   std::atomic<uint64_t> completedBytes_{0};
@@ -2408,6 +2420,14 @@ void initializeNativeS3Scheduler() {
   LOG(WARNING) << "Native S3 scheduler initialized eagerly in " << elapsedMs
                << " ms; crt=" << (envBytesOrZero("GLUTEN_CPP_S3_CRT") != 0)
                << "; initializedAwsSdk=" << initializedAwsSdk;
+#endif
+}
+
+void refillNativeS3Scheduler() {
+#ifdef VELOX_ENABLE_S3
+  if (nativeS3ScheduledReadEnabled()) {
+    NativeS3SdkScheduler::instance().refill();
+  }
 #endif
 }
 

@@ -203,6 +203,7 @@ class CudfSplitReader : public NvtxHelper {
   std::optional<std::string> cachePrefetchQueryId_;
   std::optional<std::string> cachePrefetchHintKey_;
   bool cachePrefetchHintWaited_{false};
+  bool cachePrefetchSchedulerRefilled_{false};
   bool cachePrefetchNonBlockingRequested_{false};
   bool cachePrefetchFirstLoadPolicyEnabled_{false};
   bool cachePrefetchFirstLoadReady_{false};
