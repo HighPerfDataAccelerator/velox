@@ -622,7 +622,7 @@ TEST(ExecutorPrefetchTest, nativeScheduledReadWritesScatterBuffersDirectly) {
   auto base = std::make_shared<RecordingReadFile>();
   auto scheduled =
       makeNativeScheduledS3ReadFile(base, "s3://test-bucket/test-key");
-  refillNativeS3Scheduler();
+  EXPECT_FALSE(prioritizeNativeS3File("s3://test-bucket/test-key"));
 
   std::array<char, 3> first{};
   std::array<char, 2> second{};

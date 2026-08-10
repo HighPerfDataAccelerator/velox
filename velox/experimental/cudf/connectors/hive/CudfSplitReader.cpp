@@ -618,14 +618,14 @@ void CudfSplitReader::waitForCachePrefetchHint() {
 }
 
 void CudfSplitReader::waitForCachePrefetchHint(bool splitPreload) {
-  // Split preload only proves that this scan can start. When its consumer
-  // becomes active, refill any idle native S3 slots from the executor-global
-  // queue without changing request order.
+  // Split preload only proves that this scan can start. Once a driver actually
+  // consumes the split, let its remaining ranges pass speculative work while
+  // preserving the executor-global request window.
   if (!splitPreload && cachePrefetchHintWaited_ &&
-      !cachePrefetchSchedulerRefilled_ && cachePrefetchQueryId_ &&
+      !cachePrefetchDemandPrioritized_ && cachePrefetchQueryId_ &&
       cachePrefetchHintKey_) {
-    cachePrefetchSchedulerRefilled_ = true;
-    refillNativeS3Scheduler();
+    cachePrefetchDemandPrioritized_ =
+        prioritizeNativeS3File(split_->filePath);
   }
   if (cachePrefetchHintWaited_ || !cachePrefetchQueryId_ ||
       !cachePrefetchHintKey_) {
@@ -662,7 +662,7 @@ void CudfSplitReader::releaseCachePrefetchHint() {
   }
   cachePrefetchQueryId_.reset();
   cachePrefetchHintKey_.reset();
-  cachePrefetchSchedulerRefilled_ = false;
+  cachePrefetchDemandPrioritized_ = false;
   cachePrefetchNonBlockingRequested_ = false;
   cachePrefetchFirstLoadPolicyEnabled_ = false;
   cachePrefetchFirstLoadReady_ = false;
@@ -803,7 +803,7 @@ void CudfSplitReader::resetSplit() {
   selectivePreloadResult_.reset();
   fileMetaData_.clear();
   cachePrefetchHintWaited_ = false;
-  cachePrefetchSchedulerRefilled_ = false;
+  cachePrefetchDemandPrioritized_ = false;
 }
 
 cudf::ast::expression const* CudfSplitReader::pushdownFilter() const {

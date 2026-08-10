@@ -442,10 +442,11 @@ std::shared_ptr<facebook::velox::ReadFile> makeNativeScheduledS3ReadFile(
 /// S3 support or the native scheduler is disabled.
 void initializeNativeS3Scheduler();
 
-/// Refills the executor-global native S3 request window from already queued
-/// ranges when a consumer starts scanning a preloaded split. This preserves
-/// queue order and is a no-op when the native scheduler is disabled.
-void refillNativeS3Scheduler();
+/// Raises queued native S3 ranges for 'filePath' ahead of speculative data
+/// ranges without shrinking the executor-global request window. Returns true
+/// when at least one queued range was marked. This is a no-op when demand
+/// priority or the native CRT scheduler is disabled, or for non-S3 paths.
+bool prioritizeNativeS3File(const std::string& filePath);
 
 /// Projected remote ranges fetched into one final-layout host buffer. This is
 /// deliberately separate from the device allocation so split preload threads

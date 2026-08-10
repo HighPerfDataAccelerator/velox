@@ -1430,8 +1430,8 @@ class NativeS3SdkScheduler {
         << adaptiveWideRangePolicyCalls_.load(std::memory_order_relaxed)
         << " adaptiveGapPolicyCalls="
         << adaptiveGapPolicyCalls_.load(std::memory_order_relaxed)
-        << " consumerRefills="
-        << consumerRefills_.load(std::memory_order_relaxed)
+        << " demandKeyPriorityDispatches="
+        << demandKeyPriorityDispatches_.load(std::memory_order_relaxed)
         << " completionKeyContinuityDispatches="
         << completionKeyContinuityDispatches_.load(std::memory_order_relaxed)
         << " retries=" << retryAttempts_.load(std::memory_order_relaxed)
@@ -1441,13 +1441,25 @@ class NativeS3SdkScheduler {
   NativeS3SdkScheduler(const NativeS3SdkScheduler&) = delete;
   NativeS3SdkScheduler& operator=(const NativeS3SdkScheduler&) = delete;
 
-  void refill() {
-    consumerRefills_.fetch_add(1, std::memory_order_relaxed);
-    if (useCrt_) {
-      dispatchCrt();
-    } else {
-      condition_.notify_all();
+  bool prioritizeFile(const std::string& bucket, const std::string& key) {
+    if (!useCrt_ || !demandPriority_) {
+      return false;
     }
+    bool prioritized = false;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      const auto identity = fileIdentity(bucket, key);
+      if (std::any_of(queue_.begin(), queue_.end(), [&](const auto& queued) {
+            return fileIdentity(queued->bucket, queued->key) == identity;
+          })) {
+        demandPreferredFiles_.insert(identity);
+        prioritized = true;
+      }
+    }
+    if (prioritized) {
+      dispatchCrt();
+    }
+    return prioritized;
   }
 
  private:
@@ -1510,6 +1522,9 @@ class NativeS3SdkScheduler {
             envOrDefault("GLUTEN_CPP_S3_SLICE_OVERSIZED_RANGES", 1) != 0),
         metadataPriorityBytes_(
             envOrDefault("GLUTEN_CPP_S3_METADATA_PRIORITY_BYTES", 64UL << 10)),
+        demandPriority_(envFlagOrDefault(
+            "GLUTEN_CPP_S3_DEMAND_PRIORITY",
+            adaptiveS3PrefetchEnabled())),
         completionKeyContinuity_(envFlagOrDefault(
             "GLUTEN_CPP_S3_COMPLETION_KEY_CONTINUITY",
             adaptiveS3PrefetchEnabled())),
@@ -1523,6 +1538,9 @@ class NativeS3SdkScheduler {
     if (completionKeyContinuity_) {
       LOG(WARNING) << "CPP_S3_COMPLETION_KEY_CONTINUITY enabled=1 minBytes="
                    << completionKeyContinuityMinBytes_;
+    }
+    if (demandPriority_) {
+      LOG(WARNING) << "CPP_S3_DEMAND_PRIORITY enabled=1";
     }
     if (adaptiveRanges_) {
       LOG(WARNING) << "CPP_S3_ADAPTIVE_RANGES enabled=1 baseBytes="
@@ -1603,7 +1621,32 @@ class NativeS3SdkScheduler {
         }
         auto& source = !priorityQueue_.empty() ? priorityQueue_ : queue_;
         auto selected = source.begin();
-        if (completionKeyContinuity_ && &source == &queue_ &&
+        bool selectedByDemand = false;
+        if (&source == &queue_ && !demandPreferredFiles_.empty()) {
+          const auto demanded = std::find_if(
+              source.begin(), source.end(), [this](const auto& queued) {
+                return demandPreferredFiles_.contains(
+                    fileIdentity(queued->bucket, queued->key));
+              });
+          if (demanded != source.end()) {
+            selected = demanded;
+            selectedByDemand = true;
+            const auto selectedIdentity =
+                fileIdentity((*selected)->bucket, (*selected)->key);
+            const auto anotherQueued = std::find_if(
+                std::next(selected), source.end(), [&](const auto& queued) {
+                  return fileIdentity(queued->bucket, queued->key) ==
+                      selectedIdentity;
+                });
+            if (anotherQueued == source.end()) {
+              demandPreferredFiles_.erase(selectedIdentity);
+            }
+            demandKeyPriorityDispatches_.fetch_add(
+                1, std::memory_order_relaxed);
+          }
+        }
+        if (!selectedByDemand && completionKeyContinuity_ &&
+            &source == &queue_ &&
             !completionPreferredKeys_.empty()) {
           const auto preferred = std::find_if(
               source.begin(), source.end(), [this](const auto& queued) {
@@ -1758,6 +1801,8 @@ class NativeS3SdkScheduler {
         << directCacheFillGapBytes_.load(std::memory_order_relaxed)
         << " directCacheFillScatterBuffers="
         << directCacheFillScatterBuffers_.load(std::memory_order_relaxed)
+        << " demandKeyPriorityDispatches="
+        << demandKeyPriorityDispatches_.load(std::memory_order_relaxed)
         << " completionKeyContinuityDispatches="
         << completionKeyContinuityDispatches_.load(std::memory_order_relaxed)
         << " retries=" << retryAttempts_.load(std::memory_order_relaxed)
@@ -1832,14 +1877,21 @@ class NativeS3SdkScheduler {
   const size_t maxCoalescedRangeBytes_;
   const bool sliceOversizedRanges_;
   const size_t metadataPriorityBytes_;
+  const bool demandPriority_;
   const bool completionKeyContinuity_;
   const size_t completionKeyContinuityMinBytes_;
   const bool diagnostics_;
+  static std::string fileIdentity(
+      const std::string& bucket,
+      const std::string& key) {
+    return bucket + '\n' + key;
+  }
   std::atomic<int64_t> startedNs_{0};
   std::mutex mutex_;
   std::condition_variable condition_;
   std::deque<std::shared_ptr<Request>> priorityQueue_;
   std::deque<std::shared_ptr<Request>> queue_;
+  std::unordered_set<std::string> demandPreferredFiles_;
   std::unordered_set<std::string> completionPreferredKeys_;
   bool stopping_{false};
   std::vector<std::thread> workers_;
@@ -1855,7 +1907,7 @@ class NativeS3SdkScheduler {
   std::atomic<uint64_t> adaptiveRangePolicyCalls_{0};
   std::atomic<uint64_t> adaptiveWideRangePolicyCalls_{0};
   std::atomic<uint64_t> adaptiveGapPolicyCalls_{0};
-  std::atomic<uint64_t> consumerRefills_{0};
+  std::atomic<uint64_t> demandKeyPriorityDispatches_{0};
   std::atomic<uint64_t> completionKeyContinuityDispatches_{0};
   std::atomic<uint64_t> completedRequests_{0};
   std::atomic<uint64_t> completedBytes_{0};
@@ -2423,11 +2475,17 @@ void initializeNativeS3Scheduler() {
 #endif
 }
 
-void refillNativeS3Scheduler() {
+bool prioritizeNativeS3File(const std::string& filePath) {
 #ifdef VELOX_ENABLE_S3
-  if (nativeS3ScheduledReadEnabled()) {
-    NativeS3SdkScheduler::instance().refill();
+  if (!nativeS3ScheduledReadEnabled() || !filePath.starts_with("s3://")) {
+    return false;
   }
+  auto bucketAndObject = kvikio::S3Endpoint::parse_s3_url(filePath);
+  return NativeS3SdkScheduler::instance().prioritizeFile(
+      bucketAndObject.first, bucketAndObject.second);
+#else
+  static_cast<void>(filePath);
+  return false;
 #endif
 }
 
