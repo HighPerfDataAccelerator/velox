@@ -16,6 +16,7 @@
 
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
+#include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/expression/AstExpression.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
 #include "velox/experimental/cudf/expression/JitExpression.h"
@@ -28,6 +29,7 @@
 #include "velox/core/QueryCtx.h"
 #include "velox/expression/Expr.h"
 #include "velox/functions/prestosql/registration/RegistrationFunctions.h"
+#include "velox/functions/sparksql/SparkQueryConfig.h"
 #include "velox/functions/sparksql/registration/Register.h"
 #include "velox/type/Type.h"
 
@@ -107,6 +109,56 @@ TEST_F(CudfExpressionSelectionTest, functionRoot) {
   auto cudfExpr = createCudfExpression(expr, rowType_, pool_.get());
   auto* functionExpr = dynamic_cast<FunctionExpression*>(cudfExpr.get());
   ASSERT_NE(functionExpr, nullptr);
+}
+
+TEST_F(
+    CudfExpressionSelectionTest,
+    monotonicallyIncreasingIdUsesPartitionAndRowCount) {
+  core::TypedExprPtr expr = std::make_shared<core::CallTypedExpr>(
+      BIGINT(),
+      std::vector<core::TypedExprPtr>{},
+      "monotonically_increasing_id");
+  ASSERT_TRUE(canExprRunOnGpu(expr, queryCtx_.get(), pool_.get()));
+
+  core::QueryConfig queryConfig({
+      {functions::sparksql::SparkQueryConfig::qualify(
+           functions::sparksql::SparkQueryConfig::kPartitionId),
+       "7"},
+  });
+  auto evaluator = createCudfExpression(
+      expr, rowType_, pool_.get(), &queryConfig, queryCtx_.get());
+  auto peerEvaluator = createCudfExpression(
+      expr, rowType_, pool_.get(), &queryConfig, queryCtx_.get());
+  auto stream = cudf::get_default_stream();
+  auto mr = cudf::get_current_device_resource_ref();
+
+  auto assertIds = [&](const CudfExpressionPtr& target,
+                       cudf::size_type rows,
+                       int64_t first) {
+    std::vector<cudf::column_view> noInputs;
+    auto result = target->eval(noInputs, rows, stream, mr, true);
+    auto resultView = asView(result);
+    auto outputType = ROW({"id"}, {BIGINT()});
+    auto output = with_arrow::toVeloxColumn(
+        cudf::table_view({resultView}),
+        pool_.get(),
+        outputType,
+        "",
+        stream,
+        mr);
+    stream.synchronize();
+
+    ASSERT_EQ(output->size(), rows);
+    auto ids = output->childAt(0)->as<SimpleVector<int64_t>>();
+    for (vector_size_t i = 0; i < rows; ++i) {
+      EXPECT_EQ(ids->valueAt(i), first + i);
+    }
+  };
+
+  const int64_t partitionBase = int64_t{7} << 33;
+  assertIds(evaluator, 3, partitionBase);
+  assertIds(peerEvaluator, 2, partitionBase + 3);
+  assertIds(evaluator, 2, partitionBase + 5);
 }
 
 TEST_F(CudfExpressionSelectionTest, astTopLevelWithFunctionPrecompute) {

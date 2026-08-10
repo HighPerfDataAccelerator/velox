@@ -314,9 +314,11 @@ std::vector<CudfExpressionPtr> createAggregationInputEvaluators(
 
   std::vector<CudfExpressionPtr> evaluators;
   evaluators.reserve(precomputedInputs.size());
+  const auto* queryCtx = operatorCtx.execCtx()->queryCtx();
+  const auto* queryConfig = &operatorCtx.driverCtx()->queryConfig();
   for (const auto& expr : precomputedInputs) {
     evaluators.push_back(createCudfExpression(
-        expr, inputRowSchema, operatorCtx.pool()));
+        expr, inputRowSchema, operatorCtx.pool(), queryConfig, queryCtx));
   }
   return evaluators;
 }
@@ -340,7 +342,7 @@ PreparedAggregationInput prepareAggregationInput(
 
   for (const auto& evaluator : precomputedInputEvaluators) {
     result.precomputedColumns.push_back(
-        evaluator->eval(inputViews, stream, mr, true));
+        evaluator->eval(inputViews, inputRowCount, stream, mr, true));
     allViews.push_back(asView(result.precomputedColumns.back()));
   }
 

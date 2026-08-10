@@ -22,9 +22,8 @@ namespace facebook::velox::cudf_velox {
 
 class CudaEvent;
 
-/// GPU-accelerated TopNRowNumber: partitioned top-N with row_number.
-/// Used when the optimizer rewrites ROW_NUMBER() OVER (...) WHERE rn <= limit
-/// into a TopNRowNumber plan node.
+/// GPU-accelerated TopNRowNumber: partitioned top-N with row_number, or with
+/// dense_rank when there is one ordering key.
 ///
 /// Retained state is bounded to O(limit * distinct partitions) rather than
 /// the full input: each input batch is locally reduced to its own top-`limit`
@@ -75,6 +74,7 @@ class CudfTopNRowNumber : public CudfOperatorBase {
       rmm::device_async_resource_ref mr);
 
   const std::shared_ptr<const core::TopNRowNumberNode> node_;
+  const core::TopNRowNumberNode::RankFunction rankFunction_;
   const int32_t limit_;
   const bool generateRowNumber_;
   const TypePtr inputType_;

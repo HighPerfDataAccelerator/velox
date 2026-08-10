@@ -24,6 +24,7 @@
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/detail/utilities/stream_pool.hpp>
+#include <cudf/groupby.hpp>
 #include <cudf/merge.hpp>
 #include <cudf/rolling.hpp>
 #include <cudf/sorting.hpp>
@@ -71,6 +72,55 @@ std::unique_ptr<cudf::column> computeRowNumbers(
       partKeys, firstCol, unbounded, currentRow, 1, *rowNumberAgg, stream, mr);
 }
 
+std::unique_ptr<cudf::column> computeDenseRanks(
+    cudf::table_view view,
+    const std::vector<cudf::size_type>& partitionKeyIndices,
+    cudf::size_type sortKeyIndex,
+    cudf::order sortOrder,
+    cudf::null_order nullOrder,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) {
+  std::unique_ptr<cudf::column> singlePartitionCol;
+  auto partKeys = makePartitionKeys(
+      view, partitionKeyIndices, stream, mr, singlePartitionCol);
+  cudf::groupby::scan_request request;
+  request.values = view.column(sortKeyIndex);
+  request.aggregations.push_back(
+      cudf::make_rank_aggregation<cudf::groupby_scan_aggregation>(
+          cudf::rank_method::DENSE,
+          sortOrder,
+          cudf::null_policy::INCLUDE,
+          nullOrder));
+  cudf::groupby::groupby groupBy(
+      partKeys, cudf::null_policy::INCLUDE, cudf::sorted::YES);
+  std::vector<cudf::groupby::scan_request> requests;
+  requests.push_back(std::move(request));
+  auto result = groupBy.scan(requests, stream, mr);
+  return std::move(result.second.front().results.front());
+}
+
+std::unique_ptr<cudf::column> computeRanks(
+    cudf::table_view view,
+    const std::vector<cudf::size_type>& partitionKeyIndices,
+    core::TopNRowNumberNode::RankFunction rankFunction,
+    cudf::size_type sortKeyIndex,
+    cudf::order sortOrder,
+    cudf::null_order nullOrder,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) {
+  if (rankFunction == core::TopNRowNumberNode::RankFunction::kDenseRank) {
+    return computeDenseRanks(
+        view,
+        partitionKeyIndices,
+        sortKeyIndex,
+        sortOrder,
+        nullOrder,
+        stream,
+        mr);
+  }
+  return computeRowNumbers(view, partitionKeyIndices, stream, mr);
+}
+
 // Filters `rowNums` to <= limit and returns the resulting boolean mask.
 std::unique_ptr<cudf::column> makeLimitMask(
     const cudf::column& rowNums,
@@ -104,14 +154,16 @@ CudfTopNRowNumber::CudfTopNRowNumber(
           std::nullopt,
           node),
       node_(node),
+      rankFunction_(node->rankFunction()),
       limit_(node->limit()),
       generateRowNumber_(node->generateRowNumber()),
       inputType_(node->sources()[0]->outputType()),
       cudaEvent_(std::make_unique<CudaEvent>(cudaEventDisableTiming)) {
-  VELOX_CHECK_EQ(
-      node->rankFunction(),
-      core::TopNRowNumberNode::RankFunction::kRowNumber,
-      "CudfTopNRowNumber only supports row_number");
+  VELOX_CHECK(
+      rankFunction_ == core::TopNRowNumberNode::RankFunction::kRowNumber ||
+          (rankFunction_ == core::TopNRowNumberNode::RankFunction::kDenseRank &&
+           node->sortingKeys().size() == 1),
+      "CudfTopNRowNumber supports row_number and single-key dense_rank");
 
   partitionKeyIndices_.reserve(node->partitionKeys().size());
   for (const auto& key : node->partitionKeys()) {
@@ -166,9 +218,16 @@ CudfVectorPtr CudfTopNRowNumber::reduceBatchToLocalCandidates(
       cudf::negative_index_policy::NOT_ALLOWED,
       stream,
       mr);
-  auto rowNums = computeRowNumbers(
-      sortedKeyTable->view(), localPartitionKeyIndices_, stream, mr);
-  auto mask = makeLimitMask(*rowNums, limit_, stream, mr);
+  auto ranks = computeRanks(
+      sortedKeyTable->view(),
+      localPartitionKeyIndices_,
+      rankFunction_,
+      static_cast<cudf::size_type>(localPartitionKeyIndices_.size()),
+      sortOrders_.front(),
+      nullOrders_.front(),
+      stream,
+      mr);
+  auto mask = makeLimitMask(*ranks, limit_, stream, mr);
 
   // Filter the sort permutation to the surviving rows before gathering the
   // full payload, so batches with many rows per partition don't pay for
@@ -210,9 +269,16 @@ CudfVectorPtr CudfTopNRowNumber::mergeAndPruneCandidates(
   // Ensure input-stream deallocations don't race with the merge kernel.
   streamsWaitForStream(*cudaEvent_, inputStreams, stream);
 
-  auto rowNums =
-      computeRowNumbers(merged->view(), partitionKeyIndices_, stream, mr);
-  auto mask = makeLimitMask(*rowNums, limit_, stream, mr);
+  auto ranks = computeRanks(
+      merged->view(),
+      partitionKeyIndices_,
+      rankFunction_,
+      sortKeyIndices_.front(),
+      sortOrders_.front(),
+      nullOrders_.front(),
+      stream,
+      mr);
+  auto mask = makeLimitMask(*ranks, limit_, stream, mr);
   auto pruned =
       cudf::apply_boolean_mask(merged->view(), mask->view(), stream, mr);
 
@@ -271,19 +337,26 @@ RowVectorPtr CudfTopNRowNumber::doGetOutput() {
 
   auto stream = candidates_->stream();
   auto mr = get_output_mr();
-  auto rowNums = computeRowNumbers(
-      candidates_->getTableView(), partitionKeyIndices_, stream, mr);
-  // cuDF row_number is int32; Velox expects bigint.
+  auto ranks = computeRanks(
+      candidates_->getTableView(),
+      partitionKeyIndices_,
+      rankFunction_,
+      sortKeyIndices_.front(),
+      sortOrders_.front(),
+      nullOrders_.front(),
+      stream,
+      mr);
+  // cuDF row_number and dense_rank are int32; Velox expects bigint.
   const auto rowNumberCudfType = cudf_velox::veloxToCudfDataType(
       outputType_->childAt(outputType_->size() - 1));
-  if (rowNums->type() != rowNumberCudfType) {
-    rowNums = cudf::cast(*rowNums, rowNumberCudfType, stream, mr);
+  if (ranks->type() != rowNumberCudfType) {
+    ranks = cudf::cast(*ranks, rowNumberCudfType, stream, mr);
   }
 
   auto pool = candidates_->pool();
   auto const size = candidates_->size();
   auto cols = candidates_->release()->release();
-  cols.push_back(std::move(rowNums));
+  cols.push_back(std::move(ranks));
   auto finalTable = std::make_unique<cudf::table>(std::move(cols));
 
   return std::make_shared<CudfVector>(

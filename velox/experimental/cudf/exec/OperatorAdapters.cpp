@@ -704,7 +704,10 @@ class TopNRowNumberAdapter : public OperatorAdapter {
       return false;
     }
     return node->rankFunction() ==
-        core::TopNRowNumberNode::RankFunction::kRowNumber;
+        core::TopNRowNumberNode::RankFunction::kRowNumber ||
+        (node->rankFunction() ==
+             core::TopNRowNumberNode::RankFunction::kDenseRank &&
+         node->sortingKeys().size() == 1);
   }
 
   bool acceptsGpuInput() const override {
@@ -1233,12 +1236,20 @@ class ExchangeAdapter : public OperatorAdapter {
             operatorId, ctx, planNode, std::move(client)));
     if (CudfConfig::getInstance().concatOptimizationEnabled &&
         CudfConfig::getInstance().exchangeConcatOptimizationEnabled) {
+      const auto& cudfConfig = CudfConfig::getInstance();
+      const auto targetRows = ctx->queryConfig().get<int32_t>(
+          CudfConfig::kCudfExchangeBatchSizeMinThreshold,
+          cudfConfig.exchangeBatchSizeMinThreshold);
+      const auto targetBytes = ctx->queryConfig().get<uint64_t>(
+          CudfConfig::kCudfExchangeBatchSizeMinThresholdBytes,
+          cudfConfig.exchangeBatchSizeMinThresholdBytes);
       result.push_back(std::make_unique<CudfBatchConcat>(
           operatorId,
           ctx,
           planNode,
           planNode->outputType(),
-          CudfConfig::getInstance().exchangeBatchSizeMinThreshold));
+          targetRows,
+          targetBytes));
     }
     return result;
   }

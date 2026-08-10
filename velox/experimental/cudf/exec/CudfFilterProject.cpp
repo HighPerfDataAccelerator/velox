@@ -187,10 +187,15 @@ void CudfFilterProject::initialize() {
   // lifetime.
   auto* const queryCtx = operatorCtx_->execCtx()->queryCtx();
   auto* const pool = operatorCtx_->pool();
+  const auto* const queryConfig = &operatorCtx_->driverCtx()->queryConfig();
   const auto optimizeAndCompile =
-      [inputType, queryCtx, pool](const core::TypedExprPtr& expr) {
+      [inputType, queryCtx, pool, queryConfig](const core::TypedExprPtr& expr) {
         return createCudfExpression(
-            expression::optimize(expr, queryCtx, pool), inputType, pool);
+            expression::optimize(expr, queryCtx, pool),
+            inputType,
+            pool,
+            queryConfig,
+            queryCtx);
       };
   if (hasFilter_) {
     // First expr is Filter, rest are Project.
@@ -237,7 +242,7 @@ RowVectorPtr CudfFilterProject::doGetOutput() {
   if (!inputTableColumns.empty()) {
     outputSize = inputTableColumns.front()->size();
   }
-  auto outputColumns = project(inputTableColumns, stream);
+  auto outputColumns = project(inputTableColumns, outputSize, stream);
 
   auto outputTable = std::make_unique<cudf::table>(std::move(outputColumns));
   auto const numColumns = outputTable->num_columns();
@@ -295,6 +300,7 @@ void CudfFilterProject::filter(
 
 std::vector<std::unique_ptr<cudf::column>> CudfFilterProject::project(
     std::vector<std::unique_ptr<cudf::column>>& inputTableColumns,
+    vector_size_t outputSize,
     rmm::cuda_stream_view stream) {
   std::vector<cudf::column_view> inputViews;
   inputViews.reserve(inputTableColumns.size());
@@ -303,8 +309,12 @@ std::vector<std::unique_ptr<cudf::column>> CudfFilterProject::project(
   }
   std::vector<ColumnOrView> columns;
   for (auto& projectEvaluator : projectEvaluators_) {
-    columns.push_back(
-        projectEvaluator->eval(inputViews, stream, get_output_mr(), true));
+    columns.push_back(projectEvaluator->eval(
+        inputViews,
+        static_cast<cudf::size_type>(outputSize),
+        stream,
+        get_output_mr(),
+        true));
   }
 
   // Rearrange columns to match outputType_

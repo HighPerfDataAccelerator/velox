@@ -284,3 +284,26 @@ TEST_F(TopNRowNumberTest, rankFallsBackToCpu) {
   ASSERT_FALSE(wasCudfTopNRowNumberUsed(task));
   ASSERT_TRUE(wasCpuTopNRowNumberUsed(task));
 }
+
+TEST_F(TopNRowNumberTest, denseRankSingleKeyPreservesTiesAcrossBatches) {
+  auto first = makeRowVector({
+      makeFlatVector<int64_t>({1, 1, 2, 2}),
+      makeFlatVector<int64_t>({10, 20, 30, 40}),
+      makeFlatVector<int64_t>({100, 200, 300, 400}),
+  });
+  auto second = makeRowVector({
+      makeFlatVector<int64_t>({1, 1, 2, 2}),
+      makeFlatVector<int64_t>({10, 30, 30, 50}),
+      makeFlatVector<int64_t>({101, 201, 301, 401}),
+  });
+  createDuckDbTable({first, second});
+
+  auto plan = PlanBuilder()
+                  .values({first, second})
+                  .topNRank("dense_rank", {"c0"}, {"c1"}, 1, true)
+                  .planNode();
+  assertGpuTopNRowNumber(
+      plan,
+      "SELECT * FROM (SELECT *, dense_rank() over (partition by c0 order by c1) as row_number FROM tmp) "
+      "WHERE row_number <= 1");
+}

@@ -21,6 +21,7 @@
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/concatenate.hpp>
+#include <cudf/copying.hpp>
 #include <cudf/detail/utilities/stream_pool.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 
@@ -217,7 +218,8 @@ std::vector<std::unique_ptr<cudf::table>> getConcatenatedTableBatched(
     std::vector<CudfVectorPtr>&& tables,
     const TypePtr& tableType,
     rmm::cuda_stream_view stream,
-    rmm::device_async_resource_ref mr) {
+    rmm::device_async_resource_ref mr,
+    std::optional<size_t> maxRowsOverride) {
   std::vector<std::unique_ptr<cudf::table>> concatTables;
   // Check for empty vector
   if (tables.size() == 0) {
@@ -241,33 +243,53 @@ std::vector<std::unique_ptr<cudf::table>> getConcatenatedTableBatched(
 
   try {
     std::vector<std::unique_ptr<cudf::table>> outputTables;
-    auto const maxRows = maxBatchRows();
+    const auto maxRows = maxRowsOverride.value_or(maxBatchRows());
+    VELOX_CHECK_GT(maxRows, 0, "cuDF max batch size must be positive");
+    std::vector<cudf::table_view> boundedViews;
+    boundedViews.reserve(tableViews.size());
+    for (const auto& tableView : tableViews) {
+      const auto numRows = static_cast<size_t>(tableView.num_rows());
+      if (numRows <= maxRows) {
+        boundedViews.push_back(tableView);
+        continue;
+      }
+      for (size_t start = 0; start < numRows;) {
+        const auto end = start + std::min(maxRows, numRows - start);
+        auto slices = cudf::slice(
+            tableView,
+            {static_cast<cudf::size_type>(start),
+             static_cast<cudf::size_type>(end)},
+            stream);
+        VELOX_CHECK_EQ(slices.size(), 1);
+        boundedViews.push_back(slices.front());
+        start = end;
+      }
+    }
+
     size_t startpos = 0;
     size_t runningRows = 0;
-    for (size_t i = 0; i < tableViews.size(); ++i) {
-      auto const numRows = static_cast<size_t>(tableViews[i].num_rows());
+    for (size_t i = 0; i < boundedViews.size(); ++i) {
+      auto const numRows = static_cast<size_t>(boundedViews[i].num_rows());
       // If adding this table would exceed the limit, flush current batch
       // [startpos, i).
       if (runningRows > 0 && runningRows + numRows > maxRows) {
-        outputTables.push_back(
-            cudf::concatenate(
-                std::vector<cudf::table_view>(
-                    tableViews.begin() + startpos, tableViews.begin() + i),
-                stream,
-                mr));
+        outputTables.push_back(cudf::concatenate(
+            std::vector<cudf::table_view>(
+                boundedViews.begin() + startpos, boundedViews.begin() + i),
+            stream,
+            mr));
         startpos = i;
         runningRows = 0;
       }
       runningRows += numRows;
     }
     // Flush the final batch [startpos, end).
-    if (startpos < tableViews.size()) {
-      outputTables.push_back(
-          cudf::concatenate(
-              std::vector<cudf::table_view>(
-                  tableViews.begin() + startpos, tableViews.end()),
-              stream,
-              mr));
+    if (startpos < boundedViews.size()) {
+      outputTables.push_back(cudf::concatenate(
+          std::vector<cudf::table_view>(
+              boundedViews.begin() + startpos, boundedViews.end()),
+          stream,
+          mr));
     }
     orderCudfVectorDeallocationsAfterStream(tables, inputStreams, stream);
 
