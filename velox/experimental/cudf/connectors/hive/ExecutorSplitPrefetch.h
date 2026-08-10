@@ -22,6 +22,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <future>
 #include <memory>
 #include <optional>
 #include <string>
@@ -71,6 +72,26 @@ struct CachePrefetchPlanStats {
   uint64_t hits{0};
   uint64_t misses{0};
   uint64_t entries{0};
+};
+
+enum class CacheHintWaitMode : uint8_t {
+  kScan,
+  kSplitPreload,
+  kFirstLoadGroup,
+};
+
+struct CacheHintWaitStats {
+  uint64_t scanWaits{0};
+  uint64_t scanReadyAtTake{0};
+  uint64_t scanWaitWallNanos{0};
+  uint64_t splitPreloadWaits{0};
+  uint64_t splitPreloadReadyAtTake{0};
+  uint64_t splitPreloadWaitWallNanos{0};
+  uint64_t rangeReadyRequests{0};
+  uint64_t rangeReadyReleases{0};
+  uint64_t firstLoadGroupWaits{0};
+  uint64_t firstLoadGroupReadyAtTake{0};
+  uint64_t firstLoadGroupWaitWallNanos{0};
 };
 
 /// Executor-scoped, cross-split prefetch queue. MPP registers all physical
@@ -127,12 +148,61 @@ class ExecutorSplitPrefetch {
       uint32_t concurrency,
       uint64_t maxReadyBytes);
 
+  static void registerCacheHint(
+      folly::Executor* executor,
+      const std::string& queryId,
+      const std::string& splitKey,
+      CacheHintRangeStats rangeStats,
+      CacheHintLoad load,
+      uint32_t concurrency,
+      uint64_t maxReadyBytes,
+      std::shared_future<void> firstLoadReady);
+
   /// Marks a cache hint as demanded and waits for it. Failures are swallowed:
   /// the regular reader demand path remains the correctness fallback.
   static void takeCacheHint(
       folly::Executor* executor,
       const std::string& queryId,
       const std::string& splitKey);
+
+  static void takeCacheHint(
+      folly::Executor* executor,
+      const std::string& queryId,
+      const std::string& splitKey,
+      CacheHintWaitMode waitMode);
+
+  /// Marks a cache hint as demanded and eligible for scheduling without
+  /// waiting for the entire hint. Demand reads then synchronize on the
+  /// individual AsyncDataCache keys they actually consume.
+  static void requestCacheHint(
+      folly::Executor* executor,
+      const std::string& queryId,
+      const std::string& splitKey);
+
+  /// Releases scheduler admission bytes retained by a non-blocking request.
+  /// This is safe before the best-effort load completes: the worker owns the
+  /// load lifetime independently of the scheduler entry.
+  static void releaseCacheHint(
+      folly::Executor* executor,
+      const std::string& queryId,
+      const std::string& splitKey);
+
+  /// Publishes the coordinator's complete split count before individual
+  /// splits are registered, so readers can choose a query-wide wait policy
+  /// without waiting behind the registration wave.
+  static void setExpectedSplitCount(
+      folly::Executor* executor,
+      const std::string& queryId,
+      uint64_t expectedSplits,
+      uint64_t minRegisteredSplits);
+
+  /// Makes one query-wide first-load decision from the physical splits already
+  /// known by the coordinator. The first decision is frozen so every scan in
+  /// the query uses the same wait policy.
+  static bool useFirstLoadReadyForQuery(
+      folly::Executor* executor,
+      const std::string& queryId,
+      uint64_t minRegisteredSplits);
 
   static void recordCacheHintFallback();
 
@@ -143,6 +213,8 @@ class ExecutorSplitPrefetch {
   static CachePrefetchPlanStats cachePrefetchPlanStatsForTest();
 
   static CacheHintRangeStats cacheHintRangeStatsForTest();
+
+  static CacheHintWaitStats cacheHintWaitStatsForTest();
 
   static void eraseQuery(folly::Executor* executor, const std::string& queryId);
 

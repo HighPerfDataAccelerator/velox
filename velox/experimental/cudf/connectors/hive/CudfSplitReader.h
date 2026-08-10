@@ -65,7 +65,7 @@ class CudfSplitReader : public NvtxHelper {
       bool useExperimentalCudfReader,
       cudf::ast::expression const* subfieldFilterExpr);
 
-  virtual ~CudfSplitReader() = default;
+  virtual ~CudfSplitReader();
 
   /// Prepare the split: open cudf reader, set up data source and options.
   /// @param runtimeStats Reference to the DataSource's runtime statistics
@@ -148,6 +148,10 @@ class CudfSplitReader : public NvtxHelper {
 
   void waitForCachePrefetchHint();
 
+  void waitForCachePrefetchHint(bool splitPreload);
+
+  void releaseCachePrefetchHint();
+
   // Whether to use the experimental cuDF reader.
   bool useExperimentalCudfReader() const;
 
@@ -196,8 +200,12 @@ class CudfSplitReader : public NvtxHelper {
   CudfHybridScanReaderPtr exptSplitReader_;
   std::unique_ptr<HybridScanState> hybridScanState_;
   bool useExperimentalCudfReader_;
+  std::optional<std::string> cachePrefetchQueryId_;
   std::optional<std::string> cachePrefetchHintKey_;
   bool cachePrefetchHintWaited_{false};
+  bool cachePrefetchNonBlockingRequested_{false};
+  bool cachePrefetchFirstLoadPolicyEnabled_{false};
+  bool cachePrefetchFirstLoadReady_{false};
 
   dwio::common::ReaderOptions baseReaderOpts_;
   cudf::ast::expression const* subfieldFilterExpr_;

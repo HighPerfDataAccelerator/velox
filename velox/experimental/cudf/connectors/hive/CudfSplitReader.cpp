@@ -92,6 +92,59 @@ bool experimentalPrepareHostOnlyEnabled() {
   return value != nullptr && std::string_view(value) == "1";
 }
 
+bool envFlagEnabled(const char* value) {
+  return value != nullptr &&
+      (std::string_view(value) == "1" || std::string_view(value) == "true");
+}
+
+bool adaptiveS3PrefetchEnabled() {
+  return envFlagEnabled(std::getenv("GLUTEN_CUDF_S3_ADAPTIVE_PREFETCH"));
+}
+
+bool envFlagOrAdaptive(const char* name) {
+  const auto* value = std::getenv(name);
+  return value == nullptr || *value == '\0' ? adaptiveS3PrefetchEnabled()
+                                            : envFlagEnabled(value);
+}
+
+bool prepareCacheHintLoadsEnabled() {
+  return envFlagOrAdaptive("GLUTEN_CUDF_CACHE_HINT_PREPARE_LOADS");
+}
+
+bool cacheHintReadySplitPreloadEnabled() {
+  return envFlagOrAdaptive("GLUTEN_CUDF_CACHE_HINT_READY_SPLIT_PRELOAD");
+}
+
+bool cacheHintFirstLoadGroupReadyScanEnabled() {
+  return envFlagOrAdaptive(
+      "GLUTEN_CUDF_CACHE_HINT_FIRST_LOAD_GROUP_READY_SCAN");
+}
+
+uint64_t cacheHintFirstLoadGroupReadyMinQueryRegisteredSplits() {
+  static const auto minSplits = [] {
+    const auto* value = std::getenv(
+        "GLUTEN_CUDF_CACHE_HINT_FIRST_LOAD_GROUP_READY_MIN_QUERY_REGISTERED_SPLITS");
+    if (value == nullptr || *value == '\0') {
+      return adaptiveS3PrefetchEnabled() ? uint64_t{600} : uint64_t{0};
+    }
+    try {
+      size_t parsedCharacters{0};
+      const auto parsed = std::stoull(value, &parsedCharacters);
+      VELOX_CHECK_EQ(
+          value[parsedCharacters],
+          '\0',
+          "Invalid first-load-ready minimum query registered splits: {}",
+          value);
+      return static_cast<uint64_t>(parsed);
+    } catch (const std::exception&) {
+      VELOX_FAIL(
+          "Invalid first-load-ready minimum query registered splits: {}",
+          value);
+    }
+  }();
+  return minSplits;
+}
+
 #ifdef VELOX_ENABLE_S3
 std::shared_ptr<ReadFile> openNativeS3ReadFile(
     const std::shared_ptr<filesystems::S3FileSystem>& fileSystem,
@@ -344,6 +397,10 @@ CudfSplitReader::CudfSplitReader(
       baseReaderOpts_);
 }
 
+CudfSplitReader::~CudfSplitReader() {
+  releaseCachePrefetchHint();
+}
+
 void CudfSplitReader::setDataSourceContext(
     const ConnectorQueryCtx* connectorQueryCtx,
     dwio::common::RuntimeStatistics& /*runtimeStats*/,
@@ -418,6 +475,7 @@ std::optional<std::unique_ptr<cudf::table>> CudfSplitReader::readNextChunk() {
     VELOX_CHECK_NOT_NULL(splitReader_, "cudf parquet reader not present");
 
     if (!splitReader_->has_next()) {
+      releaseCachePrefetchHint();
       return std::nullopt;
     }
 
@@ -499,20 +557,53 @@ void CudfSplitReader::setupCachePrefetchHint() {
         split_->filePath,
         split_->start,
         split_->length);
+    cachePrefetchQueryId_ = connectorQueryCtx_->queryId();
     const auto* session = connectorQueryCtx_->sessionProperties();
+    const auto prepareLoads = prepareCacheHintLoadsEnabled();
+    ExecutorSplitPrefetch::CacheHintLoad load;
+    std::shared_future<void> firstLoadReady;
+    if (prepareLoads) {
+      std::function<void()> firstLoadReadyCallback;
+      cachePrefetchFirstLoadPolicyEnabled_ =
+          cacheHintFirstLoadGroupReadyScanEnabled();
+      cachePrefetchFirstLoadReady_ =
+          cachePrefetchFirstLoadPolicyEnabled_ &&
+          ExecutorSplitPrefetch::useFirstLoadReadyForQuery(
+              executor_,
+              *cachePrefetchQueryId_,
+              cacheHintFirstLoadGroupReadyMinQueryRegisteredSplits());
+      if (cachePrefetchFirstLoadReady_) {
+        auto firstLoadPromise = std::make_shared<std::promise<void>>();
+        firstLoadReady = firstLoadPromise->get_future().share();
+        firstLoadReadyCallback = [firstLoadPromise =
+                                      std::move(firstLoadPromise)]() {
+          firstLoadPromise->set_value();
+        };
+      }
+      auto prepared = buffered->prepareCachePrefetch(
+          cachedPlan->ranges, std::move(firstLoadReadyCallback));
+      VELOX_CHECK(
+          static_cast<bool>(prepared),
+          "Projected cache hint lost its cache-backed input while preparing loads");
+      load = [buffered = std::move(buffered),
+              prepared = std::move(prepared)]() mutable { prepared(); };
+    } else {
+      load = [buffered = std::move(buffered),
+              ranges = cachedPlan->ranges]() mutable {
+        VELOX_CHECK(
+            buffered->prefetchToCache(ranges),
+            "Projected cache hint lost its cache-backed input");
+      };
+    }
     ExecutorSplitPrefetch::registerCacheHint(
         executor_,
-        connectorQueryCtx_->queryId(),
+        *cachePrefetchQueryId_,
         *cachePrefetchHintKey_,
         cachedPlan->rangeStats,
-        [buffered = std::move(buffered),
-         ranges = cachedPlan->ranges]() mutable {
-          VELOX_CHECK(
-              buffered->prefetchToCache(ranges),
-              "Projected cache hint lost its cache-backed input");
-        },
+        std::move(load),
         cudfHiveConfig_->executorSplitPrefetchConcurrencySession(session),
-        cudfHiveConfig_->prefetchMaxInFlightBytesSession(session));
+        cudfHiveConfig_->prefetchMaxInFlightBytesSession(session),
+        std::move(firstLoadReady));
   } catch (const std::exception& e) {
     ExecutorSplitPrefetch::recordCacheHintFallback();
     LOG(WARNING) << "Falling back to demand reads after cuDF cache hint "
@@ -523,12 +614,48 @@ void CudfSplitReader::setupCachePrefetchHint() {
 }
 
 void CudfSplitReader::waitForCachePrefetchHint() {
-  if (cachePrefetchHintWaited_ || !cachePrefetchHintKey_) {
+  waitForCachePrefetchHint(/*splitPreload=*/false);
+}
+
+void CudfSplitReader::waitForCachePrefetchHint(bool splitPreload) {
+  if (cachePrefetchHintWaited_ || !cachePrefetchQueryId_ ||
+      !cachePrefetchHintKey_) {
     return;
   }
   cachePrefetchHintWaited_ = true;
+  if (cachePrefetchFirstLoadPolicyEnabled_) {
+    if (!cachePrefetchFirstLoadReady_) {
+      ExecutorSplitPrefetch::requestCacheHint(
+          executor_, *cachePrefetchQueryId_, *cachePrefetchHintKey_);
+      cachePrefetchNonBlockingRequested_ = true;
+      return;
+    }
+    ExecutorSplitPrefetch::takeCacheHint(
+        executor_,
+        *cachePrefetchQueryId_,
+        *cachePrefetchHintKey_,
+        CacheHintWaitMode::kFirstLoadGroup);
+    return;
+  }
   ExecutorSplitPrefetch::takeCacheHint(
-      executor_, connectorQueryCtx_->queryId(), *cachePrefetchHintKey_);
+      executor_,
+      *cachePrefetchQueryId_,
+      *cachePrefetchHintKey_,
+      splitPreload ? CacheHintWaitMode::kSplitPreload
+                   : CacheHintWaitMode::kScan);
+}
+
+void CudfSplitReader::releaseCachePrefetchHint() {
+  if (cachePrefetchNonBlockingRequested_ && cachePrefetchQueryId_ &&
+      cachePrefetchHintKey_) {
+    ExecutorSplitPrefetch::releaseCacheHint(
+        executor_, *cachePrefetchQueryId_, *cachePrefetchHintKey_);
+  }
+  cachePrefetchQueryId_.reset();
+  cachePrefetchHintKey_.reset();
+  cachePrefetchNonBlockingRequested_ = false;
+  cachePrefetchFirstLoadPolicyEnabled_ = false;
+  cachePrefetchFirstLoadReady_ = false;
 }
 
 void CudfSplitReader::prepareExperimentalHostRead() {
@@ -656,6 +783,7 @@ void CudfSplitReader::setupExperimentalScan() {
 }
 
 void CudfSplitReader::resetSplit() {
+  releaseCachePrefetchHint();
   splitReader_.reset();
   exptSplitReader_.reset();
   hybridScanState_.reset();
@@ -664,6 +792,7 @@ void CudfSplitReader::resetSplit() {
   selectivePreloadBuffers_.clear();
   selectivePreloadResult_.reset();
   fileMetaData_.clear();
+  cachePrefetchHintWaited_ = false;
 }
 
 cudf::ast::expression const* CudfSplitReader::pushdownFilter() const {
@@ -1210,6 +1339,12 @@ void CudfSplitReader::createCudfReader() {
   setupReaderOptions();
 
   setupCachePrefetchHint();
+
+  // Make the existing TableScan ready-first selection reflect projected cache
+  // range readiness, not just footer parsing and reader construction.
+  if (cacheHintReadySplitPreloadEnabled() && cachePrefetchHintKey_) {
+    waitForCachePrefetchHint(/*splitPreload=*/true);
+  }
 
   auto sources = makeDataSourceViews();
 
