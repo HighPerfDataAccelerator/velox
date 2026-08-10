@@ -2917,6 +2917,7 @@ FetchedDeviceByteRanges fetchByteRangesAsync(
         std::move(prepared), byteRanges, stream, mr);
   }
 
+#ifdef VELOX_ENABLE_S3
   using PackedHostRead = std::function<size_t(
       const std::vector<size_t>&,
       const std::vector<size_t>&,
@@ -3058,6 +3059,7 @@ FetchedDeviceByteRanges fetchByteRangesAsync(
         std::move(columnChunkData),
         std::async(std::launch::deferred, [] {})};
   }
+#endif
 
   // Allocate single device buffer for all column chunks
   std::vector<rmm::device_buffer> columnChunkBuffers{};
