@@ -53,6 +53,8 @@ struct CudfConfig {
       "cudf.batch_size_min_threshold_bytes"};
   static constexpr const char* kCudfBatchSizeMaxThreshold{
       "cudf.batch_size_max_threshold"};
+  static constexpr const char* kCudfHashJoinLoadFactor{
+      "cudf.hash_join_load_factor"};
   static constexpr const char* kCudfConcatOptimizationEnabled{
       "cudf.concat_optimization_enabled"};
   static constexpr const char* kCudfGroupbyStreamingMaxDistinctKeys{
@@ -281,6 +283,10 @@ struct CudfConfig {
   /// Maximum rows allowed in a concatenated batch (user configurable).
   /// When not set, cuDF's own `size_type::max()` is used.
   std::optional<int32_t> batchSizeMaxThreshold;
+
+  /// Hash-table occupancy used by cuDF hash joins. Higher values reduce
+  /// retained build memory at the cost of additional probe collisions.
+  double hashJoinLoadFactor{0.5};
   // Query config key for the TopN batch size in the cuDF TopN operator.
   int32_t topNBatchSize{5};
 

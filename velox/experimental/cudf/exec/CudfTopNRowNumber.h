@@ -42,10 +42,17 @@ namespace facebook::velox::cudf_velox {
 
 class CudaEvent;
 
-/// GPU-accelerated TopNRowNumber.  The existing incremental top-N algorithm
-/// handles the general row_number case.  Partitioned limit=1 plans use the
-/// same operator's bounded host/disk state when their candidate set outgrows
-/// the configured device tier.
+/// GPU-accelerated TopNRowNumber: partitioned top-N with row_number, or with
+/// dense_rank when there is one ordering key. Partitioned row_number limit=1
+/// plans use the same operator's bounded host/disk state when their candidate
+/// set outgrows the configured device tier.
+///
+/// Retained state is bounded to O(limit * distinct partitions) rather than
+/// the full input: each input batch is locally reduced to its own top-`limit`
+/// rows per partition, then merged with the running `candidates_` (which
+/// already holds the top-`limit` rows per partition across all prior
+/// batches) and pruned back down to `limit` rows per partition. See
+/// reduceBatchToLocalCandidates() and mergeAndPruneCandidates().
 class CudfTopNRowNumber : public CudfOperatorBase {
  public:
   CudfTopNRowNumber(
@@ -348,6 +355,7 @@ class CudfTopNRowNumber : public CudfOperatorBase {
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr);
 
+  const core::TopNRowNumberNode::RankFunction rankFunction_;
   const int32_t limit_;
   const bool generateRowNumber_;
   const bool partialOutput_;

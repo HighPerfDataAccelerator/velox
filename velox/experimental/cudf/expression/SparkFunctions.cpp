@@ -23,9 +23,98 @@
 #include "velox/experimental/cudf/expression/sparksql/SubStringFunction.h"
 
 #include "velox/expression/FunctionSignature.h"
+#include "velox/functions/sparksql/SparkQueryConfig.h"
+
+#include <cudf/filling.hpp>
+#include <cudf/scalar/scalar.hpp>
+
+#include <folly/Synchronized.h>
+#include <folly/container/F14Map.h>
+
+#include <atomic>
 
 namespace facebook::velox::cudf_velox {
 namespace {
+
+struct MonotonicallyIncreasingIdState {
+  std::atomic<int64_t> nextOffset{0};
+};
+
+std::shared_ptr<MonotonicallyIncreasingIdState> monotonicallyIncreasingIdState(
+    const core::QueryCtx* queryCtx) {
+  if (queryCtx == nullptr) {
+    return std::make_shared<MonotonicallyIncreasingIdState>();
+  }
+
+  static folly::Synchronized<folly::F14FastMap<
+      const core::QueryCtx*,
+      std::weak_ptr<MonotonicallyIncreasingIdState>>>
+      states;
+  return states.withWLock([&](auto& stateMap) {
+    auto& weakState = stateMap[queryCtx];
+    if (auto state = weakState.lock()) {
+      return state;
+    }
+    auto state = std::make_shared<MonotonicallyIncreasingIdState>();
+    weakState = state;
+    return state;
+  });
+}
+
+class MonotonicallyIncreasingIdFunction : public CudfFunction {
+ public:
+  explicit MonotonicallyIncreasingIdFunction(const core::TypedExprPtr& expr) {
+    VELOX_CHECK_EQ(
+        expr->inputs().size(),
+        0,
+        "monotonically_increasing_id expects no inputs");
+    VELOX_CHECK(
+        expr->type()->kind() == TypeKind::BIGINT,
+        "monotonically_increasing_id output must be BIGINT");
+
+    const auto* queryConfig = currentCudfFunctionQueryConfig();
+    const auto partitionId = queryConfig == nullptr
+        ? 0
+        : functions::sparksql::SparkQueryConfig{*queryConfig}.partitionId();
+    partitionBase_ = static_cast<int64_t>(partitionId) << 33;
+    state_ = monotonicallyIncreasingIdState(currentCudfFunctionQueryCtx());
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    const auto inputRowCount = inputColumns.empty()
+        ? cudf::size_type{0}
+        : asView(inputColumns.front()).size();
+    return eval(inputColumns, inputRowCount, stream, mr);
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      cudf::size_type inputRowCount,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    VELOX_CHECK(inputColumns.empty());
+    constexpr int64_t kRowsPerPartition = int64_t{1} << 33;
+    const auto rowCount = static_cast<int64_t>(inputRowCount);
+    const auto startOffset =
+        state_->nextOffset.fetch_add(rowCount, std::memory_order_relaxed);
+    VELOX_CHECK_GE(startOffset, 0);
+    VELOX_CHECK_LE(
+        startOffset,
+        kRowsPerPartition - rowCount,
+        "monotonically_increasing_id exceeded 2^33 rows in one partition");
+    cudf::numeric_scalar<int64_t> init(
+        partitionBase_ + startOffset, true, stream, mr);
+    cudf::numeric_scalar<int64_t> step(1, true, stream, mr);
+    return cudf::sequence(inputRowCount, init, step, stream, mr);
+  }
+
+ private:
+  int64_t partitionBase_{0};
+  std::shared_ptr<MonotonicallyIncreasingIdState> state_;
+};
 
 void registerSparkArrayAccessFunctions(const std::string& prefix) {
   // Spark get is 0 based and returns NULL for negative or out-of-bounds
@@ -125,6 +214,15 @@ void registerSparkFunctions(const std::string& prefix) {
            .build()},
       true,
       DateTruncFunction::canEvaluate);
+
+  registerCudfFunction(
+      prefix + "monotonically_increasing_id",
+      [](const std::string&,
+         const core::TypedExprPtr& expr,
+         memory::MemoryPool*) {
+        return std::make_shared<MonotonicallyIncreasingIdFunction>(expr);
+      },
+      {FunctionSignatureBuilder().returnType("bigint").build()});
 
   registerSparkArrayAccessFunctions(prefix);
 }

@@ -46,6 +46,7 @@
 #include <functional>
 #include <future>
 #include <iostream>
+#include <limits>
 #include <optional>
 #include <streambuf>
 #include <vector>
@@ -321,11 +322,15 @@ struct NativeS3ReadGroup {
   std::vector<folly::Range<char*>> destinations;
 };
 
-/// Groups caller-owned destinations into the minimum number of contiguous
-/// file ranges. Null destinations represent logical gaps and split groups.
+/// Groups caller-owned destinations into bounded file ranges. Null
+/// destinations represent logical gaps. Gaps up to 'maxGapBytes' are retained
+/// as discard spans when the resulting request does not exceed
+/// 'maxRangeBytes'. Zero gap bytes preserves exact contiguous-only grouping.
 std::vector<NativeS3ReadGroup> groupNativeS3ReadDestinations(
     uint64_t offset,
-    const std::vector<folly::Range<char*>>& destinations);
+    const std::vector<folly::Range<char*>>& destinations,
+    uint64_t maxGapBytes = 0,
+    uint64_t maxRangeBytes = std::numeric_limits<uint64_t>::max());
 
 class NativeS3ScatterWriteStreamBuf : public std::streambuf {
  public:
@@ -355,7 +360,8 @@ class NativeS3ScatterWriteStreamBuf : public std::streambuf {
 };
 
 /// AWS response stream that scatters a single Range GET body directly across
-/// caller-owned cache page destinations.
+/// caller-owned cache page destinations. Null destinations discard coalesced
+/// gap bytes without allocating a bounce buffer.
 class NativeS3ScatterWriteStream : private NativeS3ScatterWriteStreamBuf,
                                    public std::iostream {
  public:

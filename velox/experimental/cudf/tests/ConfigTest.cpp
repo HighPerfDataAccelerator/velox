@@ -31,6 +31,7 @@ TEST(ConfigTest, CudfConfig) {
   EXPECT_EQ(defaults.exchangeBatchSizeMinThresholdBytes, 0);
   EXPECT_EQ(defaults.deviceMemoryMinHeadroomBytes, 6ULL << 30);
   EXPECT_EQ(defaults.deviceMemoryMinReclaimBytes, 2ULL << 30);
+  EXPECT_DOUBLE_EQ(defaults.hashJoinLoadFactor, 0.5);
 
   std::unordered_map<std::string, std::string> options = {
       {CudfConfig::kCudfEnabled, "false"},
@@ -51,6 +52,7 @@ TEST(ConfigTest, CudfConfig) {
       {CudfConfig::kCudfHashJoinGraceRestoreBytes, "3221225472"},
       {CudfConfig::kCudfHashJoinGraceProbeRestoreBytes, "805306368"},
       {CudfConfig::kCudfExchangeBatchSizeMinThresholdBytes, "8388608"},
+      {CudfConfig::kCudfHashJoinLoadFactor, "0.7"},
       {CudfConfig::kCudfOrderByMergeFanIn, "7"},
       {CudfConfig::kCudfWindowSortedRunBytes, "134217728"},
       {CudfConfig::kCudfTopNRowNumberFinalizeInputBytes, "67108864"},
@@ -74,6 +76,7 @@ TEST(ConfigTest, CudfConfig) {
   ASSERT_EQ(config.hashJoinGraceRestoreBytes, 3221225472);
   ASSERT_EQ(config.hashJoinGraceProbeRestoreBytes, 805306368);
   ASSERT_EQ(config.exchangeBatchSizeMinThresholdBytes, 8388608);
+  ASSERT_DOUBLE_EQ(config.hashJoinLoadFactor, 0.7);
   ASSERT_EQ(config.allowCpuFallback, false);
   ASSERT_EQ(config.groupbyStreamingMaxDistinctKeys, 16777216);
   ASSERT_EQ(config.orderBySortedRunBytes, 67108864);
@@ -111,6 +114,16 @@ TEST(ConfigTest, TopNRowNumberFinalizeBounds) {
   CudfConfig overflowOutputRows;
   EXPECT_ANY_THROW(overflowOutputRows.initialize(
       {{CudfConfig::kCudfTopNRowNumberMaxOutputRows, "2147483648"}}));
+}
+
+TEST(ConfigTest, HashJoinLoadFactorBounds) {
+  CudfConfig zero;
+  EXPECT_ANY_THROW(
+      zero.initialize({{CudfConfig::kCudfHashJoinLoadFactor, "0"}}));
+
+  CudfConfig aboveOne;
+  EXPECT_ANY_THROW(
+      aboveOne.initialize({{CudfConfig::kCudfHashJoinLoadFactor, "1.01"}}));
 }
 
 TEST(ConfigTest, WindowBounds) {

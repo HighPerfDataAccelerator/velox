@@ -593,6 +593,10 @@ class HashJoinProbeAdapter : public CudfHashJoinBaseAdapter {
         std::dynamic_pointer_cast<const core::HashJoinNode>(planNode);
 
     std::vector<std::unique_ptr<exec::Operator>> result;
+    if (CudfConfig::getInstance().concatOptimizationEnabled) {
+      result.push_back(
+          std::make_unique<CudfBatchConcat>(operatorId, ctx, joinPlanNode));
+    }
     result.push_back(
         std::make_unique<CudfHashJoinProbe>(operatorId, ctx, joinPlanNode));
     return result;
@@ -813,17 +817,21 @@ class TopNRowNumberAdapter : public OperatorAdapter {
       exec::DriverCtx* /*ctx*/) const override {
     auto node =
         std::dynamic_pointer_cast<const core::TopNRowNumberNode>(planNode);
-    const bool communityCanRun =
+    const bool supportedRank =
         node != nullptr &&
-        node->rankFunction() ==
-            core::TopNRowNumberNode::RankFunction::kRowNumber;
-    const bool canRun = canHandle(op) && communityCanRun;
+        (node->rankFunction() ==
+             core::TopNRowNumberNode::RankFunction::kRowNumber ||
+         (node->rankFunction() ==
+              core::TopNRowNumberNode::RankFunction::kDenseRank &&
+          node->sortingKeys().size() == 1));
+    const bool canRun = canHandle(op) && supportedRank;
     if (!canRun) {
       LOG_FALLBACK(
           "TopNRowNumberAdapter {}, PlanNode id: {}",
           !canHandle(op) ? "operator is not TopNRowNumber"
               : !node ? "planNode is not TopNRowNumberNode"
-                      : "CudfTopNRowNumber supports only row_number",
+                      : "CudfTopNRowNumber supports row_number and "
+                        "single-key dense_rank",
           planNode->id());
     }
     return canRun;
@@ -1377,12 +1385,20 @@ class ExchangeAdapter : public OperatorAdapter {
             operatorId, ctx, planNode, std::move(client)));
     if (CudfConfig::getInstance().concatOptimizationEnabled &&
         CudfConfig::getInstance().exchangeConcatOptimizationEnabled) {
+      const auto& cudfConfig = CudfConfig::getInstance();
+      const auto targetRows = ctx->queryConfig().get<int32_t>(
+          CudfConfig::kCudfExchangeBatchSizeMinThreshold,
+          cudfConfig.exchangeBatchSizeMinThreshold);
+      const auto targetBytes = ctx->queryConfig().get<uint64_t>(
+          CudfConfig::kCudfExchangeBatchSizeMinThresholdBytes,
+          cudfConfig.exchangeBatchSizeMinThresholdBytes);
       result.push_back(std::make_unique<CudfBatchConcat>(
           operatorId,
           ctx,
           planNode,
           planNode->outputType(),
-          CudfConfig::getInstance().exchangeBatchSizeMinThreshold));
+          targetRows,
+          targetBytes));
     }
     return result;
   }

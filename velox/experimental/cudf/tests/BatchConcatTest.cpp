@@ -16,6 +16,8 @@
 
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
+#include "velox/experimental/cudf/exec/Utilities.h"
+#include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 
 #include "velox/exec/PlanNodeStats.h"
 #include "velox/exec/tests/utils/AssertQueryBuilder.h"
@@ -581,4 +583,22 @@ TEST_F(CudfBatchConcatTest, concatSplitsZeroColumnBatchesAtMaxThreshold) {
   EXPECT_EQ(concatIt->second->inputVectors, 3);
   EXPECT_EQ(concatIt->second->outputVectors, 2)
       << "30 zero-column rows should be split into 20-row and 10-row batches";
+}
+
+TEST_F(CudfBatchConcatTest, batchedConcatSplitsSingleOversizedInput) {
+  auto input = makeRowVector({makeFlatSequence<int64_t>(0, 10)});
+  auto inputType = asRowType(input->type());
+  auto stream = cudf::get_default_stream();
+  auto mr = cudf::get_current_device_resource_ref();
+  auto table = with_arrow::toCudfTable(input, pool_.get(), stream, mr);
+  std::vector<CudfVectorPtr> inputs;
+  inputs.push_back(std::make_shared<CudfVector>(
+      pool_.get(), inputType, input->size(), std::move(table), stream));
+
+  auto outputs =
+      getConcatenatedTableBatched(std::move(inputs), inputType, stream, mr, 4);
+  ASSERT_EQ(outputs.size(), 3);
+  EXPECT_EQ(outputs[0]->num_rows(), 4);
+  EXPECT_EQ(outputs[1]->num_rows(), 4);
+  EXPECT_EQ(outputs[2]->num_rows(), 2);
 }

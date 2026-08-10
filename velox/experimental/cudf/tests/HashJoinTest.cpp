@@ -3256,15 +3256,12 @@ TEST_F(HashJoinTest, nullAwareRightSemiProjectOverScan) {
         {buildScanId, {buildFile->getPath()}},
     };
 
-    // right semi project not supported
-    VELOX_ASSERT_THROW(
-        HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
-            .planNode(plan)
-            .inputSplits(splitPaths)
-            .checkSpillStats(false)
-            .referenceQuery("SELECT u0, u0 IN (SELECT t0 FROM t) FROM u")
-            .run(),
-        "Replacement with cuDF operator failed");
+    HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
+        .planNode(plan)
+        .inputSplits(splitPaths)
+        .checkSpillStats(false)
+        .referenceQuery("SELECT u0, u0 IN (SELECT t0 FROM t) FROM u")
+        .run();
   }
 }
 
@@ -3412,16 +3409,13 @@ TEST_F(HashJoinTest, semiProject) {
           "SELECT t.c0, t.c1, EXISTS (SELECT * FROM u WHERE t.c0 = u.c0) FROM t")
       .run();
 
-  // right semi project not supported
-  VELOX_ASSERT_THROW(
-      HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
-          .injectSpill(false)
-          .checkSpillStats(false)
-          .planNode(flipJoinSides(plan))
-          .referenceQuery(
-              "SELECT t.c0, t.c1, EXISTS (SELECT * FROM u WHERE t.c0 = u.c0) FROM t")
-          .run(),
-      "Replacement with cuDF operator failed");
+  HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
+      .injectSpill(false)
+      .checkSpillStats(false)
+      .planNode(flipJoinSides(plan))
+      .referenceQuery(
+          "SELECT t.c0, t.c1, EXISTS (SELECT * FROM u WHERE t.c0 = u.c0) FROM t")
+      .run();
 
   // With extra filter.
   planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
@@ -3448,16 +3442,13 @@ TEST_F(HashJoinTest, semiProject) {
           "SELECT t.c0, t.c1, EXISTS (SELECT * FROM u WHERE t.c0 = u.c0 AND t.c1 * 10 <> u.c1) FROM t")
       .run();
 
-  // right semi project not supported
-  VELOX_ASSERT_THROW(
-      HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
-          .injectSpill(false)
-          .checkSpillStats(false)
-          .planNode(flipJoinSides(plan))
-          .referenceQuery(
-              "SELECT t.c0, t.c1, EXISTS (SELECT * FROM u WHERE t.c0 = u.c0 AND t.c1 * 10 <> u.c1) FROM t")
-          .run(),
-      "Replacement with cuDF operator failed");
+  HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
+      .injectSpill(false)
+      .checkSpillStats(false)
+      .planNode(flipJoinSides(plan))
+      .referenceQuery(
+          "SELECT t.c0, t.c1, EXISTS (SELECT * FROM u WHERE t.c0 = u.c0 AND t.c1 * 10 <> u.c1) FROM t")
+      .run();
 
   // Empty build side.
   planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
@@ -3487,19 +3478,16 @@ TEST_F(HashJoinTest, semiProject) {
       // build-side rows have been filtered out.
       .run();
 
-  // right semi project not supported
-  VELOX_ASSERT_THROW(
-      HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
-          .injectSpill(false)
-          .checkSpillStats(false)
-          .planNode(flipJoinSides(plan))
-          .referenceQuery(
-              "SELECT t.c0, t.c1, EXISTS (SELECT * FROM u WHERE u.c0 < 0 AND t.c0 = u.c0) FROM t")
-          // NOTE: there is no spilling in empty build test case as all the
-          // build-side rows have been filtered out.
-          .checkSpillStats(false)
-          .run(),
-      "Replacement with cuDF operator failed");
+  HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
+      .injectSpill(false)
+      .checkSpillStats(false)
+      .planNode(flipJoinSides(plan))
+      .referenceQuery(
+          "SELECT t.c0, t.c1, EXISTS (SELECT * FROM u WHERE u.c0 < 0 AND t.c0 = u.c0) FROM t")
+      // NOTE: there is no spilling in empty build test case as all the
+      // build-side rows have been filtered out.
+      .checkSpillStats(false)
+      .run();
 }
 
 TEST_F(HashJoinTest, semiProjectWithNullKeys) {
@@ -3564,16 +3552,13 @@ TEST_F(HashJoinTest, semiProjectWithNullKeys) {
           "SELECT t0, t1, EXISTS (SELECT * FROM u WHERE u0 = t0) FROM t")
       .run();
 
-  // right semi project not supported
-  VELOX_ASSERT_THROW(
-      HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
-          .injectSpill(false)
-          .checkSpillStats(false)
-          .planNode(flipJoinSides(plan))
-          .referenceQuery(
-              "SELECT t0, t1, EXISTS (SELECT * FROM u WHERE u0 = t0) FROM t")
-          .run(),
-      "Replacement with cuDF operator failed");
+  HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
+      .injectSpill(false)
+      .checkSpillStats(false)
+      .planNode(flipJoinSides(plan))
+      .referenceQuery(
+          "SELECT t0, t1, EXISTS (SELECT * FROM u WHERE u0 = t0) FROM t")
+      .run();
 
   plan = makePlan(true /*nullAware*/);
 
@@ -3585,15 +3570,12 @@ TEST_F(HashJoinTest, semiProjectWithNullKeys) {
       .referenceQuery("SELECT t0, t1, t0 IN (SELECT u0 FROM u) FROM t")
       .run();
 
-  // null-aware right semi project not supported
-  VELOX_ASSERT_THROW(
-      HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
-          .injectSpill(false)
-          .checkSpillStats(false)
-          .planNode(flipJoinSides(plan))
-          .referenceQuery("SELECT t0, t1, t0 IN (SELECT u0 FROM u) FROM t")
-          .run(),
-      "Replacement with cuDF operator failed");
+  HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
+      .injectSpill(false)
+      .checkSpillStats(false)
+      .planNode(flipJoinSides(plan))
+      .referenceQuery("SELECT t0, t1, t0 IN (SELECT u0 FROM u) FROM t")
+      .run();
 
   // Null join keys on build side-only.
   plan = makePlan(false /*nullAware*/, "t0 IS NOT NULL");
@@ -3606,16 +3588,13 @@ TEST_F(HashJoinTest, semiProjectWithNullKeys) {
           "SELECT t0, t1, EXISTS (SELECT * FROM u WHERE u0 = t0) FROM t WHERE t0 IS NOT NULL")
       .run();
 
-  // right semi project not supported
-  VELOX_ASSERT_THROW(
-      HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
-          .injectSpill(false)
-          .checkSpillStats(false)
-          .planNode(flipJoinSides(plan))
-          .referenceQuery(
-              "SELECT t0, t1, EXISTS (SELECT * FROM u WHERE u0 = t0) FROM t WHERE t0 IS NOT NULL")
-          .run(),
-      "Replacement with cuDF operator failed");
+  HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
+      .injectSpill(false)
+      .checkSpillStats(false)
+      .planNode(flipJoinSides(plan))
+      .referenceQuery(
+          "SELECT t0, t1, EXISTS (SELECT * FROM u WHERE u0 = t0) FROM t WHERE t0 IS NOT NULL")
+      .run();
 
   plan = makePlan(true /*nullAware*/, "t0 IS NOT NULL");
 
@@ -3628,16 +3607,13 @@ TEST_F(HashJoinTest, semiProjectWithNullKeys) {
           "SELECT t0, t1, t0 IN (SELECT u0 FROM u) FROM t WHERE t0 IS NOT NULL")
       .run();
 
-  // null-aware right semi project not supported
-  VELOX_ASSERT_THROW(
-      HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
-          .injectSpill(false)
-          .checkSpillStats(false)
-          .planNode(flipJoinSides(plan))
-          .referenceQuery(
-              "SELECT t0, t1, t0 IN (SELECT u0 FROM u) FROM t WHERE t0 IS NOT NULL")
-          .run(),
-      "Replacement with cuDF operator failed");
+  HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
+      .injectSpill(false)
+      .checkSpillStats(false)
+      .planNode(flipJoinSides(plan))
+      .referenceQuery(
+          "SELECT t0, t1, t0 IN (SELECT u0 FROM u) FROM t WHERE t0 IS NOT NULL")
+      .run();
 
   // Null join keys on probe side-only.
   plan = makePlan(false /*nullAware*/, "", "u0 IS NOT NULL");
@@ -3650,16 +3626,13 @@ TEST_F(HashJoinTest, semiProjectWithNullKeys) {
           "SELECT t0, t1, EXISTS (SELECT * FROM u WHERE u0 = t0 AND u0 IS NOT NULL) FROM t")
       .run();
 
-  // right semi project not supported
-  VELOX_ASSERT_THROW(
-      HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
-          .injectSpill(false)
-          .checkSpillStats(false)
-          .planNode(flipJoinSides(plan))
-          .referenceQuery(
-              "SELECT t0, t1, EXISTS (SELECT * FROM u WHERE u0 = t0 AND u0 IS NOT NULL) FROM t")
-          .run(),
-      "Replacement with cuDF operator failed");
+  HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
+      .injectSpill(false)
+      .checkSpillStats(false)
+      .planNode(flipJoinSides(plan))
+      .referenceQuery(
+          "SELECT t0, t1, EXISTS (SELECT * FROM u WHERE u0 = t0 AND u0 IS NOT NULL) FROM t")
+      .run();
 
   plan = makePlan(true /*nullAware*/, "", "u0 IS NOT NULL");
 
@@ -3672,16 +3645,13 @@ TEST_F(HashJoinTest, semiProjectWithNullKeys) {
           "SELECT t0, t1, t0 IN (SELECT u0 FROM u WHERE u0 IS NOT NULL) FROM t")
       .run();
 
-  // null-aware right semi project not supported
-  VELOX_ASSERT_THROW(
-      HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
-          .injectSpill(false)
-          .checkSpillStats(false)
-          .planNode(flipJoinSides(plan))
-          .referenceQuery(
-              "SELECT t0, t1, t0 IN (SELECT u0 FROM u WHERE u0 IS NOT NULL) FROM t")
-          .run(),
-      "Replacement with cuDF operator failed");
+  HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
+      .injectSpill(false)
+      .checkSpillStats(false)
+      .planNode(flipJoinSides(plan))
+      .referenceQuery(
+          "SELECT t0, t1, t0 IN (SELECT u0 FROM u WHERE u0 IS NOT NULL) FROM t")
+      .run();
 
   // Empty build side.
   plan = makePlan(false /*nullAware*/, "", "u0 < 0");
@@ -3694,16 +3664,13 @@ TEST_F(HashJoinTest, semiProjectWithNullKeys) {
           "SELECT t0, t1, EXISTS (SELECT * FROM u WHERE u0 = t0 AND u0 < 0) FROM t")
       .run();
 
-  // right semi project not supported
-  VELOX_ASSERT_THROW(
-      HashJoinBuilder(*pool_, duckDbQueryRunner_, executor_.get())
-          .planNode(flipJoinSides(plan))
-          .injectSpill(false)
-          .checkSpillStats(false)
-          .referenceQuery(
-              "SELECT t0, t1, EXISTS (SELECT * FROM u WHERE u0 = t0 AND u0 < 0) FROM t")
-          .run(),
-      "Replacement with cuDF operator failed");
+  HashJoinBuilder(*pool_, duckDbQueryRunner_, executor_.get())
+      .planNode(flipJoinSides(plan))
+      .injectSpill(false)
+      .checkSpillStats(false)
+      .referenceQuery(
+          "SELECT t0, t1, EXISTS (SELECT * FROM u WHERE u0 = t0 AND u0 < 0) FROM t")
+      .run();
 
   plan = makePlan(true /*nullAware*/, "", "u0 < 0");
 
@@ -3716,16 +3683,13 @@ TEST_F(HashJoinTest, semiProjectWithNullKeys) {
           "SELECT t0, t1, t0 IN (SELECT u0 FROM u WHERE u0 < 0) FROM t")
       .run();
 
-  // null-aware right semi project not supported
-  VELOX_ASSERT_THROW(
-      HashJoinBuilder(*pool_, duckDbQueryRunner_, executor_.get())
-          .planNode(flipJoinSides(plan))
-          .injectSpill(false)
-          .checkSpillStats(false)
-          .referenceQuery(
-              "SELECT t0, t1, t0 IN (SELECT u0 FROM u WHERE u0 < 0) FROM t")
-          .run(),
-      "Replacement with cuDF operator failed");
+  HashJoinBuilder(*pool_, duckDbQueryRunner_, executor_.get())
+      .planNode(flipJoinSides(plan))
+      .injectSpill(false)
+      .checkSpillStats(false)
+      .referenceQuery(
+          "SELECT t0, t1, t0 IN (SELECT u0 FROM u WHERE u0 < 0) FROM t")
+      .run();
 
   // Build side with all rows having null join keys.
   plan = makePlan(false /*nullAware*/, "", "u0 IS NULL");
@@ -3738,16 +3702,13 @@ TEST_F(HashJoinTest, semiProjectWithNullKeys) {
           "SELECT t0, t1, EXISTS (SELECT * FROM u WHERE u0 = t0 AND u0 IS NULL) FROM t")
       .run();
 
-  // right semi project not supported
-  VELOX_ASSERT_THROW(
-      HashJoinBuilder(*pool_, duckDbQueryRunner_, executor_.get())
-          .planNode(flipJoinSides(plan))
-          .injectSpill(false)
-          .checkSpillStats(false)
-          .referenceQuery(
-              "SELECT t0, t1, EXISTS (SELECT * FROM u WHERE u0 = t0 AND u0 IS NULL) FROM t")
-          .run(),
-      "Replacement with cuDF operator failed");
+  HashJoinBuilder(*pool_, duckDbQueryRunner_, executor_.get())
+      .planNode(flipJoinSides(plan))
+      .injectSpill(false)
+      .checkSpillStats(false)
+      .referenceQuery(
+          "SELECT t0, t1, EXISTS (SELECT * FROM u WHERE u0 = t0 AND u0 IS NULL) FROM t")
+      .run();
 
   plan = makePlan(true /*nullAware*/, "", "u0 IS NULL");
 
@@ -3760,16 +3721,13 @@ TEST_F(HashJoinTest, semiProjectWithNullKeys) {
           "SELECT t0, t1, t0 IN (SELECT u0 FROM u WHERE u0 IS NULL) FROM t")
       .run();
 
-  // null-aware right semi project not supported
-  VELOX_ASSERT_THROW(
-      HashJoinBuilder(*pool_, duckDbQueryRunner_, executor_.get())
-          .planNode(flipJoinSides(plan))
-          .injectSpill(false)
-          .checkSpillStats(false)
-          .referenceQuery(
-              "SELECT t0, t1, t0 IN (SELECT u0 FROM u WHERE u0 IS NULL) FROM t")
-          .run(),
-      "Replacement with cuDF operator failed");
+  HashJoinBuilder(*pool_, duckDbQueryRunner_, executor_.get())
+      .planNode(flipJoinSides(plan))
+      .injectSpill(false)
+      .checkSpillStats(false)
+      .referenceQuery(
+          "SELECT t0, t1, t0 IN (SELECT u0 FROM u WHERE u0 IS NULL) FROM t")
+      .run();
 }
 
 TEST_F(HashJoinTest, semiProjectWithFilter) {
@@ -4417,15 +4375,12 @@ TEST_F(HashJoinTest, semiProjectOverLazyVectors) {
       .referenceQuery("SELECT t0, t1, t0 IN (SELECT u0 FROM u) FROM t")
       .run();
 
-  // right semi project not supported
-  VELOX_ASSERT_THROW(
-      HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
-          .planNode(flipJoinSides(plan))
-          .inputSplits(splitPaths)
-          .checkSpillStats(false)
-          .referenceQuery("SELECT t0, t1, t0 IN (SELECT u0 FROM u) FROM t")
-          .run(),
-      "Replacement with cuDF operator failed");
+  HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
+      .planNode(flipJoinSides(plan))
+      .inputSplits(splitPaths)
+      .checkSpillStats(false)
+      .referenceQuery("SELECT t0, t1, t0 IN (SELECT u0 FROM u) FROM t")
+      .run();
 
   // With extra filter.
   planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
@@ -4452,16 +4407,13 @@ TEST_F(HashJoinTest, semiProjectOverLazyVectors) {
           "SELECT t0, t1, t0 IN (SELECT u0 FROM u WHERE (t1 + u1) % 3 = 0) FROM t")
       .run();
 
-  // right semi project not supported
-  VELOX_ASSERT_THROW(
-      HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
-          .planNode(flipJoinSides(plan))
-          .inputSplits(splitPaths)
-          .checkSpillStats(false)
-          .referenceQuery(
-              "SELECT t0, t1, t0 IN (SELECT u0 FROM u WHERE (t1 + u1) % 3 = 0) FROM t")
-          .run(),
-      "Replacement with cuDF operator failed");
+  HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
+      .planNode(flipJoinSides(plan))
+      .inputSplits(splitPaths)
+      .checkSpillStats(false)
+      .referenceQuery(
+          "SELECT t0, t1, t0 IN (SELECT u0 FROM u WHERE (t1 + u1) % 3 = 0) FROM t")
+      .run();
 }
 
 // Tests for join filters that require precomputation (non-AST operations)

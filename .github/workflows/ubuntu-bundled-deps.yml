@@ -13,8 +13,7 @@
 # limitations under the License.
 
 # Tests the BUNDLED dependency resolution path on a plain Ubuntu runner
-# (no container). Triggered on PRs that change dependency scripts or
-# CMake modules, and on a nightly schedule.
+# (no container). During Phase 0 it runs on a nightly schedule or manually.
 
 name: Ubuntu Bundled Dependencies
 
@@ -22,15 +21,6 @@ on:
   schedule:
     - cron: 0 5 * * *
   workflow_dispatch: {}
-  pull_request:
-    paths:
-      - scripts/setup-*.sh
-      - scripts/setup-common.sh
-      - scripts/setup-versions.sh
-      - scripts/setup-helper-functions.sh
-      - CMake/**
-      - CMakeLists.txt
-      - .github/workflows/ubuntu-bundled-deps.yml
 
 permissions:
   contents: read

@@ -80,7 +80,9 @@ bool isMppFinalOutputBoundary(
     return false;
   }
 
-  return poNode->id().rfind("mpp_output_", 0) == 0 &&
+  const bool isMppOrFluxOutput = poNode->id().rfind("mpp_output_", 0) == 0 ||
+      poNode->id().rfind("flux_output_", 0) == 0;
+  return isMppOrFluxOutput &&
       poNode->transportKind() == core::TransportKind::kInMemory &&
       poNode->isPartitioned() && poNode->numPartitions() == 1 &&
       poNode->serdeKind() == "Presto";
@@ -641,6 +643,19 @@ void CudfConfig::initialize(
   if (config.find(kCudfBatchSizeMaxThreshold) != config.end()) {
     batchSizeMaxThreshold =
         folly::to<int32_t>(config[kCudfBatchSizeMaxThreshold]);
+  }
+  if (config.find(kCudfHashJoinLoadFactor) != config.end()) {
+    hashJoinLoadFactor = folly::to<double>(config[kCudfHashJoinLoadFactor]);
+    VELOX_USER_CHECK_GT(
+        hashJoinLoadFactor,
+        0,
+        "{} must be greater than zero",
+        kCudfHashJoinLoadFactor);
+    VELOX_USER_CHECK_LE(
+        hashJoinLoadFactor,
+        1,
+        "{} must not exceed one",
+        kCudfHashJoinLoadFactor);
   }
   if (config.find(kCudfConcatOptimizationEnabled) != config.end()) {
     concatOptimizationEnabled =

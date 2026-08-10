@@ -352,6 +352,56 @@ std::unique_ptr<cudf::column> computeGeneralRowNumbers(
       mr);
 }
 
+std::unique_ptr<cudf::column> computeDenseRanks(
+    cudf::table_view view,
+    const std::vector<cudf::size_type>& partitionKeyIndices,
+    cudf::size_type sortKeyIndex,
+    cudf::order sortOrder,
+    cudf::null_order nullOrder,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) {
+  std::unique_ptr<cudf::column> singlePartitionCol;
+  auto partKeys = makeGeneralPartitionKeys(
+      view, partitionKeyIndices, stream, mr, singlePartitionCol);
+  cudf::groupby::scan_request request;
+  request.values = view.column(sortKeyIndex);
+  request.aggregations.push_back(
+      cudf::make_rank_aggregation<cudf::groupby_scan_aggregation>(
+          cudf::rank_method::DENSE,
+          sortOrder,
+          cudf::null_policy::INCLUDE,
+          nullOrder));
+  cudf::groupby::groupby groupBy(
+      partKeys, cudf::null_policy::INCLUDE, cudf::sorted::YES);
+  std::vector<cudf::groupby::scan_request> requests;
+  requests.push_back(std::move(request));
+  auto result = groupBy.scan(requests, stream, mr);
+  return std::move(result.second.front().results.front());
+}
+
+std::unique_ptr<cudf::column> computeRanks(
+    cudf::table_view view,
+    const std::vector<cudf::size_type>& partitionKeyIndices,
+    core::TopNRowNumberNode::RankFunction rankFunction,
+    cudf::size_type sortKeyIndex,
+    cudf::order sortOrder,
+    cudf::null_order nullOrder,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) {
+  if (rankFunction == core::TopNRowNumberNode::RankFunction::kDenseRank) {
+    return computeDenseRanks(
+        view,
+        partitionKeyIndices,
+        sortKeyIndex,
+        sortOrder,
+        nullOrder,
+        stream,
+        mr);
+  }
+  return computeGeneralRowNumbers(view, partitionKeyIndices, stream, mr);
+}
+
+// Filters `rowNums` to <= limit and returns the resulting boolean mask.
 std::unique_ptr<cudf::column> makeGeneralLimitMask(
     const cudf::column& rowNums,
     int32_t limit,
@@ -407,6 +457,7 @@ CudfTopNRowNumber::CudfTopNRowNumber(
           NvtxMethodFlag::kAll,
           std::nullopt,
           node),
+      rankFunction_(node->rankFunction()),
       limit_(node->limit()),
       generateRowNumber_(node->generateRowNumber()),
       partialOutput_(node->partialOutput()),
@@ -445,10 +496,11 @@ CudfTopNRowNumber::CudfTopNRowNumber(
           driverCtx->queryConfig().abandonPartialTopNRowNumberMinRows()),
       abandonPartialMinPct_(
           driverCtx->queryConfig().abandonPartialTopNRowNumberMinPct()) {
-  VELOX_CHECK_EQ(
-      node->rankFunction(),
-      core::TopNRowNumberNode::RankFunction::kRowNumber,
-      "CudfTopNRowNumber only supports row_number");
+  VELOX_CHECK(
+      rankFunction_ == core::TopNRowNumberNode::RankFunction::kRowNumber ||
+          (rankFunction_ == core::TopNRowNumberNode::RankFunction::kDenseRank &&
+           node->sortingKeys().size() == 1),
+      "CudfTopNRowNumber supports row_number and single-key dense_rank");
   if (boundedTop1_) {
     addRuntimeStat("topNBoundedTop1Backend", RuntimeCounter(1));
     VELOX_CHECK_GT(
@@ -612,9 +664,20 @@ CudfVectorPtr CudfTopNRowNumber::reduceBatchToLocalCandidates(
       cudf::negative_index_policy::NOT_ALLOWED,
       stream,
       mr);
-  auto rowNums = computeGeneralRowNumbers(
-      sortedKeyTable->view(), generalPartitionKeys_, stream, mr);
-  auto mask = makeGeneralLimitMask(*rowNums, limit_, stream, mr);
+  auto ranks = computeRanks(
+      sortedKeyTable->view(),
+      generalPartitionKeys_,
+      rankFunction_,
+      static_cast<cudf::size_type>(generalPartitionKeys_.size()),
+      columnOrders_.at(partitionKeys_.size()),
+      nullOrders_.at(partitionKeys_.size()),
+      stream,
+      mr);
+  auto mask = makeGeneralLimitMask(*ranks, limit_, stream, mr);
+
+  // Filter the sort permutation to the surviving rows before gathering the
+  // full payload, so batches with many rows per partition don't pay for
+  // materializing rows that will be pruned immediately after.
   auto filteredIndicesTable = cudf::apply_boolean_mask(
       cudf::table_view{{indices->view()}}, mask->view(), stream, mr);
   auto localCandidatesTable = cudf::gather(
@@ -651,9 +714,16 @@ CudfVectorPtr CudfTopNRowNumber::mergeAndPruneCandidates(
       stream,
       mr);
   streamsWaitForStream(*generalCudaEvent_, inputStreams, stream);
-  auto rowNums =
-      computeGeneralRowNumbers(merged->view(), partitionKeys_, stream, mr);
-  auto mask = makeGeneralLimitMask(*rowNums, limit_, stream, mr);
+  auto ranks = computeRanks(
+      merged->view(),
+      partitionKeys_,
+      rankFunction_,
+      sortKeys_.front(),
+      columnOrders_.at(partitionKeys_.size()),
+      nullOrders_.at(partitionKeys_.size()),
+      stream,
+      mr);
+  auto mask = makeGeneralLimitMask(*ranks, limit_, stream, mr);
   auto pruned =
       cudf::apply_boolean_mask(merged->view(), mask->view(), stream, mr);
   const auto size = pruned->num_rows();
@@ -698,22 +768,27 @@ RowVectorPtr CudfTopNRowNumber::getOutputGeneral() {
   }
 
   auto stream = generalCandidates_->stream();
-  auto rowNums = computeGeneralRowNumbers(
+  auto mr = get_output_mr();
+  auto ranks = computeRanks(
       generalCandidates_->getTableView(),
       partitionKeys_,
+      rankFunction_,
+      sortKeys_.front(),
+      columnOrders_.at(partitionKeys_.size()),
+      nullOrders_.at(partitionKeys_.size()),
       stream,
-      get_output_mr());
+      mr);
+  // cuDF row_number and dense_rank are int32; Velox expects bigint.
   const auto rowNumberCudfType = cudf_velox::veloxToCudfDataType(
       outputType_->childAt(outputType_->size() - 1));
-  if (rowNums->type() != rowNumberCudfType) {
-    rowNums = cudf::cast(
-        *rowNums, rowNumberCudfType, stream, get_output_mr());
+  if (ranks->type() != rowNumberCudfType) {
+    ranks = cudf::cast(*ranks, rowNumberCudfType, stream, mr);
   }
 
   auto pool = generalCandidates_->pool();
   const auto size = generalCandidates_->size();
   auto columns = generalCandidates_->release()->release();
-  columns.push_back(std::move(rowNums));
+  columns.push_back(std::move(ranks));
   return std::make_shared<CudfVector>(
       pool,
       outputType_,

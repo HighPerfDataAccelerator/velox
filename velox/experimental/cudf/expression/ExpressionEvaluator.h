@@ -36,6 +36,7 @@
 #include <vector>
 
 namespace facebook::velox::core {
+class QueryConfig;
 class QueryCtx;
 } // namespace facebook::velox::core
 
@@ -87,6 +88,14 @@ class CudfFunction {
       std::vector<ColumnOrView>& inputColumns,
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr) const = 0;
+
+  virtual ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      cudf::size_type inputRowCount,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const {
+    return eval(inputColumns, stream, mr);
+  }
 };
 
 using CudfFunctionFactory = std::function<std::shared_ptr<CudfFunction>(
@@ -129,6 +138,10 @@ std::shared_ptr<CudfFunction> createCudfFunction(
     const core::TypedExprPtr& expr,
     memory::MemoryPool* pool);
 
+const core::QueryConfig* currentCudfFunctionQueryConfig();
+
+const core::QueryCtx* currentCudfFunctionQueryCtx();
+
 bool registerBuiltinFunctions(const std::string& prefix);
 
 void unregisterFunctions();
@@ -151,6 +164,15 @@ class CudfExpression {
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr,
       bool finalize = false) = 0;
+
+  virtual ColumnOrView eval(
+      std::vector<cudf::column_view> inputColumnViews,
+      cudf::size_type inputRowCount,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr,
+      bool finalize = false) {
+    return eval(std::move(inputColumnViews), stream, mr, finalize);
+  }
 };
 
 using CudfExpressionPtr = std::shared_ptr<CudfExpression>;
@@ -210,6 +232,13 @@ class FunctionExpression : public CudfExpression {
       rmm::device_async_resource_ref mr,
       bool finalize = false) override;
 
+  ColumnOrView eval(
+      std::vector<cudf::column_view> inputColumnViews,
+      cudf::size_type inputRowCount,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr,
+      bool finalize = false) override;
+
   void close() override;
 
   /// Check if this specific operation can be evaluated by FunctionExpression.
@@ -249,6 +278,21 @@ std::shared_ptr<CudfExpression> createCudfExpression(
     const RowTypePtr& inputRowSchema,
     memory::MemoryPool* pool,
     CudfExpressionBatchCachePtr batchCache = nullptr);
+
+std::shared_ptr<CudfExpression> createCudfExpression(
+    const core::TypedExprPtr& expr,
+    const RowTypePtr& inputRowSchema,
+    memory::MemoryPool* pool,
+    const core::QueryConfig* queryConfig,
+    const core::QueryCtx* queryCtx);
+
+std::shared_ptr<CudfExpression> createCudfExpression(
+    const core::TypedExprPtr& expr,
+    const RowTypePtr& inputRowSchema,
+    memory::MemoryPool* pool,
+    CudfExpressionBatchCachePtr batchCache,
+    const core::QueryConfig* queryConfig,
+    const core::QueryCtx* queryCtx);
 
 /// Plan-time GPU eligibility for a top-level operator expression, as invoked by
 /// the OperatorAdapters and the aggregation validators. Optimizes the

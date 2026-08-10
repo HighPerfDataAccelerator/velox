@@ -84,6 +84,30 @@ namespace facebook::velox::cudf_velox {
 // Implementation details in anonymous namespace
 namespace {
 
+thread_local const core::QueryConfig* currentFunctionQueryConfig = nullptr;
+thread_local const core::QueryCtx* currentFunctionQueryCtx = nullptr;
+
+class ScopedCudfFunctionQueryContext {
+ public:
+  ScopedCudfFunctionQueryContext(
+      const core::QueryConfig* queryConfig,
+      const core::QueryCtx* queryCtx)
+      : previousConfig_(currentFunctionQueryConfig),
+        previousCtx_(currentFunctionQueryCtx) {
+    currentFunctionQueryConfig = queryConfig;
+    currentFunctionQueryCtx = queryCtx;
+  }
+
+  ~ScopedCudfFunctionQueryContext() {
+    currentFunctionQueryConfig = previousConfig_;
+    currentFunctionQueryCtx = previousCtx_;
+  }
+
+ private:
+  const core::QueryConfig* previousConfig_;
+  const core::QueryCtx* previousCtx_;
+};
+
 bool decimalScalarIsZero(
     const cudf::scalar& scalar,
     rmm::cuda_stream_view stream) {
@@ -404,6 +428,14 @@ bool canBeEvaluatedByCudf(const core::TypedExprPtr& expr) {
 }
 
 } // namespace
+
+const core::QueryConfig* currentCudfFunctionQueryConfig() {
+  return currentFunctionQueryConfig;
+}
+
+const core::QueryCtx* currentCudfFunctionQueryCtx() {
+  return currentFunctionQueryCtx;
+}
 
 void checkAllTrue(
     cudf::column_view cond,
@@ -3299,8 +3331,12 @@ std::shared_ptr<FunctionExpression> FunctionExpression::create(
         // createCudfExpression (e.g. AST for arithmetic, Function for
         // string ops).  Field references are handled as leaf
         // FunctionExpressions.
-        node->subexpressions_.push_back(
-            createCudfExpression(input, inputRowSchema, pool));
+        node->subexpressions_.push_back(createCudfExpression(
+            input,
+            inputRowSchema,
+            pool,
+            currentCudfFunctionQueryConfig(),
+            currentCudfFunctionQueryCtx()));
       }
     }
   }
@@ -3351,6 +3387,18 @@ ColumnOrView FunctionExpression::eval(
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr,
     bool finalize) {
+  const auto inputRowCount = inputColumnViews.empty()
+      ? cudf::size_type{0}
+      : inputColumnViews.front().size();
+  return eval(std::move(inputColumnViews), inputRowCount, stream, mr, finalize);
+}
+
+ColumnOrView FunctionExpression::eval(
+    std::vector<cudf::column_view> inputColumnViews,
+    cudf::size_type inputRowCount,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr,
+    bool finalize) {
   const bool useCache = batchCache_ != nullptr && !cseKey_.empty() &&
       batchCache_->isCacheable(cseKey_);
   if (useCache) {
@@ -3358,7 +3406,6 @@ ColumnOrView FunctionExpression::eval(
       return *cached;
     }
   }
-
   // Top-level field access (or chain of field accesses on input columns) maps
   // directly to a column_view zero-copy.
   if (isInputFieldReference(expr_)) {
@@ -3388,7 +3435,8 @@ ColumnOrView FunctionExpression::eval(
         subexpressions_.size(),
         1,
         "Nested field reference expects exactly one subexpression");
-    auto parent = subexpressions_[0]->eval(inputColumnViews, stream, mr);
+    auto parent =
+        subexpressions_[0]->eval(inputColumnViews, inputRowCount, stream, mr);
     VELOX_DCHECK_GE(fieldIndex_, 0);
     auto child = FunctionExpression::makeStructChildColumn(
         parent, static_cast<cudf::size_type>(fieldIndex_), stream, mr);
@@ -3402,10 +3450,11 @@ ColumnOrView FunctionExpression::eval(
     subexprResults.reserve(subexpressions_.size());
 
     for (const auto& subexpr : subexpressions_) {
-      subexprResults.push_back(subexpr->eval(inputColumnViews, stream, mr));
+      subexprResults.push_back(
+          subexpr->eval(inputColumnViews, inputRowCount, stream, mr));
     }
 
-    auto result = function_->eval(subexprResults, stream, mr);
+    auto result = function_->eval(subexprResults, inputRowCount, stream, mr);
     if (finalize || useCache) {
       const auto requestedType = cudf_velox::veloxToCudfDataType(expr_->type());
       auto resultView = asView(result);
@@ -3581,7 +3630,10 @@ std::shared_ptr<CudfExpression> createCudfExpression(
     const core::TypedExprPtr& expr,
     const RowTypePtr& inputRowSchema,
     memory::MemoryPool* pool,
-    CudfExpressionBatchCachePtr batchCache) {
+    CudfExpressionBatchCachePtr batchCache,
+    const core::QueryConfig* queryConfig,
+    const core::QueryCtx* queryCtx) {
+  ScopedCudfFunctionQueryContext scope(queryConfig, queryCtx);
   const auto* best = findBestEvaluator(expr);
   VELOX_CHECK_NOT_NULL(
       best, "No cuDF expression evaluator can handle: {}", expr->toString());
@@ -3590,6 +3642,25 @@ std::shared_ptr<CudfExpression> createCudfExpression(
     evaluator->attachBatchCache(std::move(batchCache));
   }
   return evaluator;
+}
+
+std::shared_ptr<CudfExpression> createCudfExpression(
+    const core::TypedExprPtr& expr,
+    const RowTypePtr& inputRowSchema,
+    memory::MemoryPool* pool,
+    CudfExpressionBatchCachePtr batchCache) {
+  return createCudfExpression(
+      expr, inputRowSchema, pool, std::move(batchCache), nullptr, nullptr);
+}
+
+std::shared_ptr<CudfExpression> createCudfExpression(
+    const core::TypedExprPtr& expr,
+    const RowTypePtr& inputRowSchema,
+    memory::MemoryPool* pool,
+    const core::QueryConfig* queryConfig,
+    const core::QueryCtx* queryCtx) {
+  return createCudfExpression(
+      expr, inputRowSchema, pool, nullptr, queryConfig, queryCtx);
 }
 
 void unregisterFunctions() {
