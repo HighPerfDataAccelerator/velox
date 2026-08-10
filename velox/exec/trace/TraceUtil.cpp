@@ -450,7 +450,8 @@ core::PlanNodePtr getTraceNode(
                           : std::nullopt,
         topNRowNumberNode->limit(),
         std::make_shared<DummySourceNode>(
-            topNRowNumberNode->sources().front()->outputType()));
+            topNRowNumberNode->sources().front()->outputType()),
+        topNRowNumberNode->partialOutput());
   }
 
   if (const auto* exchangeNode =

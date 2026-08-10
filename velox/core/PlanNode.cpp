@@ -2926,6 +2926,10 @@ TopNRowNumberNode::TopNRowNumberNode(
       outputType_{getOptionalRowNumberOutputType(
           sources_[0]->outputType(),
           rowNumberColumnName)} {
+  VELOX_USER_CHECK(
+      !partialOutput_ || !rowNumberColumnName.has_value(),
+      "Partial TopNRowNumber output cannot include a rank column");
+
   VELOX_USER_CHECK_EQ(
       sortingKeys_.size(),
       sortingOrders_.size(),

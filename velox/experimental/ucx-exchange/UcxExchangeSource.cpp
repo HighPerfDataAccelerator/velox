@@ -995,6 +995,9 @@ bool UcxExchangeSource::tryStartDataReceive(
   // the steady-state watermark, preserve one minimum consumer workspace. If
   // receives consume that last GiB, the Filter/TopN input which must dequeue
   // them cannot run and both sides wait forever despite a valid byte cap.
+  std::optional<
+      facebook::velox::cudf_velox::DeviceMemoryWorkspaceReservation>
+      receiveWorkspace;
   if (!useHostStaging) {
     const auto now = std::chrono::steady_clock::now();
     const bool useProgressHeadroom =
@@ -1016,7 +1019,7 @@ bool UcxExchangeSource::tryStartDataReceive(
       wakeCommunicator();
       return false;
     }
-    auto receiveWorkspace =
+    receiveWorkspace =
         facebook::velox::cudf_velox::
             tryAcquireBackgroundDeviceMemoryWorkspace(
                 ptr->metadata.dataSizeBytes,

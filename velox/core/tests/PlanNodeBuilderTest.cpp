@@ -1346,4 +1346,8 @@ TEST_F(PlanNodeBuilderTest, topNRowNumberNode) {
 
   const auto node2 = TopNRowNumberNode::Builder(*node).build();
   verify(node2);
+
+  VELOX_ASSERT_THROW(
+      TopNRowNumberNode::Builder(*node).partialOutput(true).build(),
+      "Partial TopNRowNumber output cannot include a rank column");
 }

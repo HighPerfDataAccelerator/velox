@@ -322,6 +322,13 @@ TEST_F(FunctionRegistryTest, canEvaluateCastExpression) {
   EXPECT_TRUE(FunctionExpression::canEvaluate(makeCast(BIGINT(), DOUBLE())));
   EXPECT_TRUE(
       FunctionExpression::canEvaluate(makeCast(BIGINT(), DOUBLE(), true)));
+
+  // Short decimals share BIGINT's TypeKind, but string integer conversion
+  // does not implement decimal scale or precision semantics.
+  EXPECT_FALSE(
+      FunctionExpression::canEvaluate(makeCast(DECIMAL(12, 2), VARCHAR())));
+  EXPECT_FALSE(
+      FunctionExpression::canEvaluate(makeCast(VARCHAR(), DECIMAL(12, 2))));
 }
 
 // Two function registrations under the same name with identical signatures,

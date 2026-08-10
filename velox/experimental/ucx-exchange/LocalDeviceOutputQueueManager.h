@@ -134,6 +134,9 @@ class LocalDeviceOutputQueueManager {
       const TaskQueue& changedQueue,
       std::vector<ContinuePromise>& promises);
 
+  // mutex_ and accountingMutex_ must both be held.
+  void recomputeAggregateBudgetLocked();
+
   std::mutex mutex_;
   std::unordered_map<std::string, std::shared_ptr<TaskQueue>> queues_;
   std::unordered_set<std::string> directOutputTasks_;

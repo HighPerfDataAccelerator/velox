@@ -110,6 +110,24 @@ TEST_F(CudfExpressionSelectionTest, functionRoot) {
   ASSERT_NE(functionExpr, nullptr);
 }
 
+TEST_F(CudfExpressionSelectionTest, rejectsUnsupportedJavaRegexSyntax) {
+  const auto regexpExtract = [](std::string pattern) {
+    std::vector<core::TypedExprPtr> inputs{
+        std::make_shared<core::FieldAccessTypedExpr>(VARCHAR(), "name"),
+        std::make_shared<core::ConstantTypedExpr>(
+            VARCHAR(), variant(std::move(pattern))),
+        std::make_shared<core::ConstantTypedExpr>(INTEGER(), variant(0))};
+    return std::make_shared<core::CallTypedExpr>(
+        VARCHAR(), std::move(inputs), "regexp_extract");
+  };
+
+  EXPECT_TRUE(FunctionExpression::canEvaluate(regexpExtract("(a)")));
+  EXPECT_FALSE(FunctionExpression::canEvaluate(regexpExtract("(?i)a")));
+  EXPECT_FALSE(FunctionExpression::canEvaluate(regexpExtract("(a)\\1")));
+  EXPECT_FALSE(FunctionExpression::canEvaluate(
+      regexpExtract("(?<name>a)\\k<name>")));
+}
+
 TEST_F(CudfExpressionSelectionTest, operatorBatchCacheSharesRepeatedRoot) {
   auto first = optimizeTypedExpr(
       "lower(name)", rowType_, queryCtx_.get(), execCtx_.get());

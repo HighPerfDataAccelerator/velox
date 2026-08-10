@@ -209,10 +209,17 @@ std::string constantToString(
   return toConstantVector(expr, pool)->toString(0);
 }
 
-bool hasUnsupportedCudfRegexPattern(std::string_view pattern) {
+bool isCudfRegexPatternSupported(std::string_view pattern) {
   bool escaped = false;
+  bool inCharacterClass = false;
   for (size_t i = 0; i < pattern.size(); ++i) {
     if (escaped) {
+      // Java regex supports numeric and named backreferences. libcudf's regex
+      // engine does not, and accepting them can silently change the match.
+      if (!inCharacterClass &&
+          ((pattern[i] >= '1' && pattern[i] <= '9') || pattern[i] == 'k')) {
+        return false;
+      }
       escaped = false;
       continue;
     }
@@ -220,18 +227,29 @@ bool hasUnsupportedCudfRegexPattern(std::string_view pattern) {
       escaped = true;
       continue;
     }
-    if (pattern[i] != '(' || i + 2 >= pattern.size() || pattern[i + 1] != '?') {
-      continue;
+    if (pattern[i] == '[' && !inCharacterClass) {
+      inCharacterClass = true;
+    } else if (pattern[i] == ']' && inCharacterClass) {
+      inCharacterClass = false;
     }
-    if (pattern[i + 2] == '=' || pattern[i + 2] == '!') {
-      return true;
-    }
-    if (pattern[i + 2] == '<' && i + 3 < pattern.size() &&
-        (pattern[i + 3] == '=' || pattern[i + 3] == '!')) {
-      return true;
+    // Reject every Java (?...) extension conservatively: lookarounds, inline
+    // flags, non-capturing/atomic groups, named groups and flag scopes are not
+    // a uniformly supported libcudf subset.
+    if (!inCharacterClass && pattern[i] == '(' &&
+        i + 1 < pattern.size() && pattern[i + 1] == '?') {
+      return false;
     }
   }
-  return false;
+
+  // Let libcudf's parser be the final authority for the remaining syntax.
+  // This keeps selection conservative as the engine's supported grammar
+  // evolves, instead of discovering an invalid constant pattern during eval.
+  try {
+    (void)cudf::strings::regex_program::create(std::string(pattern));
+    return true;
+  } catch (const std::exception&) {
+    return false;
+  }
 }
 
 std::unique_ptr<cudf::column> makeAllNullStringColumn(
@@ -550,7 +568,7 @@ class CastFunction : public CudfFunction {
     }
 
     const auto isIntegral = [](const TypePtr& type) {
-      if (type == nullptr || type->isDate()) {
+      if (type == nullptr || type->isDate() || type->isDecimal()) {
         return false;
       }
       switch (type->kind()) {
@@ -2480,9 +2498,9 @@ bool registerBuiltinFunctions(const std::string& prefix) {
           return true;
         }
         const auto value = constantVarcharValue(expr->inputs()[1]);
-        return value.has_value() &&
-            !hasUnsupportedCudfRegexPattern(
-                std::string_view(value->data(), value->size()));
+        return value.has_value() && isCudfRegexPatternSupported(
+                                        std::string_view(
+                                            value->data(), value->size()));
       });
 
   registerCudfFunction(

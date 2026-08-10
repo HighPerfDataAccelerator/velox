@@ -361,6 +361,46 @@ TEST_F(
   localManager->removeTask(taskId);
 }
 
+TEST_F(
+    UcxOutputQueueManagerTest,
+    localDeviceOutputBudgetExpandsAfterTightTaskRemoval) {
+  const std::string tightTaskId = "local-device-root-tight-budget";
+  const std::string roomyTaskId = "local-device-root-roomy-budget";
+  auto localManager = LocalDeviceOutputQueueManager::getInstanceRef();
+  localManager->removeTask(tightTaskId);
+  localManager->removeTask(roomyTaskId);
+
+  auto data = makeCudfVector(
+      pool_.get(),
+      1024,
+      UcxTestData::kTestRowType,
+      nullptr,
+      rmm::cuda_stream_default);
+  const auto batchBytes = data->estimateFlatSize();
+  ASSERT_GT(batchBytes, 0);
+
+  localManager->registerDirectOutputTask(tightTaskId);
+  localManager->registerDirectOutputTask(roomyTaskId);
+  auto tightTask = createSourceTask(
+      tightTaskId, pool_, UcxTestData::kTestRowType, batchBytes / 2);
+  auto roomyTask = createSourceTask(
+      roomyTaskId, pool_, UcxTestData::kTestRowType, batchBytes * 4);
+  localManager->initializeTask(tightTask, 1, 1);
+  localManager->initializeTask(roomyTask, 1, 1);
+  localManager->enqueue(roomyTaskId, 0, std::move(data));
+
+  ContinueFuture future;
+  EXPECT_TRUE(localManager->checkBlocked(roomyTaskId, &future));
+  EXPECT_FALSE(future.isReady());
+
+  localManager->removeTask(tightTaskId);
+  future.wait();
+  EXPECT_TRUE(future.isReady());
+  EXPECT_FALSE(localManager->checkBlocked(roomyTaskId, nullptr));
+
+  localManager->removeTask(roomyTaskId);
+}
+
 TEST_F(UcxOutputQueueManagerTest, basicPartitioned) {
   vector_size_t size = 100;
   std::string taskId = "t0";

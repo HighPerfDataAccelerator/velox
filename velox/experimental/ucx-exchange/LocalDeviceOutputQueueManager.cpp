@@ -91,21 +91,12 @@ void LocalDeviceOutputQueueManager::initializeTask(
   auto queue =
       std::make_shared<TaskQueue>(task, numDestinations, numDrivers);
   {
-    std::lock_guard<std::mutex> accountingLock(accountingMutex_);
-    if (aggregateMaxBytes_ == 0) {
-      aggregateMaxBytes_ = queue->maxBytes;
-      aggregateContinueBytes_ = aggregateMaxBytes_ * kContinuePct / 100;
-    } else {
-      // Concurrent local roots in one executor must agree on the tightest
-      // configured budget. Queries normally use the same setting; min keeps a
-      // late query from silently expanding live device ownership.
-      aggregateMaxBytes_ = std::min(aggregateMaxBytes_, queue->maxBytes);
-      aggregateContinueBytes_ = aggregateMaxBytes_ * kContinuePct / 100;
-    }
+    std::scoped_lock lock(mutex_, accountingMutex_);
+    const auto [it, inserted] = queues_.emplace(taskId, std::move(queue));
+    VELOX_CHECK(
+        inserted, "Local device output task already exists: {}", taskId);
+    recomputeAggregateBudgetLocked();
   }
-  std::lock_guard<std::mutex> lock(mutex_);
-  const auto [it, inserted] = queues_.emplace(taskId, std::move(queue));
-  VELOX_CHECK(inserted, "Local device output task already exists: {}", taskId);
 }
 
 bool LocalDeviceOutputQueueManager::updateNumDriversIfExists(
@@ -270,8 +261,9 @@ void LocalDeviceOutputQueueManager::deleteResults(
 
 void LocalDeviceOutputQueueManager::removeTask(std::string_view taskId) {
   std::shared_ptr<TaskQueue> queue;
+  std::vector<ContinuePromise> promises;
   {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::scoped_lock managerLock(mutex_, accountingMutex_);
     directOutputTasks_.erase(std::string(taskId));
     auto it = queues_.find(std::string(taskId));
     if (it == queues_.end()) {
@@ -279,10 +271,6 @@ void LocalDeviceOutputQueueManager::removeTask(std::string_view taskId) {
     }
     queue = std::move(it->second);
     queues_.erase(it);
-  }
-  std::vector<ContinuePromise> promises;
-  {
-    std::lock_guard<std::mutex> accountingLock(accountingMutex_);
     std::lock_guard<std::mutex> lock(queue->mutex);
     queue->terminated = true;
     VELOX_CHECK_GE(aggregateQueuedBytes_, queue->queuedBytes);
@@ -307,11 +295,23 @@ void LocalDeviceOutputQueueManager::removeTask(std::string_view taskId) {
     for (auto& destination : queue->queues) {
       destination.clear();
     }
-    if (aggregateQueuedBytes_ < aggregateContinueBytes_) {
+    recomputeAggregateBudgetLocked();
+    if (aggregateMaxBytes_ == 0 ||
+        aggregateQueuedBytes_ < aggregateContinueBytes_) {
       promises.swap(aggregatePromises_);
     }
   }
   fulfill(std::move(promises));
+}
+
+void LocalDeviceOutputQueueManager::recomputeAggregateBudgetLocked() {
+  aggregateMaxBytes_ = 0;
+  for (const auto& [_, queue] : queues_) {
+    aggregateMaxBytes_ = aggregateMaxBytes_ == 0
+        ? queue->maxBytes
+        : std::min(aggregateMaxBytes_, queue->maxBytes);
+  }
+  aggregateContinueBytes_ = aggregateMaxBytes_ * kContinuePct / 100;
 }
 
 std::shared_ptr<LocalDeviceOutputQueueManager::TaskQueue>

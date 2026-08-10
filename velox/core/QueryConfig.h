@@ -395,7 +395,7 @@ class QueryConfig {
       ucxPartitionedOutputBatchBytes,
       "cudf.partitioned_output_batch_bytes",
       uint64_t,
-      0,
+      128UL << 20,
       "Target bytes per CudfPartitionedOutput exchange chunk.")
 
   VELOX_QUERY_CONFIG(
