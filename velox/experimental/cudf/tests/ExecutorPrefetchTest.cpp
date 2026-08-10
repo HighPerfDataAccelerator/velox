@@ -665,6 +665,31 @@ TEST(ExecutorPrefetchTest, nativeScatterRespectsMaximumCoalescedRange) {
   EXPECT_EQ(groups[1].size, second.size());
 }
 
+TEST(ExecutorPrefetchTest, nativeScatterSplitsOversizedDestination) {
+  std::array<char, 10> destination{};
+  const std::vector<folly::Range<char*>> destinations{
+      {destination.data(), destination.size()}};
+
+  const auto groups = groupNativeS3ReadDestinations(
+      10, destinations, /*maxGapBytes=*/0, /*maxRangeBytes=*/4);
+  ASSERT_EQ(groups.size(), 3);
+  EXPECT_EQ(groups[0].offset, 10);
+  EXPECT_EQ(groups[0].size, 4);
+  ASSERT_EQ(groups[0].destinations.size(), 1);
+  EXPECT_EQ(groups[0].destinations[0].data(), destination.data());
+  EXPECT_EQ(groups[0].destinations[0].size(), 4);
+  EXPECT_EQ(groups[1].offset, 14);
+  EXPECT_EQ(groups[1].size, 4);
+  ASSERT_EQ(groups[1].destinations.size(), 1);
+  EXPECT_EQ(groups[1].destinations[0].data(), destination.data() + 4);
+  EXPECT_EQ(groups[1].destinations[0].size(), 4);
+  EXPECT_EQ(groups[2].offset, 18);
+  EXPECT_EQ(groups[2].size, 2);
+  ASSERT_EQ(groups[2].destinations.size(), 1);
+  EXPECT_EQ(groups[2].destinations[0].data(), destination.data() + 8);
+  EXPECT_EQ(groups[2].destinations[0].size(), 2);
+}
+
 TEST(ExecutorPrefetchTest, nativeScatterStreamWritesExactDestinations) {
   std::array<char, 2> first{};
   std::array<char, 4> second{};

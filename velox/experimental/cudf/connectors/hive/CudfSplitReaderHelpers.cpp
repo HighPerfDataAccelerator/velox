@@ -1885,40 +1885,49 @@ std::vector<NativeS3ReadGroup> groupNativeS3ReadDestinations(
       logicalOffset += destination.size();
       continue;
     }
-    bool startGroup = groups.empty();
-    uint64_t gapBytes = 0;
-    uint64_t coalescedSize = destination.size();
-    if (!startGroup) {
-      const auto& group = groups.back();
-      VELOX_CHECK_LE(
-          group.size,
-          std::numeric_limits<uint64_t>::max() - group.offset,
-          "Native S3 scatter group end overflow");
-      const auto groupEnd = group.offset + group.size;
-      VELOX_CHECK_LE(groupEnd, logicalOffset);
-      gapBytes = logicalOffset - groupEnd;
-      VELOX_CHECK_LE(
-          destination.size(),
-          std::numeric_limits<uint64_t>::max() - logicalOffset,
-          "Native S3 coalesced range end overflow");
-      const auto destinationEnd = logicalOffset + destination.size();
-      coalescedSize = destinationEnd - group.offset;
-      startGroup = gapBytes > maxGapBytes || coalescedSize > maxRangeBytes;
+    uint64_t destinationOffset = 0;
+    while (destinationOffset < destination.size()) {
+      const auto chunkSize = std::min<uint64_t>(
+          maxRangeBytes, destination.size() - destinationOffset);
+      folly::Range<char*> chunk{
+          destination.data() + static_cast<size_t>(destinationOffset),
+          static_cast<size_t>(chunkSize)};
+      bool startGroup = groups.empty();
+      uint64_t gapBytes = 0;
+      uint64_t coalescedSize = chunkSize;
+      if (!startGroup) {
+        const auto& group = groups.back();
+        VELOX_CHECK_LE(
+            group.size,
+            std::numeric_limits<uint64_t>::max() - group.offset,
+            "Native S3 scatter group end overflow");
+        const auto groupEnd = group.offset + group.size;
+        VELOX_CHECK_LE(groupEnd, logicalOffset);
+        gapBytes = logicalOffset - groupEnd;
+        VELOX_CHECK_LE(
+            chunkSize,
+            std::numeric_limits<uint64_t>::max() - logicalOffset,
+            "Native S3 coalesced range end overflow");
+        const auto chunkEnd = logicalOffset + chunkSize;
+        coalescedSize = chunkEnd - group.offset;
+        startGroup = gapBytes > maxGapBytes || coalescedSize > maxRangeBytes;
+      }
+      if (startGroup) {
+        groups.push_back(
+            NativeS3ReadGroup{
+                .offset = logicalOffset, .size = 0, .destinations = {}});
+        gapBytes = 0;
+        coalescedSize = chunkSize;
+      }
+      auto& group = groups.back();
+      if (gapBytes != 0) {
+        group.destinations.emplace_back(nullptr, gapBytes);
+      }
+      group.size = coalescedSize;
+      group.destinations.push_back(chunk);
+      destinationOffset += chunkSize;
+      logicalOffset += chunkSize;
     }
-    if (startGroup) {
-      groups.push_back(
-          NativeS3ReadGroup{
-              .offset = logicalOffset, .size = 0, .destinations = {}});
-      gapBytes = 0;
-      coalescedSize = destination.size();
-    }
-    auto& group = groups.back();
-    if (gapBytes != 0) {
-      group.destinations.emplace_back(nullptr, gapBytes);
-    }
-    group.size = coalescedSize;
-    group.destinations.push_back(destination);
-    logicalOffset += destination.size();
   }
   return groups;
 }
