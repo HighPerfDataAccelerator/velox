@@ -29,6 +29,7 @@
 #include "velox/common/testutil/TempDirectoryPath.h"
 #include "velox/common/testutil/TestValue.h"
 
+#include <folly/ScopeGuard.h>
 #include <folly/executors/CPUThreadPoolExecutor.h>
 #include <folly/io/IOBuf.h>
 #include <folly/synchronization/Baton.h>
@@ -113,6 +114,24 @@ class GatedAsyncReadFile : public InMemoryReadFile {
   mutable std::mutex mutex_;
   mutable std::condition_variable condition_;
   mutable std::vector<Pending> pending_;
+};
+
+class ShortAsyncReadFile : public InMemoryReadFile {
+ public:
+  using InMemoryReadFile::InMemoryReadFile;
+
+  bool hasPreadvAsync() const override {
+    return true;
+  }
+
+  folly::SemiFuture<uint64_t> preadvAsync(
+      uint64_t offset,
+      const std::vector<folly::Range<char*>>& buffers,
+      const FileIoContext& context = {}) const override {
+    const auto bytes = ReadFile::preadv(offset, buffers, context);
+    VELOX_CHECK_GT(bytes, 0);
+    return folly::SemiFuture<uint64_t>(bytes - 1);
+  }
 };
 
 class RecordingPreadvFile : public InMemoryReadFile {
@@ -712,6 +731,7 @@ TEST_F(CachedBufferedInputTest, submitsAllPhysicalGroupsBeforeWaiting) {
       [&] { firstLoadReady.set_value(); });
   EXPECT_EQ(cache_->refreshStats().numExclusive, regions.size());
   auto execution = std::async(std::launch::async, std::move(prepared));
+  auto releaseReads = folly::makeGuard([&] { readFile->completeAll(); });
 
   ASSERT_TRUE(readFile->waitForSubmissions(2));
   EXPECT_EQ(
@@ -729,6 +749,203 @@ TEST_F(CachedBufferedInputTest, submitsAllPhysicalGroupsBeforeWaiting) {
 
   EXPECT_EQ(cache_->refreshStats().numExclusive, 0);
   EXPECT_EQ(cache_->refreshStats().numEntries, regions.size());
+}
+
+TEST_F(CachedBufferedInputTest, rejectsShortAsyncRead) {
+  constexpr uint64_t kQuantum = 1 << 20;
+  auto readFile =
+      std::make_shared<ShortAsyncReadFile>(std::string(2 * kQuantum, 'x'));
+
+  io::ReaderOptions readerOptions(pool_.get());
+  readerOptions.setDataIoStats(dataIoStats_);
+  readerOptions.setMetadataIoStats(metadataIoStats_);
+  readerOptions.setLoadQuantum(kQuantum);
+
+  auto& ids = fileIds();
+  CachedBufferedInput input(
+      readFile,
+      MetricsLog::voidLog(),
+      StringIdLease(ids, "rejectsShortAsyncRead"),
+      cache_.get(),
+      tracker_,
+      StringIdLease(ids, "rejectsShortAsyncReadGroup"),
+      dataIoStats_,
+      nullptr,
+      executor_.get(),
+      readerOptions);
+
+  auto prepared = input.preparePrefetch(
+      {{0, kQuantum}},
+      /*inlineLoad=*/true,
+      /*preallocatePins=*/true,
+      /*asyncPhysicalGroups=*/true);
+  VELOX_ASSERT_THROW(
+      prepared(), "Async cache read must return exactly the requested bytes");
+  EXPECT_EQ(cache_->refreshStats().numExclusive, 0);
+}
+
+TEST_F(CachedBufferedInputTest, drainsAsyncReadsWhenReadyCallbackThrows) {
+  constexpr uint64_t kQuantum = 1 << 20;
+  auto readFile =
+      std::make_shared<GatedAsyncReadFile>(std::string(8 * kQuantum, 'x'));
+
+  io::ReaderOptions readerOptions(pool_.get());
+  readerOptions.setDataIoStats(dataIoStats_);
+  readerOptions.setMetadataIoStats(metadataIoStats_);
+  readerOptions.setLoadQuantum(kQuantum);
+
+  auto& ids = fileIds();
+  CachedBufferedInput input(
+      readFile,
+      MetricsLog::voidLog(),
+      StringIdLease(ids, "drainsAsyncReadsWhenReadyCallbackThrows"),
+      cache_.get(),
+      tracker_,
+      StringIdLease(ids, "drainsAsyncReadsWhenReadyCallbackThrowsGroup"),
+      dataIoStats_,
+      nullptr,
+      executor_.get(),
+      readerOptions);
+
+  std::promise<void> callbackInvoked;
+  auto callbackInvokedFuture = callbackInvoked.get_future();
+  auto prepared = input.preparePrefetch(
+      {{0, kQuantum}, {4 * kQuantum, kQuantum}},
+      /*inlineLoad=*/true,
+      /*preallocatePins=*/true,
+      /*asyncPhysicalGroups=*/true,
+      [&] {
+        callbackInvoked.set_value();
+        throw std::runtime_error("ready callback failure");
+      });
+  auto execution = std::async(std::launch::async, std::move(prepared));
+  auto releaseReads = folly::makeGuard([&] { readFile->completeAll(); });
+
+  ASSERT_TRUE(readFile->waitForSubmissions(2));
+  readFile->completeOne();
+  ASSERT_EQ(
+      callbackInvokedFuture.wait_for(std::chrono::seconds(5)),
+      std::future_status::ready);
+  EXPECT_EQ(
+      execution.wait_for(std::chrono::milliseconds(0)),
+      std::future_status::timeout);
+  readFile->completeAll();
+  EXPECT_THROW(execution.get(), std::runtime_error);
+  EXPECT_EQ(cache_->refreshStats().numExclusive, 0);
+}
+
+TEST_F(CachedBufferedInputTest, asyncPhysicalGroupsSupportsSsdFallback) {
+  constexpr uint64_t kQuantum = 1 << 20;
+  const std::string content(8 * kQuantum, 'x');
+  resetCacheWithSsd();
+
+  auto readFile = std::make_shared<GatedAsyncReadFile>(content);
+  io::ReaderOptions readerOptions(pool_.get());
+  readerOptions.setDataIoStats(dataIoStats_);
+  readerOptions.setMetadataIoStats(metadataIoStats_);
+  readerOptions.setLoadQuantum(kQuantum);
+
+  auto& ids = fileIds();
+  StringIdLease fileId(ids, "asyncPhysicalGroupsSupportsSsdFallback");
+  const auto fileNum = fileId.id();
+  seedSsd(fileNum, 0, std::string_view(content).substr(0, kQuantum));
+  CachedBufferedInput input(
+      readFile,
+      MetricsLog::voidLog(),
+      std::move(fileId),
+      cache_.get(),
+      tracker_,
+      StringIdLease(ids, "asyncPhysicalGroupsSupportsSsdFallbackGroup"),
+      dataIoStats_,
+      nullptr,
+      executor_.get(),
+      readerOptions);
+
+  auto prepared = input.preparePrefetch(
+      {{0, kQuantum}, {4 * kQuantum, kQuantum}},
+      /*inlineLoad=*/true,
+      /*preallocatePins=*/true,
+      /*asyncPhysicalGroups=*/true);
+  auto execution = std::async(std::launch::async, std::move(prepared));
+  auto releaseReads = folly::makeGuard([&] { readFile->completeAll(); });
+  ASSERT_TRUE(readFile->waitForSubmissions(1));
+  readFile->completeAll();
+  execution.get();
+
+  EXPECT_TRUE(cache_->exists({fileNum, 0}));
+  EXPECT_TRUE(cache_->exists({fileNum, 4 * kQuantum}));
+  EXPECT_EQ(cache_->refreshStats().numExclusive, 0);
+}
+
+TEST_F(
+    CachedBufferedInputTest,
+    rejectsUnsafeAsyncPreparationWithoutInlineLoad) {
+  constexpr uint64_t kQuantum = 1 << 20;
+  auto readFile = std::make_shared<tests::utils::CountingReadFile>(
+      std::string(2 * kQuantum, 'x'));
+
+  io::ReaderOptions readerOptions(pool_.get());
+  readerOptions.setLoadQuantum(kQuantum);
+  auto& ids = fileIds();
+  CachedBufferedInput input(
+      readFile,
+      MetricsLog::voidLog(),
+      StringIdLease(ids, "rejectsUnsafeAsyncPreparationWithoutInlineLoad"),
+      cache_.get(),
+      tracker_,
+      StringIdLease(ids, "rejectsUnsafeAsyncPreparationWithoutInlineLoadGroup"),
+      dataIoStats_,
+      nullptr,
+      executor_.get(),
+      readerOptions);
+
+  VELOX_ASSERT_THROW(
+      input.preparePrefetch(
+          {{0, kQuantum}},
+          /*inlineLoad=*/false,
+          /*preallocatePins=*/true,
+          /*asyncPhysicalGroups=*/false),
+      "require inline loading");
+  VELOX_ASSERT_THROW(
+      input.preparePrefetch(
+          {{0, kQuantum}},
+          /*inlineLoad=*/false,
+          /*preallocatePins=*/false,
+          /*asyncPhysicalGroups=*/true),
+      "require inline loading");
+}
+
+TEST_F(CachedBufferedInputTest, asyncMakePinsStatsExcludeSynchronousLoads) {
+  constexpr uint64_t kQuantum = 1 << 20;
+  auto readFile = std::make_shared<tests::utils::CountingReadFile>(
+      std::string(4 * kQuantum, 'x'));
+
+  io::ReaderOptions readerOptions(pool_.get());
+  readerOptions.setLoadQuantum(kQuantum);
+  auto& ids = fileIds();
+  CachedBufferedInput input(
+      readFile,
+      MetricsLog::voidLog(),
+      StringIdLease(ids, "asyncMakePinsStatsExcludeSynchronousLoads"),
+      cache_.get(),
+      tracker_,
+      StringIdLease(ids, "asyncMakePinsStatsExcludeSynchronousLoadsGroup"),
+      dataIoStats_,
+      nullptr,
+      executor_.get(),
+      readerOptions);
+
+  const auto before = cacheHintAsyncLoadStats();
+  auto synchronous = input.preparePrefetch(
+      {{0, kQuantum}},
+      /*inlineLoad=*/true,
+      /*preallocatePins=*/false,
+      /*asyncPhysicalGroups=*/false);
+  synchronous();
+  const auto afterSynchronous = cacheHintAsyncLoadStats();
+  EXPECT_EQ(afterSynchronous.makePinsCalls, before.makePinsCalls);
+  EXPECT_EQ(afterSynchronous.makePinsEntries, before.makePinsEntries);
+  EXPECT_EQ(afterSynchronous.makePinsWallNanos, before.makePinsWallNanos);
 }
 
 TEST_F(CachedBufferedInputTest, invalidPhysicalChunkPlanFallsBack) {

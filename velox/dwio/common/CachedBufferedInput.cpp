@@ -61,8 +61,7 @@ std::atomic<uint64_t> hintAsyncWaitMaxActive{0};
 
 uint32_t hintAsyncMakePinsConcurrency() {
   static const uint32_t value = [] {
-    constexpr const char* kEnv =
-        "GLUTEN_CUDF_CACHE_HINT_MAKE_PINS_CONCURRENCY";
+    constexpr const char* kEnv = "GLUTEN_CUDF_CACHE_HINT_MAKE_PINS_CONCURRENCY";
     const auto* text = std::getenv(kEnv);
     if (text == nullptr || text[0] == '\0') {
       return 1U;
@@ -90,9 +89,8 @@ class HintAsyncMakePinsGate {
  public:
   void acquire() {
     std::unique_lock<std::mutex> lock(mutex_);
-    condition_.wait(lock, [&] {
-      return active_ < hintAsyncMakePinsConcurrency();
-    });
+    condition_.wait(
+        lock, [&] { return active_ < hintAsyncMakePinsConcurrency(); });
     ++active_;
   }
 
@@ -144,8 +142,7 @@ class AsyncLoadStageTimer {
       std::atomic<uint64_t>& maxActive)
       : wallNanos_(wallNanos), active_(active) {
     calls.fetch_add(1, std::memory_order_relaxed);
-    const auto nowActive =
-        active_.fetch_add(1, std::memory_order_relaxed) + 1;
+    const auto nowActive = active_.fetch_add(1, std::memory_order_relaxed) + 1;
     updateMax(maxActive, nowActive);
   }
 
@@ -572,9 +569,7 @@ std::vector<int32_t> CachedBufferedInput::groupRequests(
   if (requests.empty() || (requests.size() < 2 && !prefetch)) {
     return {};
   }
-  const int32_t maxDistance = kSsd
-      ? 20'000
-      : options_.maxCoalesceDistance();
+  const int32_t maxDistance = kSsd ? 20'000 : options_.maxCoalesceDistance();
 
   // Combine adjacent short reads.
   int64_t coalescedBytes = 0;
@@ -733,7 +728,8 @@ class DwioCoalescedLoad : public DwioCoalescedLoadBase {
 
   void prepare(bool prefetch) override {
     VELOX_CHECK(!prepared_, "Coalesced cache load prepared more than once");
-    preparedPins_ = makePins(prefetch);
+    HintAsyncMakePinsSlot slot(hintAsyncMakePinsGate);
+    preparedPins_ = makePins(prefetch, /*asyncHint=*/true);
     prepared_ = true;
   }
 
@@ -746,13 +742,17 @@ class DwioCoalescedLoad : public DwioCoalescedLoadBase {
       pins = std::move(preparedPins_);
     } else {
       HintAsyncMakePinsSlot slot(hintAsyncMakePinsGate);
-      pins = makePins(/*prefetch=*/false);
+      pins = makePins(/*prefetch=*/false, /*asyncHint=*/true);
     }
     prepared_ = false;
     if (pins.empty()) {
       return [] {};
     }
-    std::vector<folly::SemiFuture<uint64_t>> pending;
+    struct PendingRead {
+      folly::SemiFuture<uint64_t> future;
+      uint64_t expectedBytes;
+    };
+    std::vector<PendingRead> pending;
     CoalesceIoStats stats;
     try {
       AsyncLoadStageTimer submitTimer(
@@ -770,24 +770,27 @@ class DwioCoalescedLoad : public DwioCoalescedLoadBase {
               int32_t /*end*/,
               uint64_t offset,
               const std::vector<folly::Range<char*>>& buffers) {
+            uint64_t expectedBytes = 0;
+            for (const auto& buffer : buffers) {
+              expectedBytes += buffer.size();
+            }
             pending.push_back(
-                input_->readAsync(buffers, offset, LogType::FILE));
-            hintAsyncSubmittedRequests.fetch_add(
-                1, std::memory_order_relaxed);
+                {input_->readAsync(buffers, offset, LogType::FILE),
+                 expectedBytes});
+            hintAsyncSubmittedRequests.fetch_add(1, std::memory_order_relaxed);
           });
     } catch (...) {
       const auto failure = std::current_exception();
-      for (auto& future : pending) {
+      for (auto& read : pending) {
         try {
-          std::move(future).get();
+          std::move(read.future).get();
         } catch (...) {
         }
       }
       std::rethrow_exception(failure);
     }
     auto pendingReads =
-        std::make_shared<std::vector<folly::SemiFuture<uint64_t>>>(
-            std::move(pending));
+        std::make_shared<std::vector<PendingRead>>(std::move(pending));
     return [this,
             pins = std::move(pins),
             pendingReads = std::move(pendingReads),
@@ -800,9 +803,13 @@ class DwioCoalescedLoad : public DwioCoalescedLoadBase {
             hintAsyncWaitWallNanos,
             hintAsyncWaitActive,
             hintAsyncWaitMaxActive);
-        for (auto& future : *pendingReads) {
+        for (auto& read : *pendingReads) {
           try {
-            std::move(future).get();
+            const auto bytesRead = std::move(read.future).get();
+            VELOX_CHECK_EQ(
+                bytesRead,
+                read.expectedBytes,
+                "Async cache read must return exactly the requested bytes");
           } catch (...) {
             if (!failure) {
               failure = std::current_exception();
@@ -821,7 +828,8 @@ class DwioCoalescedLoad : public DwioCoalescedLoadBase {
   }
 
   std::vector<CachePin> loadData(bool prefetch) override {
-    auto pins = prepared_ ? std::move(preparedPins_) : makePins(prefetch);
+    auto pins = prepared_ ? std::move(preparedPins_)
+                          : makePins(prefetch, /*asyncHint=*/false);
     prepared_ = false;
     if (pins.empty()) {
       return pins;
@@ -843,12 +851,15 @@ class DwioCoalescedLoad : public DwioCoalescedLoadBase {
   }
 
  private:
-  std::vector<CachePin> makePins(bool prefetch) {
-    AsyncLoadStageTimer makePinsTimer(
-        hintAsyncMakePinsCalls,
-        hintAsyncMakePinsWallNanos,
-        hintAsyncMakePinsActive,
-        hintAsyncMakePinsMaxActive);
+  std::vector<CachePin> makePins(bool prefetch, bool asyncHint) {
+    std::optional<AsyncLoadStageTimer> makePinsTimer;
+    if (asyncHint) {
+      makePinsTimer.emplace(
+          hintAsyncMakePinsCalls,
+          hintAsyncMakePinsWallNanos,
+          hintAsyncMakePinsActive,
+          hintAsyncMakePinsMaxActive);
+    }
     std::vector<CachePin> pins;
     pins.reserve(keys_.size());
     cache_.makePins(
@@ -860,8 +871,10 @@ class DwioCoalescedLoad : public DwioCoalescedLoadBase {
           }
           pins.push_back(std::move(pin));
         });
-    hintAsyncMakePinsEntries.fetch_add(
-        pins.size(), std::memory_order_relaxed);
+    if (asyncHint) {
+      hintAsyncMakePinsEntries.fetch_add(
+          pins.size(), std::memory_order_relaxed);
+    }
     if (pins.empty()) {
       return pins;
     }
@@ -1089,6 +1102,10 @@ std::function<void()> CachedBufferedInput::preparePrefetch(
     bool preallocatePins,
     bool asyncPhysicalGroups,
     std::function<void()> firstLoadReady) {
+  VELOX_CHECK(
+      inlineLoad || (!preallocatePins && !asyncPhysicalGroups),
+      "Cache-hint pin preallocation and asynchronous physical groups require "
+      "inline loading");
   auto plan = makeCacheRegionPlan(regions);
   {
     auto locked = cacheRegionPlan_.wlock();
@@ -1175,26 +1192,48 @@ std::function<void()> CachedBufferedInput::preparePrefetch(
           auto completion =
               checkedPointerCast<DwioCoalescedLoadBase>(pending.get())
                   ->startAsyncLoad(cacheable);
-          VELOX_CHECK(
-              static_cast<bool>(completion),
-              "Async cache-hint load requires an asynchronous ReadFile");
-          completions.push_back(std::move(completion));
+          if (completion) {
+            completions.push_back(std::move(completion));
+          } else {
+            // Submit all natively asynchronous remote reads before running
+            // SSD or non-async fallback loads synchronously.
+            completions.push_back([pending, cacheable]() {
+              folly::SemiFuture<bool> waitFuture(false);
+              if (!pending->loadOrFuture(&waitFuture, cacheable)) {
+                std::move(waitFuture).wait();
+              }
+            });
+          }
         }
       } catch (...) {
         failure = std::current_exception();
       }
-      if (completions.empty()) {
-        signalFirstLoad();
-      }
+      bool completedOne = false;
       for (auto& completion : completions) {
         try {
           completion();
+          completedOne = true;
         } catch (...) {
           if (!failure) {
             failure = std::current_exception();
           }
         }
-        signalFirstLoad();
+        if (completedOne && !firstLoadSignaled) {
+          try {
+            signalFirstLoad();
+          } catch (...) {
+            if (!failure) {
+              failure = std::current_exception();
+            }
+          }
+        }
+      }
+      if (completions.empty() && !failure) {
+        try {
+          signalFirstLoad();
+        } catch (...) {
+          failure = std::current_exception();
+        }
       }
       if (failure) {
         std::rethrow_exception(failure);
