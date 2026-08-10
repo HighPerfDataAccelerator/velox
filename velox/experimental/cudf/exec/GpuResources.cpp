@@ -1037,7 +1037,8 @@ void serviceDeviceReclaimerState(
 void requestDeviceMemoryReclaimForPhysicalPressure(
     memory::MemoryPool* pool,
     exec::Operator* requestor,
-    uint64_t requiredHeadroomBytes = 0) {
+    uint64_t requiredHeadroomBytes = 0,
+    bool requireCompleteExpensiveWave = false) {
   const auto& config = CudfConfig::getInstance();
   const auto minHeadroom = requiredHeadroomBytes == 0
       ? config.deviceMemoryMinHeadroomBytes
@@ -1086,6 +1087,14 @@ void requestDeviceMemoryReclaimForPhysicalPressure(
   // level. Wait for a material victim and reclaim in a bucket/build-sized wave.
   const auto minVictimBytes = std::max<uint64_t>(
       64ULL << 20, std::min<uint64_t>(minReclaim, minReclaim / 8));
+  // A small resident Join build is a poor cross-Driver victim for ordinary
+  // input or a one-batch transform: freeing a fraction of one reclaim wave can
+  // externalize tens of GiB of downstream probe traffic. Keep it resident
+  // until it can supply at least half of the configured wave. Synchronous
+  // self-reclaim remains eligible at every size so this protection cannot
+  // create a wait cycle.
+  const auto minCrossDriverExpensiveVictimBytes =
+      std::max<uint64_t>(minVictimBytes, minReclaim / 2);
 
   struct Candidate {
     std::shared_ptr<DeviceMemoryReclaimerState> state;
@@ -1099,6 +1108,7 @@ void requestDeviceMemoryReclaimForPhysicalPressure(
     bool expensiveToRebuild;
   };
   std::vector<Candidate> candidates;
+  uint64_t protectedSmallExpensiveVictims = 0;
   bool outstanding = false;
   {
     std::lock_guard<std::mutex> registryLock(deviceReclaimerRegistryMutex);
@@ -1123,6 +1133,12 @@ void requestDeviceMemoryReclaimForPhysicalPressure(
       if (bytes >= minVictimBytes) {
         const bool expensiveToRebuild =
             state->owner->operatorType() == "CudfHashJoinBuild";
+        if (requireCompleteExpensiveWave && expensiveToRebuild &&
+            state != requestorState &&
+            bytes < minCrossDriverExpensiveVictimBytes) {
+          ++protectedSmallExpensiveVictims;
+          continue;
+        }
         candidates.push_back(Candidate{
             std::move(state), bytes, expensiveToRebuild});
       }
@@ -1162,11 +1178,43 @@ void requestDeviceMemoryReclaimForPhysicalPressure(
             }
             return left.bytes > right.bytes;
           });
+      // An input waiter grows state, and a transform releases only its source
+      // batch. If all currently reclaimable state cannot make either waiter
+      // fit, evicting a resident Join build is pure amplification: the waiter
+      // remains blocked until transient reservations complete, while the
+      // entire downstream probe is irreversibly converted to Grace work.
+      // Preserve bounded TopN reclaim and synchronous self-reclaim, but defer
+      // cross-Driver Join victims until one wave can close the shortfall.
+      uint64_t potentialAssigned = 0;
+      bool potentialCrossDriverExpensiveVictim = false;
+      if (requireCompleteExpensiveWave) {
+        for (const auto& candidate : candidates) {
+          if (potentialAssigned >= requestBytes) {
+            break;
+          }
+          if (outstanding && candidate.state != requestorState) {
+            break;
+          }
+          const auto victimRequest = std::min<uint64_t>(
+              candidate.bytes,
+              std::max<uint64_t>(
+                  minVictimBytes, requestBytes - potentialAssigned));
+          potentialAssigned += victimRequest;
+          potentialCrossDriverExpensiveVictim |=
+              candidate.expensiveToRebuild &&
+              candidate.state != requestorState;
+        }
+      }
+      const bool deferCrossDriverExpensiveVictims =
+          requireCompleteExpensiveWave &&
+          potentialCrossDriverExpensiveVictim &&
+          potentialAssigned < requestBytes;
       const auto epoch =
           nextDeviceReclaimEpoch.fetch_add(1, std::memory_order_relaxed);
       uint64_t assigned = 0;
       uint64_t selectedVictims = 0;
       uint64_t selectedExpensiveVictims = 0;
+      uint64_t deferredExpensiveVictims = 0;
       bool selectedRequestor = false;
       for (auto& candidate : candidates) {
         if (assigned >= requestBytes) {
@@ -1174,6 +1222,12 @@ void requestDeviceMemoryReclaimForPhysicalPressure(
         }
         if (outstanding && candidate.state != requestorState) {
           break;
+        }
+        if (deferCrossDriverExpensiveVictims &&
+            candidate.expensiveToRebuild &&
+            candidate.state != requestorState) {
+          ++deferredExpensiveVictims;
+          continue;
         }
         const auto victimRequest = std::min<uint64_t>(
             candidate.bytes,
@@ -1197,10 +1251,32 @@ void requestDeviceMemoryReclaimForPhysicalPressure(
             << " assignedBytes=" << assigned
             << " victimCount=" << selectedVictims
             << " expensiveVictimCount=" << selectedExpensiveVictims
+            << " deferredExpensiveVictimCount=" << deferredExpensiveVictims
             << " selectedRequestor=" << selectedRequestor
             << " allocatableBefore=" << before.allocatableBytes()
             << " cudaFreeBefore=" << before.freeBytes
             << " reusablePoolBefore=" << before.reusablePoolBytes();
+      } else if (deferredExpensiveVictims > 0) {
+        LOG(WARNING)
+            << "CUDF_DEVICE_GLOBAL_ARBITRATION device=" << before.device
+            << " mode=defer_incomplete_expensive_wave"
+            << " epoch=" << epoch
+            << " requestedBytes=" << requestBytes
+            << " potentialAssignedBytes=" << potentialAssigned
+            << " deferredExpensiveVictimCount="
+            << deferredExpensiveVictims
+            << " allocatableBytes=" << before.allocatableBytes();
+      } else if (protectedSmallExpensiveVictims > 0) {
+        LOG(WARNING)
+            << "CUDF_DEVICE_GLOBAL_ARBITRATION device=" << before.device
+            << " mode=protect_small_expensive_victim"
+            << " epoch=" << epoch
+            << " requestedBytes=" << requestBytes
+            << " minExpensiveVictimBytes="
+            << minCrossDriverExpensiveVictimBytes
+            << " protectedExpensiveVictimCount="
+            << protectedSmallExpensiveVictims
+            << " allocatableBytes=" << before.allocatableBytes();
       } else {
         const auto now = std::chrono::steady_clock::now();
         const auto previous = lastNoDeviceVictimLog.find(before.device);
@@ -1900,7 +1976,11 @@ tryAcquireDeviceMemoryWorkspace(
           : requiredHeadroom + reservedForPressure;
       if (requestor != nullptr) {
         requestDeviceMemoryReclaimForPhysicalPressure(
-            pool, requestor, physicalRequiredHeadroom);
+            pool,
+            requestor,
+            physicalRequiredHeadroom,
+            priority == DeviceMemoryWorkspacePriority::kInput ||
+                priority == DeviceMemoryWorkspacePriority::kTransform);
       }
       scheduleDeviceMemoryWorkspaceWaiters(headroom.device);
     }
