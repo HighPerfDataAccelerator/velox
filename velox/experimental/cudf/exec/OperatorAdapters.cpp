@@ -32,7 +32,6 @@
 #include "velox/experimental/cudf/exec/CudfNestedLoopJoin.h"
 #include "velox/experimental/cudf/exec/CudfOrderBy.h"
 #include "velox/experimental/cudf/exec/CudfReduce.h"
-#include "velox/experimental/cudf/exec/CudfSpillableTopNRowNumber.h"
 #include "velox/experimental/cudf/exec/CudfTopN.h"
 #include "velox/experimental/cudf/exec/CudfTopNRowNumber.h"
 #include "velox/experimental/cudf/exec/CudfUnnest.h"
@@ -798,9 +797,8 @@ class TopNAdapter : public OperatorAdapter {
   }
 };
 
-/// Keeps the community cuDF operator as the public implementation and
-/// automatically selects its bounded-memory backend for the supported
-/// partitioned row_number limit=1 shape.
+/// Replaces supported row_number nodes with CudfTopNRowNumber.  The operator
+/// internally selects its bounded-memory Top-1 path when applicable.
 class TopNRowNumberAdapter : public OperatorAdapter {
  public:
   TopNRowNumberAdapter() : OperatorAdapter("TopNRowNumber") {}
@@ -819,15 +817,13 @@ class TopNRowNumberAdapter : public OperatorAdapter {
         node != nullptr &&
         node->rankFunction() ==
             core::TopNRowNumberNode::RankFunction::kRowNumber;
-    const bool spillableCanRun =
-        CudfSpillableTopNRowNumber::shouldReplace(node);
-    const bool canRun = canHandle(op) && (communityCanRun || spillableCanRun);
+    const bool canRun = canHandle(op) && communityCanRun;
     if (!canRun) {
       LOG_FALLBACK(
           "TopNRowNumberAdapter {}, PlanNode id: {}",
           !canHandle(op) ? "operator is not TopNRowNumber"
               : !node ? "planNode is not TopNRowNumberNode"
-                      : "neither community nor spillable implementation supports the node",
+                      : "CudfTopNRowNumber supports only row_number",
           planNode->id());
     }
     return canRun;
@@ -849,32 +845,28 @@ class TopNRowNumberAdapter : public OperatorAdapter {
     auto node =
         std::dynamic_pointer_cast<const core::TopNRowNumberNode>(planNode);
     std::vector<std::unique_ptr<exec::Operator>> result;
-    if (!CudfSpillableTopNRowNumber::shouldReplace(node)) {
-      result.push_back(
-          std::make_unique<CudfTopNRowNumber>(operatorId, ctx, node));
-      return result;
-    }
-
     // Exchange and scan sources can deliver tens of thousands of rows per
     // batch.  Running the grouped Top-1 kernel once for every such batch makes
     // high-cardinality ROW_NUMBER=1 windows kernel-launch bound and creates
     // hundreds of packed host chunks.  Coalesce to a bounded device batch
     // before reducing.  The byte cap is deliberately tied to (and no larger
     // than) the operator's candidate-run cap, so this does not increase the
-    // peak state that CudfSpillableTopNRowNumber is configured to tolerate.
-    const auto candidateRunBytes = ctx->queryConfig().get<uint64_t>(
-        CudfConfig::kCudfTopNRowNumberCandidateRunBytes,
-        CudfConfig::getInstance().topNRowNumberCandidateRunBytes);
+    // peak state that the bounded Top-1 path is configured to tolerate.
+    if (CudfTopNRowNumber::useBoundedTop1(node)) {
+      const auto candidateRunBytes = ctx->queryConfig().get<uint64_t>(
+          CudfConfig::kCudfTopNRowNumberCandidateRunBytes,
+          CudfConfig::getInstance().topNRowNumberCandidateRunBytes);
+      result.push_back(
+          std::make_unique<CudfBatchConcat>(
+              operatorId,
+              ctx,
+              planNode,
+              node->inputType(),
+              1'000'000,
+              std::min<uint64_t>(candidateRunBytes, 256ULL << 20)));
+    }
     result.push_back(
-        std::make_unique<CudfBatchConcat>(
-            operatorId,
-            ctx,
-            planNode,
-            node->inputType(),
-            1'000'000,
-            std::min<uint64_t>(candidateRunBytes, 256ULL << 20)));
-    result.push_back(
-        std::make_unique<CudfSpillableTopNRowNumber>(operatorId, ctx, node));
+        std::make_unique<CudfTopNRowNumber>(operatorId, ctx, node));
     return result;
   }
 };

@@ -95,11 +95,11 @@ std::set<fs::path> findTopLevelProcessSpillDirectories() {
   return paths;
 }
 
-bool usedCudfSpillableTopNRowNumber(const TaskStats& stats) {
+bool usedBoundedTop1Backend(const TaskStats& stats) {
   for (const auto& pipelineStats : stats.pipelineStats) {
     for (const auto& operatorStats : pipelineStats.operatorStats) {
       if (operatorStats.operatorType == "CudfTopNRowNumber" &&
-          operatorStats.runtimeStats.count("topNSpillableBackend") != 0) {
+          operatorStats.runtimeStats.count("topNBoundedTop1Backend") != 0) {
         return true;
       }
     }
@@ -129,7 +129,7 @@ class ScopedEnvVar {
   std::optional<std::string> oldValue_;
 };
 
-class CudfSpillableTopNRowNumberTest : public OperatorTestBase {
+class CudfTopNRowNumberBoundedTest : public OperatorTestBase {
  protected:
   static constexpr vector_size_t kNumRows = 32;
 
@@ -194,7 +194,7 @@ class CudfSpillableTopNRowNumberTest : public OperatorTestBase {
   bool previousAllowCpuFallback_{true};
 };
 
-TEST_F(CudfSpillableTopNRowNumberTest, rowNumberHostStateDoesNotUseDisk) {
+TEST_F(CudfTopNRowNumberBoundedTest, rowNumberHostStateDoesNotUseDisk) {
   const auto spillRoot = TempDirectoryPath::create();
   const auto preexistingTopLevelSpills = findTopLevelProcessSpillDirectories();
   auto cursor = makeSpillingCursor(spillRoot->getPath());
@@ -217,7 +217,7 @@ TEST_F(CudfSpillableTopNRowNumberTest, rowNumberHostStateDoesNotUseDisk) {
   EXPECT_EQ(findTopLevelProcessSpillDirectories(), preexistingTopLevelSpills);
 
   auto task = cursor->task();
-  EXPECT_TRUE(usedCudfSpillableTopNRowNumber(task->taskStats()));
+  EXPECT_TRUE(usedBoundedTop1Backend(task->taskStats()));
 
   actualResults.clear();
   cursor.reset();
@@ -226,7 +226,7 @@ TEST_F(CudfSpillableTopNRowNumberTest, rowNumberHostStateDoesNotUseDisk) {
   EXPECT_TRUE(fs::is_empty(spillRoot->getPath()));
 }
 
-TEST_F(CudfSpillableTopNRowNumberTest, earlyCloseCleansHostState) {
+TEST_F(CudfTopNRowNumberBoundedTest, earlyCloseCleansHostState) {
   const auto spillRoot = TempDirectoryPath::create();
   const auto preexistingTopLevelSpills = findTopLevelProcessSpillDirectories();
   auto cursor = makeSpillingCursor(spillRoot->getPath());
@@ -243,14 +243,14 @@ TEST_F(CudfSpillableTopNRowNumberTest, earlyCloseCleansHostState) {
   cursor.reset();
   EXPECT_TRUE(findSpillDirectories(spillRoot->getPath()).empty());
   EXPECT_EQ(findTopLevelProcessSpillDirectories(), preexistingTopLevelSpills);
-  EXPECT_TRUE(usedCudfSpillableTopNRowNumber(task->taskStats()));
+  EXPECT_TRUE(usedBoundedTop1Backend(task->taskStats()));
 
   task.reset();
   EXPECT_FALSE(fs::exists(taskSpillRoot));
   EXPECT_TRUE(fs::is_empty(spillRoot->getPath()));
 }
 
-TEST_F(CudfSpillableTopNRowNumberTest, groupedDescendingNullsLastAcrossBatches) {
+TEST_F(CudfTopNRowNumberBoundedTest, groupedDescendingNullsLastAcrossBatches) {
   // Exercise the grouped scalar ARGMAX path used by Job 144, including null
   // partition keys and an all-null sort-key group.
   auto first = makeRowVector(
@@ -298,11 +298,11 @@ TEST_F(CudfSpillableTopNRowNumberTest, groupedDescendingNullsLastAcrossBatches) 
        makeFlatVector<std::string>({"a8", "b9", "c3", "null-4", "d-null"}),
        makeFlatVector<int64_t>(5, [](vector_size_t) { return 1; })});
   assertEqualResults({expected}, actual);
-  EXPECT_TRUE(usedCudfSpillableTopNRowNumber(cursor->task()->taskStats()));
+  EXPECT_TRUE(usedBoundedTop1Backend(cursor->task()->taskStats()));
   EXPECT_TRUE(findSpillDirectories(spillRoot->getPath()).empty());
 }
 
-TEST_F(CudfSpillableTopNRowNumberTest, multiKeyArgMaxIsStableAcrossBatches) {
+TEST_F(CudfTopNRowNumberBoundedTest, multiKeyArgMaxIsStableAcrossBatches) {
   auto first = makeRowVector(
       {"p", "s1", "s2", "v"},
       {makeFlatVector<std::string>({"a", "a", "a", "b", "b"}),
@@ -353,11 +353,11 @@ TEST_F(CudfSpillableTopNRowNumberTest, multiKeyArgMaxIsStableAcrossBatches) {
        makeFlatVector<std::string>({"a-first", "b7", "c7"}),
        makeFlatVector<int64_t>(3, [](vector_size_t) { return 1; })});
   assertEqualResults({expected}, actual);
-  EXPECT_TRUE(usedCudfSpillableTopNRowNumber(cursor->task()->taskStats()));
+  EXPECT_TRUE(usedBoundedTop1Backend(cursor->task()->taskStats()));
   EXPECT_TRUE(findSpillDirectories(spillRoot->getPath()).empty());
 }
 
-TEST_F(CudfSpillableTopNRowNumberTest, uniquePartitionFastPathIsExactAndFallsBack) {
+TEST_F(CudfTopNRowNumberBoundedTest, uniquePartitionFastPathIsExactAndFallsBack) {
   ScopedEnvVar uniqueFastPath(
       "GLUTEN_CUDF_TOPN_UNIQUE_PARTITION_FAST_PATH", "1");
   // This small semantic fixture is intentionally duplicate-heavy. Force the
@@ -444,7 +444,7 @@ TEST_F(CudfSpillableTopNRowNumberTest, uniquePartitionFastPathIsExactAndFallsBac
 }
 
 TEST_F(
-    CudfSpillableTopNRowNumberTest,
+    CudfTopNRowNumberBoundedTest,
     sequentialSparseDuplicatePathFallsBackForDenseCandidates) {
   ScopedEnvVar uniqueFastPath(
       "GLUTEN_CUDF_TOPN_UNIQUE_PARTITION_FAST_PATH", "1");
@@ -539,7 +539,7 @@ TEST_F(
   EXPECT_TRUE(findSpillDirectories(spillRoot->getPath()).empty());
 }
 
-TEST_F(CudfSpillableTopNRowNumberTest, uniquePartitionFastPathSkipsReduction) {
+TEST_F(CudfTopNRowNumberBoundedTest, uniquePartitionFastPathSkipsReduction) {
   ScopedEnvVar uniqueFastPath(
       "GLUTEN_CUDF_TOPN_UNIQUE_PARTITION_FAST_PATH", "1");
   auto data = makeRowVector(
@@ -602,7 +602,7 @@ TEST_F(CudfSpillableTopNRowNumberTest, uniquePartitionFastPathSkipsReduction) {
 
 // Manual A/B probe for the wide-payload path. Keep disabled in the default
 // suite because it intentionally materializes roughly 256 MiB of strings.
-TEST_F(CudfSpillableTopNRowNumberTest, DISABLED_widePayloadLateGatherBenchmark) {
+TEST_F(CudfTopNRowNumberBoundedTest, DISABLED_widePayloadLateGatherBenchmark) {
   constexpr vector_size_t kRows = 262'144;
   constexpr vector_size_t kDuplicateEvery = 80;
   const auto* sparseValue =
@@ -675,11 +675,11 @@ TEST_F(CudfSpillableTopNRowNumberTest, DISABLED_widePayloadLateGatherBenchmark) 
       : kRows;
   EXPECT_EQ(outputRows, expectedRows);
   const auto taskStats = cursor->task()->taskStats();
-  EXPECT_TRUE(usedCudfSpillableTopNRowNumber(taskStats));
+  EXPECT_TRUE(usedBoundedTop1Backend(taskStats));
   for (const auto& pipelineStats : taskStats.pipelineStats) {
     for (const auto& operatorStats : pipelineStats.operatorStats) {
       if (operatorStats.operatorType == "CudfTopNRowNumber" &&
-          operatorStats.runtimeStats.count("topNSpillableBackend") != 0) {
+          operatorStats.runtimeStats.count("topNBoundedTop1Backend") != 0) {
         const auto runtimeSum = [&](std::string_view name) -> uint64_t {
           const auto it = operatorStats.runtimeStats.find(std::string(name));
           return it == operatorStats.runtimeStats.end() ? 0 : it->second.sum;
@@ -771,7 +771,7 @@ TEST_F(CudfSpillableTopNRowNumberTest, DISABLED_widePayloadLateGatherBenchmark) 
   }
 }
 
-TEST_F(CudfSpillableTopNRowNumberTest, abandonsLowReductionPartial) {
+TEST_F(CudfTopNRowNumberBoundedTest, abandonsLowReductionPartial) {
   constexpr vector_size_t kRows = 128;
   auto first = makeRowVector(
       {"p", "s", "v"},
@@ -853,7 +853,7 @@ TEST_F(CudfSpillableTopNRowNumberTest, abandonsLowReductionPartial) {
 }
 
 TEST_F(
-    CudfSpillableTopNRowNumberTest,
+    CudfTopNRowNumberBoundedTest,
     sequentialEarlyDenseProbeSwitchesToOnePassHashExactly) {
   ScopedEnvVar uniqueFastPath(
       "GLUTEN_CUDF_TOPN_UNIQUE_PARTITION_FAST_PATH", "1");
@@ -943,7 +943,7 @@ TEST_F(
 }
 
 TEST_F(
-    CudfSpillableTopNRowNumberTest,
+    CudfTopNRowNumberBoundedTest,
     oversizedFinalizeBucketIsRepartitionedFromPackedSpill) {
   constexpr vector_size_t kRows = 4096;
   constexpr vector_size_t kBatchRows = 128;
@@ -1025,7 +1025,7 @@ TEST_F(
   assertEqualResults({expected}, actual);
   EXPECT_GT(actual.size(), 2)
       << "oversized two-bucket input was not split into bounded outputs";
-  EXPECT_TRUE(usedCudfSpillableTopNRowNumber(cursor->task()->taskStats()));
+  EXPECT_TRUE(usedBoundedTop1Backend(cursor->task()->taskStats()));
   const auto planStats = exec::toPlanStats(cursor->task()->taskStats());
   const auto& topNStats = planStats.at(plan->id());
   const auto* sequential =
@@ -1063,7 +1063,7 @@ TEST_F(
   EXPECT_TRUE(findSpillDirectories(spillRoot->getPath()).empty());
 }
 
-TEST_F(CudfSpillableTopNRowNumberTest, largeFinalizeBucketHasBoundedOutputBatches) {
+TEST_F(CudfTopNRowNumberBoundedTest, largeFinalizeBucketHasBoundedOutputBatches) {
   constexpr vector_size_t kRows = 300000;
   auto data = makeRowVector(
       {"p", "s", "payload"},
@@ -1141,7 +1141,7 @@ TEST_F(CudfSpillableTopNRowNumberTest, largeFinalizeBucketHasBoundedOutputBatche
   }
 }
 
-TEST_F(CudfSpillableTopNRowNumberTest, deviceOutputStagingHonorsConfiguredBounds) {
+TEST_F(CudfTopNRowNumberBoundedTest, deviceOutputStagingHonorsConfiguredBounds) {
   // Device staging avoids the device -> host -> device round trip, but it
   // must not bypass the operator's row/byte ownership boundary. In
   // particular, downstream exchange backpressure must never keep a complete
