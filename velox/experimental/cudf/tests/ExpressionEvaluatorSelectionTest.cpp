@@ -34,6 +34,7 @@
 #include "velox/type/Type.h"
 
 #include <cudf/column/column_factories.hpp>
+
 #include <folly/ScopeGuard.h>
 #include <gtest/gtest.h>
 
@@ -126,8 +127,8 @@ TEST_F(CudfExpressionSelectionTest, rejectsUnsupportedJavaRegexSyntax) {
   EXPECT_TRUE(FunctionExpression::canEvaluate(regexpExtract("(a)")));
   EXPECT_FALSE(FunctionExpression::canEvaluate(regexpExtract("(?i)a")));
   EXPECT_FALSE(FunctionExpression::canEvaluate(regexpExtract("(a)\\1")));
-  EXPECT_FALSE(FunctionExpression::canEvaluate(
-      regexpExtract("(?<name>a)\\k<name>")));
+  EXPECT_FALSE(
+      FunctionExpression::canEvaluate(regexpExtract("(?<name>a)\\k<name>")));
 }
 
 TEST_F(CudfExpressionSelectionTest, operatorBatchCacheSharesRepeatedRoot) {
@@ -151,12 +152,12 @@ TEST_F(CudfExpressionSelectionTest, operatorBatchCacheSharesRepeatedRoot) {
       rmm::device_buffer{},
       0,
       rmm::device_buffer{});
-  auto a = cudf::make_fixed_width_column(
-      cudf::data_type{cudf::type_id::INT64}, 0);
-  auto b = cudf::make_fixed_width_column(
-      cudf::data_type{cudf::type_id::INT64}, 0);
-  auto c = cudf::make_fixed_width_column(
-      cudf::data_type{cudf::type_id::INT32}, 0);
+  auto a =
+      cudf::make_fixed_width_column(cudf::data_type{cudf::type_id::INT64}, 0);
+  auto b =
+      cudf::make_fixed_width_column(cudf::data_type{cudf::type_id::INT64}, 0);
+  auto c =
+      cudf::make_fixed_width_column(cudf::data_type{cudf::type_id::INT32}, 0);
   std::vector<cudf::column_view> inputViews{
       a->view(), b->view(), c->view(), input->view()};
 
@@ -206,7 +207,8 @@ TEST_F(
                        cudf::size_type rows,
                        int64_t first) {
     std::vector<cudf::column_view> noInputs;
-    auto result = target->eval(noInputs, rows, stream, mr, true);
+    auto result =
+        target->evalWithInputRowCount(noInputs, rows, stream, mr, true);
     auto resultView = asView(result);
     auto outputType = ROW({"id"}, {BIGINT()});
     auto output = with_arrow::toVeloxColumn(

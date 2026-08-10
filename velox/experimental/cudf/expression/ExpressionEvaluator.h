@@ -88,14 +88,6 @@ class CudfFunction {
       std::vector<ColumnOrView>& inputColumns,
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr) const = 0;
-
-  virtual ColumnOrView eval(
-      std::vector<ColumnOrView>& inputColumns,
-      cudf::size_type inputRowCount,
-      rmm::cuda_stream_view stream,
-      rmm::device_async_resource_ref mr) const {
-    return eval(inputColumns, stream, mr);
-  }
 };
 
 using CudfFunctionFactory = std::function<std::shared_ptr<CudfFunction>(
@@ -142,6 +134,12 @@ const core::QueryConfig* currentCudfFunctionQueryConfig();
 
 const core::QueryCtx* currentCudfFunctionQueryCtx();
 
+/// Returns the row count of the input batch currently being evaluated. This
+/// lets zero-argument functions size their output without extending the
+/// CudfFunction virtual interface, which is also implemented by external UDF
+/// libraries.
+cudf::size_type currentCudfFunctionInputRowCount();
+
 bool registerBuiltinFunctions(const std::string& prefix);
 
 void unregisterFunctions();
@@ -165,14 +163,12 @@ class CudfExpression {
       rmm::device_async_resource_ref mr,
       bool finalize = false) = 0;
 
-  virtual ColumnOrView eval(
+  ColumnOrView evalWithInputRowCount(
       std::vector<cudf::column_view> inputColumnViews,
       cudf::size_type inputRowCount,
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr,
-      bool finalize = false) {
-    return eval(std::move(inputColumnViews), stream, mr, finalize);
-  }
+      bool finalize = false);
 };
 
 using CudfExpressionPtr = std::shared_ptr<CudfExpression>;
@@ -213,8 +209,7 @@ class CudfExpressionBatchCache {
   uint64_t retained_{0};
 };
 
-using CudfExpressionBatchCachePtr =
-    std::shared_ptr<CudfExpressionBatchCache>;
+using CudfExpressionBatchCachePtr = std::shared_ptr<CudfExpressionBatchCache>;
 
 CudfExpressionBatchCachePtr makeCudfExpressionBatchCache(
     const std::vector<core::TypedExprPtr>& roots);
@@ -228,13 +223,6 @@ class FunctionExpression : public CudfExpression {
 
   ColumnOrView eval(
       std::vector<cudf::column_view> inputColumnViews,
-      rmm::cuda_stream_view stream,
-      rmm::device_async_resource_ref mr,
-      bool finalize = false) override;
-
-  ColumnOrView eval(
-      std::vector<cudf::column_view> inputColumnViews,
-      cudf::size_type inputRowCount,
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr,
       bool finalize = false) override;

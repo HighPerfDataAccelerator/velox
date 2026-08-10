@@ -58,8 +58,8 @@
 #include <cudf/strings/convert/convert_datetime.hpp>
 #include <cudf/strings/convert/convert_floats.hpp>
 #include <cudf/strings/convert/convert_integers.hpp>
-#include <cudf/strings/find.hpp>
 #include <cudf/strings/extract.hpp>
+#include <cudf/strings/find.hpp>
 #include <cudf/strings/regex/regex_program.hpp>
 #include <cudf/strings/replace.hpp>
 #include <cudf/strings/split/split.hpp>
@@ -86,6 +86,7 @@ namespace {
 
 thread_local const core::QueryConfig* currentFunctionQueryConfig = nullptr;
 thread_local const core::QueryCtx* currentFunctionQueryCtx = nullptr;
+thread_local cudf::size_type currentFunctionInputRowCount = 0;
 
 class ScopedCudfFunctionQueryContext {
  public:
@@ -106,6 +107,21 @@ class ScopedCudfFunctionQueryContext {
  private:
   const core::QueryConfig* previousConfig_;
   const core::QueryCtx* previousCtx_;
+};
+
+class ScopedCudfFunctionInputRowCount {
+ public:
+  explicit ScopedCudfFunctionInputRowCount(cudf::size_type inputRowCount)
+      : previous_(currentFunctionInputRowCount) {
+    currentFunctionInputRowCount = inputRowCount;
+  }
+
+  ~ScopedCudfFunctionInputRowCount() {
+    currentFunctionInputRowCount = previous_;
+  }
+
+ private:
+  cudf::size_type previous_;
 };
 
 bool decimalScalarIsZero(
@@ -259,8 +275,8 @@ bool isCudfRegexPatternSupported(std::string_view pattern) {
     // Reject every Java (?...) extension conservatively: lookarounds, inline
     // flags, non-capturing/atomic groups, named groups and flag scopes are not
     // a uniformly supported libcudf subset.
-    if (!inCharacterClass && pattern[i] == '(' &&
-        i + 1 < pattern.size() && pattern[i + 1] == '?') {
+    if (!inCharacterClass && pattern[i] == '(' && i + 1 < pattern.size() &&
+        pattern[i + 1] == '?') {
       return false;
     }
   }
@@ -437,6 +453,20 @@ const core::QueryCtx* currentCudfFunctionQueryCtx() {
   return currentFunctionQueryCtx;
 }
 
+cudf::size_type currentCudfFunctionInputRowCount() {
+  return currentFunctionInputRowCount;
+}
+
+ColumnOrView CudfExpression::evalWithInputRowCount(
+    std::vector<cudf::column_view> inputColumnViews,
+    cudf::size_type inputRowCount,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr,
+    bool finalize) {
+  ScopedCudfFunctionInputRowCount scope(inputRowCount);
+  return eval(std::move(inputColumnViews), stream, mr, finalize);
+}
+
 void checkAllTrue(
     cudf::column_view cond,
     std::string_view userMessage,
@@ -591,10 +621,8 @@ class CastFunction : public CudfFunction {
 
     const auto& sourceVeloxType = expr->inputs()[0]->type();
     const auto& targetVeloxType = expr->type();
-    const auto sourceType =
-        cudf_velox::veloxToCudfDataType(sourceVeloxType);
-    const auto targetType =
-        cudf_velox::veloxToCudfDataType(targetVeloxType);
+    const auto sourceType = cudf_velox::veloxToCudfDataType(sourceVeloxType);
+    const auto targetType = cudf_velox::veloxToCudfDataType(targetVeloxType);
     if (sourceType == targetType) {
       return Mode::kIdentity;
     }
@@ -615,8 +643,7 @@ class CastFunction : public CudfFunction {
     };
     const auto isFloating = [](const TypePtr& type) {
       return type != nullptr &&
-          (type->kind() == TypeKind::REAL ||
-           type->kind() == TypeKind::DOUBLE);
+          (type->kind() == TypeKind::REAL || type->kind() == TypeKind::DOUBLE);
     };
 
     if (sourceVeloxType->kind() == TypeKind::VARCHAR &&
@@ -643,9 +670,8 @@ class CastFunction : public CudfFunction {
         !cudf::is_fixed_width(targetType)) {
       return Mode::kUnsupported;
     }
-    return cudf::is_supported_cast(sourceType, targetType)
-        ? Mode::kCudf
-        : Mode::kUnsupported;
+    return cudf::is_supported_cast(sourceType, targetType) ? Mode::kCudf
+                                                           : Mode::kUnsupported;
   }
 
   static bool canEvaluate(const core::TypedExprPtr& expr) {
@@ -1486,8 +1512,7 @@ bool isSwitchExpressionSupported(const core::TypedExprPtr& expr) {
 
     // Literal operands are materialized as cuDF scalars. Complex literals
     // need type-specific column construction and remain unsupported here.
-    if (inputs[i]->isConstantKind() &&
-        !inputs[i]->type()->isPrimitiveType()) {
+    if (inputs[i]->isConstantKind() && !inputs[i]->type()->isPrimitiveType()) {
       return false;
     }
   }
@@ -1529,8 +1554,9 @@ class SwitchFunction : public CudfFunction {
 
     auto operandView = [&](const Operand& operand) -> cudf::column_view {
       if (operand.scalar) {
-        materializedScalars.push_back(cudf::make_column_from_scalar(
-            *operand.scalar, rowCount, stream, mr));
+        materializedScalars.push_back(
+            cudf::make_column_from_scalar(
+                *operand.scalar, rowCount, stream, mr));
         return materializedScalars.back()->view();
       }
       VELOX_CHECK_LT(operand.columnIndex, inputColumns.size());
@@ -1542,8 +1568,7 @@ class SwitchFunction : public CudfFunction {
       auto condition = operandView(operands_[i]);
       auto thenValue = operandView(operands_[i + 1]);
       auto elseValue = result ? result->view() : operandView(operands_.back());
-      result =
-          cudf::copy_if_else(thenValue, elseValue, condition, stream, mr);
+      result = cudf::copy_if_else(thenValue, elseValue, condition, stream, mr);
     }
     return result;
   }
@@ -1614,8 +1639,8 @@ class CoalesceFunction : public CudfFunction {
         result = cudf::copy_if_else(
             asView(inputColumns[i]), current, nullRows->view(), stream, mr);
       } else {
-        result = cudf::replace_nulls(
-            current, asView(inputColumns[i]), stream, mr);
+        result =
+            cudf::replace_nulls(current, asView(inputColumns[i]), stream, mr);
       }
     }
 
@@ -2316,10 +2341,7 @@ class RowConstructorFunction : public CudfFunction {
       : parentNullPolicy_(parentNullPolicy),
         functionName_(std::move(functionName)) {
     VELOX_CHECK_GE(
-        expr->inputs().size(),
-        1,
-        "{} expects at least 1 input",
-        functionName_);
+        expr->inputs().size(), 1, "{} expects at least 1 input", functionName_);
     numInputs_ = expr->inputs().size();
     bool hasNonLiteralInput = false;
     literals_.reserve(numInputs_);
@@ -2530,9 +2552,9 @@ bool registerBuiltinFunctions(const std::string& prefix) {
           return true;
         }
         const auto value = constantVarcharValue(expr->inputs()[1]);
-        return value.has_value() && isCudfRegexPatternSupported(
-                                        std::string_view(
-                                            value->data(), value->size()));
+        return value.has_value() &&
+            isCudfRegexPatternSupported(
+                   std::string_view(value->data(), value->size()));
       });
 
   registerCudfFunction(
@@ -3188,8 +3210,7 @@ bool isExpressionCseSafe(const core::TypedExprPtr& expr) {
     // Dynamically loaded Netflix JSON functions do not publish Velox function
     // metadata, but both are pure functions of their two arguments.
     if ((!deterministic.has_value() || !deterministic.value()) &&
-        name != "nf_json_extract_scalar" &&
-        name != "nf_json_extract_array") {
+        name != "nf_json_extract_scalar" && name != "nf_json_extract_array") {
       return false;
     }
   }
@@ -3388,17 +3409,8 @@ ColumnOrView FunctionExpression::eval(
     rmm::device_async_resource_ref mr,
     bool finalize) {
   const auto inputRowCount = inputColumnViews.empty()
-      ? cudf::size_type{0}
+      ? currentCudfFunctionInputRowCount()
       : inputColumnViews.front().size();
-  return eval(std::move(inputColumnViews), inputRowCount, stream, mr, finalize);
-}
-
-ColumnOrView FunctionExpression::eval(
-    std::vector<cudf::column_view> inputColumnViews,
-    cudf::size_type inputRowCount,
-    rmm::cuda_stream_view stream,
-    rmm::device_async_resource_ref mr,
-    bool finalize) {
   const bool useCache = batchCache_ != nullptr && !cseKey_.empty() &&
       batchCache_->isCacheable(cseKey_);
   if (useCache) {
@@ -3435,8 +3447,8 @@ ColumnOrView FunctionExpression::eval(
         subexpressions_.size(),
         1,
         "Nested field reference expects exactly one subexpression");
-    auto parent =
-        subexpressions_[0]->eval(inputColumnViews, inputRowCount, stream, mr);
+    auto parent = subexpressions_[0]->evalWithInputRowCount(
+        inputColumnViews, inputRowCount, stream, mr);
     VELOX_DCHECK_GE(fieldIndex_, 0);
     auto child = FunctionExpression::makeStructChildColumn(
         parent, static_cast<cudf::size_type>(fieldIndex_), stream, mr);
@@ -3450,11 +3462,12 @@ ColumnOrView FunctionExpression::eval(
     subexprResults.reserve(subexpressions_.size());
 
     for (const auto& subexpr : subexpressions_) {
-      subexprResults.push_back(
-          subexpr->eval(inputColumnViews, inputRowCount, stream, mr));
+      subexprResults.push_back(subexpr->evalWithInputRowCount(
+          inputColumnViews, inputRowCount, stream, mr));
     }
 
-    auto result = function_->eval(subexprResults, inputRowCount, stream, mr);
+    ScopedCudfFunctionInputRowCount scope(inputRowCount);
+    auto result = function_->eval(subexprResults, stream, mr);
     if (finalize || useCache) {
       const auto requestedType = cudf_velox::veloxToCudfDataType(expr_->type());
       auto resultView = asView(result);
