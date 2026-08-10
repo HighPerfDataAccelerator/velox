@@ -125,6 +125,12 @@ class SplitsStore {
   /// any waiters on the splits.
   void addSplit(Split split, std::vector<ContinuePromise>& promises);
 
+  /// Starts asynchronous preload for up to 'maxPreloadSplits' queued splits
+  /// without assigning a split to a driver.
+  void preloadSplits(
+      int32_t maxPreloadSplits,
+      const ConnectorSplitPreloadFunc& preload);
+
   /// Return the number of waiters waiting for new splits.
   int numWaiters() const {
     return promises_.size();
@@ -133,6 +139,7 @@ class SplitsStore {
   /// Signal there will not be any more splits added to this store.
   std::vector<ContinuePromise> noMoreSplits() {
     noMoreSplits_ = true;
+    initialSplitPreloader_ = {};
     return std::move(promises_);
   }
 
@@ -178,6 +185,12 @@ class SplitsStore {
 
   // Signal, that no more splits will arrive.
   bool noMoreSplits_{false};
+
+  // One-time preload budget registered before scan drivers are runnable. The
+  // callback is retained until late-arriving splits fill the initial window.
+  int32_t initialSplitPreloadLimit_{0};
+  int32_t numInitialSplitsPreloaded_{0};
+  ConnectorSplitPreloadFunc initialSplitPreloader_;
 
   // Blocking promises given out when out of splits to distribute.
   std::vector<ContinuePromise> promises_;

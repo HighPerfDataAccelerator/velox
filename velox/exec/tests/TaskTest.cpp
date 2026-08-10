@@ -804,6 +804,39 @@ TEST_F(TaskTest, preloadedSplitsAreConsumedInReadyOrder) {
   task->requestCancel().wait();
 }
 
+TEST_F(TaskTest, primesLateArrivingSplitsWithoutDriver) {
+  auto data = makeRowVector({makeFlatVector<int32_t>({1, 2, 3})});
+  auto task = Task::create(
+      "task-initial-split-preload",
+      PlanBuilder().tableScan(asRowType(data->type())).planFragment(),
+      0,
+      core::QueryCtx::create(),
+      Task::ExecutionMode::kSerial,
+      exec::Consumer{});
+
+  std::atomic_int32_t numPreloaded{0};
+  ConnectorSplitPreloadFunc preload =
+      [&](const std::shared_ptr<connector::ConnectorSplit>& connectorSplit) {
+        ++numPreloaded;
+        connectorSplit->dataSource =
+            std::make_unique<AsyncSource<connector::DataSource>>(
+                []() -> std::unique_ptr<connector::DataSource> {
+                  return nullptr;
+                });
+      };
+
+  task->preloadSplits(kUngroupedGroupId, "0", /*maxPreloadSplits=*/3, preload);
+  for (int32_t i = 0; i < 5; ++i) {
+    task->addSplit(
+        "0",
+        exec::Split(makeHiveConnectorSplit(fmt::format("file:/tmp/{}", i))));
+  }
+  EXPECT_EQ(numPreloaded, 3);
+
+  task->noMoreSplits("0");
+  task->requestCancel().wait();
+}
+
 TEST_F(TaskTest, wrongPlanNodeForSplit) {
   auto connectorSplit = std::make_shared<connector::hive::HiveConnectorSplit>(
       "test",

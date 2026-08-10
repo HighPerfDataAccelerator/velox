@@ -20,11 +20,34 @@
 #include "velox/exec/OperatorType.h"
 #include "velox/exec/Task.h"
 
+#include <charconv>
+#include <cstdlib>
+#include <cstring>
+#include <limits>
+#include <string_view>
+
 using facebook::velox::common::testutil::TestValue;
 
 namespace facebook::velox::exec {
 
 namespace {
+
+bool eagerTaskSplitPreloadEnabled() {
+  const auto* value = std::getenv("GLUTEN_CUDF_EAGER_TASK_SPLIT_PRELOAD");
+  if (value != nullptr && *value != '\0') {
+    return std::string_view(value) == "1" || std::string_view(value) == "true";
+  }
+  const auto* adaptive = std::getenv("GLUTEN_CUDF_S3_ADAPTIVE_PREFETCH");
+  return adaptive != nullptr &&
+      (std::string_view(adaptive) == "1" ||
+       std::string_view(adaptive) == "true");
+}
+
+bool adaptiveS3PrefetchEnabled() {
+  const auto* value = std::getenv("GLUTEN_CUDF_S3_ADAPTIVE_PREFETCH");
+  return value != nullptr &&
+      (std::string_view(value) == "1" || std::string_view(value) == "true");
+}
 
 std::unique_ptr<connector::DataSource> createDataSource(
     folly::Synchronized<PushdownFilters>& pushdownFilters,
@@ -87,6 +110,30 @@ void copyConnectorRuntimeStatsLocked(
 
 } // namespace
 
+int32_t initialTaskSplitPreloadLimit(int32_t steadyStateLimit) {
+  VELOX_CHECK_GE(steadyStateLimit, 0);
+  constexpr int32_t kAdaptiveInitialSplits = 1'024;
+  const auto defaultValue = adaptiveS3PrefetchEnabled()
+      ? std::max(steadyStateLimit, kAdaptiveInitialSplits)
+      : steadyStateLimit;
+  const auto* value =
+      std::getenv("GLUTEN_CUDF_EAGER_TASK_SPLIT_PRELOAD_INITIAL_SPLITS");
+  if (value == nullptr || *value == '\0') {
+    return defaultValue;
+  }
+
+  int64_t parsed{0};
+  const auto* end = value + std::strlen(value);
+  const auto [parsedEnd, error] = std::from_chars(value, end, parsed);
+  VELOX_USER_CHECK(
+      error == std::errc{} && parsedEnd == end && parsed >= 0 &&
+          parsed <= std::numeric_limits<int32_t>::max(),
+      "GLUTEN_CUDF_EAGER_TASK_SPLIT_PRELOAD_INITIAL_SPLITS must be a "
+      "non-negative 32-bit integer: {}",
+      value);
+  return std::max(steadyStateLimit, static_cast<int32_t>(parsed));
+}
+
 TableScan::TableScan(
     int32_t operatorId,
     DriverCtx* driverCtx,
@@ -128,6 +175,16 @@ TableScan::TableScan(
 void TableScan::initialize() {
   SourceOperator::initialize();
   VELOX_CHECK_EQ(driverCtx_->driver->operatorIndex(this), 0);
+  if (eagerTaskSplitPreloadEnabled()) {
+    checkPreload();
+    if (splitPreloader_) {
+      driverCtx_->task->preloadSplits(
+          driverCtx_->splitGroupId,
+          planNodeId(),
+          initialTaskSplitPreloadLimit(maxPreloadedSplits_),
+          splitPreloader_);
+    }
+  }
 }
 
 bool TableScan::shouldYield(StopReason taskStopReason, size_t startTimeMs)

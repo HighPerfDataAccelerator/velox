@@ -14,10 +14,12 @@
  * limitations under the License.
  */
 #include <atomic>
+#include <cstdlib>
 #include <shared_mutex>
 
 #include <fmt/ranges.h>
 #include <folly/OperationCancelled.h>
+#include <folly/ScopeGuard.h>
 #include <folly/synchronization/Baton.h>
 #include <folly/synchronization/EventCount.h>
 #include <folly/synchronization/Latch.h>
@@ -85,6 +87,37 @@ class TableScanTest : public TableScanTestBase {
     orc::registerOrcReaderFactory();
   }
 };
+
+TEST(TableScanConfigTest, initialTaskSplitPreloadLimit) {
+  constexpr const char* kAdaptive = "GLUTEN_CUDF_S3_ADAPTIVE_PREFETCH";
+  constexpr const char* kInitial =
+      "GLUTEN_CUDF_EAGER_TASK_SPLIT_PRELOAD_INITIAL_SPLITS";
+  const auto oldAdaptive = std::getenv(kAdaptive) == nullptr
+      ? std::optional<std::string>{}
+      : std::optional<std::string>{std::getenv(kAdaptive)};
+  const auto oldInitial = std::getenv(kInitial) == nullptr
+      ? std::optional<std::string>{}
+      : std::optional<std::string>{std::getenv(kInitial)};
+  const auto restore = folly::makeGuard([&]() {
+    oldAdaptive.has_value() ? setenv(kAdaptive, oldAdaptive->c_str(), 1)
+                            : unsetenv(kAdaptive);
+    oldInitial.has_value() ? setenv(kInitial, oldInitial->c_str(), 1)
+                           : unsetenv(kInitial);
+  });
+
+  ASSERT_EQ(unsetenv(kAdaptive), 0);
+  ASSERT_EQ(unsetenv(kInitial), 0);
+  EXPECT_EQ(initialTaskSplitPreloadLimit(128), 128);
+
+  ASSERT_EQ(setenv(kAdaptive, "1", 1), 0);
+  EXPECT_EQ(initialTaskSplitPreloadLimit(128), 1'024);
+  EXPECT_EQ(initialTaskSplitPreloadLimit(2'048), 2'048);
+
+  ASSERT_EQ(setenv(kInitial, "2", 1), 0);
+  EXPECT_EQ(initialTaskSplitPreloadLimit(128), 128);
+  ASSERT_EQ(setenv(kInitial, "1536", 1), 0);
+  EXPECT_EQ(initialTaskSplitPreloadLimit(128), 1'536);
+}
 
 TEST_F(TableScanTest, allColumns) {
   auto vectors = makeVectors(10, 1'000);

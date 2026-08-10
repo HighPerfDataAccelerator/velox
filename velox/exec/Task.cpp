@@ -2200,6 +2200,17 @@ BlockingReason Task::getSplitOrFuture(
                     : BlockingReason::kWaitForSplit;
 }
 
+void Task::preloadSplits(
+    uint32_t splitGroupId,
+    const core::PlanNodeId& planNodeId,
+    int32_t maxPreloadSplits,
+    const ConnectorSplitPreloadFunc& preload) {
+  std::lock_guard<std::timed_mutex> l(mutex_);
+  auto& splitsState = getPlanNodeSplitsStateLocked(planNodeId);
+  auto* splitsStore = getOrCreateSplitsStoreLocked(splitsState, splitGroupId);
+  splitsStore->preloadSplits(maxPreloadSplits, preload);
+}
+
 void Task::splitPreloadFinished(
     uint32_t splitGroupId,
     const core::PlanNodeId& planNodeId) {

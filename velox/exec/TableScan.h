@@ -23,6 +23,16 @@
 
 namespace facebook::velox::exec {
 
+/// Returns the number of queued splits to prime when eager task-level split
+/// preload starts. The steady-state scan window remains controlled by
+/// max_split_preload_per_task; this larger one-time window lets independent
+/// scan fragments publish I/O before join dependencies release their drivers.
+///
+/// GLUTEN_CUDF_EAGER_TASK_SPLIT_PRELOAD_INITIAL_SPLITS is an explicit
+/// override. The adaptive S3 umbrella defaults the initial window to 1,024.
+/// The result never shrinks the steady-state window.
+int32_t initialTaskSplitPreloadLimit(int32_t steadyStateLimit);
+
 class TableScan : public SourceOperator {
  public:
   TableScan(
