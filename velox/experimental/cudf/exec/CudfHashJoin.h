@@ -224,8 +224,11 @@ class CudfHashJoinBuild : public CudfOperatorBase {
   void doAddInput(RowVectorPtr input) override;
   RowVectorPtr doGetOutput() override;
   void doNoMoreInput() override;
+  void doClose() override;
 
  private:
+  void finalizeBuild();
+  uint64_t residentBuildFinalizeWorkspaceBytes() const;
   void partitionAndPack(CudfVectorPtr input);
   void storeGraceBuildBatch(
       HashJoinHostBatch batch,
@@ -257,6 +260,11 @@ class CudfHashJoinBuild : public CudfOperatorBase {
   bool graceEligible_{false};
   bool graceActive_{false};
   bool graceEagerProbeNotified_{false};
+  // The last build Driver owns all peer inputs after the barrier. Finalizing
+  // that resident image is replayable from getOutput(): a workspace wake only
+  // retries admission and never repeats peer collection or bridge publication.
+  bool buildFinalizePending_{false};
+  ReplayableDeviceMemoryWorkspace buildFinalizeWorkspace_;
   ContinueFuture future_{ContinueFuture::makeEmpty()};
 };
 
@@ -464,11 +472,7 @@ class CudfHashJoinProbe : public CudfOperatorBase {
   // batch is blocked downstream double-counts that memory and can starve the
   // next drain for tens of seconds.
   std::optional<DeviceMemoryWorkspaceReservation> graceWorkspaceAdmission_;
-  DeviceMemoryWorkspaceRequest graceWorkspaceRequest_;
-  ContinueFuture graceWorkspaceFuture_{ContinueFuture::makeEmpty()};
-  bool waitingForGraceWorkspace_{false};
-  bool graceWorkspaceWaitPending_{false};
-  std::chrono::steady_clock::time_point graceWorkspaceWaitStart_;
+  ReplayableDeviceMemoryWorkspace graceWorkspace_;
   size_t graceProbePrefetchDepth_{4};
   std::deque<std::pair<size_t, std::future<void>>>
       graceProbePrefetchFutures_;

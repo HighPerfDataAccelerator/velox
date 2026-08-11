@@ -457,7 +457,7 @@ class CudfTopNRowNumber : public CudfOperatorBase {
   // avoids a bucket-wide D2H/pageable copy followed by H2D per output slice.
   std::unique_ptr<cudf::table> pendingPartitionedDeviceOutput_;
   std::optional<DeviceMemoryWorkspaceReservation> inputWorkspaceAdmission_;
-  DeviceMemoryWorkspaceRequest deviceWorkspaceRequest_;
+  ReplayableDeviceMemoryWorkspace deviceWorkspace_;
   cudf::size_type pendingPartitionedDeviceOutputOffset_{0};
   uint64_t pendingPartitionedDeviceOutputBytes_{0};
   rmm::cuda_stream_view pendingPartitionedDeviceOutputStream_{};
@@ -467,8 +467,6 @@ class CudfTopNRowNumber : public CudfOperatorBase {
   std::shared_ptr<rmm::cuda_stream> deviceOutputStream_;
   std::deque<DeferredDeviceOutput> deferredDeviceOutputs_;
   std::deque<DeferredFinalizeOwnership> deferredFinalizeOwnerships_;
-  ContinueFuture deviceWorkspaceFuture_{ContinueFuture::makeEmpty()};
-  bool waitingForDeviceWorkspace_{false};
   bool partitionedRowNumberMode_{false};
   // Opt-in exact path for low-reduction final ROW_NUMBER=1. Wide input runs
   // are stored without a local hash partition while narrow partition-key

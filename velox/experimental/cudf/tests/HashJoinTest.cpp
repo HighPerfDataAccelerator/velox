@@ -336,6 +336,34 @@ DEBUG_ONLY_TEST_F(HashJoinTest, transferBuildInputOwnershipFromSourceDrivers) {
       << "Source build drivers retained input batches after transfer";
 }
 
+DEBUG_ONLY_TEST_F(HashJoinTest, replayResidentBuildFinalizeAfterWorkspaceWake) {
+  std::atomic_size_t finalizeAdmissionAttempts{0};
+
+  SCOPED_TESTVALUE_SET(
+      "facebook::velox::cudf_velox::CudfHashJoinBuild::finalizeBuild::deferAfterAdmission",
+      std::function<void(bool*)>([&](bool* defer) {
+        // Defer exactly the first admitted attempt. The ready advisory makes
+        // the Driver leave noMoreInput(), pass through isBlocked(), and resume
+        // finalization from getOutput() without repeating the peer barrier.
+        *defer = finalizeAdmissionAttempts.fetch_add(1) == 0;
+      }));
+
+  HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
+      .injectSpill(false)
+      .numDrivers(
+          2,
+          /*runParallelProbe=*/false,
+          /*runParallelBuild=*/true)
+      .keyTypes({BIGINT()})
+      .probeVectors(100, 2)
+      .buildVectors(100, 2)
+      .referenceQuery(
+          "SELECT t_k0, t_data, u_k0, u_data FROM t, u WHERE t_k0 = u_k0")
+      .run();
+
+  EXPECT_GE(finalizeAdmissionAttempts.load(), 2);
+}
+
 TEST_P(MultiThreadedHashJoinTest, normalizedKey) {
   HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
       .injectSpill(false)

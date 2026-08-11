@@ -36,6 +36,43 @@ Velox-cuDF builds are included in Velox CI as part of the [adapters build](https
 
 Velox-cuDF provides several configuration properties to control GPU execution behavior, memory management, and debugging. These configurations are available when compiled with cuDF support and can be set via Velox's configuration system. For a complete list of cuDF-specific configuration properties and their descriptions, see the [Cudf-specific Configuration section](https://facebookincubator.github.io/velox/configs.html#cudf-specific-configuration-experimental) in the Velox configuration documentation.
 
+### Cooperative spill and device-workspace framework
+
+Blocking cuDF operators share a cooperative control plane for persistent GPU
+state, spill victim selection, and transient restore/compute workspace. The
+framework deliberately does not prescribe an on-disk format or an
+operator-specific partitioning policy.
+
+The control plane has three layers:
+
+1. `CudfOperatorBase` registers each operator's device pool with both Velox's
+   memory reclaimer and the process-wide device reclaimer. Pressure is
+   published asynchronously and serviced by the owning Driver only at safe
+   operator boundaries.
+2. `DeviceMemoryWorkspaceReservation` accounts for transient restore,
+   concatenate, hash-build, and output memory across all Drivers on a device.
+   Requests are ordered by progress priority: input, transform, restore,
+   drain, then output handoff.
+3. `ReplayableDeviceMemoryWorkspace` owns one cancellation-safe request,
+   advisory future, and wait interval. An operator whose replayable phase
+   cannot be admitted returns `kWaitForArbitration`, preserves its input or
+   spilled partition, and retries the phase after the Driver is woken.
+
+An operator adopting the framework must separate irreversible work from the
+replayable phase. Peer barriers, ownership transfer, output publication, and
+spill-file mutation run once. Admission is retried before the first GPU
+allocation in a phase; a wake is advisory, so physical headroom is always
+revalidated. `close()` resets the replayable workspace to cancel any queued
+request. Workspace reservations remain scoped to the kernels they protect and
+must not be retained while an output batch is blocked downstream.
+
+Hash join uses this protocol for resident build finalization and Grace
+partition restore. Top-N row number uses it for input, restore, drain, and
+output phases. Order By and Batch Concat use the same lifecycle for output and
+bounded replacement work. Their spill layouts and victim heuristics remain
+operator-owned, allowing other blocking operators to adopt the common control
+plane without inheriting join-specific behavior.
+
 ### Testing Velox with cuDF
 
 Tests with Velox-cuDF can only be run on GPU-enabled hardware. The Velox-cuDF tests in [experimental/cudf/tests](https://github.com/facebookincubator/velox/blob/main/velox/experimental/cudf/tests) include several types of tests:

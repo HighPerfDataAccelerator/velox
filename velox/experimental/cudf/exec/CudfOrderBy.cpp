@@ -380,6 +380,23 @@ CudfOrderBy::CudfOrderBy(
 }
 
 uint64_t CudfOrderBy::outputWorkspaceBytes() const {
+  // Once a result is materialized, the next call only hands it off or copies
+  // one bounded slice. Do not charge the configured maximum run size here:
+  // tests and production deployments may deliberately set that limit far
+  // above device capacity to select the in-memory path.
+  if (pendingOutput_) {
+    const auto copyBytes = std::min(pendingOutputBytes_, outputChunkBytes_);
+    if (copyBytes >
+        (std::numeric_limits<uint64_t>::max() -
+         kOrderByOutputFixedWorkspaceBytes) /
+            2) {
+      return std::numeric_limits<uint64_t>::max();
+    }
+    return std::max<uint64_t>(
+        kMinOrderByOutputWorkspaceBytes,
+        copyBytes * 2 + kOrderByOutputFixedWorkspaceBytes);
+  }
+
   // One drain step can restore one bounded chunk from each merge input,
   // materialize the merged table, and copy one bounded output slice.  Charge
   // all of those transient owners before getOutput() competes with Ucx/TopN
@@ -405,26 +422,24 @@ uint64_t CudfOrderBy::outputWorkspaceBytes() const {
 }
 
 exec::BlockingReason CudfOrderBy::isBlocked(ContinueFuture* future) {
-  if (finished_ || !noMoreInput_ || outputWorkspaceAdmission_.has_value()) {
+  if (finished_ || !noMoreInput_ || outputWorkspaceAdmission_.has_value() ||
+      (!spilled_ && !pendingOutput_)) {
     return exec::BlockingReason::kNotBlocked;
   }
 
-  ContinueFuture workspaceFuture;
   const auto minHeadroom = std::min<uint64_t>(
       CudfConfig::getInstance().deviceMemoryMinHeadroomBytes, 1ULL << 30);
-  auto workspace = tryAcquireDeviceMemoryWorkspace(
+  auto attempt = outputWorkspace_.tryAcquire(
       customPool(kCudfDeviceMemoryResourceTag),
       this,
       outputWorkspaceBytes(),
       minHeadroom,
-      DeviceMemoryWorkspacePriority::kOutput,
-      &outputWorkspaceRequest_,
-      &workspaceFuture);
-  if (!workspace.has_value()) {
-    *future = std::move(workspaceFuture);
+      DeviceMemoryWorkspacePriority::kOutput);
+  if (!attempt.reservation.has_value()) {
+    VELOX_CHECK(outputWorkspace_.takeFuture(future));
     return exec::BlockingReason::kWaitForArbitration;
   }
-  outputWorkspaceAdmission_.emplace(std::move(workspace.value()));
+  outputWorkspaceAdmission_.emplace(std::move(attempt.reservation.value()));
   return exec::BlockingReason::kNotBlocked;
 }
 
@@ -497,6 +512,14 @@ void CudfOrderBy::doNoMoreInput() {
 
 RowVectorPtr CudfOrderBy::doGetOutput() {
   if (finished_ || !noMoreInput_) {
+    return nullptr;
+  }
+
+  // An in-memory result may have been moved directly to the consumer. The
+  // following call only marks end-of-stream and must not acquire another
+  // output workspace using the configured (potentially very large) run cap.
+  if (!spilled_ && !pendingOutput_) {
+    finished_ = true;
     return nullptr;
   }
 

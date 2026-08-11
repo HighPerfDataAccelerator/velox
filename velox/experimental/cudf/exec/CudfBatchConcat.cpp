@@ -402,8 +402,7 @@ exec::BlockingReason CudfBatchConcat::isBlocked(ContinueFuture* future) {
   // caused by a 1 GiB minimum request near the device headroom watermark.
   constexpr std::size_t kConcatWorkspaceBytes = 512ULL << 20;
   VELOX_CHECK_NOT_NULL(future);
-  ContinueFuture workspaceFuture;
-  auto workspace = tryAcquireDeviceMemoryWorkspace(
+  auto attempt = workspace_.tryAcquire(
       customPool(kCudfDeviceMemoryResourceTag),
       this,
       kConcatWorkspaceBytes,
@@ -412,14 +411,12 @@ exec::BlockingReason CudfBatchConcat::isBlocked(ContinueFuture* future) {
       // replacement as drain work so it runs ahead of FilterProject: leaving
       // both in the transform FIFO can let filters consume the remaining
       // headroom and form a producer/consumer admission cycle.
-      DeviceMemoryWorkspacePriority::kDrain,
-      &workspaceRequest_,
-      &workspaceFuture);
-  if (!workspace.has_value()) {
-    *future = std::move(workspaceFuture);
+      DeviceMemoryWorkspacePriority::kDrain);
+  if (!attempt.reservation.has_value()) {
+    VELOX_CHECK(workspace_.takeFuture(future));
     return exec::BlockingReason::kWaitForArbitration;
   }
-  workspaceAdmission_.emplace(std::move(workspace.value()));
+  workspaceAdmission_.emplace(std::move(attempt.reservation.value()));
   addRuntimeStat(
       "batchConcatWorkspaceBytes",
       RuntimeCounter(

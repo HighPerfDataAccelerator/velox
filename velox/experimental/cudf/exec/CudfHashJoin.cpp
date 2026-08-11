@@ -159,6 +159,17 @@ bool gracePageableRestoreBounceEnabled() {
       std::string_view(value) == "TRUE";
 }
 
+bool replayableResidentBuildFinalizeEnabled() {
+  const auto* value =
+      std::getenv("GLUTEN_CUDF_HASH_JOIN_REPLAYABLE_FINALIZE");
+  if (value == nullptr) {
+    return true;
+  }
+  return std::string_view(value) != "0" &&
+      std::string_view(value) != "false" &&
+      std::string_view(value) != "FALSE";
+}
+
 size_t graceBuildDemoteThreads() {
   static const size_t threads = [] {
     const auto* value =
@@ -793,7 +804,7 @@ class ProbeMatchTracker {
 } // namespace
 
 void CudfHashJoinProbe::doClose() {
-  graceWorkspaceRequest_.reset();
+  graceWorkspace_.reset();
   graceWorkspaceAdmission_.reset();
   Operator::close();
   filterEvaluator_.reset();
@@ -1414,7 +1425,16 @@ bool CudfHashJoinBuild::needsInput() const {
 }
 
 RowVectorPtr CudfHashJoinBuild::doGetOutput() {
+  if (buildFinalizePending_) {
+    finalizeBuild();
+  }
   return nullptr;
+}
+
+void CudfHashJoinBuild::doClose() {
+  buildFinalizeWorkspace_.reset();
+  buildFinalizePending_ = false;
+  Operator::close();
 }
 
 void CudfHashJoinBuild::doNoMoreInput() {
@@ -1489,6 +1509,30 @@ void CudfHashJoinBuild::doNoMoreInput() {
     }
   };
 
+  VELOX_CHECK(!buildFinalizePending_);
+  buildFinalizePending_ = true;
+  finalizeBuild();
+}
+
+uint64_t CudfHashJoinBuild::residentBuildFinalizeWorkspaceBytes() const {
+  constexpr uint64_t kFinalizeFixedWorkspaceBytes = 512ULL << 20;
+  const auto buildCopiesBytes =
+      retainedBuildBytes_ >
+          (std::numeric_limits<uint64_t>::max() -
+           kFinalizeFixedWorkspaceBytes) /
+              2
+      ? std::numeric_limits<uint64_t>::max()
+      : retainedBuildBytes_ * 2 + kFinalizeFixedWorkspaceBytes;
+  return std::max<uint64_t>(
+      1ULL << 30,
+      std::min<uint64_t>(
+          buildCopiesBytes, std::numeric_limits<std::size_t>::max()));
+}
+
+void CudfHashJoinBuild::finalizeBuild() {
+  VELOX_CHECK(buildFinalizePending_);
+  VELOX_CHECK(!buildFinalizeWorkspace_.waiting());
+
   // A resident build owns all of its input columns while concatenating them
   // and constructing the cuco hash table.  Account for that transient image
   // in the same workspace admission domain as TopN/Grace restore.  Without
@@ -1496,65 +1540,101 @@ void CudfHashJoinBuild::doNoMoreInput() {
   // TopN has admitted restore work, observe the same physical headroom, and
   // fail the first full-size concatenate allocation.
   //
-  // doNoMoreInput() is already past the peer barrier and cannot safely block
-  // and replay the finalize operation. The admission attempt may publish
-  // cooperative victim requests, but this caller cancels its waiter and takes
-  // the existing host-first Grace path when it cannot reserve immediately.
-  // Victim selection is still required to advance other blocked workspace
-  // consumers; the scheduler limits explicit requests to their actual
-  // physical shortfall.
+  // Peer collection and build publication are separate one-shot phases. If
+  // headroom is unavailable, retain the cancellation-safe request and resume
+  // this phase from getOutput() after an advisory scheduler wake. This keeps a
+  // short-lived pressure wave from converting a resident build into a full
+  // downstream Grace spill/restore pass.
   std::optional<DeviceMemoryWorkspaceReservation>
       residentBuildFinalizeWorkspace;
   if (!graceActive_ && retainedBuildBytes_ > 0 && deviceMemoryPool_ != nullptr) {
-    constexpr uint64_t kFinalizeFixedWorkspaceBytes = 512ULL << 20;
-    const auto buildCopiesBytes =
-        retainedBuildBytes_ >
-            (std::numeric_limits<uint64_t>::max() -
-             kFinalizeFixedWorkspaceBytes) /
-                2
-        ? std::numeric_limits<uint64_t>::max()
-        : retainedBuildBytes_ * 2 + kFinalizeFixedWorkspaceBytes;
-    const auto requestedWorkspace = std::max<uint64_t>(
-        1ULL << 30,
-        std::min<uint64_t>(
-            buildCopiesBytes, std::numeric_limits<std::size_t>::max()));
-    DeviceMemoryWorkspaceRequest workspaceRequest;
-    auto workspaceFuture = ContinueFuture::makeEmpty();
-    auto workspace = tryAcquireDeviceMemoryWorkspace(
-        deviceMemoryPool_,
-        this,
-        static_cast<std::size_t>(requestedWorkspace),
-        CudfConfig::getInstance().deviceMemoryMinHeadroomBytes,
-        DeviceMemoryWorkspacePriority::kRestore,
-        &workspaceRequest,
-        &workspaceFuture);
-    if (workspace.has_value()) {
-      residentBuildFinalizeWorkspace.emplace(std::move(workspace.value()));
+    const auto requestedWorkspace = residentBuildFinalizeWorkspaceBytes();
+    const auto minHeadroom =
+        CudfConfig::getInstance().deviceMemoryMinHeadroomBytes;
+    const auto headroom = captureDeviceAllocationHeadroom();
+    const auto restoreCushion = minHeadroom - minHeadroom / 4;
+    const bool workspaceCanEverFit = headroom.cudaValid &&
+        requestedWorkspace <= headroom.totalBytes &&
+        restoreCushion <= headroom.totalBytes - requestedWorkspace;
+    if (!workspaceCanEverFit) {
       addRuntimeStat(
-          "residentBuildFinalizeWorkspaceBytes",
-          RuntimeCounter(requestedWorkspace, RuntimeCounter::Unit::kBytes));
-    } else {
-      workspaceRequest.reset();
+          "residentBuildFinalizeWorkspaceImpossible",
+          RuntimeCounter(1, RuntimeCounter::Unit::kNone));
+      LOG(WARNING)
+          << "CudfHashJoinBuild task=" << taskId()
+          << " node=" << planNodeId()
+          << " cannot ever satisfy resident finalize workspace retainedBytes="
+          << retainedBuildBytes_
+          << " requestedWorkspaceBytes=" << requestedWorkspace
+          << " restoreCushionBytes=" << restoreCushion
+          << " deviceTotalBytes=" << headroom.totalBytes
+          << " cudaValid=" << headroom.cudaValid;
       if (graceEligible_) {
-        addRuntimeStat(
-            "residentBuildFinalizeGraceFallbacks",
-            RuntimeCounter(1, RuntimeCounter::Unit::kNone));
-        LOG(WARNING)
-            << "CudfHashJoinBuild task=" << taskId()
-            << " node=" << planNodeId()
-            << " switching resident finalize to Grace after workspace "
-               "admission pressure retainedBytes="
-            << retainedBuildBytes_
-            << " requestedWorkspaceBytes=" << requestedWorkspace;
         activateGracePath();
+      }
+    } else {
+      auto attempt = buildFinalizeWorkspace_.tryAcquire(
+          deviceMemoryPool_,
+          this,
+          static_cast<std::size_t>(requestedWorkspace),
+          minHeadroom,
+          DeviceMemoryWorkspacePriority::kRestore);
+      auto workspace = std::move(attempt.reservation);
+      bool testDeferAfterAdmission = false;
+      common::testutil::TestValue::adjust(
+          "facebook::velox::cudf_velox::CudfHashJoinBuild::finalizeBuild::deferAfterAdmission",
+          &testDeferAfterAdmission);
+      if (testDeferAfterAdmission && workspace.has_value()) {
+        // Exercise the Driver replay path without manufacturing real device
+        // pressure in a unit test. A ready advisory models a scheduler wake;
+        // the next getOutput() still performs the normal physical-headroom
+        // recheck.
+        workspace.reset();
+        buildFinalizeWorkspace_.deferReadyForTesting();
+      }
+      if (workspace.has_value()) {
+        residentBuildFinalizeWorkspace.emplace(std::move(workspace.value()));
+        addRuntimeStat(
+            "residentBuildFinalizeWorkspaceBytes",
+            RuntimeCounter(requestedWorkspace, RuntimeCounter::Unit::kBytes));
+        if (attempt.completedWaitMicros.has_value()) {
+          addRuntimeStat(
+              "residentBuildFinalizeWorkspaceWaitMicros",
+              RuntimeCounter(
+                  attempt.completedWaitMicros.value(),
+                  RuntimeCounter::Unit::kNone));
+        }
       } else {
-        LOG(WARNING)
-            << "CudfHashJoinBuild task=" << taskId()
-            << " node=" << planNodeId()
-            << " could not reserve resident finalize workspace and is not "
-               "Grace-eligible retainedBytes="
-            << retainedBuildBytes_
-            << " requestedWorkspaceBytes=" << requestedWorkspace;
+        if (!replayableResidentBuildFinalizeEnabled()) {
+          buildFinalizeWorkspace_.reset();
+          addRuntimeStat(
+              "residentBuildFinalizeImmediateFallbacks",
+              RuntimeCounter(1, RuntimeCounter::Unit::kNone));
+          if (graceEligible_) {
+            activateGracePath();
+          } else {
+            LOG(WARNING)
+                << "CudfHashJoinBuild task=" << taskId()
+                << " node=" << planNodeId()
+                << " could not reserve resident finalize workspace and is "
+                   "not Grace-eligible retainedBytes="
+                << retainedBuildBytes_
+                << " requestedWorkspaceBytes=" << requestedWorkspace;
+          }
+        } else {
+          if (attempt.firstWait) {
+            addRuntimeStat(
+                "residentBuildFinalizeWorkspaceWaits",
+                RuntimeCounter(1, RuntimeCounter::Unit::kNone));
+            LOG(WARNING)
+                << "CudfHashJoinBuild task=" << taskId()
+                << " node=" << planNodeId()
+                << " deferred resident finalize for workspace retainedBytes="
+                << retainedBuildBytes_
+                << " requestedWorkspaceBytes=" << requestedWorkspace;
+          }
+          return;
+        }
       }
     }
   }
@@ -1601,6 +1681,7 @@ void CudfHashJoinBuild::doNoMoreInput() {
     logLiveDeviceMemoryAttribution(
         fmt::format("CudfHashJoinBuild node={} Grace publish", planNodeId()));
     cudfHashJoinBridge->setGraceBuildData(std::move(graceBuildData_));
+    buildFinalizePending_ = false;
     return;
   }
 
@@ -1713,9 +1794,13 @@ void CudfHashJoinBuild::doNoMoreInput() {
       std::make_optional(
           std::make_pair(std::move(shared_tbls), std::move(hashObjects))),
       std::move(deviceAdmissions_));
+  buildFinalizePending_ = false;
 }
 
 exec::BlockingReason CudfHashJoinBuild::isBlocked(ContinueFuture* future) {
+  if (buildFinalizeWorkspace_.takeFuture(future)) {
+    return exec::BlockingReason::kWaitForArbitration;
+  }
   if (!future_.valid()) {
     return exec::BlockingReason::kNotBlocked;
   }
@@ -1724,7 +1809,7 @@ exec::BlockingReason CudfHashJoinBuild::isBlocked(ContinueFuture* future) {
 }
 
 bool CudfHashJoinBuild::isFinished() {
-  return !future_.valid() && noMoreInput_;
+  return !future_.valid() && !buildFinalizePending_ && noMoreInput_;
 }
 
 CudfHashJoinProbe::CudfHashJoinProbe(
@@ -2614,31 +2699,19 @@ bool CudfHashJoinProbe::acquireGraceWorkspace(
   if (graceWorkspaceAdmission_.has_value()) {
     return true;
   }
-  ContinueFuture workspaceFuture;
-  auto workspaceAdmission = tryAcquireDeviceMemoryWorkspace(
+  auto attempt = graceWorkspace_.tryAcquire(
       customPool(kCudfDeviceMemoryResourceTag),
       this,
       bytes,
       CudfConfig::getInstance().deviceMemoryMinHeadroomBytes,
-      priority,
-      &graceWorkspaceRequest_,
-      &workspaceFuture);
+      priority);
+  auto workspaceAdmission = std::move(attempt.reservation);
   if (!workspaceAdmission.has_value()) {
-    VELOX_CHECK(!waitingForGraceWorkspace_);
-    if (!graceWorkspaceWaitPending_) {
-      graceWorkspaceWaitStart_ = std::chrono::steady_clock::now();
-      graceWorkspaceWaitPending_ = true;
-    }
-    graceWorkspaceFuture_ = std::move(workspaceFuture);
-    waitingForGraceWorkspace_ = true;
     return false;
   }
-  if (graceWorkspaceWaitPending_) {
+  if (attempt.completedWaitMicros.has_value()) {
     gracePartitionWorkspaceWaitMicros_ +=
-        std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::steady_clock::now() - graceWorkspaceWaitStart_)
-            .count();
-    graceWorkspaceWaitPending_ = false;
+        attempt.completedWaitMicros.value();
   }
   graceWorkspaceAdmission_ = std::move(workspaceAdmission.value());
   return true;
@@ -3056,7 +3129,7 @@ RowVectorPtr CudfHashJoinProbe::getGraceOutput() {
     return output;
   }
   hashObject_.reset();
-  graceWorkspaceRequest_.reset();
+  graceWorkspace_.reset();
   graceWorkspaceAdmission_.reset();
   gracePartition_.reset();
   graceProbeChunk_ = 0;
@@ -5557,10 +5630,7 @@ bool CudfHashJoinProbe::skipProbeOnEmptyBuild() const {
 }
 
 exec::BlockingReason CudfHashJoinProbe::isBlocked(ContinueFuture* future) {
-  if (waitingForGraceWorkspace_) {
-    VELOX_CHECK_NOT_NULL(future);
-    *future = std::move(graceWorkspaceFuture_);
-    waitingForGraceWorkspace_ = false;
+  if (graceWorkspace_.takeFuture(future)) {
     return exec::BlockingReason::kWaitForArbitration;
   }
   if (graceEnabled_ && noMoreInput_ && future_.valid()) {

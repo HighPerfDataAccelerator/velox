@@ -1582,6 +1582,76 @@ void DeviceMemoryWorkspaceRequest::reset() noexcept {
   cancelDeviceMemoryWorkspaceRequest(state);
 }
 
+ReplayableDeviceMemoryWorkspace::Attempt
+ReplayableDeviceMemoryWorkspace::tryAcquire(
+    memory::MemoryPool* pool,
+    exec::Operator* requestor,
+    std::size_t bytes,
+    std::size_t minHeadroomBytes,
+    DeviceMemoryWorkspacePriority priority) {
+  VELOX_CHECK(
+      !waiting_,
+      "A replayable workspace future must be handed to the Driver before "
+      "admission is retried");
+  auto nextFuture = ContinueFuture::makeEmpty();
+  auto reservation = tryAcquireDeviceMemoryWorkspace(
+      pool,
+      requestor,
+      bytes,
+      minHeadroomBytes,
+      priority,
+      &request_,
+      &nextFuture);
+  if (reservation.has_value()) {
+    std::optional<uint64_t> completedWaitMicros;
+    if (waitStart_.has_value()) {
+      completedWaitMicros =
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              std::chrono::steady_clock::now() - waitStart_.value())
+              .count();
+      waitStart_.reset();
+    }
+    return {
+        std::move(reservation), false, std::move(completedWaitMicros)};
+  }
+
+  const bool firstWait = !waitStart_.has_value();
+  if (firstWait) {
+    waitStart_ = std::chrono::steady_clock::now();
+  }
+  future_ = std::move(nextFuture);
+  waiting_ = true;
+  return {std::nullopt, firstWait, std::nullopt};
+}
+
+bool ReplayableDeviceMemoryWorkspace::takeFuture(ContinueFuture* future) {
+  if (!waiting_) {
+    return false;
+  }
+  VELOX_CHECK_NOT_NULL(future);
+  *future = std::move(future_);
+  waiting_ = false;
+  return true;
+}
+
+void ReplayableDeviceMemoryWorkspace::reset() noexcept {
+  request_.reset();
+  future_ = ContinueFuture::makeEmpty();
+  waiting_ = false;
+  waitStart_.reset();
+}
+
+void ReplayableDeviceMemoryWorkspace::deferReadyForTesting() {
+  VELOX_CHECK(!waiting_);
+  ContinuePromise promise{"ReplayableDeviceMemoryWorkspace::test"};
+  future_ = promise.getSemiFuture();
+  promise.setValue();
+  if (!waitStart_.has_value()) {
+    waitStart_ = std::chrono::steady_clock::now();
+  }
+  waiting_ = true;
+}
+
 DeviceMemoryWorkspaceReservation::DeviceMemoryWorkspaceReservation(
     DeviceMemoryWorkspaceReservation&& other) noexcept
     : device_{other.device_},

@@ -25,6 +25,7 @@
 
 #include "velox/common/future/VeloxPromise.h"
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -257,6 +258,55 @@ class DeviceMemoryWorkspaceRequest {
       ContinueFuture*);
 
   std::shared_ptr<DeviceMemoryWorkspaceRequestState> state_;
+};
+
+/// Reusable Driver-facing state for a replayable GPU phase. It owns the
+/// cancellation-safe scheduler request, advisory future, and wait timing as a
+/// single lifecycle. Operators keep their input/spill state intact, return
+/// kWaitForArbitration while this object is waiting, and retry only the
+/// idempotent phase after the future wakes.
+class ReplayableDeviceMemoryWorkspace {
+ public:
+  struct Attempt {
+    std::optional<DeviceMemoryWorkspaceReservation> reservation;
+    bool firstWait{false};
+    std::optional<uint64_t> completedWaitMicros;
+  };
+
+  ReplayableDeviceMemoryWorkspace() = default;
+  ~ReplayableDeviceMemoryWorkspace() = default;
+
+  ReplayableDeviceMemoryWorkspace(
+      const ReplayableDeviceMemoryWorkspace&) = delete;
+  ReplayableDeviceMemoryWorkspace& operator=(
+      const ReplayableDeviceMemoryWorkspace&) = delete;
+
+  [[nodiscard]] Attempt tryAcquire(
+      memory::MemoryPool* pool,
+      exec::Operator* requestor,
+      std::size_t bytes,
+      std::size_t minHeadroomBytes,
+      DeviceMemoryWorkspacePriority priority);
+
+  /// Moves an installed advisory future to the Driver. Returns false when no
+  /// workspace request is waiting.
+  [[nodiscard]] bool takeFuture(ContinueFuture* future);
+
+  [[nodiscard]] bool waiting() const noexcept {
+    return waiting_;
+  }
+
+  void reset() noexcept;
+
+  /// Installs an already-ready advisory used to exercise Driver replay without
+  /// manufacturing device pressure in an operator test.
+  void deferReadyForTesting();
+
+ private:
+  DeviceMemoryWorkspaceRequest request_;
+  ContinueFuture future_{ContinueFuture::makeEmpty()};
+  bool waiting_{false};
+  std::optional<std::chrono::steady_clock::time_point> waitStart_;
 };
 
 struct DeviceMemoryReclaimerState;

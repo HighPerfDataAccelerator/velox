@@ -608,31 +608,26 @@ exec::BlockingReason CudfTopNRowNumber::isBlocked(
   if (!boundedTop1_) {
     return exec::BlockingReason::kNotBlocked;
   }
-  if (!waitingForDeviceWorkspace_) {
+  if (!deviceWorkspace_.waiting()) {
     if (pendingInput_ != nullptr &&
         !(partialOutput_ && abandonedPartial_) &&
         !inputWorkspaceAdmission_.has_value()) {
       VELOX_CHECK_NOT_NULL(future);
-      ContinueFuture workspaceFuture;
-      auto workspaceAdmission = tryAcquireDeviceMemoryWorkspace(
+      auto attempt = deviceWorkspace_.tryAcquire(
           customPool(kCudfDeviceMemoryResourceTag),
           this,
           inputWorkspaceBytes_,
           CudfConfig::getInstance().deviceMemoryMinHeadroomBytes,
-          DeviceMemoryWorkspacePriority::kInput,
-          &deviceWorkspaceRequest_,
-          &workspaceFuture);
-      if (!workspaceAdmission.has_value()) {
-        *future = std::move(workspaceFuture);
+          DeviceMemoryWorkspacePriority::kInput);
+      if (!attempt.reservation.has_value()) {
+        VELOX_CHECK(deviceWorkspace_.takeFuture(future));
         return exec::BlockingReason::kWaitForArbitration;
       }
-      inputWorkspaceAdmission_ = std::move(workspaceAdmission.value());
+      inputWorkspaceAdmission_ = std::move(attempt.reservation.value());
     }
     return exec::BlockingReason::kNotBlocked;
   }
-  VELOX_CHECK_NOT_NULL(future);
-  *future = std::move(deviceWorkspaceFuture_);
-  waitingForDeviceWorkspace_ = false;
+  VELOX_CHECK(deviceWorkspace_.takeFuture(future));
   return exec::BlockingReason::kWaitForArbitration;
 }
 
@@ -1257,7 +1252,7 @@ RowVectorPtr CudfTopNRowNumber::doGetOutput() {
     if (result.status == PartitionedOutputStatus::kBlocked) {
       VELOX_CHECK_NULL(result.output);
       VELOX_CHECK(
-          waitingForDeviceWorkspace_,
+          deviceWorkspace_.waiting(),
           "Partitioned TopN reported blocked without a workspace future");
       return nullptr;
     }
@@ -1266,7 +1261,7 @@ RowVectorPtr CudfTopNRowNumber::doGetOutput() {
         "Unexpected partitioned TopN output status");
     VELOX_CHECK_NULL(result.output);
     VELOX_CHECK(
-        !waitingForDeviceWorkspace_,
+        !deviceWorkspace_.waiting(),
         "Partitioned TopN cannot finish while waiting for device workspace");
     finished_ = true;
     clearPartitionedRowNumberState();
@@ -2807,19 +2802,15 @@ CudfTopNRowNumber::computeNextPartitionedRowNumberOutput() {
     const auto rows = static_cast<uint64_t>(
         sequentialDensePrefixHost_.back().rows);
     const auto workspaceBytes = estimateFinalizeWorkspaceBytes(packedBytes);
-    ContinueFuture workspaceFuture;
-    auto workspaceAdmission = tryAcquireDeviceMemoryWorkspace(
+    auto attempt = deviceWorkspace_.tryAcquire(
         customPool(kCudfDeviceMemoryResourceTag),
         this,
         workspaceBytes,
         CudfConfig::getInstance().deviceMemoryMinHeadroomBytes,
-        DeviceMemoryWorkspacePriority::kDrain,
-        &deviceWorkspaceRequest_,
-        &workspaceFuture);
+        DeviceMemoryWorkspacePriority::kDrain);
+    auto workspaceAdmission = std::move(attempt.reservation);
     if (!workspaceAdmission.has_value()) {
-      VELOX_CHECK(!waitingForDeviceWorkspace_);
-      deviceWorkspaceFuture_ = std::move(workspaceFuture);
-      waitingForDeviceWorkspace_ = true;
+      VELOX_CHECK(deviceWorkspace_.waiting());
       return {PartitionedOutputStatus::kBlocked, nullptr};
     }
 
@@ -2927,19 +2918,15 @@ CudfTopNRowNumber::computeNextPartitionedRowNumberOutput() {
                 bucketBytes * kProbeCopies + kProbeFixedWorkspace);
       sequentialUniqueProbePeakWorkspaceBytes_ = std::max(
           sequentialUniqueProbePeakWorkspaceBytes_, probeWorkspaceBytes);
-      ContinueFuture workspaceFuture;
-      auto probeWorkspaceAdmission = tryAcquireDeviceMemoryWorkspace(
+      auto attempt = deviceWorkspace_.tryAcquire(
           customPool(kCudfDeviceMemoryResourceTag),
           this,
           probeWorkspaceBytes,
           CudfConfig::getInstance().deviceMemoryMinHeadroomBytes,
-          DeviceMemoryWorkspacePriority::kDrain,
-          &deviceWorkspaceRequest_,
-          &workspaceFuture);
+          DeviceMemoryWorkspacePriority::kDrain);
+      auto probeWorkspaceAdmission = std::move(attempt.reservation);
       if (!probeWorkspaceAdmission.has_value()) {
-        VELOX_CHECK(!waitingForDeviceWorkspace_);
-        deviceWorkspaceFuture_ = std::move(workspaceFuture);
-        waitingForDeviceWorkspace_ = true;
+        VELOX_CHECK(deviceWorkspace_.waiting());
         return {PartitionedOutputStatus::kBlocked, nullptr};
       }
 
@@ -3291,22 +3278,18 @@ CudfTopNRowNumber::computeNextPartitionedRowNumberOutput() {
 
     std::optional<DeviceMemoryWorkspaceReservation> outputWorkspaceAdmission;
     if (outputWorkspaceBytes > 0) {
-      ContinueFuture workspaceFuture;
       const auto outputMinHeadroom = std::min<uint64_t>(
           CudfConfig::getInstance().deviceMemoryMinHeadroomBytes,
           1ULL << 30);
-      outputWorkspaceAdmission = tryAcquireDeviceMemoryWorkspace(
+      auto attempt = deviceWorkspace_.tryAcquire(
           customPool(kCudfDeviceMemoryResourceTag),
           this,
           outputWorkspaceBytes,
           outputMinHeadroom,
-          DeviceMemoryWorkspacePriority::kOutput,
-          &deviceWorkspaceRequest_,
-          &workspaceFuture);
+          DeviceMemoryWorkspacePriority::kOutput);
+      outputWorkspaceAdmission = std::move(attempt.reservation);
       if (!outputWorkspaceAdmission.has_value()) {
-        VELOX_CHECK(!waitingForDeviceWorkspace_);
-        deviceWorkspaceFuture_ = std::move(workspaceFuture);
-        waitingForDeviceWorkspace_ = true;
+        VELOX_CHECK(deviceWorkspace_.waiting());
         return {PartitionedOutputStatus::kBlocked, nullptr};
       }
     }
@@ -3377,19 +3360,15 @@ CudfTopNRowNumber::computeNextPartitionedRowNumberOutput() {
     VELOX_CHECK(!wideChunks.empty());
     const auto packedBytes = wideChunks.back().dataBytes;
     const auto workspaceBytes = estimateFinalizeWorkspaceBytes(packedBytes);
-    ContinueFuture workspaceFuture;
-    auto workspaceAdmission = tryAcquireDeviceMemoryWorkspace(
+    auto attempt = deviceWorkspace_.tryAcquire(
         customPool(kCudfDeviceMemoryResourceTag),
         this,
         workspaceBytes,
         CudfConfig::getInstance().deviceMemoryMinHeadroomBytes,
-        DeviceMemoryWorkspacePriority::kDrain,
-        &deviceWorkspaceRequest_,
-        &workspaceFuture);
+        DeviceMemoryWorkspacePriority::kDrain);
+    auto workspaceAdmission = std::move(attempt.reservation);
     if (!workspaceAdmission.has_value()) {
-      VELOX_CHECK(!waitingForDeviceWorkspace_);
-      deviceWorkspaceFuture_ = std::move(workspaceFuture);
-      waitingForDeviceWorkspace_ = true;
+      VELOX_CHECK(deviceWorkspace_.waiting());
       return {PartitionedOutputStatus::kBlocked, nullptr};
     }
 
@@ -3568,19 +3547,15 @@ CudfTopNRowNumber::computeNextPartitionedRowNumberOutput() {
     // isBlocked() instead of shrinking the input batch or holding a GPU lock.
     const auto workspaceBytes = estimateFinalizeWorkspaceBytes(
         std::min<uint64_t>(finalizeBytes, finalizeInputBytes_));
-    ContinueFuture workspaceFuture;
-    auto workspaceAdmission = tryAcquireDeviceMemoryWorkspace(
+    auto attempt = deviceWorkspace_.tryAcquire(
         customPool(kCudfDeviceMemoryResourceTag),
         this,
         workspaceBytes,
         CudfConfig::getInstance().deviceMemoryMinHeadroomBytes,
-        DeviceMemoryWorkspacePriority::kDrain,
-        &deviceWorkspaceRequest_,
-        &workspaceFuture);
+        DeviceMemoryWorkspacePriority::kDrain);
+    auto workspaceAdmission = std::move(attempt.reservation);
     if (!workspaceAdmission.has_value()) {
-      VELOX_CHECK(!waitingForDeviceWorkspace_);
-      deviceWorkspaceFuture_ = std::move(workspaceFuture);
-      waitingForDeviceWorkspace_ = true;
+      VELOX_CHECK(deviceWorkspace_.waiting());
       // A temporary arbitration miss is not end-of-stream. Returning an
       // unqualified nullptr used to make doGetOutput() mark the operator
       // finished and clear every unprocessed bucket. Under Job 144 pressure,
@@ -4194,7 +4169,7 @@ void CudfTopNRowNumber::doClose() {
     Operator::close();
     return;
   }
-  deviceWorkspaceRequest_.reset();
+  deviceWorkspace_.reset();
   inputWorkspaceAdmission_.reset();
   pendingInput_.reset();
   candidates_.reset();
