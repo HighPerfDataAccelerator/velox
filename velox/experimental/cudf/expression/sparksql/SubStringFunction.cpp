@@ -27,6 +27,7 @@
 #include <cudf/strings/attributes.hpp>
 #include <cudf/strings/slice.hpp>
 #include <cudf/unary.hpp>
+#include <cudf/version_config.hpp>
 
 #include <algorithm>
 #include <limits>
@@ -137,6 +138,8 @@ class SubStringFunction : public CudfFunction {
       // Spark's 1-based positive start has already been normalized to cuDF's
       // 0-based start, and Spark start zero maps to cuDF start zero.
       auto clampedLength = std::max<cudf::size_type>(0, length_);
+#if CUDF_VERSION_MAJOR > 26 || \
+    (CUDF_VERSION_MAJOR == 26 && CUDF_VERSION_MINOR >= 8)
       const auto start = std::optional<cudf::size_type>{start_};
       const auto end = hasLength_
           ? std::optional<cudf::size_type>{saturatingAddNonNegative(
@@ -145,6 +148,18 @@ class SubStringFunction : public CudfFunction {
       const auto step = std::optional<cudf::size_type>{1};
       return cudf::strings::slice_strings(
           inputColumn, start, end, step, stream, mr);
+#else
+      cudf::numeric_scalar<cudf::size_type> startScalar(
+          start_, true, stream, mr);
+      cudf::numeric_scalar<cudf::size_type> endScalar(
+          hasLength_ ? saturatingAddNonNegative(start_, clampedLength) : 0,
+          hasLength_,
+          stream,
+          mr);
+      cudf::numeric_scalar<cudf::size_type> stepScalar(1, true, stream, mr);
+      return cudf::strings::slice_strings(
+          inputColumn, startScalar, endScalar, stepScalar, stream, mr);
+#endif
     }
 
     cudf::column_view originalStartColumn;

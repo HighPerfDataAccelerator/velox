@@ -47,6 +47,7 @@
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/unary.hpp>
+#include <cudf/version_config.hpp>
 
 #include <cuda_runtime.h>
 #include <nvtx3/nvtx3.hpp>
@@ -622,8 +623,7 @@ void CudfSplitReader::waitForCachePrefetchHint(bool splitPreload) {
   if (!splitPreload && cachePrefetchHintWaited_ &&
       !cachePrefetchDemandPrioritized_ && cachePrefetchQueryId_ &&
       cachePrefetchHintKey_) {
-    cachePrefetchDemandPrioritized_ =
-        prioritizeNativeS3File(split_->filePath);
+    cachePrefetchDemandPrioritized_ = prioritizeNativeS3File(split_->filePath);
   }
   if (cachePrefetchHintWaited_ || !cachePrefetchQueryId_ ||
       !cachePrefetchHintKey_) {
@@ -1309,7 +1309,12 @@ void CudfSplitReader::setupReaderOptions() {
   }
 
   if (prependRowIndex_) {
+#if CUDF_VERSION_MAJOR > 26 || \
+    (CUDF_VERSION_MAJOR == 26 && CUDF_VERSION_MINOR >= 8)
     readerOptions_.enable_prepend_row_index_column(true);
+#else
+    VELOX_FAIL("Prepending a row-index column requires cuDF 26.08 or newer");
+#endif
   }
 }
 
