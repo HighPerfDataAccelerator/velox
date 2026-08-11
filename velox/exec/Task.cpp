@@ -2205,6 +2205,9 @@ void Task::preloadSplits(
     const core::PlanNodeId& planNodeId,
     int32_t maxPreloadSplits,
     const ConnectorSplitPreloadFunc& preload) {
+  if (maxPreloadSplits <= 0 || !preload) {
+    return;
+  }
   std::lock_guard<std::timed_mutex> l(mutex_);
   auto& splitsState = getPlanNodeSplitsStateLocked(planNodeId);
   auto* splitsStore = getOrCreateSplitsStoreLocked(splitsState, splitGroupId);

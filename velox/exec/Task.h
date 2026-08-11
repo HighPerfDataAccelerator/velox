@@ -494,9 +494,8 @@ class Task : public std::enable_shared_from_this<Task> {
       exec::Split& split,
       ContinueFuture& future);
 
-  /// Starts asynchronous preload for queued splits without assigning a split
-  /// to a scan driver. This is used to prime independent scan fragments before
-  /// join dependencies release their drivers.
+  /// Starts preload for queued splits without assigning one to a scan driver.
+  /// This prepares source work before a downstream pipeline requests input.
   void preloadSplits(
       uint32_t splitGroupId,
       const core::PlanNodeId& planNodeId,

@@ -804,36 +804,60 @@ TEST_F(TaskTest, preloadedSplitsAreConsumedInReadyOrder) {
   task->requestCancel().wait();
 }
 
-TEST_F(TaskTest, primesLateArrivingSplitsWithoutDriver) {
+TEST_F(TaskTest, primesSplitPreloadsWithoutConsuming) {
   auto data = makeRowVector({makeFlatVector<int32_t>({1, 2, 3})});
   auto task = Task::create(
-      "task-initial-split-preload",
+      "task-prime-preload",
       PlanBuilder().tableScan(asRowType(data->type())).planFragment(),
       0,
       core::QueryCtx::create(),
       Task::ExecutionMode::kSerial,
       exec::Consumer{});
 
-  std::atomic_int32_t numPreloaded{0};
+  auto first = makeHiveConnectorSplit("file:/tmp/first");
+  auto second = makeHiveConnectorSplit("file:/tmp/second");
+  task->addSplit("0", exec::Split(first));
+  task->addSplit("0", exec::Split(second));
+  task->noMoreSplits("0");
+
+  int32_t preloadCalls = 0;
   ConnectorSplitPreloadFunc preload =
       [&](const std::shared_ptr<connector::ConnectorSplit>& connectorSplit) {
-        ++numPreloaded;
+        ++preloadCalls;
         connectorSplit->dataSource =
             std::make_unique<AsyncSource<connector::DataSource>>(
                 []() -> std::unique_ptr<connector::DataSource> {
-                  return nullptr;
+                  VELOX_FAIL("Primed preload completion");
                 });
+        connectorSplit->dataSource->prepare();
       };
 
-  task->preloadSplits(kUngroupedGroupId, "0", /*maxPreloadSplits=*/3, preload);
-  for (int32_t i = 0; i < 5; ++i) {
-    task->addSplit(
-        "0",
-        exec::Split(makeHiveConnectorSplit(fmt::format("file:/tmp/{}", i))));
-  }
-  EXPECT_EQ(numPreloaded, 3);
+  task->preloadSplits(kUngroupedGroupId, "0", /*maxPreloadSplits=*/2, preload);
+  EXPECT_EQ(preloadCalls, 2);
+  EXPECT_EQ(task->taskStats().numQueuedTableScanSplits, 2);
+  EXPECT_TRUE(first->dataSource->hasValue());
+  EXPECT_TRUE(second->dataSource->hasValue());
 
-  task->noMoreSplits("0");
+  // Priming is idempotent and does not assign either split to a driver.
+  task->preloadSplits(kUngroupedGroupId, "0", /*maxPreloadSplits=*/2, preload);
+  EXPECT_EQ(preloadCalls, 2);
+  EXPECT_EQ(task->taskStats().numQueuedTableScanSplits, 2);
+
+  exec::Split split;
+  ContinueFuture splitFuture = ContinueFuture::makeEmpty();
+  EXPECT_EQ(
+      task->getSplitOrFuture(
+          /*driverId=*/0,
+          kUngroupedGroupId,
+          "0",
+          /*maxPreloadSplits=*/2,
+          preload,
+          split,
+          splitFuture),
+      BlockingReason::kNotBlocked);
+  EXPECT_EQ(preloadCalls, 2);
+  EXPECT_EQ(task->taskStats().numQueuedTableScanSplits, 1);
+
   task->requestCancel().wait();
 }
 
