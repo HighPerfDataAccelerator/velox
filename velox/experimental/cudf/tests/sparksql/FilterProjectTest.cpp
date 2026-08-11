@@ -155,6 +155,28 @@ TEST_F(CudfFilterProjectTest, hashWithSeed) {
   facebook::velox::test::assertEqualVectors(expected, hashResults);
 }
 
+TEST_F(CudfFilterProjectTest, netflixExpressionCoverage) {
+  auto input = makeRowVector({
+      makeNullableFlatVector<int64_t>({1, std::nullopt, -7, 42}),
+      makeNullableFlatVector<int32_t>({3, 5, std::nullopt, -1}),
+      makeNullableFlatVector<std::string>(
+          {"Pixel android", "no_match", std::nullopt, "x android"}),
+      makeNullableFlatVector<double>({12.5, std::nullopt, -7.25, 0.0}),
+  });
+
+  for (const auto& expression : {
+           "isnull(c0)",
+           "cast(c0 as varchar)",
+           "cast(c3 as varchar)",
+           "regexp_extract(c2, '(.*?) android', 1)",
+           "regexp_extract(c2, 'android', 0)",
+           "array_constructor(c1, add(c1, 1), 7)",
+       }) {
+    SCOPED_TRACE(expression);
+    assertExpressionMatchesCpu(expression, input, input->rowType());
+  }
+}
+
 // TODO: Re-enable after https://github.com/rapidsai/cudf/issues/21720.
 // cuDF's murmurhash3_x86_32 combines columns via hash_combine(h(col0, seed),
 // h(col1, seed)), while Spark instead hashes columns iteratively:

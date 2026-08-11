@@ -111,6 +111,35 @@ TEST_F(CudfExpressionSelectionTest, functionRoot) {
   ASSERT_NE(functionExpr, nullptr);
 }
 
+TEST_F(CudfExpressionSelectionTest, sparkNetflixExpressionCoverage) {
+  for (const auto& expression : {
+           "isnull(a)",
+           "cast(a as varchar)",
+           "regexp_extract(name, '(.*?) android', 1)",
+       }) {
+    SCOPED_TRACE(expression);
+    auto expr = optimizeTypedExpr(
+        expression,
+        rowType_,
+        queryCtx_.get(),
+        execCtx_.get(),
+        {.parseIntegerAsBigint = false, .functionPrefix = ""});
+    ASSERT_TRUE(canExprRunOnGpu(expr, queryCtx_.get(), pool_.get()));
+    ASSERT_NE(createCudfExpression(expr, rowType_, pool_.get()), nullptr);
+  }
+
+  core::TypedExprPtr arrayExpr = std::make_shared<core::CallTypedExpr>(
+      ARRAY(INTEGER()),
+      std::vector<core::TypedExprPtr>{
+          std::make_shared<core::FieldAccessTypedExpr>(INTEGER(), "c"),
+          std::make_shared<core::FieldAccessTypedExpr>(INTEGER(), "c"),
+          std::make_shared<core::ConstantTypedExpr>(INTEGER(), variant(7)),
+      },
+      "array");
+  ASSERT_TRUE(canExprRunOnGpu(arrayExpr, queryCtx_.get(), pool_.get()));
+  ASSERT_NE(createCudfExpression(arrayExpr, rowType_, pool_.get()), nullptr);
+}
+
 TEST_F(
     CudfExpressionSelectionTest,
     monotonicallyIncreasingIdUsesPartitionAndRowCount) {
