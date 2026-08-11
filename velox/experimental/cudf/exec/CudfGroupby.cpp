@@ -215,11 +215,14 @@ uint64_t addRepresentedRows(uint64_t left, uint64_t right) {
                                                                               \
     std::unique_ptr<cudf::column> makePartialIdentityColumn(                  \
         cudf::table_view const& tbl,                                          \
+        std::unique_ptr<cudf::column> inputOwner,                             \
         rmm::cuda_stream_view stream,                                         \
         rmm::device_async_resource_ref mr) override {                         \
       VELOX_CHECK(supportsPartialIdentity());                                 \
-      auto col =                                                              \
-          std::make_unique<cudf::column>(tbl.column(inputIndex), stream, mr); \
+      auto col = inputOwner                                                   \
+          ? std::move(inputOwner)                                             \
+          : std::make_unique<cudf::column>(                                   \
+                tbl.column(inputIndex), stream, mr);                          \
       const auto cudfType = cudf_velox::veloxToCudfDataType(resultType);      \
       if (col->type() != cudfType) {                                          \
         col = cudf::cast(*col, cudfType, stream, mr);                         \
@@ -1422,17 +1425,57 @@ void CudfGroupby::computePartialIdentity(CudfVectorPtr tbl) {
   auto permutedInputView = preparedInput.tableView.select(
       aggregationInputChannels_.begin(), aggregationInputChannels_.end());
 
+  const auto originalColumnCount = tbl->getTableView().num_columns();
+  auto inputColumns = tbl->release()->release();
+  tbl.reset();
+
+  std::unordered_map<column_index_t, size_t> remainingUses;
+  for (const auto key : groupingKeyOutputChannels_) {
+    ++remainingUses[aggregationInputChannels_.at(key)];
+  }
+  for (const auto& aggregator : aggregators_) {
+    ++remainingUses[aggregationInputChannels_.at(aggregator->inputIndex)];
+  }
+
+  const auto takeOwner = [&](column_index_t sourceChannel) {
+    std::unique_ptr<cudf::column> owner;
+    auto& uses = remainingUses.at(sourceChannel);
+    VELOX_CHECK_GT(uses, 0);
+    if (--uses != 0) {
+      return owner;
+    }
+    if (sourceChannel < originalColumnCount) {
+      owner = std::move(inputColumns.at(sourceChannel));
+      return owner;
+    }
+    auto& precomputed =
+        preparedInput.precomputedColumns.at(sourceChannel - originalColumnCount);
+    if (std::holds_alternative<std::unique_ptr<cudf::column>>(precomputed)) {
+      owner = std::move(
+          std::get<std::unique_ptr<cudf::column>>(precomputed));
+    }
+    return owner;
+  };
+
   std::vector<std::unique_ptr<cudf::column>> resultColumns;
   resultColumns.reserve(
       groupingKeyOutputChannels_.size() + aggregators_.size());
   for (const auto key : groupingKeyOutputChannels_) {
-    resultColumns.push_back(
-        std::make_unique<cudf::column>(
-            permutedInputView.column(key), inputTableStream, get_output_mr()));
+    auto owner = takeOwner(aggregationInputChannels_.at(key));
+    resultColumns.push_back(owner ? std::move(owner)
+                                  : std::make_unique<cudf::column>(
+                                        permutedInputView.column(key),
+                                        inputTableStream,
+                                        get_output_mr()));
   }
   for (auto& aggregator : aggregators_) {
+    auto owner =
+        takeOwner(aggregationInputChannels_.at(aggregator->inputIndex));
     resultColumns.push_back(aggregator->makePartialIdentityColumn(
-        permutedInputView, inputTableStream, get_output_mr()));
+        permutedInputView,
+        std::move(owner),
+        inputTableStream,
+        get_output_mr()));
   }
   auto resultTable = std::make_unique<cudf::table>(std::move(resultColumns));
   const auto outputRows = resultTable->num_rows();

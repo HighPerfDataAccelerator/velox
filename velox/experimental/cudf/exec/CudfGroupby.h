@@ -61,6 +61,7 @@ struct GroupbyAggregator {
 
   virtual std::unique_ptr<cudf::column> makePartialIdentityColumn(
       cudf::table_view const& /* tbl */,
+      std::unique_ptr<cudf::column> /* inputOwner */,
       rmm::cuda_stream_view /* stream */,
       rmm::device_async_resource_ref /* mr */) {
     VELOX_UNSUPPORTED("Aggregate does not support PARTIAL identity output");
