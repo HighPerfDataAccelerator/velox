@@ -309,12 +309,8 @@ std::optional<HashJoinBridge::HashBuildResult> HashJoinBridge::tableOrFuture(
        restoringSpillShards_.empty()));
   probeStarted_ = true;
   tableSpillFunc_ = nullptr;
-  if (buildResult_.has_value()) {
-    return buildResult_.value();
-  }
-  promises_.emplace_back("HashJoinBridge::tableOrFuture");
-  *future = promises_.back().getSemiFuture();
-  return std::nullopt;
+  return resultOrFutureLocked(
+      buildResult_, future, "HashJoinBridge::tableOrFuture");
 }
 
 void HashJoinBridge::probeFinished(bool restart) {

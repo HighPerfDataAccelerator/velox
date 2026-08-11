@@ -115,6 +115,39 @@ class CudfOperator : public NvtxHelper {
 ///     RowVectorPtr doGetOutput() override { /* return output or nullptr */ }
 ///   };
 class CudfOperatorBase : public exec::Operator, public NvtxHelper {
+ private:
+  /// Reclaimer for the operator leaf in the cuDF device-memory hierarchy.
+  /// The device resource owns its allocator and arbitrator; this class only
+  /// binds that resource's leaf reclaim callback to the owning operator and
+  /// Driver lifecycle.
+  class CudfDeviceMemoryReclaimer final
+      : public exec::Operator::MemoryReclaimer {
+   public:
+    static std::unique_ptr<memory::MemoryReclaimer> create(
+        exec::DriverCtx* driverCtx,
+        CudfOperatorBase* op,
+        memory::MemoryPool* devicePool) {
+      return std::unique_ptr<memory::MemoryReclaimer>(
+          new CudfDeviceMemoryReclaimer(
+              driverCtx->driver->shared_from_this(), op, devicePool));
+    }
+
+   private:
+    CudfDeviceMemoryReclaimer(
+        const std::shared_ptr<exec::Driver>& driver,
+        CudfOperatorBase* op,
+        memory::MemoryPool* devicePool)
+        : exec::Operator::MemoryReclaimer(driver, op), devicePool_(devicePool) {
+      VELOX_CHECK_NOT_NULL(devicePool_);
+    }
+
+    memory::MemoryPool* reclaimPool() const override {
+      return devicePool_;
+    }
+
+    memory::MemoryPool* const devicePool_;
+  };
+
  public:
   CudfOperatorBase(
       int32_t operatorId,
@@ -146,7 +179,7 @@ class CudfOperatorBase : public exec::Operator, public NvtxHelper {
     if (auto* devicePool = customPool(kCudfDeviceMemoryResourceTag);
         devicePool != nullptr && devicePool->reclaimer() == nullptr) {
       devicePool->setReclaimer(
-          exec::Operator::MemoryReclaimer::create(driverCtx, this, devicePool));
+          CudfDeviceMemoryReclaimer::create(driverCtx, this, devicePool));
     }
     if (auto* devicePool = customPool(kCudfDeviceMemoryResourceTag);
         devicePool != nullptr) {

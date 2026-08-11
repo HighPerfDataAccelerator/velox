@@ -61,6 +61,13 @@ inline constexpr uint64_t kMaxSafeConcatEstimatedBytes = 1ULL << 30;
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr);
 
+/// Creates the INT32 offsets child for an empty STRING/LIST value column with
+/// 'numRows' top-level rows. The returned column contains numRows + 1 zeros.
+[[nodiscard]] std::unique_ptr<cudf::column> makeZeroOffsetsColumn(
+    cudf::size_type numRows,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr);
+
 /// Creates a column of the requested size in which every top-level value is
 /// null. Unlike make_column_from_scalar, this supports nested LIST/MAP/ROW
 /// types by constructing their physical children and null mask directly.

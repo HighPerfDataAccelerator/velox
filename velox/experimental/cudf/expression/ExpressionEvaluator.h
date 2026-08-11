@@ -72,6 +72,23 @@ inline std::vector<cudf::column_view> tableViewToColumnViews(
   return result;
 }
 
+/// Returns a table view consisting of the original columns followed by the
+/// materialized or view-backed expression columns. The returned view borrows
+/// from both inputs.
+inline cudf::table_view appendExpressionColumns(
+    cudf::table_view table,
+    std::vector<ColumnOrView>& expressionColumns) {
+  if (expressionColumns.empty()) {
+    return table;
+  }
+  auto columns = tableViewToColumnViews(table);
+  columns.reserve(columns.size() + expressionColumns.size());
+  for (auto& column : expressionColumns) {
+    columns.push_back(asView(column));
+  }
+  return cudf::table_view{columns};
+}
+
 // Throws a VeloxUserError with userMessage if any non-null entry of cond is
 // false. cond must be a BOOL8 column. Does nothing for empty or all-null
 // columns.

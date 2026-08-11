@@ -117,6 +117,13 @@ using GraceHashJoinPartitionSet =
  * The bridge handles batched hash tables when build data exceeds
  * cudf::size_type limits, and manages CUDA stream coordination between build
  * and probe operations.
+ *
+ * Coordination is deliberately shared with Velox: JoinBridge owns the
+ * start/cancel/waiter contract and IterableSpillPartitionSetBase owns the
+ * recursive SpillPartitionId ordering. The payload remains cuDF-specific:
+ * CPU HashJoinBridge transfers BaseHashTable and RowVector-backed
+ * SpillPartition shards, while this bridge transfers CUDA hash tables and
+ * packed host/disk batches without a device-to-RowVector conversion.
  */
 class CudfHashJoinBridge : public exec::JoinBridge {
  public:

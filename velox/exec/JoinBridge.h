@@ -15,7 +15,10 @@
  */
 #pragma once
 
+#include "velox/common/base/Exceptions.h"
 #include "velox/common/future/VeloxPromise.h"
+
+#include <optional>
 
 namespace facebook::velox::exec {
 
@@ -33,6 +36,25 @@ class JoinBridge {
 
  protected:
   static void notify(std::vector<ContinuePromise> promises);
+
+  /// Returns a bridge result or registers a waiter. The caller must hold
+  /// mutex_. Keeping this transition in JoinBridge gives CPU and accelerator
+  /// bridges the same start/cancel/future contract without constraining the
+  /// result payload type.
+  template <typename Result>
+  std::optional<Result> resultOrFutureLocked(
+      std::optional<Result> result,
+      ContinueFuture* future,
+      const char* waitReason) {
+    VELOX_CHECK(started_);
+    VELOX_CHECK(!cancelled_, "Getting join result after join is aborted");
+    if (result.has_value()) {
+      return result;
+    }
+    promises_.emplace_back(waitReason);
+    *future = promises_.back().getSemiFuture();
+    return std::nullopt;
+  }
 
   std::mutex mutex_;
   bool started_{false};

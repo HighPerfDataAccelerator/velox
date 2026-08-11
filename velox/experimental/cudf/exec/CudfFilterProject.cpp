@@ -18,6 +18,7 @@
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/exec/CudfFilterProject.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
+#include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/Validation.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/expression/AstUtils.h"
@@ -155,21 +156,6 @@ rmm::device_buffer makeAllNullMask(
     return rmm::device_buffer{};
   }
   return cudf::create_null_mask(size, cudf::mask_state::ALL_NULL, stream, mr);
-}
-
-std::unique_ptr<cudf::column> makeZeroOffsetsColumn(
-    cudf::size_type numRows,
-    rmm::cuda_stream_view stream,
-    rmm::device_async_resource_ref mr) {
-  std::vector<cudf::size_type> offsets(numRows + 1, 0);
-  rmm::device_buffer offsetsBuffer(
-      offsets.data(), offsets.size() * sizeof(cudf::size_type), stream, mr);
-  return std::make_unique<cudf::column>(
-      cudf::data_type{cudf::type_id::INT32},
-      static_cast<cudf::size_type>(offsets.size()),
-      std::move(offsetsBuffer),
-      rmm::device_buffer{},
-      0);
 }
 
 std::unique_ptr<cudf::column> makeNullCudfColumn(

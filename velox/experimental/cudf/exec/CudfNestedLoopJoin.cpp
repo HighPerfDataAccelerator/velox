@@ -43,29 +43,6 @@
 
 namespace facebook::velox::cudf_velox {
 
-namespace {
-
-// Appends precomputed columns to a table view for filter AST evaluation.
-// TODO: Consolidate with the identical helper in CudfHashJoin.cpp.
-cudf::table_view createExtendedTableView(
-    cudf::table_view originalView,
-    std::vector<ColumnOrView>& precomputedColumns) {
-  if (precomputedColumns.empty()) {
-    return originalView;
-  }
-  std::vector<cudf::column_view> allViews;
-  allViews.reserve(originalView.num_columns() + precomputedColumns.size());
-  for (cudf::size_type i = 0; i < originalView.num_columns(); ++i) {
-    allViews.push_back(originalView.column(i));
-  }
-  for (auto& col : precomputedColumns) {
-    allViews.push_back(asView(col));
-  }
-  return cudf::table_view(allViews);
-}
-
-} // namespace
-
 void CudfNestedLoopJoinBridge::setData(
     std::optional<CudfNestedLoopJoinBridge::build_data_type> data) {
   std::vector<ContinuePromise> promises;
@@ -83,14 +60,8 @@ void CudfNestedLoopJoinBridge::setData(
 std::optional<CudfNestedLoopJoinBridge::build_data_type>
 CudfNestedLoopJoinBridge::dataOrFuture(ContinueFuture* future) {
   std::lock_guard<std::mutex> l(mutex_);
-  VELOX_CHECK(!cancelled_, "Getting data after the build side is aborted");
-  if (data_.has_value()) {
-    return data_;
-  }
-  // Data not ready yet, create a promise that will be fulfilled by setData()
-  promises_.emplace_back("CudfNestedLoopJoinBridge::dataOrFuture");
-  *future = promises_.back().getSemiFuture();
-  return std::nullopt; // Probe will block on the future
+  return resultOrFutureLocked(
+      data_, future, "CudfNestedLoopJoinBridge::dataOrFuture");
 }
 
 void CudfNestedLoopJoinBridge::setBuildReadyEvent(
@@ -545,7 +516,7 @@ exec::BlockingReason CudfNestedLoopJoinProbe::isBlocked(
         buildType_,
         precomputeStream);
     buildExtendedView_ =
-        createExtendedTableView(buildData_.value()->view(), buildPrecomputed_);
+        appendExpressionColumns(buildData_.value()->view(), buildPrecomputed_);
     precomputeStream.synchronize();
   }
 
@@ -610,7 +581,7 @@ std::unique_ptr<cudf::table> CudfNestedLoopJoinProbe::joinWithBuildBatch(
         probeType_,
         stream);
     extendedProbeView =
-        createExtendedTableView(probeTableView, leftPrecomputed);
+        appendExpressionColumns(probeTableView, leftPrecomputed);
   }
   // Use cached extended build view if build-side precompute was needed.
   const cudf::table_view& extendedBuildView =
@@ -944,7 +915,7 @@ RowVectorPtr CudfNestedLoopJoinProbe::doGetOutput() {
             probeType_,
             stream);
         extendedProbeView =
-            createExtendedTableView(probeTableView, leftPrecomputed);
+            appendExpressionColumns(probeTableView, leftPrecomputed);
       }
       const cudf::table_view& extendedBuildView = buildPrecomputed_.empty()
           ? buildData_.value()->view()

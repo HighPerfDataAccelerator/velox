@@ -661,27 +661,6 @@ uint64_t appendGraceSpillBatch(
   return offset;
 }
 
-/// Creates extended table view by appending precomputed columns
-cudf::table_view createExtendedTableView(
-    cudf::table_view originalView,
-    std::vector<ColumnOrView>& precomputedColumns) {
-  if (precomputedColumns.empty()) {
-    return originalView;
-  }
-
-  std::vector<cudf::column_view> allViews;
-  allViews.reserve(originalView.num_columns() + precomputedColumns.size());
-
-  for (cudf::size_type i = 0; i < originalView.num_columns(); ++i) {
-    allViews.push_back(originalView.column(i));
-  }
-  for (auto& col : precomputedColumns) {
-    allViews.push_back(asView(col));
-  }
-
-  return cudf::table_view(allViews);
-}
-
 vector_size_t filteredOutputNumRows(
     bool zeroColumnOutput,
     cudf::column_view filterColumn,
@@ -824,21 +803,11 @@ std::optional<CudfHashJoinBridge::hash_type> CudfHashJoinBridge::hashOrFuture(
     VLOG(2) << "Calling CudfHashJoinBridge::hashOrFuture";
   }
   std::lock_guard<std::mutex> l(mutex_);
-  if (hashObject_.has_value()) {
-    return hashObject_;
-  }
   if (CudfConfig::getInstance().debugEnabled) {
     VLOG(2) << "Calling CudfHashJoinBridge::hashOrFuture constructing promise";
   }
-  promises_.emplace_back("CudfHashJoinBridge::hashOrFuture");
-  if (CudfConfig::getInstance().debugEnabled) {
-    VLOG(2) << "Calling CudfHashJoinBridge::hashOrFuture getSemiFuture";
-  }
-  *future = promises_.back().getSemiFuture();
-  if (CudfConfig::getInstance().debugEnabled) {
-    VLOG(2) << "Calling CudfHashJoinBridge::hashOrFuture returning nullopt";
-  }
-  return std::nullopt;
+  return resultOrFutureLocked(
+      hashObject_, future, "CudfHashJoinBridge::hashOrFuture");
 }
 
 void CudfHashJoinBridge::setGraceBuildData(
@@ -872,29 +841,27 @@ void CudfHashJoinBridge::setGraceActivated() {
 std::optional<std::shared_ptr<GraceHashJoinBuildData>>
 CudfHashJoinBridge::graceOrFuture(ContinueFuture* future) {
   std::lock_guard<std::mutex> l(mutex_);
+  std::optional<std::shared_ptr<GraceHashJoinBuildData>> result;
   if (graceBuildData_) {
-    return graceBuildData_;
+    result = graceBuildData_;
   }
-  promises_.emplace_back("CudfHashJoinBridge::graceOrFuture");
-  *future = promises_.back().getSemiFuture();
-  return std::nullopt;
+  return resultOrFutureLocked(
+      std::move(result), future, "CudfHashJoinBridge::graceOrFuture");
 }
 
 std::optional<CudfHashJoinBridge::BuildResult>
 CudfHashJoinBridge::resultOrFuture(ContinueFuture* future) {
   std::lock_guard<std::mutex> l(mutex_);
+  std::optional<BuildResult> result;
   if (hashObject_.has_value()) {
-    return BuildResult{hashObject_, nullptr, false};
+    result = BuildResult{hashObject_, nullptr, false};
+  } else if (graceBuildData_) {
+    result = BuildResult{std::nullopt, graceBuildData_, true};
+  } else if (graceActivated_) {
+    result = BuildResult{std::nullopt, nullptr, true};
   }
-  if (graceBuildData_) {
-    return BuildResult{std::nullopt, graceBuildData_, true};
-  }
-  if (graceActivated_) {
-    return BuildResult{std::nullopt, nullptr, true};
-  }
-  promises_.emplace_back("CudfHashJoinBridge::resultOrFuture");
-  *future = promises_.back().getSemiFuture();
-  return std::nullopt;
+  return resultOrFutureLocked(
+      std::move(result), future, "CudfHashJoinBridge::resultOrFuture");
 }
 
 std::optional<CudfHashJoinBridge::BuildResult>
@@ -912,15 +879,14 @@ CudfHashJoinBridge::tryFinalResult() {
 std::optional<CudfHashJoinBridge::BuildResult>
 CudfHashJoinBridge::finalResultOrFuture(ContinueFuture* future) {
   std::lock_guard<std::mutex> l(mutex_);
+  std::optional<BuildResult> result;
   if (hashObject_.has_value()) {
-    return BuildResult{hashObject_, nullptr, false};
+    result = BuildResult{hashObject_, nullptr, false};
+  } else if (graceBuildData_) {
+    result = BuildResult{std::nullopt, graceBuildData_, true};
   }
-  if (graceBuildData_) {
-    return BuildResult{std::nullopt, graceBuildData_, true};
-  }
-  promises_.emplace_back("CudfHashJoinBridge::finalResultOrFuture");
-  *future = promises_.back().getSemiFuture();
-  return std::nullopt;
+  return resultOrFutureLocked(
+      std::move(result), future, "CudfHashJoinBridge::finalResultOrFuture");
 }
 
 void CudfHashJoinBridge::setGracePartitions(
@@ -3582,7 +3548,7 @@ std::vector<CudfHashJoinProbe::JoinOutput> CudfHashJoinProbe::innerJoin(
         scalars_,
         probeType_,
         stream);
-    extendedLeftView = createExtendedTableView(leftTableView, leftPrecomputed);
+    extendedLeftView = appendExpressionColumns(leftTableView, leftPrecomputed);
   }
 
   for (auto i = 0; i < rightTables.size(); i++) {
@@ -3683,7 +3649,7 @@ std::vector<CudfHashJoinProbe::JoinOutput> CudfHashJoinProbe::leftJoin(
         scalars_,
         probeType_,
         stream);
-    extendedLeftView = createExtendedTableView(leftTableView, leftPrecomputed);
+    extendedLeftView = appendExpressionColumns(leftTableView, leftPrecomputed);
   }
 
   // Processes a build batch of join indices: applies the filter (if any),
@@ -3954,7 +3920,7 @@ CudfHashJoinProbe::multiTableLeftOuterJoin(
         scalars_,
         probeType_,
         stream);
-    extendedLeftView = createExtendedTableView(leftTableView, leftPrecomputed);
+    extendedLeftView = appendExpressionColumns(leftTableView, leftPrecomputed);
   }
 
   cudfOutputs.reserve(rightTables.size() + 1);
@@ -4593,7 +4559,7 @@ CudfHashJoinProbe::leftSemiProjectJoin(
         scalars_,
         probeType_,
         stream);
-    extendedLeftView = createExtendedTableView(leftTableView, leftPrecomputed);
+    extendedLeftView = appendExpressionColumns(leftTableView, leftPrecomputed);
   }
 
   for (auto i = 0; i < rightTables.size(); i++) {
@@ -5012,7 +4978,7 @@ CudfHashJoinProbe::rightSemiProjectJoin(
         scalars_,
         probeType_,
         stream);
-    extendedLeftView = createExtendedTableView(leftTableView, leftPrecomputed);
+    extendedLeftView = appendExpressionColumns(leftTableView, leftPrecomputed);
   }
 
   for (size_t i = 0; i < rightTables.size(); ++i) {
@@ -5641,7 +5607,7 @@ exec::BlockingReason CudfHashJoinProbe::isBlocked(ContinueFuture* future) {
           buildType_,
           initStream);
       auto extendedView =
-          createExtendedTableView(rightTableView, rightPrecomputed);
+          appendExpressionColumns(rightTableView, rightPrecomputed);
       cachedRightPrecomputed_.push_back(std::move(rightPrecomputed));
       cachedExtendedRightViews_.push_back(extendedView);
     }

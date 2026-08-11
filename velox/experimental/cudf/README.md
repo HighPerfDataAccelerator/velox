@@ -45,10 +45,14 @@ operator-specific partitioning policy.
 
 The control plane has three layers:
 
-1. `CudfOperatorBase` registers each operator's device pool with both Velox's
-   memory reclaimer and the process-wide device reclaimer. It also owns one
-   replayable workspace coordinator and cancels any queued request before
-   derived teardown. Pressure is published asynchronously and serviced by the
+1. `CudfOperatorBase` installs a cuDF-owned reclaimer on the operator leaf in
+   the custom device-memory hierarchy and separately registers the operator
+   with the process-wide cooperative device reclaimer. The device resource
+   retains its own allocator and arbitrator; the default
+   `Operator::MemoryReclaimer::create(DriverCtx*, Operator*)` API and CPU-pool
+   behavior are unchanged. The base also owns one replayable workspace
+   coordinator and cancels any queued request before derived teardown.
+   Cooperative pressure is published asynchronously and serviced by the
    owning Driver only at safe operator boundaries.
 2. `DeviceMemoryWorkspaceReservation` accounts for transient restore,
    concatenate, hash-build, and output memory across all Drivers on a device.
@@ -75,6 +79,15 @@ output phases. Order By and Batch Concat use the same lifecycle for output and
 bounded replacement work. Their spill layouts and victim heuristics remain
 operator-owned, allowing other blocking operators to adopt the common control
 plane without inheriting join-specific behavior.
+
+cuDF joins reuse Velox's payload-neutral coordination rather than duplicating
+CPU storage types. `JoinBridge` supplies the common start, cancellation, result
+publication, and waiter transition; `IterableSpillPartitionSetBase` supplies
+the recursive `SpillPartitionId` order used by Grace hash join. CPU
+`HashJoinBridge` continues to transfer `BaseHashTable` and `RowVector`-backed
+spill shards. `CudfHashJoinBridge` keeps CUDA hash tables and packed host/disk
+batches as its payload so reuse does not introduce a device-to-`RowVector`
+conversion.
 
 ### Testing Velox with cuDF
 

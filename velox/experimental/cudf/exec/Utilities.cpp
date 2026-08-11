@@ -253,16 +253,6 @@ std::unique_ptr<cudf::column> makeEmptyColumnForType(
     const TypePtr& type,
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr) {
-  auto zeroOffsets = [&]() {
-    cudf::size_type zero = 0;
-    rmm::device_buffer offsets(&zero, sizeof(zero), stream, mr);
-    return std::make_unique<cudf::column>(
-        cudf::data_type{cudf::type_id::INT32},
-        1,
-        std::move(offsets),
-        rmm::device_buffer{},
-        0);
-  };
   switch (type->kind()) {
     case TypeKind::UNKNOWN:
       // Velox uses UNKNOWN for an untyped NULL literal. cuDF has no physical
@@ -275,11 +265,15 @@ std::unique_ptr<cudf::column> makeEmptyColumnForType(
     case TypeKind::VARCHAR:
     case TypeKind::VARBINARY:
       return cudf::make_strings_column(
-          0, zeroOffsets(), rmm::device_buffer{}, 0, rmm::device_buffer{});
+          0,
+          makeZeroOffsetsColumn(0, stream, mr),
+          rmm::device_buffer{},
+          0,
+          rmm::device_buffer{});
     case TypeKind::ARRAY:
       return cudf::make_lists_column(
           0,
-          zeroOffsets(),
+          makeZeroOffsetsColumn(0, stream, mr),
           makeEmptyColumnForType(type->childAt(0), stream, mr),
           0,
           rmm::device_buffer{});
@@ -290,7 +284,11 @@ std::unique_ptr<cudf::column> makeEmptyColumnForType(
       auto entryStruct = cudf::make_structs_column(
           0, std::move(entries), 0, rmm::device_buffer{}, stream, mr);
       return cudf::make_lists_column(
-          0, zeroOffsets(), std::move(entryStruct), 0, rmm::device_buffer{});
+          0,
+          makeZeroOffsetsColumn(0, stream, mr),
+          std::move(entryStruct),
+          0,
+          rmm::device_buffer{});
     }
     case TypeKind::ROW: {
       std::vector<std::unique_ptr<cudf::column>> children;
@@ -307,23 +305,30 @@ std::unique_ptr<cudf::column> makeEmptyColumnForType(
   }
 }
 
+std::unique_ptr<cudf::column> makeZeroOffsetsColumn(
+    cudf::size_type numRows,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) {
+  VELOX_CHECK_GE(numRows, 0);
+  const auto numOffsets = static_cast<size_t>(numRows) + 1;
+  rmm::device_buffer offsetsBuffer(
+      numOffsets * sizeof(cudf::size_type), stream, mr);
+  CUDF_CUDA_TRY(cudaMemsetAsync(
+      offsetsBuffer.data(), 0, offsetsBuffer.size(), stream.value()));
+  return std::make_unique<cudf::column>(
+      cudf::data_type{cudf::type_id::INT32},
+      static_cast<cudf::size_type>(numOffsets),
+      std::move(offsetsBuffer),
+      rmm::device_buffer{},
+      0);
+}
+
 std::unique_ptr<cudf::column> makeAllNullColumnForType(
     const TypePtr& type,
     cudf::size_type size,
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr) {
   VELOX_CHECK_GE(size, 0);
-  auto zeroOffsets = [&]() {
-    std::vector<cudf::size_type> offsets(static_cast<size_t>(size) + 1, 0);
-    rmm::device_buffer offsetsBuffer(
-        offsets.data(), offsets.size() * sizeof(cudf::size_type), stream, mr);
-    return std::make_unique<cudf::column>(
-        cudf::data_type{cudf::type_id::INT32},
-        static_cast<cudf::size_type>(offsets.size()),
-        std::move(offsetsBuffer),
-        rmm::device_buffer{},
-        0);
-  };
   auto allNullMask = [&]() {
     return cudf::create_null_mask(size, cudf::mask_state::ALL_NULL, stream, mr);
   };
@@ -339,11 +344,15 @@ std::unique_ptr<cudf::column> makeAllNullColumnForType(
     case TypeKind::VARCHAR:
     case TypeKind::VARBINARY:
       return cudf::make_strings_column(
-          size, zeroOffsets(), rmm::device_buffer{}, size, allNullMask());
+          size,
+          makeZeroOffsetsColumn(size, stream, mr),
+          rmm::device_buffer{},
+          size,
+          allNullMask());
     case TypeKind::ARRAY:
       return cudf::make_lists_column(
           size,
-          zeroOffsets(),
+          makeZeroOffsetsColumn(size, stream, mr),
           makeEmptyColumnForType(type->childAt(0), stream, mr),
           size,
           allNullMask());
@@ -354,7 +363,11 @@ std::unique_ptr<cudf::column> makeAllNullColumnForType(
       auto entryStruct = cudf::make_structs_column(
           0, std::move(entries), 0, rmm::device_buffer{}, stream, mr);
       return cudf::make_lists_column(
-          size, zeroOffsets(), std::move(entryStruct), size, allNullMask());
+          size,
+          makeZeroOffsetsColumn(size, stream, mr),
+          std::move(entryStruct),
+          size,
+          allNullMask());
     }
     case TypeKind::ROW: {
       std::vector<std::unique_ptr<cudf::column>> children;

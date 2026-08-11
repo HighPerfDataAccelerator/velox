@@ -557,8 +557,7 @@ class Operator : public BaseRuntimeStatWriter {
    public:
     static std::unique_ptr<memory::MemoryReclaimer> create(
         DriverCtx* driverCtx,
-        Operator* op,
-        memory::MemoryPool* targetPool = nullptr);
+        Operator* op);
 
     void enterArbitration() override;
 
@@ -578,16 +577,17 @@ class Operator : public BaseRuntimeStatWriter {
         override;
 
    protected:
-    MemoryReclaimer(
-        const std::shared_ptr<Driver>& driver,
-        Operator* op,
-        memory::MemoryPool* targetPool)
-        : memory::MemoryReclaimer(0),
-          driver_(driver),
-          op_(op),
-          targetPool_(targetPool == nullptr ? op->pool() : targetPool) {
+    MemoryReclaimer(const std::shared_ptr<Driver>& driver, Operator* op)
+        : memory::MemoryReclaimer(0), driver_(driver), op_(op) {
       VELOX_CHECK_NOT_NULL(op_);
-      VELOX_CHECK_NOT_NULL(targetPool_);
+    }
+
+    /// Returns the pool whose arbitration this reclaimer serves. The default
+    /// preserves the one-operator/one-pool contract. Resource-specific
+    /// operator bases may override this for a leaf in their own parallel pool
+    /// hierarchy without changing the default reclaimer factory API.
+    virtual memory::MemoryPool* reclaimPool() const {
+      return op_->pool();
     }
 
     // Gets the shared pointer to the associated driver to ensure the liveness
@@ -600,7 +600,6 @@ class Operator : public BaseRuntimeStatWriter {
 
     const std::weak_ptr<Driver> driver_;
     Operator* const op_;
-    memory::MemoryPool* const targetPool_;
   };
 
   /// Invoked to setup memory reclaimer for this operator's memory pool if its
