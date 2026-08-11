@@ -678,11 +678,9 @@ TEST_F(OrderByTest, outputBatchBytesInPassthroughMode) {
   constexpr uint64_t kMaxBatchBytes = 64ULL << 10;
   auto keys = makeFlatVector<int64_t>(
       kRows, [](vector_size_t row) { return kRows - row; });
-  auto payload = makeFlatVector<std::string>(
-      kRows, [](vector_size_t row) {
-        return fmt::format(
-            "{:04d}-{}", row, std::string(4096, 'a' + row % 26));
-      });
+  auto payload = makeFlatVector<std::string>(kRows, [](vector_size_t row) {
+    return fmt::format("{:04d}-{}", row, std::string(4096, 'a' + row % 26));
+  });
   std::vector<RowVectorPtr> rowVectors{
       makeRowVector({std::move(keys), std::move(payload)})};
   createDuckDbTable(rowVectors);
@@ -721,21 +719,19 @@ TEST_F(OrderByTest, inputBatchBytesBoundBeforeGpuConversion) {
   constexpr uint64_t kMaxBatchBytes = 64ULL << 10;
   std::vector<RowVectorPtr> rowVectors;
   for (int32_t batch = 0; batch < kBatches; ++batch) {
-    auto keys = makeFlatVector<int64_t>(
-        kRowsPerBatch, [batch](vector_size_t row) {
-          return kBatches * kRowsPerBatch -
-              (batch * kRowsPerBatch + row);
+    auto keys =
+        makeFlatVector<int64_t>(kRowsPerBatch, [batch](vector_size_t row) {
+          return kBatches * kRowsPerBatch - (batch * kRowsPerBatch + row);
         });
-    auto payload = makeFlatVector<std::string>(
-        kRowsPerBatch, [batch](vector_size_t row) {
+    auto payload =
+        makeFlatVector<std::string>(kRowsPerBatch, [batch](vector_size_t row) {
           return fmt::format(
               "{:02d}-{:04d}-{}",
               batch,
               row,
               std::string(4096, 'a' + (batch + row) % 26));
         });
-    rowVectors.push_back(
-        makeRowVector({std::move(keys), std::move(payload)}));
+    rowVectors.push_back(makeRowVector({std::move(keys), std::move(payload)}));
   }
   createDuckDbTable(rowVectors);
 

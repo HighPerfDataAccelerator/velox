@@ -29,8 +29,7 @@ void JitExpression::close() {
   expr_.close();
 }
 
-void JitExpression::attachBatchCache(
-    CudfExpressionBatchCachePtr batchCache) {
+void JitExpression::attachBatchCache(CudfExpressionBatchCachePtr batchCache) {
   expr_.attachBatchCache(std::move(batchCache));
 }
 

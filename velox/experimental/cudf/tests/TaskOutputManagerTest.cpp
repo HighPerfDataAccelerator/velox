@@ -94,8 +94,7 @@ TEST_F(TaskOutputManagerTest, selectionAndCancellationCleanup) {
   auto cleanup =
       folly::makeGuard([&]() { queueManager->removeTask(ucxTaskId); });
 
-  auto ucxTask = startTask(
-      ucxTaskId, std::string{core::TransportKind::kUcx});
+  auto ucxTask = startTask(ucxTaskId, std::string{core::TransportKind::kUcx});
   ASSERT_TRUE(queueManager->stats(ucxTaskId).has_value());
 
   std::atomic_bool cancellationDelivered{false};
@@ -113,8 +112,8 @@ TEST_F(TaskOutputManagerTest, selectionAndCancellationCleanup) {
   cleanup.dismiss();
 
   const std::string httpTaskId = "http-output-manager-lifecycle";
-  auto httpTask = startTask(
-      httpTaskId, std::string{core::TransportKind::kInMemory});
+  auto httpTask =
+      startTask(httpTaskId, std::string{core::TransportKind::kInMemory});
   EXPECT_FALSE(queueManager->stats(httpTaskId).has_value());
   httpTask->requestAbort().wait();
 
@@ -148,9 +147,10 @@ TEST_F(TaskOutputManagerTest, localDeviceRootSharesUcxTaskLifecycle) {
   auto task = startTask(
       taskId,
       std::string{core::TransportKind::kUcx},
-      core::QueryConfig(std::unordered_map<std::string, std::string>{
-          {ucx_exchange::LocalDeviceOutputQueueManager::kEnabledConfig,
-           "true"}}));
+      core::QueryConfig(
+          std::unordered_map<std::string, std::string>{
+              {ucx_exchange::LocalDeviceOutputQueueManager::kEnabledConfig,
+               "true"}}));
 
   EXPECT_TRUE(ucxManager->stats(taskId).has_value());
   EXPECT_TRUE(localManager->isDirectOutputTask(taskId));

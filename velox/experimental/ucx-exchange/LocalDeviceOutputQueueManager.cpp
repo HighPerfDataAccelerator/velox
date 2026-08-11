@@ -50,19 +50,16 @@ LocalDeviceOutputQueueManager::TaskQueue::TaskQueue(
   // internal fragment in the same MPP runtime to inherit the cache budget and
   // lets several independent 8 GiB queues exhaust a 32 GiB GPU.
   maxBytes = task->queryCtx()->queryConfig().get<uint64_t>(
-      kMaxBytesConfig,
-      task->queryCtx()->queryConfig().maxOutputBufferSize());
+      kMaxBytesConfig, task->queryCtx()->queryConfig().maxOutputBufferSize());
   continueBytes = maxBytes * kContinuePct / 100;
   LOG(INFO) << "Local device output queue task=" << task->taskId()
-            << " maxBytes=" << maxBytes
-            << " ordinaryMppMaxBytes="
+            << " maxBytes=" << maxBytes << " ordinaryMppMaxBytes="
             << task->queryCtx()->queryConfig().maxOutputBufferSize();
 }
 
 std::shared_ptr<LocalDeviceOutputQueueManager>
 LocalDeviceOutputQueueManager::getInstanceRef() {
-  static auto instance =
-      std::make_shared<LocalDeviceOutputQueueManager>();
+  static auto instance = std::make_shared<LocalDeviceOutputQueueManager>();
   return instance;
 }
 
@@ -88,8 +85,7 @@ void LocalDeviceOutputQueueManager::initializeTask(
       isDirectOutputTask(taskId),
       "Cannot initialize non-root local device output task: {}",
       taskId);
-  auto queue =
-      std::make_shared<TaskQueue>(task, numDestinations, numDrivers);
+  auto queue = std::make_shared<TaskQueue>(task, numDestinations, numDrivers);
   {
     std::scoped_lock lock(mutex_, accountingMutex_);
     const auto [it, inserted] = queues_.emplace(taskId, std::move(queue));
@@ -122,8 +118,7 @@ void LocalDeviceOutputQueueManager::enqueue(
   std::lock_guard<std::mutex> accountingLock(accountingMutex_);
   std::lock_guard<std::mutex> lock(queue->mutex);
   VELOX_CHECK(!queue->terminated, "Local device output task is terminated");
-  VELOX_CHECK(
-      queue->task->isRunning(), "Task is terminated, cannot add data");
+  VELOX_CHECK(queue->task->isRunning(), "Task is terminated, cannot add data");
   VELOX_CHECK_GE(destination, 0);
   VELOX_CHECK_LT(destination, queue->queues.size());
   const auto sequence = queue->nextSequences[destination]++;
@@ -150,8 +145,8 @@ bool LocalDeviceOutputQueueManager::checkBlocked(
   std::lock_guard<std::mutex> accountingLock(accountingMutex_);
   std::lock_guard<std::mutex> lock(queue->mutex);
   const bool queueFull = queue->queuedBytes >= queue->maxBytes;
-  const bool executorFull = aggregateMaxBytes_ > 0 &&
-      aggregateQueuedBytes_ >= aggregateMaxBytes_;
+  const bool executorFull =
+      aggregateMaxBytes_ > 0 && aggregateQueuedBytes_ >= aggregateMaxBytes_;
   if ((!queueFull && !executorFull) || future == nullptr) {
     return false;
   }
@@ -207,8 +202,7 @@ LocalDeviceOutputQueueManager::tryGetData(
       aggregateQueuedBytes_ -= front.bytes;
       destinationQueue.pop_front();
       fulfillAggregateWaitersIfReady(*queue, promises);
-    } else if (queue->terminated ||
-               queue->numFinished == queue->numDrivers) {
+    } else if (queue->terminated || queue->numFinished == queue->numDrivers) {
       result.ready = true;
       result.atEnd = true;
       result.sequence = sequence;
@@ -275,22 +269,22 @@ void LocalDeviceOutputQueueManager::removeTask(std::string_view taskId) {
     queue->terminated = true;
     VELOX_CHECK_GE(aggregateQueuedBytes_, queue->queuedBytes);
     aggregateQueuedBytes_ -= queue->queuedBytes;
-    LOG(WARNING)
-        << "[LOCAL_DEVICE_OUTPUT_QUEUE_METRICS] task=" << taskId
-        << " enqueueCalls=" << queue->enqueueCalls
-        << " dequeueCalls=" << queue->dequeueCalls
-        << " blockedCalls=" << queue->blockedCalls
-        << " localBudgetBlockedCalls=" << queue->localBudgetBlockedCalls
-        << " aggregateBudgetBlockedCalls="
-        << queue->aggregateBudgetBlockedCalls
-        << " rows=" << queue->totalEnqueuedRows
-        << " enqueuedBytes=" << queue->totalEnqueuedBytes
-        << " dequeuedBytes=" << queue->totalDequeuedBytes
-        << " remainingBytes=" << queue->queuedBytes
-        << " peakQueueBytes=" << queue->peakQueuedBytes
-        << " aggregatePeakBytes=" << aggregatePeakQueuedBytes_
-        << " aggregateRemainingBytes=" << aggregateQueuedBytes_
-        << " aggregateMaxBytes=" << aggregateMaxBytes_;
+    LOG(WARNING) << "[LOCAL_DEVICE_OUTPUT_QUEUE_METRICS] task=" << taskId
+                 << " enqueueCalls=" << queue->enqueueCalls
+                 << " dequeueCalls=" << queue->dequeueCalls
+                 << " blockedCalls=" << queue->blockedCalls
+                 << " localBudgetBlockedCalls="
+                 << queue->localBudgetBlockedCalls
+                 << " aggregateBudgetBlockedCalls="
+                 << queue->aggregateBudgetBlockedCalls
+                 << " rows=" << queue->totalEnqueuedRows
+                 << " enqueuedBytes=" << queue->totalEnqueuedBytes
+                 << " dequeuedBytes=" << queue->totalDequeuedBytes
+                 << " remainingBytes=" << queue->queuedBytes
+                 << " peakQueueBytes=" << queue->peakQueuedBytes
+                 << " aggregatePeakBytes=" << aggregatePeakQueuedBytes_
+                 << " aggregateRemainingBytes=" << aggregateQueuedBytes_
+                 << " aggregateMaxBytes=" << aggregateMaxBytes_;
     queue->queuedBytes = 0;
     for (auto& destination : queue->queues) {
       destination.clear();

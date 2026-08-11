@@ -138,17 +138,18 @@ std::shared_ptr<Task> createPartitionedOutputTask(
         rowType->childAt(0), rowType->nameOf(0));
     auto sortingKey = std::make_shared<core::FieldAccessTypedExpr>(
         rowType->childAt(1), rowType->nameOf(1));
-    auto partialTopN = core::TopNRowNumberNode::Builder()
-                           .id("partial_topn_source")
-                           .function(core::TopNRowNumberNode::RankFunction::kRowNumber)
-                           .partitionKeys({partitionKey})
-                           .sortingKeys({sortingKey})
-                           .sortingOrders({core::SortOrder(true, true)})
-                           .rowNumberColumnName(std::nullopt)
-                           .limit(1)
-                           .source(output->sources().front())
-                           .partialOutput(true)
-                           .build();
+    auto partialTopN =
+        core::TopNRowNumberNode::Builder()
+            .id("partial_topn_source")
+            .function(core::TopNRowNumberNode::RankFunction::kRowNumber)
+            .partitionKeys({partitionKey})
+            .sortingKeys({sortingKey})
+            .sortingOrders({core::SortOrder(true, true)})
+            .rowNumberColumnName(std::nullopt)
+            .limit(1)
+            .source(output->sources().front())
+            .partialOutput(true)
+            .build();
     planFragment.planNode = core::PartitionedOutputNode::Builder(*output)
                                 .source(std::move(partialTopN))
                                 .build();

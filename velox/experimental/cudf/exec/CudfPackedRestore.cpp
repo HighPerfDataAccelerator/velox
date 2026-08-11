@@ -15,7 +15,6 @@
  */
 
 #include "velox/experimental/cudf/exec/CudfPackedRestore.h"
-
 #include "velox/experimental/cudf/exec/CudfPackedSpill.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 
@@ -24,9 +23,9 @@
 #include <cudf/contiguous_split.hpp>
 #include <cudf/utilities/error.hpp>
 
-#include <folly/executors/CPUThreadPoolExecutor.h>
-
 #include <cuda_runtime_api.h>
+
+#include <folly/executors/CPUThreadPoolExecutor.h>
 
 #include <algorithm>
 #include <array>
@@ -57,8 +56,7 @@ constexpr uint64_t kMinPinnedBounceRestoreBytes = 16ULL << 20;
 
 uint64_t pinnedBounceBytes() {
   static const uint64_t bytes = [] {
-    const auto* value =
-        std::getenv("CUDF_PACKED_RESTORE_PINNED_BOUNCE_BYTES");
+    const auto* value = std::getenv("CUDF_PACKED_RESTORE_PINNED_BOUNCE_BYTES");
     if (value == nullptr) {
       return kDefaultPinnedBounceBytes;
     }
@@ -79,8 +77,7 @@ uint64_t pinnedBounceBytes() {
 
 size_t pinnedBounceHostThreads() {
   static const size_t threads = [] {
-    const auto* value =
-        std::getenv("CUDF_PACKED_RESTORE_HOST_THREADS");
+    const auto* value = std::getenv("CUDF_PACKED_RESTORE_HOST_THREADS");
     if (value == nullptr) {
       return size_t{1};
     }
@@ -89,8 +86,7 @@ size_t pinnedBounceHostThreads() {
     if (end == value || *end != '\0') {
       return size_t{1};
     }
-    return static_cast<size_t>(
-        std::clamp<uint64_t>(requested, 1, 8));
+    return static_cast<size_t>(std::clamp<uint64_t>(requested, 1, 8));
   }();
   return threads;
 }
@@ -126,8 +122,7 @@ size_t residentPageableBounceHostThreads() {
     if (end == value || *end != '\0') {
       return size_t{4};
     }
-    return static_cast<size_t>(
-        std::clamp<uint64_t>(requested, 1, 8));
+    return static_cast<size_t>(std::clamp<uint64_t>(requested, 1, 8));
   }();
   return threads;
 }
@@ -199,11 +194,12 @@ CudfBulkPackedRestore bulkRestoreCudfPackedHostChunks(
   for (const auto& chunk : chunks) {
     diagnosticBytes += chunk.dataBytes;
   }
-  CudaCallDiagnosticScope callDiagnostic(fmt::format(
-      "phase=bulkPackedRestore chunks={} bytes={} stream={}",
-      chunks.size(),
-      diagnosticBytes,
-      static_cast<const void*>(stream.value())));
+  CudaCallDiagnosticScope callDiagnostic(
+      fmt::format(
+          "phase=bulkPackedRestore chunks={} bytes={} stream={}",
+          chunks.size(),
+          diagnosticBytes,
+          static_cast<const void*>(stream.value())));
   CudfBulkPackedRestore result;
   if (chunks.empty()) {
     return result;
@@ -247,11 +243,10 @@ CudfBulkPackedRestore bulkRestoreCudfPackedHostChunks(
 
   result.gpuData_ = std::make_unique<rmm::device_buffer>(
       static_cast<size_t>(totalBytes), stream, mr);
-  auto* const gpuBase =
-      static_cast<uint8_t*>(result.gpuData_->data());
+  auto* const gpuBase = static_cast<uint8_t*>(result.gpuData_->data());
 
-  const auto hasPinnedStages = std::any_of(
-      chunks.begin(), chunks.end(), [](const auto& chunk) {
+  const auto hasPinnedStages =
+      std::any_of(chunks.begin(), chunks.end(), [](const auto& chunk) {
         return needsPinnedStage(chunk);
       });
   const auto bounceCapacity = pinnedBounceBytes();
@@ -263,8 +258,8 @@ CudfBulkPackedRestore bulkRestoreCudfPackedHostChunks(
       static_cast<std::ptrdiff_t>(pinnedHostThreads));
   std::array<std::shared_ptr<uint8_t>, 2> bounceBuffers;
   size_t bounceBufferCount = 0;
-  if (hasPinnedStages &&
-      totalBytes >= kMinPinnedBounceRestoreBytes && bounceCapacity > 0) {
+  if (hasPinnedStages && totalBytes >= kMinPinnedBounceRestoreBytes &&
+      bounceCapacity > 0) {
     bounceBuffers[0] = acquireCudfPackedPinnedBuffer(bounceCapacity);
     if (bounceBuffers[0]) {
       // One slab is sufficient when every non-empty chunk belongs to one
@@ -273,7 +268,8 @@ CudfBulkPackedRestore bulkRestoreCudfPackedHostChunks(
       // fell back to pageable H2D while D2H spill occupied the shared pool.
       // Multi-wave restore still requires two slabs so it cannot convoy by
       // synchronizing the same slab after every submission.
-      const auto singleStageWave = totalBytes <= bounceCapacity &&
+      const auto singleStageWave =
+          totalBytes <= bounceCapacity &&
           std::all_of(chunks.begin(), chunks.end(), [](const auto& chunk) {
             return chunk.dataBytes == 0 || needsPinnedStage(chunk);
           });
@@ -298,8 +294,8 @@ CudfBulkPackedRestore bulkRestoreCudfPackedHostChunks(
     auto copyStream = cudfGlobalStreamPool().get_stream();
     ScopedCudaEvent allocationReady;
     CUDF_CUDA_TRY(cudaEventRecord(allocationReady.get(), stream.value()));
-    CUDF_CUDA_TRY(cudaStreamWaitEvent(
-        copyStream.value(), allocationReady.get(), 0));
+    CUDF_CUDA_TRY(
+        cudaStreamWaitEvent(copyStream.value(), allocationReady.get(), 0));
 
     std::array<std::unique_ptr<ScopedCudaEvent>, 2> reusableEvents;
     std::array<bool, 2> pending{false, false};
@@ -372,8 +368,7 @@ CudfBulkPackedRestore bulkRestoreCudfPackedHostChunks(
 
       if (pending[nextSlot]) {
         const auto waitStart = std::chrono::steady_clock::now();
-        CUDF_CUDA_TRY(
-            cudaEventSynchronize(reusableEvents[nextSlot]->get()));
+        CUDF_CUDA_TRY(cudaEventSynchronize(reusableEvents[nextSlot]->get()));
         result.stats_.bounceReuseWaitMicros += elapsedMicros(waitStart);
       }
 
@@ -382,8 +377,7 @@ CudfBulkPackedRestore bulkRestoreCudfPackedHostChunks(
           chunks.begin() + groupBegin,
           chunks.begin() + next,
           [](const auto& chunk) {
-            return chunk.dataBytes > 0 &&
-                needsPinnedStage(chunk);
+            return chunk.dataBytes > 0 && needsPinnedStage(chunk);
           });
       const auto residentPageableOnly = std::all_of(
           chunks.begin() + groupBegin,
@@ -413,8 +407,8 @@ CudfBulkPackedRestore bulkRestoreCudfPackedHostChunks(
             continue;
           }
           auto materialize = takePinnedStage(chunks[i]);
-          auto* const destination = bounceBuffers[nextSlot].get() +
-              offsets[i] - deviceBegin;
+          auto* const destination =
+              bounceBuffers[nextSlot].get() + offsets[i] - deviceBegin;
           auto task = std::make_shared<std::packaged_task<void()>>(
               [materialize = std::move(materialize), destination]() mutable {
                 materialize(destination);
@@ -481,8 +475,7 @@ CudfBulkPackedRestore bulkRestoreCudfPackedHostChunks(
             continue;
           }
           auto materialize = takePinnedStage(chunks[i]);
-          materialize(
-              bounceBuffers[nextSlot].get() + offsets[i] - deviceBegin);
+          materialize(bounceBuffers[nextSlot].get() + offsets[i] - deviceBegin);
         }
       }
       for (size_t i = groupBegin; i < next; ++i) {
@@ -499,8 +492,8 @@ CudfBulkPackedRestore bulkRestoreCudfPackedHostChunks(
           deviceEnd - deviceBegin,
           cudaMemcpyHostToDevice,
           copyStream.value()));
-      CUDF_CUDA_TRY(cudaEventRecord(
-          reusableEvents[nextSlot]->get(), copyStream.value()));
+      CUDF_CUDA_TRY(
+          cudaEventRecord(reusableEvents[nextSlot]->get(), copyStream.value()));
       pending[nextSlot] = true;
       ++result.stats_.pinnedBounceCopies;
       nextSlot = (nextSlot + 1) % bounceBufferCount;
@@ -516,8 +509,7 @@ CudfBulkPackedRestore bulkRestoreCudfPackedHostChunks(
       }
       if (chunks[i].materializeIntoPinned) {
         chunks[i].data = std::shared_ptr<uint8_t>(
-            new uint8_t[chunks[i].dataBytes],
-            std::default_delete<uint8_t[]>());
+            new uint8_t[chunks[i].dataBytes], std::default_delete<uint8_t[]>());
         const auto stageStart = std::chrono::steady_clock::now();
         chunks[i].materializeIntoPinned(chunks[i].data.get());
         result.stats_.hostStageMicros += elapsedMicros(stageStart);

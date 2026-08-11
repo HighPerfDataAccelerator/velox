@@ -817,8 +817,7 @@ class TopNRowNumberAdapter : public OperatorAdapter {
       exec::DriverCtx* /*ctx*/) const override {
     auto node =
         std::dynamic_pointer_cast<const core::TopNRowNumberNode>(planNode);
-    const bool supportedRank =
-        node != nullptr &&
+    const bool supportedRank = node != nullptr &&
         (node->rankFunction() ==
              core::TopNRowNumberNode::RankFunction::kRowNumber ||
          (node->rankFunction() ==
@@ -829,9 +828,9 @@ class TopNRowNumberAdapter : public OperatorAdapter {
       LOG_FALLBACK(
           "TopNRowNumberAdapter {}, PlanNode id: {}",
           !canHandle(op) ? "operator is not TopNRowNumber"
-              : !node ? "planNode is not TopNRowNumberNode"
-                      : "CudfTopNRowNumber supports row_number and "
-                        "single-key dense_rank",
+              : !node    ? "planNode is not TopNRowNumberNode"
+                         : "CudfTopNRowNumber supports row_number and "
+                           "single-key dense_rank",
           planNode->id());
     }
     return canRun;
@@ -1392,13 +1391,14 @@ class ExchangeAdapter : public OperatorAdapter {
       const auto targetBytes = ctx->queryConfig().get<uint64_t>(
           CudfConfig::kCudfExchangeBatchSizeMinThresholdBytes,
           cudfConfig.exchangeBatchSizeMinThresholdBytes);
-      result.push_back(std::make_unique<CudfBatchConcat>(
-          operatorId,
-          ctx,
-          planNode,
-          planNode->outputType(),
-          targetRows,
-          targetBytes));
+      result.push_back(
+          std::make_unique<CudfBatchConcat>(
+              operatorId,
+              ctx,
+              planNode,
+              planNode->outputType(),
+              targetRows,
+              targetBytes));
     }
     return result;
   }
@@ -1423,8 +1423,7 @@ class PartitionedOutputAdapter : public OperatorAdapter {
       const core::PlanNodePtr& planNode,
       exec::DriverCtx* /*ctx*/) const override {
     auto outputNode =
-        std::dynamic_pointer_cast<const core::PartitionedOutputNode>(
-            planNode);
+        std::dynamic_pointer_cast<const core::PartitionedOutputNode>(planNode);
     return CudfConfig::getInstance().exchange && outputNode &&
         outputNode->transportKind() == core::TransportKind::kUcx;
   }
@@ -1442,18 +1441,17 @@ class PartitionedOutputAdapter : public OperatorAdapter {
       const core::PlanNodePtr& planNode,
       exec::DriverCtx* ctx,
       int32_t operatorId) const override {
-    auto* partitionOp =
-        const_cast<exec::PartitionedOutput*>(
-            dynamic_cast<const exec::PartitionedOutput*>(op));
+    auto* partitionOp = const_cast<exec::PartitionedOutput*>(
+        dynamic_cast<const exec::PartitionedOutput*>(op));
     auto outputNode =
-        std::dynamic_pointer_cast<const core::PartitionedOutputNode>(
-            planNode);
+        std::dynamic_pointer_cast<const core::PartitionedOutputNode>(planNode);
     VELOX_CHECK_NOT_NULL(partitionOp);
     VELOX_CHECK_NOT_NULL(outputNode);
 
     std::vector<std::unique_ptr<exec::Operator>> result;
-    result.push_back(std::make_unique<ucx_exchange::UcxPartitionedOutput>(
-        operatorId, ctx, outputNode, partitionOp->getEagerFlush()));
+    result.push_back(
+        std::make_unique<ucx_exchange::UcxPartitionedOutput>(
+            operatorId, ctx, outputNode, partitionOp->getEagerFlush()));
     return result;
   }
 

@@ -173,10 +173,9 @@ void CudfIcebergSplitReader::prepareSplitInternal(
       const auto& metadata = fileMetaData_[sourceIndex];
       const auto columnCount = metadata.row_groups.empty()
           ? std::nullopt
-          : std::optional<size_t>(
-                metadata.row_groups.front().columns.size());
-      auto compatible = std::find_if(
-          groups.begin(), groups.end(), [&](const auto& group) {
+          : std::optional<size_t>(metadata.row_groups.front().columns.size());
+      auto compatible =
+          std::find_if(groups.begin(), groups.end(), [&](const auto& group) {
             return !group.columnCount || !columnCount ||
                 group.columnCount == columnCount;
           });
@@ -237,7 +236,6 @@ void CudfIcebergSplitReader::prepareSplitInternal(
 
 void CudfIcebergSplitReader::prepareCurrentSourceGroup(
     dwio::common::RuntimeStatistics& runtimeStats) {
-
   // Read file metadata and cache schema information
   cacheSchemaFromMetadata();
 

@@ -269,9 +269,8 @@ TEST_F(CudfBatchConcatTest, stringBatchesAreConcatenated) {
 
   std::vector<RowVectorPtr> vectors;
   for (int batch = 0; batch < 3; ++batch) {
-    vectors.push_back(makeRowVector({makeFlatVector<std::string>(
-        10,
-        [batch](vector_size_t row) {
+    vectors.push_back(makeRowVector(
+        {makeFlatVector<std::string>(10, [batch](vector_size_t row) {
           return fmt::format("batch-{}-row-{}", batch, row);
         })}));
   }
@@ -592,8 +591,9 @@ TEST_F(CudfBatchConcatTest, batchedConcatSplitsSingleOversizedInput) {
   auto mr = cudf::get_current_device_resource_ref();
   auto table = with_arrow::toCudfTable(input, pool_.get(), stream, mr);
   std::vector<CudfVectorPtr> inputs;
-  inputs.push_back(std::make_shared<CudfVector>(
-      pool_.get(), inputType, input->size(), std::move(table), stream));
+  inputs.push_back(
+      std::make_shared<CudfVector>(
+          pool_.get(), inputType, input->size(), std::move(table), stream));
 
   auto outputs =
       getConcatenatedTableBatched(std::move(inputs), inputType, stream, mr, 4);

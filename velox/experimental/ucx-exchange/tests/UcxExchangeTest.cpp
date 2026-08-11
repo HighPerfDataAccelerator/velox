@@ -38,8 +38,8 @@
 #include "velox/core/QueryConfig.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
 #include "velox/experimental/cudf/CudfConfig.h"
-#include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/CudfPackedSpill.h"
+#include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/ucx-exchange/Communicator.h"
 #include "velox/experimental/ucx-exchange/RangePartitionFunction.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeProtocol.h"
@@ -1872,8 +1872,7 @@ TEST_P(UcxExchangeTest, partialTopNTailExternalizesOnBackpressure) {
   if (p.numSrcDrivers != 1 || p.numDstDrivers != 1 || p.numPartitions != 1 ||
       p.numChunks != 100 || p.numUpstreamTasks != 1 ||
       p.tableType != TableType::NARROW) {
-    GTEST_SKIP()
-        << "partialTopNTailExternalizesOnBackpressure: runs only once";
+    GTEST_SKIP() << "partialTopNTailExternalizesOnBackpressure: runs only once";
   }
 
   auto& config = cudf_velox::CudfConfig::getInstance();
@@ -1917,8 +1916,8 @@ TEST_P(UcxExchangeTest, partialTopNTailExternalizesOnBackpressure) {
       kNumPartitions,
       1);
 
-  auto source = std::make_shared<SourceDriverMock>(
-      sourceTask, 1, 1, kRows, generator);
+  auto source =
+      std::make_shared<SourceDriverMock>(sourceTask, 1, 1, kRows, generator);
   source->run();
 
   bool externalized = false;
@@ -1941,8 +1940,7 @@ TEST_P(UcxExchangeTest, partialTopNTailExternalizesOnBackpressure) {
         partition,
         exchangeNodeId);
     auto sink = std::make_shared<SinkDriverMock>(sinkTask, 1);
-    std::vector<exec::Split> splits{
-        remoteSplit(sourceTaskId, partition)};
+    std::vector<exec::Split> splits{remoteSplit(sourceTaskId, partition)};
     sink->addSplits(splits);
     sink->run();
     sinks.push_back(std::move(sink));

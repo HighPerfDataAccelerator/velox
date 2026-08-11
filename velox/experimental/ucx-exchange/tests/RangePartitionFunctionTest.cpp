@@ -85,14 +85,7 @@ TEST(RangePartitionFunctionSpecTest, repeatedBoundsSplitOnlyEqualKeys) {
   const std::vector<cudf::null_order> nullOrders{cudf::null_order::BEFORE};
 
   auto ids = makeRangePartitionIds(
-      boundaryTable,
-      keyTable,
-      orders,
-      nullOrders,
-      true,
-      0,
-      stream,
-      mr);
+      boundaryTable, keyTable, orders, nullOrders, true, 0, stream, mr);
   std::vector<int32_t> actual(ids->size());
   EXPECT_EQ(
       cudaMemcpyAsync(

@@ -43,8 +43,7 @@ namespace {
 bool hasLoadedCudaUctComponent() {
   uct_component_h* components = nullptr;
   unsigned numComponents = 0;
-  const auto queryStatus =
-      uct_query_components(&components, &numComponents);
+  const auto queryStatus = uct_query_components(&components, &numComponents);
   if (queryStatus != UCS_OK) {
     LOG(WARNING) << "Failed to query loaded UCT components: "
                  << ucs_status_string(queryStatus);
@@ -338,10 +337,9 @@ void Communicator::run() {
       contextSupportsCuda && cudaComponentLoaded, std::memory_order_release);
   LOG(INFO) << "UCX CUDA transport support="
             << (hasCudaTransport() ? "enabled" : "disabled")
-            << " (contextMemoryType="
-            << (contextSupportsCuda ? "yes" : "no")
-            << ", loadedCudaComponent="
-            << (cudaComponentLoaded ? "yes" : "no") << ")"
+            << " (contextMemoryType=" << (contextSupportsCuda ? "yes" : "no")
+            << ", loadedCudaComponent=" << (cudaComponentLoaded ? "yes" : "no")
+            << ")"
             << "; remote transfers will use "
             << (hasCudaTransport() ? "direct device buffers" : "host staging");
 

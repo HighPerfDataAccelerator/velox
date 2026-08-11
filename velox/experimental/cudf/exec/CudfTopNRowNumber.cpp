@@ -16,9 +16,9 @@
 
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/CudfNoDefaults.h"
-#include "velox/experimental/cudf/exec/CudfTopNRowNumber.h"
 #include "velox/experimental/cudf/exec/CudfPackedRestore.h"
 #include "velox/experimental/cudf/exec/CudfPackedSpill.h"
+#include "velox/experimental/cudf/exec/CudfTopNRowNumber.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
@@ -26,8 +26,6 @@
 #include "velox/exec/OperatorUtils.h"
 #include "velox/exec/Task.h"
 #include "velox/exec/TopNRowNumber.h"
-
-#include <folly/ScopeGuard.h>
 
 #include <cudf/aggregation.hpp>
 #include <cudf/binaryop.hpp>
@@ -43,20 +41,21 @@
 #include <cudf/join/hash_join.hpp>
 #include <cudf/merge.hpp>
 #include <cudf/partitioning.hpp>
+#include <cudf/reduction/distinct_count.hpp>
 #include <cudf/replace.hpp>
 #include <cudf/rolling.hpp>
-#include <cudf/reduction/distinct_count.hpp>
 #include <cudf/search.hpp>
 #include <cudf/sorting.hpp>
 #include <cudf/stream_compaction.hpp>
 #include <cudf/unary.hpp>
 
-#include <malloc.h>
+#include <folly/ScopeGuard.h>
 #include <lz4.h>
+#include <malloc.h>
 #include <unistd.h>
 
-#include <atomic>
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -80,23 +79,18 @@ constexpr std::string_view kConditionalTopNMarker = "__gluten_mpp_topn_active";
 // four-way exchange followed by 64 local buckets only uses 16 buckets per
 // executor. A fixed independent seed keeps a logical key stable across input
 // batches while decorrelating the operator-local fanout from the exchange.
-constexpr uint32_t kTopNLocalHashSeed =
-    cudf::DEFAULT_HASH_SEED ^ 0x9e3779b9U;
+constexpr uint32_t kTopNLocalHashSeed = cudf::DEFAULT_HASH_SEED ^ 0x9e3779b9U;
 std::atomic<uint64_t> spillDirectorySequence{0};
 
-bool topNPhaseSyncEnabled(
-    std::string_view nodeId,
-    uint64_t inputBatches) {
-  const auto* enabled =
-      std::getenv("GLUTEN_CUDF_TOPN_PHASE_SYNC");
+bool topNPhaseSyncEnabled(std::string_view nodeId, uint64_t inputBatches) {
+  const auto* enabled = std::getenv("GLUTEN_CUDF_TOPN_PHASE_SYNC");
   if (enabled == nullptr ||
       (std::string_view(enabled) != "1" &&
        std::string_view(enabled) != "true" &&
        std::string_view(enabled) != "TRUE")) {
     return false;
   }
-  const auto* nodeFilter =
-      std::getenv("GLUTEN_CUDF_TOPN_PHASE_SYNC_NODE");
+  const auto* nodeFilter = std::getenv("GLUTEN_CUDF_TOPN_PHASE_SYNC_NODE");
   if (nodeFilter != nullptr && *nodeFilter != '\0' &&
       std::string_view(nodeFilter) != nodeId) {
     return false;
@@ -140,25 +134,21 @@ bool topNDeviceOutputStagingEnabled() {
   if (value == nullptr) {
     return false;
   }
-  return std::string_view(value) == "1" ||
-      std::string_view(value) == "true" ||
+  return std::string_view(value) == "1" || std::string_view(value) == "true" ||
       std::string_view(value) == "TRUE";
 }
 
 bool topNLatePayloadGatherEnabled() {
-  const auto* value =
-      std::getenv("GLUTEN_CUDF_TOPN_LATE_PAYLOAD_GATHER");
+  const auto* value = std::getenv("GLUTEN_CUDF_TOPN_LATE_PAYLOAD_GATHER");
   if (value == nullptr) {
     return true;
   }
-  return std::string_view(value) != "0" &&
-      std::string_view(value) != "false" &&
+  return std::string_view(value) != "0" && std::string_view(value) != "false" &&
       std::string_view(value) != "FALSE";
 }
 
 bool topNLatePayloadSortEnabled() {
-  const auto* value =
-      std::getenv("GLUTEN_CUDF_TOPN_LATE_PAYLOAD_ALGORITHM");
+  const auto* value = std::getenv("GLUTEN_CUDF_TOPN_LATE_PAYLOAD_ALGORITHM");
   return value != nullptr && std::string_view(value) == "sort";
 }
 
@@ -168,8 +158,7 @@ bool topNUniquePartitionFastPathEnabled() {
   if (value == nullptr) {
     return false;
   }
-  return std::string_view(value) == "1" ||
-      std::string_view(value) == "true" ||
+  return std::string_view(value) == "1" || std::string_view(value) == "true" ||
       std::string_view(value) == "TRUE";
 }
 
@@ -179,8 +168,7 @@ bool topNSequentialUniqueFastPathEnabled() {
   if (value == nullptr) {
     return false;
   }
-  return std::string_view(value) == "1" ||
-      std::string_view(value) == "true" ||
+  return std::string_view(value) == "1" || std::string_view(value) == "true" ||
       std::string_view(value) == "TRUE";
 }
 
@@ -200,8 +188,7 @@ bool topNSequentialSparseDuplicatePathEnabled() {
   // continuation enabled by default inside it, with a same-binary escape
   // hatch for endpoint attribution or emergency rollback.
   return value == nullptr ||
-      (std::string_view(value) != "0" &&
-       std::string_view(value) != "false" &&
+      (std::string_view(value) != "0" && std::string_view(value) != "false" &&
        std::string_view(value) != "FALSE");
 }
 
@@ -214,10 +201,9 @@ size_t topNDenseRestoreHostThreads() {
   char* end = nullptr;
   const auto parsed = std::strtoull(value, &end, 10);
   if (end == value || *end != '\0' || parsed > 8) {
-    LOG(WARNING)
-        << "Ignoring invalid "
-           "GLUTEN_CUDF_TOPN_DENSE_RESTORE_HOST_THREADS="
-        << value << "; using the shared packed-restore default";
+    LOG(WARNING) << "Ignoring invalid "
+                    "GLUTEN_CUDF_TOPN_DENSE_RESTORE_HOST_THREADS="
+                 << value << "; using the shared packed-restore default";
     return 0;
   }
   // Zero is an explicit same-binary disable switch. Non-zero calls receive a
@@ -235,10 +221,9 @@ uint32_t topNSequentialSparseMaxCandidatePct() {
   char* end = nullptr;
   const auto parsed = std::strtoull(value, &end, 10);
   if (end == value || *end != '\0' || parsed > 100) {
-    LOG(WARNING)
-        << "Ignoring invalid "
-           "GLUTEN_CUDF_TOPN_SEQUENTIAL_SPARSE_MAX_CANDIDATE_PCT="
-        << value << "; using " << kDefaultMaxCandidatePct;
+    LOG(WARNING) << "Ignoring invalid "
+                    "GLUTEN_CUDF_TOPN_SEQUENTIAL_SPARSE_MAX_CANDIDATE_PCT="
+                 << value << "; using " << kDefaultMaxCandidatePct;
     return kDefaultMaxCandidatePct;
   }
   return static_cast<uint32_t>(parsed);
@@ -253,10 +238,9 @@ uint64_t topNSequentialEarlyDenseProbeBatches() {
   char* end = nullptr;
   const auto parsed = std::strtoull(value, &end, 10);
   if (end == value || *end != '\0') {
-    LOG(WARNING)
-        << "Ignoring invalid "
-           "GLUTEN_CUDF_TOPN_SEQUENTIAL_EARLY_DENSE_BATCHES="
-        << value;
+    LOG(WARNING) << "Ignoring invalid "
+                    "GLUTEN_CUDF_TOPN_SEQUENTIAL_EARLY_DENSE_BATCHES="
+                 << value;
     return 0;
   }
   return std::clamp<uint64_t>(parsed, 2, 1024);
@@ -264,18 +248,17 @@ uint64_t topNSequentialEarlyDenseProbeBatches() {
 
 uint32_t topNSequentialEarlyDenseMaxDistinctPct() {
   constexpr uint32_t kDefaultMaxDistinctPct = 95;
-  const auto* value = std::getenv(
-      "GLUTEN_CUDF_TOPN_SEQUENTIAL_EARLY_DENSE_MAX_DISTINCT_PCT");
+  const auto* value =
+      std::getenv("GLUTEN_CUDF_TOPN_SEQUENTIAL_EARLY_DENSE_MAX_DISTINCT_PCT");
   if (value == nullptr || *value == '\0') {
     return kDefaultMaxDistinctPct;
   }
   char* end = nullptr;
   const auto parsed = std::strtoull(value, &end, 10);
   if (end == value || *end != '\0' || parsed > 100) {
-    LOG(WARNING)
-        << "Ignoring invalid "
-           "GLUTEN_CUDF_TOPN_SEQUENTIAL_EARLY_DENSE_MAX_DISTINCT_PCT="
-        << value << "; using " << kDefaultMaxDistinctPct;
+    LOG(WARNING) << "Ignoring invalid "
+                    "GLUTEN_CUDF_TOPN_SEQUENTIAL_EARLY_DENSE_MAX_DISTINCT_PCT="
+                 << value << "; using " << kDefaultMaxDistinctPct;
     return kDefaultMaxDistinctPct;
   }
   return static_cast<uint32_t>(parsed);
@@ -288,8 +271,7 @@ bool topNSequentialDenseRawRewriteEnabled() {
   // NVMe and restore work more than it saves compression work. Keep the
   // implementation as an explicit diagnostic A/B only.
   return value != nullptr && std::string_view(value) != "0" &&
-      std::string_view(value) != "false" &&
-      std::string_view(value) != "FALSE";
+      std::string_view(value) != "false" && std::string_view(value) != "FALSE";
 }
 
 bool isSupportedKeyType(const TypePtr& type) {
@@ -467,9 +449,10 @@ CudfTopNRowNumber::CudfTopNRowNumber(
       candidateRunBytes_(driverCtx->queryConfig().get<uint64_t>(
           CudfConfig::kCudfTopNRowNumberCandidateRunBytes,
           CudfConfig::getInstance().topNRowNumberCandidateRunBytes)),
-      inputWorkspaceBytes_(std::max<uint64_t>(
-          1ULL << 30,
-          std::min<uint64_t>(candidateRunBytes_, 1ULL << 30) * 2)),
+      inputWorkspaceBytes_(
+          std::max<uint64_t>(
+              1ULL << 30,
+              std::min<uint64_t>(candidateRunBytes_, 1ULL << 30) * 2)),
       hostPartitionCount_(driverCtx->queryConfig().get<uint64_t>(
           CudfConfig::kCudfTopNRowNumberHostPartitions,
           CudfConfig::getInstance().topNRowNumberHostPartitions)),
@@ -539,8 +522,7 @@ CudfTopNRowNumber::CudfTopNRowNumber(
               << " hostResidentBytesLimit=" << hostResidentBytesLimit_
               << " outputChunkBytes=" << outputChunkBytes_
               << " maxOutputRows=" << maxOutputRows_
-              << " deviceOutputStagingEnabled="
-              << deviceOutputStagingEnabled_
+              << " deviceOutputStagingEnabled=" << deviceOutputStagingEnabled_
               << " abandonPartialMinRows=" << abandonPartialMinRows_
               << " abandonPartialMinPct=" << abandonPartialMinPct_
               << " partialOutput=" << partialOutput_;
@@ -553,7 +535,8 @@ CudfTopNRowNumber::CudfTopNRowNumber(
         "TopNRowNumber doesn't allow constant partition keys");
     partitionKeys_.push_back(channel);
     const auto& keyName = inputType_->nameOf(channel);
-    if (boundedTop1_ && keyName.compare(
+    if (boundedTop1_ &&
+        keyName.compare(
             0, kConditionalTopNMarker.size(), kConditionalTopNMarker) == 0) {
       VELOX_CHECK(
           !passthroughKey_.has_value(),
@@ -603,14 +586,12 @@ CudfTopNRowNumber::CudfTopNRowNumber(
   }
 }
 
-exec::BlockingReason CudfTopNRowNumber::isBlocked(
-    ContinueFuture* future) {
+exec::BlockingReason CudfTopNRowNumber::isBlocked(ContinueFuture* future) {
   if (!boundedTop1_) {
     return exec::BlockingReason::kNotBlocked;
   }
   if (!deviceWorkspace_.waiting()) {
-    if (pendingInput_ != nullptr &&
-        !(partialOutput_ && abandonedPartial_) &&
+    if (pendingInput_ != nullptr && !(partialOutput_ && abandonedPartial_) &&
         !inputWorkspaceAdmission_.has_value()) {
       VELOX_CHECK_NOT_NULL(future);
       auto attempt = deviceWorkspace_.tryAcquire(
@@ -637,7 +618,8 @@ void CudfTopNRowNumber::doAddInput(RowVectorPtr input) {
     return;
   }
   VELOX_CHECK_NULL(
-      pendingInput_, "TopN received a second input before processing the first");
+      pendingInput_,
+      "TopN received a second input before processing the first");
   VELOX_CHECK(
       !inputWorkspaceAdmission_.has_value(),
       "TopN input workspace must not be reserved before input ownership");
@@ -702,12 +684,7 @@ CudfVectorPtr CudfTopNRowNumber::mergeAndPruneCandidates(
   std::vector<cudf::table_view> tableViews{
       previous->getTableView(), incoming->getTableView()};
   auto merged = cudf::merge(
-      tableViews,
-      allKeyIndices_,
-      columnOrders_,
-      nullOrders_,
-      stream,
-      mr);
+      tableViews, allKeyIndices_, columnOrders_, nullOrders_, stream, mr);
   streamsWaitForStream(*generalCudaEvent_, inputStreams, stream);
   auto ranks = computeRanks(
       merged->view(),
@@ -878,13 +855,14 @@ void CudfTopNRowNumber::processPendingInput(RowVectorPtr input) {
     const auto sampleRows = static_cast<cudf::size_type>(
         std::min<uint64_t>(inputRows, abandonPartialMinRows_));
     const auto originalInputBytes = cudfInput->estimateFlatSize();
-    logDeviceMemorySnapshot(fmt::format(
-        "operator=CudfTopNRowNumber node={} state=partialSample.begin "
-        "originalInputRows={} originalInputBytes={} sampleRows={}",
-        diagnosticNodeId_,
-        inputRows,
-        originalInputBytes,
-        sampleRows));
+    logDeviceMemorySnapshot(
+        fmt::format(
+            "operator=CudfTopNRowNumber node={} state=partialSample.begin "
+            "originalInputRows={} originalInputBytes={} sampleRows={}",
+            diagnosticNodeId_,
+            inputRows,
+            originalInputBytes,
+            sampleRows));
     auto sampleViews =
         cudf::slice(cudfInput->getTableView(), {0, sampleRows}, stream);
     VELOX_CHECK_EQ(sampleViews.size(), 1);
@@ -895,26 +873,28 @@ void CudfTopNRowNumber::processPendingInput(RowVectorPtr input) {
         diagnosticInputBatches_,
         "reduce-partial-abandon-sample");
     const auto sampleOutputRows = sampleCandidates->num_rows();
-    logDeviceMemorySnapshot(fmt::format(
-        "operator=CudfTopNRowNumber node={} state=partialSample.reduced "
-        "originalInputRows={} originalInputBytes={} sampleInputRows={} "
-        "sampleOutputRows={}",
-        diagnosticNodeId_,
-        inputRows,
-        originalInputBytes,
-        sampleRows,
-        sampleOutputRows));
+    logDeviceMemorySnapshot(
+        fmt::format(
+            "operator=CudfTopNRowNumber node={} state=partialSample.reduced "
+            "originalInputRows={} originalInputBytes={} sampleInputRows={} "
+            "sampleOutputRows={}",
+            diagnosticNodeId_,
+            inputRows,
+            originalInputBytes,
+            sampleRows,
+            sampleOutputRows));
     if (static_cast<uint64_t>(sampleOutputRows) * 100 >=
         static_cast<uint64_t>(sampleRows) * abandonPartialMinPct_) {
       // Release the probe result before publishing the original input. The
       // partial output queue must retain only the original owner, never both
       // the diagnostic sample candidates and the pass-through batch.
       sampleCandidates.reset();
-      logDeviceMemorySnapshot(fmt::format(
-          "operator=CudfTopNRowNumber node={} state=partialSample.released "
-          "logicalOutputOwnerBytes={}",
-          diagnosticNodeId_,
-          originalInputBytes));
+      logDeviceMemorySnapshot(
+          fmt::format(
+              "operator=CudfTopNRowNumber node={} state=partialSample.released "
+              "logicalOutputOwnerBytes={}",
+              diagnosticNodeId_,
+              originalInputBytes));
       abandonedPartial_ = true;
       partialOutputs_.push_back(std::move(cudfInput));
       ++diagnosticInputBatches_;
@@ -932,15 +912,13 @@ void CudfTopNRowNumber::processPendingInput(RowVectorPtr input) {
         lockedStats->addRuntimeStat(
             "partialAbandonSampleInputRows", RuntimeCounter(sampleRows));
         lockedStats->addRuntimeStat(
-            "partialAbandonSampleOutputRows",
-            RuntimeCounter(sampleOutputRows));
+            "partialAbandonSampleOutputRows", RuntimeCounter(sampleOutputRows));
       }
       LOG(WARNING) << "CudfTopNRowNumber node=" << diagnosticNodeId_
                    << " abandoned low-reduction partial from bounded sample"
                    << " sampleInputRows=" << sampleRows
                    << " sampleOutputRows=" << sampleOutputRows
-                   << " retainedPct="
-                   << (100.0 * sampleOutputRows / sampleRows)
+                   << " retainedPct=" << (100.0 * sampleOutputRows / sampleRows)
                    << " originalBatchRows=" << inputRows
                    << " thresholdPct=" << abandonPartialMinPct_;
       return;
@@ -953,10 +931,9 @@ void CudfTopNRowNumber::processPendingInput(RowVectorPtr input) {
   // wide payload on the measured all-unique path. Any duplicate later
   // consolidates these untouched runs and enters the historical recursive
   // exact path.
-  const bool sequentialUniqueInput =
-      !partialOutput_ && topNUniquePartitionFastPathEnabled() &&
-      topNSequentialUniqueFastPathEnabled() &&
-      !sequentialDenseInputMode_ &&
+  const bool sequentialUniqueInput = !partialOutput_ &&
+      topNUniquePartitionFastPathEnabled() &&
+      topNSequentialUniqueFastPathEnabled() && !sequentialDenseInputMode_ &&
       !partitionKeys_.empty();
   if (sequentialUniqueInput) {
     const auto estimatedBytes = cudfInput->estimateFlatSize();
@@ -978,9 +955,8 @@ void CudfTopNRowNumber::processPendingInput(RowVectorPtr input) {
   // defer reduction to that final bucket instead of probing/sorting each
   // batch first. Duplicates are therefore never discarded speculatively; the
   // final exact probe either reuses a unique bucket or falls back to Top-1.
-  const bool deferInputReduction =
-      !partialOutput_ && topNUniquePartitionFastPathEnabled() &&
-      !partitionKeys_.empty();
+  const bool deferInputReduction = !partialOutput_ &&
+      topNUniquePartitionFastPathEnabled() && !partitionKeys_.empty();
   auto batchCandidates = deferInputReduction
       ? cudfInput->release()
       : reduceToCandidates(cudfInput->getTableView(), stream, mr);
@@ -989,19 +965,13 @@ void CudfTopNRowNumber::processPendingInput(RowVectorPtr input) {
     addRuntimeStat("topNDeferredInputBatches", RuntimeCounter(1));
   }
   synchronizeTopNPhase(
-      stream,
-      diagnosticNodeId_,
-      diagnosticInputBatches_,
-      "reduce-input-batch");
+      stream, diagnosticNodeId_, diagnosticInputBatches_, "reduce-input-batch");
   if (partialOutput_) {
     const auto rows = batchCandidates->num_rows();
     if (rows > 0) {
-      partialOutputs_.push_back(std::make_shared<CudfVector>(
-          pool(),
-          inputType_,
-          rows,
-          std::move(batchCandidates),
-          stream));
+      partialOutputs_.push_back(
+          std::make_shared<CudfVector>(
+              pool(), inputType_, rows, std::move(batchCandidates), stream));
     }
     ++diagnosticInputBatches_;
     diagnosticInputRows_ += inputRows;
@@ -1010,8 +980,7 @@ void CudfTopNRowNumber::processPendingInput(RowVectorPtr input) {
         std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now() - addInputStart)
             .count();
-    if (!generateRowNumber_ &&
-        diagnosticInputRows_ >= abandonPartialMinRows_ &&
+    if (!generateRowNumber_ && diagnosticInputRows_ >= abandonPartialMinRows_ &&
         diagnosticPartialOutputRows_ * 100 >=
             diagnosticInputRows_ * abandonPartialMinPct_) {
       abandonedPartial_ = true;
@@ -1072,8 +1041,7 @@ void CudfTopNRowNumber::processPendingInput(RowVectorPtr input) {
       std::chrono::duration_cast<std::chrono::microseconds>(
           std::chrono::steady_clock::now() - addInputStart)
           .count();
-  if (diagnosticInputBatches_ == 1 ||
-      diagnosticInputBatches_ % 64 == 0) {
+  if (diagnosticInputBatches_ == 1 || diagnosticInputBatches_ % 64 == 0) {
     LOG(WARNING) << "CudfTopNRowNumber node=" << diagnosticNodeId_
                  << " progress inputBatches=" << diagnosticInputBatches_
                  << " inputRows=" << diagnosticInputRows_
@@ -1086,11 +1054,9 @@ void CudfTopNRowNumber::processPendingInput(RowVectorPtr input) {
                  << " diskBytes=" << partitionedDiskBytes_
                  << " externalizeCalls=" << diagnosticExternalizeCalls_
                  << " hashPartitionUs=" << diagnosticHashPartitionMicros_
-                 << " contiguousSplitUs="
-                 << diagnosticContiguousSplitMicros_
+                 << " contiguousSplitUs=" << diagnosticContiguousSplitMicros_
                  << " d2hSubmitUs=" << diagnosticD2hSubmitMicros_
-                 << " d2hSynchronizeUs="
-                 << diagnosticD2hSynchronizeMicros_
+                 << " d2hSynchronizeUs=" << diagnosticD2hSynchronizeMicros_
                  << " compressionUs=" << diagnosticCompressionMicros_
                  << " spillEnqueueUs=" << diagnosticSpillEnqueueMicros_
                  << " storeUs=" << diagnosticStoreMicros_;
@@ -1110,8 +1076,7 @@ void CudfTopNRowNumber::doNoMoreInput() {
                << " partialOutputRows=" << diagnosticPartialOutputRows_
                << " abandonedPartial=" << abandonedPartial_
                << " partialWorkspaceBypassBatches="
-               << diagnosticPartialWorkspaceBypassBatches_
-               << " candidateRows="
+               << diagnosticPartialWorkspaceBypassBatches_ << " candidateRows="
                << (candidates_ ? candidates_->num_rows() : 0)
                << " partitionedMode=" << partitionedRowNumberMode_
                << " deviceBytes=" << partitionedDeviceBytes_
@@ -1121,8 +1086,7 @@ void CudfTopNRowNumber::doNoMoreInput() {
                << " hashPartitionUs=" << diagnosticHashPartitionMicros_
                << " contiguousSplitUs=" << diagnosticContiguousSplitMicros_
                << " d2hSubmitUs=" << diagnosticD2hSubmitMicros_
-               << " d2hSynchronizeUs="
-               << diagnosticD2hSynchronizeMicros_
+               << " d2hSynchronizeUs=" << diagnosticD2hSynchronizeMicros_
                << " compressionUs=" << diagnosticCompressionMicros_
                << " spillEnqueueUs=" << diagnosticSpillEnqueueMicros_
                << " storeUs=" << diagnosticStoreMicros_;
@@ -1157,8 +1121,8 @@ void CudfTopNRowNumber::doNoMoreInput() {
     std::vector<size_t> wave;
     uint64_t waveBytes = 0;
     size_t spilledBuckets = 0;
-    for (size_t bucket = 0;
-         bucket < partitionedRowNumberDeviceBytes_.size(); ++bucket) {
+    for (size_t bucket = 0; bucket < partitionedRowNumberDeviceBytes_.size();
+         ++bucket) {
       const auto bucketBytes = partitionedRowNumberDeviceBytes_[bucket];
       if (bucketBytes == 0) {
         continue;
@@ -1179,8 +1143,7 @@ void CudfTopNRowNumber::doNoMoreInput() {
     VELOX_CHECK_EQ(partitionedDeviceBytes_, 0);
     LOG(WARNING) << "CudfTopNRowNumber node=" << diagnosticNodeId_
                  << " flushed mixed-tier device state before finalize bytes="
-                 << finalizeDeviceResidentBytes
-                 << " buckets=" << spilledBuckets
+                 << finalizeDeviceResidentBytes << " buckets=" << spilledBuckets
                  << " hostBytes=" << partitionedHostBytes_
                  << " residentHostBytes=" << partitionedResidentHostBytes_
                  << " diskBytes=" << partitionedDiskBytes_;
@@ -1191,14 +1154,12 @@ void CudfTopNRowNumber::doNoMoreInput() {
     // bytes whenever candidates_ was non-null at noMoreInput().
     auto lockedStats = stats_.wlock();
     lockedStats->addRuntimeStat(
-        "topNDeviceResidentBytes",
-        RuntimeCounter(finalizeDeviceResidentBytes));
+        "topNDeviceResidentBytes", RuntimeCounter(finalizeDeviceResidentBytes));
     lockedStats->addRuntimeStat(
         "topNFinalizePreflushBytes",
         RuntimeCounter(finalizeDeviceResidentBytes - partitionedDeviceBytes_));
     lockedStats->addRuntimeStat(
-        "topNDeviceSpillBytes",
-        RuntimeCounter(diagnosticDeviceSpillBytes_));
+        "topNDeviceSpillBytes", RuntimeCounter(diagnosticDeviceSpillBytes_));
     lockedStats->addRuntimeStat(
         "topNDeviceSpillBuckets",
         RuntimeCounter(diagnosticDeviceSpillBuckets_));
@@ -1327,10 +1288,9 @@ std::unique_ptr<cudf::table> CudfTopNRowNumber::reduceOwnedCandidates(
         stream);
     unique = distinctRows == inputRows;
   }
-  const auto probeNanos =
-      std::chrono::duration_cast<std::chrono::nanoseconds>(
-          std::chrono::steady_clock::now() - probeStart)
-          .count();
+  const auto probeNanos = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              std::chrono::steady_clock::now() - probeStart)
+                              .count();
   addRuntimeStat(
       "topNUniquePartitionProbeNanos",
       RuntimeCounter(probeNanos, RuntimeCounter::Unit::kNanos));
@@ -1342,8 +1302,7 @@ std::unique_ptr<cudf::table> CudfTopNRowNumber::reduceOwnedCandidates(
     return input;
   }
 
-  addRuntimeStat(
-      "topNUniquePartitionFallbackRows", RuntimeCounter(inputRows));
+  addRuntimeStat("topNUniquePartitionFallbackRows", RuntimeCounter(inputRows));
   addRuntimeStat("topNUniquePartitionFallbackBatches", RuntimeCounter(1));
   return reduceToCandidates(input->view(), stream, mr);
 }
@@ -1375,8 +1334,8 @@ void CudfTopNRowNumber::externalizeSequentialUniqueCandidates(
   const auto packStart = std::chrono::steady_clock::now();
   constexpr uint64_t kSequentialPackedChunkBytes = 96ULL << 20;
   const auto inputRows = candidates->num_rows();
-  const auto bytesPerRow = std::max<uint64_t>(
-      1, (estimatedBytes + inputRows - 1) / inputRows);
+  const auto bytesPerRow =
+      std::max<uint64_t>(1, (estimatedBytes + inputRows - 1) / inputRows);
   const auto rowsPerChunk = static_cast<cudf::size_type>(
       std::max<uint64_t>(1, kSequentialPackedChunkBytes / bytesPerRow));
   std::vector<cudf::size_type> splitOffsets;
@@ -1484,8 +1443,7 @@ void CudfTopNRowNumber::externalizeSequentialUniqueCandidates(
   auto keyStorage = std::shared_ptr<uint8_t>(
       new uint8_t[keyBytes], std::default_delete<uint8_t[]>());
   if (keyBytes > 0) {
-    std::memcpy(
-        keyStorage.get(), hostStorage.get() + inputBytes, keyBytes);
+    std::memcpy(keyStorage.get(), hostStorage.get() + inputBytes, keyBytes);
   }
   std::vector<HostPackedChunk> keyChunks(hostPartitionCount_);
   keyHostOffset = inputBytes;
@@ -1508,15 +1466,14 @@ void CudfTopNRowNumber::externalizeSequentialUniqueCandidates(
   for (auto& packed : packedInputs) {
     HostPackedChunk inputChunk;
     inputChunk.metadata = std::move(packed.data.metadata);
-    inputChunk.data = std::shared_ptr<uint8_t>(
-        hostStorage, hostStorage.get() + hostOffset);
+    inputChunk.data =
+        std::shared_ptr<uint8_t>(hostStorage, hostStorage.get() + hostOffset);
     inputChunk.dataBytes = packed.data.gpu_data->size();
     inputChunk.storedBytes = inputChunk.dataBytes;
     inputChunk.rows = packed.table.num_rows();
     inputChunk.pinned = usedPinnedStaging;
     hostOffset += inputChunk.dataBytes;
-    const auto bucket =
-        sequentialUniqueNextBucket_++ % hostPartitionCount_;
+    const auto bucket = sequentialUniqueNextBucket_++ % hostPartitionCount_;
     storeHostPartitionChunk(std::move(inputChunk), bucket);
   }
   for (size_t bucket = 0; bucket < keyChunks.size(); ++bucket) {
@@ -1600,20 +1557,19 @@ void CudfTopNRowNumber::maybeSwitchSequentialDenseInputMode(
     probeRows += chunk.rows;
     auto owner = chunk.data;
     CudfPackedHostRestoreChunk copy;
-    copy.metadata =
-        std::make_unique<std::vector<uint8_t>>(*chunk.metadata);
+    copy.metadata = std::make_unique<std::vector<uint8_t>>(*chunk.metadata);
     copy.dataBytes = chunk.dataBytes;
     copy.keepAlive = owner;
-    copy.materializeIntoPinned =
-        [owner = std::move(owner), bytes = chunk.dataBytes](
-            uint8_t* destination) {
-          VELOX_CHECK(
-              bytes == 0 || destination != nullptr,
-              "Sequential early-dense key probe has no destination");
-          if (bytes > 0) {
-            std::memcpy(destination, owner.get(), bytes);
-          }
-        };
+    copy.materializeIntoPinned = [owner = std::move(owner),
+                                  bytes =
+                                      chunk.dataBytes](uint8_t* destination) {
+      VELOX_CHECK(
+          bytes == 0 || destination != nullptr,
+          "Sequential early-dense key probe has no destination");
+      if (bytes > 0) {
+        std::memcpy(destination, owner.get(), bytes);
+      }
+    };
     prepared.push_back(std::move(copy));
   }
   if (probeRows == 0) {
@@ -1623,14 +1579,12 @@ void CudfTopNRowNumber::maybeSwitchSequentialDenseInputMode(
   const auto probeStart = std::chrono::steady_clock::now();
   auto restored = bulkRestoreCudfPackedHostChunks(
       std::move(prepared), stream, get_output_mr());
-  auto merged = cudf::concatenate(
-      restored.tables(), stream, get_output_mr());
-  const auto distinctRows = static_cast<uint64_t>(cudf::distinct_count(
-      merged->view(), cudf::null_equality::EQUAL, stream));
-  const auto probeNanos =
-      std::chrono::duration_cast<std::chrono::nanoseconds>(
-          std::chrono::steady_clock::now() - probeStart)
-          .count();
+  auto merged = cudf::concatenate(restored.tables(), stream, get_output_mr());
+  const auto distinctRows = static_cast<uint64_t>(
+      cudf::distinct_count(merged->view(), cudf::null_equality::EQUAL, stream));
+  const auto probeNanos = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              std::chrono::steady_clock::now() - probeStart)
+                              .count();
   sequentialEarlyDenseProbeRows_ += probeRows;
   sequentialEarlyDenseDistinctRows_ += distinctRows;
   addRuntimeStat(
@@ -1641,21 +1595,15 @@ void CudfTopNRowNumber::maybeSwitchSequentialDenseInputMode(
       "topNSequentialEarlyDenseProbeNanos",
       RuntimeCounter(probeNanos, RuntimeCounter::Unit::kNanos));
 
-  const auto maxDistinctPct =
-      topNSequentialEarlyDenseMaxDistinctPct();
-  const bool dense =
-      static_cast<unsigned __int128>(distinctRows) * 100 <=
+  const auto maxDistinctPct = topNSequentialEarlyDenseMaxDistinctPct();
+  const bool dense = static_cast<unsigned __int128>(distinctRows) * 100 <=
       static_cast<unsigned __int128>(probeRows) * maxDistinctPct;
   LOG(WARNING) << "CudfTopNRowNumber node=" << diagnosticNodeId_
                << " sequential early-dense probe inputBatches="
-               << sequentialEarlyDenseInputBatches_
-               << " bucket=" << probeBucket
-               << " rows=" << probeRows
-               << " distinctRows=" << distinctRows
-               << " distinctPct="
-               << (100.0 * distinctRows / probeRows)
-               << " maxDistinctPct=" << maxDistinctPct
-               << " dense=" << dense;
+               << sequentialEarlyDenseInputBatches_ << " bucket=" << probeBucket
+               << " rows=" << probeRows << " distinctRows=" << distinctRows
+               << " distinctPct=" << (100.0 * distinctRows / probeRows)
+               << " maxDistinctPct=" << maxDistinctPct << " dense=" << dense;
   merged.reset();
   restored = CudfBulkPackedRestore{};
   if (dense) {
@@ -1705,8 +1653,7 @@ void CudfTopNRowNumber::switchSequentialDenseInputMode(
   sequentialDenseConvertedRows_ = 0;
   sequentialDenseConvertedBytes_ = 0;
 
-  addRuntimeStat(
-      "topNSequentialEarlyDenseSwitches", RuntimeCounter(1));
+  addRuntimeStat("topNSequentialEarlyDenseSwitches", RuntimeCounter(1));
   addRuntimeStat(
       "topNSequentialEarlyDensePrefixRows", RuntimeCounter(prefixRows));
   addRuntimeStat(
@@ -1716,8 +1663,7 @@ void CudfTopNRowNumber::switchSequentialDenseInputMode(
                << " deferred sequential prefix for bounded dense hash drain"
                << " inputBatches=" << sequentialEarlyDenseInputBatches_
                << " prefixChunks=" << sequentialDensePrefixHost_.size()
-               << " prefixRows=" << prefixRows
-               << " prefixBytes=" << prefixBytes
+               << " prefixRows=" << prefixRows << " prefixBytes=" << prefixBytes
                << " hostBytes=" << partitionedHostBytes_
                << " deviceBytes=" << partitionedDeviceBytes_
                << " diskBytes=" << partitionedDiskBytes_;
@@ -1734,8 +1680,7 @@ void CudfTopNRowNumber::spillSequentialDensePrefixDeviceState(
   // GiB per GPU and finish every prefix drain at zero resident bytes.
   constexpr uint64_t kDenseDrainDeviceWaveBytes = 512ULL << 20;
   if (partitionedDeviceBytes_ == 0 ||
-      (!flushAll &&
-       partitionedDeviceBytes_ <= kDenseDrainDeviceWaveBytes)) {
+      (!flushAll && partitionedDeviceBytes_ <= kDenseDrainDeviceWaveBytes)) {
     return;
   }
 
@@ -1761,8 +1706,7 @@ void CudfTopNRowNumber::spillSequentialDensePrefixDeviceState(
   addRuntimeStat(
       "topNSequentialEarlyDenseDeviceSpillBytes",
       RuntimeCounter(spilledBytes, RuntimeCounter::Unit::kBytes));
-  addRuntimeStat(
-      "topNSequentialEarlyDenseDeviceSpillWaves", RuntimeCounter(1));
+  addRuntimeStat("topNSequentialEarlyDenseDeviceSpillWaves", RuntimeCounter(1));
 }
 
 void CudfTopNRowNumber::externalizeRowNumberCandidates(
@@ -1935,13 +1879,12 @@ void CudfTopNRowNumber::externalizeRowNumberCandidates(
           .count();
   ++diagnosticExternalizeCalls_;
   LOG(INFO) << "CudfTopNRowNumber node=" << diagnosticNodeId_
-            << " externalized ROW_NUMBER=1 candidates rows="
-            << externalizedRows << " bytes=" << externalizedBytes
+            << " externalized ROW_NUMBER=1 candidates rows=" << externalizedRows
+            << " bytes=" << externalizedBytes
             << " hostBytes=" << partitionedHostBytes_
             << " residentHostBytes=" << partitionedResidentHostBytes_
             << " diskBytes=" << partitionedDiskBytes_
-            << " diskUncompressedBytes="
-            << partitionedDiskUncompressedBytes_
+            << " diskUncompressedBytes=" << partitionedDiskUncompressedBytes_
             << " buckets=" << hostPartitionCount_;
 }
 
@@ -1980,8 +1923,7 @@ void CudfTopNRowNumber::retainDevicePartitionChunk(
   chunk.dataBytes = packed.data.gpu_data->size();
   chunk.rows = packed.table.num_rows();
   chunk.producerStream = stream;
-  chunk.packed =
-      std::make_unique<cudf::packed_table>(std::move(packed));
+  chunk.packed = std::make_unique<cudf::packed_table>(std::move(packed));
 
   if (auto* devicePool = customPool(kCudfDeviceMemoryResourceTag);
       devicePool != nullptr && chunk.dataBytes > 0) {
@@ -2020,13 +1962,13 @@ void CudfTopNRowNumber::retainDevicePartitionChunk(
       uint64_t selectedBytes = 0;
       std::vector<size_t> victims;
       while (selectedBytes < targetFree) {
-        const auto largest = std::max_element(
-            remainingBytes.begin(), remainingBytes.end());
+        const auto largest =
+            std::max_element(remainingBytes.begin(), remainingBytes.end());
         if (largest == remainingBytes.end() || *largest == 0) {
           break;
         }
-        const auto victim = static_cast<size_t>(
-            std::distance(remainingBytes.begin(), largest));
+        const auto victim =
+            static_cast<size_t>(std::distance(remainingBytes.begin(), largest));
         selectedBytes += *largest;
         *largest = 0;
         victims.push_back(victim);
@@ -2058,8 +2000,7 @@ bool CudfTopNRowNumber::canReclaim() const {
   return boundedTop1_ && partitionedDeviceBytes_ > 0;
 }
 
-bool CudfTopNRowNumber::reclaimableBytes(
-    uint64_t& reclaimableBytes) const {
+bool CudfTopNRowNumber::reclaimableBytes(uint64_t& reclaimableBytes) const {
   if (!boundedTop1_) {
     reclaimableBytes = 0;
     return false;
@@ -2204,8 +2145,7 @@ void CudfTopNRowNumber::spillDevicePartitions(
             stream.value()));
       }
       hostOffset += hostChunk.dataBytes;
-      hostChunks.push_back(
-          PendingHostChunk{bucket, std::move(hostChunk)});
+      hostChunks.push_back(PendingHostChunk{bucket, std::move(hostChunk)});
     }
   }
   const auto d2hSubmitEnd = std::chrono::steady_clock::now();
@@ -2253,8 +2193,8 @@ void CudfTopNRowNumber::evictLargestDevicePartitions(
   auto projectedDeviceBytes = partitionedDeviceBytes_;
   std::vector<size_t> victims;
   while (projectedDeviceBytes > lowWatermark) {
-    const auto largest = std::max_element(
-        remainingBytes.begin(), remainingBytes.end());
+    const auto largest =
+        std::max_element(remainingBytes.begin(), remainingBytes.end());
     VELOX_CHECK(
         largest != remainingBytes.end() && *largest > 0,
         "TopN device residency exceeds its low watermark without a "
@@ -2277,8 +2217,7 @@ uint64_t CudfTopNRowNumber::partitionBytes(size_t bucket) const {
       [](uint64_t bytes, const HostPackedChunk& chunk) {
         return bytes + chunk.dataBytes;
       });
-  const auto deviceBytes =
-      bucket < partitionedRowNumberDeviceBytes_.size()
+  const auto deviceBytes = bucket < partitionedRowNumberDeviceBytes_.size()
       ? partitionedRowNumberDeviceBytes_[bucket]
       : 0;
   return hostBytes + deviceBytes;
@@ -2293,8 +2232,8 @@ void CudfTopNRowNumber::storeHostPartitionChunk(
       chunk.dataBytes,
       static_cast<uint64_t>(std::numeric_limits<int>::max()),
       "Packed cuDF spill chunk exceeds the LZ4 block size limit");
-  auto hostReservation = tryReserveCudfPackedHostMemory(
-      chunk.dataBytes, hostResidentBytesLimit_);
+  auto hostReservation =
+      tryReserveCudfPackedHostMemory(chunk.dataBytes, hostResidentBytesLimit_);
   if (!hostReservation) {
     auto& spillFile = partitionedRowNumberSpillFiles_[bucket];
     if (!spillFile) {
@@ -2344,8 +2283,8 @@ void CudfTopNRowNumber::storeHostPartitionChunk(
   partitionedRowNumberHost_[bucket].push_back(std::move(chunk));
 }
 
-CudfPackedHostRestoreChunk
-CudfTopNRowNumber::prepareHostChunkForBulkRestore(HostPackedChunk chunk) {
+CudfPackedHostRestoreChunk CudfTopNRowNumber::prepareHostChunkForBulkRestore(
+    HostPackedChunk chunk) {
   if (chunk.data) {
     return materializeHostChunk(std::move(chunk));
   }
@@ -2377,8 +2316,7 @@ CudfTopNRowNumber::prepareHostChunkForBulkRestore(HostPackedChunk chunk) {
         RuntimeCounter(
             result.compressionMicros * 1'000, RuntimeCounter::Unit::kNanos));
     addRuntimeStat(
-        result.compressed ? "topNSpillCompressedChunks"
-                          : "topNSpillRawChunks",
+        result.compressed ? "topNSpillCompressedChunks" : "topNSpillRawChunks",
         RuntimeCounter(1));
   }
   auto owner = std::make_shared<HostPackedChunk>(std::move(chunk));
@@ -2426,8 +2364,7 @@ void CudfTopNRowNumber::materializeDiskChunkInto(
         RuntimeCounter(
             result.compressionMicros * 1'000, RuntimeCounter::Unit::kNanos));
     addRuntimeStat(
-        result.compressed ? "topNSpillCompressedChunks"
-                          : "topNSpillRawChunks",
+        result.compressed ? "topNSpillCompressedChunks" : "topNSpillRawChunks",
         RuntimeCounter(1));
   }
 
@@ -2437,8 +2374,7 @@ void CudfTopNRowNumber::materializeDiskChunkInto(
     compressed = std::make_unique<uint8_t[]>(chunk.storedBytes);
     readDestination = compressed.get();
   }
-  chunk.spillFile->read(
-      chunk.fileOffset, chunk.storedBytes, readDestination);
+  chunk.spillFile->read(chunk.fileOffset, chunk.storedBytes, readDestination);
   chunk.spillFile->reclaim(chunk.fileOffset, chunk.storedBytes);
   {
     std::lock_guard<std::mutex> lock(partitionedDiskAccountingMutex_);
@@ -2491,8 +2427,7 @@ CudfPackedHostRestoreChunk CudfTopNRowNumber::materializeHostChunk(
       addRuntimeStat(
           "topNSpillCompressionNanos",
           RuntimeCounter(
-              result.compressionMicros * 1'000,
-              RuntimeCounter::Unit::kNanos));
+              result.compressionMicros * 1'000, RuntimeCounter::Unit::kNanos));
       addRuntimeStat(
           result.compressed ? "topNSpillCompressedChunks"
                             : "topNSpillRawChunks",
@@ -2530,8 +2465,7 @@ CudfPackedHostRestoreChunk CudfTopNRowNumber::materializeHostChunk(
       std::move(chunk.hostReservation)};
 }
 
-std::unique_ptr<cudf::packed_table>
-CudfTopNRowNumber::restoreHostChunk(
+std::unique_ptr<cudf::packed_table> CudfTopNRowNumber::restoreHostChunk(
     HostPackedChunk chunk,
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr,
@@ -2570,15 +2504,14 @@ void CudfTopNRowNumber::repartitionOversizedHostBucket(
   const auto depth = partitionedRowNumberHashDepths_[bucket];
   const auto requiredFanout =
       (bucketBytes + finalizeInputBytes_ - 1) / finalizeInputBytes_;
-  const auto fanout = static_cast<size_t>(
-      std::clamp<uint64_t>(requiredFanout, 2, 64));
+  const auto fanout =
+      static_cast<size_t>(std::clamp<uint64_t>(requiredFanout, 2, 64));
   const auto childStart = partitionedRowNumberHost_.size();
 
   // Move the source state before growing the parallel vectors, since resize
   // may invalidate references into them.
   auto sourceChunks = std::move(partitionedRowNumberHost_[bucket]);
-  auto sourceSpillFile =
-      std::move(partitionedRowNumberSpillFiles_[bucket]);
+  auto sourceSpillFile = std::move(partitionedRowNumberSpillFiles_[bucket]);
 
   partitionedRowNumberHost_.resize(childStart + fanout);
   partitionedRowNumberDevice_.resize(childStart + fanout);
@@ -2614,8 +2547,7 @@ void CudfTopNRowNumber::repartitionOversizedHostBucket(
       const auto sourceBytes = chunk.dataBytes;
       sourceRows += chunk.rows;
       groupBytes += sourceBytes;
-      hostChunks.push_back(
-          prepareHostChunkForBulkRestore(std::move(chunk)));
+      hostChunks.push_back(prepareHostChunkForBulkRestore(std::move(chunk)));
       VELOX_CHECK_GE(partitionedHostBytes_, sourceBytes);
       partitionedHostBytes_ -= sourceBytes;
       ++sourceIndex;
@@ -2650,8 +2582,7 @@ void CudfTopNRowNumber::repartitionOversizedHostBucket(
       offsets = std::move(result.second);
     }
     merged.reset();
-    VELOX_CHECK(
-        offsets.size() == fanout || offsets.size() == fanout + 1);
+    VELOX_CHECK(offsets.size() == fanout || offsets.size() == fanout + 1);
     VELOX_CHECK_EQ(offsets.front(), 0);
     offsets.erase(offsets.begin());
     if (offsets.size() == fanout) {
@@ -2682,8 +2613,7 @@ void CudfTopNRowNumber::repartitionOversizedHostBucket(
           "topNSequentialDenseRawRewriteBytes",
           RuntimeCounter(rewrittenBytes, RuntimeCounter::Unit::kBytes));
       lockedStats->addRuntimeStat(
-          "topNSequentialDenseRawRewriteChunks",
-          RuntimeCounter(childChunks));
+          "topNSequentialDenseRawRewriteChunks", RuntimeCounter(childChunks));
     }
   }
   LOG(WARNING) << "CudfTopNRowNumber node=" << diagnosticNodeId_
@@ -2691,8 +2621,7 @@ void CudfTopNRowNumber::repartitionOversizedHostBucket(
                << " depth=" << depth << " inputRows=" << sourceRows
                << " inputBytes=" << bucketBytes
                << " finalizeInputBytes=" << finalizeInputBytes_
-               << " fanout=" << fanout
-               << " sourceChunks=" << sourceChunkCount
+               << " fanout=" << fanout << " sourceChunks=" << sourceChunkCount
                << " restoreGroups=" << restoreGroups
                << " childChunks=" << childChunks
                << " rewrittenBytes=" << rewrittenBytes
@@ -2799,8 +2728,8 @@ CudfTopNRowNumber::computeNextPartitionedRowNumberOutput() {
   // backpressure as normal TopN finalization.
   while (!sequentialDensePrefixHost_.empty()) {
     const auto packedBytes = sequentialDensePrefixHost_.back().dataBytes;
-    const auto rows = static_cast<uint64_t>(
-        sequentialDensePrefixHost_.back().rows);
+    const auto rows =
+        static_cast<uint64_t>(sequentialDensePrefixHost_.back().rows);
     const auto workspaceBytes = estimateFinalizeWorkspaceBytes(packedBytes);
     auto attempt = deviceWorkspace_.tryAcquire(
         customPool(kCudfDeviceMemoryResourceTag),
@@ -2825,8 +2754,7 @@ CudfTopNRowNumber::computeNextPartitionedRowNumberOutput() {
     auto restored = bulkRestoreCudfPackedHostChunks(
         std::move(prepared), stream, get_output_mr());
     const auto restoreStats = restored.stats();
-    auto wide =
-        cudf::concatenate(restored.tables(), stream, get_output_mr());
+    auto wide = cudf::concatenate(restored.tables(), stream, get_output_mr());
     externalizeRowNumberCandidates(std::move(wide), stream);
     restored = CudfBulkPackedRestore{};
     spillSequentialDensePrefixDeviceState(stream, false);
@@ -2859,8 +2787,7 @@ CudfTopNRowNumber::computeNextPartitionedRowNumberOutput() {
     auto stream = cudfGlobalStreamPool().get_stream();
     spillSequentialDensePrefixDeviceState(stream, true);
     VELOX_CHECK_EQ(partitionedDeviceBytes_, 0);
-    VELOX_CHECK_EQ(
-        sequentialDenseConvertedBytes_, sequentialDensePrefixBytes_);
+    VELOX_CHECK_EQ(sequentialDenseConvertedBytes_, sequentialDensePrefixBytes_);
     LOG(WARNING) << "CudfTopNRowNumber node=" << diagnosticNodeId_
                  << " completed bounded sequential dense prefix drain"
                  << " rows=" << sequentialDenseConvertedRows_
@@ -2890,8 +2817,7 @@ CudfTopNRowNumber::computeNextPartitionedRowNumberOutput() {
       }
       if (sequentialUniqueProbeBucket_ ==
           sequentialUniqueKeyPartitions_.size()) {
-        sequentialUniqueConfirmed_ =
-            sequentialDuplicateKeyTables_.empty();
+        sequentialUniqueConfirmed_ = sequentialDuplicateKeyTables_.empty();
         sequentialUniqueProbeComplete_ = true;
         break;
       }
@@ -2908,14 +2834,12 @@ CudfTopNRowNumber::computeNextPartitionedRowNumberOutput() {
         bucketBytes += chunk.dataBytes;
         bucketRows += chunk.rows;
       }
-      const auto probeWorkspaceBytes =
-          bucketBytes >
+      const auto probeWorkspaceBytes = bucketBytes >
               (std::numeric_limits<uint64_t>::max() - kProbeFixedWorkspace) /
                   kProbeCopies
           ? std::numeric_limits<uint64_t>::max()
           : std::max<uint64_t>(
-                1ULL << 30,
-                bucketBytes * kProbeCopies + kProbeFixedWorkspace);
+                1ULL << 30, bucketBytes * kProbeCopies + kProbeFixedWorkspace);
       sequentialUniqueProbePeakWorkspaceBytes_ = std::max(
           sequentialUniqueProbePeakWorkspaceBytes_, probeWorkspaceBytes);
       auto attempt = deviceWorkspace_.tryAcquire(
@@ -2946,8 +2870,8 @@ CudfTopNRowNumber::computeNextPartitionedRowNumberOutput() {
         prepared.dataBytes = chunk.dataBytes;
         prepared.keepAlive = keyOwner;
         prepared.materializeIntoPinned =
-            [keyOwner = std::move(keyOwner), bytes = chunk.dataBytes](
-                uint8_t* destination) {
+            [keyOwner = std::move(keyOwner),
+             bytes = chunk.dataBytes](uint8_t* destination) {
               VELOX_CHECK(
                   bytes == 0 || destination != nullptr,
                   "Sequential TopN key restore has no destination");
@@ -2965,8 +2889,7 @@ CudfTopNRowNumber::computeNextPartitionedRowNumberOutput() {
       VELOX_CHECK(!restoredKeys.tables().empty());
       auto mergedKeys =
           cudf::concatenate(restoredKeys.tables(), probeStream, probeMr);
-      std::vector<cudf::size_type> keyColumns(
-          mergedKeys->num_columns());
+      std::vector<cudf::size_type> keyColumns(mergedKeys->num_columns());
       std::iota(keyColumns.begin(), keyColumns.end(), 0);
       auto distinctKeys = cudf::distinct(
           mergedKeys->view(),
@@ -3007,9 +2930,7 @@ CudfTopNRowNumber::computeNextPartitionedRowNumberOutput() {
           duplicateKeys = std::move(distinctKeys);
         } else {
           cudf::filtered_join singletonFilter(
-              singletonKeys->view(),
-              cudf::null_equality::EQUAL,
-              probeStream);
+              singletonKeys->view(), cudf::null_equality::EQUAL, probeStream);
           auto duplicateIndices = singletonFilter.anti_join(
               distinctKeys->view(), probeStream, get_temp_mr());
           auto duplicateSpan =
@@ -3040,8 +2961,7 @@ CudfTopNRowNumber::computeNextPartitionedRowNumberOutput() {
       addRuntimeStat(
           "topNSequentialKeyPinnedBounceBytes",
           RuntimeCounter(
-              keyRestoreStats.pinnedBounceBytes,
-              RuntimeCounter::Unit::kBytes));
+              keyRestoreStats.pinnedBounceBytes, RuntimeCounter::Unit::kBytes));
       addRuntimeStat(
           "topNSequentialKeyPageableDirectBytes",
           RuntimeCounter(
@@ -3058,8 +2978,7 @@ CudfTopNRowNumber::computeNextPartitionedRowNumberOutput() {
               keyRestoreStats.copyStreamSynchronizeMicros * 1'000,
               RuntimeCounter::Unit::kNanos));
       ++sequentialUniqueProbeBucket_;
-      if (!bucketUnique &&
-          !topNSequentialSparseDuplicatePathEnabled()) {
+      if (!bucketUnique && !topNSequentialSparseDuplicatePathEnabled()) {
         sequentialUniqueConfirmed_ = false;
         sequentialUniqueProbeComplete_ = true;
       }
@@ -3080,10 +2999,8 @@ CudfTopNRowNumber::computeNextPartitionedRowNumberOutput() {
           RuntimeCounter(sequentialUniqueKeyRows_));
     }
 
-    const auto sparseMaxCandidatePct =
-        topNSequentialSparseMaxCandidatePct();
-    const bool hasProvenDuplicateKeys =
-        !sequentialDuplicateKeyTables_.empty();
+    const auto sparseMaxCandidatePct = topNSequentialSparseMaxCandidatePct();
+    const bool hasProvenDuplicateKeys = !sequentialDuplicateKeyTables_.empty();
     const bool sparseCandidateRatioAccepted =
         static_cast<unsigned __int128>(
             sequentialProvenDuplicateCandidateRows_) *
@@ -3100,8 +3017,8 @@ CudfTopNRowNumber::computeNextPartitionedRowNumberOutput() {
     }
 
     if (!sequentialUniqueConfirmed_ &&
-        topNSequentialSparseDuplicatePathEnabled() &&
-        hasProvenDuplicateKeys && sparseCandidateRatioAccepted) {
+        topNSequentialSparseDuplicatePathEnabled() && hasProvenDuplicateKeys &&
+        sparseCandidateRatioAccepted) {
       std::vector<cudf::table_view> duplicateKeyViews;
       duplicateKeyViews.reserve(sequentialDuplicateKeyTables_.size());
       for (const auto& duplicateKeys : sequentialDuplicateKeyTables_) {
@@ -3110,8 +3027,7 @@ CudfTopNRowNumber::computeNextPartitionedRowNumberOutput() {
       auto sparseStream = sequentialSparseStream_->view();
       sequentialDuplicateKeys_ = duplicateKeyViews.size() == 1
           ? std::move(sequentialDuplicateKeyTables_.front())
-          : cudf::concatenate(
-                duplicateKeyViews, sparseStream, get_output_mr());
+          : cudf::concatenate(duplicateKeyViews, sparseStream, get_output_mr());
       sequentialDuplicateKeyTables_.clear();
       VELOX_CHECK_EQ(
           sequentialDuplicateKeys_->num_rows(),
@@ -3137,8 +3053,7 @@ CudfTopNRowNumber::computeNextPartitionedRowNumberOutput() {
           "topNSequentialSparseClassifiedRows",
           RuntimeCounter(sequentialUniqueKeyRows_));
     } else if (!sequentialUniqueConfirmed_) {
-      sequentialDenseRawRewrite_ =
-          topNSequentialDenseRawRewriteEnabled();
+      sequentialDenseRawRewrite_ = topNSequentialDenseRawRewriteEnabled();
       if (hasProvenDuplicateKeys && !sparseCandidateRatioAccepted) {
         addRuntimeStat(
             "topNSequentialSparseDenseFallbackRows",
@@ -3162,8 +3077,8 @@ CudfTopNRowNumber::computeNextPartitionedRowNumberOutput() {
       // untouched wide chunks so the existing oversized-bucket recursion
       // re-hashes the complete input before any per-bucket exact reduction.
       auto& fallback = partitionedRowNumberHost_.front();
-      for (size_t bucket = 1;
-           bucket < partitionedRowNumberHost_.size(); ++bucket) {
+      for (size_t bucket = 1; bucket < partitionedRowNumberHost_.size();
+           ++bucket) {
         auto& source = partitionedRowNumberHost_[bucket];
         fallback.insert(
             fallback.end(),
@@ -3178,18 +3093,15 @@ CudfTopNRowNumber::computeNextPartitionedRowNumberOutput() {
       sequentialUniqueMode_ = false;
     }
     LOG(WARNING) << "CudfTopNRowNumber node=" << diagnosticNodeId_
-                 << " sequential unique proof rows="
-                 << sequentialUniqueKeyRows_
+                 << " sequential unique proof rows=" << sequentialUniqueKeyRows_
                  << " probedRows=" << sequentialUniqueProbedRows_
                  << " keyBytes=" << sequentialUniqueKeyBytes_
                  << " probedDistinctRows="
                  << sequentialUniqueProbedDistinctRows_
-                 << " duplicateKeyRows="
-                 << sequentialDuplicateKeyRows_
+                 << " duplicateKeyRows=" << sequentialDuplicateKeyRows_
                  << " provenDuplicateCandidateRows="
                  << sequentialProvenDuplicateCandidateRows_
-                 << " sparseMaxCandidatePct="
-                 << sparseMaxCandidatePct
+                 << " sparseMaxCandidatePct=" << sparseMaxCandidatePct
                  << " unique=" << sequentialUniqueConfirmed_
                  << " sparse=" << sequentialSparseMode_
                  << " denseRawRewrite=" << sequentialDenseRawRewrite_
@@ -3223,8 +3135,8 @@ CudfTopNRowNumber::computeNextPartitionedRowNumberOutput() {
       const auto totalRows = pendingPartitionedDeviceOutput_->num_rows();
       VELOX_CHECK_LT(pendingPartitionedDeviceOutputOffset_, totalRows);
       const auto bytesPerRow = std::max<uint64_t>(
-          1, (pendingPartitionedDeviceOutputBytes_ + totalRows - 1) /
-              totalRows);
+          1,
+          (pendingPartitionedDeviceOutputBytes_ + totalRows - 1) / totalRows);
       const auto remainingRows =
           totalRows - pendingPartitionedDeviceOutputOffset_;
       // Transfer the finalized bucket without a copy only when it already
@@ -3239,8 +3151,8 @@ CudfTopNRowNumber::computeNextPartitionedRowNumberOutput() {
           pendingPartitionedDeviceOutputOffset_ == 0 &&
           pendingPartitionedDeviceOutputBytes_ <= outputChunkBytes_ &&
           totalRows <= maxOutputRows_;
-      const auto byteBoundRows = std::max<uint64_t>(
-          1, outputChunkBytes_ / bytesPerRow);
+      const auto byteBoundRows =
+          std::max<uint64_t>(1, outputChunkBytes_ / bytesPerRow);
       const auto rows = wholeBucketHandoff
           ? static_cast<uint64_t>(totalRows)
           : static_cast<uint64_t>(std::min<uint64_t>(
@@ -3248,16 +3160,15 @@ CudfTopNRowNumber::computeNextPartitionedRowNumberOutput() {
                 std::min<uint64_t>(maxOutputRows_, byteBoundRows)));
       // A whole-bucket ownership handoff is zero-copy.
       if (pendingPartitionedDeviceOutputOffset_ != 0 || rows != totalRows) {
-        const auto sliceBytes = rows >
-                std::numeric_limits<uint64_t>::max() / bytesPerRow
+        const auto sliceBytes =
+            rows > std::numeric_limits<uint64_t>::max() / bytesPerRow
             ? pendingPartitionedDeviceOutputBytes_
             : std::min<uint64_t>(
                   pendingPartitionedDeviceOutputBytes_, bytesPerRow * rows);
         constexpr uint64_t kOutputCopyFixedWorkspace = 256ULL << 20;
         outputWorkspaceBytes =
-            sliceBytes >
-                (std::numeric_limits<uint64_t>::max() -
-                 kOutputCopyFixedWorkspace) /
+            sliceBytes > (std::numeric_limits<uint64_t>::max() -
+                          kOutputCopyFixedWorkspace) /
                     2
             ? std::numeric_limits<uint64_t>::max()
             : sliceBytes * 2 + kOutputCopyFixedWorkspace;
@@ -3268,9 +3179,8 @@ CudfTopNRowNumber::computeNextPartitionedRowNumberOutput() {
           pendingPartitionedOutputChunks_.front().dataBytes;
       constexpr uint64_t kOutputRestoreFixedWorkspace = 256ULL << 20;
       outputWorkspaceBytes =
-          packedBytes >
-              (std::numeric_limits<uint64_t>::max() -
-               kOutputRestoreFixedWorkspace) /
+          packedBytes > (std::numeric_limits<uint64_t>::max() -
+                         kOutputRestoreFixedWorkspace) /
                   2
           ? std::numeric_limits<uint64_t>::max()
           : packedBytes * 2 + kOutputRestoreFixedWorkspace;
@@ -3279,8 +3189,7 @@ CudfTopNRowNumber::computeNextPartitionedRowNumberOutput() {
     std::optional<DeviceMemoryWorkspaceReservation> outputWorkspaceAdmission;
     if (outputWorkspaceBytes > 0) {
       const auto outputMinHeadroom = std::min<uint64_t>(
-          CudfConfig::getInstance().deviceMemoryMinHeadroomBytes,
-          1ULL << 30);
+          CudfConfig::getInstance().deviceMemoryMinHeadroomBytes, 1ULL << 30);
       auto attempt = deviceWorkspace_.tryAcquire(
           customPool(kCudfDeviceMemoryResourceTag),
           this,
@@ -3293,9 +3202,7 @@ CudfTopNRowNumber::computeNextPartitionedRowNumberOutput() {
         return {PartitionedOutputStatus::kBlocked, nullptr};
       }
     }
-    return {
-        PartitionedOutputStatus::kOutput,
-        takeNextPartitionedOutputBatch()};
+    return {PartitionedOutputStatus::kOutput, takeNextPartitionedOutputBatch()};
   }
 
   // The exact duplicate-key filter is typically tiny relative to the wide
@@ -3345,18 +3252,15 @@ CudfTopNRowNumber::computeNextPartitionedRowNumberOutput() {
                    << " duplicateKeyRows=" << sequentialDuplicateKeyRows_
                    << " duplicateCandidateRows="
                    << sequentialSparseCandidateRows_
-                   << " singletonOutputRows="
-                   << sequentialSingletonOutputRows_
-                   << " remainingCandidateHostBytes="
-                   << partitionedHostBytes_
+                   << " singletonOutputRows=" << sequentialSingletonOutputRows_
+                   << " remainingCandidateHostBytes=" << partitionedHostBytes_
                    << " remainingCandidateDeviceBytes="
                    << partitionedDeviceBytes_;
       sequentialUniqueKeyRows_ = 0;
       break;
     }
 
-    auto& wideChunks =
-        sequentialWideHost_[sequentialWideDrainBucket_];
+    auto& wideChunks = sequentialWideHost_[sequentialWideDrainBucket_];
     VELOX_CHECK(!wideChunks.empty());
     const auto packedBytes = wideChunks.back().dataBytes;
     const auto workspaceBytes = estimateFinalizeWorkspaceBytes(packedBytes);
@@ -3391,14 +3295,12 @@ CudfTopNRowNumber::computeNextPartitionedRowNumberOutput() {
     VELOX_CHECK_NOT_NULL(sequentialDuplicateFilter_);
     const auto keyView = wideView.select(partitionKeys_);
     auto tempMr = get_temp_mr();
-    auto duplicateIndices = sequentialDuplicateFilter_->semi_join(
-        keyView, sparseStream, tempMr);
-    auto singletonIndices = sequentialDuplicateFilter_->anti_join(
-        keyView, sparseStream, tempMr);
-    const auto duplicateRows =
-        static_cast<uint64_t>(duplicateIndices->size());
-    const auto singletonRows =
-        static_cast<uint64_t>(singletonIndices->size());
+    auto duplicateIndices =
+        sequentialDuplicateFilter_->semi_join(keyView, sparseStream, tempMr);
+    auto singletonIndices =
+        sequentialDuplicateFilter_->anti_join(keyView, sparseStream, tempMr);
+    const auto duplicateRows = static_cast<uint64_t>(duplicateIndices->size());
+    const auto singletonRows = static_cast<uint64_t>(singletonIndices->size());
     VELOX_CHECK_LE(
         duplicateRows,
         wideRows,
@@ -3474,32 +3376,23 @@ CudfTopNRowNumber::computeNextPartitionedRowNumberOutput() {
         RuntimeCounter(
             sparseRestoreStats.copyStreamSynchronizeMicros * 1'000,
             RuntimeCounter::Unit::kNanos));
-    addRuntimeStat(
-        "topNSequentialSparseInputRows", RuntimeCounter(wideRows));
+    addRuntimeStat("topNSequentialSparseInputRows", RuntimeCounter(wideRows));
 
     if (!singletonOutput) {
       workspaceAdmission.reset();
       continue;
     }
     if (generateRowNumber_) {
-      auto one = cudf::numeric_scalar<int64_t>(
-          1, true, sparseStream, sparseMr);
+      auto one = cudf::numeric_scalar<int64_t>(1, true, sparseStream, sparseMr);
       auto rowNumber = cudf::make_column_from_scalar(
-          one,
-          singletonOutput->num_rows(),
-          sparseStream,
-          sparseMr);
+          one, singletonOutput->num_rows(), sparseStream, sparseMr);
       auto columns = singletonOutput->release();
       columns.push_back(std::move(rowNumber));
-      singletonOutput =
-          std::make_unique<cudf::table>(std::move(columns));
+      singletonOutput = std::make_unique<cudf::table>(std::move(columns));
     }
-    stagePartitionedOutput(
-        std::move(singletonOutput), sparseStream, sparseMr);
+    stagePartitionedOutput(std::move(singletonOutput), sparseStream, sparseMr);
     workspaceAdmission.reset();
-    return {
-        PartitionedOutputStatus::kOutput,
-        takeNextPartitionedOutputBatch()};
+    return {PartitionedOutputStatus::kOutput, takeNextPartitionedOutputBatch()};
   }
 
   auto stream = cudfGlobalStreamPool().get_stream();
@@ -3512,8 +3405,7 @@ CudfTopNRowNumber::computeNextPartitionedRowNumberOutput() {
     // blocking behind an arbitrary large numeric bucket.
     size_t bucket = partitionedRowNumberHost_.size();
     uint64_t bucketBytes = std::numeric_limits<uint64_t>::max();
-    for (size_t candidate = 0;
-         candidate < partitionedRowNumberHost_.size();
+    for (size_t candidate = 0; candidate < partitionedRowNumberHost_.size();
          ++candidate) {
       const auto candidateBytes = partitionBytes(candidate);
       if (candidateBytes > 0 && candidateBytes < bucketBytes) {
@@ -3531,8 +3423,8 @@ CudfTopNRowNumber::computeNextPartitionedRowNumberOutput() {
     // bucket and then copying that larger table back into bounded output
     // slices. Storage still uses the fixed bucket/file fanout, so this avoids
     // creating hundreds of spill files for a large Job-144 input.
-    const bool sequentialDirectChunk =
-        sequentialUniqueMode_ && sequentialUniqueConfirmed_ &&
+    const bool sequentialDirectChunk = sequentialUniqueMode_ &&
+        sequentialUniqueConfirmed_ &&
         topNSequentialDirectChunkOutputEnabled() &&
         !partitionedRowNumberHost_[bucket].empty();
     const auto finalizeBytes = sequentialDirectChunk
@@ -3586,8 +3478,7 @@ CudfTopNRowNumber::computeNextPartitionedRowNumberOutput() {
     const auto prepareChunk = [&](HostPackedChunk chunk) {
       const auto hostBytes = chunk.dataBytes;
       restoredRows += chunk.rows;
-      hostChunks.push_back(
-          prepareHostChunkForBulkRestore(std::move(chunk)));
+      hostChunks.push_back(prepareHostChunkForBulkRestore(std::move(chunk)));
       VELOX_CHECK_GE(partitionedHostBytes_, hostBytes);
       partitionedHostBytes_ -= hostBytes;
       restoredBytes += hostBytes;
@@ -3639,8 +3530,7 @@ CudfTopNRowNumber::computeNextPartitionedRowNumberOutput() {
     auto merged = cudf::concatenate(inputTables, stream, mr);
     const auto residentDeviceBytes = partitionedRowNumberDeviceBytes_[bucket];
     const auto concatenateEnd = std::chrono::steady_clock::now();
-    auto accumulator =
-        sequentialUniqueMode_ && sequentialUniqueConfirmed_
+    auto accumulator = sequentialUniqueMode_ && sequentialUniqueConfirmed_
         ? std::move(merged)
         : reduceOwnedCandidates(std::move(merged), stream, mr);
     const auto reduceEnd = std::chrono::steady_clock::now();
@@ -3654,8 +3544,7 @@ CudfTopNRowNumber::computeNextPartitionedRowNumberOutput() {
             RuntimeCounter(restoredBytes, RuntimeCounter::Unit::kBytes));
         addRuntimeStat(
             "topNSequentialDirectChunkRows", RuntimeCounter(restoredRows));
-        addRuntimeStat(
-            "topNSequentialDirectChunkBatches", RuntimeCounter(1));
+        addRuntimeStat("topNSequentialDirectChunkBatches", RuntimeCounter(1));
       }
     }
     const auto restoreMicros =
@@ -3670,33 +3559,24 @@ CudfTopNRowNumber::computeNextPartitionedRowNumberOutput() {
         std::chrono::duration_cast<std::chrono::microseconds>(
             reduceEnd - concatenateEnd)
             .count();
-    LOG(WARNING) << "CudfTopNRowNumber node=" << diagnosticNodeId_
-                 << " finalized host bucket=" << bucket
-                 << " inputChunks=" << inputChunks
-                 << " inputRows=" << restoredRows
-                 << " inputBytes=" << restoredBytes
-                 << " outputRows=" << accumulator->num_rows()
-                 << " pinnedBounceBytes="
-                 << restoreStats.pinnedBounceBytes
-                 << " pageableDirectBytes="
-                 << restoreStats.pageableDirectBytes
-                 << " pinnedBounceCopies="
-                 << restoreStats.pinnedBounceCopies
-                 << " bounceHostStageUs="
-                 << restoreStats.hostStageMicros
-                 << " bounceReuseWaitUs="
-                 << restoreStats.bounceReuseWaitMicros
-                 << " copyStreamSynchronizeUs="
-                 << restoreStats.copyStreamSynchronizeMicros
-                 << " parallelHostStageGroups="
-                 << restoreStats.parallelHostStageGroups
-                 << " parallelHostStageChunks="
-                 << restoreStats.parallelHostStageChunks
-                 << " pinnedHostThreadLimit="
-                 << restoreStats.pinnedHostThreadLimit
-                 << " restoreUs=" << restoreMicros
-                 << " concatenateUs=" << concatenateMicros
-                 << " reduceUs=" << reduceMicros;
+    LOG(WARNING)
+        << "CudfTopNRowNumber node=" << diagnosticNodeId_
+        << " finalized host bucket=" << bucket << " inputChunks=" << inputChunks
+        << " inputRows=" << restoredRows << " inputBytes=" << restoredBytes
+        << " outputRows=" << accumulator->num_rows()
+        << " pinnedBounceBytes=" << restoreStats.pinnedBounceBytes
+        << " pageableDirectBytes=" << restoreStats.pageableDirectBytes
+        << " pinnedBounceCopies=" << restoreStats.pinnedBounceCopies
+        << " bounceHostStageUs=" << restoreStats.hostStageMicros
+        << " bounceReuseWaitUs=" << restoreStats.bounceReuseWaitMicros
+        << " copyStreamSynchronizeUs="
+        << restoreStats.copyStreamSynchronizeMicros
+        << " parallelHostStageGroups=" << restoreStats.parallelHostStageGroups
+        << " parallelHostStageChunks=" << restoreStats.parallelHostStageChunks
+        << " pinnedHostThreadLimit=" << restoreStats.pinnedHostThreadLimit
+        << " restoreUs=" << restoreMicros
+        << " concatenateUs=" << concatenateMicros
+        << " reduceUs=" << reduceMicros;
     addRuntimeStat(
         "topNFinalizeInputBytes",
         RuntimeCounter(restoredBytes, RuntimeCounter::Unit::kBytes));
@@ -3713,13 +3593,11 @@ CudfTopNRowNumber::computeNextPartitionedRowNumberOutput() {
     addRuntimeStat(
         "topNPinnedBounceBytes",
         RuntimeCounter(
-            restoreStats.pinnedBounceBytes,
-            RuntimeCounter::Unit::kBytes));
+            restoreStats.pinnedBounceBytes, RuntimeCounter::Unit::kBytes));
     addRuntimeStat(
         "topNPageableDirectRestoreBytes",
         RuntimeCounter(
-            restoreStats.pageableDirectBytes,
-            RuntimeCounter::Unit::kBytes));
+            restoreStats.pageableDirectBytes, RuntimeCounter::Unit::kBytes));
     addRuntimeStat(
         "topNPinnedBounceCopies",
         RuntimeCounter(restoreStats.pinnedBounceCopies));
@@ -3769,8 +3647,8 @@ CudfTopNRowNumber::computeNextPartitionedRowNumberOutput() {
     // producer -> output-stream dependency; this deferred owner protects only
     // the inputs read by the producer kernels.
     cudaEvent_t finalizeComplete{nullptr};
-    CUDF_CUDA_TRY(cudaEventCreateWithFlags(
-        &finalizeComplete, cudaEventDisableTiming));
+    CUDF_CUDA_TRY(
+        cudaEventCreateWithFlags(&finalizeComplete, cudaEventDisableTiming));
     try {
       CUDF_CUDA_TRY(cudaEventRecord(finalizeComplete, stream.value()));
       deferredFinalizeOwnerships_.emplace_back(
@@ -3794,9 +3672,7 @@ CudfTopNRowNumber::computeNextPartitionedRowNumberOutput() {
     // was consumed double-counted the resident bucket and starved unrelated
     // restores on the same executor.
     workspaceAdmission.reset();
-    return {
-        PartitionedOutputStatus::kOutput,
-        takeNextPartitionedOutputBatch()};
+    return {PartitionedOutputStatus::kOutput, takeNextPartitionedOutputBatch()};
   }
   return {PartitionedOutputStatus::kFinished, nullptr};
 }
@@ -3811,8 +3687,7 @@ uint64_t CudfTopNRowNumber::estimateFinalizeWorkspaceBytes(
     return std::numeric_limits<uint64_t>::max();
   }
   return std::max<uint64_t>(
-      1ULL << 30,
-      bucketBytes * kWorkspaceCopies + kFixedWorkspaceBytes);
+      1ULL << 30, bucketBytes * kWorkspaceCopies + kFixedWorkspaceBytes);
 }
 
 void CudfTopNRowNumber::stagePartitionedOutput(
@@ -3826,10 +3701,10 @@ void CudfTopNRowNumber::stagePartitionedOutput(
   auto outputVector = std::make_shared<CudfVector>(
       pool(), outputType_, totalRows, std::move(output), stream);
   const auto outputBytes = outputVector->estimateFlatSize();
-  const auto bytesPerRow = std::max<uint64_t>(
-      1, (outputBytes + totalRows - 1) / totalRows);
-  const auto byteBoundRows = std::max<uint64_t>(
-      1, outputChunkBytes_ / bytesPerRow);
+  const auto bytesPerRow =
+      std::max<uint64_t>(1, (outputBytes + totalRows - 1) / totalRows);
+  const auto byteBoundRows =
+      std::max<uint64_t>(1, outputChunkBytes_ / bytesPerRow);
   const auto batchRows = static_cast<cudf::size_type>(
       std::min<uint64_t>(maxOutputRows_, byteBoundRows));
 
@@ -3948,17 +3823,17 @@ CudfVectorPtr CudfTopNRowNumber::takeNextPartitionedOutputBatch() {
     const auto totalRows = pendingPartitionedDeviceOutput_->num_rows();
     VELOX_CHECK_LT(pendingPartitionedDeviceOutputOffset_, totalRows);
     const auto bytesPerRow = std::max<uint64_t>(
-        1, (pendingPartitionedDeviceOutputBytes_ + totalRows - 1) /
-            totalRows);
+        1, (pendingPartitionedDeviceOutputBytes_ + totalRows - 1) / totalRows);
     const auto remainingRows =
         totalRows - pendingPartitionedDeviceOutputOffset_;
     const bool wholeBucketHandoff =
         pendingPartitionedDeviceOutputOffset_ == 0 &&
         pendingPartitionedDeviceOutputBytes_ <= outputChunkBytes_ &&
         totalRows <= maxOutputRows_;
-    const auto byteBoundRows = std::max<uint64_t>(
-        1, outputChunkBytes_ / bytesPerRow);
-    const auto rows = static_cast<cudf::size_type>(wholeBucketHandoff
+    const auto byteBoundRows =
+        std::max<uint64_t>(1, outputChunkBytes_ / bytesPerRow);
+    const auto rows = static_cast<cudf::size_type>(
+        wholeBucketHandoff
             ? totalRows
             : std::min<uint64_t>(
                   remainingRows,
@@ -3994,13 +3869,12 @@ CudfVectorPtr CudfTopNRowNumber::takeNextPartitionedOutputBatch() {
       // CUDA event rather than synchronizing here: a per-bucket synchronize
       // turns the output pipeline into a serial restore/copy/consume loop.
       cudaEvent_t completionEvent{nullptr};
-      CUDF_CUDA_TRY(cudaEventCreateWithFlags(
-          &completionEvent, cudaEventDisableTiming));
+      CUDF_CUDA_TRY(
+          cudaEventCreateWithFlags(&completionEvent, cudaEventDisableTiming));
       try {
         CUDF_CUDA_TRY(cudaEventRecord(completionEvent, stream.value()));
         deferredDeviceOutputs_.emplace_back(
-            std::move(pendingPartitionedDeviceOutput_),
-            completionEvent);
+            std::move(pendingPartitionedDeviceOutput_), completionEvent);
       } catch (...) {
         cudaEventDestroy(completionEvent);
         throw;
@@ -4018,14 +3892,9 @@ CudfVectorPtr CudfTopNRowNumber::takeNextPartitionedOutputBatch() {
   pendingPartitionedOutputChunks_.pop_front();
   const auto rows = chunk.rows;
   auto stream = cudfGlobalStreamPool().get_stream();
-  auto packed =
-      restoreHostChunk(std::move(chunk), stream, get_output_mr());
+  auto packed = restoreHostChunk(std::move(chunk), stream, get_output_mr());
   return std::make_shared<CudfVector>(
-      pool(),
-      outputType_,
-      rows,
-      std::move(packed),
-      stream);
+      pool(), outputType_, rows, std::move(packed), stream);
 }
 
 void CudfTopNRowNumber::reclaimCompletedDeviceOutputs() {
@@ -4132,19 +4001,17 @@ void CudfTopNRowNumber::ensureSpillDirectory() {
     return;
   }
   namespace fs = std::filesystem;
-  const auto& taskSpillRoot =
-      operatorCtx_->task()->getOrCreateSpillDirectory();
+  const auto& taskSpillRoot = operatorCtx_->task()->getOrCreateSpillDirectory();
   VELOX_CHECK(
       !taskSpillRoot.empty(),
       "CudfTopNRowNumber requires an explicit Task spill directory");
   const auto sequence = spillDirectorySequence.fetch_add(1);
-  spillDirectory_ =
-      (fs::path(taskSpillRoot) /
-       fmt::format(
-           "velox-cudf-topn-spill-{}-{}",
-           static_cast<int64_t>(::getpid()),
-           sequence))
-          .string();
+  spillDirectory_ = (fs::path(taskSpillRoot) /
+                     fmt::format(
+                         "velox-cudf-topn-spill-{}-{}",
+                         static_cast<int64_t>(::getpid()),
+                         sequence))
+                        .string();
   fs::create_directories(spillDirectory_);
 }
 
@@ -4207,22 +4074,17 @@ CudfVectorPtr CudfTopNRowNumber::computeLimitOneRowNumber(
         mr);
   } else if (
       !sortKeys_.empty() &&
-      std::all_of(
-          sortKeys_.begin(),
-          sortKeys_.end(),
-          [&](auto key) {
-            const auto index =
-                std::find(sortKeys_.begin(), sortKeys_.end(), key) -
-                sortKeys_.begin();
-            const auto order = columnOrders_[partitionKeys_.size() + index];
-            const auto nullOrder =
-                nullOrders_[partitionKeys_.size() + index];
-            // Spark NULLS LAST maps to AFTER for ascending and BEFORE for
-            // descending in the cuDF ordering representation used here.
-            return order == cudf::order::ASCENDING
-                ? nullOrder == cudf::null_order::AFTER
-                : nullOrder == cudf::null_order::BEFORE;
-          })) {
+      std::all_of(sortKeys_.begin(), sortKeys_.end(), [&](auto key) {
+        const auto index = std::find(sortKeys_.begin(), sortKeys_.end(), key) -
+            sortKeys_.begin();
+        const auto order = columnOrders_[partitionKeys_.size() + index];
+        const auto nullOrder = nullOrders_[partitionKeys_.size() + index];
+        // Spark NULLS LAST maps to AFTER for ascending and BEFORE for
+        // descending in the cuDF ordering representation used here.
+        return order == cudf::order::ASCENDING
+            ? nullOrder == cudf::null_order::AFTER
+            : nullOrder == cudf::null_order::BEFORE;
+      })) {
     // A full stable sort is unnecessary for ROW_NUMBER=1. Reduce
     // lexicographically: keep the min/max rows for the first ordering key,
     // then repeat over the surviving ties for each later key. Finally choose
@@ -4263,8 +4125,7 @@ CudfVectorPtr CudfTopNRowNumber::computeLimitOneRowNumber(
       pool(), outputType_, result->num_rows(), std::move(result), stream);
 }
 
-std::unique_ptr<cudf::table>
-CudfTopNRowNumber::computeGroupedLexicographicTop(
+std::unique_ptr<cudf::table> CudfTopNRowNumber::computeGroupedLexicographicTop(
     cudf::table_view input,
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr,
@@ -4340,8 +4201,7 @@ CudfTopNRowNumber::computeGroupedLexicographicTop(
   // The final row set is gathered from the input exactly once.
   const auto keyInput = input.select(allKeyIndices_);
   std::vector<cudf::size_type> narrowPartitionKeys(partitionKeys_.size());
-  std::iota(
-      narrowPartitionKeys.begin(), narrowPartitionKeys.end(), 0);
+  std::iota(narrowPartitionKeys.begin(), narrowPartitionKeys.end(), 0);
 
   if (!preserveTies && topNLatePayloadSortEnabled()) {
     auto sortedIndices = cudf::stable_sorted_order(
@@ -4366,8 +4226,7 @@ CudfTopNRowNumber::computeGroupedLexicographicTop(
         stream,
         mr);
     auto distinctColumns = distinctCandidates->release();
-    VELOX_CHECK_EQ(
-        distinctColumns.size(), narrowPartitionKeys.size() + 1);
+    VELOX_CHECK_EQ(distinctColumns.size(), narrowPartitionKeys.size() + 1);
     auto finalIndices = std::move(distinctColumns.back());
     return cudf::gather(
         input,
@@ -4403,8 +4262,7 @@ CudfTopNRowNumber::computeGroupedLexicographicTop(
     cudf::groupby::groupby grouper(
         current.select(narrowPartitionKeys), cudf::null_policy::INCLUDE);
     std::vector<cudf::groupby::aggregation_request> requests(1);
-    requests[0].values =
-        current.column(partitionKeys_.size() + sortIndex);
+    requests[0].values = current.column(partitionKeys_.size() + sortIndex);
     if (columnOrders_[partitionKeys_.size() + sortIndex] ==
         cudf::order::ASCENDING) {
       requests[0].aggregations.push_back(
@@ -4467,8 +4325,7 @@ CudfTopNRowNumber::computeGroupedLexicographicTop(
         stream,
         mr);
     auto distinctColumns = distinctCandidates->release();
-    VELOX_CHECK_EQ(
-        distinctColumns.size(), narrowPartitionKeys.size() + 1);
+    VELOX_CHECK_EQ(distinctColumns.size(), narrowPartitionKeys.size() + 1);
     candidateIndices = std::move(distinctColumns.back());
   }
 

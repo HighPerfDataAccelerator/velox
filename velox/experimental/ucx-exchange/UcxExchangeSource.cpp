@@ -15,8 +15,8 @@
  */
 
 #include <algorithm>
-#include <cstring>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <string>
 #include <thread>
@@ -61,8 +61,8 @@ void retireRequest(
   // generations without growing for the lifetime of a long exchange.
   constexpr size_t kRetainedRequestWindow = 4;
   while (inFlight.size() > kRetainedRequestWindow) {
-    const auto completed = std::find_if(
-        inFlight.begin(), inFlight.end(), [](const auto& request) {
+    const auto completed =
+        std::find_if(inFlight.begin(), inFlight.end(), [](const auto& request) {
           return request == nullptr || request->isCompleted();
         });
     if (completed == inFlight.end()) {
@@ -172,9 +172,8 @@ std::size_t recvAdmissionMinHeadroom() {
                         .deviceMemoryMinHeadroomBytes;
   const auto progress = recvConsumerProgressBytes();
   const auto maximum = std::numeric_limits<std::size_t>::max();
-  return progress > maximum || base > maximum - progress
-      ? maximum
-      : base + progress;
+  return progress > maximum || base > maximum - progress ? maximum
+                                                         : base + progress;
 }
 
 constexpr auto kRecvWorkspaceProgressAge = std::chrono::seconds(2);
@@ -571,12 +570,10 @@ folly::F14FastMap<std::string, RuntimeMetric> UcxExchangeSource::metrics()
   map["ucxExchangeSource.numPackedColumns"] = metrics_.numPackedColumns_;
   map["ucxExchangeSource.totalBytes"] = metrics_.totalBytes_;
   map["ucxExchangeSource.hostStagedBytes"] = metrics_.hostStagedBytes_;
-  map["ucxExchangeSource.asyncHostCopyBytes"] =
-      metrics_.asyncHostCopyBytes_;
+  map["ucxExchangeSource.asyncHostCopyBytes"] = metrics_.asyncHostCopyBytes_;
   map["ucxExchangeSource.asyncHostCopyThrottledBytes"] =
       metrics_.asyncHostCopyThrottledBytes_;
-  map["ucxExchangeSource.hostCopySyncNanos"] =
-      metrics_.hostCopySyncNanos_;
+  map["ucxExchangeSource.hostCopySyncNanos"] = metrics_.hostCopySyncNanos_;
   map["ucxExchangeSource.rttPerRequest"] = metrics_.rttPerRequest_;
   return map;
 }
@@ -717,12 +714,9 @@ void UcxExchangeSource::sendCancel() {
   }
 
   auto cancel = std::make_shared<HandshakeMsg>();
-  cancel->destination =
-      partitionKey_.destination | kCancelDestinationFlag;
+  cancel->destination = partitionKey_.destination | kCancelDestinationFlag;
   strncpy(
-      cancel->taskId,
-      partitionKey_.taskId.c_str(),
-      sizeof(cancel->taskId) - 1);
+      cancel->taskId, partitionKey_.taskId.c_str(), sizeof(cancel->taskId) - 1);
   cancel->taskId[sizeof(cancel->taskId) - 1] = '\0';
   cancel->workerId = communicator->getWorkerId();
   VLOG(1) << "[UCX-CANCEL] send task=" << partitionKey_.taskId
@@ -796,8 +790,7 @@ void UcxExchangeSource::getMetadata() {
   // Each retained UCXX request needs a distinct receive address. An old
   // request can be replayed during endpoint wireup; sharing this allocation
   // with the current request would let the transport overwrite new metadata.
-  auto metadataReq =
-      std::make_shared<std::vector<uint8_t>>(kMaxMetaBufSize);
+  auto metadataReq = std::make_shared<std::vector<uint8_t>>(kMaxMetaBufSize);
   const auto expectedSequence = sequenceNumber_;
   uint64_t metadataTag = getMetadataTag(partitionKeyHash_, expectedSequence);
 
@@ -814,8 +807,7 @@ void UcxExchangeSource::getMetadata() {
       ucxx::Tag{metadataTag},
       ucxx::TagMaskFull,
       false,
-      [weak, expectedSequence](
-          ucs_status_t status, std::shared_ptr<void> arg) {
+      [weak, expectedSequence](ucs_status_t status, std::shared_ptr<void> arg) {
         auto metadata = std::static_pointer_cast<std::vector<uint8_t>>(arg);
         if (auto self = weak.lock()) {
           self->onMetadata(status, metadata, expectedSequence);
@@ -995,8 +987,7 @@ bool UcxExchangeSource::tryStartDataReceive(
   // the steady-state watermark, preserve one minimum consumer workspace. If
   // receives consume that last GiB, the Filter/TopN input which must dequeue
   // them cannot run and both sides wait forever despite a valid byte cap.
-  std::optional<
-      facebook::velox::cudf_velox::DeviceMemoryWorkspaceReservation>
+  std::optional<facebook::velox::cudf_velox::DeviceMemoryWorkspaceReservation>
       receiveWorkspace;
   if (!useHostStaging) {
     const auto now = std::chrono::steady_clock::now();
@@ -1020,12 +1011,10 @@ bool UcxExchangeSource::tryStartDataReceive(
       return false;
     }
     receiveWorkspace =
-        facebook::velox::cudf_velox::
-            tryAcquireBackgroundDeviceMemoryWorkspace(
-                ptr->metadata.dataSizeBytes,
-                receiveMinHeadroom,
-                facebook::velox::cudf_velox::DeviceMemoryWorkspacePriority::
-                    kInput);
+        facebook::velox::cudf_velox::tryAcquireBackgroundDeviceMemoryWorkspace(
+            ptr->metadata.dataSizeBytes,
+            receiveMinHeadroom,
+            facebook::velox::cudf_velox::DeviceMemoryWorkspacePriority::kInput);
     if (!receiveWorkspace.has_value()) {
       if (!receiveWorkspaceBlockedSince_.has_value()) {
         receiveWorkspaceBlockedSince_ = now;
@@ -1163,8 +1152,7 @@ bool UcxExchangeSource::tryStartDataReceive(
   // Only stage through host memory when the active UCX context has confirmed
   // that no CUDA transport is available; sm/tcp cannot write through a device
   // pointer safely in that configuration.
-  void* receiveBuffer =
-      useHostStaging ? nullptr : ptr->dataBuf->data();
+  void* receiveBuffer = useHostStaging ? nullptr : ptr->dataBuf->data();
   if (useHostStaging) {
     const auto receiveSize = static_cast<size_t>(ptr->metadata.dataSizeBytes);
     // Keep this allocation attached to the retained UCXX request for the
@@ -1175,10 +1163,9 @@ bool UcxExchangeSource::tryStartDataReceive(
     receiveBuffer = ptr->hostData.get();
   }
   VLOG(2) << toString() << " posting "
-          << (useHostStaging
-                  ? (ptr->hostDataPinned ? "pinned-host-staged"
-                                         : "pageable-host-staged")
-                  : "direct-device")
+          << (useHostStaging ? (ptr->hostDataPinned ? "pinned-host-staged"
+                                                    : "pageable-host-staged")
+                             : "direct-device")
           << " receive for " << ptr->metadata.dataSizeBytes << " bytes";
 
   const auto expectedSequence = sequenceNumber_;
@@ -1200,8 +1187,7 @@ bool UcxExchangeSource::tryStartDataReceive(
       ucxx::Tag{dataTag},
       ucxx::TagMaskFull,
       false,
-      [weak, expectedSequence](
-          ucs_status_t status, std::shared_ptr<void> arg) {
+      [weak, expectedSequence](ucs_status_t status, std::shared_ptr<void> arg) {
         if (auto self = weak.lock()) {
           self->onData(status, arg, expectedSequence);
         }
@@ -1225,8 +1211,9 @@ void UcxExchangeSource::onData(
     return;
   }
   if (expectedSequence != sequenceNumber_) {
-    VLOG(1) << toString() << " ignoring replayed data callback for seq="
-            << expectedSequence << ", currentSeq=" << sequenceNumber_;
+    VLOG(1) << toString()
+            << " ignoring replayed data callback for seq=" << expectedSequence
+            << ", currentSeq=" << sequenceNumber_;
     return;
   }
   // Guard against replayed callbacks from UCP wireup replay.
@@ -1263,14 +1250,12 @@ void UcxExchangeSource::onData(
     if (ptr->hostData != nullptr) {
       metrics_.hostStagedBytes_.addValue(ptr->metadata.dataSizeBytes);
       if (exchangeVariableWidthValidationEnabled()) {
-        LOG(WARNING) << "UCX receiver staged key="
-                     << partitionKey_.toString()
+        LOG(WARNING) << "UCX receiver staged key=" << partitionKey_.toString()
                      << " sequence=" << expectedSequence
                      << " bytes=" << ptr->metadata.dataSizeBytes
                      << " fingerprint=0x" << std::hex
                      << diagnosticBufferFingerprint(
-                            ptr->hostData.get(),
-                            ptr->metadata.dataSizeBytes)
+                            ptr->hostData.get(), ptr->metadata.dataSizeBytes)
                      << std::dec;
       }
       auto data = std::make_unique<PackedTableWithStream>(
@@ -1294,8 +1279,7 @@ void UcxExchangeSource::onData(
       const int64_t reservedReceiveBytes = reservedReceiveBytes_;
       enqueue(std::move(data), reservedReceiveBytes);
       reservedReceiveBytes_ = 0;
-      setStateIf(
-          ReceiverState::WaitingForData, ReceiverState::ReadyToReceive);
+      setStateIf(ReceiverState::WaitingForData, ReceiverState::ReadyToReceive);
       wakeCommunicator();
       return;
     }
@@ -1319,8 +1303,8 @@ void UcxExchangeSource::onData(
                    << " destination=" << partitionKey_.destination
                    << " sequence=" << expectedSequence
                    << " rows=" << tableView.num_rows()
-                   << " bytes=" << ptr->metadata.dataSizeBytes
-                   << " layout=" << cudf_velox::validateVariableWidthTableLayout(
+                   << " bytes=" << ptr->metadata.dataSizeBytes << " layout="
+                   << cudf_velox::validateVariableWidthTableLayout(
                           tableView, ptr->stream);
     }
     auto packedTable = std::make_unique<cudf::packed_table>(
@@ -1499,13 +1483,11 @@ void UcxExchangeSource::onIntraNodeData(IntraNodeTransferResult result) {
     return;
   }
 
-  const auto dataBytes = result.isHostBacked()
-      ? result.hostDataSize
-      : result.data->gpu_data->size();
+  const auto dataBytes = result.isHostBacked() ? result.hostDataSize
+                                               : result.data->gpu_data->size();
   VLOG(3) << toString()
           << " Intra-node transfer: received data for seq=" << sequenceNumber_
-          << " size=" << dataBytes
-          << " hostBacked=" << result.isHostBacked();
+          << " size=" << dataBytes << " hostBacked=" << result.isHostBacked();
 
   metrics_.numPackedColumns_.addValue(1);
   metrics_.totalBytes_.addValue(dataBytes);

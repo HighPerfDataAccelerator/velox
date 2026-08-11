@@ -2180,23 +2180,20 @@ TEST_F(CudfFilterProjectTest, coalesceColumnWithLiteral) {
 }
 
 TEST_F(CudfFilterProjectTest, coalesceRetainsComputedFirstInputOwner) {
-  auto input = makeRowVector({
-      makeFlatVector<int64_t>({101, 202, 303, 404}),
-      makeNullableFlatVector<StringView>(
-          {StringView("fallback-a"),
-           std::nullopt,
-           StringView("fallback-c"),
-           StringView("fallback-d")})});
+  auto input = makeRowVector(
+      {makeFlatVector<int64_t>({101, 202, 303, 404}),
+       makeNullableFlatVector<StringView>(
+           {StringView("fallback-a"),
+            std::nullopt,
+            StringView("fallback-c"),
+            StringView("fallback-d")})});
 
   createDuckDbTable({input});
   auto plan = PlanBuilder()
                   .values({input})
-                  .project(
-                      {"coalesce(cast(c0 as varchar), c1) AS result"})
+                  .project({"coalesce(cast(c0 as varchar), c1) AS result"})
                   .planNode();
-  runTest(
-      plan,
-      "SELECT coalesce(cast(c0 as varchar), c1) AS result FROM tmp");
+  runTest(plan, "SELECT coalesce(cast(c0 as varchar), c1) AS result FROM tmp");
 }
 
 TEST_F(CudfFilterProjectTest, coalesceLiteralFirst) {
@@ -2326,14 +2323,12 @@ TEST_F(CudfFilterProjectTest, multiBranchSwitchExpr) {
   auto data = makeRowVector(
       {makeFlatVector<int32_t>({-2, 0, 3, 8}),
        makeFlatVector<double>({10.0, 20.0, 30.0, 40.0})});
-  auto plan =
-      PlanBuilder()
-          .values({data})
-          .project(
-              {"CASE WHEN c0 < 0 THEN c1 * 2.0 "
-               "WHEN c0 = 0 THEN c1 + 1.0 "
-               "WHEN c0 < 5 THEN c1 - 2.0 ELSE c1 END AS result"})
-          .planNode();
+  auto plan = PlanBuilder()
+                  .values({data})
+                  .project({"CASE WHEN c0 < 0 THEN c1 * 2.0 "
+                            "WHEN c0 = 0 THEN c1 + 1.0 "
+                            "WHEN c0 < 5 THEN c1 - 2.0 ELSE c1 END AS result"})
+                  .planNode();
   auto result = AssertQueryBuilder(plan).copyResults(pool());
 
   auto expected =
@@ -2501,8 +2496,7 @@ TEST_F(CudfSimpleFilterProjectTest, castIntegralToVarchar) {
       (evaluateOnce<std::string, int32_t>("cast(c0 as varchar)", 12345)),
       "12345");
   EXPECT_EQ(
-      (evaluateOnce<std::string, int64_t>(
-          "cast(c0 as varchar)", 9876543210LL)),
+      (evaluateOnce<std::string, int64_t>("cast(c0 as varchar)", 9876543210LL)),
       "9876543210");
   EXPECT_EQ(
       (evaluateOnce<std::string, int16_t>(
@@ -2520,8 +2514,7 @@ TEST_F(CudfSimpleFilterProjectTest, castIntegralToVarchar) {
 
 TEST_F(CudfSimpleFilterProjectTest, castFloatingPointToVarchar) {
   EXPECT_EQ(
-      (evaluateOnce<std::string, double>("cast(c0 as varchar)", 12.5)),
-      "12.5");
+      (evaluateOnce<std::string, double>("cast(c0 as varchar)", 12.5)), "12.5");
   EXPECT_EQ(
       (evaluateOnce<std::string, float>(
           "try_cast(c0 as varchar)", static_cast<float>(-7.25))),

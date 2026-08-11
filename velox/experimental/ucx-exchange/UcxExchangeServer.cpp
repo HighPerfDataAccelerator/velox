@@ -583,10 +583,10 @@ void UcxExchangeServer::sendData() {
                 pinned,
                 makeIntraNodeRetrieveWakeup());
         LOG_EVERY_N(WARNING, 128)
-            << "CUDF_UCX_INTRANODE_HOST_BOUNCE task="
-            << partitionKey_.taskId << " destination="
-            << partitionKey_.destination << " sequence=" << sequenceNumber_
-            << " bytes=" << bytes_ << " pinned=" << pinned;
+            << "CUDF_UCX_INTRANODE_HOST_BOUNCE task=" << partitionKey_.taskId
+            << " destination=" << partitionKey_.destination
+            << " sequence=" << sequenceNumber_ << " bytes=" << bytes_
+            << " pinned=" << pinned;
       } else {
         // The consumer tags uniquely owned pages with this stream so
         // downstream reads and stream-ordered async frees remain ordered with
@@ -679,8 +679,7 @@ void UcxExchangeServer::sendData() {
     if (exchangeVariableWidthValidationEnabled()) {
       LOG(WARNING) << "UCX sender metadata key=" << partitionKey_.toString()
                    << " sequence=" << sequenceNumber_
-                   << " bytes=" << serMetaSize << " fingerprint=0x"
-                   << std::hex
+                   << " bytes=" << serMetaSize << " fingerprint=0x" << std::hex
                    << diagnosticBufferFingerprint(
                           serializedMetadata.get(), serMetaSize)
                    << std::dec;
@@ -709,8 +708,7 @@ void UcxExchangeServer::sendData() {
         [tid = partitionKey_.toString(),
          metadataTag,
          metadataSequence,
-         weakMeta](
-            ucs_status_t status, std::shared_ptr<void> arg) {
+         weakMeta](ucs_status_t status, std::shared_ptr<void> arg) {
           auto ctx = std::static_pointer_cast<MetaSendContext>(arg);
 
           auto self = weakMeta.lock();
@@ -734,8 +732,7 @@ void UcxExchangeServer::sendData() {
             // completes.  Local completion is not a sufficiently strong
             // ownership handoff on every UCX transport used by MPP.
             {
-              std::lock_guard<std::mutex> lock(
-                  self->retainedSendBufferMutex_);
+              std::lock_guard<std::mutex> lock(self->retainedSendBufferMutex_);
               self->retainedCompletedMetadata_ = ctx->metadata;
             }
             VLOG(3) << "@" << self->partitionKey_.taskId
@@ -782,8 +779,8 @@ void UcxExchangeServer::sendData() {
       void* sendBuffer = dataCtx->data->gpu_data->data();
       if (useHostStaging) {
         dataCtx->hostDataBytes = bytes_;
-        dataCtx->hostData = allocateHostStagingBuffer(
-            bytes_, dataCtx->hostDataPinned);
+        dataCtx->hostData =
+            allocateHostStagingBuffer(bytes_, dataCtx->hostDataPinned);
         const auto producerStream = dataCtx->data->gpu_data->stream();
         if (exchangeVariableWidthValidationEnabled()) {
           LOG(WARNING) << "UCX sender validating key="
@@ -830,10 +827,9 @@ void UcxExchangeServer::sendData() {
         }
         CUDF_CUDA_TRY(synchronizeStatus);
         if (exchangeVariableWidthValidationEnabled()) {
-          LOG(WARNING) << "UCX sender staged key="
-                       << partitionKey_.toString()
-                       << " sequence=" << sequenceNumber_
-                       << " bytes=" << bytes_ << " fingerprint=0x" << std::hex
+          LOG(WARNING) << "UCX sender staged key=" << partitionKey_.toString()
+                       << " sequence=" << sequenceNumber_ << " bytes=" << bytes_
+                       << " fingerprint=0x" << std::hex
                        << diagnosticBufferFingerprint(
                               dataCtx->hostData.get(), bytes_)
                        << std::dec;
@@ -882,16 +878,15 @@ void UcxExchangeServer::sendData() {
                 // boundary for large pinned bounce buffers, so return their
                 // pooled slot immediately instead of pinning one per server.
                 if (useHostStaging &&
-                    hostDataBytes <= static_cast<uint64_t>(
-                                         kDeviceEagerHostStageBytes)) {
+                    hostDataBytes <=
+                        static_cast<uint64_t>(kDeviceEagerHostStageBytes)) {
                   std::lock_guard<std::mutex> lock(
                       self->retainedSendBufferMutex_);
                   if (self->retainedCompletedHostData_) {
                     previouslyRetainedBytes =
                         self->retainedCompletedHostDataBytes_;
                   }
-                  self->retainedCompletedHostData_ =
-                      std::move(hostDataHolder);
+                  self->retainedCompletedHostData_ = std::move(hostDataHolder);
                   self->retainedCompletedHostDataBytes_ = hostDataBytes;
                 }
               }

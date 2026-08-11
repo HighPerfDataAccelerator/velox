@@ -14,10 +14,10 @@
  * limitations under the License.
  */
 #include "velox/experimental/cudf/connectors/hive/SelectiveParquetReader.h"
+#include "velox/experimental/cudf/exec/NvtxHelper.h"
 
 #include "velox/common/base/Exceptions.h"
 #include "velox/dwio/parquet/thrift/ParquetThrift.h"
-#include "velox/experimental/cudf/exec/NvtxHelper.h"
 
 #include <algorithm>
 #include <cstring>
@@ -46,8 +46,7 @@ void recordPreloadBufferStats(
   }
   const auto prefix =
       buffer.isPinned() ? "cudfPinnedPreload" : "cudfPageablePreload";
-  ioStats->addCounter(
-      std::string(prefix) + "Allocations", RuntimeCounter(1));
+  ioStats->addCounter(std::string(prefix) + "Allocations", RuntimeCounter(1));
   ioStats->addCounter(
       std::string(prefix) + "Bytes",
       RuntimeCounter(buffer.size(), RuntimeCounter::Unit::kBytes));
@@ -66,22 +65,21 @@ void brokerRead(
   }
   const auto numRanges = ranges.size();
   auto requestStats = std::make_shared<ExecutorReadRequestStats>();
-  broker->read(
-            readFunction,
-            sourceSize,
-            std::move(ranges),
-            destination,
-            requestStats)
+  broker
+      ->read(
+          readFunction,
+          sourceSize,
+          std::move(ranges),
+          destination,
+          requestStats)
       .get();
   if (!ioStats) {
     return;
   }
   ioStats->addCounter("cudfPrefetchRequests", RuntimeCounter(1));
+  ioStats->addCounter("cudfPrefetchRanges", RuntimeCounter(numRanges));
   ioStats->addCounter(
-      "cudfPrefetchRanges", RuntimeCounter(numRanges));
-  ioStats->addCounter(
-      "cudfPrefetchBytes",
-      RuntimeCounter(bytes, RuntimeCounter::Unit::kBytes));
+      "cudfPrefetchBytes", RuntimeCounter(bytes, RuntimeCounter::Unit::kBytes));
   ioStats->addCounter(
       "cudfPrefetchWaitNanos",
       RuntimeCounter(
@@ -128,8 +126,7 @@ struct ColumnChunkRange {
   int64_t size;
 };
 
-ColumnChunkRange getColumnChunkByteRange(
-    const pqthrift::ColumnMetaData& meta) {
+ColumnChunkRange getColumnChunkByteRange(const pqthrift::ColumnMetaData& meta) {
   int64_t start = *meta.data_page_offset();
   if (meta.dictionary_page_offset().has_value() &&
       *meta.dictionary_page_offset() > 0 &&
@@ -164,10 +161,9 @@ std::shared_ptr<PinnedHostBuffer> selectiveParquetRead(
 
   // Clamp the split range to the file: splitLength may arrive as sentinel
   // max or oversize when the caller only has the file path.
-  const uint64_t splitEndExclusive =
-      (splitStart >= fileSize) ? fileSize
-      : (splitLength > fileSize - splitStart) ? fileSize
-      : splitStart + splitLength;
+  const uint64_t splitEndExclusive = (splitStart >= fileSize) ? fileSize
+      : (splitLength > fileSize - splitStart)                 ? fileSize
+                                              : splitStart + splitLength;
 
   auto fullRead = [&]() {
     VELOX_NVTX_SCOPED("SelectiveRead::FullRead");
@@ -188,12 +184,7 @@ std::shared_ptr<PinnedHostBuffer> selectiveParquetRead(
              offset});
       }
       brokerRead(
-          broker,
-          readFunction,
-          fileSize,
-          std::move(ranges),
-          buf,
-          ioStats);
+          broker, readFunction, fileSize, std::move(ranges), buf, ioStats);
     } else {
       readFunction(0, fileSize, buf->data());
     }
@@ -457,8 +448,7 @@ std::shared_ptr<PinnedHostBuffer> selectiveParquetRead(
   auto serializedFooter = serializedFooterQueue.move();
   serializedFooter->coalesce();
   const auto* newFooterData = serializedFooter->data();
-  const auto newFooterSize =
-      static_cast<uint32_t>(serializedFooter->length());
+  const auto newFooterSize = static_cast<uint32_t>(serializedFooter->length());
 
   const size_t totalBufSize =
       kHeaderLen + totalChunkBytes + newFooterSize + kEnderLen;
@@ -523,14 +513,12 @@ std::shared_ptr<PinnedHostBuffer> selectiveParquetRead(
   dstOffset += sizeof(newFooterSize);
   std::memcpy(dst + dstOffset, &magic, sizeof(magic));
 
-  LOG(INFO) << "Selective Parquet read: " << filePath
-            << " full=" << fileSize
+  LOG(INFO) << "Selective Parquet read: " << filePath << " full=" << fileSize
             << " selective=" << totalBufSize
-            << " saved=" << (fileSize - totalBufSize)
-            << " (" << (100 - totalBufSize * 100 / fileSize) << "%)";
+            << " saved=" << (fileSize - totalBufSize) << " ("
+            << (100 - totalBufSize * 100 / fileSize) << "%)";
 
   return buf;
 }
-
 
 } // namespace facebook::velox::cudf_velox::connector::hive

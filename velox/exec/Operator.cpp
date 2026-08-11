@@ -675,9 +675,8 @@ std::unique_ptr<memory::MemoryReclaimer> Operator::MemoryReclaimer::create(
     DriverCtx* driverCtx,
     Operator* op,
     memory::MemoryPool* targetPool) {
-  return std::unique_ptr<memory::MemoryReclaimer>(
-      new Operator::MemoryReclaimer(
-          driverCtx->driver->shared_from_this(), op, targetPool));
+  return std::unique_ptr<memory::MemoryReclaimer>(new Operator::MemoryReclaimer(
+      driverCtx->driver->shared_from_this(), op, targetPool));
 }
 
 void Operator::MemoryReclaimer::enterArbitration() {

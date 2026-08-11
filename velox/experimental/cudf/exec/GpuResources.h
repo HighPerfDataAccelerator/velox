@@ -16,14 +16,14 @@
 
 #pragma once
 
+#include "velox/common/future/VeloxPromise.h"
+
 #include <cudf/detail/utilities/stream_pool.hpp>
 
 #include <rmm/mr/statistics_resource_adaptor.hpp>
 #include <rmm/resource_ref.hpp>
 
 #include <cuda/memory_resource>
-
-#include "velox/common/future/VeloxPromise.h"
 
 #include <chrono>
 #include <cstddef>
@@ -46,8 +46,7 @@ namespace facebook::velox::cudf_velox {
 
 /// Custom Velox memory-resource tag used for reclaimable persistent GPU state.
 /// Transient kernel workspaces are intentionally not charged to this pool.
-inline constexpr std::string_view kCudfDeviceMemoryResourceTag{
-    "cudf_device"};
+inline constexpr std::string_view kCudfDeviceMemoryResourceTag{"cudf_device"};
 
 struct DeviceMemorySnapshot {
   bool enabled{false};
@@ -153,8 +152,8 @@ class DeviceMemoryWorkspaceReservation {
   DeviceMemoryWorkspaceReservation& operator=(
       DeviceMemoryWorkspaceReservation&& other) noexcept;
 
-  DeviceMemoryWorkspaceReservation(
-      const DeviceMemoryWorkspaceReservation&) = delete;
+  DeviceMemoryWorkspaceReservation(const DeviceMemoryWorkspaceReservation&) =
+      delete;
   DeviceMemoryWorkspaceReservation& operator=(
       const DeviceMemoryWorkspaceReservation&) = delete;
 
@@ -237,8 +236,8 @@ class DeviceMemoryWorkspaceRequest {
       DeviceMemoryWorkspaceRequest&&) noexcept;
 
   DeviceMemoryWorkspaceRequest(const DeviceMemoryWorkspaceRequest&) = delete;
-  DeviceMemoryWorkspaceRequest& operator=(
-      const DeviceMemoryWorkspaceRequest&) = delete;
+  DeviceMemoryWorkspaceRequest& operator=(const DeviceMemoryWorkspaceRequest&) =
+      delete;
 
   [[nodiscard]] explicit operator bool() const noexcept {
     return state_ != nullptr;
@@ -276,8 +275,8 @@ class ReplayableDeviceMemoryWorkspace {
   ReplayableDeviceMemoryWorkspace() = default;
   ~ReplayableDeviceMemoryWorkspace() = default;
 
-  ReplayableDeviceMemoryWorkspace(
-      const ReplayableDeviceMemoryWorkspace&) = delete;
+  ReplayableDeviceMemoryWorkspace(const ReplayableDeviceMemoryWorkspace&) =
+      delete;
   ReplayableDeviceMemoryWorkspace& operator=(
       const ReplayableDeviceMemoryWorkspace&) = delete;
 
@@ -325,8 +324,8 @@ class DeviceMemoryReclaimerRegistration {
   DeviceMemoryReclaimerRegistration& operator=(
       DeviceMemoryReclaimerRegistration&&) noexcept = default;
 
-  DeviceMemoryReclaimerRegistration(
-      const DeviceMemoryReclaimerRegistration&) = delete;
+  DeviceMemoryReclaimerRegistration(const DeviceMemoryReclaimerRegistration&) =
+      delete;
   DeviceMemoryReclaimerRegistration& operator=(
       const DeviceMemoryReclaimerRegistration&) = delete;
 

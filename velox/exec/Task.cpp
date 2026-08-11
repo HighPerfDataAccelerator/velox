@@ -3867,10 +3867,9 @@ uint64_t Task::MemoryReclaimer::reclaim(
     return 0;
   }
   const bool knownPool = task->pool() == pool ||
-      std::any_of(
-          task->customTaskPools_.begin(),
-          task->customTaskPools_.end(),
-          [pool](const auto& entry) { return entry.second == pool; });
+      std::any_of(task->customTaskPools_.begin(),
+                  task->customTaskPools_.end(),
+                  [pool](const auto& entry) { return entry.second == pool; });
   VELOX_CHECK(knownPool, "Unexpected task reclaim pool {}", pool->name());
 
   uint64_t reclaimWaitTimeUs{0};
@@ -3934,8 +3933,8 @@ uint64_t Task::MemoryReclaimer::reclaimTask(
     uint64_t reclaimExecTimeUs{0};
     {
       MicrosecondWallTimer timer{&reclaimExecTimeUs};
-      reclaimedBytes = memory::MemoryReclaimer::reclaim(
-          pool, targetBytes, maxWaitMs, stats);
+      reclaimedBytes =
+          memory::MemoryReclaimer::reclaim(pool, targetBytes, maxWaitMs, stats);
     }
     RECORD_HISTOGRAM_METRIC_VALUE(
         kMetricTaskMemoryReclaimExecTimeMs, reclaimExecTimeUs / 1'000);
@@ -3957,10 +3956,9 @@ void Task::MemoryReclaimer::abort(
     return;
   }
   const bool knownPool = task->pool() == pool ||
-      std::any_of(
-          task->customTaskPools_.begin(),
-          task->customTaskPools_.end(),
-          [pool](const auto& entry) { return entry.second == pool; });
+      std::any_of(task->customTaskPools_.begin(),
+                  task->customTaskPools_.end(),
+                  [pool](const auto& entry) { return entry.second == pool; });
   VELOX_CHECK(knownPool, "Unexpected task abort pool {}", pool->name());
 
   task->setError(error);

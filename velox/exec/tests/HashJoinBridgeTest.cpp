@@ -642,8 +642,7 @@ TEST(HashJoinBridgeTest, payloadNeutralRecursivePartitionScheduling) {
   PartitionSet roots;
   for (uint32_t i = 0; i < 3; ++i) {
     auto id = SpillPartitionId(i);
-    roots.emplace(
-        id, std::make_unique<MoveOnlyPartition>(id, 10 + i));
+    roots.emplace(id, std::make_unique<MoveOnlyPartition>(id, 10 + i));
   }
 
   Iterator iterator;
@@ -655,8 +654,7 @@ TEST(HashJoinBridgeTest, payloadNeutralRecursivePartitionScheduling) {
   PartitionSet children;
   for (uint32_t i = 0; i < 2; ++i) {
     auto id = SpillPartitionId(root.id(), i);
-    children.emplace(
-        id, std::make_unique<MoveOnlyPartition>(id, 20 + i));
+    children.emplace(id, std::make_unique<MoveOnlyPartition>(id, 20 + i));
   }
   iterator.insert(std::move(children));
 

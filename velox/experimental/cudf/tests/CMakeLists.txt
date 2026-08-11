@@ -85,9 +85,7 @@ function(velox_add_cudf_test)
   set_target_properties(${ARG_NAME} PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CUDF_TESTS_OUTPUT_DIR})
   add_test(NAME ${ARG_NAME} COMMAND ${ARG_NAME} WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
   set_tests_properties(${ARG_NAME} PROPERTIES LABELS cuda_driver TIMEOUT ${ARG_TIMEOUT})
-  target_link_libraries(
-    ${ARG_NAME} ${ARG_LIBS} gtest gtest_main ${CUDF_TEST_S2_ABSL_LINK_LIBS}
-  )
+  target_link_libraries(${ARG_NAME} ${ARG_LIBS} gtest gtest_main ${CUDF_TEST_S2_ABSL_LINK_LIBS})
 endfunction()
 
 if(VELOX_ENABLE_ABFS)
@@ -112,11 +110,7 @@ endif()
 velox_add_cudf_test(
   NAME velox_cudf_adapter_operator_test
   SOURCES Main.cpp AdapterOperatorTest.cpp TaskOutputManagerTest.cpp
-  LIBS
-    ${CUDF_TEST_DEFAULT_LIBS}
-    velox_functions_test_lib
-    velox_window
-    velox_functions_spark_window
+  LIBS ${CUDF_TEST_DEFAULT_LIBS} velox_functions_test_lib velox_window velox_functions_spark_window
 )
 
 velox_add_cudf_test(

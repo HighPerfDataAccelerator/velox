@@ -110,12 +110,11 @@ class TopNRowNumberReplayerTest : public HiveConnectorTestBase {
     core::PlanNodePtr plan =
         builder.capturePlanNodeId(topNRowNumberId_).planNode();
     if (partialOutput) {
-      const auto topN = std::dynamic_pointer_cast<
-          const core::TopNRowNumberNode>(plan);
+      const auto topN =
+          std::dynamic_pointer_cast<const core::TopNRowNumberNode>(plan);
       VELOX_CHECK_NOT_NULL(topN);
-      plan = core::TopNRowNumberNode::Builder(*topN)
-                 .partialOutput(true)
-                 .build();
+      plan =
+          core::TopNRowNumberNode::Builder(*topN).partialOutput(true).build();
     }
 
     const std::vector<Split> splits =
@@ -243,32 +242,26 @@ TEST_F(TopNRowNumberReplayerTest, partialOutput) {
        makeFlatVector<std::string>(
            100, [](auto row) { return fmt::format("partial_{}", row); })})};
 
-  const auto planWithSplits =
-      createPlan(10, false, {"c0"}, {"c1"}, true);
+  const auto planWithSplits = createPlan(10, false, {"c0"}, {"c1"}, true);
   const auto result = AssertQueryBuilder(planWithSplits.plan)
                           .maxDrivers(1)
                           .splits(planWithSplits.splits)
                           .copyResults(pool());
 
-  const auto traceRoot = fmt::format(
-      "{}/{}/traceRoot/", testDir_->getPath(), "partialOutput");
+  const auto traceRoot =
+      fmt::format("{}/{}/traceRoot/", testDir_->getPath(), "partialOutput");
   std::shared_ptr<Task> task;
-  auto tracePlanWithSplits =
-      createPlan(10, false, {"c0"}, {"c1"}, true);
-  auto traceResult = AssertQueryBuilder(tracePlanWithSplits.plan)
-                         .maxDrivers(1)
-                         .config(core::QueryConfig::kQueryTraceEnabled, true)
-                         .config(core::QueryConfig::kQueryTraceDir, traceRoot)
-                         .config(
-                             core::QueryConfig::kQueryTraceMaxBytes,
-                             100UL << 30)
-                         .config(
-                             core::QueryConfig::kQueryTraceTaskRegExp, ".*")
-                         .config(
-                             core::QueryConfig::kQueryTraceNodeId,
-                             topNRowNumberId_)
-                         .splits(tracePlanWithSplits.splits)
-                         .copyResults(pool(), task);
+  auto tracePlanWithSplits = createPlan(10, false, {"c0"}, {"c1"}, true);
+  auto traceResult =
+      AssertQueryBuilder(tracePlanWithSplits.plan)
+          .maxDrivers(1)
+          .config(core::QueryConfig::kQueryTraceEnabled, true)
+          .config(core::QueryConfig::kQueryTraceDir, traceRoot)
+          .config(core::QueryConfig::kQueryTraceMaxBytes, 100UL << 30)
+          .config(core::QueryConfig::kQueryTraceTaskRegExp, ".*")
+          .config(core::QueryConfig::kQueryTraceNodeId, topNRowNumberId_)
+          .splits(tracePlanWithSplits.splits)
+          .copyResults(pool(), task);
 
   assertEqualResults({result}, {traceResult});
 

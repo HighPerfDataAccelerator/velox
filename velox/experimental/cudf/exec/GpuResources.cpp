@@ -14,11 +14,11 @@
  * limitations under the License.
  */
 
+#include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/CudfDefaultStreamOverload.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 
 #include "velox/common/memory/MemoryPool.h"
-#include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/exec/Operator.h"
 
 #include <cudf/detail/utilities/stream_pool.hpp>
@@ -159,10 +159,8 @@ struct OperatorAttributionResourceImpl {
       rmm::device_async_resource_ref upstream)
       : upstream_(upstream) {}
 
-  void* allocate(
-      cuda::stream_ref stream,
-      std::size_t bytes,
-      std::size_t alignment) {
+  void*
+  allocate(cuda::stream_ref stream, std::size_t bytes, std::size_t alignment) {
     void* pointer = nullptr;
     try {
       pointer = upstream_.allocate(stream, bytes, alignment);
@@ -203,13 +201,11 @@ struct OperatorAttributionResourceImpl {
     recordDeallocation(pointer);
   }
 
-  bool operator==(
-      const OperatorAttributionResourceImpl& other) const noexcept {
+  bool operator==(const OperatorAttributionResourceImpl& other) const noexcept {
     return this == &other;
   }
 
-  bool operator!=(
-      const OperatorAttributionResourceImpl& other) const noexcept {
+  bool operator!=(const OperatorAttributionResourceImpl& other) const noexcept {
     return !(*this == other);
   }
 
@@ -232,14 +228,13 @@ struct OperatorAttributionResourceImpl {
         });
     const auto count = std::min<std::size_t>(snapshot.size(), 12);
     for (std::size_t index = 0; index < count; ++index) {
-      LOG(WARNING)
-          << "CUDF_DEVICE_MEMORY_OWNER label={" << label << "}"
-          << " resource=" << resource << " rank=" << (index + 1)
-          << " currentBytes=" << snapshot[index].second.currentBytes
-          << " peakBytes=" << snapshot[index].second.peakBytes
-          << " currentAllocations="
-          << snapshot[index].second.currentAllocations
-          << " context={" << snapshot[index].first << "}";
+      LOG(WARNING) << "CUDF_DEVICE_MEMORY_OWNER label={" << label << "}"
+                   << " resource=" << resource << " rank=" << (index + 1)
+                   << " currentBytes=" << snapshot[index].second.currentBytes
+                   << " peakBytes=" << snapshot[index].second.peakBytes
+                   << " currentAllocations="
+                   << snapshot[index].second.currentAllocations << " context={"
+                   << snapshot[index].first << "}";
     }
   }
 
@@ -249,26 +244,23 @@ struct OperatorAttributionResourceImpl {
       const void* pointer,
       std::size_t bytes) const {
     const auto requestedBegin = reinterpret_cast<uintptr_t>(pointer);
-    const auto requestedEnd =
-        requestedBegin + std::max<std::size_t>(bytes, 1);
+    const auto requestedEnd = requestedBegin + std::max<std::size_t>(bytes, 1);
     std::lock_guard<std::mutex> lock(mutex_);
     for (const auto& [allocationPointer, allocation] : allocations_) {
       const auto allocationBegin =
           reinterpret_cast<uintptr_t>(allocationPointer);
       const auto allocationEnd = allocationBegin + allocation.bytes;
       if (requestedBegin < allocationEnd && requestedEnd > allocationBegin) {
-        LOG(ERROR)
-            << "CUDF_DEVICE_MEMORY_POINTER label={" << label << "}"
-            << " resource=" << resource << " state=live"
-            << " requestPtr=" << pointer << " requestBytes=" << bytes
-            << " allocationPtr=" << allocationPointer
-            << " allocationBytes=" << allocation.bytes
-            << " offset="
-            << (requestedBegin >= allocationBegin
-                    ? requestedBegin - allocationBegin
-                    : 0)
-            << " allocationSequence=" << allocation.sequence
-            << " context={" << allocation.context << "}";
+        LOG(ERROR) << "CUDF_DEVICE_MEMORY_POINTER label={" << label << "}"
+                   << " resource=" << resource << " state=live"
+                   << " requestPtr=" << pointer << " requestBytes=" << bytes
+                   << " allocationPtr=" << allocationPointer
+                   << " allocationBytes=" << allocation.bytes << " offset="
+                   << (requestedBegin >= allocationBegin
+                           ? requestedBegin - allocationBegin
+                           : 0)
+                   << " allocationSequence=" << allocation.sequence
+                   << " context={" << allocation.context << "}";
         return;
       }
     }
@@ -276,19 +268,17 @@ struct OperatorAttributionResourceImpl {
       const auto allocationBegin = reinterpret_cast<uintptr_t>(it->pointer);
       const auto allocationEnd = allocationBegin + it->bytes;
       if (requestedBegin < allocationEnd && requestedEnd > allocationBegin) {
-        LOG(ERROR)
-            << "CUDF_DEVICE_MEMORY_POINTER label={" << label << "}"
-            << " resource=" << resource << " state=recently_freed"
-            << " requestPtr=" << pointer << " requestBytes=" << bytes
-            << " allocationPtr=" << it->pointer
-            << " allocationBytes=" << it->bytes
-            << " offset="
-            << (requestedBegin >= allocationBegin
-                    ? requestedBegin - allocationBegin
-                    : 0)
-            << " allocationSequence=" << it->allocationSequence
-            << " freeSequence=" << it->freeSequence
-            << " context={" << it->context << "}";
+        LOG(ERROR) << "CUDF_DEVICE_MEMORY_POINTER label={" << label << "}"
+                   << " resource=" << resource << " state=recently_freed"
+                   << " requestPtr=" << pointer << " requestBytes=" << bytes
+                   << " allocationPtr=" << it->pointer
+                   << " allocationBytes=" << it->bytes << " offset="
+                   << (requestedBegin >= allocationBegin
+                           ? requestedBegin - allocationBegin
+                           : 0)
+                   << " allocationSequence=" << it->allocationSequence
+                   << " freeSequence=" << it->freeSequence << " context={"
+                   << it->context << "}";
         return;
       }
     }
@@ -303,8 +293,7 @@ struct OperatorAttributionResourceImpl {
         ? std::string{"unattributed"}
         : currentAllocationContext;
     std::lock_guard<std::mutex> lock(mutex_);
-    allocations_.emplace(
-        pointer, Allocation{bytes, context, ++eventSequence_});
+    allocations_.emplace(pointer, Allocation{bytes, context, ++eventSequence_});
     auto& stats = contexts_[context];
     stats.currentBytes += bytes;
     stats.peakBytes = std::max(stats.peakBytes, stats.currentBytes);
@@ -322,12 +311,13 @@ struct OperatorAttributionResourceImpl {
       context->second.currentBytes -= allocation->second.bytes;
       --context->second.currentAllocations;
     }
-    recentlyFreed_.push_back(FreedAllocation{
-        pointer,
-        allocation->second.bytes,
-        allocation->second.context,
-        allocation->second.sequence,
-        ++eventSequence_});
+    recentlyFreed_.push_back(
+        FreedAllocation{
+            pointer,
+            allocation->second.bytes,
+            allocation->second.context,
+            allocation->second.sequence,
+            ++eventSequence_});
     if (recentlyFreed_.size() > 4096) {
       recentlyFreed_.pop_front();
     }
@@ -355,21 +345,19 @@ struct OperatorAttributionResourceImpl {
     std::size_t freeBytes = 0;
     std::size_t totalBytes = 0;
     const auto cudaStatus = cudaMemGetInfo(&freeBytes, &totalBytes);
-    LOG(ERROR)
-        << "CUDF_DEVICE_OOM triggerContext={" << currentAllocationContext
-        << "} requestedBytes=" << requestedBytes
-        << " cudaValid=" << (cudaStatus == cudaSuccess)
-        << " freeBytes=" << freeBytes << " totalBytes=" << totalBytes
-        << " attributedContexts=" << snapshot.size();
+    LOG(ERROR) << "CUDF_DEVICE_OOM triggerContext={" << currentAllocationContext
+               << "} requestedBytes=" << requestedBytes
+               << " cudaValid=" << (cudaStatus == cudaSuccess)
+               << " freeBytes=" << freeBytes << " totalBytes=" << totalBytes
+               << " attributedContexts=" << snapshot.size();
     const auto count = std::min<std::size_t>(snapshot.size(), 12);
     for (std::size_t index = 0; index < count; ++index) {
-      LOG(ERROR)
-          << "CUDF_DEVICE_OOM_OWNER rank=" << (index + 1)
-          << " currentBytes=" << snapshot[index].second.currentBytes
-          << " peakBytes=" << snapshot[index].second.peakBytes
-          << " currentAllocations="
-          << snapshot[index].second.currentAllocations
-          << " context={" << snapshot[index].first << "}";
+      LOG(ERROR) << "CUDF_DEVICE_OOM_OWNER rank=" << (index + 1)
+                 << " currentBytes=" << snapshot[index].second.currentBytes
+                 << " peakBytes=" << snapshot[index].second.peakBytes
+                 << " currentAllocations="
+                 << snapshot[index].second.currentAllocations << " context={"
+                 << snapshot[index].first << "}";
     }
   }
 
@@ -386,8 +374,7 @@ class OperatorAttributionResource final
   using Base = cuda::mr::shared_resource<OperatorAttributionResourceImpl>;
 
  public:
-  explicit OperatorAttributionResource(
-      rmm::device_async_resource_ref upstream)
+  explicit OperatorAttributionResource(rmm::device_async_resource_ref upstream)
       : Base(
             cuda::std::in_place_type<OperatorAttributionResourceImpl>,
             upstream) {}
@@ -429,8 +416,7 @@ constexpr auto kDeviceWorkspacePollInterval = std::chrono::milliseconds(5);
 // allow another fitting waiter to be advised. Without this lease, one stale
 // kWakePending request can permanently stop the device-level scheduler while
 // every GPU is idle.
-constexpr auto kDeviceWorkspaceAdvisoryLease =
-    std::chrono::milliseconds(20);
+constexpr auto kDeviceWorkspaceAdvisoryLease = std::chrono::milliseconds(20);
 // A releasing output edge must not remain below a static physical watermark
 // forever. After a bounded wait it may use the lower emergency cushion, but
 // the byte-accounted reservation must still fit the same physical snapshot.
@@ -496,9 +482,7 @@ std::mutex devicePhysicalPressureMutex;
 // atomics in DeviceMemoryReclaimerState. The owning Driver is solely
 // responsible for invoking Operator::reclaim() at a subsequent safe boundary.
 std::mutex deviceReclaimerRegistryMutex;
-std::unordered_map<
-    exec::Operator*,
-    std::weak_ptr<DeviceMemoryReclaimerState>>
+std::unordered_map<exec::Operator*, std::weak_ptr<DeviceMemoryReclaimerState>>
     deviceReclaimerRegistry;
 std::atomic<uint64_t> nextDeviceReclaimEpoch{1};
 std::unordered_map<int, std::chrono::steady_clock::time_point>
@@ -572,8 +556,7 @@ uint64_t deviceWorkspaceRequiredHeadroom(
     DeviceMemoryWorkspacePriority priority) {
   const auto effectiveMinHeadroom =
       deviceWorkspaceEffectiveMinHeadroom(minHeadroomBytes, priority);
-  return effectiveMinHeadroom >
-          std::numeric_limits<std::size_t>::max() - bytes
+  return effectiveMinHeadroom > std::numeric_limits<std::size_t>::max() - bytes
       ? std::numeric_limits<std::size_t>::max()
       : effectiveMinHeadroom + bytes;
 }
@@ -685,8 +668,7 @@ bool isHighestPriorityDeviceWorkspaceWaiter(
   for (const auto& waiter : waitersIt->second) {
     if (waiter == nullptr || waiter == state ||
         (waiter->status != DeviceMemoryWorkspaceRequestStatus::kQueued &&
-         waiter->status !=
-             DeviceMemoryWorkspaceRequestStatus::kWakePending)) {
+         waiter->status != DeviceMemoryWorkspaceRequestStatus::kWakePending)) {
       continue;
     }
     if (waiter->status == DeviceMemoryWorkspaceRequestStatus::kWakePending) {
@@ -745,25 +727,21 @@ void scheduleDeviceMemoryWorkspaceWaiters(int device) noexcept {
     // cannot promptly retry (for example because its downstream consumer is
     // blocked). This preserves the anti-herd gate without letting a stale
     // kWakePending request deadlock all other drain work.
-    if (std::any_of(
-            waiters.begin(), waiters.end(), [&](const auto& waiter) {
-              return waiter->status ==
-                      DeviceMemoryWorkspaceRequestStatus::kWakePending &&
-                  now - waiter->wakeTime <
-                      kDeviceWorkspaceAdvisoryLease;
-            })) {
+    if (std::any_of(waiters.begin(), waiters.end(), [&](const auto& waiter) {
+          return waiter->status ==
+              DeviceMemoryWorkspaceRequestStatus::kWakePending &&
+              now - waiter->wakeTime < kDeviceWorkspaceAdvisoryLease;
+        })) {
       return;
     }
 
     const auto reservedIt = deviceMemoryWorkspaceBytes.find(device);
-    const auto reservedBytes = reservedIt == deviceMemoryWorkspaceBytes.end()
-        ? 0
-        : reservedIt->second;
+    const auto reservedBytes =
+        reservedIt == deviceMemoryWorkspaceBytes.end() ? 0 : reservedIt->second;
     auto best = waiters.end();
     for (auto candidate = waiters.begin(); candidate != waiters.end();
          ++candidate) {
-      if ((*candidate)->status !=
-          DeviceMemoryWorkspaceRequestStatus::kQueued) {
+      if ((*candidate)->status != DeviceMemoryWorkspaceRequestStatus::kQueued) {
         continue;
       }
       if ((*candidate)->retryNotBefore > now) {
@@ -795,18 +773,16 @@ void scheduleDeviceMemoryWorkspaceWaiters(int device) noexcept {
         promises.push_back(std::move(waiter->promise.value()));
         waiter->promise.reset();
       }
-      VLOG(1) << "CUDF_DEVICE_WORKSPACE_WAKE device=" << device
-              << " operator="
+      VLOG(1) << "CUDF_DEVICE_WORKSPACE_WAKE device=" << device << " operator="
               << (waiter->requestor != nullptr
                       ? waiter->requestor->operatorType()
                       : "CudfConnector")
               << " task="
               << (waiter->requestor != nullptr ? waiter->requestor->taskId()
-                                                : "unknown")
+                                               : "unknown")
               << " node="
-              << (waiter->requestor != nullptr
-                      ? waiter->requestor->planNodeId()
-                      : "unknown")
+              << (waiter->requestor != nullptr ? waiter->requestor->planNodeId()
+                                               : "unknown")
               << " bytes=" << waiter->bytes
               << " priority=" << static_cast<int>(waiter->priority)
               << " waitUs="
@@ -837,8 +813,7 @@ void DeviceWorkspaceWaiterPoller::run() noexcept {
       {
         std::lock_guard<std::mutex> lock(deviceMemoryWorkspaceMutex);
         devices.reserve(deviceMemoryWorkspaceWaiters.size());
-        for (const auto& [device, waiters] :
-             deviceMemoryWorkspaceWaiters) {
+        for (const auto& [device, waiters] : deviceMemoryWorkspaceWaiters) {
           const auto hasQueued = std::any_of(
               waiters.begin(), waiters.end(), [](const auto& waiter) {
                 return waiter != nullptr &&
@@ -1020,18 +995,17 @@ void serviceDeviceReclaimerState(
     notifyDeviceMemoryWorkspaceWaiters(
         state->device.load(std::memory_order_relaxed));
   }
-  LOG(WARNING)
-      << "CUDF_DEVICE_COOPERATIVE_RECLAIM device=" << state->device.load()
-      << " epoch=" << state->requestEpoch.load(std::memory_order_relaxed)
-      << " safePoint=" << safePoint
-      << " operator=" << owner->operatorType()
-      << " task=" << owner->taskId()
-      << " node=" << owner->planNodeId()
-      << " requestedBytes=" << requested
-      << " reportedBeforeBytes=" << reportedBefore
-      << " reclaimedCapacityBytes=" << reclaimed
-      << " reportedAfterBytes=" << reportedAfter
-      << " allocatableAfter=" << headroom.allocatableBytes();
+  LOG(WARNING) << "CUDF_DEVICE_COOPERATIVE_RECLAIM device="
+               << state->device.load() << " epoch="
+               << state->requestEpoch.load(std::memory_order_relaxed)
+               << " safePoint=" << safePoint
+               << " operator=" << owner->operatorType()
+               << " task=" << owner->taskId() << " node=" << owner->planNodeId()
+               << " requestedBytes=" << requested
+               << " reportedBeforeBytes=" << reportedBefore
+               << " reclaimedCapacityBytes=" << reclaimed
+               << " reportedAfterBytes=" << reportedAfter
+               << " allocatableAfter=" << headroom.allocatableBytes();
 }
 
 void requestDeviceMemoryReclaimForPhysicalPressure(
@@ -1060,8 +1034,8 @@ void requestDeviceMemoryReclaimForPhysicalPressure(
     return;
   }
 
-  const auto minReclaim = std::max<uint64_t>(
-      config.deviceMemoryMinReclaimBytes, 1);
+  const auto minReclaim =
+      std::max<uint64_t>(config.deviceMemoryMinReclaimBytes, 1);
   // Normal persistent-state admission uses hysteresis. An explicit workspace
   // request already includes the kernel's byte estimate, so targeting another
   // full reclaim wave above it would externalize healthy state unnecessarily.
@@ -1070,8 +1044,7 @@ void requestDeviceMemoryReclaimForPhysicalPressure(
       : (minHeadroom > std::numeric_limits<uint64_t>::max() - minReclaim
              ? std::numeric_limits<uint64_t>::max()
              : minHeadroom + minReclaim);
-  const auto physicalShortfall =
-      highWatermark > before.allocatableBytes()
+  const auto physicalShortfall = highWatermark > before.allocatableBytes()
       ? highWatermark - before.allocatableBytes()
       : 0;
   // A concrete workspace request needs only enough victims to make that
@@ -1139,15 +1112,13 @@ void requestDeviceMemoryReclaimForPhysicalPressure(
           ++protectedSmallExpensiveVictims;
           continue;
         }
-        candidates.push_back(Candidate{
-            std::move(state), bytes, expensiveToRebuild});
+        candidates.push_back(
+            Candidate{std::move(state), bytes, expensiveToRebuild});
       }
     }
 
     const bool requestorIsCandidate = std::any_of(
-        candidates.begin(),
-        candidates.end(),
-        [&](const Candidate& candidate) {
+        candidates.begin(), candidates.end(), [&](const Candidate& candidate) {
           return candidate.state == requestorState;
         });
     // An outstanding cooperative request suppresses another cross-Driver
@@ -1201,13 +1172,11 @@ void requestDeviceMemoryReclaimForPhysicalPressure(
                   minVictimBytes, requestBytes - potentialAssigned));
           potentialAssigned += victimRequest;
           potentialCrossDriverExpensiveVictim |=
-              candidate.expensiveToRebuild &&
-              candidate.state != requestorState;
+              candidate.expensiveToRebuild && candidate.state != requestorState;
         }
       }
       const bool deferCrossDriverExpensiveVictims =
-          requireCompleteExpensiveWave &&
-          potentialCrossDriverExpensiveVictim &&
+          requireCompleteExpensiveWave && potentialCrossDriverExpensiveVictim &&
           potentialAssigned < requestBytes;
       const auto epoch =
           nextDeviceReclaimEpoch.fetch_add(1, std::memory_order_relaxed);
@@ -1223,8 +1192,7 @@ void requestDeviceMemoryReclaimForPhysicalPressure(
         if (outstanding && candidate.state != requestorState) {
           break;
         }
-        if (deferCrossDriverExpensiveVictims &&
-            candidate.expensiveToRebuild &&
+        if (deferCrossDriverExpensiveVictims && candidate.expensiveToRebuild &&
             candidate.state != requestorState) {
           ++deferredExpensiveVictims;
           continue;
@@ -1241,53 +1209,48 @@ void requestDeviceMemoryReclaimForPhysicalPressure(
         selectedRequestor |= candidate.state == requestorState;
       }
       if (assigned > 0) {
-        LOG(WARNING)
-            << "CUDF_DEVICE_GLOBAL_ARBITRATION device=" << before.device
-            << " mode=publish_cooperative_victims"
-            << " epoch=" << epoch
-            << " minHeadroomBytes=" << minHeadroom
-            << " highWatermarkBytes=" << highWatermark
-            << " requestedBytes=" << requestBytes
-            << " assignedBytes=" << assigned
-            << " victimCount=" << selectedVictims
-            << " expensiveVictimCount=" << selectedExpensiveVictims
-            << " deferredExpensiveVictimCount=" << deferredExpensiveVictims
-            << " selectedRequestor=" << selectedRequestor
-            << " allocatableBefore=" << before.allocatableBytes()
-            << " cudaFreeBefore=" << before.freeBytes
-            << " reusablePoolBefore=" << before.reusablePoolBytes();
+        LOG(WARNING) << "CUDF_DEVICE_GLOBAL_ARBITRATION device="
+                     << before.device << " mode=publish_cooperative_victims"
+                     << " epoch=" << epoch
+                     << " minHeadroomBytes=" << minHeadroom
+                     << " highWatermarkBytes=" << highWatermark
+                     << " requestedBytes=" << requestBytes
+                     << " assignedBytes=" << assigned
+                     << " victimCount=" << selectedVictims
+                     << " expensiveVictimCount=" << selectedExpensiveVictims
+                     << " deferredExpensiveVictimCount="
+                     << deferredExpensiveVictims
+                     << " selectedRequestor=" << selectedRequestor
+                     << " allocatableBefore=" << before.allocatableBytes()
+                     << " cudaFreeBefore=" << before.freeBytes
+                     << " reusablePoolBefore=" << before.reusablePoolBytes();
       } else if (deferredExpensiveVictims > 0) {
-        LOG(WARNING)
-            << "CUDF_DEVICE_GLOBAL_ARBITRATION device=" << before.device
-            << " mode=defer_incomplete_expensive_wave"
-            << " epoch=" << epoch
-            << " requestedBytes=" << requestBytes
-            << " potentialAssignedBytes=" << potentialAssigned
-            << " deferredExpensiveVictimCount="
-            << deferredExpensiveVictims
-            << " allocatableBytes=" << before.allocatableBytes();
+        LOG(WARNING) << "CUDF_DEVICE_GLOBAL_ARBITRATION device="
+                     << before.device << " mode=defer_incomplete_expensive_wave"
+                     << " epoch=" << epoch << " requestedBytes=" << requestBytes
+                     << " potentialAssignedBytes=" << potentialAssigned
+                     << " deferredExpensiveVictimCount="
+                     << deferredExpensiveVictims
+                     << " allocatableBytes=" << before.allocatableBytes();
       } else if (protectedSmallExpensiveVictims > 0) {
-        LOG(WARNING)
-            << "CUDF_DEVICE_GLOBAL_ARBITRATION device=" << before.device
-            << " mode=protect_small_expensive_victim"
-            << " epoch=" << epoch
-            << " requestedBytes=" << requestBytes
-            << " minExpensiveVictimBytes="
-            << minCrossDriverExpensiveVictimBytes
-            << " protectedExpensiveVictimCount="
-            << protectedSmallExpensiveVictims
-            << " allocatableBytes=" << before.allocatableBytes();
+        LOG(WARNING) << "CUDF_DEVICE_GLOBAL_ARBITRATION device="
+                     << before.device << " mode=protect_small_expensive_victim"
+                     << " epoch=" << epoch << " requestedBytes=" << requestBytes
+                     << " minExpensiveVictimBytes="
+                     << minCrossDriverExpensiveVictimBytes
+                     << " protectedExpensiveVictimCount="
+                     << protectedSmallExpensiveVictims
+                     << " allocatableBytes=" << before.allocatableBytes();
       } else {
         const auto now = std::chrono::steady_clock::now();
         const auto previous = lastNoDeviceVictimLog.find(before.device);
         if (previous == lastNoDeviceVictimLog.end() ||
             now - previous->second >= std::chrono::seconds(1)) {
           lastNoDeviceVictimLog[before.device] = now;
-          LOG(WARNING)
-              << "CUDF_DEVICE_GLOBAL_ARBITRATION device=" << before.device
-              << " mode=no_material_victim"
-              << " minVictimBytes=" << minVictimBytes
-              << " allocatableBytes=" << before.allocatableBytes();
+          LOG(WARNING) << "CUDF_DEVICE_GLOBAL_ARBITRATION device="
+                       << before.device << " mode=no_material_victim"
+                       << " minVictimBytes=" << minVictimBytes
+                       << " allocatableBytes=" << before.allocatableBytes();
         }
       }
     }
@@ -1305,10 +1268,9 @@ cuda::mr::any_resource<cuda::mr::device_accessible>
 wrapDeviceMemoryResourceForDiagnostics(
     cuda::mr::any_resource<cuda::mr::device_accessible> upstream,
     bool outputResource) {
-  auto& statistics =
-      outputResource ? output_statistics_mr_ : statistics_mr_;
-  auto& attribution = outputResource ? outputAttributionResource
-                                     : primaryAttributionResource;
+  auto& statistics = outputResource ? output_statistics_mr_ : statistics_mr_;
+  auto& attribution =
+      outputResource ? outputAttributionResource : primaryAttributionResource;
   statistics.emplace(std::move(upstream));
   attribution.emplace(rmm::device_async_resource_ref{statistics.value()});
   return cuda::mr::any_resource<cuda::mr::device_accessible>{
@@ -1611,8 +1573,7 @@ ReplayableDeviceMemoryWorkspace::tryAcquire(
               .count();
       waitStart_.reset();
     }
-    return {
-        std::move(reservation), false, std::move(completedWaitMicros)};
+    return {std::move(reservation), false, std::move(completedWaitMicros)};
   }
 
   const bool firstWait = !waitStart_.has_value();
@@ -1664,8 +1625,7 @@ DeviceMemoryWorkspaceReservation::DeviceMemoryWorkspaceReservation(
   other.active_ = false;
 }
 
-DeviceMemoryWorkspaceReservation&
-DeviceMemoryWorkspaceReservation::operator=(
+DeviceMemoryWorkspaceReservation& DeviceMemoryWorkspaceReservation::operator=(
     DeviceMemoryWorkspaceReservation&& other) noexcept {
   if (this == &other) {
     return *this;
@@ -1791,11 +1751,9 @@ tryAcquireBackgroundDeviceMemoryWorkspace(
   std::size_t reserved = 0;
   {
     std::lock_guard<std::mutex> lock(deviceMemoryWorkspaceMutex);
-    const auto reservedIt =
-        deviceMemoryWorkspaceBytes.find(headroom.device);
-    reserved = reservedIt == deviceMemoryWorkspaceBytes.end()
-        ? 0
-        : reservedIt->second;
+    const auto reservedIt = deviceMemoryWorkspaceBytes.find(headroom.device);
+    reserved =
+        reservedIt == deviceMemoryWorkspaceBytes.end() ? 0 : reservedIt->second;
     const auto requiredHeadroom =
         deviceWorkspaceRequiredHeadroom(bytes, minHeadroomBytes, priority);
     const auto availableBytes = headroom.allocatableBytes();
@@ -1815,13 +1773,11 @@ tryAcquireBackgroundDeviceMemoryWorkspace(
                        DeviceMemoryWorkspaceRequestStatus::kQueued ||
                    (waiter->status ==
                         DeviceMemoryWorkspaceRequestStatus::kWakePending &&
-                    now - waiter->wakeTime <
-                        kDeviceWorkspaceAdvisoryLease)) &&
+                    now - waiter->wakeTime < kDeviceWorkspaceAdvisoryLease)) &&
                   static_cast<uint8_t>(waiter->priority) >=
                   static_cast<uint8_t>(priority);
             });
-    if (hasEqualOrHigherPriorityWaiter ||
-        availableBytes < requiredHeadroom ||
+    if (hasEqualOrHigherPriorityWaiter || availableBytes < requiredHeadroom ||
         reserved > availableBytes - requiredHeadroom) {
       return std::nullopt;
     }
@@ -1837,8 +1793,7 @@ tryAcquireBackgroundDeviceMemoryWorkspace(
   return DeviceMemoryWorkspaceReservation{headroom.device, nullptr, bytes};
 }
 
-std::optional<DeviceMemoryWorkspaceReservation>
-tryAcquireDeviceMemoryWorkspace(
+std::optional<DeviceMemoryWorkspaceReservation> tryAcquireDeviceMemoryWorkspace(
     memory::MemoryPool* pool,
     exec::Operator* requestor,
     std::size_t bytes,
@@ -1919,14 +1874,14 @@ tryAcquireDeviceMemoryWorkspace(
                           kDeviceWorkspaceAdvisoryLease)) &&
                     waiter->retryNotBefore <= now &&
                     deviceWorkspaceRequestFits(
-                        *waiter, headroom, reserved, now) &&
+                           *waiter, headroom, reserved, now) &&
                     deviceWorkspaceRequestPrecedes(*waiter, *state, now);
               });
       const bool stateFits =
           deviceWorkspaceRequestFits(*state, headroom, reserved, now);
       if (stateFits && !precedingFittingWaiter) {
-        const auto normalRequiredHeadroom = deviceWorkspaceRequiredHeadroom(
-            bytes, minHeadroomBytes, priority);
+        const auto normalRequiredHeadroom =
+            deviceWorkspaceRequiredHeadroom(bytes, minHeadroomBytes, priority);
         const auto normalAvailableBytes = headroom.allocatableBytes();
         const bool normalHeadroomFits =
             normalAvailableBytes >= normalRequiredHeadroom &&
@@ -1953,8 +1908,7 @@ tryAcquireDeviceMemoryWorkspace(
         queued = true;
       }
     } else {
-      const auto reservedIt =
-          deviceMemoryWorkspaceBytes.find(headroom.device);
+      const auto reservedIt = deviceMemoryWorkspaceBytes.find(headroom.device);
       reserved = reservedIt == deviceMemoryWorkspaceBytes.end()
           ? 0
           : reservedIt->second;
@@ -2039,9 +1993,8 @@ tryAcquireDeviceMemoryWorkspace(
           reservedForPressure = reservedIt->second;
         }
       }
-      const auto physicalRequiredHeadroom =
-          requiredHeadroom > std::numeric_limits<std::size_t>::max() -
-                  reservedForPressure
+      const auto physicalRequiredHeadroom = requiredHeadroom >
+              std::numeric_limits<std::size_t>::max() - reservedForPressure
           ? std::numeric_limits<std::size_t>::max()
           : requiredHeadroom + reservedForPressure;
       if (requestor != nullptr) {
@@ -2100,8 +2053,7 @@ tryAcquireDeviceMemoryWorkspace(
             << (requestor != nullptr ? requestor->taskId() : "unknown")
             << " node="
             << (requestor != nullptr ? requestor->planNodeId() : "unknown")
-            << " bytes=" << bytes
-            << " priority=" << static_cast<int>(priority)
+            << " bytes=" << bytes << " priority=" << static_cast<int>(priority)
             << " previouslyReservedBytes=" << reserved
             << " allocatableBytes=" << headroom.allocatableBytes()
             << " minHeadroomBytes=" << minHeadroomBytes;
@@ -2167,8 +2119,7 @@ bool deviceMemoryDiagnosticsEnabled() {
 
 bool deviceMemoryAttributionEnabled() {
   static const bool enabled = [] {
-    const auto* value =
-        std::getenv("GLUTEN_CUDF_DEVICE_MEMORY_ATTRIBUTION");
+    const auto* value = std::getenv("GLUTEN_CUDF_DEVICE_MEMORY_ATTRIBUTION");
     if (value == nullptr) {
       return false;
     }
@@ -2178,8 +2129,8 @@ bool deviceMemoryAttributionEnabled() {
         normalized.end(),
         normalized.begin(),
         [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    return !normalized.empty() && normalized != "0" &&
-        normalized != "false" && normalized != "off" && normalized != "no";
+    return !normalized.empty() && normalized != "0" && normalized != "false" &&
+        normalized != "off" && normalized != "no";
   }();
   return enabled;
 }
@@ -2319,8 +2270,7 @@ CudaCallDiagnosticScope::CudaCallDiagnosticScope(std::string label)
   if (!enabled) {
     return;
   }
-  const auto* filter =
-      std::getenv("GLUTEN_CUDF_CALL_DIAGNOSTICS_FILTER");
+  const auto* filter = std::getenv("GLUTEN_CUDF_CALL_DIAGNOSTICS_FILTER");
   if (filter != nullptr && *filter != '\0') {
     const std::string_view filters{filter};
     bool matched = false;
@@ -2329,8 +2279,7 @@ CudaCallDiagnosticScope::CudaCallDiagnosticScope(std::string label)
       const auto end = filters.find(',', begin);
       const auto token = filters.substr(
           begin,
-          end == std::string_view::npos ? filters.size() - begin
-                                        : end - begin);
+          end == std::string_view::npos ? filters.size() - begin : end - begin);
       if (!token.empty() && label_.find(token) != std::string::npos) {
         matched = true;
         break;

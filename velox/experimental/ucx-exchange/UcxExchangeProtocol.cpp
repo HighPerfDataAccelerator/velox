@@ -28,8 +28,7 @@ namespace facebook::velox::ucx_exchange {
 namespace {
 class UcxPinnedBufferPool {
  public:
-  UcxPinnedBufferPool(const char* countEnv, const char* label)
-      : label_{label} {
+  UcxPinnedBufferPool(const char* countEnv, const char* label) : label_{label} {
     if (const char* value = std::getenv(countEnv)) {
       char* end = nullptr;
       const auto requested = std::strtoull(value, &end, 10);
@@ -64,8 +63,7 @@ class UcxPinnedBufferPool {
 
     auto& slot = *slots_[available];
     uint8_t* allocation = nullptr;
-    const auto allocationBytes =
-        std::max<uint64_t>(64ULL << 20, requiredBytes);
+    const auto allocationBytes = std::max<uint64_t>(64ULL << 20, requiredBytes);
     const auto status = cudaHostAlloc(
         reinterpret_cast<void**>(&allocation),
         allocationBytes,
@@ -73,9 +71,8 @@ class UcxPinnedBufferPool {
     if (status != cudaSuccess) {
       cudaGetLastError();
       LOG(WARNING) << "Could not allocate " << allocationBytes
-                   << " bytes for UCX " << label_
-                   << " pinned bounce slot " << available
-                   << ": " << cudaGetErrorString(status)
+                   << " bytes for UCX " << label_ << " pinned bounce slot "
+                   << available << ": " << cudaGetErrorString(status)
                    << "; falling back to pageable staging";
       return {};
     }
@@ -132,8 +129,7 @@ UcxPinnedBufferPool& ucxPinnedBufferPool() {
 }
 
 UcxPinnedBufferPool& ucxH2DPinnedBufferPool() {
-  static UcxPinnedBufferPool pool(
-      "GLUTEN_UCX_H2D_PINNED_BUFFER_COUNT", "H2D");
+  static UcxPinnedBufferPool pool("GLUTEN_UCX_H2D_PINNED_BUFFER_COUNT", "H2D");
   return pool;
 }
 } // namespace

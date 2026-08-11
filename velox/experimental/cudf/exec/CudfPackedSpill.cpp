@@ -18,10 +18,14 @@
 
 #include "velox/common/base/Exceptions.h"
 
-#include <folly/executors/CPUThreadPoolExecutor.h>
-
 #include <cuda_runtime_api.h>
+
+#include <fcntl.h>
+#include <folly/executors/CPUThreadPoolExecutor.h>
+#include <linux/falloc.h>
 #include <lz4.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <cerrno>
@@ -29,12 +33,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
-#include <fcntl.h>
-#include <linux/falloc.h>
 #include <limits>
-#include <sys/syscall.h>
-#include <unistd.h>
-
 #include <vector>
 
 namespace facebook::velox::cudf_velox {
@@ -73,8 +72,8 @@ const std::vector<std::string>& packedSpillRoots() {
   static const auto roots = [] {
     auto result = parseRoots(std::getenv("CUDF_PACKED_SPILL_DIRECTORIES"));
     if (result.empty()) {
-      result = parseRoots(
-          std::getenv("CUDF_HASH_JOIN_GRACE_SPILL_DIRECTORIES"));
+      result =
+          parseRoots(std::getenv("CUDF_HASH_JOIN_GRACE_SPILL_DIRECTORIES"));
     }
     return result;
   }();
@@ -148,8 +147,8 @@ class PackedPinnedBufferPool {
         cudaHostAllocDefault);
     if (status != cudaSuccess) {
       LOG(WARNING) << "Could not allocate " << allocationBytes
-                   << " bytes for packed cuDF pinned staging slot "
-                   << available << ": " << cudaGetErrorString(status)
+                   << " bytes for packed cuDF pinned staging slot " << available
+                   << ": " << cudaGetErrorString(status)
                    << "; falling back to pageable staging";
       return {};
     }
@@ -178,8 +177,7 @@ class PackedPinnedBufferPool {
   };
 
   struct Lease {
-    Lease(PackedPinnedBufferPool* pool, size_t slot)
-        : pool(pool), slot(slot) {}
+    Lease(PackedPinnedBufferPool* pool, size_t slot) : pool(pool), slot(slot) {}
     ~Lease() {
       std::lock_guard<std::mutex> lock(pool->mutex_);
       VELOX_CHECK(pool->slots_[slot]->busy);
@@ -230,15 +228,14 @@ CudfPackedSpillFile::~CudfPackedSpillFile() {
   std::error_code error;
   std::filesystem::remove(path_, error);
   if (error) {
-    LOG(WARNING) << "Failed to remove packed cuDF spill file " << path_
-                 << ": " << error.message();
+    LOG(WARNING) << "Failed to remove packed cuDF spill file " << path_ << ": "
+                 << error.message();
   }
   error.clear();
   std::filesystem::remove(std::filesystem::path(path_).parent_path(), error);
 }
 
-std::pair<uint64_t, std::shared_future<void>>
-CudfPackedSpillFile::appendAsync(
+std::pair<uint64_t, std::shared_future<void>> CudfPackedSpillFile::appendAsync(
     std::shared_ptr<uint8_t> data,
     uint64_t bytes) {
   VELOX_CHECK(data != nullptr || bytes == 0);
@@ -246,19 +243,18 @@ CudfPackedSpillFile::appendAsync(
   std::promise<void> completion;
   auto future = completion.get_future().share();
   auto self = shared_from_this();
-  executor_->add(
-      [self = std::move(self),
-       data = std::move(data),
-       offset,
-       bytes,
-       completion = std::move(completion)]() mutable {
-        try {
-          self->write(offset, bytes, data.get());
-          completion.set_value();
-        } catch (...) {
-          completion.set_exception(std::current_exception());
-        }
-      });
+  executor_->add([self = std::move(self),
+                  data = std::move(data),
+                  offset,
+                  bytes,
+                  completion = std::move(completion)]() mutable {
+    try {
+      self->write(offset, bytes, data.get());
+      completion.set_value();
+    } catch (...) {
+      completion.set_exception(std::current_exception());
+    }
+  });
   return {offset, std::move(future)};
 }
 
@@ -275,54 +271,50 @@ CudfPackedSpillFile::appendCompressedAsync(
   std::promise<CudfPackedSpillWriteResult> completion;
   auto future = completion.get_future().share();
   auto self = shared_from_this();
-  executor_->add(
-      [self = std::move(self),
-       data = std::move(data),
-       bytes,
-       enableCompression,
-        completion = std::move(completion)]() mutable {
-        try {
-          std::vector<uint8_t> compressed;
-          int compressedBytes = 0;
-          uint64_t compressionMicros = 0;
-          if (enableCompression) {
-            const auto compressionStart = std::chrono::steady_clock::now();
-            compressed.resize(static_cast<size_t>(
-                LZ4_compressBound(static_cast<int>(bytes))));
-            compressedBytes = LZ4_compress_default(
-                reinterpret_cast<const char*>(data.get()),
-                reinterpret_cast<char*>(compressed.data()),
-                static_cast<int>(bytes),
-                static_cast<int>(compressed.size()));
-            compressionMicros =
-                std::chrono::duration_cast<std::chrono::microseconds>(
-                    std::chrono::steady_clock::now() - compressionStart)
-                    .count();
-          }
-          const bool useCompressed = enableCompression &&
-              compressedBytes > 0 &&
-              static_cast<uint64_t>(compressedBytes) < bytes;
-          const auto storedBytes = useCompressed
-              ? static_cast<uint64_t>(compressedBytes)
-              : bytes;
-          const auto offset = self->reserveOffset(storedBytes);
-          self->write(
-              offset,
-              storedBytes,
-              useCompressed ? compressed.data() : data.get());
-          // The promise is the write-completion boundary used by restore.
-          // Release a pooled pinned D2H source before waking that restore so
-          // it can immediately reuse the slot as an H2D bounce slab.
-          data.reset();
-          completion.set_value(CudfPackedSpillWriteResult{
+  executor_->add([self = std::move(self),
+                  data = std::move(data),
+                  bytes,
+                  enableCompression,
+                  completion = std::move(completion)]() mutable {
+    try {
+      std::vector<uint8_t> compressed;
+      int compressedBytes = 0;
+      uint64_t compressionMicros = 0;
+      if (enableCompression) {
+        const auto compressionStart = std::chrono::steady_clock::now();
+        compressed.resize(
+            static_cast<size_t>(LZ4_compressBound(static_cast<int>(bytes))));
+        compressedBytes = LZ4_compress_default(
+            reinterpret_cast<const char*>(data.get()),
+            reinterpret_cast<char*>(compressed.data()),
+            static_cast<int>(bytes),
+            static_cast<int>(compressed.size()));
+        compressionMicros =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - compressionStart)
+                .count();
+      }
+      const bool useCompressed = enableCompression && compressedBytes > 0 &&
+          static_cast<uint64_t>(compressedBytes) < bytes;
+      const auto storedBytes =
+          useCompressed ? static_cast<uint64_t>(compressedBytes) : bytes;
+      const auto offset = self->reserveOffset(storedBytes);
+      self->write(
+          offset, storedBytes, useCompressed ? compressed.data() : data.get());
+      // The promise is the write-completion boundary used by restore.
+      // Release a pooled pinned D2H source before waking that restore so
+      // it can immediately reuse the slot as an H2D bounce slab.
+      data.reset();
+      completion.set_value(
+          CudfPackedSpillWriteResult{
               offset,
               storedBytes,
               static_cast<uint64_t>(compressionMicros),
               useCompressed});
-        } catch (...) {
-          completion.set_exception(std::current_exception());
-        }
-      });
+    } catch (...) {
+      completion.set_exception(std::current_exception());
+    }
+  });
   return future;
 }
 
@@ -373,9 +365,9 @@ void CudfPackedSpillFile::reclaim(uint64_t offset, uint64_t bytes) {
   if (rc != 0) {
     if (!reclaimWarningLogged_) {
       reclaimWarningLogged_ = true;
-      LOG(WARNING) << "Failed to reclaim packed cuDF spill range file="
-                   << path_ << " offset=" << offset << " bytes=" << bytes
-                   << ": " << std::strerror(savedErrno);
+      LOG(WARNING) << "Failed to reclaim packed cuDF spill range file=" << path_
+                   << " offset=" << offset << " bytes=" << bytes << ": "
+                   << std::strerror(savedErrno);
     }
     return;
   }
@@ -393,8 +385,7 @@ void CudfPackedSpillFile::ensureOpenLocked() {
   }
   std::filesystem::create_directories(
       std::filesystem::path(path_).parent_path());
-  dataFd_ =
-      ::open(path_.c_str(), O_CREAT | O_TRUNC | O_RDWR | O_CLOEXEC, 0600);
+  dataFd_ = ::open(path_.c_str(), O_CREAT | O_TRUNC | O_RDWR | O_CLOEXEC, 0600);
   VELOX_CHECK_GE(
       dataFd_,
       0,
@@ -460,8 +451,8 @@ std::string makeCudfPackedSpillPath(
   if (roots.empty()) {
     return fmt::format("{}/{}", taskSpillDirectory, filename);
   }
-  const auto taskHash = static_cast<uint64_t>(
-      std::hash<std::string>{}(taskSpillDirectory));
+  const auto taskHash =
+      static_cast<uint64_t>(std::hash<std::string>{}(taskSpillDirectory));
   const auto& root = roots[stripeKey % roots.size()];
   const auto taskKey = fmt::format("task-{:016x}", taskHash);
   return (std::filesystem::path(root) / taskKey / filename).string();
@@ -475,7 +466,8 @@ std::shared_ptr<CudfPackedSpillFile> createCudfPackedSpillFile(
   return std::make_shared<CudfPackedSpillFile>(
       makeCudfPackedSpillPath(taskSpillDirectory, filename, stripeKey),
       spillConfig == nullptr ? nullptr : spillConfig->executor,
-      spillConfig == nullptr ? nullptr : spillConfig->updateAndCheckSpillLimitCb);
+      spillConfig == nullptr ? nullptr
+                             : spillConfig->updateAndCheckSpillLimitCb);
 }
 
 std::shared_ptr<void> tryReserveCudfPackedHostMemory(
@@ -502,8 +494,7 @@ uint64_t currentCudfPackedHostMemoryReservedBytes() {
   return packedHostMemoryReservedBytes().load(std::memory_order_acquire);
 }
 
-std::shared_ptr<uint8_t> acquireCudfPackedPinnedBuffer(
-    uint64_t requiredBytes) {
+std::shared_ptr<uint8_t> acquireCudfPackedPinnedBuffer(uint64_t requiredBytes) {
   return packedPinnedBufferPool().acquire(requiredBytes);
 }
 

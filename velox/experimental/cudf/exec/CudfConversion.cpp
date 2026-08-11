@@ -96,12 +96,11 @@ CudfFromVelox::CudfFromVelox(
           result.planNodeId = parentId;
           return std::vector<exec::OperatorStats>{std::move(result)};
         });
-      });
+  });
 }
 
 vector_size_t CudfFromVelox::preferredBatchRows() const {
-  return preferredGpuBatchSizeRows(
-      operatorCtx_->driverCtx()->queryConfig());
+  return preferredGpuBatchSizeRows(operatorCtx_->driverCtx()->queryConfig());
 }
 
 uint64_t CudfFromVelox::maxBatchBytes() const {
@@ -169,13 +168,11 @@ RowVectorPtr CudfFromVelox::doGetOutput() {
   for (const auto& input : inputs_) {
     const auto inputSize = static_cast<vector_size_t>(input->size());
     const auto inputBytes = input->estimateFlatSize();
-    const bool wouldExceedRows =
-        totalSize > 0 &&
+    const bool wouldExceedRows = totalSize > 0 &&
         (totalSize >= targetOutputSize ||
          inputSize > targetOutputSize - totalSize ||
          inputSize > maxVectorSize - totalSize);
-    const bool wouldExceedBytes =
-        totalBytes > 0 &&
+    const bool wouldExceedBytes = totalBytes > 0 &&
         (inputBytes > targetOutputBytes ||
          totalBytes > targetOutputBytes - inputBytes);
     if (wouldExceedRows || wouldExceedBytes) {
@@ -298,8 +295,7 @@ uint64_t CudfToVelox::maxBatchBytes() const {
 
 vector_size_t CudfToVelox::nextBatchRows() const {
   VELOX_CHECK_NOT_NULL(cudfBuffer_);
-  const auto totalRows =
-      static_cast<vector_size_t>(cudfBuffer_->size());
+  const auto totalRows = static_cast<vector_size_t>(cudfBuffer_->size());
   VELOX_CHECK_LT(cudfOffset_, totalRows);
   const auto remaining = totalRows - cudfOffset_;
   const auto flatBytes =
@@ -308,15 +304,12 @@ vector_size_t CudfToVelox::nextBatchRows() const {
   const auto averageRowBytes =
       std::max<uint64_t>(1, (flatBytes + totalRows - 1) / totalRows);
   const auto byteBoundRows = std::max<vector_size_t>(
-      1,
-      std::min<uint64_t>(
-          remaining, maxBatchBytes() / averageRowBytes));
+      1, std::min<uint64_t>(remaining, maxBatchBytes() / averageRowBytes));
   if (isPassthroughMode()) {
     return byteBoundRows;
   }
   return std::min(
-      byteBoundRows,
-      outputBatchRows(std::optional<uint64_t>{averageRowBytes}));
+      byteBoundRows, outputBatchRows(std::optional<uint64_t>{averageRowBytes}));
 }
 
 // Slice on GPU first, then convert only the bounded view. Converting the

@@ -24,8 +24,9 @@
 #include "velox/core/PlanNode.h"
 #include "velox/exec/Operator.h"
 
-#include <glog/logging.h>
 #include <cudf/utilities/error.hpp>
+
+#include <glog/logging.h>
 
 #include <cstdlib>
 #include <type_traits>
@@ -144,22 +145,22 @@ class CudfOperatorBase : public exec::Operator, public NvtxHelper {
     // Driver and have it reclaimed at the next operator boundary.
     if (auto* devicePool = customPool(kCudfDeviceMemoryResourceTag);
         devicePool != nullptr && devicePool->reclaimer() == nullptr) {
-      devicePool->setReclaimer(exec::Operator::MemoryReclaimer::create(
-          driverCtx, this, devicePool));
+      devicePool->setReclaimer(
+          exec::Operator::MemoryReclaimer::create(driverCtx, this, devicePool));
     }
     if (auto* devicePool = customPool(kCudfDeviceMemoryResourceTag);
         devicePool != nullptr) {
-      deviceMemoryReclaimer_ =
-          registerDeviceMemoryReclaimer(this, devicePool);
+      deviceMemoryReclaimer_ = registerDeviceMemoryReclaimer(this, devicePool);
     }
   }
 
   void addInput(RowVectorPtr input) final {
-    CudaCallDiagnosticScope callDiagnostic(fmt::format(
-        "operator={} node={} instance={} method=addInput",
-        className_,
-        planNodeId_,
-        static_cast<const void*>(this)));
+    CudaCallDiagnosticScope callDiagnostic(
+        fmt::format(
+            "operator={} node={} instance={} method=addInput",
+            className_,
+            planNodeId_,
+            static_cast<const void*>(this)));
     VELOX_NVTX_OPERATOR_FUNC_RANGE_IF(
         nvtxMethods_ & NvtxMethodFlag::kAddInput, className_);
     CudaAllocationTraceScope allocationTrace(
@@ -191,11 +192,12 @@ class CudfOperatorBase : public exec::Operator, public NvtxHelper {
   }
 
   RowVectorPtr getOutput() final {
-    CudaCallDiagnosticScope callDiagnostic(fmt::format(
-        "operator={} node={} instance={} method=getOutput",
-        className_,
-        planNodeId_,
-        static_cast<const void*>(this)));
+    CudaCallDiagnosticScope callDiagnostic(
+        fmt::format(
+            "operator={} node={} instance={} method=getOutput",
+            className_,
+            planNodeId_,
+            static_cast<const void*>(this)));
     VELOX_NVTX_OPERATOR_FUNC_RANGE_IF(
         nvtxMethods_ & NvtxMethodFlag::kGetOutput, className_);
     CudaAllocationTraceScope allocationTrace(
@@ -228,11 +230,12 @@ class CudfOperatorBase : public exec::Operator, public NvtxHelper {
   }
 
   void noMoreInput() final {
-    CudaCallDiagnosticScope callDiagnostic(fmt::format(
-        "operator={} node={} instance={} method=noMoreInput",
-        className_,
-        planNodeId_,
-        static_cast<const void*>(this)));
+    CudaCallDiagnosticScope callDiagnostic(
+        fmt::format(
+            "operator={} node={} instance={} method=noMoreInput",
+            className_,
+            planNodeId_,
+            static_cast<const void*>(this)));
     VELOX_NVTX_OPERATOR_FUNC_RANGE_IF(
         nvtxMethods_ & NvtxMethodFlag::kNoMoreInput, className_);
     serviceDeviceMemoryReclaimer(

@@ -71,7 +71,6 @@ UcxExchange::UcxExchange(
         1 // number of consumers, is always 1.
     );
   }
-
 }
 
 UcxExchange::~UcxExchange() {
@@ -172,8 +171,7 @@ BlockingReason UcxExchange::isBlocked(ContinueFuture* future) {
         pool(),
         this,
         currentData_->dataSize(),
-        cudf_velox::CudfConfig::getInstance()
-            .deviceMemoryMinHeadroomBytes,
+        cudf_velox::CudfConfig::getInstance().deviceMemoryMinHeadroomBytes,
         // This replaces an already-dequeued host receive page with its device
         // representation. Admit it ahead of ordinary ingestion so the page
         // can reach its consumer and release the bounce-buffer credit, while
@@ -246,12 +244,9 @@ RowVectorPtr UcxExchange::getOutputFromPackedTable() {
     VELOX_CHECK_NOT_NULL(data.hostMetadata);
     const auto copyStart = std::chrono::steady_clock::now();
     auto deviceData = std::make_unique<rmm::device_buffer>(
-        data.hostDataSize,
-        data.stream,
-        cudf_velox::get_temp_mr());
+        data.hostDataSize, data.stream, cudf_velox::get_temp_mr());
     auto h2dBounce = data.hostDataPinned ||
-            data.hostDataSize <=
-                static_cast<size_t>(kDeviceEagerHostStageBytes)
+            data.hostDataSize <= static_cast<size_t>(kDeviceEagerHostStageBytes)
         ? std::shared_ptr<uint8_t>{}
         : acquireUcxH2DPinnedBuffer(data.hostDataSize);
     const void* h2dSource = data.hostData.get();
@@ -283,10 +278,9 @@ RowVectorPtr UcxExchange::getOutputFromPackedTable() {
         cudaMemcpyHostToDevice,
         data.stream.value()));
     data.stream.synchronize();
-    const auto copyNanos =
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now() - copyStart)
-            .count();
+    const auto copyNanos = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               std::chrono::steady_clock::now() - copyStart)
+                               .count();
     addRuntimeStat(
         "ucxDeferredHostCopyBytes",
         RuntimeCounter(data.hostDataSize, RuntimeCounter::Unit::kBytes));

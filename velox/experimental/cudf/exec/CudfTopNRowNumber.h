@@ -28,8 +28,9 @@
 #include <cudf/packed_types.hpp>
 #include <cudf/types.hpp>
 
-#include <cuda_runtime_api.h>
 #include <rmm/cuda_stream.hpp>
+
+#include <cuda_runtime_api.h>
 
 #include <cstdint>
 #include <deque>
@@ -68,17 +69,15 @@ class CudfTopNRowNumber : public CudfOperatorBase {
   exec::BlockingReason isBlocked(ContinueFuture* future) override;
 
   bool isFinished() override {
-    return finished_ && passthroughOutputs_.empty() &&
-        partialOutputs_.empty();
+    return finished_ && passthroughOutputs_.empty() && partialOutputs_.empty();
   }
 
   bool canReclaim() const override;
 
   bool reclaimableBytes(uint64_t& reclaimableBytes) const override;
 
-  void reclaim(
-      uint64_t targetBytes,
-      memory::MemoryReclaimer::Stats& stats) override;
+  void reclaim(uint64_t targetBytes, memory::MemoryReclaimer::Stats& stats)
+      override;
 
   static bool useBoundedTop1(
       const std::shared_ptr<const core::TopNRowNumberNode>& node);
@@ -145,15 +144,13 @@ class CudfTopNRowNumber : public CudfOperatorBase {
     DeferredDeviceOutput(
         std::unique_ptr<cudf::table> sourceTable,
         cudaEvent_t completionEvent)
-        : table(std::move(sourceTable)),
-          event(completionEvent) {}
+        : table(std::move(sourceTable)), event(completionEvent) {}
 
     DeferredDeviceOutput(const DeferredDeviceOutput&) = delete;
     DeferredDeviceOutput& operator=(const DeferredDeviceOutput&) = delete;
 
     DeferredDeviceOutput(DeferredDeviceOutput&& other) noexcept
-        : table(std::move(other.table)),
-          event(other.event) {
+        : table(std::move(other.table)), event(other.event) {
       other.event = nullptr;
     }
 
@@ -203,8 +200,8 @@ class CudfTopNRowNumber : public CudfOperatorBase {
           event(completionEvent) {}
 
     DeferredFinalizeOwnership(const DeferredFinalizeOwnership&) = delete;
-    DeferredFinalizeOwnership& operator=(
-        const DeferredFinalizeOwnership&) = delete;
+    DeferredFinalizeOwnership& operator=(const DeferredFinalizeOwnership&) =
+        delete;
 
     DeferredFinalizeOwnership(DeferredFinalizeOwnership&& other) noexcept
         : restored(std::move(other.restored)),
@@ -281,9 +278,7 @@ class CudfTopNRowNumber : public CudfOperatorBase {
       cudf::packed_table packed,
       size_t bucket,
       rmm::cuda_stream_view stream);
-  void spillDevicePartition(
-      size_t bucket,
-      rmm::cuda_stream_view stream);
+  void spillDevicePartition(size_t bucket, rmm::cuda_stream_view stream);
   void spillDevicePartitions(
       const std::vector<size_t>& buckets,
       rmm::cuda_stream_view stream);
@@ -304,9 +299,7 @@ class CudfTopNRowNumber : public CudfOperatorBase {
   CudfPackedHostRestoreChunk prepareHostChunkForBulkRestore(
       HostPackedChunk chunk);
   CudfPackedHostRestoreChunk materializeHostChunk(HostPackedChunk chunk);
-  void materializeDiskChunkInto(
-      HostPackedChunk chunk,
-      uint8_t* destination);
+  void materializeDiskChunkInto(HostPackedChunk chunk, uint8_t* destination);
   std::unique_ptr<cudf::packed_table> restoreHostChunk(
       HostPackedChunk chunk,
       rmm::cuda_stream_view stream,
@@ -476,8 +469,7 @@ class CudfTopNRowNumber : public CudfOperatorBase {
   // Narrow partition keys are hash-partitioned independently of the wide
   // arrival-order payload. Equal keys always land in the same bucket, so
   // exact distinct_count can prove uniqueness one bounded bucket at a time.
-  std::vector<std::vector<HostPackedChunk>>
-      sequentialUniqueKeyPartitions_;
+  std::vector<std::vector<HostPackedChunk>> sequentialUniqueKeyPartitions_;
   // Once duplicate keys are known, move the untouched arrival-order payload
   // out of the normal candidate buckets. This frees those buckets to receive
   // only sparse duplicate rows while the wide runs are restored one chunk at
@@ -489,8 +481,7 @@ class CudfTopNRowNumber : public CudfOperatorBase {
   // aside and convert one bounded packed chunk at a time during drain, where
   // every restore/hash wave first acquires the shared drain-workspace lease.
   std::vector<HostPackedChunk> sequentialDensePrefixHost_;
-  std::vector<std::unique_ptr<cudf::table>>
-      sequentialDuplicateKeyTables_;
+  std::vector<std::unique_ptr<cudf::table>> sequentialDuplicateKeyTables_;
   std::unique_ptr<cudf::table> sequentialDuplicateKeys_;
   std::unique_ptr<cudf::filtered_join> sequentialDuplicateFilter_;
   std::shared_ptr<rmm::cuda_stream> sequentialSparseStream_;

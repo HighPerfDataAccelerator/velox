@@ -69,19 +69,14 @@ class LocalDeviceOutputQueueManager {
       std::string_view taskId,
       uint32_t newNumDrivers);
 
-  void enqueue(
-      std::string_view taskId,
-      int destination,
-      RowVectorPtr data);
+  void enqueue(std::string_view taskId, int destination, RowVectorPtr data);
 
   bool checkBlocked(std::string_view taskId, ContinueFuture* future);
 
   void noMoreData(std::string_view taskId);
 
-  FetchResult tryGetData(
-      std::string_view taskId,
-      int destination,
-      int64_t sequence);
+  FetchResult
+  tryGetData(std::string_view taskId, int destination, int64_t sequence);
 
   void deleteResults(std::string_view taskId, int destination);
 

@@ -48,9 +48,8 @@ streamOwnerRegistry() {
   // background thread.  A process owns only a small bounded set of these
   // operator output streams, so retaining them is preferable to destroying a
   // stream while an asynchronously published buffer still references it.
-  static auto* registry = new std::unordered_map<
-      cudaStream_t,
-      std::shared_ptr<rmm::cuda_stream>>();
+  static auto* registry =
+      new std::unordered_map<cudaStream_t, std::shared_ptr<rmm::cuda_stream>>();
   return *registry;
 }
 

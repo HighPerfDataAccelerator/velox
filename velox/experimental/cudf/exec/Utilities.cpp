@@ -215,8 +215,7 @@ bool hasSameEmptyStringCharsPattern(
     return false;
   }
   for (cudf::size_type i = 0; i < left.num_columns(); ++i) {
-    if (!hasSameEmptyStringCharsPattern(
-            left.column(i), right.column(i))) {
+    if (!hasSameEmptyStringCharsPattern(left.column(i), right.column(i))) {
       return false;
     }
   }
@@ -315,8 +314,7 @@ std::unique_ptr<cudf::column> makeAllNullColumnForType(
     rmm::device_async_resource_ref mr) {
   VELOX_CHECK_GE(size, 0);
   auto zeroOffsets = [&]() {
-    std::vector<cudf::size_type> offsets(
-        static_cast<size_t>(size) + 1, 0);
+    std::vector<cudf::size_type> offsets(static_cast<size_t>(size) + 1, 0);
     rmm::device_buffer offsetsBuffer(
         offsets.data(), offsets.size() * sizeof(cudf::size_type), stream, mr);
     return std::make_unique<cudf::column>(
@@ -327,8 +325,7 @@ std::unique_ptr<cudf::column> makeAllNullColumnForType(
         0);
   };
   auto allNullMask = [&]() {
-    return cudf::create_null_mask(
-        size, cudf::mask_state::ALL_NULL, stream, mr);
+    return cudf::create_null_mask(size, cudf::mask_state::ALL_NULL, stream, mr);
   };
 
   switch (type->kind()) {
@@ -342,11 +339,7 @@ std::unique_ptr<cudf::column> makeAllNullColumnForType(
     case TypeKind::VARCHAR:
     case TypeKind::VARBINARY:
       return cudf::make_strings_column(
-          size,
-          zeroOffsets(),
-          rmm::device_buffer{},
-          size,
-          allNullMask());
+          size, zeroOffsets(), rmm::device_buffer{}, size, allNullMask());
     case TypeKind::ARRAY:
       return cudf::make_lists_column(
           size,
@@ -361,18 +354,14 @@ std::unique_ptr<cudf::column> makeAllNullColumnForType(
       auto entryStruct = cudf::make_structs_column(
           0, std::move(entries), 0, rmm::device_buffer{}, stream, mr);
       return cudf::make_lists_column(
-          size,
-          zeroOffsets(),
-          std::move(entryStruct),
-          size,
-          allNullMask());
+          size, zeroOffsets(), std::move(entryStruct), size, allNullMask());
     }
     case TypeKind::ROW: {
       std::vector<std::unique_ptr<cudf::column>> children;
       children.reserve(type->size());
       for (size_t i = 0; i < type->size(); ++i) {
-        children.push_back(makeAllNullColumnForType(
-            type->childAt(i), size, stream, mr));
+        children.push_back(
+            makeAllNullColumnForType(type->childAt(i), size, stream, mr));
       }
       return cudf::make_structs_column(
           size, std::move(children), size, allNullMask(), stream, mr);
@@ -519,15 +508,14 @@ std::vector<std::unique_ptr<cudf::table>> getConcatenatedTableBatched(
           (runningRows + numRows > maxRows ||
            !hasSameEmptyStringCharsPattern(
                boundedViews[startpos], boundedViews[i]) ||
-           estimatedBytes >
-               kMaxSafeConcatEstimatedBytes -
-                   std::min(
-                       runningBytes, kMaxSafeConcatEstimatedBytes))) {
-        outputTables.push_back(cudf::concatenate(
-            std::vector<cudf::table_view>(
-                boundedViews.begin() + startpos, boundedViews.begin() + i),
-            stream,
-            mr));
+           estimatedBytes > kMaxSafeConcatEstimatedBytes -
+                   std::min(runningBytes, kMaxSafeConcatEstimatedBytes))) {
+        outputTables.push_back(
+            cudf::concatenate(
+                std::vector<cudf::table_view>(
+                    boundedViews.begin() + startpos, boundedViews.begin() + i),
+                stream,
+                mr));
         startpos = i;
         runningRows = 0;
         runningBytes = 0;
@@ -537,11 +525,12 @@ std::vector<std::unique_ptr<cudf::table>> getConcatenatedTableBatched(
     }
     // Flush the final batch [startpos, end).
     if (startpos < boundedViews.size()) {
-      outputTables.push_back(cudf::concatenate(
-          std::vector<cudf::table_view>(
-              boundedViews.begin() + startpos, boundedViews.end()),
-          stream,
-          mr));
+      outputTables.push_back(
+          cudf::concatenate(
+              std::vector<cudf::table_view>(
+                  boundedViews.begin() + startpos, boundedViews.end()),
+              stream,
+              mr));
     }
     orderCudfVectorDeallocationsAfterStream(tables, inputStreams, stream);
 

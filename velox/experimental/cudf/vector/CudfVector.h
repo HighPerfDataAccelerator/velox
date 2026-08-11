@@ -22,8 +22,8 @@
 #include <cudf/contiguous_split.hpp>
 #include <cudf/table/table.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/cuda_stream.hpp>
+#include <rmm/cuda_stream_view.hpp>
 
 #include <memory>
 #include <utility>

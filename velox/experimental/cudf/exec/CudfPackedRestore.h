@@ -17,10 +17,11 @@
 #pragma once
 
 #include <cudf/table/table_view.hpp>
+
 #include <rmm/device_buffer.hpp>
 
-#include <cstdint>
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <vector>
@@ -92,8 +93,7 @@ class CudfBulkPackedRestore {
  public:
   CudfBulkPackedRestore() = default;
   CudfBulkPackedRestore(CudfBulkPackedRestore&&) noexcept = default;
-  CudfBulkPackedRestore& operator=(CudfBulkPackedRestore&&) noexcept =
-      default;
+  CudfBulkPackedRestore& operator=(CudfBulkPackedRestore&&) noexcept = default;
   CudfBulkPackedRestore(const CudfBulkPackedRestore&) = delete;
   CudfBulkPackedRestore& operator=(const CudfBulkPackedRestore&) = delete;
 

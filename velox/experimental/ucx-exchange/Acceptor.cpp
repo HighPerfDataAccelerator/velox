@@ -95,8 +95,7 @@ void Acceptor::cStyleAMCallback(
         std::memchr(handshake.taskId, '\0', sizeof(handshake.taskId)));
     VELOX_CHECK_NOT_NULL(taskIdEnd, "Handshake task id is not NUL terminated");
     VELOX_CHECK_GT(taskIdEnd, handshake.taskId, "Handshake task id is empty");
-    const bool isCancel =
-        (handshake.destination & kCancelDestinationFlag) != 0;
+    const bool isCancel = (handshake.destination & kCancelDestinationFlag) != 0;
     const uint32_t destination =
         handshake.destination & ~kCancelDestinationFlag;
     VELOX_CHECK_LT(

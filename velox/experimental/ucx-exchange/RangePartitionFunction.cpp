@@ -163,8 +163,8 @@ std::unique_ptr<cudf::column> makeRangePartitionIds(
     int32_t splitStart,
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr) {
-  auto lower = cudf::lower_bound(
-      boundaries, keys, orders, nullOrders, stream, mr);
+  auto lower =
+      cudf::lower_bound(boundaries, keys, orders, nullOrders, stream, mr);
   if (!splitEqualKeys || keys.num_rows() == 0) {
     return lower;
   }
@@ -172,8 +172,8 @@ std::unique_ptr<cudf::column> makeRangePartitionIds(
   // For a key equal to r repeated boundaries, lower_bound and upper_bound
   // differ by r. Stripe only that equality span. A non-boundary key has a
   // zero-width span and therefore keeps its ordinary lower-bound partition.
-  auto upper = cudf::upper_bound(
-      boundaries, keys, orders, nullOrders, stream, mr);
+  auto upper =
+      cudf::upper_bound(boundaries, keys, orders, nullOrders, stream, mr);
   const auto int32Type = cudf::data_type{cudf::type_id::INT32};
   auto widths = cudf::binary_operation(
       upper->view(),

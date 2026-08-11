@@ -26,10 +26,11 @@
 #include <cudf/table/table.hpp>
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/memory_resource.hpp>
-#include <gtest/gtest.h>
-#include <lz4.h>
 
 #include <cuda_runtime_api.h>
+
+#include <gtest/gtest.h>
+#include <lz4.h>
 
 #include <chrono>
 #include <cstdlib>
@@ -55,13 +56,14 @@ CudfPackedMicroBucketDescriptor microBucket(uint64_t id, uint64_t bytes) {
   bucket.rows = bytes;
   bucket.restoreBytes = bytes;
   bucket.storedBytes = bytes;
-  bucket.extents.push_back(CudfPackedMicroBucketExtent{
-      CudfPackedMicroBucketExtent::Tier::kHost,
-      std::move(metadata),
-      std::move(storage),
-      0,
-      bytes,
-      bytes});
+  bucket.extents.push_back(
+      CudfPackedMicroBucketExtent{
+          CudfPackedMicroBucketExtent::Tier::kHost,
+          std::move(metadata),
+          std::move(storage),
+          0,
+          bytes,
+          bytes});
   return bucket;
 }
 
@@ -167,14 +169,10 @@ TEST(CudfPackedSpillTest, microBucketHashBitsFollowObservedBytes) {
   constexpr uint64_t kGiB = uint64_t{1} << 30;
   constexpr uint64_t kMiB = uint64_t{1} << 20;
   EXPECT_EQ(
-      chooseCudfPackedMicroBucketHashBits(594 * kGiB, 512 * kMiB, 7, 12),
-      11);
+      chooseCudfPackedMicroBucketHashBits(594 * kGiB, 512 * kMiB, 7, 12), 11);
   EXPECT_EQ(
-      chooseCudfPackedMicroBucketHashBits(1 * kGiB, 512 * kMiB, 7, 12),
-      7);
-  EXPECT_EQ(
-      chooseCudfPackedMicroBucketHashBits(8 * kGiB, 1 * kMiB, 7, 12),
-      12);
+      chooseCudfPackedMicroBucketHashBits(1 * kGiB, 512 * kMiB, 7, 12), 7);
+  EXPECT_EQ(chooseCudfPackedMicroBucketHashBits(8 * kGiB, 1 * kMiB, 7, 12), 12);
 }
 
 TEST(CudfPackedSpillTest, asyncOffsetLocalRoundTripAndCleanup) {
@@ -183,9 +181,7 @@ TEST(CudfPackedSpillTest, asyncOffsetLocalRoundTripAndCleanup) {
       (std::filesystem::path(directory->getPath()) / "packed.bin").string();
   uint64_t accountedBytes = 0;
   auto file = std::make_shared<CudfPackedSpillFile>(
-      path,
-      nullptr,
-      [&](uint64_t bytes) { accountedBytes += bytes; });
+      path, nullptr, [&](uint64_t bytes) { accountedBytes += bytes; });
 
   auto first = std::shared_ptr<uint8_t>(
       new uint8_t[4]{1, 2, 3, 4}, std::default_delete<uint8_t[]>());
@@ -229,8 +225,7 @@ TEST(CudfPackedSpillTest, asynchronousCompressionRoundTrip) {
   auto directory = common::testutil::TempDirectoryPath::create();
   const auto path =
       (std::filesystem::path(directory->getPath()) / "compressed.bin").string();
-  auto file =
-      std::make_shared<CudfPackedSpillFile>(path, nullptr, nullptr);
+  auto file = std::make_shared<CudfPackedSpillFile>(path, nullptr, nullptr);
   constexpr uint64_t kBytes = 1 << 20;
   auto source = std::shared_ptr<uint8_t>(
       new uint8_t[kBytes], std::default_delete<uint8_t[]>());
@@ -255,17 +250,14 @@ TEST(CudfPackedSpillTest, asynchronousCompressionRoundTrip) {
 TEST(CudfPackedSpillTest, asynchronousRawResultRoundTrip) {
   auto directory = common::testutil::TempDirectoryPath::create();
   const auto path =
-      (std::filesystem::path(directory->getPath()) / "raw-result.bin")
-          .string();
-  auto file =
-      std::make_shared<CudfPackedSpillFile>(path, nullptr, nullptr);
+      (std::filesystem::path(directory->getPath()) / "raw-result.bin").string();
+  auto file = std::make_shared<CudfPackedSpillFile>(path, nullptr, nullptr);
   constexpr uint64_t kBytes = 1 << 20;
   auto source = std::shared_ptr<uint8_t>(
       new uint8_t[kBytes], std::default_delete<uint8_t[]>());
   std::memset(source.get(), 0x5a, kBytes);
 
-  const auto result =
-      file->appendCompressedAsync(source, kBytes, false).get();
+  const auto result = file->appendCompressedAsync(source, kBytes, false).get();
   EXPECT_FALSE(result.compressed);
   EXPECT_EQ(result.storedBytes, kBytes);
   EXPECT_EQ(result.compressionMicros, 0);
@@ -277,8 +269,7 @@ TEST(CudfPackedSpillTest, asynchronousRawResultRoundTrip) {
 TEST(CudfPackedSpillTest, bulkRestoreUsesOneDeviceAllocation) {
   const auto stream = cudf::get_default_stream();
   const auto mr = cudf::get_current_device_resource_ref();
-  const std::vector<std::vector<int32_t>> expected{
-      {1, 2, 3, 4}, {10, 20, 30}};
+  const std::vector<std::vector<int32_t>> expected{{1, 2, 3, 4}, {10, 20, 30}};
   std::vector<CudfPackedHostRestoreChunk> chunks;
   for (const auto& values : expected) {
     auto column = cudf::make_numeric_column(
@@ -311,8 +302,9 @@ TEST(CudfPackedSpillTest, bulkRestoreUsesOneDeviceAllocation) {
             stream.value()),
         cudaSuccess);
     stream.synchronize();
-    chunks.push_back(CudfPackedHostRestoreChunk{
-        std::move(packed.metadata), std::move(hostData), bytes});
+    chunks.push_back(
+        CudfPackedHostRestoreChunk{
+            std::move(packed.metadata), std::move(hostData), bytes});
   }
 
   auto restored =
@@ -321,14 +313,13 @@ TEST(CudfPackedSpillTest, bulkRestoreUsesOneDeviceAllocation) {
   ASSERT_EQ(restored.tables().size(), expected.size());
   const auto* allocationBegin =
       static_cast<const uint8_t*>(restored.deviceBuffer()->data());
-  const auto* allocationEnd =
-      allocationBegin + restored.deviceBuffer()->size();
+  const auto* allocationEnd = allocationBegin + restored.deviceBuffer()->size();
   for (size_t i = 0; i < expected.size(); ++i) {
     const auto& table = restored.tables()[i];
     ASSERT_EQ(table.num_columns(), 1);
     ASSERT_EQ(table.num_rows(), expected[i].size());
-    const auto* columnData = reinterpret_cast<const uint8_t*>(
-        table.column(0).data<int32_t>());
+    const auto* columnData =
+        reinterpret_cast<const uint8_t*>(table.column(0).data<int32_t>());
     EXPECT_GE(columnData, allocationBegin);
     EXPECT_LT(columnData, allocationEnd);
     std::vector<int32_t> actual(expected[i].size());
@@ -382,10 +373,10 @@ TEST(CudfPackedSpillTest, bulkRestoreUsesPinnedBounceForLargePageableWave) {
     CudfPackedHostRestoreChunk restoreChunk;
     restoreChunk.metadata = std::move(packed.metadata);
     restoreChunk.dataBytes = bytes;
-    restoreChunk.materializeIntoPinned =
-        [hostData = std::move(hostData), bytes](uint8_t* destination) {
-          std::memcpy(destination, hostData.get(), bytes);
-        };
+    restoreChunk.materializeIntoPinned = [hostData = std::move(hostData),
+                                          bytes](uint8_t* destination) {
+      std::memcpy(destination, hostData.get(), bytes);
+    };
     chunks.push_back(std::move(restoreChunk));
   }
 
@@ -469,10 +460,10 @@ TEST(CudfPackedSpillTest, singleWaveUsesLastAvailablePinnedBounceSlot) {
   CudfPackedHostRestoreChunk chunk;
   chunk.metadata = std::move(packed.metadata);
   chunk.dataBytes = bytes;
-  chunk.materializeIntoPinned =
-      [hostData = std::move(hostData), bytes](uint8_t* destination) {
-        std::memcpy(destination, hostData.get(), bytes);
-      };
+  chunk.materializeIntoPinned = [hostData = std::move(hostData),
+                                 bytes](uint8_t* destination) {
+    std::memcpy(destination, hostData.get(), bytes);
+  };
   std::vector<CudfPackedHostRestoreChunk> chunks;
   chunks.push_back(std::move(chunk));
   auto restored =
@@ -618,23 +609,24 @@ TEST(CudfPackedSpillTest, bulkRestoreMatchesJob144BucketShape) {
       restoreChunk.metadata =
           std::make_unique<std::vector<uint8_t>>(*packed.metadata);
       restoreChunk.dataBytes = bytes;
-      restoreChunk.materializeIntoPinned =
-          [restoreData, bytes](uint8_t* destination) {
-            std::memcpy(destination, restoreData.get(), bytes);
-          };
+      restoreChunk.materializeIntoPinned = [restoreData,
+                                            bytes](uint8_t* destination) {
+        std::memcpy(destination, restoreData.get(), bytes);
+      };
       chunks.push_back(std::move(restoreChunk));
     } else {
-      chunks.push_back(CudfPackedHostRestoreChunk{
-          std::make_unique<std::vector<uint8_t>>(*packed.metadata),
-          restoreData,
-          bytes});
+      chunks.push_back(
+          CudfPackedHostRestoreChunk{
+              std::make_unique<std::vector<uint8_t>>(*packed.metadata),
+              restoreData,
+              bytes});
     }
   }
 
   const auto* configuredBounce =
       std::getenv("CUDF_PACKED_RESTORE_PINNED_BOUNCE_BYTES");
-  const bool bounceDisabled = configuredBounce != nullptr &&
-      std::string_view(configuredBounce) == "0";
+  const bool bounceDisabled =
+      configuredBounce != nullptr && std::string_view(configuredBounce) == "0";
   if (!bounceDisabled) {
     // Job 144 has already used this process-wide pool for D2H spill before
     // finalize begins. Exclude first-use cudaHostAlloc cost from this
@@ -675,17 +667,12 @@ TEST(CudfPackedSpillTest, bulkRestoreMatchesJob144BucketShape) {
             << " elapsedUs=" << elapsedMicros
             << " sourcePinned=" << sourcePinned
             << " materializer=" << useMaterializer
-            << " pinnedBounceBytes="
-            << restored.stats().pinnedBounceBytes
-            << " pageableDirectBytes="
-            << restored.stats().pageableDirectBytes
-            << " pinnedBounceCopies="
-            << restored.stats().pinnedBounceCopies
+            << " pinnedBounceBytes=" << restored.stats().pinnedBounceBytes
+            << " pageableDirectBytes=" << restored.stats().pageableDirectBytes
+            << " pinnedBounceCopies=" << restored.stats().pinnedBounceCopies
             << " hostStageUs=" << restored.stats().hostStageMicros
-            << " reuseWaitUs="
-            << restored.stats().bounceReuseWaitMicros
-            << " copySyncUs="
-            << restored.stats().copyStreamSynchronizeMicros
+            << " reuseWaitUs=" << restored.stats().bounceReuseWaitMicros
+            << " copySyncUs=" << restored.stats().copyStreamSynchronizeMicros
             << " parallelHostStageGroups="
             << restored.stats().parallelHostStageGroups
             << " parallelHostStageChunks="
@@ -696,8 +683,7 @@ TEST(CudfPackedSpillTest, DISABLED_job144GraceBuildRestoreBenchmark) {
   const auto stream = cudf::get_default_stream();
   const auto mr = cudf::get_current_device_resource_ref();
   size_t numChunks = 34;
-  if (const auto* value =
-          std::getenv("CUDF_PACKED_RESTORE_BENCH_CHUNKS")) {
+  if (const auto* value = std::getenv("CUDF_PACKED_RESTORE_BENCH_CHUNKS")) {
     char* end = nullptr;
     const auto requested = std::strtoull(value, &end, 10);
     if (end != value && *end == '\0' && requested > 0 && requested <= 68) {
@@ -742,18 +728,16 @@ TEST(CudfPackedSpillTest, DISABLED_job144GraceBuildRestoreBenchmark) {
   first.reset();
   second.reset();
 
-  const auto* legacyValue =
-      std::getenv("CUDF_PACKED_RESTORE_BENCH_LEGACY");
-  const bool legacy = legacyValue != nullptr &&
-      std::string_view(legacyValue) == "1";
-  const auto* residentValue =
-      std::getenv("CUDF_PACKED_RESTORE_BENCH_RESIDENT");
-  const bool resident = residentValue != nullptr &&
-      std::string_view(residentValue) == "1";
+  const auto* legacyValue = std::getenv("CUDF_PACKED_RESTORE_BENCH_LEGACY");
+  const bool legacy =
+      legacyValue != nullptr && std::string_view(legacyValue) == "1";
+  const auto* residentValue = std::getenv("CUDF_PACKED_RESTORE_BENCH_RESIDENT");
+  const bool resident =
+      residentValue != nullptr && std::string_view(residentValue) == "1";
   const auto* prePinnedValue =
       std::getenv("CUDF_PACKED_RESTORE_BENCH_PREPINNED");
-  const bool prePinned = prePinnedValue != nullptr &&
-      std::string_view(prePinnedValue) == "1";
+  const bool prePinned =
+      prePinnedValue != nullptr && std::string_view(prePinnedValue) == "1";
   const auto* residentBounceValue =
       std::getenv("CUDF_PACKED_RESTORE_BENCH_RESIDENT_BOUNCE");
   const bool residentBounce = residentBounceValue != nullptr &&
@@ -782,8 +766,7 @@ TEST(CudfPackedSpillTest, DISABLED_job144GraceBuildRestoreBenchmark) {
         std::memcpy(pinned.get(), hostData.get(), bytes);
         sourceData = pinned.get();
       }
-      auto gpuData =
-          std::make_unique<rmm::device_buffer>(bytes, stream, mr);
+      auto gpuData = std::make_unique<rmm::device_buffer>(bytes, stream, mr);
       CUDF_CUDA_TRY(cudaMemcpyAsync(
           gpuData->data(),
           sourceData,
@@ -795,8 +778,9 @@ TEST(CudfPackedSpillTest, DISABLED_job144GraceBuildRestoreBenchmark) {
           std::make_unique<std::vector<uint8_t>>(*packed.metadata),
           std::move(gpuData)};
       auto view = cudf::unpack(restoredColumns);
-      restored.push_back(std::make_unique<cudf::packed_table>(
-          cudf::packed_table{view, std::move(restoredColumns)}));
+      restored.push_back(
+          std::make_unique<cudf::packed_table>(
+              cudf::packed_table{view, std::move(restoredColumns)}));
       views.push_back(restored.back()->table);
     }
     combined = cudf::concatenate(views, stream, mr);
@@ -813,10 +797,10 @@ TEST(CudfPackedSpillTest, DISABLED_job144GraceBuildRestoreBenchmark) {
         restoreChunk.data = directData;
         restoreChunk.stageResidentPageableThroughPinned = residentBounce;
       } else {
-        restoreChunk.materializeIntoPinned =
-            [hostData, bytes](uint8_t* destination) {
-              std::memcpy(destination, hostData.get(), bytes);
-            };
+        restoreChunk.materializeIntoPinned = [hostData,
+                                              bytes](uint8_t* destination) {
+          std::memcpy(destination, hostData.get(), bytes);
+        };
       }
       chunks.push_back(std::move(restoreChunk));
     }
@@ -847,12 +831,10 @@ TEST(CudfPackedSpillTest, DISABLED_job144GraceBuildRestoreBenchmark) {
   EXPECT_EQ(firstValue, 144);
   EXPECT_EQ(lastValue, 144);
   std::cout << "Job144 Grace build restore benchmark mode="
-            << (legacy ? "legacy" : "bulk")
-            << " resident=" << resident
+            << (legacy ? "legacy" : "bulk") << " resident=" << resident
             << " prePinned=" << prePinned
-            << " residentBounce=" << residentBounce
-            << " chunks=" << numChunks << " bytes=" << bytes * numChunks
-            << " elapsedUs=" << elapsedMicros
+            << " residentBounce=" << residentBounce << " chunks=" << numChunks
+            << " bytes=" << bytes * numChunks << " elapsedUs=" << elapsedMicros
             << " pinnedBounceBytes=" << bulkStats.pinnedBounceBytes
             << " residentPageableBounceBytes="
             << bulkStats.residentPageableBounceBytes
@@ -871,8 +853,8 @@ TEST(CudfPackedSpillTest, DISABLED_graceBuildHostStorageBenchmark) {
   constexpr size_t kChunkBytes = 32ULL << 20;
   constexpr size_t kTotalBytes = kChunks * kChunkBytes;
   rmm::device_buffer gpuData(kTotalBytes, stream, mr);
-  CUDF_CUDA_TRY(cudaMemsetAsync(
-      gpuData.data(), 0x5a, kTotalBytes, stream.value()));
+  CUDF_CUDA_TRY(
+      cudaMemsetAsync(gpuData.data(), 0x5a, kTotalBytes, stream.value()));
   stream.synchronize();
 
   // Exclude first-use pinned allocation; the production pool is warm after
@@ -882,10 +864,10 @@ TEST(CudfPackedSpillTest, DISABLED_graceBuildHostStorageBenchmark) {
   warmPinned.reset();
   const auto* directValue =
       std::getenv("CUDF_HASH_JOIN_BUILD_STORAGE_BENCH_DIRECT");
-  const bool direct = directValue != nullptr &&
-      std::string_view(directValue) == "1";
-  const bool shared = directValue != nullptr &&
-      std::string_view(directValue) == "shared";
+  const bool direct =
+      directValue != nullptr && std::string_view(directValue) == "1";
+  const bool shared =
+      directValue != nullptr && std::string_view(directValue) == "shared";
   const size_t parallelWorkers = directValue == nullptr
       ? 0
       : (std::string_view(directValue) == "parallel2"
@@ -904,8 +886,7 @@ TEST(CudfPackedSpillTest, DISABLED_graceBuildHostStorageBenchmark) {
     for (size_t chunk = 0; chunk < kChunks; ++chunk) {
       CUDF_CUDA_TRY(cudaMemcpyAsync(
           pageable[chunk].get(),
-          static_cast<const uint8_t*>(gpuData.data()) +
-              chunk * kChunkBytes,
+          static_cast<const uint8_t*>(gpuData.data()) + chunk * kChunkBytes,
           kChunkBytes,
           cudaMemcpyDeviceToHost,
           stream.value()));
@@ -917,8 +898,7 @@ TEST(CudfPackedSpillTest, DISABLED_graceBuildHostStorageBenchmark) {
     for (size_t chunk = 0; chunk < kChunks; ++chunk) {
       CUDF_CUDA_TRY(cudaMemcpyAsync(
           pinned.get() + chunk * kChunkBytes,
-          static_cast<const uint8_t*>(gpuData.data()) +
-              chunk * kChunkBytes,
+          static_cast<const uint8_t*>(gpuData.data()) + chunk * kChunkBytes,
           kChunkBytes,
           cudaMemcpyDeviceToHost,
           stream.value()));
@@ -940,17 +920,15 @@ TEST(CudfPackedSpillTest, DISABLED_graceBuildHostStorageBenchmark) {
       std::vector<std::future<void>> copies;
       copies.reserve(parallelWorkers);
       for (size_t worker = 0; worker < parallelWorkers; ++worker) {
-        copies.push_back(std::async(
-            std::launch::async,
-            [&, pinned, worker]() {
-              for (size_t chunk = worker; chunk < kChunks;
-                   chunk += parallelWorkers) {
-                std::memcpy(
-                    pageable[chunk].get(),
-                    pinned.get() + chunk * kChunkBytes,
-                    kChunkBytes);
-              }
-            }));
+        copies.push_back(std::async(std::launch::async, [&, pinned, worker]() {
+          for (size_t chunk = worker; chunk < kChunks;
+               chunk += parallelWorkers) {
+            std::memcpy(
+                pageable[chunk].get(),
+                pinned.get() + chunk * kChunkBytes,
+                kChunkBytes);
+          }
+        }));
       }
       for (auto& copy : copies) {
         copy.get();
@@ -975,12 +953,11 @@ TEST(CudfPackedSpillTest, DISABLED_graceBuildHostStorageBenchmark) {
   std::cout << "Grace build host storage benchmark mode="
             << (direct ? "direct-pageable"
                        : (shared ? "shared-demote"
-                                 : (parallelWorkers > 0
-                                        ? "parallel-demote"
-                                        : "pinned-demote")))
-            << " workers=" << parallelWorkers
-            << " chunks=" << kChunks << " bytes=" << kTotalBytes
-            << " elapsedUs=" << elapsedMicros << std::endl;
+                                 : (parallelWorkers > 0 ? "parallel-demote"
+                                                        : "pinned-demote")))
+            << " workers=" << parallelWorkers << " chunks=" << kChunks
+            << " bytes=" << kTotalBytes << " elapsedUs=" << elapsedMicros
+            << std::endl;
 }
 
 } // namespace

@@ -546,8 +546,7 @@ using SpillPartitionSet =
 template <typename Partition, bool PreservePartitions = true>
 class IterableSpillPartitionSetBase {
  public:
-  using PartitionSet =
-      std::map<SpillPartitionId, std::unique_ptr<Partition>>;
+  using PartitionSet = std::map<SpillPartitionId, std::unique_ptr<Partition>>;
 
   IterableSpillPartitionSetBase() {
     spillPartitionIter_ = spillPartitions_.begin();
@@ -631,8 +630,7 @@ class IterableSpillPartitionSetBase {
   PartitionSet spillPartitions_;
 };
 
-using IterableSpillPartitionSet =
-    IterableSpillPartitionSetBase<SpillPartition>;
+using IterableSpillPartitionSet = IterableSpillPartitionSetBase<SpillPartition>;
 
 /// Represents all spilled data of an operator, e.g. order by or group
 /// by. This has one SpillFileList per partition of spill data.

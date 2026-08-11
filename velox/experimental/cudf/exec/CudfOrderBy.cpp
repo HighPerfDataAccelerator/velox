@@ -219,8 +219,7 @@ CudfOrderBy::HostPackedChunk::~HostPackedChunk() {
   reset();
 }
 
-CudfOrderBy::HostPackedChunk::HostPackedChunk(
-    HostPackedChunk&& other) noexcept
+CudfOrderBy::HostPackedChunk::HostPackedChunk(HostPackedChunk&& other) noexcept
     : metadata(std::move(other.metadata)),
       data(std::move(other.data)),
       dataBytes(std::exchange(other.dataBytes, 0)),
@@ -386,9 +385,8 @@ uint64_t CudfOrderBy::outputWorkspaceBytes() const {
   // above device capacity to select the in-memory path.
   if (pendingOutput_) {
     const auto copyBytes = std::min(pendingOutputBytes_, outputChunkBytes_);
-    if (copyBytes >
-        (std::numeric_limits<uint64_t>::max() -
-         kOrderByOutputFixedWorkspaceBytes) /
+    if (copyBytes > (std::numeric_limits<uint64_t>::max() -
+                     kOrderByOutputFixedWorkspaceBytes) /
             2) {
       return std::numeric_limits<uint64_t>::max();
     }
@@ -401,13 +399,12 @@ uint64_t CudfOrderBy::outputWorkspaceBytes() const {
   // materialize the merged table, and copy one bounded output slice.  Charge
   // all of those transient owners before getOutput() competes with Ucx/TopN
   // output work on the same device.
-  const auto mergeInputBytes = sortedRunBytes_ >
-          std::numeric_limits<uint64_t>::max() /
+  const auto mergeInputBytes =
+      sortedRunBytes_ > std::numeric_limits<uint64_t>::max() /
               std::max<size_t>(mergeFanIn_, 1)
       ? std::numeric_limits<uint64_t>::max()
       : sortedRunBytes_ * std::max<size_t>(mergeFanIn_, 1);
-  if (mergeInputBytes >
-          std::numeric_limits<uint64_t>::max() -
+  if (mergeInputBytes > std::numeric_limits<uint64_t>::max() -
               kOrderByOutputFixedWorkspaceBytes ||
       outputChunkBytes_ >
           (std::numeric_limits<uint64_t>::max() - mergeInputBytes -
@@ -671,8 +668,9 @@ bool CudfOrderBy::appendHostPackedChunk(
       kHostPackChunkBytes, stateStream_, get_output_mr());
   uint64_t offset = 0;
   while (packer->has_next()) {
-    const auto copied = packer->next(cudf::device_span<uint8_t>{
-        static_cast<uint8_t*>(staging.data()), staging.size()});
+    const auto copied = packer->next(
+        cudf::device_span<uint8_t>{
+            static_cast<uint8_t*>(staging.data()), staging.size()});
     VELOX_CHECK_LE(offset + copied, bytes);
     CUDF_CUDA_TRY(cudaMemcpyAsync(
         chunk.data.get() + offset,
@@ -691,9 +689,7 @@ bool CudfOrderBy::appendHostPackedChunk(
   return true;
 }
 
-void CudfOrderBy::appendRawPackedChunk(
-    cudf::table_view table,
-    SortedRun& run) {
+void CudfOrderBy::appendRawPackedChunk(cudf::table_view table, SortedRun& run) {
   VELOX_CHECK_GT(table.num_rows(), 0);
   if (run.path.empty()) {
     run.path = fmt::format(
@@ -708,8 +704,7 @@ void CudfOrderBy::appendRawPackedChunk(
 
   std::ofstream output(run.path, std::ios::binary | std::ios::app);
   VELOX_CHECK(output.good(), "Cannot open raw packed run {}", run.path);
-  output.write(
-      reinterpret_cast<const char*>(&header), sizeof(RawPackedHeader));
+  output.write(reinterpret_cast<const char*>(&header), sizeof(RawPackedHeader));
 
   rmm::device_buffer deviceStaging(
       kHostPackChunkBytes, stateStream_, get_output_mr());
@@ -717,8 +712,9 @@ void CudfOrderBy::appendRawPackedChunk(
       std::unique_ptr<uint8_t[]>(new uint8_t[kHostPackChunkBytes]);
   uint64_t copiedBytes = 0;
   while (packer->has_next()) {
-    const auto copied = packer->next(cudf::device_span<uint8_t>{
-        static_cast<uint8_t*>(deviceStaging.data()), deviceStaging.size()});
+    const auto copied = packer->next(
+        cudf::device_span<uint8_t>{
+            static_cast<uint8_t*>(deviceStaging.data()), deviceStaging.size()});
     CUDF_CUDA_TRY(cudaMemcpyAsync(
         hostStaging.get(),
         deviceStaging.data(),
@@ -735,13 +731,11 @@ void CudfOrderBy::appendRawPackedChunk(
   const uint64_t metadataBytes = metadata->size();
   output.write(
       reinterpret_cast<const char*>(&metadataBytes), sizeof(metadataBytes));
-  output.write(
-      reinterpret_cast<const char*>(metadata->data()), metadataBytes);
+  output.write(reinterpret_cast<const char*>(metadata->data()), metadataBytes);
   output.flush();
   VELOX_CHECK(output.good(), "Failed writing raw packed run {}", run.path);
-  run.diskBytes +=
-      sizeof(RawPackedHeader) + header.dataBytes + sizeof(metadataBytes) +
-      metadataBytes;
+  run.diskBytes += sizeof(RawPackedHeader) + header.dataBytes +
+      sizeof(metadataBytes) + metadataBytes;
 }
 
 bool CudfOrderBy::loadRawPackedChunk(
@@ -868,8 +862,7 @@ bool CudfOrderBy::loadPausedChunk(
         stream.value()));
     stream.synchronize();
 
-    cudf::packed_columns columns{
-        std::move(host.metadata), std::move(gpuData)};
+    cudf::packed_columns columns{std::move(host.metadata), std::move(gpuData)};
     auto view = cudf::unpack(columns);
     run.packedChunk = std::make_unique<cudf::packed_table>(
         cudf::packed_table{view, std::move(columns)});

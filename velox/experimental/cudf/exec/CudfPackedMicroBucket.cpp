@@ -113,8 +113,7 @@ uint8_t chooseCudfPackedMicroBucketHashBits(
     throw std::invalid_argument("Invalid packed micro-bucket hash bit range");
   }
 
-  const auto requiredBuckets =
-      packedBytes / targetBucketBytes +
+  const auto requiredBuckets = packedBytes / targetBucketBytes +
       static_cast<uint64_t>(packedBytes % targetBucketBytes != 0);
   uint8_t bits = 0;
   uint64_t capacity = 1;
@@ -149,8 +148,7 @@ planCudfPackedMicroBucketRestoreWaves(
   for (const auto index : order) {
     const auto bytes = chargedBytes(buckets[index], options);
     if (bytes > waveBudget) {
-      waves.push_back(
-          {{index}, buckets[index].restoreBytes, bytes, true});
+      waves.push_back({{index}, buckets[index].restoreBytes, bytes, true});
       continue;
     }
 
@@ -171,8 +169,7 @@ planCudfPackedMicroBucketRestoreWaves(
       }
     }
     if (best == waves.size()) {
-      waves.push_back(
-          {{index}, buckets[index].restoreBytes, bytes, false});
+      waves.push_back({{index}, buckets[index].restoreBytes, bytes, false});
     } else {
       waves[best].bucketIndices.push_back(index);
       waves[best].restoreBytes = checkedAdd(
@@ -217,9 +214,10 @@ planCudfPackedMicroBucketStreamingRestore(
     validateCudfPackedMicroBucket(bucket);
   }
   if (options.smallestWaveFirst) {
-    std::stable_sort(order.begin(), order.end(), [&](size_t left, size_t right) {
-      return buckets[left].restoreBytes < buckets[right].restoreBytes;
-    });
+    std::stable_sort(
+        order.begin(), order.end(), [&](size_t left, size_t right) {
+          return buckets[left].restoreBytes < buckets[right].restoreBytes;
+        });
   }
 
   std::vector<CudfPackedMicroBucketRestoreSlice> slices;
@@ -242,15 +240,16 @@ planCudfPackedMicroBucketStreamingRestore(
       }
       const auto admissionBytes = checkedAdd(
           bytes, options.perBucketReserveBytes, "streaming admission");
-      slices.push_back(CudfPackedMicroBucketRestoreSlice{
-          bucketIndex,
-          begin,
-          end,
-          bytes,
-          admissionBytes,
-          begin == 0,
-          end == bucket.extents.size(),
-          admissionBytes > waveBudget});
+      slices.push_back(
+          CudfPackedMicroBucketRestoreSlice{
+              bucketIndex,
+              begin,
+              end,
+              bytes,
+              admissionBytes,
+              begin == 0,
+              end == bucket.extents.size(),
+              admissionBytes > waveBudget});
       begin = end;
     }
   }

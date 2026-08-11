@@ -93,8 +93,7 @@ class CudfIcebergSplitReader : public CudfSplitReader {
 
   // Prepare one group of Parquet files whose physical column counts are
   // compatible with one cuDF reader.
-  void prepareCurrentSourceGroup(
-      dwio::common::RuntimeStatistics& runtimeStats);
+  void prepareCurrentSourceGroup(dwio::common::RuntimeStatistics& runtimeStats);
 
   // Advance to the next source group after the current reader is exhausted.
   bool prepareNextSourceGroup();

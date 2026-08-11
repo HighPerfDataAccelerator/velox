@@ -20,8 +20,8 @@
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 
-#include <cstdlib>
 #include <chrono>
+#include <cstdlib>
 #include <limits>
 #include <sstream>
 #include <string_view>
@@ -109,8 +109,8 @@ bool logConcatConfig() {
 
 bool hasVariableWidthColumn(const TypePtr& type) {
   if (type->kind() == TypeKind::VARCHAR ||
-      type->kind() == TypeKind::VARBINARY ||
-      type->kind() == TypeKind::ARRAY || type->kind() == TypeKind::MAP) {
+      type->kind() == TypeKind::VARBINARY || type->kind() == TypeKind::ARRAY ||
+      type->kind() == TypeKind::MAP) {
     return true;
   }
   for (size_t i = 0; i < type->size(); ++i) {
@@ -131,8 +131,7 @@ bool rebaseVariableWidthConcatEnabled() {
     // producer supplies the original child base and a validated row range.
     return false;
   }
-  return std::string_view(value) != "0" &&
-      std::string_view(value) != "false" &&
+  return std::string_view(value) != "0" && std::string_view(value) != "false" &&
       std::string_view(value) != "FALSE";
 }
 
@@ -140,8 +139,7 @@ bool validateVariableWidthConcatEnabled() {
   const auto* value =
       std::getenv("GLUTEN_CUDF_BATCH_CONCAT_VALIDATE_VARIABLE_WIDTH");
   return value != nullptr && std::string_view(value) != "0" &&
-      std::string_view(value) != "false" &&
-      std::string_view(value) != "FALSE";
+      std::string_view(value) != "false" && std::string_view(value) != "FALSE";
 }
 
 void validateVariableWidthColumn(
@@ -332,8 +330,7 @@ CudfBatchConcat::CudfBatchConcat(
 
 bool CudfBatchConcat::needsInput() const {
   return !noMoreInput_ && pendingInput_ == nullptr && outputQueue_.empty() &&
-      currentNumRows_ < targetRows_ &&
-      !reachedFlushThreshold();
+      currentNumRows_ < targetRows_ && !reachedFlushThreshold();
 }
 
 bool CudfBatchConcat::requiresConcatWorkspace() const {
@@ -358,10 +355,8 @@ bool CudfBatchConcat::requiresConcatWorkspace() const {
     const bool flushResidentTail = !buffer_.empty() &&
         (!hasSameEmptyStringCharsPattern(
              buffer_.front()->getTableView(), cudfVector->getTableView()) ||
-         inputBytes >
-             kMaxSafeConcatEstimatedBytes -
-                 std::min(
-                     currentNumBytes_, kMaxSafeConcatEstimatedBytes));
+         inputBytes > kMaxSafeConcatEstimatedBytes -
+                 std::min(currentNumBytes_, kMaxSafeConcatEstimatedBytes));
     if (flushResidentTail && buffer_.size() > 1) {
       return currentNumBytes_ <= kMaxMaterializedConcatEstimatedBytes;
     }
@@ -372,8 +367,7 @@ bool CudfBatchConcat::requiresConcatWorkspace() const {
     if (!flushResidentTail && !buffer_.empty()) {
       const auto combinedRows = currentNumRows_ + cudfVector->size();
       const auto combinedBytes =
-          currentNumBytes_ >
-              std::numeric_limits<uint64_t>::max() - inputBytes
+          currentNumBytes_ > std::numeric_limits<uint64_t>::max() - inputBytes
           ? std::numeric_limits<uint64_t>::max()
           : currentNumBytes_ + inputBytes;
       const bool flushAfterAdmission = combinedRows >= targetRows_ ||
@@ -419,8 +413,7 @@ exec::BlockingReason CudfBatchConcat::isBlocked(ContinueFuture* future) {
   workspaceAdmission_.emplace(std::move(attempt.reservation.value()));
   addRuntimeStat(
       "batchConcatWorkspaceBytes",
-      RuntimeCounter(
-          kConcatWorkspaceBytes, RuntimeCounter::Unit::kBytes));
+      RuntimeCounter(kConcatWorkspaceBytes, RuntimeCounter::Unit::kBytes));
   return exec::BlockingReason::kNotBlocked;
 }
 
@@ -495,10 +488,9 @@ void CudfBatchConcat::processPendingInput(RowVectorPtr input) {
     cudfVector = std::make_shared<CudfVector>(
         pool(), outputType_, rebased->num_rows(), std::move(rebased), stream);
     ++rebasedBatches_;
-    rebaseMicros_ +=
-        std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::steady_clock::now() - rebaseStart)
-            .count();
+    rebaseMicros_ += std::chrono::duration_cast<std::chrono::microseconds>(
+                         std::chrono::steady_clock::now() - rebaseStart)
+                         .count();
   }
 
   if (variableWidthInputs_ && validateVariableWidthConcatEnabled()) {
@@ -516,8 +508,7 @@ void CudfBatchConcat::processPendingInput(RowVectorPtr input) {
   // variable-width inputs on the normal concatenate path. The optional D2D
   // rebase above remains diagnostic-only and must not be needed in production.
 
-  const auto inputBytes =
-      static_cast<uint64_t>(cudfVector->estimateFlatSize());
+  const auto inputBytes = static_cast<uint64_t>(cudfVector->estimateFlatSize());
   // cuDF 26.06's strings memcpy concatenate path rejects a zero-byte source
   // when another input supplies chars for the same logical column. Keep
   // unlike physical layouts in separate groups. A uniform all-empty group is
@@ -531,10 +522,8 @@ void CudfBatchConcat::processPendingInput(RowVectorPtr input) {
   // the resident tail could cross cuDF's signed 32-bit child-offset limit.
   // Retain the incoming vector separately while the queued output drains.
   if (!buffer_.empty() &&
-      inputBytes >
-          kMaxSafeConcatEstimatedBytes -
-              std::min(
-                  currentNumBytes_, kMaxSafeConcatEstimatedBytes)) {
+      inputBytes > kMaxSafeConcatEstimatedBytes -
+              std::min(currentNumBytes_, kMaxSafeConcatEstimatedBytes)) {
     flushBufferedInputs();
   }
 
@@ -578,8 +567,7 @@ RowVectorPtr CudfBatchConcat::doGetOutput() {
 
   // Merge tables if there are enough rows
   if (!buffer_.empty() &&
-      (currentNumRows_ >= targetRows_ ||
-       reachedFlushThreshold() ||
+      (currentNumRows_ >= targetRows_ || reachedFlushThreshold() ||
        noMoreInput_)) {
     // Preserve the zero-copy Exchange fast path when a single received batch
     // already satisfies the target (or is the final tail batch). CudfVector
@@ -658,8 +646,7 @@ bool CudfBatchConcat::isFinished() {
                  << ", inputBytes=" << totalInputBytes_
                  << ", rebasedBatches=" << rebasedBatches_
                  << ", rebaseMicros=" << rebaseMicros_
-                 << ", largeConcatBypassBatches="
-                 << largeConcatBypassBatches_
+                 << ", largeConcatBypassBatches=" << largeConcatBypassBatches_
                  << ", largeConcatBypassBytes=" << largeConcatBypassBytes_;
   }
   return finished;

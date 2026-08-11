@@ -33,8 +33,6 @@
 #include "velox/expression/ExprOptimizer.h"
 #include "velox/type/TypeUtil.h"
 
-#include <folly/executors/CPUThreadPoolExecutor.h>
-
 #include <cudf/aggregation.hpp>
 #include <cudf/binaryop.hpp>
 #include <cudf/column/column_factories.hpp>
@@ -62,6 +60,12 @@
 
 #include <nvtx3/nvtx3.hpp>
 
+#include <fcntl.h>
+#include <folly/executors/CPUThreadPoolExecutor.h>
+#include <linux/falloc.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -70,15 +74,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
-#include <fcntl.h>
 #include <functional>
 #include <iterator>
 #include <limits>
 #include <optional>
-#include <linux/falloc.h>
-#include <limits>
-#include <sys/syscall.h>
-#include <unistd.h>
 
 namespace facebook::velox::cudf_velox {
 namespace {
@@ -91,7 +90,8 @@ cudf::device_span<cudf::size_type const> toSpan(
 uint64_t estimateColumnViewBytes(cudf::column_view column) {
   uint64_t bytes = 0;
   if (cudf::is_fixed_width(column.type())) {
-    bytes += static_cast<uint64_t>(column.size()) * cudf::size_of(column.type());
+    bytes +=
+        static_cast<uint64_t>(column.size()) * cudf::size_of(column.type());
   }
   if (column.nullable()) {
     bytes += cudf::bitmask_allocation_size_bytes(column.size());
@@ -116,35 +116,29 @@ uint64_t retainedCudfBytes(const CudfVector& vector) {
 }
 
 bool graceBulkBuildRestoreEnabled() {
-  const auto* value =
-      std::getenv("GLUTEN_CUDF_HASH_JOIN_BULK_BUILD_RESTORE");
+  const auto* value = std::getenv("GLUTEN_CUDF_HASH_JOIN_BULK_BUILD_RESTORE");
   if (value == nullptr) {
     return false;
   }
-  return std::string_view(value) == "1" ||
-      std::string_view(value) == "true" ||
+  return std::string_view(value) == "1" || std::string_view(value) == "true" ||
       std::string_view(value) == "TRUE";
 }
 
 bool graceBulkProbeRestoreEnabled() {
-  const auto* value =
-      std::getenv("GLUTEN_CUDF_HASH_JOIN_BULK_PROBE_RESTORE");
+  const auto* value = std::getenv("GLUTEN_CUDF_HASH_JOIN_BULK_PROBE_RESTORE");
   if (value == nullptr) {
     return false;
   }
-  return std::string_view(value) == "1" ||
-      std::string_view(value) == "true" ||
+  return std::string_view(value) == "1" || std::string_view(value) == "true" ||
       std::string_view(value) == "TRUE";
 }
 
 bool graceAsyncBuildDemoteEnabled() {
-  const auto* value =
-      std::getenv("GLUTEN_CUDF_HASH_JOIN_ASYNC_BUILD_DEMOTE");
+  const auto* value = std::getenv("GLUTEN_CUDF_HASH_JOIN_ASYNC_BUILD_DEMOTE");
   if (value == nullptr) {
     return false;
   }
-  return std::string_view(value) == "1" ||
-      std::string_view(value) == "true" ||
+  return std::string_view(value) == "1" || std::string_view(value) == "true" ||
       std::string_view(value) == "TRUE";
 }
 
@@ -154,26 +148,22 @@ bool gracePageableRestoreBounceEnabled() {
   if (value == nullptr) {
     return false;
   }
-  return std::string_view(value) == "1" ||
-      std::string_view(value) == "true" ||
+  return std::string_view(value) == "1" || std::string_view(value) == "true" ||
       std::string_view(value) == "TRUE";
 }
 
 bool replayableResidentBuildFinalizeEnabled() {
-  const auto* value =
-      std::getenv("GLUTEN_CUDF_HASH_JOIN_REPLAYABLE_FINALIZE");
+  const auto* value = std::getenv("GLUTEN_CUDF_HASH_JOIN_REPLAYABLE_FINALIZE");
   if (value == nullptr) {
     return true;
   }
-  return std::string_view(value) != "0" &&
-      std::string_view(value) != "false" &&
+  return std::string_view(value) != "0" && std::string_view(value) != "false" &&
       std::string_view(value) != "FALSE";
 }
 
 size_t graceBuildDemoteThreads() {
   static const size_t threads = [] {
-    const auto* value =
-        std::getenv("CUDF_HASH_JOIN_GRACE_HOST_DEMOTE_THREADS");
+    const auto* value = std::getenv("CUDF_HASH_JOIN_GRACE_HOST_DEMOTE_THREADS");
     if (value == nullptr) {
       return size_t{2};
     }
@@ -204,8 +194,7 @@ constexpr uint64_t kGracePartitionBatchBytes = 256ULL << 20;
 // bits fixed and collapses the effective local partition count. Build and
 // probe use this independent seed together, preserving join correctness while
 // spreading all local partitions.
-constexpr uint32_t kGraceLocalHashSeed =
-    cudf::DEFAULT_HASH_SEED ^ 0x85ebca6bU;
+constexpr uint32_t kGraceLocalHashSeed = cudf::DEFAULT_HASH_SEED ^ 0x85ebca6bU;
 
 std::atomic<uint64_t> graceHashJoinSpillFileId{0};
 
@@ -294,8 +283,8 @@ class GracePinnedHostStagingLease {
       uint8_t* data)
       : pool_(pool), slot_(slot), data_(data) {}
   GracePinnedHostStagingLease(const GracePinnedHostStagingLease&) = delete;
-  GracePinnedHostStagingLease& operator=(
-      const GracePinnedHostStagingLease&) = delete;
+  GracePinnedHostStagingLease& operator=(const GracePinnedHostStagingLease&) =
+      delete;
   GracePinnedHostStagingLease(GracePinnedHostStagingLease&& other) noexcept
       : pool_(std::exchange(other.pool_, nullptr)),
         slot_(other.slot_),
@@ -371,8 +360,7 @@ class GracePinnedHostStagingPool {
     if (status != cudaSuccess) {
       // Preserve an existing smaller allocation. Pinned staging is an
       // optimization; pageable memory remains the correctness fallback.
-      LOG(WARNING) << "Grace hash join could not allocate "
-                   << allocationBytes
+      LOG(WARNING) << "Grace hash join could not allocate " << allocationBytes
                    << " bytes for reusable pinned staging slot " << available
                    << ": " << cudaGetErrorString(status)
                    << "; falling back to pageable copies";
@@ -389,8 +377,8 @@ class GracePinnedHostStagingPool {
     if (!lease) {
       return nullptr;
     }
-    auto owner = std::make_shared<GracePinnedHostStagingLease>(
-        std::move(lease));
+    auto owner =
+        std::make_shared<GracePinnedHostStagingLease>(std::move(lease));
     return std::shared_ptr<uint8_t>(owner, owner->data());
   }
 
@@ -954,8 +942,7 @@ void CudfHashJoinBridge::appendGracePartitions(
   gracePartitions_.insert(std::move(partitions));
 }
 
-std::optional<GraceHashJoinPartition>
-CudfHashJoinBridge::nextGracePartition() {
+std::optional<GraceHashJoinPartition> CudfHashJoinBridge::nextGracePartition() {
   std::lock_guard<std::mutex> l(mutex_);
   VELOX_CHECK(gracePartitionsSet_);
   if (!gracePartitions_.hasNext()) {
@@ -1023,8 +1010,8 @@ CudfHashJoinBuild::CudfHashJoinBuild(
     const auto buildType = joinNode_->sources()[1]->outputType();
     buildKeyIndices_.reserve(keys.size());
     for (const auto& key : keys) {
-      buildKeyIndices_.push_back(static_cast<cudf::size_type>(
-          buildType->getChildIdx(key->name())));
+      buildKeyIndices_.push_back(
+          static_cast<cudf::size_type>(buildType->getChildIdx(key->name())));
     }
   }
 }
@@ -1054,8 +1041,7 @@ void CudfHashJoinBuild::partitionAndPack(CudfVectorPtr input) {
     const auto sliceBytes = inputRows == 0
         ? 0
         : static_cast<uint64_t>(
-              static_cast<long double>(inputBytes) * (end - begin) /
-              inputRows);
+              static_cast<long double>(inputBytes) * (end - begin) / inputRows);
     auto partitionInput = slices.front();
     std::unique_ptr<cudf::table> nonNullRows;
     std::unique_ptr<cudf::table> nullRows;
@@ -1080,10 +1066,7 @@ void CudfHashJoinBuild::partitionAndPack(CudfVectorPtr input) {
             get_temp_mr());
       }
       auto nullMask = cudf::unary_operation(
-          validMask->view(),
-          cudf::unary_operator::NOT,
-          stream,
-          get_temp_mr());
+          validMask->view(), cudf::unary_operator::NOT, stream, get_temp_mr());
       nullRows = cudf::apply_boolean_mask(
           partitionInput, nullMask->view(), stream, get_output_mr());
       nonNullRows = cudf::apply_boolean_mask(
@@ -1152,8 +1135,7 @@ void CudfHashJoinBuild::partitionAndPack(CudfVectorPtr input) {
         },
         &packTiming,
         graceAsyncBuildDemoteEnabled());
-    if (!graceEagerProbeNotified_ &&
-        graceEagerProbeBuildMinBytes_ > 0 &&
+    if (!graceEagerProbeNotified_ && graceEagerProbeBuildMinBytes_ > 0 &&
         graceBuildData_->packedBytes >= graceEagerProbeBuildMinBytes_) {
       auto joinBridge = operatorCtx_->task()->getCustomJoinBridge(
           operatorCtx_->driverCtx()->splitGroupId, planNodeId());
@@ -1162,12 +1144,11 @@ void CudfHashJoinBuild::partitionAndPack(CudfVectorPtr input) {
       VELOX_CHECK_NOT_NULL(cudfHashJoinBridge);
       cudfHashJoinBridge->setGraceActivated();
       graceEagerProbeNotified_ = true;
-      LOG(WARNING)
-          << "CudfHashJoinBuild task="
-          << operatorCtx_->task()->taskId() << " node=" << planNodeId()
-          << " enabling eager Grace probe at localPackedBytes="
-          << graceBuildData_->packedBytes
-          << " minBytes=" << graceEagerProbeBuildMinBytes_;
+      LOG(WARNING) << "CudfHashJoinBuild task="
+                   << operatorCtx_->task()->taskId() << " node=" << planNodeId()
+                   << " enabling eager Grace probe at localPackedBytes="
+                   << graceBuildData_->packedBytes
+                   << " minBytes=" << graceEagerProbeBuildMinBytes_;
     }
     const auto partitionMicros =
         std::chrono::duration_cast<std::chrono::microseconds>(
@@ -1186,20 +1167,16 @@ void CudfHashJoinBuild::partitionAndPack(CudfVectorPtr input) {
                  << " copySynchronizeUs=" << packTiming.copySynchronizeMicros
                  << " pinnedToPageableCopyUs="
                  << packTiming.pinnedToPageableCopyMicros
-                 << " storageConsumerUs="
-                 << packTiming.storageConsumerMicros
+                 << " storageConsumerUs=" << packTiming.storageConsumerMicros
                  << " pinnedStagingAcquireUs="
                  << packTiming.pinnedStagingAcquireMicros
                  << " usedPinnedStaging=" << packTiming.usedPinnedStaging
-                 << " residentHostBytes="
-                 << graceBuildData_->residentHostBytes
+                 << " residentHostBytes=" << graceBuildData_->residentHostBytes
                  << " diskBytes=" << graceBuildData_->diskBytes
                  << " executorReservedHostBytes="
                  << currentGraceHostMemoryReservedBytes()
-                 << " cumulativeHostDemoteUs="
-                 << graceHostDemoteMicros_
-                 << " cumulativeRawSpillWriteUs="
-                 << graceRawSpillWriteMicros_;
+                 << " cumulativeHostDemoteUs=" << graceHostDemoteMicros_
+                 << " cumulativeRawSpillWriteUs=" << graceRawSpillWriteMicros_;
   }
 }
 
@@ -1214,8 +1191,7 @@ void CudfHashJoinBuild::storeGraceBuildBatch(
   graceBuildData_->rows += batch.rows;
   auto reservation =
       tryReserveGraceHostMemory(batch.dataBytes, graceHostBytes_);
-  const bool retainInHost =
-      graceHostBytes_ == 0 || reservation != nullptr;
+  const bool retainInHost = graceHostBytes_ == 0 || reservation != nullptr;
   if (!retainInHost) {
     VELOX_CHECK_LE(spillPartition, gracePartitions_);
     if (graceSpillFiles_.empty()) {
@@ -1242,8 +1218,8 @@ void CudfHashJoinBuild::storeGraceBuildBatch(
                    << " partition=" << spillPartition
                    << " hostLimitBytes=" << graceHostBytes_;
     }
-    batch.fileOffset = appendGraceSpillBatch(
-        spillFile, batch, graceRawSpillWriteMicros_);
+    batch.fileOffset =
+        appendGraceSpillBatch(spillFile, batch, graceRawSpillWriteMicros_);
     batch.spillFile = spillFile;
     batch.data.reset();
     batch.hostReservation.reset();
@@ -1251,8 +1227,7 @@ void CudfHashJoinBuild::storeGraceBuildBatch(
     graceBuildData_->diskBytes += batch.dataBytes;
   } else {
     batch.hostReservation = std::move(reservation);
-    if (graceAsyncBuildDemoteEnabled() &&
-        demotePinnedGraceBatchAsync(batch)) {
+    if (graceAsyncBuildDemoteEnabled() && demotePinnedGraceBatchAsync(batch)) {
       graceAsyncHostDemoteBytes_ += batch.dataBytes;
       ++graceAsyncHostDemoteTasks_;
     } else {
@@ -1394,8 +1369,7 @@ bool CudfHashJoinBuild::canReclaim() const {
   return graceEligible_ && !graceActive_ && !noMoreInput_ && !inputs_.empty();
 }
 
-bool CudfHashJoinBuild::reclaimableBytes(
-    uint64_t& reclaimableBytes) const {
+bool CudfHashJoinBuild::reclaimableBytes(uint64_t& reclaimableBytes) const {
   reclaimableBytes = canReclaim() ? retainedBuildBytes_ : 0;
   return true;
 }
@@ -1517,9 +1491,8 @@ void CudfHashJoinBuild::doNoMoreInput() {
 uint64_t CudfHashJoinBuild::residentBuildFinalizeWorkspaceBytes() const {
   constexpr uint64_t kFinalizeFixedWorkspaceBytes = 512ULL << 20;
   const auto buildCopiesBytes =
-      retainedBuildBytes_ >
-          (std::numeric_limits<uint64_t>::max() -
-           kFinalizeFixedWorkspaceBytes) /
+      retainedBuildBytes_ > (std::numeric_limits<uint64_t>::max() -
+                             kFinalizeFixedWorkspaceBytes) /
               2
       ? std::numeric_limits<uint64_t>::max()
       : retainedBuildBytes_ * 2 + kFinalizeFixedWorkspaceBytes;
@@ -1547,7 +1520,8 @@ void CudfHashJoinBuild::finalizeBuild() {
   // downstream Grace spill/restore pass.
   std::optional<DeviceMemoryWorkspaceReservation>
       residentBuildFinalizeWorkspace;
-  if (!graceActive_ && retainedBuildBytes_ > 0 && deviceMemoryPool_ != nullptr) {
+  if (!graceActive_ && retainedBuildBytes_ > 0 &&
+      deviceMemoryPool_ != nullptr) {
     const auto requestedWorkspace = residentBuildFinalizeWorkspaceBytes();
     const auto minHeadroom =
         CudfConfig::getInstance().deviceMemoryMinHeadroomBytes;
@@ -1561,8 +1535,7 @@ void CudfHashJoinBuild::finalizeBuild() {
           "residentBuildFinalizeWorkspaceImpossible",
           RuntimeCounter(1, RuntimeCounter::Unit::kNone));
       LOG(WARNING)
-          << "CudfHashJoinBuild task=" << taskId()
-          << " node=" << planNodeId()
+          << "CudfHashJoinBuild task=" << taskId() << " node=" << planNodeId()
           << " cannot ever satisfy resident finalize workspace retainedBytes="
           << retainedBuildBytes_
           << " requestedWorkspaceBytes=" << requestedWorkspace
@@ -1657,12 +1630,11 @@ void CudfHashJoinBuild::finalizeBuild() {
         operatorCtx_->driverCtx()->splitGroupId, planNodeId());
     auto cudfHashJoinBridge =
         std::dynamic_pointer_cast<CudfHashJoinBridge>(joinBridge);
-    LOG(WARNING) << "CudfHashJoinBuild task="
-                 << operatorCtx_->task()->taskId() << " node=" << planNodeId()
+    LOG(WARNING) << "CudfHashJoinBuild task=" << operatorCtx_->task()->taskId()
+                 << " node=" << planNodeId()
                  << " published host-first Grace build rows="
                  << graceBuildData_->rows
-                 << " unmatchedNullRows="
-                 << graceBuildData_->unmatchedNullRows
+                 << " unmatchedNullRows=" << graceBuildData_->unmatchedNullRows
                  << " packedBytes=" << graceBuildData_->packedBytes;
     LOG(WARNING) << "CudfHashJoinBuild node=" << planNodeId()
                  << " Grace storage residentHostBytes="
@@ -1671,10 +1643,8 @@ void CudfHashJoinBuild::finalizeBuild() {
                  << " executorReservedHostBytes="
                  << currentGraceHostMemoryReservedBytes()
                  << " hostDemoteUs=" << graceHostDemoteMicros_
-                 << " asyncHostDemoteBytes="
-                 << graceAsyncHostDemoteBytes_
-                 << " asyncHostDemoteTasks="
-                 << graceAsyncHostDemoteTasks_
+                 << " asyncHostDemoteBytes=" << graceAsyncHostDemoteBytes_
+                 << " asyncHostDemoteTasks=" << graceAsyncHostDemoteTasks_
                  << " asyncHostDemoteTailWaitUs="
                  << graceAsyncHostDemoteTailWaitMicros_
                  << " rawSpillWriteUs=" << graceRawSpillWriteMicros_;
@@ -1883,8 +1853,7 @@ CudfHashJoinProbe::CudfHashJoinProbe(
       char* end = nullptr;
       const auto requested = std::strtoull(value, &end, 10);
       if (end != value && *end == '\0') {
-        graceProbePrefetchDepth_ =
-            std::clamp<uint64_t>(requested, 1, 16);
+        graceProbePrefetchDepth_ = std::clamp<uint64_t>(requested, 1, 16);
       }
     }
     if (const auto* value =
@@ -1892,8 +1861,7 @@ CudfHashJoinProbe::CudfHashJoinProbe(
       char* end = nullptr;
       const auto requested = std::strtoull(value, &end, 10);
       if (end != value && *end == '\0' && requested > 0) {
-        graceEagerProbeBufferLimitBytes_ =
-            requested;
+        graceEagerProbeBufferLimitBytes_ = requested;
       }
     }
   }
@@ -1986,8 +1954,8 @@ void CudfHashJoinProbe::spillGraceProbeBatch(
                  << " hostLimitBytes=" << graceProbeHostLimitBytes_;
   }
   VELOX_CHECK_NOT_NULL(batch.data);
-  batch.fileOffset = appendGraceSpillBatch(
-      spillFile, batch, graceRawSpillWriteMicros_);
+  batch.fileOffset =
+      appendGraceSpillBatch(spillFile, batch, graceRawSpillWriteMicros_);
   batch.spillFile = spillFile;
   batch.data.reset();
   batch.hostReservation.reset();
@@ -2032,8 +2000,8 @@ void CudfHashJoinProbe::spillRecursiveGraceBuildBatch(
                  << " hostLimitBytes=" << graceProbeHostLimitBytes_;
   }
   VELOX_CHECK_NOT_NULL(batch.data);
-  batch.fileOffset = appendGraceSpillBatch(
-      spillFile, batch, graceRawSpillWriteMicros_);
+  batch.fileOffset =
+      appendGraceSpillBatch(spillFile, batch, graceRawSpillWriteMicros_);
   batch.spillFile = spillFile;
   batch.data.reset();
   batch.hostReservation.reset();
@@ -2114,8 +2082,7 @@ void CudfHashJoinProbe::partitionAndPackProbe(CudfVectorPtr input) {
       return result;
     }();
     VELOX_CHECK(
-        offsets.size() == numPartitions ||
-        offsets.size() == numPartitions + 1);
+        offsets.size() == numPartitions || offsets.size() == numPartitions + 1);
     VELOX_CHECK_EQ(offsets.front(), 0);
     offsets.erase(offsets.begin());
     if (offsets.size() == numPartitions) {
@@ -2165,13 +2132,11 @@ void CudfHashJoinProbe::queueGraceProbeInput(CudfVectorPtr input) {
   // partition/pack launches.
   if (!graceProbeInputs_.empty() &&
       !hasSameEmptyStringCharsPattern(
-          graceProbeInputs_.front()->getTableView(),
-          input->getTableView())) {
+          graceProbeInputs_.front()->getTableView(), input->getTableView())) {
     flushGraceProbeInputBatch();
   }
   if (!graceProbeInputs_.empty() &&
-      inputBytes >
-          kGracePartitionBatchBytes -
+      inputBytes > kGracePartitionBatchBytes -
               std::min(graceProbeInputBytes_, kGracePartitionBatchBytes)) {
     flushGraceProbeInputBatch();
   }
@@ -2207,8 +2172,7 @@ CudfVectorPtr CudfHashJoinProbe::restoreHostBatch(
   auto pinnedStaging = !batch.pinned && batch.spillFile
       ? gracePinnedHostStagingPool().acquire(batch.dataBytes)
       : GracePinnedHostStagingLease{};
-  auto* pinnedData =
-      batch.pinned ? batch.data.get() : pinnedStaging.data();
+  auto* pinnedData = batch.pinned ? batch.data.get() : pinnedStaging.data();
   std::unique_ptr<uint8_t[]> diskData;
   const uint8_t* sourceData = batch.data.get();
   const auto hostStageStart = std::chrono::steady_clock::now();
@@ -2222,8 +2186,7 @@ CudfVectorPtr CudfHashJoinProbe::restoreHostBatch(
       sourceData = pinnedData;
     } else {
       diskData = std::unique_ptr<uint8_t[]>(new uint8_t[batch.dataBytes]);
-      batch.spillFile->read(
-          batch.fileOffset, batch.dataBytes, diskData.get());
+      batch.spillFile->read(batch.fileOffset, batch.dataBytes, diskData.get());
       sourceData = diskData.get();
     }
   }
@@ -2231,8 +2194,7 @@ CudfVectorPtr CudfHashJoinProbe::restoreHostBatch(
   VELOX_CHECK(
       batch.dataBytes == 0 || sourceData != nullptr,
       "Grace hash join batch has neither host data nor a spill file");
-  const auto usedPinnedSource =
-      batch.dataBytes > 0 &&
+  const auto usedPinnedSource = batch.dataBytes > 0 &&
       ((batch.pinned && batch.data != nullptr) || pinnedStaging);
   if (batch.spillFile) {
     graceRestoreDiskBytes_ += batch.dataBytes;
@@ -2301,8 +2263,7 @@ void CudfHashJoinProbe::scheduleGraceProbePrefetch(
   if (!batch.spillFile || batch.data != nullptr || batch.dataBytes == 0) {
     return;
   }
-  auto pinned =
-      gracePinnedHostStagingPool().acquireShared(batch.dataBytes);
+  auto pinned = gracePinnedHostStagingPool().acquireShared(batch.dataBytes);
   if (!pinned) {
     return;
   }
@@ -2314,23 +2275,22 @@ void CudfHashJoinProbe::scheduleGraceProbePrefetch(
   const auto dataBytes = batch.dataBytes;
   std::promise<void> completion;
   auto future = completion.get_future();
-  graceSpillReadExecutor().add(
-      [spillFile,
-       spillWriteFuture,
-       fileOffset,
-       dataBytes,
-       pinned = std::move(pinned),
-       completion = std::move(completion)]() mutable {
-        try {
-          if (spillWriteFuture.valid()) {
-            spillWriteFuture.get();
-          }
-          spillFile->read(fileOffset, dataBytes, pinned.get());
-          completion.set_value();
-        } catch (...) {
-          completion.set_exception(std::current_exception());
-        }
-      });
+  graceSpillReadExecutor().add([spillFile,
+                                spillWriteFuture,
+                                fileOffset,
+                                dataBytes,
+                                pinned = std::move(pinned),
+                                completion = std::move(completion)]() mutable {
+    try {
+      if (spillWriteFuture.valid()) {
+        spillWriteFuture.get();
+      }
+      spillFile->read(fileOffset, dataBytes, pinned.get());
+      completion.set_value();
+    } catch (...) {
+      completion.set_exception(std::current_exception());
+    }
+  });
   graceProbePrefetchFutures_.emplace_back(chunk, std::move(future));
 }
 
@@ -2373,8 +2333,7 @@ void CudfHashJoinProbe::initializeGracePartitionQueue() {
       1U << exec::SpillPartitionId::kMaxPartitionBits);
 
   GraceHashJoinPartitionSet partitions;
-  for (uint32_t partition = 0;
-       partition < graceBuildData_->partitions.size();
+  for (uint32_t partition = 0; partition < graceBuildData_->partitions.size();
        ++partition) {
     auto id = exec::SpillPartitionId(partition);
     auto payload = std::make_unique<GraceHashJoinPartition>(id);
@@ -2404,8 +2363,8 @@ GraceHashJoinPartitionSet CudfHashJoinProbe::repartitionGracePartition(
       "maximum recursive spill level",
       partition.id(),
       graceRestoreBuildBytes_);
-  constexpr uint32_t kChildren =
-      1U << exec::SpillPartitionId::kMaxPartitionBits;
+  constexpr uint32_t kChildren = 1U
+      << exec::SpillPartitionId::kMaxPartitionBits;
   // Spill files become read-only after the first restore. Each recursive
   // parent therefore writes its children into fresh append-only files. Batches
   // retain shared ownership of older files until their ranges are consumed.
@@ -2486,8 +2445,7 @@ GraceHashJoinPartitionSet CudfHashJoinProbe::repartitionGracePartition(
   LOG(WARNING) << "CudfHashJoinProbe node=" << planNodeId()
                << " recursively repartitioned Grace partition="
                << partition.id() << " buildBytes=" << buildBytes
-               << " probeBytes=" << probeBytes
-               << " children=" << kChildren;
+               << " probeBytes=" << probeBytes << " children=" << kChildren;
   return children;
 }
 
@@ -2564,8 +2522,7 @@ void CudfHashJoinProbe::loadGraceBuildPartition(
     graceRestorePinnedSourceBytes_ += bulkRestoreStats.pinnedBounceBytes;
     graceRestoreResidentBounceBytes_ +=
         bulkRestoreStats.residentPageableBounceBytes;
-    graceRestorePageableDirectBytes_ +=
-        bulkRestoreStats.pageableDirectBytes;
+    graceRestorePageableDirectBytes_ += bulkRestoreStats.pageableDirectBytes;
     graceRestoreHostStageMicros_ += bulkRestoreStats.hostStageMicros;
     graceRestoreCopySynchronizeMicros_ +=
         bulkRestoreStats.copyStreamSynchronizeMicros;
@@ -2581,8 +2538,7 @@ void CudfHashJoinProbe::loadGraceBuildPartition(
   const auto restoreEnd = std::chrono::steady_clock::now();
   std::unique_ptr<cudf::table> table;
   if (useBulkRestore && !bulkRestored.tables().empty()) {
-    table = cudf::concatenate(
-        bulkRestored.tables(), stream, get_output_mr());
+    table = cudf::concatenate(bulkRestored.tables(), stream, get_output_mr());
   } else {
     table = getConcatenatedTable(
         std::move(restored), buildType_, stream, get_output_mr());
@@ -2618,20 +2574,16 @@ void CudfHashJoinProbe::loadGraceBuildPartition(
   LOG(WARNING) << "CudfHashJoinProbe node=" << planNodeId()
                << " loaded Grace build partition=" << partition.id()
                << " batches=" << hostBatches.size() << " rows=" << buildRows
-               << " bytes=" << buildBytes
-               << " bulkRestore=" << useBulkRestore
-               << " pinnedBounceBytes="
-               << bulkRestoreStats.pinnedBounceBytes
+               << " bytes=" << buildBytes << " bulkRestore=" << useBulkRestore
+               << " pinnedBounceBytes=" << bulkRestoreStats.pinnedBounceBytes
                << " residentPageableBounceBytes="
                << bulkRestoreStats.residentPageableBounceBytes
                << " pageableDirectBytes="
                << bulkRestoreStats.pageableDirectBytes
-               << " pinnedBounceCopies="
-               << bulkRestoreStats.pinnedBounceCopies
+               << " pinnedBounceCopies=" << bulkRestoreStats.pinnedBounceCopies
                << " hostStageUs=" << bulkRestoreStats.hostStageMicros
                << " bounceReuseWaitUs="
-               << bulkRestoreStats.bounceReuseWaitMicros
-               << " copyStreamSyncUs="
+               << bulkRestoreStats.bounceReuseWaitMicros << " copyStreamSyncUs="
                << bulkRestoreStats.copyStreamSynchronizeMicros
                << " restoreH2DUs="
                << std::chrono::duration_cast<std::chrono::microseconds>(
@@ -2663,16 +2615,13 @@ uint64_t CudfHashJoinProbe::estimateGraceBuildWorkspaceBytes(
   }
   constexpr uint64_t kFixedWorkspaceBytes = 512ULL << 20;
   if (buildBytes >
-      (std::numeric_limits<uint64_t>::max() - kFixedWorkspaceBytes) /
-          2) {
+      (std::numeric_limits<uint64_t>::max() - kFixedWorkspaceBytes) / 2) {
     return std::numeric_limits<uint64_t>::max();
   }
   // One restored build image, one hash-sized image, plus fixed cuDF/cuco
   // scratch. Probe workspace is admitted separately for each chunk after the
   // hash table is resident.
-  return std::max<uint64_t>(
-      1ULL << 30,
-      buildBytes * 2 + kFixedWorkspaceBytes);
+  return std::max<uint64_t>(1ULL << 30, buildBytes * 2 + kFixedWorkspaceBytes);
 }
 
 uint64_t CudfHashJoinProbe::estimateGraceProbeWorkspaceBytes(
@@ -2689,8 +2638,7 @@ uint64_t CudfHashJoinProbe::estimateGraceProbeWorkspaceBytes(
   // reduce physical headroom. Reserve only this probe chunk, its gathered
   // output/scratch image, and fixed cuDF/cuco workspace.
   return std::max<uint64_t>(
-      1ULL << 30,
-      boundedProbeBytes * kWorkspaceCopies + kFixedWorkspaceBytes);
+      1ULL << 30, boundedProbeBytes * kWorkspaceCopies + kFixedWorkspaceBytes);
 }
 
 bool CudfHashJoinProbe::acquireGraceWorkspace(
@@ -2710,8 +2658,7 @@ bool CudfHashJoinProbe::acquireGraceWorkspace(
     return false;
   }
   if (attempt.completedWaitMicros.has_value()) {
-    gracePartitionWorkspaceWaitMicros_ +=
-        attempt.completedWaitMicros.value();
+    gracePartitionWorkspaceWaitMicros_ += attempt.completedWaitMicros.value();
   }
   graceWorkspaceAdmission_ = std::move(workspaceAdmission.value());
   return true;
@@ -2752,8 +2699,7 @@ RowVectorPtr CudfHashJoinProbe::getGraceOutput() {
     }
     auto& probeBatches = gracePartition_->probe;
     const auto buildEmpty = gracePartition_->build.empty();
-    if (probeBatches.empty() &&
-        (!joinNode_->isRightJoin() || buildEmpty)) {
+    if (probeBatches.empty() && (!joinNode_->isRightJoin() || buildEmpty)) {
       gracePartition_.reset();
       graceProbeChunk_ = 0;
       continue;
@@ -2769,8 +2715,7 @@ RowVectorPtr CudfHashJoinProbe::getGraceOutput() {
     }
     if (buildBytes > graceRestoreBuildBytes_) {
       if (!acquireGraceWorkspace(
-              estimateGraceBuildWorkspaceBytes(
-                  *gracePartition_, true),
+              estimateGraceBuildWorkspaceBytes(*gracePartition_, true),
               DeviceMemoryWorkspacePriority::kDrain)) {
         return nullptr;
       }
@@ -2783,8 +2728,7 @@ RowVectorPtr CudfHashJoinProbe::getGraceOutput() {
     }
     if (!hashObject_.has_value()) {
       if (!acquireGraceWorkspace(
-              estimateGraceBuildWorkspaceBytes(
-                  *gracePartition_, false),
+              estimateGraceBuildWorkspaceBytes(*gracePartition_, false),
               DeviceMemoryWorkspacePriority::kRestore)) {
         return nullptr;
       }
@@ -2806,8 +2750,7 @@ RowVectorPtr CudfHashJoinProbe::getGraceOutput() {
       // Overlap the first sequential probe pread with build restore,
       // concatenate, and hash-table construction.
       for (size_t chunk = 0;
-           chunk < std::min(
-               graceProbePrefetchDepth_, probeBatches.size());
+           chunk < std::min(graceProbePrefetchDepth_, probeBatches.size());
            ++chunk) {
         scheduleGraceProbePrefetch(probeBatches, chunk);
       }
@@ -2823,8 +2766,7 @@ RowVectorPtr CudfHashJoinProbe::getGraceOutput() {
       graceWorkspaceAdmission_.reset();
     }
     if (graceProbeChunk_ >= probeBatches.size()) {
-      if (joinNode_->isRightJoin() &&
-          !gracePartitionUnmatchedEmitted_) {
+      if (joinNode_->isRightJoin() && !gracePartitionUnmatchedEmitted_) {
         if (!acquireGraceWorkspace(
                 estimateGraceProbeWorkspaceBytes(buildBytes),
                 DeviceMemoryWorkspacePriority::kDrain)) {
@@ -2851,33 +2793,26 @@ RowVectorPtr CudfHashJoinProbe::getGraceOutput() {
       const auto accountedMicros = gracePartitionBuildLoadMicros_ +
           gracePartitionWorkspaceWaitMicros_ +
           gracePartitionProbeRestoreMicros_ +
-          gracePartitionProbePrefetchWaitMicros_ +
-          gracePartitionJoinMicros_ + gracePartitionOutputMicros_ +
-          gracePartitionDownstreamHandoffMicros_ +
+          gracePartitionProbePrefetchWaitMicros_ + gracePartitionJoinMicros_ +
+          gracePartitionOutputMicros_ + gracePartitionDownstreamHandoffMicros_ +
           gracePartitionFinalSyncMicros_;
-      LOG(WARNING) << "CudfHashJoinProbe node=" << planNodeId()
-                   << " completed Grace partition=" << gracePartition_->id()
-                   << " probeChunks=" << gracePartitionProbeChunks_
-                   << " probeGroups=" << gracePartitionProbeGroups_
-                   << " probeBytes=" << gracePartitionProbeBytes_
-                   << " probeRestoreH2DUs="
-                   << gracePartitionProbeRestoreMicros_
-                   << " probePrefetchWaitUs="
-                   << gracePartitionProbePrefetchWaitMicros_
-                   << " joinUs=" << gracePartitionJoinMicros_
-                   << " outputUs=" << gracePartitionOutputMicros_
-                   << " buildLoadUs=" << gracePartitionBuildLoadMicros_
-                   << " workspaceWaitUs="
-                   << gracePartitionWorkspaceWaitMicros_
-                   << " finalSyncUs=" << gracePartitionFinalSyncMicros_
-                   << " downstreamHandoffUs="
-                   << gracePartitionDownstreamHandoffMicros_
-                   << " accountedUs=" << accountedMicros
-                   << " unaccountedUs="
-                   << (totalMicros > accountedMicros
-                           ? totalMicros - accountedMicros
-                           : 0)
-                   << " totalUs=" << totalMicros;
+      LOG(WARNING)
+          << "CudfHashJoinProbe node=" << planNodeId()
+          << " completed Grace partition=" << gracePartition_->id()
+          << " probeChunks=" << gracePartitionProbeChunks_
+          << " probeGroups=" << gracePartitionProbeGroups_
+          << " probeBytes=" << gracePartitionProbeBytes_
+          << " probeRestoreH2DUs=" << gracePartitionProbeRestoreMicros_
+          << " probePrefetchWaitUs=" << gracePartitionProbePrefetchWaitMicros_
+          << " joinUs=" << gracePartitionJoinMicros_
+          << " outputUs=" << gracePartitionOutputMicros_
+          << " buildLoadUs=" << gracePartitionBuildLoadMicros_
+          << " workspaceWaitUs=" << gracePartitionWorkspaceWaitMicros_
+          << " finalSyncUs=" << gracePartitionFinalSyncMicros_
+          << " downstreamHandoffUs=" << gracePartitionDownstreamHandoffMicros_
+          << " accountedUs=" << accountedMicros << " unaccountedUs="
+          << (totalMicros > accountedMicros ? totalMicros - accountedMicros : 0)
+          << " totalUs=" << totalMicros;
       hashObject_.reset();
       probeBatches.clear();
       gracePartition_.reset();
@@ -2899,7 +2834,7 @@ RowVectorPtr CudfHashJoinProbe::getGraceOutput() {
       const auto batchBytes = probeBatches[groupEnd].dataBytes;
       if (groupEnd > groupBegin &&
           batchBytes > graceRestoreProbeBytes_ -
-              std::min(groupBytes, graceRestoreProbeBytes_)) {
+                  std::min(groupBytes, graceRestoreProbeBytes_)) {
         break;
       }
       groupBytes += batchBytes;
@@ -2933,10 +2868,9 @@ RowVectorPtr CudfHashJoinProbe::getGraceOutput() {
         }
         stream.synchronize();
       }
-      groupJoinMicros +=
-          std::chrono::duration_cast<std::chrono::microseconds>(
-              std::chrono::steady_clock::now() - joinStart)
-              .count();
+      groupJoinMicros += std::chrono::duration_cast<std::chrono::microseconds>(
+                             std::chrono::steady_clock::now() - joinStart)
+                             .count();
       for (auto& output : outputs) {
         zeroColumnRows += output.numRows;
         tables.push_back(std::move(output.table));
@@ -2957,8 +2891,7 @@ RowVectorPtr CudfHashJoinProbe::getGraceOutput() {
         // While this GPU join runs, read the next raw range into a different
         // pooled pinned buffer.
         scheduleGraceProbePrefetch(
-            probeBatches,
-            graceProbeChunk_ + graceProbePrefetchDepth_);
+            probeBatches, graceProbeChunk_ + graceProbePrefetchDepth_);
         joinProbe(probe->getTableView());
         probe.reset();
         gracePartitionProbeBytes_ += restoredBytes;
@@ -2972,10 +2905,9 @@ RowVectorPtr CudfHashJoinProbe::getGraceOutput() {
       // chunk-granular so output cardinality and peak memory do not change.
       while (graceProbeChunk_ < groupEnd) {
         const auto waveBegin = graceProbeChunk_;
-        const auto waveEnd = std::min<size_t>(
-            groupEnd, waveBegin + graceProbePrefetchDepth_);
-        for (auto chunkIndex = waveBegin; chunkIndex < waveEnd;
-             ++chunkIndex) {
+        const auto waveEnd =
+            std::min<size_t>(groupEnd, waveBegin + graceProbePrefetchDepth_);
+        for (auto chunkIndex = waveBegin; chunkIndex < waveEnd; ++chunkIndex) {
           waitForGraceProbePrefetch(chunkIndex);
         }
         const auto hasUnmaterializedDisk = std::any_of(
@@ -2994,17 +2926,14 @@ RowVectorPtr CudfHashJoinProbe::getGraceOutput() {
             auto& hostProbe = probeBatches[chunkIndex];
             const auto restoredBytes = hostProbe.dataBytes;
             accountConsumedGraceProbeBatch(hostProbe);
-            const auto probeRestoreStart =
-                std::chrono::steady_clock::now();
-            auto probe =
-                restoreHostBatch(hostProbe, probeType_, stream, true);
+            const auto probeRestoreStart = std::chrono::steady_clock::now();
+            auto probe = restoreHostBatch(hostProbe, probeType_, stream, true);
             groupRestoreMicros +=
                 std::chrono::duration_cast<std::chrono::microseconds>(
                     std::chrono::steady_clock::now() - probeRestoreStart)
                     .count();
             scheduleGraceProbePrefetch(
-                probeBatches,
-                chunkIndex + graceProbePrefetchDepth_);
+                probeBatches, chunkIndex + graceProbePrefetchDepth_);
             joinProbe(probe->getTableView());
             probe.reset();
             gracePartitionProbeBytes_ += restoredBytes;
@@ -3017,8 +2946,7 @@ RowVectorPtr CudfHashJoinProbe::getGraceOutput() {
         std::vector<CudfPackedHostRestoreChunk> chunks;
         chunks.reserve(waveEnd - waveBegin);
         uint64_t pinnedDirectBytes = 0;
-        for (auto chunkIndex = waveBegin; chunkIndex < waveEnd;
-             ++chunkIndex) {
+        for (auto chunkIndex = waveBegin; chunkIndex < waveEnd; ++chunkIndex) {
           auto& hostProbe = probeBatches[chunkIndex];
           const auto restoredBytes = hostProbe.dataBytes;
           accountConsumedGraceProbeBatch(hostProbe);
@@ -3041,8 +2969,7 @@ RowVectorPtr CudfHashJoinProbe::getGraceOutput() {
             spillFile->reclaim(fileOffset, restoredBytes);
           } else {
             graceRestoreResidentBytes_ += restoredBytes;
-            if (gracePageableRestoreBounceEnabled() &&
-                !hostProbe.pinned) {
+            if (gracePageableRestoreBounceEnabled() && !hostProbe.pinned) {
               chunk.stageResidentPageableThroughPinned = true;
             }
           }
@@ -3063,13 +2990,11 @@ RowVectorPtr CudfHashJoinProbe::getGraceOutput() {
         VELOX_CHECK_GE(stats.pageableDirectBytes, pinnedDirectBytes);
         graceRestorePinnedSourceBytes_ +=
             stats.pinnedBounceBytes + pinnedDirectBytes;
-        graceRestoreResidentBounceBytes_ +=
-            stats.residentPageableBounceBytes;
+        graceRestoreResidentBounceBytes_ += stats.residentPageableBounceBytes;
         graceRestorePageableDirectBytes_ +=
             stats.pageableDirectBytes - pinnedDirectBytes;
         graceRestoreHostStageMicros_ += stats.hostStageMicros;
-        graceRestoreCopySynchronizeMicros_ +=
-            stats.copyStreamSynchronizeMicros;
+        graceRestoreCopySynchronizeMicros_ += stats.copyStreamSynchronizeMicros;
         groupRestoreMicros +=
             std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - probeRestoreStart)
@@ -3081,8 +3006,7 @@ RowVectorPtr CudfHashJoinProbe::getGraceOutput() {
         // GPU joins execute.
         for (auto chunkIndex = waveBegin; chunkIndex < waveEnd; ++chunkIndex) {
           scheduleGraceProbePrefetch(
-              probeBatches,
-              chunkIndex + graceProbePrefetchDepth_);
+              probeBatches, chunkIndex + graceProbePrefetchDepth_);
         }
         for (const auto& probeView : restored.tables()) {
           joinProbe(probeView);
@@ -3090,8 +3014,7 @@ RowVectorPtr CudfHashJoinProbe::getGraceOutput() {
       }
     }
     const auto outputStart = std::chrono::steady_clock::now();
-    auto output =
-        concatenateTables(std::move(tables), stream, get_output_mr());
+    auto output = concatenateTables(std::move(tables), stream, get_output_mr());
     const auto outputEnd = std::chrono::steady_clock::now();
     ++gracePartitionProbeGroups_;
     gracePartitionProbeRestoreMicros_ += groupRestoreMicros;
@@ -3148,21 +3071,16 @@ RowVectorPtr CudfHashJoinProbe::getGraceOutput() {
                << " rawSpillWriteUs=" << graceRawSpillWriteMicros_
                << " restoreResidentBytes=" << graceRestoreResidentBytes_
                << " restoreDiskBytes=" << graceRestoreDiskBytes_
-               << " restorePinnedSourceBytes="
-               << graceRestorePinnedSourceBytes_
+               << " restorePinnedSourceBytes=" << graceRestorePinnedSourceBytes_
                << " restoreResidentBounceBytes="
                << graceRestoreResidentBounceBytes_
                << " restorePageableDirectBytes="
                << graceRestorePageableDirectBytes_
                << " restoreHostStageUs=" << graceRestoreHostStageMicros_
-               << " restoreCopySyncUs="
-               << graceRestoreCopySynchronizeMicros_
-               << " bulkProbeRestoreBytes="
-               << graceBulkProbeRestoreBytes_
-               << " bulkProbeRestoreWaves="
-               << graceBulkProbeRestoreWaves_
-               << " bulkProbeFallbackBytes="
-               << graceBulkProbeFallbackBytes_;
+               << " restoreCopySyncUs=" << graceRestoreCopySynchronizeMicros_
+               << " bulkProbeRestoreBytes=" << graceBulkProbeRestoreBytes_
+               << " bulkProbeRestoreWaves=" << graceBulkProbeRestoreWaves_
+               << " bulkProbeFallbackBytes=" << graceBulkProbeFallbackBytes_;
   if (noMoreInput_) {
     graceBuildData_.reset();
     graceProbePartitions_.clear();
@@ -3360,16 +3278,14 @@ void CudfHashJoinProbe::doNoMoreInput() {
       if (peer.get() == operatorCtx_->driver()) {
         continue;
       }
-      auto* probe = dynamic_cast<CudfHashJoinProbe*>(
-          peer->findOperator(planNodeId()));
+      auto* probe =
+          dynamic_cast<CudfHashJoinProbe*>(peer->findOperator(planNodeId()));
       if (probe == nullptr || probe == this) {
         continue;
       }
       VELOX_CHECK_EQ(
-          probe->graceProbePartitions_.size(),
-          graceProbePartitions_.size());
-      for (size_t partition = 0;
-           partition < graceProbePartitions_.size();
+          probe->graceProbePartitions_.size(), graceProbePartitions_.size());
+      for (size_t partition = 0; partition < graceProbePartitions_.size();
            ++partition) {
         auto& source = probe->graceProbePartitions_[partition];
         auto& target = graceProbePartitions_[partition];
@@ -3380,8 +3296,7 @@ void CudfHashJoinProbe::doNoMoreInput() {
         source.clear();
       }
       graceProbeBufferedBytes_ += probe->graceProbeBufferedBytes_;
-      graceProbeResidentHostBytes_ +=
-          probe->graceProbeResidentHostBytes_;
+      graceProbeResidentHostBytes_ += probe->graceProbeResidentHostBytes_;
       graceProbeDiskBytes_ += probe->graceProbeDiskBytes_;
       graceHostDemoteMicros_ += probe->graceHostDemoteMicros_;
       graceRawSpillWriteMicros_ += probe->graceRawSpillWriteMicros_;
@@ -3399,8 +3314,7 @@ void CudfHashJoinProbe::doNoMoreInput() {
     if (graceBuildData_) {
       graceProbeDraining_ = true;
       LOG(WARNING) << "CudfHashJoinProbe task="
-                   << operatorCtx_->task()->taskId()
-                   << " node=" << planNodeId()
+                   << operatorCtx_->task()->taskId() << " node=" << planNodeId()
                    << " starting partition-major Grace drain bytes="
                    << graceProbeBufferedBytes_
                    << " partitions=" << graceProbePartitions_.size()
@@ -3635,12 +3549,10 @@ CudfHashJoinProbe::JoinOutput CudfHashJoinProbe::filteredOutputIndices(
           stream,
           get_temp_mr());
 
-  auto filteredLeftIndicesSpan =
-      cudf::device_span<cudf::size_type const>{
-          filteredLeftJoinIndices->data(), filteredLeftJoinIndices->size()};
-  auto filteredRightIndicesSpan =
-      cudf::device_span<cudf::size_type const>{
-          filteredRightJoinIndices->data(), filteredRightJoinIndices->size()};
+  auto filteredLeftIndicesSpan = cudf::device_span<cudf::size_type const>{
+      filteredLeftJoinIndices->data(), filteredLeftJoinIndices->size()};
+  auto filteredRightIndicesSpan = cudf::device_span<cudf::size_type const>{
+      filteredRightJoinIndices->data(), filteredRightJoinIndices->size()};
   auto filteredLeftIndicesCol = cudf::column_view{filteredLeftIndicesSpan};
   auto filteredRightIndicesCol = cudf::column_view{filteredRightIndicesSpan};
   // Use original views (without precomputed columns) for gathering output
@@ -3928,10 +3840,7 @@ CudfHashJoinProbe::JoinOutput CudfHashJoinProbe::leftUnmatchedOutput(
     cudf::column_view probeMatchedFlags,
     rmm::cuda_stream_view stream) {
   auto unmatchedMask = cudf::unary_operation(
-      probeMatchedFlags,
-      cudf::unary_operator::NOT,
-      stream,
-      get_temp_mr());
+      probeMatchedFlags, cudf::unary_operator::NOT, stream, get_temp_mr());
   auto unmatchedCountScalar = cudf::reduce(
       unmatchedMask->view(),
       *cudf::make_sum_aggregation<cudf::reduce_aggregation>(),
@@ -3939,8 +3848,7 @@ CudfHashJoinProbe::JoinOutput CudfHashJoinProbe::leftUnmatchedOutput(
       stream,
       get_temp_mr());
   const auto unmatchedRows = static_cast<vector_size_t>(
-      static_cast<cudf::numeric_scalar<int32_t>*>(
-          unmatchedCountScalar.get())
+      static_cast<cudf::numeric_scalar<int32_t>*>(unmatchedCountScalar.get())
           ->value(stream));
   if (unmatchedRows == 0) {
     std::vector<std::unique_ptr<cudf::column>> emptyCols;
@@ -3973,8 +3881,7 @@ CudfHashJoinProbe::JoinOutput CudfHashJoinProbe::leftUnmatchedOutput(
         get_output_mr());
   }
   stream.synchronize();
-  return {
-      std::make_unique<cudf::table>(std::move(outCols)), unmatchedRows};
+  return {std::make_unique<cudf::table>(std::move(outCols)), unmatchedRows};
 }
 
 std::vector<CudfHashJoinProbe::JoinOutput>
@@ -3995,8 +3902,7 @@ CudfHashJoinProbe::multiTableLeftOuterJoin(
       RuntimeCounter(1, RuntimeCounter::Unit::kNone));
   addRuntimeStat(
       "multiBuildOuterProbeRows",
-      RuntimeCounter(
-          leftTableView.num_rows(), RuntimeCounter::Unit::kNone));
+      RuntimeCounter(leftTableView.num_rows(), RuntimeCounter::Unit::kNone));
   addRuntimeStat(
       "multiBuildOuterTableProbes",
       RuntimeCounter(rightTables.size(), RuntimeCounter::Unit::kNone));
@@ -4008,10 +3914,8 @@ CudfHashJoinProbe::multiTableLeftOuterJoin(
       falseScalar, numProbeRows, stream, get_temp_mr());
   auto probeRowIndices = cudf::sequence(
       numProbeRows,
-      cudf::numeric_scalar<cudf::size_type>(
-          0, true, stream, get_temp_mr()),
-      cudf::numeric_scalar<cudf::size_type>(
-          1, true, stream, get_temp_mr()),
+      cudf::numeric_scalar<cudf::size_type>(0, true, stream, get_temp_mr()),
+      cudf::numeric_scalar<cudf::size_type>(1, true, stream, get_temp_mr()),
       stream,
       get_temp_mr());
 
@@ -4023,8 +3927,8 @@ CudfHashJoinProbe::multiTableLeftOuterJoin(
     if (matchedIndices.size() == 0) {
       return;
     }
-    auto matched = cudf::contains(
-        matchedIndices, allRowIndices, stream, get_temp_mr());
+    auto matched =
+        cudf::contains(matchedIndices, allRowIndices, stream, get_temp_mr());
     auto updated = cudf::binary_operation(
         flags->view(),
         matched->view(),
@@ -4094,10 +3998,7 @@ CudfHashJoinProbe::multiTableLeftOuterJoin(
       auto filteredLeftCol = cudf::column_view{filteredLeftSpan};
       auto filteredRightCol = cudf::column_view{filteredRightSpan};
       markMatchedRows(
-          probeMatchedFlags,
-          filteredLeftCol,
-          probeRowIndices->view(),
-          false);
+          probeMatchedFlags, filteredLeftCol, probeRowIndices->view(), false);
       if (trackRightMatches) {
         auto buildRowIndices = cudf::sequence(
             rightTableView.num_rows(),
@@ -4123,51 +4024,49 @@ CudfHashJoinProbe::multiTableLeftOuterJoin(
     }
 
     if (joinNode_->filter()) {
-      auto filterFunc = [&, i, leftIndicesSpan, rightIndicesSpan](
-                            std::vector<std::unique_ptr<cudf::column>>&&
-                                joinedCols,
-                            cudf::column_view filterColumn) {
-        auto filterTable =
-            std::make_unique<cudf::table>(std::move(joinedCols));
-        auto filteredTable = cudf::apply_boolean_mask(
-            *filterTable, filterColumn, stream, get_output_mr());
+      auto filterFunc =
+          [&, i, leftIndicesSpan, rightIndicesSpan](
+              std::vector<std::unique_ptr<cudf::column>>&& joinedCols,
+              cudf::column_view filterColumn) {
+            auto filterTable =
+                std::make_unique<cudf::table>(std::move(joinedCols));
+            auto filteredTable = cudf::apply_boolean_mask(
+                *filterTable, filterColumn, stream, get_output_mr());
 
-        auto filteredLeftTable = cudf::apply_boolean_mask(
-            cudf::table_view{
-                std::vector<cudf::column_view>{
+            auto filteredLeftTable = cudf::apply_boolean_mask(
+                cudf::table_view{std::vector<cudf::column_view>{
                     cudf::column_view{leftIndicesSpan}}},
-            filterColumn,
-            stream,
-            get_temp_mr());
-        markMatchedRows(
-            probeMatchedFlags,
-            filteredLeftTable->view().column(0),
-            probeRowIndices->view(),
-            false);
-        if (trackRightMatches) {
-          auto filteredRightTable = cudf::apply_boolean_mask(
-              cudf::table_view{
-                  std::vector<cudf::column_view>{
+                filterColumn,
+                stream,
+                get_temp_mr());
+            markMatchedRows(
+                probeMatchedFlags,
+                filteredLeftTable->view().column(0),
+                probeRowIndices->view(),
+                false);
+            if (trackRightMatches) {
+              auto filteredRightTable = cudf::apply_boolean_mask(
+                  cudf::table_view{std::vector<cudf::column_view>{
                       cudf::column_view{rightIndicesSpan}}},
-              filterColumn,
-              stream,
-              get_temp_mr());
-          auto buildRowIndices = cudf::sequence(
-              rightTableView.num_rows(),
-              cudf::numeric_scalar<cudf::size_type>(
-                  0, true, stream, get_temp_mr()),
-              cudf::numeric_scalar<cudf::size_type>(
-                  1, true, stream, get_temp_mr()),
-              stream,
-              get_temp_mr());
-          markMatchedRows(
-              rightMatchedFlags_[i],
-              filteredRightTable->view().column(0),
-              buildRowIndices->view(),
-              true);
-        }
-        return filteredTable->release();
-      };
+                  filterColumn,
+                  stream,
+                  get_temp_mr());
+              auto buildRowIndices = cudf::sequence(
+                  rightTableView.num_rows(),
+                  cudf::numeric_scalar<cudf::size_type>(
+                      0, true, stream, get_temp_mr()),
+                  cudf::numeric_scalar<cudf::size_type>(
+                      1, true, stream, get_temp_mr()),
+                  stream,
+                  get_temp_mr());
+              markMatchedRows(
+                  rightMatchedFlags_[i],
+                  filteredRightTable->view().column(0),
+                  buildRowIndices->view(),
+                  true);
+            }
+            return filteredTable->release();
+          };
       cudfOutputs.push_back(filteredOutput(
           leftTableView,
           leftIndicesCol,
@@ -4179,17 +4078,12 @@ CudfHashJoinProbe::multiTableLeftOuterJoin(
     }
 
     markMatchedRows(
-        probeMatchedFlags,
-        leftIndicesCol,
-        probeRowIndices->view(),
-        false);
+        probeMatchedFlags, leftIndicesCol, probeRowIndices->view(), false);
     if (trackRightMatches) {
       auto buildRowIndices = cudf::sequence(
           rightTableView.num_rows(),
-          cudf::numeric_scalar<cudf::size_type>(
-              0, true, stream, get_temp_mr()),
-          cudf::numeric_scalar<cudf::size_type>(
-              1, true, stream, get_temp_mr()),
+          cudf::numeric_scalar<cudf::size_type>(0, true, stream, get_temp_mr()),
+          cudf::numeric_scalar<cudf::size_type>(1, true, stream, get_temp_mr()),
           stream,
           get_temp_mr());
       markMatchedRows(
@@ -4238,8 +4132,7 @@ std::vector<CudfHashJoinProbe::JoinOutput> CudfHashJoinProbe::rightJoin(
     if (!joinNode_->filter()) {
       // Mark matched build rows by checking which row indices appear in
       // rightJoinIndices. Use contains to avoid scatter with duplicate indices.
-      auto rightIdxCol = cudf::column_view{
-          toSpan(*rightJoinIndices)};
+      auto rightIdxCol = cudf::column_view{toSpan(*rightJoinIndices)};
 
       // Create sequence [0, 1, ..., n-1] for build table row indices
       auto n = rightTableView.num_rows();
@@ -5374,8 +5267,9 @@ void CudfHashJoinProbe::initializeRightMatchedFlags(
   for (auto& table : rightTables) {
     auto falseScalar =
         cudf::numeric_scalar<bool>(false, true, stream, get_temp_mr());
-    rightMatchedFlags_.push_back(cudf::make_column_from_scalar(
-        falseScalar, table->num_rows(), stream, get_temp_mr()));
+    rightMatchedFlags_.push_back(
+        cudf::make_column_from_scalar(
+            falseScalar, table->num_rows(), stream, get_temp_mr()));
   }
   stream.synchronize();
 }
@@ -5405,8 +5299,7 @@ RowVectorPtr CudfHashJoinProbe::rightUnmatchedOutput(
         stream,
         get_temp_mr());
     const auto unmatched =
-        static_cast<cudf::numeric_scalar<int32_t>*>(
-            unmatchedCountScalar.get())
+        static_cast<cudf::numeric_scalar<int32_t>*>(unmatchedCountScalar.get())
             ->value(stream);
     if (unmatched == 0) {
       continue;
@@ -5453,8 +5346,7 @@ RowVectorPtr CudfHashJoinProbe::graceRightNullUnmatchedOutput(
     rmm::cuda_stream_view stream) {
   VELOX_CHECK(joinNode_->isRightJoin());
   VELOX_CHECK_NOT_NULL(graceBuildData_);
-  VELOX_CHECK_LT(
-      graceNullBuildChunk_, graceBuildData_->unmatchedNulls.size());
+  VELOX_CHECK_LT(graceNullBuildChunk_, graceBuildData_->unmatchedNulls.size());
   auto& host = graceBuildData_->unmatchedNulls[graceNullBuildChunk_++];
   const auto rows = host.rows;
   auto build = restoreHostBatch(host, buildType_, stream, true);
@@ -5464,10 +5356,7 @@ RowVectorPtr CudfHashJoinProbe::graceRightNullUnmatchedOutput(
     const auto outIdx = leftColumnOutputIndices_[li];
     const auto probeChannel = leftColumnIndicesToGather_[li];
     outCols[outIdx] = makeAllNullColumnForType(
-        probeType_->childAt(probeChannel),
-        rows,
-        stream,
-        get_output_mr());
+        probeType_->childAt(probeChannel), rows, stream, get_output_mr());
   }
   if (!rightColumnIndicesToGather_.empty()) {
     auto right = std::make_unique<cudf::table>(
@@ -5674,13 +5563,12 @@ exec::BlockingReason CudfHashJoinProbe::isBlocked(ContinueFuture* future) {
     if (!result.has_value()) {
       return exec::BlockingReason::kWaitForJoinBuild;
     }
-    if (result->graceActivated && !result->grace &&
-        !result->hash.has_value()) {
+    if (result->graceActivated && !result->grace && !result->hash.has_value()) {
       if (graceEagerProbeBufferLimitBytes_ > 0) {
         graceEagerActive_ = true;
         LOG(WARNING)
-            << "CudfHashJoinProbe task="
-            << operatorCtx_->task()->taskId() << " node=" << planNodeId()
+            << "CudfHashJoinProbe task=" << operatorCtx_->task()->taskId()
+            << " node=" << planNodeId()
             << " starting eager Grace probe partitioning hostLimitBytes="
             << graceEagerProbeBufferLimitBytes_;
         return exec::BlockingReason::kNotBlocked;

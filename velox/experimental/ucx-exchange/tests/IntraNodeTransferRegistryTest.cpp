@@ -98,7 +98,8 @@ TEST(IntraNodeTransferRegistryTest, hostBackedPayloadRetainsOwnership) {
   EXPECT_EQ(result->hostDataSize, 8);
   EXPECT_TRUE(result->hostDataPinned);
   EXPECT_EQ(result->hostData.get()[3], 42);
-  EXPECT_EQ(future.wait_for(std::chrono::seconds(0)), std::future_status::ready);
+  EXPECT_EQ(
+      future.wait_for(std::chrono::seconds(0)), std::future_status::ready);
 
   result.reset();
   EXPECT_TRUE(weakOwner.expired());

@@ -23,8 +23,8 @@
 #include "velox/core/QueryConfig.h"
 #include "velox/exec/Driver.h"
 #include "velox/exec/Operator.h"
-#include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/CudfPackedSpill.h"
+#include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
@@ -293,12 +293,13 @@ std::vector<OwningPackedChunk> makeOwningPackedChunks(
     cudf::table_view table,
     cudf::size_type rowsPerChunk,
     rmm::cuda_stream_view stream) {
-  CudaCallDiagnosticScope callDiagnostic(fmt::format(
-      "operator=UcxPartitionedOutput phase=contiguousSplit rows={} "
-      "rowsPerChunk={} stream={}",
-      table.num_rows(),
-      rowsPerChunk,
-      static_cast<const void*>(stream.value())));
+  CudaCallDiagnosticScope callDiagnostic(
+      fmt::format(
+          "operator=UcxPartitionedOutput phase=contiguousSplit rows={} "
+          "rowsPerChunk={} stream={}",
+          table.num_rows(),
+          rowsPerChunk,
+          static_cast<const void*>(stream.value())));
   VELOX_CHECK_GT(rowsPerChunk, 0);
   if (table.num_rows() == 0) {
     return {};
@@ -310,10 +311,7 @@ std::vector<OwningPackedChunk> makeOwningPackedChunks(
     splitOffsets.push_back(offset);
   }
   auto packedTables = cudf::contiguous_split(
-      table,
-      splitOffsets,
-      stream,
-      cudf::get_current_device_resource_ref());
+      table, splitOffsets, stream, cudf::get_current_device_resource_ref());
   stream.synchronize();
 
   std::vector<OwningPackedChunk> result;
@@ -379,14 +377,14 @@ UcxPartitionedOutput::UcxPartitionedOutput(
       localDeviceRootOutput_(
           planNode->numPartitions() == 1 &&
           ctx->queryConfig().get<bool>(
-              LocalDeviceOutputQueueManager::kEnabledConfig, false) &&
-          LocalDeviceOutputQueueManager::getInstanceRef()
-              ->isDirectOutputTask(ctx->task->taskId())),
+              LocalDeviceOutputQueueManager::kEnabledConfig,
+              false) &&
+          LocalDeviceOutputQueueManager::getInstanceRef()->isDirectOutputTask(
+              ctx->task->taskId())),
       pipelineId_(ctx->pipelineId),
       driverId_(ctx->driverId),
       sourceCanExternalizeOnBackpressure_(
-          sourceCanExternalizeOnBackpressure(
-              planNode->sources().front())),
+          sourceCanExternalizeOnBackpressure(planNode->sources().front())),
       packedHostBytesLimit_(packedHostBytesLimit()),
       maxOutputBufferSize_(ctx->queryConfig().maxOutputBufferSize()),
       targetRowsPerChunk_(
@@ -414,10 +412,11 @@ UcxPartitionedOutput::UcxPartitionedOutput(
 }
 
 void UcxPartitionedOutput::addInput(RowVectorPtr input) {
-  CudaCallDiagnosticScope callDiagnostic(fmt::format(
-      "operator=UcxPartitionedOutput task={} method=addInput rows={}",
-      taskId(),
-      input == nullptr ? 0 : input->size()));
+  CudaCallDiagnosticScope callDiagnostic(
+      fmt::format(
+          "operator=UcxPartitionedOutput task={} method=addInput rows={}",
+          taskId(),
+          input == nullptr ? 0 : input->size()));
   CudaAllocationTraceScope allocationTrace(
       fmt::format("UcxPartitionedOutput task={} method=addInput", taskId()));
   VLOG(3) << "@" << taskId() << "#" << pipelineId_ << "/" << driverId_
@@ -455,8 +454,7 @@ void UcxPartitionedOutput::addInput(RowVectorPtr input) {
 
   if ((targetRowsPerChunk_ <= 0 && targetBytesPerChunk_ == 0) ||
       (targetRowsPerChunk_ > 0 && pendingRows_ >= targetRowsPerChunk_) ||
-      (targetBytesPerChunk_ > 0 &&
-       pendingFlatBytes_ >= targetBytesPerChunk_)) {
+      (targetBytesPerChunk_ > 0 && pendingFlatBytes_ >= targetBytesPerChunk_)) {
     pendingFlushReady_ = true;
   }
 }
@@ -498,11 +496,10 @@ uint64_t UcxPartitionedOutput::flushWorkspaceBytes() const {
   // become reusable.  Account from the actual owner instead of a fixed batch
   // assumption: variable-width TopN output can overshoot the configured byte
   // threshold by one complete input batch.
-  const auto sourceBytes = hasActiveFlush() ? activeSourceFlatBytes_
-                                            : pendingFlatBytes_;
-  if (sourceBytes >
-      (std::numeric_limits<uint64_t>::max() -
-       kPartitionedOutputFlushFixedWorkspaceBytes) /
+  const auto sourceBytes =
+      hasActiveFlush() ? activeSourceFlatBytes_ : pendingFlatBytes_;
+  if (sourceBytes > (std::numeric_limits<uint64_t>::max() -
+                     kPartitionedOutputFlushFixedWorkspaceBytes) /
           kPartitionedOutputFlushSourceCopies) {
     return std::numeric_limits<uint64_t>::max();
   }
@@ -591,7 +588,6 @@ void UcxPartitionedOutput::preparePendingFlush() {
         targetRowsPerChunk_,
         targetBytesPerChunk_);
   }
-
 }
 
 bool UcxPartitionedOutput::hasActiveFlush() const {
@@ -619,9 +615,10 @@ cudf::table_view UcxPartitionedOutput::activeTableView() {
 }
 
 bool UcxPartitionedOutput::externalizeActiveSourceTail() {
-  CudaCallDiagnosticScope callDiagnostic(fmt::format(
-      "operator=UcxPartitionedOutput task={} phase=externalizeSourceTail",
-      taskId()));
+  CudaCallDiagnosticScope callDiagnostic(
+      fmt::format(
+          "operator=UcxPartitionedOutput task={} phase=externalizeSourceTail",
+          taskId()));
   if (!sourceCanExternalizeOnBackpressure_ || !hasActiveDeviceSource() ||
       !activeStream_) {
     return false;
@@ -656,16 +653,15 @@ bool UcxPartitionedOutput::externalizeActiveSourceTail() {
   uint64_t copiedBytes = 0;
   uint64_t copiedRows = 0;
   for (auto offset = activeNextRow_; offset < tableRows;) {
-    const auto end = std::min<cudf::size_type>(
-        tableRows, offset + activeRowsPerWindow_);
+    const auto end =
+        std::min<cudf::size_type>(tableRows, offset + activeRowsPerWindow_);
     auto slices = cudf::slice(tableView, {offset, end}, stream);
     VELOX_CHECK_EQ(slices.size(), 1);
     auto packedChunks =
         makeOwningPackedChunks(slices.front(), end - offset, stream);
     VELOX_CHECK_EQ(packedChunks.size(), 1);
     auto& packed = packedChunks.front();
-    const auto dataBytes =
-        static_cast<uint64_t>(packed.data->gpu_data->size());
+    const auto dataBytes = static_cast<uint64_t>(packed.data->gpu_data->size());
     VELOX_CHECK_LE(
         dataBytes,
         static_cast<uint64_t>(std::numeric_limits<size_t>::max()),
@@ -674,15 +670,16 @@ bool UcxPartitionedOutput::externalizeActiveSourceTail() {
         dataBytes == 0 ? nullptr : new uint8_t[static_cast<size_t>(dataBytes)],
         std::default_delete<uint8_t[]>());
     if (dataBytes > 0) {
-      CudaCallDiagnosticScope copyDiagnostic(fmt::format(
-          "operator=UcxPartitionedOutput task={} phase=externalizeD2H "
-          "rows={} bytes={} src={} dst={} stream={}",
-          taskId(),
-          packed.rows,
-          dataBytes,
-          packed.data->gpu_data->data(),
-          static_cast<const void*>(hostData.get()),
-          static_cast<const void*>(stream.value())));
+      CudaCallDiagnosticScope copyDiagnostic(
+          fmt::format(
+              "operator=UcxPartitionedOutput task={} phase=externalizeD2H "
+              "rows={} bytes={} src={} dst={} stream={}",
+              taskId(),
+              packed.rows,
+              dataBytes,
+              packed.data->gpu_data->data(),
+              static_cast<const void*>(hostData.get()),
+              static_cast<const void*>(stream.value())));
       CUDF_CUDA_TRY(cudaMemcpyAsync(
           hostData.get(),
           packed.data->gpu_data->data(),
@@ -695,12 +692,13 @@ bool UcxPartitionedOutput::externalizeActiveSourceTail() {
     stream.synchronize();
     copiedBytes += dataBytes;
     copiedRows += packed.rows;
-    hostChunks.push_back(HostSourceChunk{
-        std::move(packed.data->metadata),
-        std::move(hostData),
-        hostReservation,
-        dataBytes,
-        packed.rows});
+    hostChunks.push_back(
+        HostSourceChunk{
+            std::move(packed.data->metadata),
+            std::move(hostData),
+            hostReservation,
+            dataBytes,
+            packed.rows});
     offset = end;
   }
 
@@ -735,20 +733,22 @@ void UcxPartitionedOutput::restoreNextHostSource() {
   activeHostSources_.pop_front();
   const auto dataBytes = chunk.dataBytes;
   const auto rows = chunk.rows;
-  CudaCallDiagnosticScope callDiagnostic(fmt::format(
-      "operator=UcxPartitionedOutput task={} phase=restoreHostSource "
-      "rows={} bytes={} src={} stream={}",
-      taskId(),
-      rows,
-      dataBytes,
-      static_cast<const void*>(chunk.data.get()),
-      static_cast<const void*>(activeStream_->value())));
+  CudaCallDiagnosticScope callDiagnostic(
+      fmt::format(
+          "operator=UcxPartitionedOutput task={} phase=restoreHostSource "
+          "rows={} bytes={} src={} stream={}",
+          taskId(),
+          rows,
+          dataBytes,
+          static_cast<const void*>(chunk.data.get()),
+          static_cast<const void*>(activeStream_->value())));
   std::vector<CudfPackedHostRestoreChunk> restoreChunks;
-  restoreChunks.push_back(CudfPackedHostRestoreChunk{
-      std::move(chunk.metadata),
-      std::move(chunk.data),
-      chunk.dataBytes,
-      std::move(chunk.hostReservation)});
+  restoreChunks.push_back(
+      CudfPackedHostRestoreChunk{
+          std::move(chunk.metadata),
+          std::move(chunk.data),
+          chunk.dataBytes,
+          std::move(chunk.hostReservation)});
   activeRestoredSource_ = bulkRestoreCudfPackedHostChunks(
       std::move(restoreChunks),
       *activeStream_,
@@ -803,9 +803,10 @@ void UcxPartitionedOutput::updateBackpressure() {
 }
 
 void UcxPartitionedOutput::advanceActiveFlush() {
-  CudaCallDiagnosticScope callDiagnostic(fmt::format(
-      "operator=UcxPartitionedOutput task={} method=advanceActiveFlush",
-      taskId()));
+  CudaCallDiagnosticScope callDiagnostic(
+      fmt::format(
+          "operator=UcxPartitionedOutput task={} method=advanceActiveFlush",
+          taskId()));
   VELOX_CHECK(hasActiveFlush());
   VELOX_CHECK(activeStream_.has_value());
   VELOX_CHECK_EQ(blockingReason_, exec::BlockingReason::kNotBlocked);
@@ -978,8 +979,8 @@ void UcxPartitionedOutput::advanceActiveFlush() {
       equalPartition(partitionInput, stream);
     }
   } else {
-    auto packedChunks = makeOwningPackedChunks(
-        slices[0], slices[0].num_rows(), stream);
+    auto packedChunks =
+        makeOwningPackedChunks(slices[0], slices[0].num_rows(), stream);
     VELOX_CHECK_EQ(packedChunks.size(), 1);
     sharedQueueManager()->enqueue(
         this->taskId(),
@@ -1036,8 +1037,9 @@ exec::BlockingReason UcxPartitionedOutput::isBlocked(ContinueFuture* future) {
 }
 
 RowVectorPtr UcxPartitionedOutput::getOutput() {
-  CudaCallDiagnosticScope callDiagnostic(fmt::format(
-      "operator=UcxPartitionedOutput task={} method=getOutput", taskId()));
+  CudaCallDiagnosticScope callDiagnostic(
+      fmt::format(
+          "operator=UcxPartitionedOutput task={} method=getOutput", taskId()));
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
   if (finished_) {
     return nullptr;
@@ -1294,8 +1296,8 @@ void UcxPartitionedOutput::hashPartition(
                       destinationView.num_rows(),
                       static_cast<cudf::size_type>(targetRowsPerChunk_))
                 : destinationView.num_rows());
-        auto packedPartitions = makeOwningPackedChunks(
-            destinationView, rowsPerMessage, stream);
+        auto packedPartitions =
+            makeOwningPackedChunks(destinationView, rowsPerMessage, stream);
         for (auto& packed : packedPartitions) {
           queueManager->enqueue(
               this->taskId(), destination, std::move(packed.data), packed.rows);
@@ -1464,14 +1466,11 @@ void UcxPartitionedOutput::splitAndEnqueue(
           partitionTable.table,
           stream,
           cudf::get_current_device_resource_ref());
-      auto packedChunks = makeOwningPackedChunks(
-          owningPartition->view(), rowsPerChunk, stream);
+      auto packedChunks =
+          makeOwningPackedChunks(owningPartition->view(), rowsPerChunk, stream);
       for (auto& packedChunk : packedChunks) {
         queueManager->enqueue(
-            this->taskId(),
-            i,
-            std::move(packedChunk.data),
-            packedChunk.rows);
+            this->taskId(), i, std::move(packedChunk.data), packedChunk.rows);
       }
       continue;
     }

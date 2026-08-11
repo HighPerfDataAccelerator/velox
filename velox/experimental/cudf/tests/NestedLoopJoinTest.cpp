@@ -1342,8 +1342,7 @@ TEST_F(CudfNestedLoopJoinTest, fullJoinNestedNullExtension) {
                   .nestedLoopJoin(
                       PlanBuilder(planNodeIdGenerator)
                           .values(buildVectors)
-                          .project(
-                              {"c0 AS u_c0", "c1 AS u_c1", "c2 AS u_c2"})
+                          .project({"c0 AS u_c0", "c1 AS u_c1", "c2 AS u_c2"})
                           .planNode(),
                       "c0 < u_c0",
                       {"c0", "c1", "c2", "u_c0", "u_c1", "u_c2"},

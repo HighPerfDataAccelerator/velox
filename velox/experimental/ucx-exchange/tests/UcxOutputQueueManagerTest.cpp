@@ -341,11 +341,7 @@ TEST_F(
   localManager->removeTask(taskId);
 
   auto task = createPartitionedOutputTask(
-      taskId,
-      pool_,
-      UcxTestData::kTestRowType,
-      2,
-      {});
+      taskId, pool_, UcxTestData::kTestRowType, 2, {});
   localManager->registerDirectOutputTask(taskId);
   localManager->initializeTask(task, 2, 1);
 
@@ -716,8 +712,7 @@ TEST_F(UcxOutputQueueManagerTest, exchangeQueueRetainsLifetimeOwnerUntilReset) {
   PackedTableWithStreamPtr dequeued;
   {
     std::lock_guard<std::mutex> l(queue.mutex());
-    dequeued =
-        queue.dequeueLocked(0, &atEnd, &future, &stalePromise);
+    dequeued = queue.dequeueLocked(0, &atEnd, &future, &stalePromise);
   }
   EXPECT_NE(dequeued, nullptr);
   EXPECT_FALSE(atEnd);

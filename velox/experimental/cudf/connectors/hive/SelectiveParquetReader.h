@@ -15,9 +15,10 @@
  */
 #pragma once
 
-#include "velox/common/file/File.h"
 #include "velox/experimental/cudf/connectors/hive/ExecutorReadBroker.h"
 #include "velox/experimental/cudf/connectors/hive/PinnedHostBuffer.h"
+
+#include "velox/common/file/File.h"
 
 #include <cstdint>
 #include <limits>

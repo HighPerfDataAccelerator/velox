@@ -102,9 +102,8 @@ struct GraceHashJoinPartition {
   std::vector<HashJoinHostBatch> probe;
 };
 
-using GraceHashJoinPartitionSet = std::map<
-    exec::SpillPartitionId,
-    std::unique_ptr<GraceHashJoinPartition>>;
+using GraceHashJoinPartitionSet =
+    std::map<exec::SpillPartitionId, std::unique_ptr<GraceHashJoinPartition>>;
 
 /**
  * @brief Bridge for transferring build-side hash tables between build and probe
@@ -216,9 +215,8 @@ class CudfHashJoinBuild : public CudfOperatorBase {
 
   bool reclaimableBytes(uint64_t& reclaimableBytes) const override;
 
-  void reclaim(
-      uint64_t targetBytes,
-      memory::MemoryReclaimer::Stats& stats) override;
+  void reclaim(uint64_t targetBytes, memory::MemoryReclaimer::Stats& stats)
+      override;
 
  protected:
   void doAddInput(RowVectorPtr input) override;
@@ -474,8 +472,7 @@ class CudfHashJoinProbe : public CudfOperatorBase {
   std::optional<DeviceMemoryWorkspaceReservation> graceWorkspaceAdmission_;
   ReplayableDeviceMemoryWorkspace graceWorkspace_;
   size_t graceProbePrefetchDepth_{4};
-  std::deque<std::pair<size_t, std::future<void>>>
-      graceProbePrefetchFutures_;
+  std::deque<std::pair<size_t, std::future<void>>> graceProbePrefetchFutures_;
 
   /// True if any build table has NULL values in join key columns.
   /// Used for null-aware LEFT SEMI PROJECT to determine match column

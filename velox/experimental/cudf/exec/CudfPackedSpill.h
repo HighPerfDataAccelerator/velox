@@ -120,7 +120,6 @@ uint64_t currentCudfPackedHostMemoryReservedBytes();
 /// pointer returns the slot to the bounded process-wide pool when its final
 /// owner (including asynchronous writes) releases it. Returns nullptr instead
 /// of blocking when all slots are busy.
-std::shared_ptr<uint8_t> acquireCudfPackedPinnedBuffer(
-    uint64_t requiredBytes);
+std::shared_ptr<uint8_t> acquireCudfPackedPinnedBuffer(uint64_t requiredBytes);
 
 } // namespace facebook::velox::cudf_velox

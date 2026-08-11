@@ -78,8 +78,7 @@ void ASTExpression::close() {
   precomputeInstructions_.clear();
 }
 
-void ASTExpression::attachBatchCache(
-    CudfExpressionBatchCachePtr batchCache) {
+void ASTExpression::attachBatchCache(CudfExpressionBatchCachePtr batchCache) {
   for (auto& instruction : precomputeInstructions_) {
     if (instruction.cudf_expression != nullptr) {
       instruction.cudf_expression->attachBatchCache(batchCache);

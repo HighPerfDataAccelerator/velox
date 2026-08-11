@@ -18,8 +18,8 @@
 #include <random>
 #include "velox/exec/Operator.h"
 #include "velox/exec/Task.h"
-#include "velox/experimental/cudf/exec/NvtxHelper.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
+#include "velox/experimental/cudf/exec/NvtxHelper.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeClient.h"
 #include "velox/experimental/ucx-exchange/UcxQueues.h"
 

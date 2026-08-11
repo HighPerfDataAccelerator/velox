@@ -625,12 +625,10 @@ TEST_F(CudfIcebergReadTest, coalescedMultipleFiles) {
 /// Drain schema-compatible groups separately when one grouped split contains
 /// files from different Iceberg schema versions.
 TEST_F(CudfIcebergReadTest, coalescedSchemaEvolution) {
-  auto oldData =
-      makeRowVector({"c0"}, {makeFlatVector<int64_t>({1, 2})});
+  auto oldData = makeRowVector({"c0"}, {makeFlatVector<int64_t>({1, 2})});
   auto newData = makeRowVector(
       {"c0", "c1"},
-      {makeFlatVector<int64_t>({3, 4}),
-       makeFlatVector<int64_t>({30, 40})});
+      {makeFlatVector<int64_t>({3, 4}), makeFlatVector<int64_t>({30, 40})});
 
   auto oldFile = TempFilePath::create();
   auto newFile = TempFilePath::create();
@@ -667,8 +665,7 @@ TEST_F(CudfIcebergReadTest, coalescedSchemaEvolution) {
   auto expected = makeRowVector(
       {"c0", "c1"},
       {makeFlatVector<int64_t>({1, 2, 3, 4}),
-       makeNullableFlatVector<int64_t>(
-           {std::nullopt, std::nullopt, 30, 40})});
+       makeNullableFlatVector<int64_t>({std::nullopt, std::nullopt, 30, 40})});
   AssertQueryBuilder(plan).splits(splits).assertResults({expected});
 }
 

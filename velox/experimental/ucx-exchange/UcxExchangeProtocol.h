@@ -18,8 +18,8 @@
 #include <algorithm>
 #include <cinttypes>
 #include <cstdlib>
-#include <memory>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -55,8 +55,7 @@ constexpr uint64_t HANDSHAKE_RESPONSE_TAG = 0x04000000;
 constexpr int64_t kDeviceEagerHostStageBytes = 64 << 10;
 
 inline int64_t maxDirectDeviceTransferBytes() {
-  if (const char* value =
-          std::getenv("GLUTEN_UCX_DIRECT_DEVICE_MAX_BYTES")) {
+  if (const char* value = std::getenv("GLUTEN_UCX_DIRECT_DEVICE_MAX_BYTES")) {
     char* end = nullptr;
     const auto parsed = std::strtoll(value, &end, 10);
     if (end != value && *end == '\0' && parsed > 0) {

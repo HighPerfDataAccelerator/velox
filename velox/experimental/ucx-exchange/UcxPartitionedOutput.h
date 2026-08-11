@@ -19,9 +19,9 @@
 #include <optional>
 
 #include "velox/exec/Operator.h"
+#include "velox/experimental/cudf/exec/CudfPackedRestore.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/NvtxHelper.h"
-#include "velox/experimental/cudf/exec/CudfPackedRestore.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 #include "velox/experimental/ucx-exchange/LocalDeviceOutputQueueManager.h"
 #include "velox/experimental/ucx-exchange/UcxOutputQueueManager.h"
