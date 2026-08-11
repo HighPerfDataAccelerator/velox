@@ -1033,6 +1033,7 @@ class Task : public std::enable_shared_from_this<Task> {
 
     uint64_t reclaimTask(
         const std::shared_ptr<Task>& task,
+        memory::MemoryPool* pool,
         uint64_t targetBytes,
         uint64_t maxWaitMs,
         memory::MemoryReclaimer::Stats& stats);

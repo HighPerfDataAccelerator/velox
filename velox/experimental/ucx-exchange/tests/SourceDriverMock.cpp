@@ -108,8 +108,9 @@ void SourceDriverMock::sendAllData(UcxPartitionedOutput* partitionedOutput) {
     // 3. Call addInput() now that we're not blocked and need input.
     partitionedOutput->addInput(cudfVector);
 
-    // 4. Call getOutput() to advance operator state
-    partitionedOutput->getOutput();
+    // GPU partition/pack work is intentionally deferred from addInput() to a
+    // later Driver turn so isBlocked() can acquire device workspace first.
+    // The loop above performs that turn before it creates the next input.
 
     VLOG(3) << "SourceDriverMock: sent chunk " << chunk << " of " << numChunks_;
   }
@@ -123,6 +124,10 @@ void SourceDriverMock::sendAllData(UcxPartitionedOutput* partitionedOutput) {
     auto blocked = partitionedOutput->isBlocked(&future);
     if (blocked != exec::BlockingReason::kNotBlocked) {
       future.wait();
+      // A consumer wake only clears the queue future. Re-enter isBlocked()
+      // before getOutput() so the mock follows the real Driver contract and
+      // acquires any workspace needed by the now-resumable flush.
+      continue;
     }
     partitionedOutput->getOutput();
   }

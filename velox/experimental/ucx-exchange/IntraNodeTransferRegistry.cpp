@@ -15,6 +15,7 @@
  */
 #include "velox/experimental/ucx-exchange/IntraNodeTransferRegistry.h"
 #include <glog/logging.h>
+#include "velox/common/base/Exceptions.h"
 
 namespace facebook::velox::ucx_exchange {
 
@@ -35,6 +36,37 @@ std::future<void> IntraNodeTransferRegistry::publish(
     rmm::cuda_stream_view stream,
     bool atEnd,
     std::function<void()> onRetrieved) {
+  IntraNodeTransferResult result;
+  result.data = std::move(data);
+  result.stream = stream;
+  result.atEnd = atEnd;
+  return publishPayload(key, std::move(result), std::move(onRetrieved));
+}
+
+std::future<void> IntraNodeTransferRegistry::publishHost(
+    const IntraNodeTransferKey& key,
+    std::unique_ptr<std::vector<uint8_t>> metadata,
+    std::shared_ptr<uint8_t> data,
+    size_t dataSize,
+    bool pinned,
+    std::function<void()> onRetrieved) {
+  VELOX_CHECK_NOT_NULL(metadata);
+  VELOX_CHECK_NOT_NULL(data);
+  VELOX_CHECK_GT(dataSize, 0);
+  IntraNodeTransferResult result;
+  result.hostMetadata = std::move(metadata);
+  result.hostData = std::move(data);
+  result.hostDataSize = dataSize;
+  result.hostDataPinned = pinned;
+  return publishPayload(key, std::move(result), std::move(onRetrieved));
+}
+
+std::future<void> IntraNodeTransferRegistry::publishPayload(
+    const IntraNodeTransferKey& key,
+    IntraNodeTransferResult result,
+    std::function<void()> onRetrieved) {
+  const bool publishedAtEnd = result.atEnd;
+  const bool publishedHostBacked = result.isHostBacked();
   std::shared_ptr<IntraNodeTransferEntry> entry;
   std::future<void> future;
   bool entryExisted;
@@ -79,9 +111,7 @@ std::future<void> IntraNodeTransferRegistry::publish(
   std::vector<std::function<void()>> toWake;
   {
     std::lock_guard<std::mutex> entryLock(entry->entryMutex);
-    entry->data = std::move(data);
-    entry->stream = stream;
-    entry->atEnd = atEnd;
+    entry->result = std::move(result);
     entry->ready = true;
     // Get the future while holding the lock to avoid race with consumer
     future = entry->retrievedPromise.get_future();
@@ -105,7 +135,9 @@ std::future<void> IntraNodeTransferRegistry::publish(
 
   VLOG(2) << "[INTRA-REG] publish: task=" << key.taskId
           << " dest=" << key.destination << " seq=" << key.sequenceNumber
-          << " atEnd=" << atEnd << " entryExisted=" << entryExisted
+          << " atEnd=" << publishedAtEnd
+          << " hostBacked=" << publishedHostBacked
+          << " entryExisted=" << entryExisted
           << " registrySize=" << registrySize;
 
   return future;
@@ -151,9 +183,7 @@ std::optional<IntraNodeTransferResult> IntraNodeTransferRegistry::poll(
     }
 
     // Data is ready, retrieve it while holding the lock
-    result.data = std::move(entry->data);
-    result.stream = entry->stream;
-    result.atEnd = entry->atEnd;
+    result = std::move(entry->result);
 
     // Fulfill the promise to notify the server while still holding entry lock
     entry->retrievedPromise.set_value();
@@ -248,9 +278,7 @@ IntraNodeTransferResult IntraNodeTransferRegistry::waitFor(
     }
 
     // Data is ready, retrieve it while holding the lock
-    result.data = std::move(entry->data);
-    result.stream = entry->stream;
-    result.atEnd = entry->atEnd;
+    result = std::move(entry->result);
 
     // Fulfill the promise to notify the server while still holding entry lock
     entry->retrievedPromise.set_value();
@@ -292,7 +320,10 @@ std::shared_ptr<cudf::packed_columns> IntraNodeTransferRegistry::retrieve(
     auto entry = it->second;
     {
       std::lock_guard<std::mutex> entryLock(entry->entryMutex);
-      data = std::move(entry->data);
+      VELOX_CHECK(
+          !entry->result.isHostBacked(),
+          "Legacy intra-node retrieve() cannot return a host-backed payload");
+      data = std::move(entry->result.data);
 
       // Fulfill the promise to notify the server that data has been retrieved
       entry->retrievedPromise.set_value();
@@ -340,7 +371,7 @@ void IntraNodeTransferRegistry::cancelTask(std::string_view taskId) {
     std::lock_guard<std::mutex> entryLock(entry->entryMutex);
     if (!entry->ready) {
       entry->ready = true;
-      entry->atEnd = true;
+      entry->result.atEnd = true;
     }
     // Wake any dormant source so it re-polls and observes the atEnd result.
     for (auto& wake : entry->wakeCallbacks) {

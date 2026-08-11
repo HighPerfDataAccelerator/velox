@@ -110,9 +110,19 @@ CudfIcebergSplitReader::CudfIcebergSplitReader(
           useExperimentalCudfReader,
           subfieldFilterExpr),
       icebergSplit_(std::move(icebergSplit)),
-      hiveConfig_(hiveConfig) {}
+      hiveConfig_(hiveConfig),
+      initialReadColumnNames_(readColumnNames) {}
 
-void CudfIcebergSplitReader::resetSplit() {
+void CudfIcebergSplitReader::setDataSourceContext(
+    const ::facebook::velox::connector::ConnectorQueryCtx* connectorQueryCtx,
+    dwio::common::RuntimeStatistics& runtimeStats,
+    cudf::ast::expression const* subfieldFilterExpr) {
+  CudfSplitReader::setDataSourceContext(
+      connectorQueryCtx, runtimeStats, subfieldFilterExpr);
+  runtimeStats_ = &runtimeStats;
+}
+
+void CudfIcebergSplitReader::resetIcebergState() {
   deletionVectorReader_.reset();
   positionalDeleteFileReaders_.clear();
   equalityDeleteFileReaders_.clear();
@@ -141,9 +151,91 @@ cudf::ast::expression const* CudfIcebergSplitReader::pushdownFilter() const {
 
 void CudfIcebergSplitReader::prepareSplitInternal(
     dwio::common::RuntimeStatistics& runtimeStats) {
-  // Reset delete readers and column injection
-  resetSplit();
+  pendingSourceGroups_.clear();
+  runtimeStats_ = &runtimeStats;
+  resetIcebergState();
+  readColumnNames_ = initialReadColumnNames_;
 
+  // Inspect every footer before constructing the reader. cuDF can reconcile
+  // projected schema differences by name, but all non-empty sources in one
+  // reader must have the same number of physical column chunks.
+  setupSelectivePreloadDataSources();
+  fileMetaDatas();
+  if (fileMetaData_.size() > 1) {
+    struct CompatibleSourceGroup {
+      std::optional<size_t> columnCount;
+      std::vector<size_t> sourceIndices;
+    };
+    std::vector<CompatibleSourceGroup> groups;
+    groups.reserve(fileMetaData_.size());
+    for (size_t sourceIndex = 0; sourceIndex < fileMetaData_.size();
+         ++sourceIndex) {
+      const auto& metadata = fileMetaData_[sourceIndex];
+      const auto columnCount = metadata.row_groups.empty()
+          ? std::nullopt
+          : std::optional<size_t>(metadata.row_groups.front().columns.size());
+      auto compatible =
+          std::find_if(groups.begin(), groups.end(), [&](const auto& group) {
+            return !group.columnCount || !columnCount ||
+                group.columnCount == columnCount;
+          });
+      if (compatible == groups.end()) {
+        groups.push_back({columnCount, {sourceIndex}});
+      } else {
+        if (!compatible->columnCount && columnCount) {
+          compatible->columnCount = columnCount;
+        }
+        compatible->sourceIndices.push_back(sourceIndex);
+      }
+    }
+
+    if (groups.size() > 1) {
+      LOG(INFO) << "Partitioning Iceberg multi-file split with "
+                << fileMetaData_.size() << " Parquet sources into "
+                << groups.size() << " cuDF-compatible source groups";
+      auto sourcePath = [&](size_t index) -> const std::string& {
+        return index == 0 ? split_->filePath
+                          : split_->coalescedFiles[index - 1].filePath;
+      };
+      auto sourceLength = [&](size_t index) {
+        return index == 0 ? split_->length
+                          : split_->coalescedFiles[index - 1].length;
+      };
+      for (const auto& group : groups) {
+        const auto primaryIndex = group.sourceIndices.front();
+        std::vector<CudfCoalescedFile> compatibleFiles;
+        compatibleFiles.reserve(group.sourceIndices.size() - 1);
+        for (size_t position = 1; position < group.sourceIndices.size();
+             ++position) {
+          const auto sourceIndex = group.sourceIndices[position];
+          compatibleFiles.push_back(
+              {sourcePath(sourceIndex), sourceLength(sourceIndex)});
+        }
+        pendingSourceGroups_.push_back(
+            std::make_shared<CudfHiveConnectorSplit>(
+                split_->connectorId,
+                sourcePath(primaryIndex),
+                primaryIndex == 0 ? split_->start : 0,
+                sourceLength(primaryIndex),
+                split_->splitWeight,
+                split_->infoColumns,
+                std::move(compatibleFiles)));
+      }
+
+      split_ = pendingSourceGroups_.front();
+      pendingSourceGroups_.pop_front();
+      CudfSplitReader::resetSplit();
+      resetIcebergState();
+      readColumnNames_ = initialReadColumnNames_;
+      setupSelectivePreloadDataSources();
+    }
+  }
+
+  prepareCurrentSourceGroup(runtimeStats);
+}
+
+void CudfIcebergSplitReader::prepareCurrentSourceGroup(
+    dwio::common::RuntimeStatistics& runtimeStats) {
   // Read file metadata and cache schema information
   cacheSchemaFromMetadata();
 
@@ -178,6 +270,21 @@ void CudfIcebergSplitReader::prepareSplitInternal(
   }
 
   setupReader();
+}
+
+bool CudfIcebergSplitReader::prepareNextSourceGroup() {
+  if (pendingSourceGroups_.empty()) {
+    return false;
+  }
+  VELOX_CHECK_NOT_NULL(runtimeStats_);
+  CudfSplitReader::resetSplit();
+  split_ = pendingSourceGroups_.front();
+  pendingSourceGroups_.pop_front();
+  resetIcebergState();
+  readColumnNames_ = initialReadColumnNames_;
+  setupSelectivePreloadDataSources();
+  prepareCurrentSourceGroup(*runtimeStats_);
+  return true;
 }
 
 rmm::device_async_resource_ref
@@ -270,20 +377,25 @@ std::pair<std::size_t, std::size_t> CudfIcebergSplitReader::rowRange(
 std::optional<std::unique_ptr<cudf::table>>
 CudfIcebergSplitReader::readNextChunk() {
   std::unique_ptr<cudf::table> cudfTable;
-  if (noColumnsToRead_) {
-    if (syntheticTableProduced_) {
+  while (!cudfTable) {
+    if (noColumnsToRead_) {
+      if (!syntheticTableProduced_) {
+        syntheticTableProduced_ = true;
+        cudfTable = std::make_unique<cudf::table>(
+            std::vector<std::unique_ptr<cudf::column>>{});
+        break;
+      }
+    } else {
+      // Read the next table chunk from the current cuDF reader.
+      auto chunkOpt = CudfSplitReader::readNextChunk();
+      if (chunkOpt.has_value()) {
+        cudfTable = std::move(chunkOpt.value());
+        break;
+      }
+    }
+    if (!prepareNextSourceGroup()) {
       return std::nullopt;
     }
-    syntheticTableProduced_ = true;
-    cudfTable = std::make_unique<cudf::table>(
-        std::vector<std::unique_ptr<cudf::column>>{});
-  } else {
-    // Read the next table chunk from the cuDF reader
-    auto chunkOpt = CudfSplitReader::readNextChunk();
-    if (not chunkOpt.has_value()) {
-      return std::nullopt;
-    }
-    cudfTable = std::move(chunkOpt.value());
   }
 
   // Number of table rows before deletes.
@@ -696,12 +808,22 @@ void CudfIcebergSplitReader::cacheSchemaFromMetadata() {
 
   VELOX_CHECK_EQ(
       fileMetaData_.size(),
-      1,
-      "Expected a single parquet footer for Iceberg data file");
+      1 + split_->coalescedFiles.size(),
+      "Expected one parquet footer per Iceberg data file");
   const auto& meta = fileMetaData_.front();
   VELOX_CHECK(not meta.schema.empty(), "Parquet footer schema is empty");
   VELOX_CHECK_GE(meta.num_rows, 0, "Parquet footer reports negative row count");
-  std::tie(baseReadOffset_, splitRowCount_) = computeSplitRowRange();
+  if (fileMetaData_.size() == 1) {
+    std::tie(baseReadOffset_, splitRowCount_) = computeSplitRowRange();
+  } else {
+    baseReadOffset_ = 0;
+    splitRowCount_ = 0;
+    for (const auto& fileMeta : fileMetaData_) {
+      VELOX_CHECK_GE(
+          fileMeta.num_rows, 0, "Parquet footer reports negative row count");
+      splitRowCount_ += static_cast<std::size_t>(fileMeta.num_rows);
+    }
+  }
 
   const auto& root = meta.schema.front();
   fileColumnNames_.clear();

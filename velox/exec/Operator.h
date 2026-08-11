@@ -582,6 +582,14 @@ class Operator : public BaseRuntimeStatWriter {
       VELOX_CHECK_NOT_NULL(op_);
     }
 
+    /// Returns the pool whose arbitration this reclaimer serves. The default
+    /// preserves the one-operator/one-pool contract. Resource-specific
+    /// operator bases may override this for a leaf in their own parallel pool
+    /// hierarchy without changing the default reclaimer factory API.
+    virtual memory::MemoryPool* reclaimPool() const {
+      return op_->pool();
+    }
+
     // Gets the shared pointer to the associated driver to ensure the liveness
     // of the operator during the memory reclaim operation.
     //

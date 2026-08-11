@@ -44,9 +44,15 @@ class CudfOrderByTestHelper {
       uint64_t sortedRunBytes,
       uint64_t mergeChunkBytes,
       uint64_t outputChunkBytes,
-      cudf::size_type maxOutputRows) {
+      cudf::size_type maxOutputRows,
+      uint64_t hostSpillBytes = 0) {
     CudfOrderBy::testingSetMemoryLimits(
-        sortedRunBytes, mergeChunkBytes, outputChunkBytes, maxOutputRows);
+        sortedRunBytes,
+        mergeChunkBytes,
+        outputChunkBytes,
+        maxOutputRows,
+        2,
+        hostSpillBytes);
   }
 
   static void resetMemoryLimits() {
@@ -480,7 +486,9 @@ TEST_F(OrderByTest, boundedExternalSortManyRuns) {
   constexpr cudf::size_type kMaxOutputRows = 17;
   // One input vector per run plus tiny reader/output chunks deterministically
   // exercises multiple binary compaction levels and final paused readers.
-  OrderByTestHelper::setMemoryLimits(1, 4096, 4096, kMaxOutputRows);
+  // A one-byte host tier forces every external run through the raw packed disk
+  // format, including multiple compaction levels.
+  OrderByTestHelper::setMemoryLimits(1, 4096, 4096, kMaxOutputRows, 1);
 
   std::vector<RowVectorPtr> vectors;
   vectors.reserve(kNumRuns);
@@ -663,6 +671,95 @@ TEST_F(OrderByTest, outputBatchRows) {
             .operatorStats.at("CudfToVelox")
             ->outputVectors);
   }
+}
+
+TEST_F(OrderByTest, outputBatchBytesInPassthroughMode) {
+  constexpr vector_size_t kRows = 256;
+  constexpr uint64_t kMaxBatchBytes = 64ULL << 10;
+  auto keys = makeFlatVector<int64_t>(
+      kRows, [](vector_size_t row) { return kRows - row; });
+  auto payload = makeFlatVector<std::string>(kRows, [](vector_size_t row) {
+    return fmt::format("{:04d}-{}", row, std::string(4096, 'a' + row % 26));
+  });
+  std::vector<RowVectorPtr> rowVectors{
+      makeRowVector({std::move(keys), std::move(payload)})};
+  createDuckDbTable(rowVectors);
+
+  core::PlanNodeId orderById;
+  auto plan = PlanBuilder()
+                  .values(rowVectors)
+                  .orderBy({"c0 ASC NULLS LAST"}, false)
+                  .capturePlanNodeId(orderById)
+                  .planNode();
+  auto queryCtx = core::QueryCtx::create(executor_.get());
+  queryCtx->testingOverrideConfigUnsafe(
+      {{facebook::velox::cudf_velox::CudfToVelox::kPassthroughMode, "true"},
+       {facebook::velox::cudf_velox::CudfToVelox::kMaxBatchBytes,
+        std::to_string(kMaxBatchBytes)}});
+  CursorParameters params;
+  params.planNode = plan;
+  params.queryCtx = queryCtx;
+  auto task = assertQueryOrdered(
+      params, "SELECT * FROM tmp ORDER BY c0 ASC NULLS LAST", {0});
+
+  // Passthrough means no row-count rebatching, but it must not bypass the
+  // byte safety bound. Correctness above also proves that all slices are
+  // emitted in order without dropping or duplicating rows.
+  EXPECT_GT(
+      toPlanStats(task->taskStats())
+          .at(orderById)
+          .operatorStats.at("CudfToVelox")
+          ->outputVectors,
+      1);
+}
+
+TEST_F(OrderByTest, inputBatchBytesBoundBeforeGpuConversion) {
+  constexpr vector_size_t kRowsPerBatch = 32;
+  constexpr int32_t kBatches = 4;
+  constexpr uint64_t kMaxBatchBytes = 64ULL << 10;
+  std::vector<RowVectorPtr> rowVectors;
+  for (int32_t batch = 0; batch < kBatches; ++batch) {
+    auto keys =
+        makeFlatVector<int64_t>(kRowsPerBatch, [batch](vector_size_t row) {
+          return kBatches * kRowsPerBatch - (batch * kRowsPerBatch + row);
+        });
+    auto payload =
+        makeFlatVector<std::string>(kRowsPerBatch, [batch](vector_size_t row) {
+          return fmt::format(
+              "{:02d}-{:04d}-{}",
+              batch,
+              row,
+              std::string(4096, 'a' + (batch + row) % 26));
+        });
+    rowVectors.push_back(makeRowVector({std::move(keys), std::move(payload)}));
+  }
+  createDuckDbTable(rowVectors);
+
+  core::PlanNodeId orderById;
+  auto plan = PlanBuilder()
+                  .values(rowVectors)
+                  .orderBy({"c0 ASC NULLS LAST"}, false)
+                  .capturePlanNodeId(orderById)
+                  .planNode();
+  auto queryCtx = core::QueryCtx::create(executor_.get());
+  queryCtx->testingOverrideConfigUnsafe(
+      {{facebook::velox::cudf_velox::CudfFromVelox::kMaxBatchBytes,
+        std::to_string(kMaxBatchBytes)}});
+  CursorParameters params;
+  params.planNode = plan;
+  params.queryCtx = queryCtx;
+  auto task = assertQueryOrdered(
+      params, "SELECT * FROM tmp ORDER BY c0 ASC NULLS LAST", {0});
+
+  // Each input is already above the deliberately tiny target. It must be
+  // converted independently instead of being copied into one large host
+  // RowVector before the host-to-GPU conversion.
+  EXPECT_GE(
+      toPlanStats(task->taskStats())
+          .at(orderById)
+          .operatorStats.at("CudfOrderBy")
+          ->inputVectors,
+      kBatches);
 }
 
 } // namespace

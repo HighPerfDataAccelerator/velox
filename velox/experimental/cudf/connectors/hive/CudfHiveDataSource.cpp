@@ -286,9 +286,30 @@ void CudfHiveDataSource::setFromDataSource(
 
 std::optional<RowVectorPtr> CudfHiveDataSource::next(
     uint64_t size,
-    velox::ContinueFuture& /* future */) {
+    velox::ContinueFuture& future) {
   VELOX_CHECK_NOT_NULL(split_, "No split present. Call addSplit() first.");
   VELOX_CHECK_NOT_NULL(cudfSplitReader_, "No split to process.");
+
+  // Job 144 decodes roughly 250--350 MiB output batches, while parquet
+  // decompression, casts and an optional remaining filter need additional
+  // transient storage. A 1-GiB reservation covers that whole synchronous
+  // read boundary and is released only after the stream synchronization
+  // below makes the allocation visible to later admission decisions.
+  constexpr std::size_t kScanWorkspaceBytes = std::size_t{1} << 30;
+  ContinueFuture workspaceFuture;
+  auto scanWorkspace = tryAcquireDeviceMemoryWorkspace(
+      nullptr,
+      nullptr,
+      kScanWorkspaceBytes,
+      CudfConfig::getInstance().deviceMemoryMinHeadroomBytes,
+      DeviceMemoryWorkspacePriority::kInput,
+      &scanWorkspaceRequest_,
+      &workspaceFuture);
+  if (!scanWorkspace.has_value()) {
+    future = std::move(workspaceFuture);
+    return std::nullopt;
+  }
+
   auto chunkOpt = cudfSplitReader_->next(size);
   if (!chunkOpt.has_value()) {
     return nullptr;

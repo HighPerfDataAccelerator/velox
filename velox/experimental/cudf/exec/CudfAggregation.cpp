@@ -341,8 +341,8 @@ PreparedAggregationInput prepareAggregationInput(
   result.precomputedColumns.reserve(precomputedInputEvaluators.size());
 
   for (const auto& evaluator : precomputedInputEvaluators) {
-    result.precomputedColumns.push_back(
-        evaluator->eval(inputViews, inputRowCount, stream, mr, true));
+    result.precomputedColumns.push_back(evaluator->evalWithInputRowCount(
+        inputViews, inputRowCount, stream, mr, true));
     allViews.push_back(asView(result.precomputedColumns.back()));
   }
 

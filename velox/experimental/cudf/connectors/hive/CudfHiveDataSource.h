@@ -19,6 +19,7 @@
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConfig.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConnectorSplit.h"
 #include "velox/experimental/cudf/connectors/hive/CudfSplitReader.h"
+#include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/NvtxHelper.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
 
@@ -132,6 +133,12 @@ class CudfHiveDataSource : public DataSource, public NvtxHelper {
   dwio::common::RuntimeStatistics runtimeStats_;
 
   std::unique_ptr<CudfSplitReader> cudfSplitReader_;
+
+  // cuDF parquet decoding allocates its output and transient decode buffers
+  // inside DataSource::next(), before a GPU Operator can arbitrate. Use the
+  // shared device workspace scheduler and TableScan's connector future to
+  // avoid entering read_chunk() against an exhausted async pool.
+  DeviceMemoryWorkspaceRequest scanWorkspaceRequest_;
 
   // Optimized remaining-filter expression, or null when there is no remaining
   // filter. Gates remaining-filter evaluation in next().

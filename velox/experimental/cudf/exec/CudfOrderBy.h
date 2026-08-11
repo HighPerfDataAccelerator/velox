@@ -22,12 +22,13 @@
 #include "velox/exec/Operator.h"
 #include "velox/vector/ComplexVector.h"
 
-#include <cudf/io/parquet.hpp>
+#include <cudf/packed_types.hpp>
 #include <cudf/types.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -45,8 +46,8 @@ class CudfOrderBy : public CudfOperatorBase {
       exec::DriverCtx* driverCtx,
       const std::shared_ptr<const core::OrderByNode>& orderByNode);
 
-  /// Returns true when all output columns can round-trip through the external
-  /// Parquet runs and every sorting key has supported cuDF ordering semantics.
+  /// Returns true when every sorting key has supported cuDF ordering
+  /// semantics. External runs use cuDF's lossless packed representation.
   static bool isSupported(
       const RowTypePtr& outputType,
       const std::vector<core::FieldAccessTypedExprPtr>& sortingKeys);
@@ -58,9 +59,7 @@ class CudfOrderBy : public CudfOperatorBase {
     return !noMoreInput_;
   }
 
-  exec::BlockingReason isBlocked(ContinueFuture* /*future*/) override {
-    return exec::BlockingReason::kNotBlocked;
-  }
+  exec::BlockingReason isBlocked(ContinueFuture* future) override;
 
   bool isFinished() override {
     return finished_;
@@ -86,12 +85,35 @@ class CudfOrderBy : public CudfOperatorBase {
     uint64_t maxActiveRuns{0};
   };
 
+  struct HostPackedChunk {
+    HostPackedChunk() = default;
+    ~HostPackedChunk();
+    HostPackedChunk(HostPackedChunk&& other) noexcept;
+    HostPackedChunk& operator=(HostPackedChunk&& other) noexcept;
+    HostPackedChunk(const HostPackedChunk&) = delete;
+    HostPackedChunk& operator=(const HostPackedChunk&) = delete;
+
+    void reset() noexcept;
+
+    std::unique_ptr<std::vector<uint8_t>> metadata;
+    std::unique_ptr<uint8_t[]> data;
+    uint64_t dataBytes{0};
+    cudf::size_type rows{0};
+  };
+
   struct SortedRun {
+    // A logical run may begin with packed host chunks and end with raw packed
+    // disk chunks when the process-wide host budget is exhausted. Both
+    // portions are lossless cuDF packed tables appended in global run order.
+    std::vector<HostPackedChunk> hostChunks;
+    size_t nextHostChunk{0};
     std::string path;
-    std::unique_ptr<cudf::io::chunked_parquet_reader> reader;
+    uint64_t diskReadOffset{0};
+    uint64_t diskBytes{0};
     // A paused reader owns at most one bounded chunk. chunkOffset identifies
     // the unconsumed suffix without copying it into a growing carry table.
     std::unique_ptr<cudf::table> chunk;
+    std::unique_ptr<cudf::packed_table> packedChunk;
     cudf::size_type chunkOffset{0};
     uint64_t chunkBytes{0};
   };
@@ -102,7 +124,8 @@ class CudfOrderBy : public CudfOperatorBase {
       uint64_t mergeChunkBytes,
       uint64_t outputChunkBytes,
       cudf::size_type maxOutputRows,
-      size_t mergeFanIn = 2);
+      size_t mergeFanIn = 2,
+      uint64_t hostSpillBytes = 0);
   static void testingResetMemoryLimits();
   static uint64_t testingMaxActiveRuns();
   static uint64_t testingSourceChunks();
@@ -111,6 +134,15 @@ class CudfOrderBy : public CudfOperatorBase {
   static uint64_t testingSpillCleanups();
 
   void spillSortedRun();
+  bool appendHostPackedChunk(cudf::table_view table, SortedRun& run);
+  void appendRawPackedChunk(cudf::table_view table, SortedRun& run);
+  bool loadRawPackedChunk(
+      SortedRun& run,
+      rmm::cuda_stream_view stream,
+      MergeStats& stats);
+  void resetPausedChunk(SortedRun& run);
+  cudf::table_view pausedChunkView(const SortedRun& run) const;
+  bool runHasMoreInput(const SortedRun& run) const;
   void compactSortedRunsForMerge();
   void initializeSortedRunReaders();
   void prepareSpilledOutput();
@@ -132,6 +164,7 @@ class CudfOrderBy : public CudfOperatorBase {
   CudfVectorPtr takePendingOutput();
   void cleanupSpillFiles();
   void cleanupSpillStateAfterFailure(std::string_view context) noexcept;
+  uint64_t outputWorkspaceBytes() const;
 
   std::shared_ptr<const core::OrderByNode> orderByNode_;
   // Inputs, readers, merge cursors and output slices all outlive one Operator
@@ -142,6 +175,7 @@ class CudfOrderBy : public CudfOperatorBase {
   std::vector<cudf::order> columnOrder_;
   std::vector<cudf::null_order> nullOrder_;
   const uint64_t sortedRunBytes_;
+  const uint64_t hostSpillBytes_;
   const size_t mergeFanIn_;
   const uint64_t outputChunkBytes_;
   const cudf::size_type maxOutputRows_;
@@ -153,6 +187,7 @@ class CudfOrderBy : public CudfOperatorBase {
   cudf::size_type pendingOutputOffset_{0};
   uint64_t pendingOutputBytes_{0};
   MergeStats outputMergeStats_;
+  std::optional<DeviceMemoryWorkspaceReservation> outputWorkspaceAdmission_;
   bool readersInitialized_{false};
   bool mergeFinished_{false};
   bool spilled_{false};

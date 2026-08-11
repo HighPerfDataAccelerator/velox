@@ -17,6 +17,8 @@
 #include <gtest/gtest.h>
 #include <rmm/cuda_stream_view.hpp>
 #include <atomic>
+#include <chrono>
+#include <memory>
 
 using namespace facebook::velox::ucx_exchange;
 
@@ -67,6 +69,40 @@ TEST(IntraNodeTransferRegistryTest, registerWaiterReadyReturnsTrue) {
   auto result = registry->poll(key);
   ASSERT_TRUE(result.has_value());
   EXPECT_TRUE(result->atEnd);
+}
+
+TEST(IntraNodeTransferRegistryTest, hostBackedPayloadRetainsOwnership) {
+  auto registry = IntraNodeTransferRegistry::getInstance();
+  const auto key = makeKey("hostBackedPayloadRetainsOwnership");
+
+  auto metadata = std::make_unique<std::vector<uint8_t>>(4, 7);
+  auto owner = std::shared_ptr<uint8_t>(
+      new uint8_t[8], std::default_delete<uint8_t[]>());
+  owner.get()[3] = 42;
+  std::weak_ptr<uint8_t> weakOwner = owner;
+
+  auto future = registry->publishHost(
+      key,
+      std::move(metadata),
+      std::move(owner),
+      /*dataSize=*/8,
+      /*pinned=*/true);
+  EXPECT_FALSE(weakOwner.expired());
+
+  auto result = registry->poll(key);
+  ASSERT_TRUE(result.has_value());
+  EXPECT_TRUE(result->isHostBacked());
+  EXPECT_FALSE(result->atEnd);
+  ASSERT_NE(result->hostMetadata, nullptr);
+  EXPECT_EQ(*result->hostMetadata, std::vector<uint8_t>({7, 7, 7, 7}));
+  EXPECT_EQ(result->hostDataSize, 8);
+  EXPECT_TRUE(result->hostDataPinned);
+  EXPECT_EQ(result->hostData.get()[3], 42);
+  EXPECT_EQ(
+      future.wait_for(std::chrono::seconds(0)), std::future_status::ready);
+
+  result.reset();
+  EXPECT_TRUE(weakOwner.expired());
 }
 
 // cancelTask wakes a dormant waiter so it re-polls and observes the atEnd

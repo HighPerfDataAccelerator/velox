@@ -95,7 +95,8 @@ class TopNRowNumberReplayerTest : public HiveConnectorTestBase {
       int32_t limit,
       bool generateRowNumber = true,
       const std::vector<std::string>& partitionKeys = {"c0"},
-      const std::vector<std::string>& sortingKeys = {"c1"}) {
+      const std::vector<std::string>& sortingKeys = {"c1"},
+      bool partialOutput = false) {
     auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
     core::PlanNodeId scanId;
 
@@ -106,7 +107,15 @@ class TopNRowNumberReplayerTest : public HiveConnectorTestBase {
             .topNRowNumber(
                 partitionKeys, sortingKeys, limit, generateRowNumber);
 
-    auto plan = builder.capturePlanNodeId(topNRowNumberId_).planNode();
+    core::PlanNodePtr plan =
+        builder.capturePlanNodeId(topNRowNumberId_).planNode();
+    if (partialOutput) {
+      const auto topN =
+          std::dynamic_pointer_cast<const core::TopNRowNumberNode>(plan);
+      VELOX_CHECK_NOT_NULL(topN);
+      plan =
+          core::TopNRowNumberNode::Builder(*topN).partialOutput(true).build();
+    }
 
     const std::vector<Split> splits =
         makeSplits(input_, fmt::format("{}/splits", testDir_->getPath()));
@@ -210,6 +219,49 @@ TEST_F(TopNRowNumberReplayerTest, withoutRowNumber) {
       .config(core::QueryConfig::kQueryTraceNodeId, topNRowNumberId_);
   auto traceResult =
       traceBuilder.splits(tracePlanWithSplits.splits).copyResults(pool(), task);
+
+  assertEqualResults({result}, {traceResult});
+
+  const auto replayingResult = TopNRowNumberReplayer(
+                                   traceRoot,
+                                   task->queryCtx()->queryId(),
+                                   task->taskId(),
+                                   topNRowNumberId_,
+                                   "TopNRowNumber",
+                                   "",
+                                   "",
+                                   0,
+                                   executor_.get())
+                                   .run();
+  assertEqualResults({result}, {replayingResult});
+}
+
+TEST_F(TopNRowNumberReplayerTest, partialOutput) {
+  input_ = {makeRowVector(
+      {makeFlatVector<int64_t>(100, [](auto row) { return row % 10; }),
+       makeFlatVector<std::string>(
+           100, [](auto row) { return fmt::format("partial_{}", row); })})};
+
+  const auto planWithSplits = createPlan(10, false, {"c0"}, {"c1"}, true);
+  const auto result = AssertQueryBuilder(planWithSplits.plan)
+                          .maxDrivers(1)
+                          .splits(planWithSplits.splits)
+                          .copyResults(pool());
+
+  const auto traceRoot =
+      fmt::format("{}/{}/traceRoot/", testDir_->getPath(), "partialOutput");
+  std::shared_ptr<Task> task;
+  auto tracePlanWithSplits = createPlan(10, false, {"c0"}, {"c1"}, true);
+  auto traceResult =
+      AssertQueryBuilder(tracePlanWithSplits.plan)
+          .maxDrivers(1)
+          .config(core::QueryConfig::kQueryTraceEnabled, true)
+          .config(core::QueryConfig::kQueryTraceDir, traceRoot)
+          .config(core::QueryConfig::kQueryTraceMaxBytes, 100UL << 30)
+          .config(core::QueryConfig::kQueryTraceTaskRegExp, ".*")
+          .config(core::QueryConfig::kQueryTraceNodeId, topNRowNumberId_)
+          .splits(tracePlanWithSplits.splits)
+          .copyResults(pool(), task);
 
   assertEqualResults({result}, {traceResult});
 

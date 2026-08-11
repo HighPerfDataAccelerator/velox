@@ -227,7 +227,8 @@ void CudfLocalPartition::doAddInput(RowVectorPtr input) {
           partitionKeyIndices.push_back(static_cast<cudf::size_type>(idx));
         }
 
-        return cudf::hash_partition(
+        std::lock_guard<std::mutex> lock(cudfHashPartitionMutex());
+        auto result = cudf::hash_partition(
             tableView,
             partitionKeyIndices,
             numPartitions_,
@@ -235,6 +236,8 @@ void CudfLocalPartition::doAddInput(RowVectorPtr input) {
             hashSeed_,
             stream,
             get_temp_mr());
+        stream.synchronize();
+        return result;
       } else if (partitionFunctionType_ == PartitionFunctionType::kRange) {
         if (!rangeBoundaries_) {
           auto boundaryVector = ucx_exchange::buildRangeBoundaryVector(
@@ -243,7 +246,8 @@ void CudfLocalPartition::doAddInput(RowVectorPtr input) {
               partitionKeyIndices_,
               pool(),
               rangeOrders_,
-              rangeNullOrders_);
+              rangeNullOrders_,
+              &rangeSplitEqualKeys_);
           rangeBoundaries_ = with_arrow::toCudfTable(
               boundaryVector, pool(), stream, get_output_mr());
           VELOX_CHECK_LT(
@@ -258,13 +262,21 @@ void CudfLocalPartition::doAddInput(RowVectorPtr input) {
           rangeKeyIndices.push_back(static_cast<cudf::size_type>(index));
         }
         const auto keyTable = tableView.select(rangeKeyIndices);
-        auto partitionIds = cudf::lower_bound(
+        auto partitionIds = ucx_exchange::makeRangePartitionIds(
             rangeBoundaries_->view(),
             keyTable,
             rangeOrders_,
             rangeNullOrders_,
+            rangeSplitEqualKeys_,
+            static_cast<int32_t>(counter_),
             stream,
             get_temp_mr());
+        if (rangeSplitEqualKeys_) {
+          counter_ =
+              (counter_ % numPartitions_ +
+               static_cast<size_t>(tableView.num_rows()) % numPartitions_) %
+              numPartitions_;
+        }
         VELOX_CHECK_EQ(
             partitionIds->size(),
             tableView.num_rows(),

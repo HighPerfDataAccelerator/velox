@@ -1050,6 +1050,9 @@ CudfWindow::CudfWindow(
 }
 
 void CudfWindow::doAddInput(RowVectorPtr input) {
+  SCOPE_EXIT {
+    stateStream_.synchronize();
+  };
   if (input->size() == 0) {
     return;
   }
@@ -2562,6 +2565,12 @@ std::unique_ptr<cudf::column> CudfWindow::computeAggregateColumn(
 }
 
 void CudfWindow::doNoMoreInput() {
+  SCOPE_EXIT {
+    stateStream_.synchronize();
+    if (streamAcquired_ && stream_.value() != stateStream_.value()) {
+      stream_.synchronize();
+    }
+  };
   Operator::noMoreInput();
 
   if (boundedStreaming_) {
@@ -2990,6 +2999,12 @@ RowVectorPtr CudfWindow::computeNextSortedOutput() {
 }
 
 RowVectorPtr CudfWindow::doGetOutput() {
+  SCOPE_EXIT {
+    stateStream_.synchronize();
+    if (streamAcquired_ && stream_.value() != stateStream_.value()) {
+      stream_.synchronize();
+    }
+  };
   auto takePending = [&]() -> RowVectorPtr {
     auto output = std::exchange(pendingOutput_, nullptr);
     if (boundedStreaming_ && noMoreInput_ && streamingReplay_ == nullptr &&

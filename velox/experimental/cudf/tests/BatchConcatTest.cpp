@@ -155,6 +155,149 @@ TEST_F(CudfBatchConcatTest, concatFlushesAtByteThreshold) {
   EXPECT_LT(concatStats.outputVectors, concatStats.inputVectors);
 }
 
+// An all-null strings column can omit its chars buffer. It must not be
+// concatenated in the same libcudf call as a non-empty strings column.
+TEST_F(CudfBatchConcatTest, concatAllNullStringsWithNonEmptyStrings) {
+  updateCudfConfig(/*min=*/200, /*max=*/std::nullopt);
+  CudfConfig::getInstance().concatOptimizationEnabled = true;
+
+  std::vector<std::optional<std::string>> nullStrings(100, std::nullopt);
+  std::vector<std::optional<std::string>> largeStrings(
+      100, std::string(32 * 1024, 'x'));
+  std::vector<RowVectorPtr> vectors{
+      makeRowVector({makeNullableFlatVector<std::string>(nullStrings)}),
+      makeRowVector({makeNullableFlatVector<std::string>(largeStrings)})};
+  createDuckDbTable(vectors);
+
+  auto generator = std::make_shared<core::PlanNodeIdGenerator>();
+  core::PlanNodeId aggNodeId;
+  auto plan = PlanBuilder(generator)
+                  .addNode([&](auto, auto) {
+                    return createFragmentedSource(vectors, generator);
+                  })
+                  .singleAggregation({}, {"count(c0)"})
+                  .capturePlanNodeId(aggNodeId)
+                  .planNode();
+
+  auto task = AssertQueryBuilder(duckDbQueryRunner_)
+                  .plan(plan)
+                  .maxDrivers(1)
+                  .assertResults("SELECT count(c0) FROM tmp");
+
+  const auto planStats = toPlanStats(task->taskStats());
+  const auto& concatStats =
+      *planStats.at(aggNodeId).operatorStats.at("CudfBatchConcat");
+  EXPECT_EQ(concatStats.inputVectors, 2);
+  EXPECT_EQ(concatStats.outputVectors, 2);
+}
+
+TEST_F(CudfBatchConcatTest, concatUniformAllNullStrings) {
+  updateCudfConfig(/*min=*/200, /*max=*/std::nullopt);
+  CudfConfig::getInstance().concatOptimizationEnabled = true;
+
+  std::vector<std::optional<std::string>> nullStrings(100, std::nullopt);
+  std::vector<RowVectorPtr> vectors{
+      makeRowVector({makeNullableFlatVector<std::string>(nullStrings)}),
+      makeRowVector({makeNullableFlatVector<std::string>(nullStrings)})};
+  createDuckDbTable(vectors);
+
+  auto generator = std::make_shared<core::PlanNodeIdGenerator>();
+  core::PlanNodeId aggNodeId;
+  auto plan = PlanBuilder(generator)
+                  .addNode([&](auto, auto) {
+                    return createFragmentedSource(vectors, generator);
+                  })
+                  .singleAggregation({}, {"count(c0)"})
+                  .capturePlanNodeId(aggNodeId)
+                  .planNode();
+
+  auto task = AssertQueryBuilder(duckDbQueryRunner_)
+                  .plan(plan)
+                  .maxDrivers(1)
+                  .assertResults("SELECT count(c0) FROM tmp");
+
+  const auto planStats = toPlanStats(task->taskStats());
+  const auto& concatStats =
+      *planStats.at(aggNodeId).operatorStats.at("CudfBatchConcat");
+  EXPECT_EQ(concatStats.inputVectors, 2);
+  EXPECT_EQ(concatStats.outputVectors, 1);
+}
+
+TEST_F(CudfBatchConcatTest, nestedMapBatchesAreConcatenated) {
+  updateCudfConfig(/*min=*/1'000, /*max=*/std::nullopt);
+  CudfConfig::getInstance().concatOptimizationEnabled = true;
+
+  std::vector<RowVectorPtr> vectors;
+  for (int batch = 0; batch < 3; ++batch) {
+    vectors.push_back(makeRowVector({makeMapVector<std::string, std::string>(
+        10,
+        [](vector_size_t row) { return row % 3; },
+        [batch](vector_size_t index) {
+          return fmt::format("key-{}-{}", batch, index);
+        },
+        [batch](vector_size_t index) {
+          return fmt::format("value-{}-{}", batch, index);
+        })}));
+  }
+  createDuckDbTable(vectors);
+
+  auto generator = std::make_shared<core::PlanNodeIdGenerator>();
+  core::PlanNodeId aggNodeId;
+  auto plan = PlanBuilder(generator)
+                  .addNode([&](auto, auto) {
+                    return createFragmentedSource(vectors, generator);
+                  })
+                  .singleAggregation({}, {"count(c0)"})
+                  .capturePlanNodeId(aggNodeId)
+                  .planNode();
+
+  auto task = AssertQueryBuilder(duckDbQueryRunner_)
+                  .plan(plan)
+                  .maxDrivers(1)
+                  .assertResults("SELECT count(c0) FROM tmp");
+
+  const auto planStats = toPlanStats(task->taskStats());
+  const auto& concatStats =
+      *planStats.at(aggNodeId).operatorStats.at("CudfBatchConcat");
+  EXPECT_EQ(concatStats.inputVectors, 3);
+  EXPECT_EQ(concatStats.outputVectors, 1);
+}
+
+TEST_F(CudfBatchConcatTest, stringBatchesAreConcatenated) {
+  updateCudfConfig(/*min=*/1'000, /*max=*/std::nullopt);
+  CudfConfig::getInstance().concatOptimizationEnabled = true;
+
+  std::vector<RowVectorPtr> vectors;
+  for (int batch = 0; batch < 3; ++batch) {
+    vectors.push_back(makeRowVector(
+        {makeFlatVector<std::string>(10, [batch](vector_size_t row) {
+          return fmt::format("batch-{}-row-{}", batch, row);
+        })}));
+  }
+  createDuckDbTable(vectors);
+
+  auto generator = std::make_shared<core::PlanNodeIdGenerator>();
+  core::PlanNodeId aggNodeId;
+  auto plan = PlanBuilder(generator)
+                  .addNode([&](auto, auto) {
+                    return createFragmentedSource(vectors, generator);
+                  })
+                  .singleAggregation({}, {"count(c0)"})
+                  .capturePlanNodeId(aggNodeId)
+                  .planNode();
+
+  auto task = AssertQueryBuilder(duckDbQueryRunner_)
+                  .plan(plan)
+                  .maxDrivers(1)
+                  .assertResults("SELECT count(c0) FROM tmp");
+
+  const auto planStats = toPlanStats(task->taskStats());
+  const auto& concatStats =
+      *planStats.at(aggNodeId).operatorStats.at("CudfBatchConcat");
+  EXPECT_EQ(concatStats.inputVectors, 3);
+  EXPECT_EQ(concatStats.outputVectors, 1);
+}
+
 // Verifies that CudfBatchConcat is not inserted when the optimization is
 // disabled, even when aggregation is present.
 TEST_F(CudfBatchConcatTest, concatNotInsertedWhenDisabled) {
@@ -448,8 +591,9 @@ TEST_F(CudfBatchConcatTest, batchedConcatSplitsSingleOversizedInput) {
   auto mr = cudf::get_current_device_resource_ref();
   auto table = with_arrow::toCudfTable(input, pool_.get(), stream, mr);
   std::vector<CudfVectorPtr> inputs;
-  inputs.push_back(std::make_shared<CudfVector>(
-      pool_.get(), inputType, input->size(), std::move(table), stream));
+  inputs.push_back(
+      std::make_shared<CudfVector>(
+          pool_.get(), inputType, input->size(), std::move(table), stream));
 
   auto outputs =
       getConcatenatedTableBatched(std::move(inputs), inputType, stream, mr, 4);

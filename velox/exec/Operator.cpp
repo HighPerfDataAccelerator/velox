@@ -738,7 +738,7 @@ bool Operator::MemoryReclaimer::reclaimableBytes(
   if (FOLLY_UNLIKELY(driver == nullptr)) {
     return false;
   }
-  VELOX_CHECK_EQ(pool.name(), op_->pool()->name());
+  VELOX_CHECK_EQ(pool.name(), reclaimPool()->name());
   return op_->reclaimableBytes(reclaimableBytes);
 }
 
@@ -754,7 +754,7 @@ uint64_t Operator::MemoryReclaimer::reclaim(
   if (!op_->canReclaim()) {
     return 0;
   }
-  VELOX_CHECK_EQ(pool->name(), op_->pool()->name());
+  VELOX_CHECK_EQ(pool->name(), reclaimPool()->name());
   VELOX_CHECK(
       !driver->state().isOnThread() || driver->state().suspended() ||
           driver->state().isTerminated,
@@ -810,7 +810,7 @@ void Operator::MemoryReclaimer::abort(
   if (driver == nullptr) {
     return;
   }
-  VELOX_CHECK_EQ(pool->name(), op_->pool()->name());
+  VELOX_CHECK_EQ(pool->name(), reclaimPool()->name());
   VELOX_CHECK(
       !driver->state().isOnThread() || driver->state().suspended() ||
       driver->state().isTerminated);

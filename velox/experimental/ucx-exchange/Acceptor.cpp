@@ -95,11 +95,22 @@ void Acceptor::cStyleAMCallback(
         std::memchr(handshake.taskId, '\0', sizeof(handshake.taskId)));
     VELOX_CHECK_NOT_NULL(taskIdEnd, "Handshake task id is not NUL terminated");
     VELOX_CHECK_GT(taskIdEnd, handshake.taskId, "Handshake task id is empty");
+    const bool isCancel = (handshake.destination & kCancelDestinationFlag) != 0;
+    const uint32_t destination =
+        handshake.destination & ~kCancelDestinationFlag;
     VELOX_CHECK_LT(
-        handshake.destination,
+        destination,
         65536,
         "Handshake destination is invalid: {}",
-        handshake.destination);
+        destination);
+
+    if (isCancel) {
+      UcxOutputQueueManager::getInstanceRef()->deleteResults(
+          handshake.taskId, destination);
+      VLOG(1) << "[UCX-CANCEL] received task=" << handshake.taskId
+              << " destination=" << destination;
+      return;
+    }
 
     // Create a exchangeServer based on the information received in the initial
     // handshake.
@@ -107,7 +118,7 @@ void Acceptor::cStyleAMCallback(
     VELOX_CHECK_NOT_NULL(epRef, "Could not find endpoint reference");
     const std::string peerAddress = epRef->getPeerAddress();
 
-    const PartitionKey key = {handshake.taskId, handshake.destination};
+    const PartitionKey key = {handshake.taskId, destination};
 
     // Determine if this is an intra-process transfer by comparing the source's
     // workerId with our Communicator's workerId. A match means both source and

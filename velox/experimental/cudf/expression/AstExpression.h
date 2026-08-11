@@ -62,6 +62,8 @@ class ASTExpression : public CudfExpression {
 
   void close() override;
 
+  void attachBatchCache(CudfExpressionBatchCachePtr batchCache) override;
+
   /// Check if this specific operation (not its children) can be evaluated by
   /// ASTExpression.
   static bool canEvaluate(const core::TypedExprPtr& expr);

@@ -35,6 +35,9 @@
 #ifdef VELOX_ENABLE_ABFS
 #include "velox/connectors/hive/storage_adapters/abfs/AbfsUtil.h"
 #endif
+#ifdef VELOX_ENABLE_S3
+#include "velox/connectors/hive/storage_adapters/s3fs/S3FileSystem.h"
+#endif
 
 #include <cudf/column/column.hpp>
 #include <cudf/io/datasource.hpp>
@@ -59,11 +62,10 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <ranges>
 #include <sstream>
 #include <string_view>
 #include <unordered_map>
-
-#include <ranges>
 
 namespace facebook::velox::cudf_velox::connector::hive {
 
@@ -105,6 +107,16 @@ std::shared_ptr<ReadFile> openNativeS3ReadFile(
   return std::shared_ptr<ReadFile>(fileSystem->openFileForRead(path, options));
 }
 #endif
+
+template <typename Options>
+void enablePrependedRowIndex(Options& options) {
+  if constexpr (requires { options.enable_prepend_row_index_column(true); }) {
+    options.enable_prepend_row_index_column(true);
+  } else {
+    VELOX_UNSUPPORTED(
+        "This cuDF version does not support prepending Parquet row indices");
+  }
+}
 
 } // namespace
 
@@ -1148,15 +1160,18 @@ void CudfSplitReader::setupReaderOptions() {
           .use_pandas_metadata(cudfHiveConfig_->isUsePandasMetadata())
           .use_arrow_schema(cudfHiveConfig_->isUseArrowSchema())
           .allow_mismatched_pq_schemas(
-              cudfHiveConfig_->isAllowMismatchedCudfHiveSchemas())
+              !split_->coalescedFiles.empty() ||
+              cudfHiveConfig_->isAllowMismatchedCudfHiveSchemasSession(
+                  connectorQueryCtx_->sessionProperties()))
           .timestamp_type(cudfHiveConfig_->timestampType())
           .build();
 
   // Set skip_bytes and num_bytes if available
-  if (split_->start != 0) {
+  if (split_->coalescedFiles.empty() && split_->start != 0) {
     readerOptions_.set_skip_bytes(split_->start);
   }
-  if (split_->size() != std::numeric_limits<uint64_t>::max()) {
+  if (split_->coalescedFiles.empty() &&
+      split_->size() != std::numeric_limits<uint64_t>::max()) {
     readerOptions_.set_num_bytes(split_->size());
   }
 
@@ -1170,7 +1185,7 @@ void CudfSplitReader::setupReaderOptions() {
   }
 
   if (prependRowIndex_) {
-    readerOptions_.enable_prepend_row_index_column(true);
+    enablePrependedRowIndex(readerOptions_);
   }
 }
 
@@ -1193,8 +1208,7 @@ void CudfSplitReader::fileMetaDatas() {
       "CudfSplitReader does not have a datasource. Call setupCudfDataSource() first");
 
   // Wrap the existing datasource without transferring ownership.
-  std::vector<std::unique_ptr<cudf::io::datasource>> sources;
-  sources.push_back(cudf::io::datasource::create(dataSource_.get()));
+  auto sources = makeDataSourceViews();
   fileMetaData_ = cudf::io::read_parquet_footers(sources);
   VELOX_CHECK_GE(
       fileMetaData_.size(),
@@ -1203,6 +1217,8 @@ void CudfSplitReader::fileMetaDatas() {
 }
 
 void CudfSplitReader::createCudfReader() {
+  setupSelectivePreloadDataSources();
+
   // Read file metadatas
   fileMetaDatas();
 

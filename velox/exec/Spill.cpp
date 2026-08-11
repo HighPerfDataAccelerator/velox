@@ -548,62 +548,6 @@ SpillPartition::createOrderedReader(
       spillConfig.readBufferSize, pool, spillStats);
 }
 
-IterableSpillPartitionSet::IterableSpillPartitionSet() {
-  spillPartitionIter_ = spillPartitions_.begin();
-}
-
-void IterableSpillPartitionSet::insert(SpillPartitionSet&& spillPartitionSet) {
-  VELOX_CHECK(
-      !spillPartitionSet.empty(),
-      "Inserted spill partition set must not be empty.");
-
-  const auto parentId = spillPartitionSet.begin()->first.parentId();
-  if (!spillPartitions_.empty()) {
-    VELOX_CHECK(parentId.has_value());
-    VELOX_CHECK(spillPartitionIter_ != spillPartitions_.begin());
-    VELOX_CHECK_EQ(
-        std::prev(spillPartitionIter_)->first,
-        parentId.value(),
-        "Partition set does not have the same parent.");
-    spillPartitions_.erase(std::prev(spillPartitionIter_));
-  } else {
-    VELOX_CHECK(!parentId.has_value());
-  }
-
-  for (const auto& [id, partition] : spillPartitionSet) {
-    VELOX_CHECK_EQ(
-        id.parentId().value_or(SpillPartitionId()),
-        parentId.value_or(SpillPartitionId()));
-    spillPartitions_.emplace(id, std::make_unique<SpillPartition>(*partition));
-  }
-  spillPartitionIter_ = spillPartitions_.find(spillPartitionSet.begin()->first);
-}
-
-bool IterableSpillPartitionSet::hasNext() const {
-  return spillPartitionIter_ != spillPartitions_.end();
-}
-
-SpillPartition IterableSpillPartitionSet::next() {
-  VELOX_CHECK(hasNext(), "No more spill partitions to read.");
-  return *((spillPartitionIter_++)->second);
-}
-
-const SpillPartitionSet& IterableSpillPartitionSet::spillPartitions() const {
-  VELOX_CHECK(
-      !hasNext(),
-      "Spill partitions can only be extracted out after entire set is read.");
-  return spillPartitions_;
-}
-
-void IterableSpillPartitionSet::reset() {
-  spillPartitionIter_ = spillPartitions_.begin();
-}
-
-void IterableSpillPartitionSet::clear() {
-  spillPartitions_.clear();
-  spillPartitionIter_ = spillPartitions_.begin();
-}
-
 uint32_t FileSpillMergeStream::id() const {
   VELOX_CHECK(!closed_);
   return spillFile_->id();

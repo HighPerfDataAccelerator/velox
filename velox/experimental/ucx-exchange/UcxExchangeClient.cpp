@@ -64,6 +64,10 @@ void UcxExchangeClient::close() {
     if (closed_) {
       return;
     }
+    // Preserve the final source counters before moving the sources out.  The
+    // exchange operator records client stats during close, and callers may
+    // also inspect the client after close.
+    stats_ = collectStatsLocked();
     closed_ = true;
     sources = std::move(sources_);
   }
@@ -76,8 +80,22 @@ void UcxExchangeClient::close() {
 }
 
 folly::F14FastMap<std::string, RuntimeMetric> UcxExchangeClient::stats() const {
-  // TODO: Implement stats collection.
+  std::lock_guard<std::mutex> l(queue_->mutex());
+  if (closed_) {
+    return stats_;
+  }
+  return collectStatsLocked();
+}
+
+folly::F14FastMap<std::string, RuntimeMetric>
+UcxExchangeClient::collectStatsLocked() const {
   folly::F14FastMap<std::string, RuntimeMetric> stats;
+  for (const auto& source : sources_) {
+    for (const auto& [name, value] : source->metrics()) {
+      auto [it, inserted] = stats.try_emplace(name, value.unit);
+      it->second.merge(value);
+    }
+  }
   return stats;
 }
 

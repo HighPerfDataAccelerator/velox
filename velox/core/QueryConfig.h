@@ -348,7 +348,7 @@ class QueryConfig {
       ucxPartitionedOutputBatchRows,
       "cudf.partitioned_output_batch_rows",
       int64_t,
-      10'000,
+      32'000'000,
       "Target rows per CudfPartitionedOutput exchange chunk.")
 
   /// Maximum input rows for one libcudf hash_partition call in UCX output.
@@ -395,7 +395,7 @@ class QueryConfig {
       ucxPartitionedOutputBatchBytes,
       "cudf.partitioned_output_batch_bytes",
       uint64_t,
-      0,
+      128UL << 20,
       "Target bytes per CudfPartitionedOutput exchange chunk.")
 
   VELOX_QUERY_CONFIG(

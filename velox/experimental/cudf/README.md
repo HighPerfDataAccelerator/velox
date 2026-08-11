@@ -36,6 +36,59 @@ Velox-cuDF builds are included in Velox CI as part of the [adapters build](https
 
 Velox-cuDF provides several configuration properties to control GPU execution behavior, memory management, and debugging. These configurations are available when compiled with cuDF support and can be set via Velox's configuration system. For a complete list of cuDF-specific configuration properties and their descriptions, see the [Cudf-specific Configuration section](https://facebookincubator.github.io/velox/configs.html#cudf-specific-configuration-experimental) in the Velox configuration documentation.
 
+### Cooperative spill and device-workspace framework
+
+Blocking cuDF operators share a cooperative control plane for persistent GPU
+state, spill victim selection, and transient restore/compute workspace. The
+framework deliberately does not prescribe an on-disk format or an
+operator-specific partitioning policy.
+
+The control plane has three layers:
+
+1. `CudfOperatorBase` installs a cuDF-owned reclaimer on the operator leaf in
+   the custom device-memory hierarchy and separately registers the operator
+   with the process-wide cooperative device reclaimer. The device resource
+   retains its own allocator and arbitrator; the default
+   `Operator::MemoryReclaimer::create(DriverCtx*, Operator*)` API and CPU-pool
+   behavior are unchanged. The base also owns one replayable workspace
+   coordinator and cancels any queued request before derived teardown.
+   Cooperative pressure is published asynchronously and serviced by the
+   owning Driver only at safe operator boundaries.
+2. `DeviceMemoryWorkspaceReservation` accounts for transient restore,
+   concatenate, hash-build, and output memory across all Drivers on a device.
+   Requests are ordered by progress priority: input, transform, restore,
+   drain, then output handoff.
+3. `ReplayableDeviceMemoryWorkspace` owns the cancellation-safe request,
+   advisory future, and wait interval exposed by `CudfOperatorBase`. An
+   operator whose replayable phase cannot be admitted returns
+   `kWaitForArbitration`, preserves its input or spilled partition, and retries
+   the phase after the Driver is woken.
+
+An operator adopting the framework must separate irreversible work from the
+replayable phase. Peer barriers, ownership transfer, output publication, and
+spill-file mutation run once. Admission is retried before the first GPU
+allocation in a phase; a wake is advisory, so physical headroom is always
+revalidated. The base `close()` resets the replayable workspace to cancel any
+queued request. Workspace reservations remain operator-owned and scoped to the
+kernels they protect; they must not be retained while an output batch is
+blocked downstream.
+
+Hash join uses this protocol for resident build finalization and Grace
+partition restore. Top-N row number uses it for input, restore, drain, and
+output phases. Order By and Batch Concat use the same lifecycle for output and
+bounded replacement work. Their spill layouts and victim heuristics remain
+operator-owned, allowing other blocking operators to adopt the common control
+plane without inheriting join-specific behavior.
+
+cuDF joins reuse Velox's payload-neutral coordination rather than duplicating
+CPU storage types. `JoinBridge` supplies the common start, cancellation, result
+publication, and waiter transition; `IterableSpillPartitionSetBase` supplies
+the recursive `SpillPartitionId` order used by Grace hash join. CPU
+`HashJoinBridge` continues to transfer `BaseHashTable` and `RowVector`-backed
+spill shards. `CudfHashJoinBridge` keeps CUDA hash tables and packed host/disk
+batches as its payload so reuse does not introduce a device-to-`RowVector`
+conversion.
+
 ### Testing Velox with cuDF
 
 Tests with Velox-cuDF can only be run on GPU-enabled hardware. The Velox-cuDF tests in [experimental/cudf/tests](https://github.com/facebookincubator/velox/blob/main/velox/experimental/cudf/tests) include several types of tests:

@@ -106,7 +106,8 @@ std::shared_ptr<Task> createPartitionedOutputTask(
     const std::vector<std::string>& partitionKeys,
     uint64_t kMaxOutputBufferSize,
     const std::unordered_map<std::string, std::string>& extraConfig,
-    core::PartitionFunctionSpecPtr partitionFunctionSpec) {
+    core::PartitionFunctionSpecPtr partitionFunctionSpec,
+    bool partialTopNSource) {
   VLOG(3) << "Creating PartitionedOutput task with " << numPartitions
           << " partitions";
 
@@ -128,6 +129,31 @@ std::shared_ptr<Task> createPartitionedOutputTask(
                           .values({rowVector})
                           .partitionedOutput(partitionKeys, numPartitions)
                           .planFragment();
+  if (partialTopNSource) {
+    VELOX_CHECK_GE(rowType->size(), 2);
+    auto output = std::dynamic_pointer_cast<const core::PartitionedOutputNode>(
+        planFragment.planNode);
+    VELOX_CHECK_NOT_NULL(output);
+    auto partitionKey = std::make_shared<core::FieldAccessTypedExpr>(
+        rowType->childAt(0), rowType->nameOf(0));
+    auto sortingKey = std::make_shared<core::FieldAccessTypedExpr>(
+        rowType->childAt(1), rowType->nameOf(1));
+    auto partialTopN =
+        core::TopNRowNumberNode::Builder()
+            .id("partial_topn_source")
+            .function(core::TopNRowNumberNode::RankFunction::kRowNumber)
+            .partitionKeys({partitionKey})
+            .sortingKeys({sortingKey})
+            .sortingOrders({core::SortOrder(true, true)})
+            .rowNumberColumnName(std::nullopt)
+            .limit(1)
+            .source(output->sources().front())
+            .partialOutput(true)
+            .build();
+    planFragment.planNode = core::PartitionedOutputNode::Builder(*output)
+                                .source(std::move(partialTopN))
+                                .build();
+  }
   if (partitionFunctionSpec) {
     auto output = std::dynamic_pointer_cast<const core::PartitionedOutputNode>(
         planFragment.planNode);

@@ -25,8 +25,57 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <string>
 
 namespace facebook::velox::cudf_velox {
+
+/// Conservative aggregate input-size bound for one cudf::concatenate call.
+/// cuDF string/list offsets are signed 32-bit values, so a row-count-only
+/// bound is insufficient for wide variable-length batches.
+inline constexpr uint64_t kMaxSafeConcatEstimatedBytes = 1ULL << 30;
+
+/// Returns true when a non-empty STRING column (including one nested under
+/// LIST/STRUCT) has a zero-length chars child. cuDF 26.06's memcpy-based
+/// concatenate path passes that null child pointer to cudaMemcpyAsync even
+/// for a zero-byte copy.
+[[nodiscard]] bool hasEmptyStringChars(const cudf::table_view& table);
+
+/// Returns true when corresponding STRING columns in two tables agree on
+/// whether their chars buffer is absent. CudfBatchConcat keeps unlike layouts
+/// in separate groups. Uniform groups with absent chars buffers are safe to
+/// concatenate because their aggregate chars size is zero.
+[[nodiscard]] bool hasSameEmptyStringCharsPattern(
+    const cudf::table_view& left,
+    const cudf::table_view& right);
+
+/// Validates STRING/LIST edge offsets recursively and returns a compact
+/// physical-layout description. Intended for exchange-boundary diagnostics.
+[[nodiscard]] std::string validateVariableWidthTableLayout(
+    const cudf::table_view& table,
+    rmm::cuda_stream_view stream);
+
+/// Creates an empty cuDF column whose complete nested physical schema matches
+/// the Velox type.
+[[nodiscard]] std::unique_ptr<cudf::column> makeEmptyColumnForType(
+    const TypePtr& type,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr);
+
+/// Creates the INT32 offsets child for an empty STRING/LIST value column with
+/// 'numRows' top-level rows. The returned column contains numRows + 1 zeros.
+[[nodiscard]] std::unique_ptr<cudf::column> makeZeroOffsetsColumn(
+    cudf::size_type numRows,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr);
+
+/// Creates a column of the requested size in which every top-level value is
+/// null. Unlike make_column_from_scalar, this supports nested LIST/MAP/ROW
+/// types by constructing their physical children and null mask directly.
+[[nodiscard]] std::unique_ptr<cudf::column> makeAllNullColumnForType(
+    const TypePtr& type,
+    cudf::size_type size,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr);
 
 // Concatenate a vector of cuDF tables into a single table
 [[nodiscard]] std::unique_ptr<cudf::table> concatenateTables(

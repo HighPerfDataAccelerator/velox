@@ -27,8 +27,42 @@
 #include <cudf/column/column_stream.hpp>
 #include <cudf/table/table.hpp>
 
+#include <mutex>
+#include <unordered_map>
+
 namespace facebook::velox::cudf_velox {
 namespace {
+
+std::mutex& streamOwnerRegistryMutex() {
+  static auto* mutex = new std::mutex();
+  return *mutex;
+}
+
+std::unordered_map<cudaStream_t, std::shared_ptr<rmm::cuda_stream>>&
+streamOwnerRegistry() {
+  // Intentionally keep both the registry and registered streams alive for the
+  // process lifetime.  Device buffers can outlive the producing operator after
+  // publication to asynchronous exchange/consumer queues.  Tying stream
+  // destruction to the last visible CudfVector is therefore insufficient:
+  // libcudf/RMM may still query the buffer's deallocation stream from a
+  // background thread.  A process owns only a small bounded set of these
+  // operator output streams, so retaining them is preferable to destroying a
+  // stream while an asynchronously published buffer still references it.
+  static auto* registry =
+      new std::unordered_map<cudaStream_t, std::shared_ptr<rmm::cuda_stream>>();
+  return *registry;
+}
+
+std::shared_ptr<rmm::cuda_stream> retainRegisteredStreamOwner(
+    rmm::cuda_stream_view stream) {
+  std::lock_guard<std::mutex> lock(streamOwnerRegistryMutex());
+  auto& registry = streamOwnerRegistry();
+  const auto it = registry.find(stream.value());
+  if (it == registry.end()) {
+    return nullptr;
+  }
+  return it->second;
+}
 
 /// Calculates the total memory size in bytes of a cudf column and reconstructs
 /// it.
@@ -135,6 +169,13 @@ void validatePhysicalSchema(const TypePtr& type, cudf::table_view table) {
 
 } // namespace
 
+void CudfVector::registerStreamOwner(
+    const std::shared_ptr<rmm::cuda_stream>& owner) {
+  VELOX_CHECK_NOT_NULL(owner);
+  std::lock_guard<std::mutex> lock(streamOwnerRegistryMutex());
+  streamOwnerRegistry()[owner->value()] = owner;
+}
+
 CudfVector::CudfVector(
     velox::memory::MemoryPool* pool,
     TypePtr type,
@@ -148,6 +189,7 @@ CudfVector::CudfVector(
           size,
           std::vector<VectorPtr>(),
           std::nullopt),
+      streamOwner_{retainRegisteredStreamOwner(stream)},
       tableStorage_{std::move(table)},
       stream_{stream} {
   logDefaultStreamIfNeeded(stream_, "CudfVector(table)");
@@ -164,7 +206,8 @@ CudfVector::CudfVector(
     TypePtr type,
     vector_size_t size,
     std::unique_ptr<cudf::packed_table>&& packedTable,
-    rmm::cuda_stream_view stream)
+    rmm::cuda_stream_view stream,
+    std::shared_ptr<void> lifetimeOwner)
     : RowVector(
           pool,
           std::move(type),
@@ -172,6 +215,8 @@ CudfVector::CudfVector(
           size,
           std::vector<VectorPtr>(),
           std::nullopt),
+      lifetimeOwner_{std::move(lifetimeOwner)},
+      streamOwner_{retainRegisteredStreamOwner(stream)},
       tableStorage_{std::move(packedTable)},
       stream_{stream} {
   logDefaultStreamIfNeeded(stream_, "CudfVector(packed_table)");
@@ -183,25 +228,65 @@ CudfVector::CudfVector(
   flatSize_ = packedPtr->data.gpu_data->size();
 }
 
+CudfVector::CudfVector(
+    velox::memory::MemoryPool* pool,
+    TypePtr type,
+    vector_size_t size,
+    cudf::table_view tableView,
+    rmm::cuda_stream_view stream)
+    : RowVector(
+          pool,
+          std::move(type),
+          BufferPtr(nullptr),
+          size,
+          std::vector<VectorPtr>(),
+          std::nullopt),
+      streamOwner_{retainRegisteredStreamOwner(stream)},
+      tableStorage_{std::unique_ptr<cudf::table>()},
+      tabView_{tableView},
+      stream_{stream} {
+  validatePhysicalSchema(type_, tabView_);
+  flatSize_ = 0;
+}
+
 std::unique_ptr<cudf::table> CudfVector::release() {
   flatSize_ = 0;
   if (auto* tablePtr =
           std::get_if<std::unique_ptr<cudf::table>>(&tableStorage_)) {
-    // Constructed from owned table - just move it out
-    return std::move(*tablePtr);
+    if (*tablePtr) {
+      // Constructed from owned table - just move it out.
+      return std::move(*tablePtr);
+    }
+    // A non-owning view materializes only when a consuming API explicitly
+    // requests ownership.
+    auto materializedTable =
+        std::make_unique<cudf::table>(tabView_, stream_, get_temp_mr());
+    stream_.synchronize();
+    return materializedTable;
   }
   // Constructed from packed_table - materialize a table from the view.
   // This copies the data since the view references the packed buffer.
   auto& packedPtr =
       std::get<std::unique_ptr<cudf::packed_table>>(tableStorage_);
-  // Using same memory resource as packed_table
   auto mr = packedPtr->data.gpu_data->memory_resource();
   packedPtr->data.gpu_data->set_stream(stream_);
   auto materializedTable = std::make_unique<cudf::table>(tabView_, stream_, mr);
   stream_.synchronize();
-  // Clear the packed table since we've materialized
   packedPtr.reset();
   return materializedTable;
+}
+
+std::unique_ptr<cudf::packed_table> CudfVector::releasePacked() {
+  VELOX_CHECK(
+      !lifetimeOwner_,
+      "Cannot detach a packed table from its external lifetime owner");
+  auto* packedPtr =
+      std::get_if<std::unique_ptr<cudf::packed_table>>(&tableStorage_);
+  if (packedPtr == nullptr || !*packedPtr) {
+    return nullptr;
+  }
+  flatSize_ = 0;
+  return std::move(*packedPtr);
 }
 
 bool CudfVector::rebindStream(rmm::cuda_stream_view stream) {
@@ -223,6 +308,7 @@ bool CudfVector::rebindStream(rmm::cuda_stream_view stream) {
     *tablePtr = std::make_unique<cudf::table>(std::move(columns));
     tabView_ = (*tablePtr)->view();
     stream_ = stream;
+    streamOwner_ = retainRegisteredStreamOwner(stream);
     return true;
   }
 
@@ -234,6 +320,7 @@ bool CudfVector::rebindStream(rmm::cuda_stream_view stream) {
 
     (*packedPtr)->data.gpu_data->set_stream(stream);
     stream_ = stream;
+    streamOwner_ = retainRegisteredStreamOwner(stream);
     return true;
   }
 

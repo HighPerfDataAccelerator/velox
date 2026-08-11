@@ -84,18 +84,8 @@ class MonotonicallyIncreasingIdFunction : public CudfFunction {
       std::vector<ColumnOrView>& inputColumns,
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr) const override {
-    const auto inputRowCount = inputColumns.empty()
-        ? cudf::size_type{0}
-        : asView(inputColumns.front()).size();
-    return eval(inputColumns, inputRowCount, stream, mr);
-  }
-
-  ColumnOrView eval(
-      std::vector<ColumnOrView>& inputColumns,
-      cudf::size_type inputRowCount,
-      rmm::cuda_stream_view stream,
-      rmm::device_async_resource_ref mr) const override {
     VELOX_CHECK(inputColumns.empty());
+    const auto inputRowCount = currentCudfFunctionInputRowCount();
     constexpr int64_t kRowsPerPartition = int64_t{1} << 33;
     const auto rowCount = static_cast<int64_t>(inputRowCount);
     const auto startOffset =

@@ -52,6 +52,18 @@ struct IntraNodeTransferResult {
   std::shared_ptr<cudf::packed_columns> data;
   rmm::cuda_stream_view stream{rmm::cuda_stream_default};
   bool atEnd{false}; // True if this is the end-of-stream marker
+  // A same-node producer may externalize a published device page to bounded
+  // host storage. The consumer keeps this payload host-backed until its Velox
+  // Driver has acquired device admission, then performs the H2D copy through
+  // the ordinary deferred UCX restore path.
+  std::unique_ptr<std::vector<uint8_t>> hostMetadata;
+  std::shared_ptr<uint8_t> hostData;
+  size_t hostDataSize{0};
+  bool hostDataPinned{false};
+
+  bool isHostBacked() const {
+    return hostData != nullptr;
+  }
 };
 
 /// @brief Entry in the intra-node transfer registry containing the data and
@@ -59,9 +71,7 @@ struct IntraNodeTransferResult {
 /// waits on retrievedPromise; the source polls via poll() and fulfils the
 /// promise on retrieval.
 struct IntraNodeTransferEntry {
-  std::shared_ptr<cudf::packed_columns> data;
-  rmm::cuda_stream_view stream{rmm::cuda_stream_default};
-  bool atEnd{false}; // True if this is the end-of-stream marker
+  IntraNodeTransferResult result;
   std::promise<void> retrievedPromise; // Server waits on this after publishing
   std::condition_variable dataAvailable; // Source waits on this for data
   std::mutex entryMutex;
@@ -108,6 +118,17 @@ class IntraNodeTransferRegistry {
       std::shared_ptr<cudf::packed_columns> data,
       rmm::cuda_stream_view stream,
       bool atEnd,
+      std::function<void()> onRetrieved = {});
+
+  /// Publishes an already-completed D2H bounce image. Unlike the device
+  /// overload, retrieving this entry does not allocate device memory; the
+  /// consumer restores it only after acquiring operator admission.
+  [[nodiscard]] std::future<void> publishHost(
+      const IntraNodeTransferKey& key,
+      std::unique_ptr<std::vector<uint8_t>> metadata,
+      std::shared_ptr<uint8_t> data,
+      size_t dataSize,
+      bool pinned,
       std::function<void()> onRetrieved = {});
 
   /// @brief Non-blocking poll for intra-node transfer data.
@@ -165,6 +186,11 @@ class IntraNodeTransferRegistry {
 
  private:
   IntraNodeTransferRegistry() = default;
+
+  [[nodiscard]] std::future<void> publishPayload(
+      const IntraNodeTransferKey& key,
+      IntraNodeTransferResult result,
+      std::function<void()> onRetrieved);
 
   std::map<IntraNodeTransferKey, std::shared_ptr<IntraNodeTransferEntry>>
       registry_;

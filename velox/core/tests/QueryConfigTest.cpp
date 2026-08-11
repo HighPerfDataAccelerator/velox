@@ -34,6 +34,7 @@ TEST_F(QueryConfigTest, emptyConfig) {
 
   ASSERT_FALSE(config.isLegacyCast());
   EXPECT_EQ(config.maxNumSplitsListenedTo(), 0);
+  EXPECT_EQ(config.ucxPartitionedOutputBatchBytes(), 128UL << 20);
 }
 
 TEST_F(QueryConfigTest, setConfig) {

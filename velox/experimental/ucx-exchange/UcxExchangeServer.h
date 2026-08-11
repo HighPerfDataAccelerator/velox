@@ -25,6 +25,7 @@
 #include <functional>
 #include <future>
 #include <memory>
+#include <mutex>
 #include <tuple>
 #include "velox/common/Enums.h"
 #include "velox/experimental/ucx-exchange/CommElement.h"
@@ -161,6 +162,15 @@ class UcxExchangeServer
   // Request (and its callback lambda) stays valid for the lifetime of this
   // server.
   std::vector<std::shared_ptr<ucxx::Request>> completedRequests_;
+
+  // Retain the most recently completed eager CPU buffers until the following
+  // packet completes. Direct CUDA sends follow the UCP completion contract and
+  // release their device allocation in the completion callback; retaining one
+  // device packet per server can pin many GiB and deadlock device arbitration.
+  std::mutex retainedSendBufferMutex_;
+  std::shared_ptr<uint8_t> retainedCompletedMetadata_;
+  std::shared_ptr<uint8_t> retainedCompletedHostData_;
+  uint64_t retainedCompletedHostDataBytes_{0};
 
   std::chrono::time_point<std::chrono::high_resolution_clock> sendStart_;
   std::size_t bytes_;

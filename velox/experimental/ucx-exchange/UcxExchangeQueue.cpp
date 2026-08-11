@@ -56,7 +56,7 @@ void UcxExchangeQueue::enqueueLocked(
     return;
   }
 
-  auto dataSize = data->gpuDataSize();
+  auto dataSize = data->dataSize();
   if (reservedReceiveBytes > 0) {
     VELOX_CHECK_GE(pendingReceiveBytes_, reservedReceiveBytes);
     pendingReceiveBytes_ -= reservedReceiveBytes;
@@ -109,6 +109,13 @@ bool UcxExchangeQueue::shouldPauseReceive(
     int64_t maxInFlightBytes,
     BackpressureStats* stats) const {
   std::lock_guard<std::mutex> l(mutex_);
+  return shouldPauseReceiveLocked(highWaterMark, maxInFlightBytes, stats);
+}
+
+bool UcxExchangeQueue::shouldPauseReceiveLocked(
+    int32_t highWaterMark,
+    int64_t maxInFlightBytes,
+    BackpressureStats* stats) const {
   auto current = backpressureStatsLocked();
   if (stats != nullptr) {
     *stats = current;
@@ -195,7 +202,7 @@ PackedTableWithStreamPtr UcxExchangeQueue::dequeueLocked(
 
   data = std::move(queue_.front());
   queue_.pop_front();
-  totalBytes_ -= data->gpuDataSize();
+  totalBytes_ -= data->dataSize();
 
   return data;
 }

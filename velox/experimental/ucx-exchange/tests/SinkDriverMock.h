@@ -75,6 +75,14 @@ class SinkDriverMock {
     return numChunksReceived_.load();
   }
 
+  /// True when every received packed page exposes only zero-offset top-level
+  /// and nested column views. UCX wire pages must be independently owned; a
+  /// non-zero offset indicates that producer slice metadata escaped onto the
+  /// wire and is unsafe to concatenate with another page.
+  bool allColumnViewsZeroBased() const {
+    return allColumnViewsZeroBased_.load();
+  }
+
   bool dataIsValid() {
     return dataValidFlag_;
   }
@@ -99,6 +107,7 @@ class SinkDriverMock {
   std::atomic<uint64_t> numRows_;
   std::atomic<uint64_t> numBytes_{0};
   std::atomic<uint64_t> numChunksReceived_{0};
+  std::atomic<bool> allColumnViewsZeroBased_{true};
 
   const std::shared_ptr<BaseTableGenerator> referenceData_;
   std::vector<std::thread> threads_;

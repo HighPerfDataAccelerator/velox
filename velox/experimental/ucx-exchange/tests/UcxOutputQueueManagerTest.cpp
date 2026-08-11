@@ -27,6 +27,7 @@
 #include <vector>
 #include "velox/common/memory/MemoryPool.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
+#include "velox/experimental/ucx-exchange/LocalDeviceOutputQueueManager.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeQueue.h"
 #include "velox/experimental/ucx-exchange/tests/UcxTestHelpers.h"
 
@@ -274,6 +275,127 @@ class UcxOutputQueueManagerTest : public testing::Test {
   std::shared_ptr<facebook::velox::memory::MemoryPool> pool_;
   std::shared_ptr<UcxOutputQueueManager> queueManager_;
 };
+
+TEST_F(
+    UcxOutputQueueManagerTest,
+    localDeviceOutputBudgetIsSharedAcrossRootReplicas) {
+  const std::string taskId1 = "local-device-root-1";
+  const std::string taskId2 = "local-device-root-2";
+  auto localManager = LocalDeviceOutputQueueManager::getInstanceRef();
+  localManager->removeTask(taskId1);
+  localManager->removeTask(taskId2);
+  EXPECT_FALSE(localManager->isDirectOutputTask(taskId1));
+  EXPECT_FALSE(localManager->isDirectOutputTask(taskId2));
+  localManager->registerDirectOutputTask(taskId1);
+  localManager->registerDirectOutputTask(taskId2);
+  EXPECT_TRUE(localManager->isDirectOutputTask(taskId1));
+  EXPECT_TRUE(localManager->isDirectOutputTask(taskId2));
+
+  auto first = makeCudfVector(
+      pool_.get(),
+      1024,
+      UcxTestData::kTestRowType,
+      nullptr,
+      rmm::cuda_stream_default);
+  auto second = makeCudfVector(
+      pool_.get(),
+      1024,
+      UcxTestData::kTestRowType,
+      nullptr,
+      rmm::cuda_stream_default);
+  const auto batchBytes = first->estimateFlatSize();
+  ASSERT_GT(batchBytes, 0);
+  const auto sharedBudget = batchBytes + batchBytes / 2;
+  auto task1 =
+      createSourceTask(taskId1, pool_, UcxTestData::kTestRowType, sharedBudget);
+  auto task2 =
+      createSourceTask(taskId2, pool_, UcxTestData::kTestRowType, sharedBudget);
+  localManager->initializeTask(task1, 1, 1);
+  localManager->initializeTask(task2, 1, 1);
+
+  localManager->enqueue(taskId1, 0, std::move(first));
+  localManager->enqueue(taskId2, 0, std::move(second));
+
+  ContinueFuture future;
+  EXPECT_TRUE(localManager->checkBlocked(taskId2, &future));
+  EXPECT_FALSE(future.isReady());
+
+  auto fetched = localManager->tryGetData(taskId1, 0, 0);
+  ASSERT_TRUE(fetched.ready);
+  ASSERT_FALSE(fetched.atEnd);
+  ASSERT_NE(fetched.data, nullptr);
+  future.wait();
+  EXPECT_TRUE(future.isReady());
+
+  localManager->removeTask(taskId1);
+  localManager->removeTask(taskId2);
+  EXPECT_FALSE(localManager->isDirectOutputTask(taskId1));
+  EXPECT_FALSE(localManager->isDirectOutputTask(taskId2));
+}
+
+TEST_F(
+    UcxOutputQueueManagerTest,
+    localDeviceOutputDeleteMarksPartitionedOutputConsumed) {
+  const std::string taskId = "local-device-root-consumed";
+  auto localManager = LocalDeviceOutputQueueManager::getInstanceRef();
+  localManager->removeTask(taskId);
+
+  auto task = createPartitionedOutputTask(
+      taskId, pool_, UcxTestData::kTestRowType, 2, {});
+  localManager->registerDirectOutputTask(taskId);
+  localManager->initializeTask(task, 2, 1);
+
+  EXPECT_TRUE(task->isRunning());
+  localManager->deleteResults(taskId, 0);
+  EXPECT_TRUE(task->isRunning());
+  localManager->deleteResults(taskId, 1);
+  EXPECT_TRUE(task->isFinished());
+
+  // Repeated deletion must not attempt to complete the task twice.
+  localManager->deleteResults(taskId, 1);
+  EXPECT_TRUE(task->isFinished());
+  localManager->removeTask(taskId);
+}
+
+TEST_F(
+    UcxOutputQueueManagerTest,
+    localDeviceOutputBudgetExpandsAfterTightTaskRemoval) {
+  const std::string tightTaskId = "local-device-root-tight-budget";
+  const std::string roomyTaskId = "local-device-root-roomy-budget";
+  auto localManager = LocalDeviceOutputQueueManager::getInstanceRef();
+  localManager->removeTask(tightTaskId);
+  localManager->removeTask(roomyTaskId);
+
+  auto data = makeCudfVector(
+      pool_.get(),
+      1024,
+      UcxTestData::kTestRowType,
+      nullptr,
+      rmm::cuda_stream_default);
+  const auto batchBytes = data->estimateFlatSize();
+  ASSERT_GT(batchBytes, 0);
+
+  localManager->registerDirectOutputTask(tightTaskId);
+  localManager->registerDirectOutputTask(roomyTaskId);
+  auto tightTask = createSourceTask(
+      tightTaskId, pool_, UcxTestData::kTestRowType, batchBytes / 2);
+  auto roomyTask = createSourceTask(
+      roomyTaskId, pool_, UcxTestData::kTestRowType, batchBytes * 4);
+  localManager->initializeTask(tightTask, 1, 1);
+  localManager->initializeTask(roomyTask, 1, 1);
+  localManager->enqueue(roomyTaskId, 0, std::move(data));
+
+  ContinueFuture future;
+  EXPECT_TRUE(localManager->checkBlocked(roomyTaskId, &future));
+  EXPECT_FALSE(future.isReady());
+
+  localManager->removeTask(tightTaskId);
+  future.wait();
+  EXPECT_TRUE(future.isReady());
+  EXPECT_FALSE(localManager->checkBlocked(roomyTaskId, nullptr));
+
+  localManager->removeTask(roomyTaskId);
+}
 
 TEST_F(UcxOutputQueueManagerTest, basicPartitioned) {
   vector_size_t size = 100;
@@ -567,6 +689,80 @@ TEST_F(UcxOutputQueueManagerTest, exchangeQueueCloseWakesWaitingConsumer) {
   queue.close();
   future.wait();
   EXPECT_TRUE(future.isReady());
+}
+
+TEST_F(UcxOutputQueueManagerTest, exchangeQueueRetainsLifetimeOwnerUntilReset) {
+  UcxExchangeQueue queue(1);
+  auto owner = std::make_shared<int>(1);
+  std::weak_ptr<int> weakOwner = owner;
+  auto data = std::make_unique<PackedTableWithStream>(
+      nullptr, rmm::cuda_stream_default, owner);
+  owner.reset();
+
+  std::vector<ContinuePromise> promises;
+  {
+    std::lock_guard<std::mutex> l(queue.mutex());
+    queue.enqueueLocked(std::move(data), promises);
+  }
+  EXPECT_FALSE(weakOwner.expired());
+
+  bool atEnd = false;
+  ContinueFuture future;
+  ContinuePromise stalePromise = ContinuePromise::makeEmpty();
+  PackedTableWithStreamPtr dequeued;
+  {
+    std::lock_guard<std::mutex> l(queue.mutex());
+    dequeued = queue.dequeueLocked(0, &atEnd, &future, &stalePromise);
+  }
+  EXPECT_NE(dequeued, nullptr);
+  EXPECT_FALSE(atEnd);
+  EXPECT_FALSE(weakOwner.expired());
+
+  dequeued.reset();
+  EXPECT_TRUE(weakOwner.expired());
+}
+
+TEST_F(UcxOutputQueueManagerTest, exchangeQueueAccountsHostBackedPayload) {
+  UcxExchangeQueue queue(1);
+  constexpr size_t kPayloadBytes = 4096;
+  auto metadata = std::make_unique<std::vector<uint8_t>>(32);
+  auto hostData = std::shared_ptr<uint8_t>(
+      new uint8_t[kPayloadBytes], std::default_delete<uint8_t[]>());
+  auto owner = std::make_shared<int>(1);
+  std::weak_ptr<int> weakOwner = owner;
+  auto data = std::make_unique<PackedTableWithStream>(
+      std::move(metadata),
+      std::move(hostData),
+      kPayloadBytes,
+      true,
+      rmm::cuda_stream_default,
+      owner);
+  owner.reset();
+
+  std::vector<ContinuePromise> promises;
+  {
+    std::lock_guard<std::mutex> l(queue.mutex());
+    queue.enqueueLocked(std::move(data), promises);
+  }
+  EXPECT_EQ(queue.totalBytes(), kPayloadBytes);
+  EXPECT_FALSE(weakOwner.expired());
+
+  bool atEnd = false;
+  ContinueFuture future;
+  ContinuePromise stalePromise = ContinuePromise::makeEmpty();
+  PackedTableWithStreamPtr dequeued;
+  {
+    std::lock_guard<std::mutex> l(queue.mutex());
+    dequeued = queue.dequeueLocked(0, &atEnd, &future, &stalePromise);
+  }
+  ASSERT_NE(dequeued, nullptr);
+  EXPECT_TRUE(dequeued->isHostBacked());
+  EXPECT_EQ(dequeued->dataSize(), kPayloadBytes);
+  EXPECT_EQ(queue.totalBytes(), 0);
+  EXPECT_FALSE(weakOwner.expired());
+
+  dequeued.reset();
+  EXPECT_TRUE(weakOwner.expired());
 }
 
 TEST_F(UcxOutputQueueManagerTest, basicAsyncFetch) {

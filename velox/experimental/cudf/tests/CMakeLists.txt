@@ -15,6 +15,42 @@
 # Common libraries shared by most cudf tests.
 set(CUDF_TEST_DEFAULT_LIBS velox_cudf_exec velox_exec velox_exec_test_lib velox_test_util)
 
+# Bundled static s2 is pulled in through velox after some Abseil targets have
+# already appeared on the link line. Standalone cuDF tests therefore need the
+# S2 Abseil dependencies repeated after their Velox libraries so the static
+# linker can resolve S2's symbols. Production shared-library links do not need
+# this ordering aid.
+set(CUDF_TEST_S2_ABSL_LINK_LIBS)
+if(VELOX_ENABLE_GEO AND TARGET absl::base)
+  set(
+    CUDF_TEST_S2_ABSL_LINK_LIBS
+    absl::base
+    absl::btree
+    absl::check
+    absl::config
+    absl::core_headers
+    absl::dynamic_annotations
+    absl::endian
+    absl::fixed_array
+    absl::flags
+    absl::flat_hash_map
+    absl::flat_hash_set
+    absl::hash
+    absl::inlined_vector
+    absl::int128
+    absl::log
+    absl::log_severity
+    absl::memory
+    absl::span
+    absl::status
+    absl::str_format
+    absl::strings
+    absl::type_traits
+    absl::utility
+    absl::vlog_is_on
+  )
+endif()
+
 # Where every cudf test executable should be placed. This keeps all
 # velox_cudf_* test binaries co-located even when their CMakeLists.txt
 # lives under a subdirectory (e.g. iceberg/) added via add_subdirectory().
@@ -49,7 +85,7 @@ function(velox_add_cudf_test)
   set_target_properties(${ARG_NAME} PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CUDF_TESTS_OUTPUT_DIR})
   add_test(NAME ${ARG_NAME} COMMAND ${ARG_NAME} WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
   set_tests_properties(${ARG_NAME} PROPERTIES LABELS cuda_driver TIMEOUT ${ARG_TIMEOUT})
-  target_link_libraries(${ARG_NAME} ${ARG_LIBS} gtest gtest_main)
+  target_link_libraries(${ARG_NAME} ${ARG_LIBS} gtest gtest_main ${CUDF_TEST_S2_ABSL_LINK_LIBS})
 endfunction()
 
 if(VELOX_ENABLE_ABFS)
@@ -73,8 +109,8 @@ endif()
 
 velox_add_cudf_test(
   NAME velox_cudf_adapter_operator_test
-  SOURCES Main.cpp AdapterOperatorTest.cpp
-  LIBS ${CUDF_TEST_DEFAULT_LIBS} velox_functions_test_lib
+  SOURCES Main.cpp AdapterOperatorTest.cpp TaskOutputManagerTest.cpp
+  LIBS ${CUDF_TEST_DEFAULT_LIBS} velox_functions_test_lib velox_window velox_functions_spark_window
 )
 
 velox_add_cudf_test(
@@ -105,6 +141,12 @@ velox_add_cudf_test(
   NAME velox_cudf_config_test
   SOURCES Main.cpp ConfigTest.cpp
   LIBS velox_cudf_exec Folly::folly
+)
+
+velox_add_cudf_test(
+  NAME velox_cudf_packed_spill_test
+  SOURCES Main.cpp PackedSpillTest.cpp
+  LIBS velox_cudf_exec velox_test_util
 )
 
 velox_add_cudf_test(
@@ -290,7 +332,7 @@ velox_add_cudf_test(
 
 velox_add_cudf_test(
   NAME velox_cudf_topnrownumber_test
-  SOURCES Main.cpp TopNRowNumberTest.cpp
+  SOURCES Main.cpp TopNRowNumberTest.cpp TopNRowNumberBoundedTest.cpp
   LIBS ${CUDF_TEST_DEFAULT_LIBS} fmt::fmt
 )
 

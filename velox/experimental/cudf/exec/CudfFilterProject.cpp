@@ -18,8 +18,10 @@
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/exec/CudfFilterProject.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
+#include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/Validation.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
+#include "velox/experimental/cudf/expression/AstUtils.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
@@ -28,17 +30,52 @@
 #include "velox/expression/ExprOptimizer.h"
 
 #include <cudf/aggregation.hpp>
+#include <cudf/column/column_factories.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/stream_compaction.hpp>
 #include <cudf/unary.hpp>
 
 #include <algorithm>
+#include <cstdlib>
 #include <iostream>
+#include <limits>
+#include <string_view>
 #include <unordered_map>
 
 namespace facebook::velox::cudf_velox {
 
 namespace {
+
+bool expressionBoundarySyncEnabled() {
+  const auto* value = std::getenv("GLUTEN_CUDF_OPERATOR_BOUNDARY_SYNC");
+  return value != nullptr &&
+      (std::string_view(value) == "1" || std::string_view(value) == "true" ||
+       std::string_view(value) == "TRUE");
+}
+
+void synchronizeExpressionBoundary(
+    rmm::cuda_stream_view stream,
+    std::string_view planNodeId,
+    std::string_view phase,
+    size_t evaluatorIndex,
+    std::optional<column_index_t> outputChannel = std::nullopt) {
+  if (!expressionBoundarySyncEnabled()) {
+    return;
+  }
+  const auto error = cudaStreamSynchronize(stream.value());
+  if (error == cudaSuccess) {
+    return;
+  }
+  VELOX_FAIL(
+      "CudfFilterProject node={} phase={} evaluatorIndex={} "
+      "outputChannel={} CUDA stream synchronization failed: {}",
+      planNodeId,
+      phase,
+      evaluatorIndex,
+      outputChannel.has_value() ? std::to_string(outputChannel.value()) : "-",
+      cudaGetErrorString(error));
+}
 
 void debugPrintTree(
     const core::TypedExprPtr& expr,
@@ -105,6 +142,91 @@ std::vector<exec::OperatorStats> splitStats(
   return {std::move(projectStats), std::move(filterStats)};
 }
 
+cudf::size_type toCudfSize(vector_size_t size) {
+  VELOX_CHECK_GE(size, 0);
+  VELOX_CHECK_LE(size, std::numeric_limits<cudf::size_type>::max());
+  return static_cast<cudf::size_type>(size);
+}
+
+rmm::device_buffer makeAllNullMask(
+    cudf::size_type size,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) {
+  if (size == 0) {
+    return rmm::device_buffer{};
+  }
+  return cudf::create_null_mask(size, cudf::mask_state::ALL_NULL, stream, mr);
+}
+
+std::unique_ptr<cudf::column> makeNullCudfColumn(
+    const TypePtr& type,
+    cudf::size_type size,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) {
+  switch (type->kind()) {
+    case TypeKind::VARCHAR:
+    case TypeKind::VARBINARY:
+      return cudf::make_strings_column(
+          size,
+          makeZeroOffsetsColumn(size, stream, mr),
+          rmm::device_buffer{},
+          size,
+          makeAllNullMask(size, stream, mr));
+    case TypeKind::ARRAY:
+      return cudf::make_lists_column(
+          size,
+          makeZeroOffsetsColumn(size, stream, mr),
+          makeNullCudfColumn(type->childAt(0), 0, stream, mr),
+          size,
+          makeAllNullMask(size, stream, mr));
+    case TypeKind::MAP: {
+      std::vector<std::unique_ptr<cudf::column>> entryChildren;
+      entryChildren.reserve(2);
+      entryChildren.push_back(
+          makeNullCudfColumn(type->childAt(0), 0, stream, mr));
+      entryChildren.push_back(
+          makeNullCudfColumn(type->childAt(1), 0, stream, mr));
+      auto entries = cudf::make_structs_column(
+          0, std::move(entryChildren), 0, rmm::device_buffer{}, stream, mr);
+      return cudf::make_lists_column(
+          size,
+          makeZeroOffsetsColumn(size, stream, mr),
+          std::move(entries),
+          size,
+          makeAllNullMask(size, stream, mr));
+    }
+    case TypeKind::ROW: {
+      std::vector<std::unique_ptr<cudf::column>> children;
+      children.reserve(type->size());
+      for (size_t i = 0; i < type->size(); ++i) {
+        children.push_back(
+            makeNullCudfColumn(type->childAt(i), size, stream, mr));
+      }
+      return cudf::make_structs_column(
+          size,
+          std::move(children),
+          size,
+          makeAllNullMask(size, stream, mr),
+          stream,
+          mr);
+    }
+    default: {
+      const auto nullState = size == 0 ? cudf::mask_state::UNALLOCATED
+                                       : cudf::mask_state::ALL_NULL;
+      return cudf::make_fixed_width_column(
+          veloxToCudfDataType(type), size, nullState, stream, mr);
+    }
+  }
+}
+
+std::unique_ptr<cudf::column> makeNullComplexColumn(
+    const TypePtr& type,
+    vector_size_t size,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) {
+  return makeNullCudfColumn(type, toCudfSize(size), stream, mr);
+}
+
 } // namespace
 
 CudfFilterProject::CudfFilterProject(
@@ -141,6 +263,7 @@ void CudfFilterProject::initialize() {
   Operator::initialize();
 
   std::vector<core::TypedExprPtr> allExprs;
+  std::vector<column_index_t> nonIdentityProjectionChannels;
   if (hasFilter_) {
     VELOX_CHECK_NOT_NULL(filter_);
     allExprs.push_back(filter_->filter());
@@ -155,9 +278,13 @@ void CudfFilterProject::initialize() {
           projection, inputType, i, identityProjections_);
       if (!identityProjection) {
         allExprs.push_back(projection);
-        resultProjections_.emplace_back(allExprs.size() - 1, i);
+        nonIdentityProjectionChannels.push_back(i);
       }
     }
+    resultProjections_.reserve(nonIdentityProjectionChannels.size());
+    literalProjections_.reserve(nonIdentityProjectionChannels.size());
+    nullComplexLiteralProjections_.reserve(
+        nonIdentityProjectionChannels.size());
   } else {
     for (column_index_t i = 0; i < outputType_->size(); ++i) {
       identityProjections_.emplace_back(i, i);
@@ -187,30 +314,71 @@ void CudfFilterProject::initialize() {
   // lifetime.
   auto* const queryCtx = operatorCtx_->execCtx()->queryCtx();
   auto* const pool = operatorCtx_->pool();
+  const auto optimize = [queryCtx, pool](const core::TypedExprPtr& expr) {
+    return expression::optimize(expr, queryCtx, pool);
+  };
   const auto* const queryConfig = &operatorCtx_->driverCtx()->queryConfig();
-  const auto optimizeAndCompile =
-      [inputType, queryCtx, pool, queryConfig](const core::TypedExprPtr& expr) {
-        return createCudfExpression(
-            expression::optimize(expr, queryCtx, pool),
-            inputType,
-            pool,
-            queryConfig,
-            queryCtx);
-      };
   if (hasFilter_) {
-    // First expr is Filter, rest are Project.
-    filterEvaluator_ = optimizeAndCompile(allExprs.front());
-    std::transform(
-        allExprs.begin() + 1,
-        allExprs.end(),
-        std::back_inserter(projectEvaluators_),
-        optimizeAndCompile);
-  } else {
-    std::transform(
-        allExprs.begin(),
-        allExprs.end(),
-        std::back_inserter(projectEvaluators_),
-        optimizeAndCompile);
+    auto optimizedFilter = optimize(allExprs.front());
+    filterExpressionCache_ = makeCudfExpressionBatchCache({optimizedFilter});
+    filterExpressionLabel_ = optimizedFilter->toString();
+    filterEvaluator_ = createCudfExpression(
+        optimizedFilter,
+        inputType,
+        pool,
+        filterExpressionCache_,
+        queryConfig,
+        queryCtx);
+  }
+
+  const auto firstProjectExprIndex = hasFilter_ ? 1 : 0;
+  VELOX_CHECK_EQ(
+      nonIdentityProjectionChannels.size(),
+      allExprs.size() - firstProjectExprIndex);
+  std::vector<core::TypedExprPtr> optimizedProjects;
+  optimizedProjects.reserve(nonIdentityProjectionChannels.size());
+  for (column_index_t i = 0; i < nonIdentityProjectionChannels.size(); ++i) {
+    optimizedProjects.push_back(optimize(allExprs[firstProjectExprIndex + i]));
+  }
+  projectExpressionCache_ = makeCudfExpressionBatchCache(optimizedProjects);
+  const auto filterKeys = filterExpressionCache_ == nullptr
+      ? 0
+      : filterExpressionCache_->cacheableKeyCount();
+  const auto projectKeys = projectExpressionCache_->cacheableKeyCount();
+  addRuntimeStat(
+      "cudfExpressionCacheKeys", RuntimeCounter(filterKeys + projectKeys));
+  if (filterKeys > 0 || projectKeys > 0) {
+    LOG(WARNING) << "[CUDF_EXPRESSION_CSE] node=" << planNodeId()
+                 << " filterKeys=" << filterKeys
+                 << " projectKeys=" << projectKeys;
+  }
+  for (column_index_t i = 0; i < nonIdentityProjectionChannels.size(); ++i) {
+    const auto& optimized = optimizedProjects[i];
+    const auto outputChannel = nonIdentityProjectionChannels[i];
+    if (optimized->isConstantKind()) {
+      const auto* constant = optimized->asUnchecked<core::ConstantTypedExpr>();
+      if (!optimized->type()->isPrimitiveType()) {
+        VELOX_CHECK(
+            constant->isNull(),
+            "Only null complex literal projections are supported by cuDF");
+        nullComplexLiteralProjections_.push_back(
+            {optimized->type(), outputChannel});
+      } else {
+        literalProjections_.emplace_back(literalScalars_.size(), outputChannel);
+        literalScalars_.push_back(makeScalarFromConstantExpr(optimized, pool));
+      }
+      continue;
+    }
+
+    resultProjections_.emplace_back(projectEvaluators_.size(), outputChannel);
+    projectExpressionLabels_.push_back(optimized->toString());
+    projectEvaluators_.push_back(createCudfExpression(
+        optimized,
+        inputType,
+        pool,
+        projectExpressionCache_,
+        queryConfig,
+        queryCtx));
   }
 
   filter_.reset();
@@ -233,7 +401,16 @@ RowVectorPtr CudfFilterProject::doGetOutput() {
   auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input_);
   VELOX_CHECK_NOT_NULL(cudfInput);
   auto stream = cudfInput->stream();
-  auto inputTableColumns = cudfInput->release()->release();
+  auto inputTableColumns = [&]() {
+    CudaCallDiagnosticScope diagnostic(
+        fmt::format(
+            "operator=CudfFilterProject node={} phase=releaseInput rows={} "
+            "stream={}",
+            planNodeId(),
+            input_->size(),
+            static_cast<const void*>(stream.value())));
+    return cudfInput->release()->release();
+  }();
   auto outputSize = input_->size();
 
   if (hasFilter_) {
@@ -264,20 +441,35 @@ RowVectorPtr CudfFilterProject::doGetOutput() {
 void CudfFilterProject::filter(
     std::vector<std::unique_ptr<cudf::column>>& inputTableColumns,
     rmm::cuda_stream_view stream) {
+  filterExpressionCache_->reset();
   // Evaluate the Filter
   std::vector<cudf::column_view> inputViews;
   inputViews.reserve(inputTableColumns.size());
   for (auto& col : inputTableColumns) {
     inputViews.push_back(col->view());
   }
-  auto filterColumn =
-      filterEvaluator_->eval(inputViews, stream, get_temp_mr(), true);
+  auto filterColumn = [&]() {
+    CudaCallDiagnosticScope diagnostic(
+        fmt::format(
+            "operator=CudfFilterProject node={} phase=filterEval rows={} "
+            "expr={}",
+            planNodeId(),
+            inputViews.empty() ? 0 : inputViews.front().size(),
+            filterExpressionLabel_));
+    return filterEvaluator_->eval(inputViews, stream, get_temp_mr(), true);
+  }();
+  synchronizeExpressionBoundary(stream, planNodeId(), "filter", 0);
   auto filterColumnView = asView(filterColumn);
   bool shouldApplyFilter = [&]() {
     if (filterColumnView.has_nulls()) {
       return true;
     }
     // check if all values in filterColumnView are true
+    CudaCallDiagnosticScope diagnostic(
+        fmt::format(
+            "operator=CudfFilterProject node={} phase=filterReduce rows={}",
+            planNodeId(),
+            filterColumnView.size()));
     auto isAllTrue = cudf::reduce(
         filterColumnView,
         *cudf::make_all_aggregation<cudf::reduce_aggregation>(),
@@ -290,31 +482,61 @@ void CudfFilterProject::filter(
     return !(result->is_valid(stream) && result->value(stream));
   }();
   if (shouldApplyFilter) {
+    CudaCallDiagnosticScope diagnostic(
+        fmt::format(
+            "operator=CudfFilterProject node={} phase=applyBooleanMask rows={}",
+            planNodeId(),
+            filterColumnView.size()));
     auto filterTable =
         std::make_unique<cudf::table>(std::move(inputTableColumns));
     auto filteredTable = cudf::apply_boolean_mask(
         *filterTable, filterColumnView, stream, get_output_mr());
     inputTableColumns = filteredTable->release();
   }
+  expressionCacheHits_ += filterExpressionCache_->hits();
+  expressionCacheRetained_ += filterExpressionCache_->retained();
+  addRuntimeStat(
+      "cudfExpressionCacheHits",
+      RuntimeCounter(filterExpressionCache_->hits()));
+  addRuntimeStat(
+      "cudfExpressionCacheRetained",
+      RuntimeCounter(filterExpressionCache_->retained()));
 }
 
 std::vector<std::unique_ptr<cudf::column>> CudfFilterProject::project(
     std::vector<std::unique_ptr<cudf::column>>& inputTableColumns,
     vector_size_t outputSize,
     rmm::cuda_stream_view stream) {
+  projectExpressionCache_->reset();
   std::vector<cudf::column_view> inputViews;
   inputViews.reserve(inputTableColumns.size());
   for (auto& col : inputTableColumns) {
     inputViews.push_back(col->view());
   }
   std::vector<ColumnOrView> columns;
-  for (auto& projectEvaluator : projectEvaluators_) {
-    columns.push_back(projectEvaluator->eval(
+  for (size_t i = 0; i < projectEvaluators_.size(); ++i) {
+    auto& projectEvaluator = projectEvaluators_[i];
+    CudaCallDiagnosticScope diagnostic(
+        fmt::format(
+            "operator=CudfFilterProject node={} phase=projectEval index={} "
+            "outputChannel={} rows={} expr={}",
+            planNodeId(),
+            i,
+            resultProjections_[i].outputChannel,
+            inputViews.empty() ? 0 : inputViews.front().size(),
+            projectExpressionLabels_[i]));
+    columns.push_back(projectEvaluator->evalWithInputRowCount(
         inputViews,
         static_cast<cudf::size_type>(outputSize),
         stream,
         get_output_mr(),
         true));
+    synchronizeExpressionBoundary(
+        stream,
+        planNodeId(),
+        "project",
+        i,
+        resultProjections_[i].outputChannel);
   }
 
   // Rearrange columns to match outputType_
@@ -329,9 +551,32 @@ std::vector<std::unique_ptr<cudf::column>> CudfFilterProject::project(
     } else {
       // Materialize the column_view into an owned column
       auto view = std::get<cudf::column_view>(columnOrView);
+      CudaCallDiagnosticScope diagnostic(
+          fmt::format(
+              "operator=CudfFilterProject node={} phase=materializeProjectView "
+              "index={} outputChannel={} rows={} type={}",
+              planNodeId(),
+              i,
+              resultProjections_[i].outputChannel,
+              view.size(),
+              static_cast<int>(view.type().id())));
       outputColumns[resultProjections_[i].outputChannel] =
           std::make_unique<cudf::column>(view, stream, get_output_mr());
     }
+  }
+
+  for (const auto& literal : literalProjections_) {
+    VELOX_CHECK_LT(literal.inputChannel, literalScalars_.size());
+    outputColumns[literal.outputChannel] = cudf::make_column_from_scalar(
+        *literalScalars_[literal.inputChannel],
+        toCudfSize(outputSize),
+        stream,
+        get_output_mr());
+  }
+
+  for (const auto& literal : nullComplexLiteralProjections_) {
+    outputColumns[literal.outputChannel] = makeNullComplexColumn(
+        literal.type, outputSize, stream, get_output_mr());
   }
 
   // Count occurrences of each inputChannel, and move columns if they occur only
@@ -350,6 +595,15 @@ std::vector<std::unique_ptr<cudf::column>> CudfFilterProject::project(
           std::move(inputTableColumns[identity.inputChannel]);
     } else {
       // Otherwise, copy the column and decrement the count
+      CudaCallDiagnosticScope diagnostic(
+          fmt::format(
+              "operator=CudfFilterProject node={} phase=copyIdentity "
+              "inputChannel={} outputChannel={} rows={} occurrences={}",
+              planNodeId(),
+              identity.inputChannel,
+              identity.outputChannel,
+              inputTableColumns[identity.inputChannel]->size(),
+              inputChannelCount[identity.inputChannel]));
       outputColumns[identity.outputChannel] = std::make_unique<cudf::column>(
           *inputTableColumns[identity.inputChannel], stream, get_output_mr());
     }
@@ -357,7 +611,31 @@ std::vector<std::unique_ptr<cudf::column>> CudfFilterProject::project(
     inputChannelCount[identity.inputChannel]--;
   }
 
+  expressionCacheHits_ += projectExpressionCache_->hits();
+  expressionCacheRetained_ += projectExpressionCache_->retained();
+  addRuntimeStat(
+      "cudfExpressionCacheHits",
+      RuntimeCounter(projectExpressionCache_->hits()));
+  addRuntimeStat(
+      "cudfExpressionCacheRetained",
+      RuntimeCounter(projectExpressionCache_->retained()));
+
   return outputColumns;
+}
+
+void CudfFilterProject::doClose() {
+  if (expressionCacheHits_ > 0 || expressionCacheRetained_ > 0) {
+    LOG(WARNING) << "[CUDF_EXPRESSION_CSE_RESULT] node=" << planNodeId()
+                 << " hits=" << expressionCacheHits_
+                 << " retained=" << expressionCacheRetained_;
+  }
+  Operator::close();
+  projectEvaluators_.clear();
+  filterEvaluator_.reset();
+  projectExpressionCache_.reset();
+  filterExpressionCache_.reset();
+  literalScalars_.clear();
+  input_.reset();
 }
 
 bool CudfFilterProject::allInputProcessed() {

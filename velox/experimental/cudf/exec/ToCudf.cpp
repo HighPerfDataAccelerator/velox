@@ -33,6 +33,7 @@
 #include "velox/experimental/cudf/expression/JitExpression.h"
 #include "velox/experimental/cudf/expression/PrestoFunctions.h"
 #include "velox/experimental/cudf/expression/SparkFunctions.h"
+#include "velox/experimental/ucx-exchange/LocalDeviceOutputQueueManager.h"
 #include "velox/experimental/ucx-exchange/UcxOutputQueueManager.h"
 #include "velox/experimental/ucx-exchange/UcxPartitionedOutput.h"
 
@@ -134,8 +135,27 @@ class UcxOutputBufferManager final : public exec::OutputBufferManager {
       core::PartitionedOutputNode::Kind kind,
       int numPartitions,
       int numOutputDrivers) override {
-    ucx_exchange::UcxOutputQueueManager::getInstanceRef()->initializeTask(
-        std::move(task), kind, numPartitions, numOutputDrivers);
+    const auto taskId = task->taskId();
+    auto ucxManager = ucx_exchange::UcxOutputQueueManager::getInstanceRef();
+    auto localManager =
+        ucx_exchange::LocalDeviceOutputQueueManager::getInstanceRef();
+    const bool directLocalOutput = localManager->isDirectOutputTask(taskId);
+
+    ucxManager->initializeTask(task, kind, numPartitions, numOutputDrivers);
+    try {
+      // Task selects one OutputBufferManager for the UCX transport. A direct
+      // local root still uses the UCX output operator, but publishes owning
+      // CudfVectors through a companion process-local queue. Keep that queue
+      // on the selected transport's lifecycle instead of registering a second
+      // manager in Velox core.
+      if (directLocalOutput) {
+        localManager->initializeTask(task, numPartitions, numOutputDrivers);
+      }
+    } catch (...) {
+      ucxManager->removeTask(taskId);
+      localManager->removeTask(taskId);
+      throw;
+    }
   }
 
   bool updateOutputBuffers(
@@ -148,8 +168,13 @@ class UcxOutputBufferManager final : public exec::OutputBufferManager {
 
   bool updateNumDrivers(const std::string& taskId, uint32_t numOutputDrivers)
       override {
-    return ucx_exchange::UcxOutputQueueManager::getInstanceRef()
-        ->updateNumDriversIfExists(taskId, numOutputDrivers);
+    const bool ucxUpdated =
+        ucx_exchange::UcxOutputQueueManager::getInstanceRef()
+            ->updateNumDriversIfExists(taskId, numOutputDrivers);
+    const bool localUpdated =
+        ucx_exchange::LocalDeviceOutputQueueManager::getInstanceRef()
+            ->updateNumDriversIfExists(taskId, numOutputDrivers);
+    return ucxUpdated || localUpdated;
   }
 
   std::optional<exec::OutputBufferStats> stats(
@@ -159,6 +184,8 @@ class UcxOutputBufferManager final : public exec::OutputBufferManager {
 
   void removeTask(const std::string& taskId) override {
     ucx_exchange::UcxOutputQueueManager::getInstanceRef()->removeTask(taskId);
+    ucx_exchange::LocalDeviceOutputQueueManager::getInstanceRef()->removeTask(
+        taskId);
   }
 
   std::optional<double> getUtilization(const std::string&) override {
@@ -287,7 +314,13 @@ bool CompileState::compile(bool allowCpuFallback) {
       planNode = getPlanNode(oper->planNodeId());
     }
 
-    if (previousOperatorIsNotGpu and thisOpProps.acceptsGpuInput and planNode) {
+    // Source plan nodes (for example a fused GPU table scan) have no upstream
+    // RowVector to convert.  operatorIndex == 0 also covers real external
+    // fragment inputs, so distinguish the two using the plan-node edge: an
+    // input-consuming boundary always has at least one source.
+    const bool hasInputPlanEdge = !planNode || !planNode->sources().empty();
+    if (previousOperatorIsNotGpu and thisOpProps.acceptsGpuInput and
+        planNode and hasInputPlanEdge) {
       replaceOp.push_back(
           std::make_unique<CudfFromVelox>(
               id,
@@ -647,6 +680,12 @@ void CudfConfig::initialize(
         value, 0, "{} must be positive", kCudfOrderBySortedRunBytes);
     orderBySortedRunBytes = static_cast<uint64_t>(value);
   }
+  if (config.find(kCudfOrderByHostSpillBytes) != config.end()) {
+    const auto value = folly::to<int64_t>(config[kCudfOrderByHostSpillBytes]);
+    VELOX_USER_CHECK_GE(
+        value, 0, "{} must be non-negative", kCudfOrderByHostSpillBytes);
+    orderByHostSpillBytes = static_cast<uint64_t>(value);
+  }
   if (config.find(kCudfOrderByMergeFanIn) != config.end()) {
     const auto value = folly::to<int32_t>(config[kCudfOrderByMergeFanIn]);
     VELOX_USER_CHECK_GE(
@@ -660,6 +699,78 @@ void CudfConfig::initialize(
     VELOX_USER_CHECK_GT(
         value, 0, "{} must be positive", kCudfWindowSortedRunBytes);
     windowSortedRunBytes = static_cast<uint64_t>(value);
+  }
+  if (config.find(kCudfTopNRowNumberCandidateRunBytes) != config.end()) {
+    const auto value =
+        folly::to<int64_t>(config[kCudfTopNRowNumberCandidateRunBytes]);
+    VELOX_USER_CHECK_GT(
+        value, 0, "{} must be positive", kCudfTopNRowNumberCandidateRunBytes);
+    topNRowNumberCandidateRunBytes = static_cast<uint64_t>(value);
+  }
+  if (config.find(kCudfTopNRowNumberHostPartitions) != config.end()) {
+    const auto value =
+        folly::to<int64_t>(config[kCudfTopNRowNumberHostPartitions]);
+    VELOX_USER_CHECK_GE(
+        value, 2, "{} must be at least 2", kCudfTopNRowNumberHostPartitions);
+    topNRowNumberHostPartitions = static_cast<uint64_t>(value);
+  }
+  if (config.find(kCudfTopNRowNumberFinalizeInputBytes) != config.end()) {
+    const auto value =
+        folly::to<int64_t>(config[kCudfTopNRowNumberFinalizeInputBytes]);
+    VELOX_USER_CHECK_GT(
+        value, 0, "{} must be positive", kCudfTopNRowNumberFinalizeInputBytes);
+    topNRowNumberFinalizeInputBytes = static_cast<uint64_t>(value);
+  }
+  if (config.find(kCudfTopNRowNumberDeviceResidentBytes) != config.end()) {
+    const auto value =
+        folly::to<int64_t>(config[kCudfTopNRowNumberDeviceResidentBytes]);
+    VELOX_USER_CHECK_GE(
+        value,
+        0,
+        "{} must be non-negative",
+        kCudfTopNRowNumberDeviceResidentBytes);
+    topNRowNumberDeviceResidentBytes = static_cast<uint64_t>(value);
+  }
+  if (config.find(kCudfTopNRowNumberOutputChunkBytes) != config.end()) {
+    const auto value =
+        folly::to<int64_t>(config[kCudfTopNRowNumberOutputChunkBytes]);
+    VELOX_USER_CHECK_GT(
+        value, 0, "{} must be positive", kCudfTopNRowNumberOutputChunkBytes);
+    topNRowNumberOutputChunkBytes = static_cast<uint64_t>(value);
+  }
+  if (config.find(kCudfTopNRowNumberMaxOutputRows) != config.end()) {
+    const auto value =
+        folly::to<int64_t>(config[kCudfTopNRowNumberMaxOutputRows]);
+    VELOX_USER_CHECK_GT(
+        value, 0, "{} must be positive", kCudfTopNRowNumberMaxOutputRows);
+    VELOX_USER_CHECK_LE(
+        value,
+        std::numeric_limits<int32_t>::max(),
+        "{} must not exceed {}",
+        kCudfTopNRowNumberMaxOutputRows,
+        std::numeric_limits<int32_t>::max());
+    topNRowNumberMaxOutputRows = static_cast<int32_t>(value);
+  }
+  if (config.find(kCudfDeviceResidentCapacityBytes) != config.end()) {
+    const auto value =
+        folly::to<int64_t>(config[kCudfDeviceResidentCapacityBytes]);
+    VELOX_USER_CHECK_GE(
+        value, 0, "{} must be non-negative", kCudfDeviceResidentCapacityBytes);
+    deviceResidentCapacityBytes = static_cast<uint64_t>(value);
+  }
+  if (config.find(kCudfDeviceMemoryMinHeadroomBytes) != config.end()) {
+    const auto value =
+        folly::to<int64_t>(config[kCudfDeviceMemoryMinHeadroomBytes]);
+    VELOX_USER_CHECK_GE(
+        value, 0, "{} must be non-negative", kCudfDeviceMemoryMinHeadroomBytes);
+    deviceMemoryMinHeadroomBytes = static_cast<uint64_t>(value);
+  }
+  if (config.find(kCudfDeviceMemoryMinReclaimBytes) != config.end()) {
+    const auto value =
+        folly::to<int64_t>(config[kCudfDeviceMemoryMinReclaimBytes]);
+    VELOX_USER_CHECK_GE(
+        value, 0, "{} must be non-negative", kCudfDeviceMemoryMinReclaimBytes);
+    deviceMemoryMinReclaimBytes = static_cast<uint64_t>(value);
   }
   if (config.find(kCudfOrderByOutputChunkBytes) != config.end()) {
     const auto value = folly::to<int64_t>(config[kCudfOrderByOutputChunkBytes]);
@@ -682,6 +793,49 @@ void CudfConfig::initialize(
   if (config.find(kCudfExchangeConcatOptimizationEnabled) != config.end()) {
     exchangeConcatOptimizationEnabled =
         folly::to<bool>(config[kCudfExchangeConcatOptimizationEnabled]);
+  }
+  if (config.find(kCudfHashJoinGraceBuildBytes) != config.end()) {
+    const auto value = folly::to<int64_t>(config[kCudfHashJoinGraceBuildBytes]);
+    VELOX_USER_CHECK_GE(
+        value, 0, "{} must be non-negative", kCudfHashJoinGraceBuildBytes);
+    hashJoinGraceBuildBytes = static_cast<uint64_t>(value);
+  }
+  if (config.find(kCudfHashJoinGracePartitions) != config.end()) {
+    const auto value = folly::to<int32_t>(config[kCudfHashJoinGracePartitions]);
+    VELOX_USER_CHECK_GE(
+        value,
+        2,
+        "{} must be between 2 and {}",
+        kCudfHashJoinGracePartitions,
+        1 << exec::SpillPartitionId::kMaxPartitionBits);
+    VELOX_USER_CHECK_LE(
+        value,
+        1 << exec::SpillPartitionId::kMaxPartitionBits,
+        "{} must be between 2 and {}; larger fanout is represented by "
+        "recursive SpillPartitionId levels",
+        kCudfHashJoinGracePartitions,
+        1 << exec::SpillPartitionId::kMaxPartitionBits);
+    hashJoinGracePartitions = value;
+  }
+  if (config.find(kCudfHashJoinGraceHostBytes) != config.end()) {
+    const auto value = folly::to<int64_t>(config[kCudfHashJoinGraceHostBytes]);
+    VELOX_USER_CHECK_GE(
+        value, 0, "{} must be non-negative", kCudfHashJoinGraceHostBytes);
+    hashJoinGraceHostBytes = static_cast<uint64_t>(value);
+  }
+  if (config.find(kCudfHashJoinGraceRestoreBytes) != config.end()) {
+    const auto value =
+        folly::to<int64_t>(config[kCudfHashJoinGraceRestoreBytes]);
+    VELOX_USER_CHECK_GT(
+        value, 0, "{} must be positive", kCudfHashJoinGraceRestoreBytes);
+    hashJoinGraceRestoreBytes = static_cast<uint64_t>(value);
+  }
+  if (config.find(kCudfHashJoinGraceProbeRestoreBytes) != config.end()) {
+    const auto value =
+        folly::to<int64_t>(config[kCudfHashJoinGraceProbeRestoreBytes]);
+    VELOX_USER_CHECK_GT(
+        value, 0, "{} must be positive", kCudfHashJoinGraceProbeRestoreBytes);
+    hashJoinGraceProbeRestoreBytes = static_cast<uint64_t>(value);
   }
   if (config.find(kCudfFunctionNamePrefix) != config.end()) {
     functionNamePrefix = config[kCudfFunctionNamePrefix];

@@ -17,6 +17,7 @@
 #pragma once
 
 #include "velox/experimental/cudf/exec/CudfOperator.h"
+#include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
@@ -57,9 +58,7 @@ class CudfBatchConcat : public CudfOperatorBase {
 
   bool needsInput() const override;
 
-  exec::BlockingReason isBlocked(ContinueFuture* /*future*/) override {
-    return exec::BlockingReason::kNotBlocked;
-  }
+  exec::BlockingReason isBlocked(ContinueFuture* future) override;
 
   bool isFinished() override;
 
@@ -68,18 +67,33 @@ class CudfBatchConcat : public CudfOperatorBase {
   RowVectorPtr doGetOutput() override;
 
  private:
+  void flushBufferedInputs();
+  void processPendingInput(RowVectorPtr input);
+  bool requiresConcatWorkspace() const;
+  bool reachedFlushThreshold() const;
+
   exec::DriverCtx* const driverCtx_;
   const std::string aggregationStep_;
   std::vector<CudfVectorPtr> buffer_;
   std::queue<CudfVectorPtr> outputQueue_;
+  RowVectorPtr pendingInput_;
+  std::optional<DeviceMemoryWorkspaceReservation> workspaceAdmission_;
   uint64_t totalInputRows_{0};
   uint64_t totalInputBytes_{0};
   uint64_t inputBatches_{0};
   uint64_t outputBatches_{0};
+  uint64_t rebasedBatches_{0};
+  uint64_t rebaseMicros_{0};
+  uint64_t largeConcatBypassBatches_{0};
+  uint64_t largeConcatBypassBytes_{0};
   size_t currentNumRows_{0};
   uint64_t currentNumBytes_{0};
   const size_t targetRows_{0};
   const uint64_t targetBytes_{0};
+  // Normal UCX pages are owning and zero-based at the producer boundary. Keep
+  // the D2D rebase switch only as an explicit diagnostic for other producers.
+  const bool variableWidthInputs_{false};
+  const bool rebaseVariableWidthInputs_{false};
   bool summaryLogged_{false};
 };
 

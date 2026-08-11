@@ -19,6 +19,7 @@
 #include <rmm/cuda_stream_view.hpp>
 #include <cinttypes>
 #include <memory>
+#include <vector>
 #include "velox/common/base/Exceptions.h"
 #include "velox/common/future/VeloxPromise.h"
 
@@ -29,17 +30,55 @@ namespace facebook::velox::ucx_exchange {
 /// for subsequent operations on the data.
 struct PackedTableWithStream {
   std::unique_ptr<cudf::packed_table> packedTable;
+  // Remote transports without CUDA support enqueue the packed image in host
+  // memory. UcxExchange materializes this image only after the consuming
+  // driver has acquired device workspace. This makes the host buffer a real
+  // bounce queue instead of eagerly turning every completed UCX receive into
+  // a long-lived device allocation.
+  std::unique_ptr<std::vector<uint8_t>> hostMetadata;
+  std::shared_ptr<uint8_t> hostData;
+  size_t hostDataSize{0};
+  bool hostDataPinned{false};
   rmm::cuda_stream_view stream;
+  // Optional ownership credit. A device page can carry the low-headroom
+  // progress lease into CudfVector. Host receive credit is deliberately not
+  // attached here: completed bounce pages are bounded per ExchangeQueue.
+  std::shared_ptr<void> lifetimeOwner;
 
   PackedTableWithStream() = default;
   PackedTableWithStream(
       std::unique_ptr<cudf::packed_table>&& table,
-      rmm::cuda_stream_view s)
-      : packedTable(std::move(table)), stream(s) {}
+      rmm::cuda_stream_view s,
+      std::shared_ptr<void> owner = nullptr)
+      : packedTable(std::move(table)),
+        stream(s),
+        lifetimeOwner(std::move(owner)) {}
+
+  PackedTableWithStream(
+      std::unique_ptr<std::vector<uint8_t>>&& metadata,
+      std::shared_ptr<uint8_t> data,
+      size_t dataSize,
+      bool pinned,
+      rmm::cuda_stream_view s,
+      std::shared_ptr<void> owner)
+      : hostMetadata(std::move(metadata)),
+        hostData(std::move(data)),
+        hostDataSize(dataSize),
+        hostDataPinned(pinned),
+        stream(s),
+        lifetimeOwner(std::move(owner)) {}
+
+  bool isHostBacked() const {
+    return hostData != nullptr;
+  }
 
   /// Returns the size of the GPU data buffer, or 0 if packedTable is null.
   size_t gpuDataSize() const {
     return packedTable ? packedTable->data.gpu_data->size() : 0;
+  }
+
+  size_t dataSize() const {
+    return isHostBacked() ? hostDataSize : gpuDataSize();
   }
 };
 
@@ -113,7 +152,7 @@ class UcxExchangeQueue {
     return queue_.size();
   }
 
-  /// Returns the total bytes held by packed tables in 'this'.
+  /// Returns total serialized bytes held by device or host-backed tables.
   int64_t totalBytes() const {
     std::lock_guard<std::mutex> l(mutex_);
     return totalBytesLocked();
@@ -132,6 +171,14 @@ class UcxExchangeQueue {
   }
 
   bool shouldPauseReceive(
+      int32_t highWaterMark,
+      int64_t maxInFlightBytes,
+      BackpressureStats* stats = nullptr) const;
+
+  /// Same as shouldPauseReceive(), but requires mutex() to be held by the
+  /// caller. This lets a receiver publish its dormant flag in the same queue
+  /// critical section in which it observes the pause condition.
+  bool shouldPauseReceiveLocked(
       int32_t highWaterMark,
       int64_t maxInFlightBytes,
       BackpressureStats* stats = nullptr) const;

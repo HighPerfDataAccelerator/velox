@@ -30,9 +30,13 @@ add_library(
   CudfMarkDistinct.cpp
   CudfNestedLoopJoin.cpp
   CudfOrderBy.cpp
+  CudfPackedMicroBucket.cpp
+  CudfPackedRestore.cpp
+  CudfPackedSpill.cpp
   CudfReduce.cpp
   CudfTopN.cpp
   CudfTopNRowNumber.cpp
+  CudfUnnest.cpp
   CudfWindow.cpp
   DebugUtil.cpp
   DecimalAggregationDevice.cu
@@ -69,6 +73,7 @@ target_link_libraries(
     velox_exception
     velox_exec
     velox_test_util
+    lz4::lz4
 )
 
 if(TARGET velox_ucx_exchange)

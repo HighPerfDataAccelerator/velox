@@ -15,7 +15,10 @@
  */
 #pragma once
 
+#include <algorithm>
 #include <cinttypes>
+#include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -44,8 +47,87 @@ constexpr uint64_t METADATA_TAG = 0x02000000;
 constexpr uint64_t DATA_TAG = 0x03000000;
 constexpr uint64_t HANDSHAKE_RESPONSE_TAG = 0x04000000;
 
+// A CUDA-capable UCP context does not guarantee that every endpoint lane can
+// execute the eager "short" protocol directly from device memory. TCP/SM can
+// select uct_*_am_short for a tiny packed table and call memcpy on the device
+// address before cuda_copy participates. Sender and receiver must make the
+// same host-staging decision.
+constexpr int64_t kDeviceEagerHostStageBytes = 64 << 10;
+
+inline int64_t maxDirectDeviceTransferBytes() {
+  if (const char* value = std::getenv("GLUTEN_UCX_DIRECT_DEVICE_MAX_BYTES")) {
+    char* end = nullptr;
+    const auto parsed = std::strtoll(value, &end, 10);
+    if (end != value && *end == '\0' && parsed > 0) {
+      return parsed;
+    }
+  }
+  return 0;
+}
+
+inline bool shouldHostStageDeviceTransfer(
+    bool hasCudaTransport,
+    int64_t bytes) {
+  if (const char* value = std::getenv("GLUTEN_UCX_FORCE_HOST_STAGING");
+      value != nullptr && value[0] != '\0') {
+    if (value[0] != '0') {
+      return true;
+    }
+  }
+  const auto directLimit = maxDirectDeviceTransferBytes();
+  return !hasCudaTransport || bytes <= kDeviceEagerHostStageBytes ||
+      (directLimit > 0 && bytes > directLimit);
+}
+
+/// Acquires one reusable pinned host buffer dedicated to UCX bounce traffic.
+/// The exchange pool is intentionally separate from packed spill/restore: a
+/// long rendezvous send must not consume the small pool that Grace Join and
+/// TopN need to overlap disk decode with H2D. Returns nullptr when every
+/// bounded slot is busy so callers can preserve correctness with pageable
+/// staging.
+std::shared_ptr<uint8_t> acquireUcxPinnedBuffer(uint64_t requiredBytes);
+
+/// Acquires a pinned scratch buffer used only for deferred host-to-device
+/// copies. Remote UCX receive buffers deliberately remain pageable and owned
+/// by their retained Request so a wireup replay cannot overwrite a recycled
+/// pool slot. Keeping this pool separate also prevents long D2H sends from
+/// starving the short-lived H2D copy engine bounce.
+std::shared_ptr<uint8_t> acquireUcxH2DPinnedBuffer(uint64_t requiredBytes);
+
+inline bool exchangeVariableWidthValidationEnabled() {
+  const char* value =
+      std::getenv("GLUTEN_CUDF_BATCH_CONCAT_VALIDATE_VARIABLE_WIDTH");
+  if (value == nullptr || value[0] == '\0') {
+    return false;
+  }
+  const std::string_view setting(value);
+  return setting != "0" && setting != "false" && setting != "FALSE";
+}
+
 // Implementation of the fowler-noll-vo hash function for 32 bits.
 uint32_t fnv1a_32(std::string_view s);
+
+// Low-overhead diagnostic fingerprint for large exchange buffers. It samples
+// up to 4,096 evenly spaced 64-bit words, which is sufficient to distinguish
+// cross-wired pages without adding a full extra memory-bandwidth pass.
+inline uint64_t diagnosticBufferFingerprint(const void* data, size_t size) {
+  constexpr uint64_t kOffsetBasis = 1469598103934665603ULL;
+  constexpr uint64_t kPrime = 1099511628211ULL;
+  if (data == nullptr || size == 0) {
+    return kOffsetBasis ^ size;
+  }
+  const auto* bytes = static_cast<const uint8_t*>(data);
+  const size_t words = size / sizeof(uint64_t);
+  const size_t samples = std::min<size_t>(words, 4096);
+  uint64_t hash = kOffsetBasis ^ size;
+  for (size_t i = 0; i < samples; ++i) {
+    const size_t wordIndex = samples == words ? i : (i * words) / samples;
+    uint64_t value;
+    std::memcpy(&value, bytes + wordIndex * sizeof(uint64_t), sizeof(value));
+    hash = (hash ^ value) * kPrime;
+  }
+  return hash;
+}
 
 // Gets the tag used for metadata communication
 // Note: taskHash and sequenceNumber are implicitly converted to 64 bits.
@@ -80,6 +162,11 @@ struct HandshakeMsg {
   /// against its own workerId to detect same-process (intra-node) transfers.
   uint64_t workerId{0};
 };
+
+/// Marks an active message as a request to discard one destination's output.
+/// Real destination IDs are restricted to [0, 65536), leaving the high bit
+/// available without changing the wire layout.
+constexpr uint32_t kCancelDestinationFlag = 0x80000000U;
 
 /// @brief Response sent from server to source after handshake.
 /// Informs the source whether intra-node transfer optimization is available,

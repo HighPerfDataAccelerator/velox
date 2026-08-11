@@ -36,15 +36,28 @@
 #include <rmm/mr/cuda_memory_resource.hpp>
 #include <rmm/mr/pool_memory_resource.hpp>
 
+#include <chrono>
+#include <optional>
+
 namespace facebook::velox::ucx_exchange {
+
+struct IntraNodeTransferResult;
 
 struct UcxExchangeMetrics {
   UcxExchangeMetrics()
       : numPackedColumns_(RuntimeMetric(RuntimeCounter::Unit::kNone)),
         totalBytes_(RuntimeCounter::Unit::kBytes),
+        hostStagedBytes_(RuntimeCounter::Unit::kBytes),
+        asyncHostCopyBytes_(RuntimeCounter::Unit::kBytes),
+        asyncHostCopyThrottledBytes_(RuntimeCounter::Unit::kBytes),
+        hostCopySyncNanos_(RuntimeCounter::Unit::kNanos),
         rttPerRequest_(RuntimeMetric(RuntimeCounter::Unit::kNanos)) {}
   RuntimeMetric numPackedColumns_; // total number of packed columns received.
   RuntimeMetric totalBytes_; // total number of bytes received
+  RuntimeMetric hostStagedBytes_; // bytes received through a host bounce.
+  RuntimeMetric asyncHostCopyBytes_; // host-bounce H2D bytes published async.
+  RuntimeMetric asyncHostCopyThrottledBytes_; // bytes fenced by async limit.
+  RuntimeMetric hostCopySyncNanos_; // fallback H2D synchronization wall.
   RuntimeMetric rttPerRequest_;
 };
 
@@ -162,22 +175,11 @@ class UcxExchangeSource
   struct DataAndMetadata {
     MetadataMsg metadata;
     std::unique_ptr<rmm::device_buffer> dataBuf;
-    std::shared_ptr<std::vector<uint8_t>> hostData;
+    std::shared_ptr<uint8_t> hostData;
+    bool hostDataPinned{false};
     rmm::cuda_stream_view stream; // The stream used to allocate dataBuf
+    std::shared_ptr<void> receiveWorkspaceProgressLease;
   };
-
-  // Metadata receives are strictly serial for a source. Reuse one fixed-size
-  // receive buffer instead of allocating a new 1 MiB mapping per packet.
-  // Some UCXX request internals outlive the user callback, so per-packet
-  // buffers otherwise accumulate until exchange teardown.
-  std::shared_ptr<std::vector<uint8_t>> metadataReceiveBuffer_;
-
-  // Data receives are also strictly serial for a source. Keep one pageable
-  // staging allocation and use synchronous CUDA copies. Explicit pinned
-  // allocations trigger a PCI SERR on this host, while async copies from
-  // pageable per-packet buffers make the CUDA runtime retain implicit pinned
-  // staging mappings.
-  std::shared_ptr<std::vector<uint8_t>> dataReceiveBuffer_;
 
   /// @brief The constructor is private in order to ensure that exchange sources
   /// are always generated through a shared pointer. This ensures that
@@ -216,6 +218,10 @@ class UcxExchangeSource
   /// @brief Sends a handshake request to the server. The endpoint must exist.
   void sendHandshake();
 
+  /// Asks the producer to discard this destination when the consumer closes
+  /// before receiving end-of-stream.
+  void sendCancel();
+
   /// @brief Called by the transport layer when handshake is completed
   /// @param status indication by transport layer of transfer status
   /// @param arg NOT USED at the moment
@@ -227,7 +233,10 @@ class UcxExchangeSource
   /// @brief Called by the transport layer when data is available
   /// @param status indication by transport layer of transfer status
   /// @param arg the serialized form of the metadata
-  void onMetadata(ucs_status_t status, std::shared_ptr<void> arg);
+  void onMetadata(
+      ucs_status_t status,
+      std::shared_ptr<void> arg,
+      uint32_t expectedSequence);
 
   /// @brief Reserves receive credit and posts the data receive for a metadata
   /// packet that has already arrived.
@@ -238,7 +247,10 @@ class UcxExchangeSource
   /// @brief Called by the transport layer when data is available
   /// @param status indication by transport layer of transfer status
   /// @param arg
-  void onData(ucs_status_t status, std::shared_ptr<void> arg);
+  void onData(
+      ucs_status_t status,
+      std::shared_ptr<void> arg,
+      uint32_t expectedSequence);
 
   /// @brief Initiates receiving the HandshakeResponse from server.
   void receiveHandshakeResponse();
@@ -252,12 +264,9 @@ class UcxExchangeSource
   void waitForIntraNodeData();
 
   /// @brief For intra-node transfer: handles data retrieved from registry.
-  /// @param data The packed_columns from registry (nullptr if atEnd or error)
-  /// @param atEnd True if this is end-of-stream
-  void onIntraNodeData(
-      std::shared_ptr<cudf::packed_columns> data,
-      rmm::cuda_stream_view producerStream,
-      bool atEnd);
+  /// @param result Device-owned data, a host-backed bounce image, or an end
+  /// marker retrieved from the same-node registry.
+  void onIntraNodeData(IntraNodeTransferResult result);
 
   /// @brief Sets the new state of this exchange source using
   /// sequential consistency. Logs transitions at VLOG(2).
@@ -332,6 +341,15 @@ class UcxExchangeSource
   std::shared_ptr<DataAndMetadata> pendingReceive_;
   int64_t reservedReceiveBytes_{0};
   int64_t reservedGlobalHostReceiveBytes_{0};
+
+  // A receive normally preserves one full consumer workspace above the
+  // steady-state device watermark. If the same pending receive cannot be
+  // admitted for a bounded interval, it may use the steady-state watermark;
+  // the operator workspace scheduler's own progress lane then guarantees that
+  // the received page can be consumed instead of completing a credit cycle.
+  std::optional<std::chrono::steady_clock::time_point>
+      receiveWorkspaceBlockedSince_;
+  bool receiveWorkspaceProgressLogged_{false};
 
   // Some metrics/counters:
   UcxExchangeMetrics metrics_;

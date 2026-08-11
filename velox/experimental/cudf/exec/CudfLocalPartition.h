@@ -91,6 +91,7 @@ class CudfLocalPartition : public CudfOperatorBase {
   std::unique_ptr<cudf::table> rangeBoundaries_;
   std::vector<cudf::order> rangeOrders_;
   std::vector<cudf::null_order> rangeNullOrders_;
+  bool rangeSplitEqualKeys_{false};
 };
 
 } // namespace facebook::velox::cudf_velox

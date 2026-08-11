@@ -539,14 +539,18 @@ class SpillPartition {
 using SpillPartitionSet =
     std::map<SpillPartitionId, std::unique_ptr<SpillPartition>>;
 
-/// Used in recursive spilling scenario. Capable of handling spill partition
-/// insertion while handling the partition retrieving order such that deeper and
-/// lower partition number partitions are retrieved first. It also preserves the
-/// entire leaf spill partition set that could be retrieved by calling
-/// 'extractAll()' after the set is fully iterated.
-class IterableSpillPartitionSet {
+/// Payload-neutral recursive spill-partition iterator. 'Partition' must expose
+/// id() and be copy constructible. This lets CPU and accelerator backends share
+/// the hierarchical SpillPartitionId scheduling without sharing their payload
+/// serialization.
+template <typename Partition, bool PreservePartitions = true>
+class IterableSpillPartitionSetBase {
  public:
-  IterableSpillPartitionSet();
+  using PartitionSet = std::map<SpillPartitionId, std::unique_ptr<Partition>>;
+
+  IterableSpillPartitionSetBase() {
+    spillPartitionIter_ = spillPartitions_.begin();
+  }
 
   /// Inserts 'spillPartitionSet', and replaces the common parent of
   /// 'spillPartitionSet' in the iteration list if not root.
@@ -554,27 +558,79 @@ class IterableSpillPartitionSet {
   /// NOTE: All spill partitions in 'spillPartitionSet' must have the same
   /// direct parent if they are not root. And the common parent must be the
   /// same as the partition latest returned by next().
-  void insert(SpillPartitionSet&& spillPartitionSet);
+  void insert(PartitionSet&& spillPartitionSet) {
+    VELOX_CHECK(
+        !spillPartitionSet.empty(),
+        "Inserted spill partition set must not be empty.");
 
-  bool hasNext() const;
+    const auto parentId = spillPartitionSet.begin()->first.parentId();
+    if (!spillPartitions_.empty()) {
+      VELOX_CHECK(parentId.has_value());
+      VELOX_CHECK(spillPartitionIter_ != spillPartitions_.begin());
+      VELOX_CHECK_EQ(
+          std::prev(spillPartitionIter_)->first,
+          parentId.value(),
+          "Partition set does not have the same parent.");
+      spillPartitions_.erase(std::prev(spillPartitionIter_));
+    } else {
+      VELOX_CHECK(!parentId.has_value());
+    }
 
-  SpillPartition next();
+    for (auto& [id, partition] : spillPartitionSet) {
+      VELOX_CHECK_EQ(
+          id.parentId().value_or(SpillPartitionId()),
+          parentId.value_or(SpillPartitionId()));
+      if constexpr (PreservePartitions) {
+        spillPartitions_.emplace(id, std::make_unique<Partition>(*partition));
+      } else {
+        spillPartitions_.emplace(id, std::move(partition));
+      }
+    }
+    spillPartitionIter_ =
+        spillPartitions_.find(spillPartitionSet.begin()->first);
+  }
+
+  bool hasNext() const {
+    return spillPartitionIter_ != spillPartitions_.end();
+  }
+
+  Partition next() {
+    VELOX_CHECK(hasNext(), "No more spill partitions to read.");
+    auto& partition = (spillPartitionIter_++)->second;
+    if constexpr (PreservePartitions) {
+      return *partition;
+    } else {
+      return std::move(*partition);
+    }
+  }
 
   /// Retrieves the entire leaf spill partition set. This method can be called
   /// only after the set is fully iterated. This is used in hash join in mixed
   /// mode spilling.
-  const SpillPartitionSet& spillPartitions() const;
+  const PartitionSet& spillPartitions() const {
+    VELOX_CHECK(
+        !hasNext(),
+        "Spill partitions can only be extracted out after entire set is read.");
+    return spillPartitions_;
+  }
 
-  void reset();
+  void reset() {
+    spillPartitionIter_ = spillPartitions_.begin();
+  }
 
-  void clear();
+  void clear() {
+    spillPartitions_.clear();
+    spillPartitionIter_ = spillPartitions_.begin();
+  }
 
  private:
   // Iterator on 'spillPartitions_' pointing to the next returning spill
   // partition.
-  SpillPartitionSet::iterator spillPartitionIter_;
-  SpillPartitionSet spillPartitions_;
+  typename PartitionSet::iterator spillPartitionIter_;
+  PartitionSet spillPartitions_;
 };
+
+using IterableSpillPartitionSet = IterableSpillPartitionSetBase<SpillPartition>;
 
 /// Represents all spilled data of an operator, e.g. order by or group
 /// by. This has one SpillFileList per partition of spill data.

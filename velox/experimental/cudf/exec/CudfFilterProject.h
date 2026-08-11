@@ -63,13 +63,7 @@ class CudfFilterProject : public CudfOperatorBase {
   void doAddInput(RowVectorPtr input) override;
   RowVectorPtr doGetOutput() override;
 
-  void doClose() override {
-    Operator::close();
-    projectEvaluators_.clear();
-    literalScalars_.clear();
-    nullComplexLiteralProjections_.clear();
-    filterEvaluator_.reset();
-  }
+  void doClose() override;
 
  private:
   struct NullComplexLiteralProjection {
@@ -89,6 +83,12 @@ class CudfFilterProject : public CudfOperatorBase {
 
   std::vector<CudfExpressionPtr> projectEvaluators_;
   CudfExpressionPtr filterEvaluator_;
+  CudfExpressionBatchCachePtr projectExpressionCache_;
+  CudfExpressionBatchCachePtr filterExpressionCache_;
+  std::string filterExpressionLabel_;
+  std::vector<std::string> projectExpressionLabels_;
+  uint64_t expressionCacheHits_{0};
+  uint64_t expressionCacheRetained_{0};
 
   std::vector<velox::exec::IdentityProjection> resultProjections_;
   std::vector<velox::exec::IdentityProjection> literalProjections_;

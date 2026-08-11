@@ -107,8 +107,10 @@ void ExchangeClient::close() {
 
 folly::F14FastMap<std::string, RuntimeMetric> ExchangeClient::stats() {
   std::lock_guard<std::mutex> l(queue_->mutex());
-  if (stats_.empty()) {
-    stats_ = collectStatsLocked();
+  if (!closed_) {
+    // Sources are still progressing. Do not freeze the first snapshot: the
+    // exchange operator samples these stats while consuming pages.
+    return collectStatsLocked();
   }
   return stats_;
 }

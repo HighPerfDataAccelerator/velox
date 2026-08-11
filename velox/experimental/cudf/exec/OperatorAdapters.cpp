@@ -34,6 +34,7 @@
 #include "velox/experimental/cudf/exec/CudfReduce.h"
 #include "velox/experimental/cudf/exec/CudfTopN.h"
 #include "velox/experimental/cudf/exec/CudfTopNRowNumber.h"
+#include "velox/experimental/cudf/exec/CudfUnnest.h"
 #include "velox/experimental/cudf/exec/CudfWindow.h"
 #include "velox/experimental/cudf/exec/OperatorAdapters.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
@@ -66,6 +67,7 @@
 #include "velox/exec/Task.h"
 #include "velox/exec/TopN.h"
 #include "velox/exec/TopNRowNumber.h"
+#include "velox/exec/Unnest.h"
 #include "velox/exec/Values.h"
 #include "velox/exec/Window.h"
 
@@ -92,6 +94,22 @@ struct TaskPipelineKey {
   };
 };
 
+struct TaskPlanNodeKey {
+  std::string taskId;
+  core::PlanNodeId planNodeId;
+
+  bool operator==(const TaskPlanNodeKey& other) const {
+    return taskId == other.taskId && planNodeId == other.planNodeId;
+  }
+
+  struct Hash {
+    std::size_t operator()(const TaskPlanNodeKey& key) const {
+      return std::hash<std::string>{}(key.taskId) ^
+          (std::hash<std::string>{}(key.planNodeId) << 1);
+    }
+  };
+};
+
 using UcxExchangeClientMap = std::unordered_map<
     TaskPipelineKey,
     std::weak_ptr<ucx_exchange::UcxExchangeClient>,
@@ -102,12 +120,46 @@ UcxExchangeClientMap& getUcxExchangeClientMap() {
   return instance;
 }
 
+using UcxExchangePlanNodeClientMap = std::unordered_map<
+    TaskPlanNodeKey,
+    std::weak_ptr<ucx_exchange::UcxExchangeClient>,
+    TaskPlanNodeKey::Hash>;
+
+UcxExchangePlanNodeClientMap& getUcxExchangePlanNodeClientMap() {
+  static UcxExchangePlanNodeClientMap instance;
+  return instance;
+}
+
 std::mutex& getUcxExchangeClientMapMutex() {
   static std::mutex instance;
   return instance;
 }
 
 } // namespace
+
+bool primeUcxExchangeClient(
+    const std::string& taskId,
+    const core::PlanNodeId& planNodeId,
+    const std::vector<std::string>& remoteTaskIds) {
+  std::shared_ptr<ucx_exchange::UcxExchangeClient> client;
+  {
+    std::lock_guard<std::mutex> lock(getUcxExchangeClientMapMutex());
+    auto& clientMap = getUcxExchangePlanNodeClientMap();
+    const auto it = clientMap.find({taskId, planNodeId});
+    if (it == clientMap.end() || !(client = it->second.lock())) {
+      if (it != clientMap.end()) {
+        clientMap.erase(it);
+      }
+      return false;
+    }
+  }
+
+  for (const auto& remoteTaskId : remoteTaskIds) {
+    client->addRemoteTaskId(remoteTaskId);
+  }
+  client->noMoreRemoteTasks();
+  return true;
+}
 
 /// OperatorAdapterRegistry Implementation
 OperatorAdapterRegistry& OperatorAdapterRegistry::getInstance() {
@@ -254,6 +306,13 @@ class FilterProjectAdapter : public OperatorAdapter {
     // Check projects separately
     if (projectPlanNode) {
       for (const auto& projection : projectPlanNode->projections()) {
+        if (projection->isConstantKind()) {
+          const auto* constant =
+              projection->asUnchecked<core::ConstantTypedExpr>();
+          if (projection->type()->isPrimitiveType() || constant->isNull()) {
+            continue;
+          }
+        }
         if (!canExprRunOnGpu(
                 projection, ctx->task->queryCtx().get(), op->pool())) {
           LOG_FALLBACK(
@@ -367,6 +426,57 @@ class AggregationAdapter : public OperatorAdapter {
       result.push_back(
           std::make_unique<CudfGroupby>(operatorId, ctx, aggregationPlanNode));
     }
+    return result;
+  }
+};
+
+class UnnestAdapter : public OperatorAdapter {
+ public:
+  UnnestAdapter() : OperatorAdapter("Unnest") {}
+
+  bool canHandle(const exec::Operator* op) const override {
+    return dynamic_cast<const exec::Unnest*>(op) != nullptr;
+  }
+
+  bool canRunOnGPU(
+      const exec::Operator* op,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* /*ctx*/) const override {
+    if (!canHandle(op)) {
+      LOG_FALLBACK(
+          "UnnestAdapter operator is not Unnest, PlanNode id: {}",
+          planNode->id());
+      return false;
+    }
+
+    auto unnestNode =
+        std::dynamic_pointer_cast<const core::UnnestNode>(planNode);
+    if (!CudfUnnest::canRunOnGPU(unnestNode)) {
+      LOG_FALLBACK(
+          "Unnest shape is not supported by cuDF, PlanNode id: {}",
+          planNode->id());
+      return false;
+    }
+    return true;
+  }
+
+  bool acceptsGpuInput() const override {
+    return true;
+  }
+
+  bool producesGpuOutput() const override {
+    return true;
+  }
+
+  std::vector<std::unique_ptr<exec::Operator>> createReplacements(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* ctx,
+      int32_t operatorId) const override {
+    auto unnestNode =
+        std::dynamic_pointer_cast<const core::UnnestNode>(planNode);
+    std::vector<std::unique_ptr<exec::Operator>> result;
+    result.push_back(std::make_unique<CudfUnnest>(operatorId, ctx, unnestNode));
     return result;
   }
 };
@@ -620,8 +730,14 @@ class OrderByAdapter : public OperatorAdapter {
       const exec::Operator* /*op*/,
       const core::PlanNodePtr& planNode,
       exec::DriverCtx* /*ctx*/) const override {
-    return std::dynamic_pointer_cast<const core::OrderByNode>(planNode) !=
-        nullptr;
+    const auto orderByNode =
+        std::dynamic_pointer_cast<const core::OrderByNode>(planNode);
+    if (!CudfOrderBy::isSupported(orderByNode)) {
+      LOG_FALLBACK(
+          "OrderBy external spill schema or sorting key is not supported");
+      return false;
+    }
+    return true;
   }
 
   bool acceptsGpuInput() const override {
@@ -685,7 +801,8 @@ class TopNAdapter : public OperatorAdapter {
   }
 };
 
-/// TopNRowNumberAdapter - Replaces with CudfTopNRowNumber
+/// Replaces supported row_number nodes with CudfTopNRowNumber.  The operator
+/// internally selects its bounded-memory Top-1 path when applicable.
 class TopNRowNumberAdapter : public OperatorAdapter {
  public:
   TopNRowNumberAdapter() : OperatorAdapter("TopNRowNumber") {}
@@ -695,19 +812,28 @@ class TopNRowNumberAdapter : public OperatorAdapter {
   }
 
   bool canRunOnGPU(
-      const exec::Operator* /*op*/,
+      const exec::Operator* op,
       const core::PlanNodePtr& planNode,
       exec::DriverCtx* /*ctx*/) const override {
     auto node =
         std::dynamic_pointer_cast<const core::TopNRowNumberNode>(planNode);
-    if (!node) {
-      return false;
-    }
-    return node->rankFunction() ==
-        core::TopNRowNumberNode::RankFunction::kRowNumber ||
+    const bool supportedRank = node != nullptr &&
         (node->rankFunction() ==
-             core::TopNRowNumberNode::RankFunction::kDenseRank &&
-         node->sortingKeys().size() == 1);
+             core::TopNRowNumberNode::RankFunction::kRowNumber ||
+         (node->rankFunction() ==
+              core::TopNRowNumberNode::RankFunction::kDenseRank &&
+          node->sortingKeys().size() == 1));
+    const bool canRun = canHandle(op) && supportedRank;
+    if (!canRun) {
+      LOG_FALLBACK(
+          "TopNRowNumberAdapter {}, PlanNode id: {}",
+          !canHandle(op) ? "operator is not TopNRowNumber"
+              : !node    ? "planNode is not TopNRowNumberNode"
+                         : "CudfTopNRowNumber supports row_number and "
+                           "single-key dense_rank",
+          planNode->id());
+    }
+    return canRun;
   }
 
   bool acceptsGpuInput() const override {
@@ -726,6 +852,26 @@ class TopNRowNumberAdapter : public OperatorAdapter {
     auto node =
         std::dynamic_pointer_cast<const core::TopNRowNumberNode>(planNode);
     std::vector<std::unique_ptr<exec::Operator>> result;
+    // Exchange and scan sources can deliver tens of thousands of rows per
+    // batch.  Running the grouped Top-1 kernel once for every such batch makes
+    // high-cardinality ROW_NUMBER=1 windows kernel-launch bound and creates
+    // hundreds of packed host chunks.  Coalesce to a bounded device batch
+    // before reducing.  The byte cap is deliberately tied to (and no larger
+    // than) the operator's candidate-run cap, so this does not increase the
+    // peak state that the bounded Top-1 path is configured to tolerate.
+    if (CudfTopNRowNumber::useBoundedTop1(node)) {
+      const auto candidateRunBytes = ctx->queryConfig().get<uint64_t>(
+          CudfConfig::kCudfTopNRowNumberCandidateRunBytes,
+          CudfConfig::getInstance().topNRowNumberCandidateRunBytes);
+      result.push_back(
+          std::make_unique<CudfBatchConcat>(
+              operatorId,
+              ctx,
+              planNode,
+              node->inputType(),
+              1'000'000,
+              std::min<uint64_t>(candidateRunBytes, 256ULL << 20)));
+    }
     result.push_back(
         std::make_unique<CudfTopNRowNumber>(operatorId, ctx, node));
     return result;
@@ -1228,6 +1374,8 @@ class ExchangeAdapter : public OperatorAdapter {
       } else {
         exchangeOp->resetExchangeClient();
       }
+      getUcxExchangePlanNodeClientMap()[{op->taskId(), planNode->id()}] =
+          client;
     }
 
     std::vector<std::unique_ptr<exec::Operator>> result;
@@ -1243,13 +1391,14 @@ class ExchangeAdapter : public OperatorAdapter {
       const auto targetBytes = ctx->queryConfig().get<uint64_t>(
           CudfConfig::kCudfExchangeBatchSizeMinThresholdBytes,
           cudfConfig.exchangeBatchSizeMinThresholdBytes);
-      result.push_back(std::make_unique<CudfBatchConcat>(
-          operatorId,
-          ctx,
-          planNode,
-          planNode->outputType(),
-          targetRows,
-          targetBytes));
+      result.push_back(
+          std::make_unique<CudfBatchConcat>(
+              operatorId,
+              ctx,
+              planNode,
+              planNode->outputType(),
+              targetRows,
+              targetBytes));
     }
     return result;
   }
@@ -1274,8 +1423,7 @@ class PartitionedOutputAdapter : public OperatorAdapter {
       const core::PlanNodePtr& planNode,
       exec::DriverCtx* /*ctx*/) const override {
     auto outputNode =
-        std::dynamic_pointer_cast<const core::PartitionedOutputNode>(
-            planNode);
+        std::dynamic_pointer_cast<const core::PartitionedOutputNode>(planNode);
     return CudfConfig::getInstance().exchange && outputNode &&
         outputNode->transportKind() == core::TransportKind::kUcx;
   }
@@ -1293,18 +1441,17 @@ class PartitionedOutputAdapter : public OperatorAdapter {
       const core::PlanNodePtr& planNode,
       exec::DriverCtx* ctx,
       int32_t operatorId) const override {
-    auto* partitionOp =
-        const_cast<exec::PartitionedOutput*>(
-            dynamic_cast<const exec::PartitionedOutput*>(op));
+    auto* partitionOp = const_cast<exec::PartitionedOutput*>(
+        dynamic_cast<const exec::PartitionedOutput*>(op));
     auto outputNode =
-        std::dynamic_pointer_cast<const core::PartitionedOutputNode>(
-            planNode);
+        std::dynamic_pointer_cast<const core::PartitionedOutputNode>(planNode);
     VELOX_CHECK_NOT_NULL(partitionOp);
     VELOX_CHECK_NOT_NULL(outputNode);
 
     std::vector<std::unique_ptr<exec::Operator>> result;
-    result.push_back(std::make_unique<ucx_exchange::UcxPartitionedOutput>(
-        operatorId, ctx, outputNode, partitionOp->getEagerFlush()));
+    result.push_back(
+        std::make_unique<ucx_exchange::UcxPartitionedOutput>(
+            operatorId, ctx, outputNode, partitionOp->getEagerFlush()));
     return result;
   }
 
@@ -1324,6 +1471,7 @@ void registerAllOperatorAdapters() {
   registry.registerAdapter(std::make_unique<TableScanAdapter>());
   registry.registerAdapter(std::make_unique<FilterProjectAdapter>());
   registry.registerAdapter(std::make_unique<AggregationAdapter>());
+  registry.registerAdapter(std::make_unique<UnnestAdapter>());
   registry.registerAdapter(std::make_unique<HashJoinBuildAdapter>());
   registry.registerAdapter(std::make_unique<HashJoinProbeAdapter>());
   registry.registerAdapter(std::make_unique<NestedLoopJoinBuildAdapter>());

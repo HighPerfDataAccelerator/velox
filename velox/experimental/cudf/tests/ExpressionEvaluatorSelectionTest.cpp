@@ -33,6 +33,8 @@
 #include "velox/functions/sparksql/registration/Register.h"
 #include "velox/type/Type.h"
 
+#include <cudf/column/column_factories.hpp>
+
 #include <folly/ScopeGuard.h>
 #include <gtest/gtest.h>
 
@@ -111,6 +113,75 @@ TEST_F(CudfExpressionSelectionTest, functionRoot) {
   ASSERT_NE(functionExpr, nullptr);
 }
 
+TEST_F(CudfExpressionSelectionTest, rejectsUnsupportedJavaRegexSyntax) {
+  const auto regexpExtract = [](std::string pattern) {
+    std::vector<core::TypedExprPtr> inputs{
+        std::make_shared<core::FieldAccessTypedExpr>(VARCHAR(), "name"),
+        std::make_shared<core::ConstantTypedExpr>(
+            VARCHAR(), variant(std::move(pattern))),
+        std::make_shared<core::ConstantTypedExpr>(INTEGER(), variant(0))};
+    return std::make_shared<core::CallTypedExpr>(
+        VARCHAR(), std::move(inputs), "regexp_extract");
+  };
+
+  EXPECT_TRUE(FunctionExpression::canEvaluate(regexpExtract("(a)")));
+  EXPECT_FALSE(FunctionExpression::canEvaluate(regexpExtract("(?i)a")));
+  EXPECT_FALSE(FunctionExpression::canEvaluate(regexpExtract("(a)\\1")));
+  EXPECT_FALSE(
+      FunctionExpression::canEvaluate(regexpExtract("(?<name>a)\\k<name>")));
+}
+
+TEST_F(CudfExpressionSelectionTest, operatorBatchCacheSharesRepeatedRoot) {
+  auto first = optimizeTypedExpr(
+      "lower(name)", rowType_, queryCtx_.get(), execCtx_.get());
+  auto second = optimizeTypedExpr(
+      "lower(name)", rowType_, queryCtx_.get(), execCtx_.get());
+  auto cache = makeCudfExpressionBatchCache({first, second});
+  ASSERT_EQ(cache->cacheableKeyCount(), 1);
+
+  auto firstEvaluator =
+      createCudfExpression(first, rowType_, pool_.get(), cache);
+  auto secondEvaluator =
+      createCudfExpression(second, rowType_, pool_.get(), cache);
+  auto input = cudf::make_strings_column(
+      0,
+      cudf::make_numeric_column(
+          cudf::data_type{cudf::type_id::INT32},
+          1,
+          cudf::mask_state::UNALLOCATED),
+      rmm::device_buffer{},
+      0,
+      rmm::device_buffer{});
+  auto a =
+      cudf::make_fixed_width_column(cudf::data_type{cudf::type_id::INT64}, 0);
+  auto b =
+      cudf::make_fixed_width_column(cudf::data_type{cudf::type_id::INT64}, 0);
+  auto c =
+      cudf::make_fixed_width_column(cudf::data_type{cudf::type_id::INT32}, 0);
+  std::vector<cudf::column_view> inputViews{
+      a->view(), b->view(), c->view(), input->view()};
+
+  auto firstResult = firstEvaluator->eval(
+      inputViews,
+      cudf::get_default_stream(),
+      cudf::get_current_device_resource_ref(),
+      true);
+  auto secondResult = secondEvaluator->eval(
+      inputViews,
+      cudf::get_default_stream(),
+      cudf::get_current_device_resource_ref(),
+      true);
+
+  EXPECT_EQ(asView(firstResult).size(), 0);
+  EXPECT_EQ(asView(secondResult).size(), 0);
+  EXPECT_EQ(cache->retained(), 1);
+  EXPECT_EQ(cache->hits(), 1);
+
+  cache->reset();
+  EXPECT_EQ(cache->retained(), 0);
+  EXPECT_EQ(cache->hits(), 0);
+}
+
 TEST_F(
     CudfExpressionSelectionTest,
     monotonicallyIncreasingIdUsesPartitionAndRowCount) {
@@ -136,7 +207,8 @@ TEST_F(
                        cudf::size_type rows,
                        int64_t first) {
     std::vector<cudf::column_view> noInputs;
-    auto result = target->eval(noInputs, rows, stream, mr, true);
+    auto result =
+        target->evalWithInputRowCount(noInputs, rows, stream, mr, true);
     auto resultView = asView(result);
     auto outputType = ROW({"id"}, {BIGINT()});
     auto output = with_arrow::toVeloxColumn(
