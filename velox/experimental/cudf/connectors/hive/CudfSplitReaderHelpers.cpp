@@ -1646,8 +1646,7 @@ class NativeS3SdkScheduler {
           }
         }
         if (!selectedByDemand && completionKeyContinuity_ &&
-            &source == &queue_ &&
-            !completionPreferredKeys_.empty()) {
+            &source == &queue_ && !completionPreferredKeys_.empty()) {
           const auto preferred = std::find_if(
               source.begin(), source.end(), [this](const auto& queued) {
                 return queued->directCacheFill &&
