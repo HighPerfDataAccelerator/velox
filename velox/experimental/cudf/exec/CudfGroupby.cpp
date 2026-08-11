@@ -1304,7 +1304,8 @@ void CudfGroupby::initialize() {
                 aggregationNode_->step();
           });
 
-  if (streamingEnabled_ && groupbyStreamingMaxDistinctKeys_ == 0 &&
+  if (streamingEnabled_ && !partialIdentityAggregationEnabled_ &&
+      groupbyStreamingMaxDistinctKeys_ == 0 &&
       canUseOneShotCompanionAggregation(*aggregationNode_)) {
     streamingEnabled_ = false;
     LOG(INFO) << "CUDF_GROUPBY_STREAMING node=" << diagnosticNodeId_

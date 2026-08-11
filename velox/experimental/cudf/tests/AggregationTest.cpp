@@ -1108,6 +1108,36 @@ TEST_F(AggregationTest, partialIdentityUsesQueryScopedStreamingCapacity) {
       .assertResults("SELECT c0, sum(c1) FROM tmp GROUP BY c0");
 }
 
+TEST_F(AggregationTest, partialIdentityDoesNotRequireStreamingCapacity) {
+  auto& globalCapacity =
+      cudf_velox::CudfConfig::getInstance().groupbyStreamingMaxDistinctKeys;
+  const auto previousCapacity = globalCapacity;
+  SCOPE_EXIT {
+    globalCapacity = previousCapacity;
+  };
+  globalCapacity = 0;
+
+  auto vectors = {
+      makeRowVector(
+          {makeFlatVector<int64_t>({1, 1, 2}),
+           makeFlatVector<int64_t>({10, 20, 30})}),
+      makeRowVector(
+          {makeFlatVector<int64_t>({1, 2, 2}),
+           makeFlatVector<int64_t>({40, 50, 60})}),
+  };
+  createDuckDbTable(vectors);
+
+  auto plan = PlanBuilder()
+                  .values(vectors)
+                  .partialAggregation({"c0"}, {"sum(c1)"})
+                  .finalAggregation()
+                  .planNode();
+  AssertQueryBuilder(duckDbQueryRunner_)
+      .config(cudf_velox::CudfConfig::kCudfPartialIdentityAggregation, "true")
+      .plan(plan)
+      .assertResults("SELECT c0, sum(c1) FROM tmp GROUP BY c0");
+}
+
 class FinalAggregationStreamingTest : public AggregationTest {
  protected:
   class ScopedStreamingCapacity {
