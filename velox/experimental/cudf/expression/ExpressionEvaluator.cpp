@@ -1348,19 +1348,19 @@ class GreatestLeastFunction : public CudfFunction {
 class SwitchFunction : public CudfFunction {
  public:
   SwitchFunction(const core::TypedExprPtr& expr, memory::MemoryPool* pool) {
-    VELOX_CHECK_EQ(
-        expr->inputs().size(), 3, "case when expects exactly 3 inputs");
-    VELOX_CHECK_EQ(
-        expr->inputs()[0]->type()->kind(),
-        TypeKind::BOOLEAN,
-        "The switch condition result type should be boolean");
-    VELOX_CHECK(
-        !expr->isConstantKind(), "The condition should not be constant");
-    if (expr->inputs()[1]->isConstantKind()) {
-      left_ = makeScalarFromConstantExpr(expr->inputs()[1], pool);
-    }
-    if (expr->inputs()[2]->isConstantKind()) {
-      right_ = makeScalarFromConstantExpr(expr->inputs()[2], pool);
+    VELOX_CHECK_GE(expr->inputs().size(), 3);
+    VELOX_CHECK_EQ(expr->inputs().size() % 2, 1);
+
+    size_t nextColumn = 0;
+    operands_.reserve(expr->inputs().size());
+    for (const auto& input : expr->inputs()) {
+      Operand operand;
+      if (input->isConstantKind()) {
+        operand.scalar = makeScalarFromConstantExpr(input, pool);
+      } else {
+        operand.column = nextColumn++;
+      }
+      operands_.push_back(std::move(operand));
     }
   }
 
@@ -1368,32 +1368,54 @@ class SwitchFunction : public CudfFunction {
       std::vector<ColumnOrView>& inputColumns,
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr) const override {
-    if (left_ == nullptr && right_ == nullptr) {
+    const auto view = [&](const Operand& operand) {
+      VELOX_DCHECK_NULL(operand.scalar);
+      return asView(inputColumns[operand.column]);
+    };
+    const auto select = [&](const Operand& left,
+                            const Operand& right,
+                            cudf::column_view condition) {
+      if (left.scalar && right.scalar) {
+        return cudf::copy_if_else(
+            *left.scalar, *right.scalar, condition, stream, mr);
+      }
+      if (left.scalar) {
+        return cudf::copy_if_else(
+            *left.scalar, view(right), condition, stream, mr);
+      }
+      if (right.scalar) {
+        return cudf::copy_if_else(
+            view(left), *right.scalar, condition, stream, mr);
+      }
       return cudf::copy_if_else(
-          asView(inputColumns[1]),
-          asView(inputColumns[2]),
-          asView(inputColumns[0]),
-          stream,
-          mr);
-    } else if (left_ == nullptr) {
-      return cudf::copy_if_else(
-          asView(inputColumns[1]),
-          *right_,
-          asView(inputColumns[0]),
-          stream,
-          mr);
-    } else if (right_ == nullptr) {
-      return cudf::copy_if_else(
-          *left_, asView(inputColumns[1]), asView(inputColumns[0]), stream, mr);
+          view(left), view(right), condition, stream, mr);
+    };
+
+    std::unique_ptr<cudf::column> result;
+    const auto branchCount = (operands_.size() - 1) / 2;
+    for (size_t branch = branchCount; branch-- > 0;) {
+      const auto condition = view(operands_[2 * branch]);
+      const auto& value = operands_[2 * branch + 1];
+      if (!result) {
+        result = select(value, operands_.back(), condition);
+      } else if (value.scalar) {
+        result = cudf::copy_if_else(
+            *value.scalar, result->view(), condition, stream, mr);
+      } else {
+        result = cudf::copy_if_else(
+            view(value), result->view(), condition, stream, mr);
+      }
     }
-    // right != null and left != null
-    return cudf::copy_if_else(
-        *left_, *right_, asView(inputColumns[0]), stream, mr);
+    return result;
   }
 
  private:
-  std::unique_ptr<cudf::scalar> left_;
-  std::unique_ptr<cudf::scalar> right_;
+  struct Operand {
+    size_t column{0};
+    std::unique_ptr<cudf::scalar> scalar;
+  };
+
+  std::vector<Operand> operands_;
 };
 
 class CoalesceFunction : public CudfFunction {
@@ -2800,13 +2822,22 @@ bool registerBuiltinFunctions(const std::string& prefix) {
          memory::MemoryPool* pool) {
         return std::make_shared<SwitchFunction>(expr, pool);
       },
-      {FunctionSignatureBuilder()
-           .typeVariable("T")
-           .returnType("T")
-           .argumentType("boolean")
-           .argumentType("T")
-           .argumentType("T")
-           .build()});
+      {},
+      true,
+      [](const core::TypedExprPtr& expr) {
+        const auto& inputs = expr->inputs();
+        if (inputs.size() < 3 || inputs.size() % 2 == 0) {
+          return false;
+        }
+        for (size_t i = 0; i + 1 < inputs.size(); i += 2) {
+          if (inputs[i]->type()->kind() != TypeKind::BOOLEAN ||
+              inputs[i]->isConstantKind() ||
+              !inputs[i + 1]->type()->equivalent(*expr->type())) {
+            return false;
+          }
+        }
+        return inputs.back()->type()->equivalent(*expr->type());
+      });
 
   registerCudfFunctions(
       // No signatures required for cast and try_cast. They are special forms.

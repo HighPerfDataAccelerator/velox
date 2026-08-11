@@ -140,6 +140,20 @@ TEST_F(CudfExpressionSelectionTest, sparkNetflixExpressionCoverage) {
   ASSERT_NE(createCudfExpression(arrayExpr, rowType_, pool_.get()), nullptr);
 }
 
+TEST_F(CudfExpressionSelectionTest, multiBranchSwitch) {
+  auto expr = optimizeTypedExpr(
+      "CASE WHEN a = 1 THEN name "
+      "WHEN b = 2 THEN regexp_extract(name, '(.*?) android', 1) "
+      "WHEN c = 3 THEN 'three' ELSE '--' END",
+      rowType_,
+      queryCtx_.get(),
+      execCtx_.get(),
+      {.parseIntegerAsBigint = false, .functionPrefix = ""});
+
+  ASSERT_TRUE(canExprRunOnGpu(expr, queryCtx_.get(), pool_.get()));
+  ASSERT_NE(createCudfExpression(expr, rowType_, pool_.get()), nullptr);
+}
+
 TEST_F(
     CudfExpressionSelectionTest,
     monotonicallyIncreasingIdUsesPartitionAndRowCount) {
