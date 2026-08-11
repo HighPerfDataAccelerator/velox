@@ -1129,13 +1129,13 @@ TEST_F(AggregationTest, partialIdentityDoesNotRequireStreamingCapacity) {
 
   auto plan = PlanBuilder()
                   .values(vectors)
-                  .partialAggregation({"c0"}, {"sum(c1)"})
+                  .partialAggregation({"c0"}, {"sum(c1)", "min(c1)"})
                   .finalAggregation()
                   .planNode();
   AssertQueryBuilder(duckDbQueryRunner_)
       .config(cudf_velox::CudfConfig::kCudfPartialIdentityAggregation, "true")
       .plan(plan)
-      .assertResults("SELECT c0, sum(c1) FROM tmp GROUP BY c0");
+      .assertResults("SELECT c0, sum(c1), min(c1) FROM tmp GROUP BY c0");
 }
 
 class FinalAggregationStreamingTest : public AggregationTest {
