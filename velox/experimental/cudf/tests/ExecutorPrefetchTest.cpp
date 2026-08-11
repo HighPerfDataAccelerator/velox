@@ -1425,8 +1425,7 @@ TEST(ExecutorPrefetchTest, cacheHintRangeReadyRequestReleasesAdmissionWindow) {
 
 TEST(ExecutorPrefetchTest, cacheHintFirstLoadGroupPrecedesFullCompletion) {
   folly::CPUThreadPoolExecutor executor(1);
-  std::promise<void> firstLoadReady;
-  auto firstLoadReadyFuture = firstLoadReady.get_future().share();
+  auto firstLoadReady = std::make_shared<CacheHintFirstLoadSignal>();
   std::promise<void> unblockFullLoad;
   auto unblockFullLoadFuture = unblockFullLoad.get_future().share();
   std::atomic<bool> fullLoadCompleted{false};
@@ -1446,7 +1445,7 @@ TEST(ExecutorPrefetchTest, cacheHintFirstLoadGroupPrecedesFullCompletion) {
       },
       1,
       2,
-      firstLoadReadyFuture);
+      firstLoadReady);
 
   const auto before = ExecutorSplitPrefetch::cacheHintWaitStatsForTest();
   auto take = std::async(std::launch::async, [&] {
@@ -1457,7 +1456,7 @@ TEST(ExecutorPrefetchTest, cacheHintFirstLoadGroupPrecedesFullCompletion) {
         CacheHintWaitMode::kFirstLoadGroup);
   });
   EXPECT_EQ(take.wait_for(50ms), std::future_status::timeout);
-  firstLoadReady.set_value();
+  firstLoadReady->signal();
   ASSERT_EQ(take.wait_for(5s), std::future_status::ready);
   take.get();
   EXPECT_FALSE(fullLoadCompleted.load(std::memory_order_relaxed));
@@ -1476,8 +1475,7 @@ TEST(ExecutorPrefetchTest, cacheHintFirstLoadGroupPrecedesFullCompletion) {
 
 TEST(ExecutorPrefetchTest, cacheHintFirstLoadFailureDoesNotHang) {
   folly::CPUThreadPoolExecutor executor(1);
-  std::promise<void> unresolvedFirstLoad;
-  auto unresolvedFirstLoadFuture = unresolvedFirstLoad.get_future().share();
+  auto firstLoadReady = std::make_shared<CacheHintFirstLoadSignal>();
 
   ExecutorSplitPrefetch::registerCacheHint(
       &executor,
@@ -1491,7 +1489,7 @@ TEST(ExecutorPrefetchTest, cacheHintFirstLoadFailureDoesNotHang) {
       [] { throw std::runtime_error("failure before first load callback"); },
       1,
       1,
-      unresolvedFirstLoadFuture);
+      firstLoadReady);
 
   auto take = std::async(std::launch::async, [&] {
     ExecutorSplitPrefetch::takeCacheHint(
@@ -1504,6 +1502,62 @@ TEST(ExecutorPrefetchTest, cacheHintFirstLoadFailureDoesNotHang) {
   EXPECT_NO_THROW(take.get());
   ExecutorSplitPrefetch::eraseQuery(
       &executor, "query-cache-first-load-failure");
+}
+
+TEST(ExecutorPrefetchTest, cacheHintFirstLoadCancellationDoesNotHang) {
+  folly::CPUThreadPoolExecutor executor(1);
+  std::promise<void> blockerStarted;
+  std::promise<void> unblockBlocker;
+  auto unblockBlockerFuture = unblockBlocker.get_future().share();
+
+  ExecutorSplitPrefetch::registerCacheHint(
+      &executor,
+      "query-cache-first-load-cancel",
+      "blocker",
+      1,
+      [&] {
+        blockerStarted.set_value();
+        unblockBlockerFuture.wait();
+      },
+      1,
+      2);
+  ASSERT_EQ(
+      blockerStarted.get_future().wait_for(5s), std::future_status::ready);
+
+  auto firstLoadReady = std::make_shared<CacheHintFirstLoadSignal>();
+  ExecutorSplitPrefetch::registerCacheHint(
+      &executor,
+      "query-cache-first-load-cancel",
+      "canceled-before-schedule",
+      CacheHintRangeStats{
+          .logicalRanges = 1,
+          .logicalBytes = 1,
+          .uniqueRanges = 1,
+          .uniqueBytes = 1},
+      [] {},
+      1,
+      2,
+      firstLoadReady);
+
+  auto take = std::async(std::launch::async, [&] {
+    ExecutorSplitPrefetch::takeCacheHint(
+        &executor,
+        "query-cache-first-load-cancel",
+        "canceled-before-schedule",
+        CacheHintWaitMode::kFirstLoadGroup);
+  });
+  EXPECT_EQ(take.wait_for(50ms), std::future_status::timeout);
+
+  auto erase = std::async(std::launch::async, [&] {
+    ExecutorSplitPrefetch::eraseQuery(
+        &executor, "query-cache-first-load-cancel");
+  });
+  ASSERT_EQ(take.wait_for(5s), std::future_status::ready);
+  EXPECT_NO_THROW(take.get());
+
+  unblockBlocker.set_value();
+  ASSERT_EQ(erase.wait_for(5s), std::future_status::ready);
+  erase.get();
 }
 
 TEST(ExecutorPrefetchTest, cacheHintQueryRegisteredSplitDecisionIsUniform) {

@@ -20,6 +20,7 @@
 
 #include <folly/Executor.h>
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <future>
@@ -72,6 +73,26 @@ struct CachePrefetchPlanStats {
   uint64_t hits{0};
   uint64_t misses{0};
   uint64_t entries{0};
+};
+
+/// Future-backed one-shot signal for the first physical cache load. The
+/// scheduler also signals terminal completion so an early load failure cannot
+/// strand a scan. Keeping the wait side on std::shared_future preserves the
+/// direct blocking behavior used by the original ready-first implementation.
+class CacheHintFirstLoadSignal {
+ public:
+  CacheHintFirstLoadSignal();
+
+  void signal();
+
+  const std::shared_future<void>& future() const {
+    return future_;
+  }
+
+ private:
+  std::atomic<bool> signaled_{false};
+  std::promise<void> promise_;
+  std::shared_future<void> future_;
 };
 
 enum class CacheHintWaitMode : uint8_t {
@@ -156,7 +177,7 @@ class ExecutorSplitPrefetch {
       CacheHintLoad load,
       uint32_t concurrency,
       uint64_t maxReadyBytes,
-      std::shared_future<void> firstLoadReady);
+      std::shared_ptr<CacheHintFirstLoadSignal> firstLoadReady);
 
   /// Marks a cache hint as demanded and waits for it. Failures are swallowed:
   /// the regular reader demand path remains the correctness fallback.

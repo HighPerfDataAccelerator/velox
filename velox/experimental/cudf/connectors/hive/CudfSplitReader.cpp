@@ -561,7 +561,7 @@ void CudfSplitReader::setupCachePrefetchHint() {
     const auto* session = connectorQueryCtx_->sessionProperties();
     const auto prepareLoads = prepareCacheHintLoadsEnabled();
     ExecutorSplitPrefetch::CacheHintLoad load;
-    std::shared_future<void> firstLoadReady;
+    std::shared_ptr<CacheHintFirstLoadSignal> firstLoadReady;
     if (prepareLoads) {
       std::function<void()> firstLoadReadyCallback;
       cachePrefetchFirstLoadPolicyEnabled_ =
@@ -573,11 +573,9 @@ void CudfSplitReader::setupCachePrefetchHint() {
               *cachePrefetchQueryId_,
               cacheHintFirstLoadGroupReadyMinQueryRegisteredSplits());
       if (cachePrefetchFirstLoadReady_) {
-        auto firstLoadPromise = std::make_shared<std::promise<void>>();
-        firstLoadReady = firstLoadPromise->get_future().share();
-        firstLoadReadyCallback = [firstLoadPromise =
-                                      std::move(firstLoadPromise)]() {
-          firstLoadPromise->set_value();
+        firstLoadReady = std::make_shared<CacheHintFirstLoadSignal>();
+        firstLoadReadyCallback = [firstLoadReady]() {
+          firstLoadReady->signal();
         };
       }
       auto prepared = buffered->prepareCachePrefetch(

@@ -61,7 +61,7 @@ struct CacheHintEntry {
   std::shared_ptr<std::promise<void>> promise{
       std::make_shared<std::promise<void>>()};
   std::shared_future<void> future{promise->get_future().share()};
-  std::shared_future<void> firstLoadReady;
+  std::shared_ptr<CacheHintFirstLoadSignal> firstLoadReady;
 };
 
 std::atomic<uint64_t> cacheHintPlannedSplits{0};
@@ -339,7 +339,7 @@ class QueryPrefetchState
       ExecutorSplitPrefetch::CacheHintLoad load,
       uint32_t concurrency,
       uint64_t maxReadyBytes,
-      std::shared_future<void> firstLoadReady) {
+      std::shared_ptr<CacheHintFirstLoadSignal> firstLoadReady) {
     VELOX_CHECK(static_cast<bool>(load));
     auto entry = std::make_shared<CacheHintEntry>();
     entry->key = splitKey;
@@ -389,34 +389,13 @@ class QueryPrefetchState
     }
     pumpCacheHints();
     const bool waitForFirstLoad =
-        waitMode == CacheHintWaitMode::kFirstLoadGroup &&
-        entry->firstLoadReady.valid();
+        waitMode == CacheHintWaitMode::kFirstLoadGroup && entry->firstLoadReady;
+    const auto& waitFuture =
+        waitForFirstLoad ? entry->firstLoadReady->future() : entry->future;
     const auto waitStart = std::chrono::steady_clock::now();
-    const auto readyAtTake = waitForFirstLoad
-        ? (entry->firstLoadReady.wait_for(std::chrono::seconds(0)) ==
-               std::future_status::ready ||
-           entry->future.wait_for(std::chrono::seconds(0)) ==
-               std::future_status::ready)
-        : entry->future.wait_for(std::chrono::seconds(0)) ==
-            std::future_status::ready;
-    const std::shared_future<void>* waitFuture = &entry->future;
-    if (waitForFirstLoad) {
-      // A load can fail before its first physical group invokes the readiness
-      // callback. In that case full completion is the fallback signal; never
-      // strand a scan on an external first-load future that cannot be set.
-      while (entry->firstLoadReady.wait_for(std::chrono::milliseconds(1)) !=
-             std::future_status::ready) {
-        if (entry->future.wait_for(std::chrono::seconds(0)) ==
-            std::future_status::ready) {
-          break;
-        }
-      }
-      if (entry->firstLoadReady.wait_for(std::chrono::seconds(0)) ==
-          std::future_status::ready) {
-        waitFuture = &entry->firstLoadReady;
-      }
-    }
-    waitFuture->wait();
+    const auto readyAtTake = waitFuture.wait_for(std::chrono::seconds(0)) ==
+        std::future_status::ready;
+    waitFuture.wait();
     const auto waitNanos = std::chrono::duration_cast<std::chrono::nanoseconds>(
                                std::chrono::steady_clock::now() - waitStart)
                                .count();
@@ -551,6 +530,9 @@ class QueryPrefetchState
       entry->promise->set_exception(failure);
     }
     for (const auto& entry : canceledCacheHints) {
+      if (entry->firstLoadReady) {
+        entry->firstLoadReady->signal();
+      }
       entry->promise->set_value();
     }
     // CPUThreadPoolExecutor destruction joins all active reads. This method is
@@ -600,6 +582,9 @@ class QueryPrefetchState
           if (fallbacks == 1) {
             logCacheHintStats("first-fallback", entry->key);
           }
+        }
+        if (entry->firstLoadReady) {
+          entry->firstLoadReady->signal();
         }
         entry->promise->set_value();
         {
@@ -991,6 +976,17 @@ SplitPrefetchResult::~SplitPrefetchResult() {
   }
 }
 
+CacheHintFirstLoadSignal::CacheHintFirstLoadSignal()
+    : future_(promise_.get_future().share()) {}
+
+void CacheHintFirstLoadSignal::signal() {
+  bool expected = false;
+  if (signaled_.compare_exchange_strong(
+          expected, true, std::memory_order_acq_rel)) {
+    promise_.set_value();
+  }
+}
+
 void ExecutorSplitPrefetch::registerSplit(
     folly::Executor* executor,
     const std::string& queryId,
@@ -1103,7 +1099,7 @@ void ExecutorSplitPrefetch::registerCacheHint(
     CacheHintLoad load,
     uint32_t concurrency,
     uint64_t maxReadyBytes,
-    std::shared_future<void> firstLoadReady) {
+    std::shared_ptr<CacheHintFirstLoadSignal> firstLoadReady) {
   if (!executor || rangeStats.uniqueBytes == 0 || !load) {
     return;
   }
