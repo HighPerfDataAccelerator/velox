@@ -78,7 +78,6 @@ class CudfBatchConcat : public CudfOperatorBase {
   std::queue<CudfVectorPtr> outputQueue_;
   RowVectorPtr pendingInput_;
   std::optional<DeviceMemoryWorkspaceReservation> workspaceAdmission_;
-  ReplayableDeviceMemoryWorkspace workspace_;
   uint64_t totalInputRows_{0};
   uint64_t totalInputBytes_{0};
   uint64_t inputBatches_{0};

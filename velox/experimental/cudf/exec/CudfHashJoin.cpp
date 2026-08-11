@@ -792,7 +792,6 @@ class ProbeMatchTracker {
 } // namespace
 
 void CudfHashJoinProbe::doClose() {
-  graceWorkspace_.reset();
   graceWorkspaceAdmission_.reset();
   Operator::close();
   filterEvaluator_.reset();
@@ -1406,7 +1405,6 @@ RowVectorPtr CudfHashJoinBuild::doGetOutput() {
 }
 
 void CudfHashJoinBuild::doClose() {
-  buildFinalizeWorkspace_.reset();
   buildFinalizePending_ = false;
   Operator::close();
 }
@@ -1504,7 +1502,7 @@ uint64_t CudfHashJoinBuild::residentBuildFinalizeWorkspaceBytes() const {
 
 void CudfHashJoinBuild::finalizeBuild() {
   VELOX_CHECK(buildFinalizePending_);
-  VELOX_CHECK(!buildFinalizeWorkspace_.waiting());
+  VELOX_CHECK(!replayableDeviceWorkspace().waiting());
 
   // A resident build owns all of its input columns while concatenating them
   // and constructing the cuco hash table.  Account for that transient image
@@ -1546,7 +1544,7 @@ void CudfHashJoinBuild::finalizeBuild() {
         activateGracePath();
       }
     } else {
-      auto attempt = buildFinalizeWorkspace_.tryAcquire(
+      auto attempt = replayableDeviceWorkspace().tryAcquire(
           deviceMemoryPool_,
           this,
           static_cast<std::size_t>(requestedWorkspace),
@@ -1563,7 +1561,7 @@ void CudfHashJoinBuild::finalizeBuild() {
         // the next getOutput() still performs the normal physical-headroom
         // recheck.
         workspace.reset();
-        buildFinalizeWorkspace_.deferReadyForTesting();
+        replayableDeviceWorkspace().deferReadyForTesting();
       }
       if (workspace.has_value()) {
         residentBuildFinalizeWorkspace.emplace(std::move(workspace.value()));
@@ -1579,7 +1577,7 @@ void CudfHashJoinBuild::finalizeBuild() {
         }
       } else {
         if (!replayableResidentBuildFinalizeEnabled()) {
-          buildFinalizeWorkspace_.reset();
+          replayableDeviceWorkspace().reset();
           addRuntimeStat(
               "residentBuildFinalizeImmediateFallbacks",
               RuntimeCounter(1, RuntimeCounter::Unit::kNone));
@@ -1768,7 +1766,7 @@ void CudfHashJoinBuild::finalizeBuild() {
 }
 
 exec::BlockingReason CudfHashJoinBuild::isBlocked(ContinueFuture* future) {
-  if (buildFinalizeWorkspace_.takeFuture(future)) {
+  if (replayableDeviceWorkspace().takeFuture(future)) {
     return exec::BlockingReason::kWaitForArbitration;
   }
   if (!future_.valid()) {
@@ -2647,7 +2645,7 @@ bool CudfHashJoinProbe::acquireGraceWorkspace(
   if (graceWorkspaceAdmission_.has_value()) {
     return true;
   }
-  auto attempt = graceWorkspace_.tryAcquire(
+  auto attempt = replayableDeviceWorkspace().tryAcquire(
       customPool(kCudfDeviceMemoryResourceTag),
       this,
       bytes,
@@ -3052,7 +3050,7 @@ RowVectorPtr CudfHashJoinProbe::getGraceOutput() {
     return output;
   }
   hashObject_.reset();
-  graceWorkspace_.reset();
+  replayableDeviceWorkspace().reset();
   graceWorkspaceAdmission_.reset();
   gracePartition_.reset();
   graceProbeChunk_ = 0;
@@ -5519,7 +5517,7 @@ bool CudfHashJoinProbe::skipProbeOnEmptyBuild() const {
 }
 
 exec::BlockingReason CudfHashJoinProbe::isBlocked(ContinueFuture* future) {
-  if (graceWorkspace_.takeFuture(future)) {
+  if (replayableDeviceWorkspace().takeFuture(future)) {
     return exec::BlockingReason::kWaitForArbitration;
   }
   if (graceEnabled_ && noMoreInput_ && future_.valid()) {

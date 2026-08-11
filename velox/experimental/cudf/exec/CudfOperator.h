@@ -262,6 +262,10 @@ class CudfOperatorBase : public exec::Operator, public NvtxHelper {
   void close() final {
     VELOX_NVTX_OPERATOR_FUNC_RANGE_IF(
         nvtxMethods_ & NvtxMethodFlag::kClose, className_);
+    // Cancel a queued transient-workspace request before derived teardown.
+    // Every built-in cuDF operator gets one replayable phase coordinator from
+    // this base, so adopting cooperative spill cannot omit cancellation.
+    replayableDeviceWorkspace_.reset();
     const auto sample = shouldSampleDeviceMemory(true);
     if (sample) {
       logDeviceMemory("close", "before", -1, -1);
@@ -280,6 +284,15 @@ class CudfOperatorBase : public exec::Operator, public NvtxHelper {
   }
 
  protected:
+  ReplayableDeviceMemoryWorkspace& replayableDeviceWorkspace() noexcept {
+    return replayableDeviceWorkspace_;
+  }
+
+  const ReplayableDeviceMemoryWorkspace& replayableDeviceWorkspace()
+      const noexcept {
+    return replayableDeviceWorkspace_;
+  }
+
   virtual void doAddInput(RowVectorPtr input) = 0;
 
   virtual RowVectorPtr doGetOutput() = 0;
@@ -367,6 +380,7 @@ class CudfOperatorBase : public exec::Operator, public NvtxHelper {
   const core::PlanNodeId planNodeId_;
   const int32_t operatorId_;
   const NvtxMethodFlag nvtxMethods_;
+  ReplayableDeviceMemoryWorkspace replayableDeviceWorkspace_;
   DeviceMemoryReclaimerRegistration deviceMemoryReclaimer_;
   uint64_t deviceMemoryCallCount_{0};
 };

@@ -262,7 +262,6 @@ class CudfHashJoinBuild : public CudfOperatorBase {
   // that resident image is replayable from getOutput(): a workspace wake only
   // retries admission and never repeats peer collection or bridge publication.
   bool buildFinalizePending_{false};
-  ReplayableDeviceMemoryWorkspace buildFinalizeWorkspace_;
   ContinueFuture future_{ContinueFuture::makeEmpty()};
 };
 
@@ -470,7 +469,6 @@ class CudfHashJoinProbe : public CudfOperatorBase {
   // batch is blocked downstream double-counts that memory and can starve the
   // next drain for tens of seconds.
   std::optional<DeviceMemoryWorkspaceReservation> graceWorkspaceAdmission_;
-  ReplayableDeviceMemoryWorkspace graceWorkspace_;
   size_t graceProbePrefetchDepth_{4};
   std::deque<std::pair<size_t, std::future<void>>> graceProbePrefetchFutures_;
 

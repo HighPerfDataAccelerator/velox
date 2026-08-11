@@ -426,14 +426,14 @@ exec::BlockingReason CudfOrderBy::isBlocked(ContinueFuture* future) {
 
   const auto minHeadroom = std::min<uint64_t>(
       CudfConfig::getInstance().deviceMemoryMinHeadroomBytes, 1ULL << 30);
-  auto attempt = outputWorkspace_.tryAcquire(
+  auto attempt = replayableDeviceWorkspace().tryAcquire(
       customPool(kCudfDeviceMemoryResourceTag),
       this,
       outputWorkspaceBytes(),
       minHeadroom,
       DeviceMemoryWorkspacePriority::kOutput);
   if (!attempt.reservation.has_value()) {
-    VELOX_CHECK(outputWorkspace_.takeFuture(future));
+    VELOX_CHECK(replayableDeviceWorkspace().takeFuture(future));
     return exec::BlockingReason::kWaitForArbitration;
   }
   outputWorkspaceAdmission_.emplace(std::move(attempt.reservation.value()));

@@ -187,7 +187,6 @@ class CudfOrderBy : public CudfOperatorBase {
   cudf::size_type pendingOutputOffset_{0};
   uint64_t pendingOutputBytes_{0};
   MergeStats outputMergeStats_;
-  ReplayableDeviceMemoryWorkspace outputWorkspace_;
   std::optional<DeviceMemoryWorkspaceReservation> outputWorkspaceAdmission_;
   bool readersInitialized_{false};
   bool mergeFinished_{false};

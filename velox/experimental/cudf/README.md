@@ -46,25 +46,28 @@ operator-specific partitioning policy.
 The control plane has three layers:
 
 1. `CudfOperatorBase` registers each operator's device pool with both Velox's
-   memory reclaimer and the process-wide device reclaimer. Pressure is
-   published asynchronously and serviced by the owning Driver only at safe
-   operator boundaries.
+   memory reclaimer and the process-wide device reclaimer. It also owns one
+   replayable workspace coordinator and cancels any queued request before
+   derived teardown. Pressure is published asynchronously and serviced by the
+   owning Driver only at safe operator boundaries.
 2. `DeviceMemoryWorkspaceReservation` accounts for transient restore,
    concatenate, hash-build, and output memory across all Drivers on a device.
    Requests are ordered by progress priority: input, transform, restore,
    drain, then output handoff.
-3. `ReplayableDeviceMemoryWorkspace` owns one cancellation-safe request,
-   advisory future, and wait interval. An operator whose replayable phase
-   cannot be admitted returns `kWaitForArbitration`, preserves its input or
-   spilled partition, and retries the phase after the Driver is woken.
+3. `ReplayableDeviceMemoryWorkspace` owns the cancellation-safe request,
+   advisory future, and wait interval exposed by `CudfOperatorBase`. An
+   operator whose replayable phase cannot be admitted returns
+   `kWaitForArbitration`, preserves its input or spilled partition, and retries
+   the phase after the Driver is woken.
 
 An operator adopting the framework must separate irreversible work from the
 replayable phase. Peer barriers, ownership transfer, output publication, and
 spill-file mutation run once. Admission is retried before the first GPU
 allocation in a phase; a wake is advisory, so physical headroom is always
-revalidated. `close()` resets the replayable workspace to cancel any queued
-request. Workspace reservations remain scoped to the kernels they protect and
-must not be retained while an output batch is blocked downstream.
+revalidated. The base `close()` resets the replayable workspace to cancel any
+queued request. Workspace reservations remain operator-owned and scoped to the
+kernels they protect; they must not be retained while an output batch is
+blocked downstream.
 
 Hash join uses this protocol for resident build finalization and Grace
 partition restore. Top-N row number uses it for input, restore, drain, and

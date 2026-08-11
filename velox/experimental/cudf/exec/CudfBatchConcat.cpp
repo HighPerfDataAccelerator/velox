@@ -396,7 +396,7 @@ exec::BlockingReason CudfBatchConcat::isBlocked(ContinueFuture* future) {
   // caused by a 1 GiB minimum request near the device headroom watermark.
   constexpr std::size_t kConcatWorkspaceBytes = 512ULL << 20;
   VELOX_CHECK_NOT_NULL(future);
-  auto attempt = workspace_.tryAcquire(
+  auto attempt = replayableDeviceWorkspace().tryAcquire(
       customPool(kCudfDeviceMemoryResourceTag),
       this,
       kConcatWorkspaceBytes,
@@ -407,7 +407,7 @@ exec::BlockingReason CudfBatchConcat::isBlocked(ContinueFuture* future) {
       // headroom and form a producer/consumer admission cycle.
       DeviceMemoryWorkspacePriority::kDrain);
   if (!attempt.reservation.has_value()) {
-    VELOX_CHECK(workspace_.takeFuture(future));
+    VELOX_CHECK(replayableDeviceWorkspace().takeFuture(future));
     return exec::BlockingReason::kWaitForArbitration;
   }
   workspaceAdmission_.emplace(std::move(attempt.reservation.value()));

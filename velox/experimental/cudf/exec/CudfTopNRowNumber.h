@@ -450,7 +450,6 @@ class CudfTopNRowNumber : public CudfOperatorBase {
   // avoids a bucket-wide D2H/pageable copy followed by H2D per output slice.
   std::unique_ptr<cudf::table> pendingPartitionedDeviceOutput_;
   std::optional<DeviceMemoryWorkspaceReservation> inputWorkspaceAdmission_;
-  ReplayableDeviceMemoryWorkspace deviceWorkspace_;
   cudf::size_type pendingPartitionedDeviceOutputOffset_{0};
   uint64_t pendingPartitionedDeviceOutputBytes_{0};
   rmm::cuda_stream_view pendingPartitionedDeviceOutputStream_{};
