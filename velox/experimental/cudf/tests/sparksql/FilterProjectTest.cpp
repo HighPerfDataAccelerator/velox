@@ -155,6 +155,56 @@ TEST_F(CudfFilterProjectTest, hashWithSeed) {
   facebook::velox::test::assertEqualVectors(expected, hashResults);
 }
 
+TEST_F(CudfFilterProjectTest, sparkExpressionParity) {
+  auto input = makeRowVector({
+      makeNullableFlatVector<int64_t>({1, std::nullopt, -7, 42, 0, 9}),
+      makeNullableFlatVector<int32_t>({3, 5, std::nullopt, -1, 4, 8}),
+      makeNullableFlatVector<std::string>(
+          {"Pixel android",
+           "no_match",
+           std::nullopt,
+           "x android",
+           "android",
+           "plain"}),
+      makeNullableFlatVector<double>(
+          {12.5,
+           std::nullopt,
+           -7.25,
+           0.0,
+           std::numeric_limits<double>::infinity(),
+           -std::numeric_limits<double>::infinity()}),
+  });
+
+  for (const auto& expression : {
+           "isnull(c0)",
+           "cast(c0 as varchar)",
+           "cast(c3 as varchar)",
+           "regexp_extract(c2, 'a.*d')",
+           "regexp_extract(c2, '(.*?) android', 1)",
+           "regexp_extract(c2, 'android', 0)",
+           "array_constructor(c1, add(c1, 1), 7)",
+       }) {
+    SCOPED_TRACE(expression);
+    assertExpressionMatchesCpu(expression, input, input->rowType());
+  }
+}
+
+TEST_F(CudfFilterProjectTest, multiBranchSwitchWithRegexpExtract) {
+  auto input = makeRowVector({
+      makeFlatVector<int64_t>({1, 0, 0, 42, -1}),
+      makeFlatVector<int32_t>({0, 2, 0, 0, 0}),
+      makeNullableFlatVector<std::string>(
+          {"first", "Pixel android", "unused", std::nullopt, "fallback"}),
+  });
+
+  assertExpressionMatchesCpu(
+      "CASE WHEN c0 = 1 THEN c2 "
+      "WHEN c1 = 2 THEN regexp_extract(c2, '(.*?) android', 1) "
+      "WHEN c0 = 42 THEN 'answer' ELSE '--' END",
+      input,
+      input->rowType());
+}
+
 // TODO: Re-enable after https://github.com/rapidsai/cudf/issues/21720.
 // cuDF's murmurhash3_x86_32 combines columns via hash_combine(h(col0, seed),
 // h(col1, seed)), while Spark instead hashes columns iteratively:
