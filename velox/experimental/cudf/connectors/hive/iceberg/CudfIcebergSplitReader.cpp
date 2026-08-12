@@ -696,12 +696,21 @@ void CudfIcebergSplitReader::cacheSchemaFromMetadata() {
 
   VELOX_CHECK_EQ(
       fileMetaData_.size(),
-      1,
-      "Expected a single parquet footer for Iceberg data file");
+      1 + split_->coalescedFiles.size(),
+      "Expected one parquet footer per Iceberg data file");
   const auto& meta = fileMetaData_.front();
   VELOX_CHECK(not meta.schema.empty(), "Parquet footer schema is empty");
   VELOX_CHECK_GE(meta.num_rows, 0, "Parquet footer reports negative row count");
   std::tie(baseReadOffset_, splitRowCount_) = computeSplitRowRange();
+  for (size_t i = 1; i < fileMetaData_.size(); ++i) {
+    const auto& coalescedMeta = fileMetaData_[i];
+    VELOX_CHECK(
+        coalescedMeta.schema == meta.schema,
+        "Iceberg data files in a coalesced split must have the same physical schema");
+    VELOX_CHECK_GE(
+        coalescedMeta.num_rows, 0, "Parquet footer reports negative row count");
+    splitRowCount_ += static_cast<std::size_t>(coalescedMeta.num_rows);
+  }
 
   const auto& root = meta.schema.front();
   fileColumnNames_.clear();
