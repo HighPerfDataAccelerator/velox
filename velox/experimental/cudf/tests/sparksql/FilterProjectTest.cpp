@@ -155,7 +155,7 @@ TEST_F(CudfFilterProjectTest, hashWithSeed) {
   facebook::velox::test::assertEqualVectors(expected, hashResults);
 }
 
-TEST_F(CudfFilterProjectTest, netflixExpressionCoverage) {
+TEST_F(CudfFilterProjectTest, sparkExpressionParity) {
   auto input = makeRowVector({
       makeNullableFlatVector<int64_t>({1, std::nullopt, -7, 42}),
       makeNullableFlatVector<int32_t>({3, 5, std::nullopt, -1}),

@@ -111,7 +111,7 @@ TEST_F(CudfExpressionSelectionTest, functionRoot) {
   ASSERT_NE(functionExpr, nullptr);
 }
 
-TEST_F(CudfExpressionSelectionTest, sparkNetflixExpressionCoverage) {
+TEST_F(CudfExpressionSelectionTest, sparkExpressionCoverage) {
   for (const auto& expression : {
            "isnull(a)",
            "cast(a as varchar)",
