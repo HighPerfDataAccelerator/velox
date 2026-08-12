@@ -126,7 +126,9 @@ uint64_t cacheHintFirstLoadGroupReadyMinQueryRegisteredSplits() {
     const auto* value = std::getenv(
         "GLUTEN_CUDF_CACHE_HINT_FIRST_LOAD_GROUP_READY_MIN_QUERY_REGISTERED_SPLITS");
     if (value == nullptr || *value == '\0') {
-      return adaptiveS3PrefetchEnabled() ? uint64_t{600} : uint64_t{0};
+      // Keep smaller scans on the range-ready path while allowing roughly
+      // 500-split scans to overlap their first cache load with GPU execution.
+      return adaptiveS3PrefetchEnabled() ? uint64_t{500} : uint64_t{0};
     }
     try {
       size_t parsedCharacters{0};
