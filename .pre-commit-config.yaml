@@ -15,7 +15,7 @@
 # See https://pre-commit.com for more information
 
 # General excludes, files can also be excluded on a hook level
-exclude: .*\.patch|scripts/tests/.*|velox/external/.*|CMake/third-party/.*
+exclude: .*\.patch|scripts/tests/.*|velox/external/.*|CMake/third-party/.*|^\.github/workflows/blossom-ci\.yml$|^scripts/ci/Jenkinsfile\.premerge$
 default_install_hook_types: [pre-commit, pre-push]
 repos:
   - repo: meta
