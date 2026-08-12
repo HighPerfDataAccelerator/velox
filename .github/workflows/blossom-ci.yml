@@ -14,16 +14,20 @@
 
 # A workflow to trigger ci on hybrid infra (github + self hosted runner)
 name: Blossom-CI
+
+permissions:
+  contents: read
+
 on:
   issue_comment:
     types: [created]
   workflow_dispatch:
     inputs:
       platform:
-        description: 'runs-on argument'
+        description: runs-on argument
         required: false
       args:
-        description: 'argument'
+        description: argument
         required: false
 jobs:
   Authorization:
@@ -56,7 +60,7 @@ jobs:
       - name: Check if comment is issued by authorized person
         run: blossom-ci
         env:
-          OPERATION: 'AUTH'
+          OPERATION: AUTH
           REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO_KEY_DATA: ${{ secrets.BLOSSOM_KEY }}
 
@@ -66,7 +70,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: NVIDIA/spark-rapids-common/checkout@main
+        uses: NVIDIA/spark-rapids-common/checkout@4b21a5b1df852488a12d17225ad9dff36b2d5a97 # main
         with:
           repository: ${{ fromJson(needs.Authorization.outputs.args).repo }}
           ref: ${{ fromJson(needs.Authorization.outputs.args).ref }}
@@ -74,7 +78,7 @@ jobs:
 
       # repo specific steps
       - name: Setup java
-        uses: actions/setup-java@v5
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
         with:
           distribution: adopt
           java-version: 8
@@ -87,7 +91,7 @@ jobs:
           echo detect.maven.included.scopes=compile >> application.properties
 
       - name: Run blossom action
-        uses: NVIDIA/blossom-action@main
+        uses: NVIDIA/blossom-action@2b0c950b993808dc31f80a1ccc32615902e39032 # main
         env:
           REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO_KEY_DATA: ${{ secrets.BLOSSOM_KEY }}
@@ -104,18 +108,18 @@ jobs:
       - name: Start ci job
         run: blossom-ci
         env:
-          OPERATION: 'START-CI-JOB'
+          OPERATION: START-CI-JOB
           CI_SERVER: ${{ secrets.CI_SERVER }}
           REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   Upload-Log:
     name: Upload log
     runs-on: blossom
-    if : github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch'
     steps:
       - name: Jenkins log for pull request ${{ fromJson(github.event.inputs.args).pr }} (click here)
         run: blossom-ci
         env:
-          OPERATION: 'POST-PROCESSING'
+          OPERATION: POST-PROCESSING
           CI_SERVER: ${{ secrets.CI_SERVER }}
           REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}

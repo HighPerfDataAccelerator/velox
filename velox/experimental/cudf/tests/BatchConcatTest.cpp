@@ -448,8 +448,9 @@ TEST_F(CudfBatchConcatTest, batchedConcatSplitsSingleOversizedInput) {
   auto mr = cudf::get_current_device_resource_ref();
   auto table = with_arrow::toCudfTable(input, pool_.get(), stream, mr);
   std::vector<CudfVectorPtr> inputs;
-  inputs.push_back(std::make_shared<CudfVector>(
-      pool_.get(), inputType, input->size(), std::move(table), stream));
+  inputs.push_back(
+      std::make_shared<CudfVector>(
+          pool_.get(), inputType, input->size(), std::move(table), stream));
 
   auto outputs =
       getConcatenatedTableBatched(std::move(inputs), inputType, stream, mr, 4);
