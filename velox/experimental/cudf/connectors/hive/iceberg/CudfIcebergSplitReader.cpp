@@ -48,6 +48,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <exception>
 #include <limits>
 #include <tuple>
 #include <unordered_set>
@@ -186,8 +187,32 @@ void CudfIcebergSplitReader::prepareSplitInternal(
 bool CudfIcebergSplitReader::loadCoalescedFileMetadataAndCheckSchemas() {
   setupCudfDataSource();
   auto sources = makeDataSourceViews();
+  const auto numSources = sources.size();
+
+  // Keep the common same-schema path in one cuDF call. Besides avoiding API
+  // setup per file, this lets the multi-source footer reader retain its I/O
+  // scheduling behavior for remote storage.
+  std::exception_ptr batchFailure;
+  try {
+    fileMetaData_ = cudf::io::read_parquet_footers(sources);
+    VELOX_CHECK_EQ(
+        fileMetaData_.size(), numSources, "Expected one footer per data file");
+    const auto& firstSchema = fileMetaData_.front().schema;
+    return std::all_of(
+        fileMetaData_.begin() + 1,
+        fileMetaData_.end(),
+        [&](const auto& metadata) { return metadata.schema == firstSchema; });
+  } catch (const cudf::logic_error&) {
+    // cuDF combines multi-source footer metadata before reader options are
+    // applied and rejects some schema-evolved groups. Read those footers
+    // independently to distinguish schema evolution from an unrelated batch
+    // reader failure.
+    batchFailure = std::current_exception();
+  }
+
+  sources = makeDataSourceViews();
   fileMetaData_.clear();
-  fileMetaData_.reserve(sources.size());
+  fileMetaData_.reserve(numSources);
   std::optional<std::vector<cudf::io::parquet::SchemaElement>> firstSchema;
   for (auto& source : sources) {
     std::vector<std::unique_ptr<cudf::io::datasource>> singleSource;
@@ -201,7 +226,10 @@ bool CudfIcebergSplitReader::loadCoalescedFileMetadataAndCheckSchemas() {
     }
     fileMetaData_.push_back(std::move(metadata.front()));
   }
-  return true;
+
+  // The individual reads succeeded with identical schemas, so the batched
+  // failure was not the schema-evolution case handled here.
+  std::rethrow_exception(batchFailure);
 }
 
 void CudfIcebergSplitReader::prepareCurrentSplit(
