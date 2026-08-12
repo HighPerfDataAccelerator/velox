@@ -157,17 +157,29 @@ TEST_F(CudfFilterProjectTest, hashWithSeed) {
 
 TEST_F(CudfFilterProjectTest, sparkExpressionParity) {
   auto input = makeRowVector({
-      makeNullableFlatVector<int64_t>({1, std::nullopt, -7, 42}),
-      makeNullableFlatVector<int32_t>({3, 5, std::nullopt, -1}),
+      makeNullableFlatVector<int64_t>({1, std::nullopt, -7, 42, 0, 9}),
+      makeNullableFlatVector<int32_t>({3, 5, std::nullopt, -1, 4, 8}),
       makeNullableFlatVector<std::string>(
-          {"Pixel android", "no_match", std::nullopt, "x android"}),
-      makeNullableFlatVector<double>({12.5, std::nullopt, -7.25, 0.0}),
+          {"Pixel android",
+           "no_match",
+           std::nullopt,
+           "x android",
+           "android",
+           "plain"}),
+      makeNullableFlatVector<double>(
+          {12.5,
+           std::nullopt,
+           -7.25,
+           0.0,
+           std::numeric_limits<double>::infinity(),
+           -std::numeric_limits<double>::infinity()}),
   });
 
   for (const auto& expression : {
            "isnull(c0)",
            "cast(c0 as varchar)",
            "cast(c3 as varchar)",
+           "regexp_extract(c2, 'a.*d')",
            "regexp_extract(c2, '(.*?) android', 1)",
            "regexp_extract(c2, 'android', 0)",
            "array_constructor(c1, add(c1, 1), 7)",

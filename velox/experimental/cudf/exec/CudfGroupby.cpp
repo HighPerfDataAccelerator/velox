@@ -26,6 +26,7 @@
 #include "velox/experimental/cudf/expression/AstUtils.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
 
+#include "velox/common/testutil/TestValue.h"
 #include "velox/exec/Aggregate.h"
 #include "velox/exec/AggregateFunctionRegistry.h"
 #include "velox/exec/HashAggregation.h"
@@ -1416,18 +1417,19 @@ void CudfGroupby::computePartialGroupbyStreaming(CudfVectorPtr tbl) {
 void CudfGroupby::computePartialIdentity(CudfVectorPtr tbl) {
   VELOX_CHECK_NULL(bufferedResult_);
   auto inputTableStream = tbl->stream();
+  auto inputTable = tbl->release();
+  tbl.reset();
+  const auto originalColumnCount = inputTable->num_columns();
   auto preparedInput = prepareAggregationInput(
-      tbl->getTableView(),
-      static_cast<cudf::size_type>(tbl->size()),
+      inputTable->view(),
+      inputTable->num_rows(),
       precomputedInputEvaluators_,
       inputTableStream,
       get_temp_mr());
   auto permutedInputView = preparedInput.tableView.select(
       aggregationInputChannels_.begin(), aggregationInputChannels_.end());
-
-  const auto originalColumnCount = tbl->getTableView().num_columns();
-  auto inputColumns = tbl->release()->release();
-  tbl.reset();
+  auto inputColumns = inputTable->release();
+  inputTable.reset();
 
   std::unordered_map<column_index_t, size_t> remainingUses;
   for (const auto key : groupingKeyOutputChannels_) {
@@ -2133,6 +2135,10 @@ void CudfGroupby::doAddInput(RowVectorPtr input) {
   auto cudfInput = std::dynamic_pointer_cast<cudf_velox::CudfVector>(input);
   VELOX_CHECK_NOT_NULL(cudfInput);
   input.reset();
+  common::testutil::TestValue::adjust(
+      "facebook::velox::cudf_velox::CudfGroupby::doAddInput::input",
+      &cudfInput);
+  VELOX_CHECK_NOT_NULL(cudfInput);
 
   if (streamingEnabled_) {
     prepareInputForStateStream(cudfInput);

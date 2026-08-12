@@ -115,6 +115,7 @@ TEST_F(CudfExpressionSelectionTest, sparkExpressionCoverage) {
   for (const auto& expression : {
            "isnull(a)",
            "cast(a as varchar)",
+           "regexp_extract(name, 'a.*d')",
            "regexp_extract(name, '(.*?) android', 1)",
        }) {
     SCOPED_TRACE(expression);

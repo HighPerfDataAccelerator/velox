@@ -431,8 +431,9 @@ class RegexpExtractFunction : public CudfFunction {
   RegexpExtractFunction(
       const core::TypedExprPtr& expr,
       memory::MemoryPool* pool) {
-    VELOX_CHECK_EQ(
-        expr->inputs().size(), 3, "regexp_extract expects exactly 3 inputs");
+    VELOX_CHECK(
+        expr->inputs().size() == 2 || expr->inputs().size() == 3,
+        "regexp_extract expects 2 or 3 inputs");
     VELOX_CHECK(
         expr->inputs()[0]->type()->kind() == TypeKind::VARCHAR,
         "regexp_extract input must be VARCHAR");
@@ -446,12 +447,14 @@ class RegexpExtractFunction : public CudfFunction {
       pattern_ = pattern->toString(0);
     }
 
-    const auto group = toConstantVector(expr->inputs()[2], pool);
-    groupIsNull_ = group->isNullAt(0);
-    if (!groupIsNull_) {
-      group_ = static_cast<cudf::size_type>(std::stoll(group->toString(0)));
-      VELOX_USER_CHECK_GE(
-          group_, 0, "regexp_extract group index must be non-negative");
+    if (expr->inputs().size() == 3) {
+      const auto group = toConstantVector(expr->inputs()[2], pool);
+      groupIsNull_ = group->isNullAt(0);
+      if (!groupIsNull_) {
+        group_ = static_cast<cudf::size_type>(std::stoll(group->toString(0)));
+        VELOX_USER_CHECK_GE(
+            group_, 0, "regexp_extract group index must be non-negative");
+      }
     }
   }
 
@@ -565,8 +568,18 @@ class CastFunction : public CudfFunction {
     switch (castMode_) {
       case CastMode::kIntegralToString:
         return cudf::strings::from_integers(inputCol, stream, mr);
-      case CastMode::kFloatingPointToString:
-        return cudf::strings::from_floats(inputCol, stream, mr);
+      case CastMode::kFloatingPointToString: {
+        auto strings = cudf::strings::from_floats(inputCol, stream, mr);
+        cudf::string_scalar infinity("Infinity", true, stream, mr);
+        cudf::string_scalar inf("Inf", true, stream, mr);
+        return cudf::strings::replace(
+            cudf::strings_column_view(strings->view()),
+            inf,
+            infinity,
+            -1,
+            stream,
+            mr);
+      }
       case CastMode::kCudfCast:
         return cudf::cast(inputCol, targetCudfType_, stream, mr);
     }
@@ -2410,6 +2423,11 @@ bool registerBuiltinFunctions(const std::string& prefix) {
         return std::make_shared<RegexpExtractFunction>(expr, pool);
       },
       {FunctionSignatureBuilder()
+           .returnType("varchar")
+           .argumentType("varchar")
+           .constantArgumentType("varchar")
+           .build(),
+       FunctionSignatureBuilder()
            .returnType("varchar")
            .argumentType("varchar")
            .constantArgumentType("varchar")
