@@ -621,6 +621,94 @@ TEST_F(CudfIcebergReadTest, coalescedMultipleFiles) {
   assertQuery(plan, splits, "SELECT * FROM tmp", 0);
 }
 
+TEST_F(CudfIcebergReadTest, coalescedSchemaEvolution) {
+  auto oldData = makeRowVector({"c0"}, {makeFlatVector<int64_t>({1, 2})});
+  auto newData = makeRowVector(
+      {"c0", "c1"},
+      {makeFlatVector<int64_t>({3, 4}), makeFlatVector<int64_t>({30, 40})});
+  auto oldFile = TempFilePath::create();
+  auto newFile = TempFilePath::create();
+  writeToFile(oldFile->getPath(), oldData);
+  writeToFile(newFile->getPath(), newData);
+
+  std::vector<std::shared_ptr<facebook::velox::connector::ConnectorSplit>>
+      splits{std::make_shared<HiveIcebergSplit>(
+          kCudfIcebergConnectorId,
+          oldFile->getPath(),
+          dwio::common::FileFormat::PARQUET,
+          0,
+          getFileSize(oldFile->getPath()),
+          std::unordered_map<std::string, std::optional<std::string>>{},
+          std::nullopt,
+          std::unordered_map<std::string, std::string>{},
+          nullptr,
+          true,
+          std::vector<IcebergDeleteFile>{},
+          std::unordered_map<std::string, std::string>{},
+          std::nullopt,
+          0,
+          std::vector<IcebergCoalescedFile>{
+              {newFile->getPath(), getFileSize(newFile->getPath())}})};
+
+  auto outputType = ROW({"c0", "c1"}, {BIGINT(), BIGINT()});
+  auto expected = makeRowVector(
+      {"c0", "c1"},
+      {makeFlatVector<int64_t>({1, 2, 3, 4}),
+       makeNullableFlatVector<int64_t>({std::nullopt, std::nullopt, 30, 40})});
+  auto plan = PlanBuilder()
+                  .startTableScan()
+                  .connectorId(kCudfIcebergConnectorId)
+                  .outputType(outputType)
+                  .dataColumns(outputType)
+                  .endTableScan()
+                  .planNode();
+
+  AssertQueryBuilder(plan).splits(splits).assertResults({expected});
+}
+
+TEST_F(CudfIcebergReadTest, coalescedAllSchemaEvolutionColumns) {
+  auto data1 =
+      makeRowVector({"old_col"}, {makeFlatVector<int64_t>({100, 200, 300})});
+  auto data2 =
+      makeRowVector({"old_col"}, {makeFlatVector<int64_t>({400, 500, 600})});
+  auto file1 = TempFilePath::create();
+  auto file2 = TempFilePath::create();
+  writeToFile(file1->getPath(), data1);
+  writeToFile(file2->getPath(), data2);
+
+  std::vector<std::shared_ptr<facebook::velox::connector::ConnectorSplit>>
+      splits{std::make_shared<HiveIcebergSplit>(
+          kCudfIcebergConnectorId,
+          file1->getPath(),
+          dwio::common::FileFormat::PARQUET,
+          0,
+          getFileSize(file1->getPath()),
+          std::unordered_map<std::string, std::optional<std::string>>{},
+          std::nullopt,
+          std::unordered_map<std::string, std::string>{},
+          nullptr,
+          true,
+          std::vector<IcebergDeleteFile>{},
+          std::unordered_map<std::string, std::string>{},
+          std::nullopt,
+          0,
+          std::vector<IcebergCoalescedFile>{
+              {file2->getPath(), getFileSize(file2->getPath())}})};
+
+  auto outputType = ROW({"new_col"}, {BIGINT()});
+  auto expected =
+      makeRowVector({"new_col"}, {makeNullConstant(TypeKind::BIGINT, 6)});
+  auto plan = PlanBuilder()
+                  .startTableScan()
+                  .connectorId(kCudfIcebergConnectorId)
+                  .outputType(outputType)
+                  .dataColumns(outputType)
+                  .endTableScan()
+                  .planNode();
+
+  AssertQueryBuilder(plan).splits(splits).assertResults({expected});
+}
+
 /// Read a single data file as multiple byte-range sub-splits with no deletes
 TEST_F(CudfIcebergReadTest, subSplitsNoDeletes) {
   auto rowType = ROW({"c0"}, {BIGINT()});
