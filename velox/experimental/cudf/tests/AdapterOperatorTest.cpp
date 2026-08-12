@@ -65,6 +65,18 @@ class AdapterOperatorTest : public OperatorTestBase {
     return false;
   }
 
+  bool wasCudfUnnestUsed(const std::shared_ptr<exec::Task>& task) {
+    auto stats = task->taskStats();
+    for (const auto& pipelineStats : stats.pipelineStats) {
+      for (const auto& operatorStats : pipelineStats.operatorStats) {
+        if (operatorStats.operatorType == "CudfUnnest") {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
   std::shared_ptr<const core::WindowNode> withRowsFrame(
       const core::PlanNodePtr& plan) {
     auto window = std::dynamic_pointer_cast<const core::WindowNode>(plan);
@@ -78,6 +90,38 @@ class AdapterOperatorTest : public OperatorTestBase {
         .build();
   }
 };
+
+TEST_F(AdapterOperatorTest, singleArrayUnnestUsesCudf) {
+  auto data = makeRowVector({
+      makeFlatVector<int64_t>({10, 20, 30}),
+      makeFlatVector<double>({1.5, 2.5, 3.5}),
+      makeFlatVector<int64_t>({100, 200, 300}),
+      makeFlatVector<int64_t>({1000, 2000, 3000}),
+      makeFlatVector<std::string>({"a", "b", "c"}),
+      makeArrayVector<int32_t>(
+          3,
+          [](auto row) { return row + 1; },
+          [](auto row, auto index) { return row * 10 + index; }),
+  });
+  auto plan = PlanBuilder()
+                  .values({data})
+                  .unnest({"c0", "c1", "c2", "c3", "c4"}, {"c5"})
+                  .planNode();
+
+  std::shared_ptr<exec::Task> task;
+  auto result = AssertQueryBuilder(plan).copyResults(pool(), task);
+  auto expected = makeRowVector({
+      makeFlatVector<int64_t>({10, 20, 20, 30, 30, 30}),
+      makeFlatVector<double>({1.5, 2.5, 2.5, 3.5, 3.5, 3.5}),
+      makeFlatVector<int64_t>({100, 200, 200, 300, 300, 300}),
+      makeFlatVector<int64_t>({1000, 2000, 2000, 3000, 3000, 3000}),
+      makeFlatVector<std::string>({"a", "b", "b", "c", "c", "c"}),
+      makeFlatVector<int32_t>({0, 10, 11, 20, 21, 22}),
+  });
+
+  facebook::velox::test::assertEqualVectors(expected, result);
+  EXPECT_TRUE(wasCudfUnnestUsed(task));
+}
 
 TEST_F(AdapterOperatorTest, adapterStatsMergedIntoPlanNode) {
   auto data = makeRowVector({"c0"}, {makeFlatVector<int32_t>({1, 2, 3, 4, 5})});
