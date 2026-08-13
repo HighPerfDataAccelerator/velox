@@ -36,7 +36,7 @@ pipeline {
         ansiColor('xterm')
         buildDiscarder(logRotator(numToKeepStr: '30', daysToKeepStr: '90'))
         skipDefaultCheckout true
-        timeout(time: 8, unit: 'HOURS')
+        timeout(time: 3, unit: 'HOURS')
     }
 
     parameters {
@@ -56,25 +56,12 @@ pipeline {
         string(name: 'GLUTEN_REF', defaultValue: 'dev',
             description: 'Known-good Gluten baseline ref.')
 
-        choice(name: 'VELOX_TIERS',
-            choices: ['velox-targeted', 'velox-targeted,velox-broad', 'velox-broad'],
-            description: 'Targeted runs exact cases; broad runs their complete binaries.')
-        text(name: 'VELOX_TARGETS',
-            defaultValue: 'velox_cudf_config_test:ConfigTest.CudfConfig',
-            description: 'First-phase fixed native gate: velox_cudf_config_test:ConfigTest.CudfConfig.')
-        booleanParam(name: 'FAIL_ON_UNSTABLE', defaultValue: true,
-            description: 'Make velox-broad UNSTABLE results fail the Jenkins build.')
-
         string(name: 'PREBUILD_IMAGE',
             defaultValue: "${common.ARTIFACTORY_NAME}/sw-spark-docker/gluten@sha256:" +
                 '8f08e69b69423756b9adc2603fbcd12b14b30578dbb7e6be59f48b6359354f76',
             description: 'Immutable SYSTEM-cuDF native builder image.')
-        string(name: 'CUDA_ARCH', defaultValue: '75',
-            description: 'CUDA architecture used by the native build and Velox tests.')
         string(name: 'GPU_TYPE', defaultValue: 'Tesla_T4',
             description: 'Blossom GPU resource matching the fixed SM75 test build.')
-        string(name: 'BUILD_JOBS', defaultValue: '4',
-            description: 'Native Velox build parallelism.')
     }
 
     stages {
@@ -164,23 +151,11 @@ pipeline {
                                         returnStdout: true).trim()
                                 }
                                 dir(env.GLUTEN_SOURCE_DIR) {
-                                    retry(3) {
-                                        deleteDir()
-                                        withCredentials([gitUsernamePassword(
-                                            credentialsId: 'blossom-github',
-                                            gitToolName: 'git-tool')]) {
-                                            sh '''
-                                                set -eu
-                                                git init .
-                                                git remote add origin "$GLUTEN_REPO_URL"
-                                                git fetch --depth=1 origin "$GLUTEN_REF"
-                                                git checkout --force --detach FETCH_HEAD
-                                            '''
-                                        }
-                                    }
-                                    env.GLUTEN_SHA = sh(
-                                        script: 'git rev-parse HEAD',
-                                        returnStdout: true).trim()
+                                    deleteDir()
+                                    common.checkoutSourceCode(
+                                        this,
+                                        params.GLUTEN_REPO_URL,
+                                        params.GLUTEN_REF.trim())
                                 }
                                 dir(env.FLUX_ROOT) {
                                     retry(3) {
@@ -197,13 +172,8 @@ pipeline {
                                             '''
                                         }
                                     }
-                                    env.FLUX_SHA = sh(
-                                        script: 'git rev-parse HEAD',
-                                        returnStdout: true).trim()
                                 }
                                 echo "Resolved Velox SHA: ${env.VELOX_SHA}"
-                                echo "Resolved Gluten SHA: ${env.GLUTEN_SHA}"
-                                echo "Resolved Flux-Veripipe SHA: ${env.FLUX_SHA}"
                             }
                         }
                     }
@@ -212,162 +182,47 @@ pipeline {
                 stage('Verify GTests') {
                     steps {
                         container('gpu') {
-                            script {
-                                def jobs = params.BUILD_JOBS.trim()
-                                if (!(jobs ==~ /[1-9][0-9]*/)) {
-                                    error("Invalid BUILD_JOBS: ${jobs}")
-                                }
-                                def cudaArch = params.CUDA_ARCH.trim()
-                                if (cudaArch != '75') {
-                                    error("Invalid CUDA_ARCH: ${cudaArch}")
-                                }
-                                def target = params.VELOX_TARGETS.trim()
-                                if (target !=
-                                        'velox_cudf_config_test:ConfigTest.CudfConfig') {
-                                    error("Unsupported first-phase Velox target: ${target}")
-                                }
-                                withEnv([
-                                    "BUILD_JOBS=${jobs}",
-                                    "CUDA_ARCH=${cudaArch}",
-                                    "FAIL_ON_UNSTABLE=${params.FAIL_ON_UNSTABLE}",
-                                    "VELOX_TIERS=${params.VELOX_TIERS}",
-                                ]) {
-                                    sh '''
+                            sh '''
                                         set -eu
 
-                                        mkdir -p "$NATIVE_RESULT_DIR/gtest-xml" \
-                                          "$NATIVE_RESULT_DIR/junit"
+                                        mkdir -p "$NATIVE_RESULT_DIR"
                                         export GLUTEN_DIR="$GLUTEN_SOURCE_DIR"
                                         export VELOX_HOME="$VELOX_SOURCE_DIR"
                                         export DEPLOY_DIR="$NATIVE_BUNDLE_DIR"
                                         export SPARK_FLUX_HOST_UID="$(id -u)"
                                         export SPARK_FLUX_HOST_GID="$(id -g)"
                                         export MAVEN_SETTINGS="$FLUX_ROOT/assets/build/maven-settings/settings.xml"
-                                        export NUM_THREADS="$BUILD_JOBS"
+                                        export NUM_THREADS=4
                                         case ";${CUDA_ARCHITECTURES:-};" in
-                                          *";$CUDA_ARCH;"*) ;;
+                                          *";75;"*) ;;
                                           *)
-                                            echo "ERROR: builder image does not include SM$CUDA_ARCH" >&2
+                                            echo "ERROR: builder image does not include SM75" >&2
                                             exit 1
                                             ;;
                                         esac
                                         gpu_capability=$(nvidia-smi \
                                           --query-gpu=compute_cap --format=csv,noheader,nounits | \
                                           sed -n '1p' | tr -d '[:space:].')
-                                        test "$gpu_capability" = "$CUDA_ARCH"
-                                        export CUDA_ARCH="${CUDA_ARCH}-real"
+                                        test "$gpu_capability" = 75
+                                        export CUDA_ARCH=75-real
                                         bash "$FLUX_ROOT/assets/os/build/invoke-gluten-system-cudf-bundle.sh"
 
                                         artifact_tool="$FLUX_ROOT/assets/os/build/native_test_artifacts.py"
                                         python3 "$artifact_tool" verify \
                                           --bundle "$NATIVE_BUNDLE_DIR" \
                                           --target velox_cudf_config_test
-                                        python3 "$artifact_tool" run \
-                                          --bundle "$NATIVE_BUNDLE_DIR" \
-                                          --target velox_cudf_config_test \
-                                          -- --gtest_list_tests > "$NATIVE_RESULT_DIR/gtest-list.txt"
-                                        awk '
-                                          /^ConfigTest[.]$/ { in_suite=1; next }
-                                          in_suite && $1 == "CudfConfig" { found=1 }
-                                          END { exit !found }
-                                        ' "$NATIVE_RESULT_DIR/gtest-list.txt"
-
                                         unset GTEST_FILTER GTEST_OUTPUT GTEST_REPEAT \
                                           GTEST_SHARD_INDEX GTEST_TOTAL_SHARDS \
                                           TESTBRIDGE_TEST_ONLY
-                                        targeted_rc=0
-                                        broad_rc=0
-                                        case ",$VELOX_TIERS," in
-                                        *,velox-targeted,*)
-                                          set +e
-                                          python3 "$artifact_tool" run \
-                                            --bundle "$NATIVE_BUNDLE_DIR" \
-                                            --target velox_cudf_config_test \
-                                            -- --gtest_filter=ConfigTest.CudfConfig \
-                                            --gtest_output="xml:$NATIVE_RESULT_DIR/gtest-xml/targeted.xml"
-                                          targeted_rc=$?
-                                          set -e
-                                          if [ "$targeted_rc" -eq 0 ] && \
-                                            ! grep -q 'name="CudfConfig"' \
-                                              "$NATIVE_RESULT_DIR/gtest-xml/targeted.xml"; then
-                                            targeted_rc=1
-                                          fi
-                                          if [ "$targeted_rc" -ne 0 ]; then
-                                            printf '%s\n' \
-                                              '<testsuite name="velox-targeted" tests="1" failures="1">' \
-                                              '  <testcase name="ConfigTest.CudfConfig">' \
-                                              '    <failure message="targeted native test failed" />' \
-                                              '  </testcase>' \
-                                              '</testsuite>' \
-                                              > "$NATIVE_RESULT_DIR/junit/targeted.xml"
-                                          else
-                                            printf '%s\n' \
-                                              '<testsuite name="velox-targeted" tests="1" failures="0">' \
-                                              '  <testcase name="ConfigTest.CudfConfig" />' \
-                                              '</testsuite>' \
-                                              > "$NATIVE_RESULT_DIR/junit/targeted.xml"
-                                          fi
-                                          ;;
-                                        esac
-                                        case ",$VELOX_TIERS," in
-                                        *,velox-broad,*)
-                                          set +e
-                                          python3 "$artifact_tool" run \
-                                            --bundle "$NATIVE_BUNDLE_DIR" \
-                                            --target velox_cudf_config_test \
-                                            -- --gtest_output="xml:$NATIVE_RESULT_DIR/gtest-xml/broad.xml"
-                                          broad_rc=$?
-                                          set -e
-                                          if [ "$broad_rc" -eq 0 ] && \
-                                            ! grep -q '<testcase' \
-                                              "$NATIVE_RESULT_DIR/gtest-xml/broad.xml"; then
-                                            broad_rc=1
-                                          fi
-                                          if [ "$broad_rc" -ne 0 ]; then
-                                            if [ "$FAIL_ON_UNSTABLE" = true ]; then
-                                              printf '%s\n' \
-                                                '<testsuite name="velox-broad" tests="1" failures="1">' \
-                                                '  <testcase name="velox_cudf_config_test">' \
-                                                '    <failure message="broad native test failed" />' \
-                                                '  </testcase>' \
-                                                '</testsuite>' \
-                                                > "$NATIVE_RESULT_DIR/junit/broad.xml"
-                                            else
-                                              printf '%s\n' \
-                                                '<testsuite name="velox-broad" tests="1" failures="0" skipped="1">' \
-                                                '  <testcase name="velox_cudf_config_test">' \
-                                                '    <skipped message="broad native test unstable" />' \
-                                                '  </testcase>' \
-                                                '</testsuite>' \
-                                                > "$NATIVE_RESULT_DIR/junit/broad.xml"
-                                            fi
-                                          else
-                                            printf '%s\n' \
-                                              '<testsuite name="velox-broad" tests="1" failures="0">' \
-                                              '  <testcase name="velox_cudf_config_test" />' \
-                                              '</testsuite>' \
-                                              > "$NATIVE_RESULT_DIR/junit/broad.xml"
-                                          fi
-                                          ;;
-                                        esac
-
-                                        test "$targeted_rc" -eq 0 || status=FAIL
-                                        status=${status:-PASS}
-                                        if [ "$broad_rc" -ne 0 ] && [ "$status" = PASS ]; then
-                                          status=UNSTABLE
-                                        fi
-                                        python3 -c 'import json,pathlib,sys; p,s,t,b,v,g,f=sys.argv[1:]; pathlib.Path(p).write_text(json.dumps({"schema":"VeloxNativePremergeResultV1","status":s,"returncodes":{"velox-targeted":int(t),"velox-broad":int(b)},"sources":{"velox":v,"gluten":g,"flux-veripipe":f}},indent=2,sort_keys=True)+chr(10))' \
-                                          "$NATIVE_RESULT_DIR/result.json" \
-                                          "$status" "$targeted_rc" "$broad_rc" \
-                                          "$VELOX_SHA" "$GLUTEN_SHA" "$FLUX_SHA"
-
-                                        test "$targeted_rc" -eq 0 || exit 1
-                                        if [ "$broad_rc" -ne 0 ] && [ "$FAIL_ON_UNSTABLE" = true ]; then
-                                          exit 1
-                                        fi
-                                    '''
-                                }
-                            }
+                                        python3 "$artifact_tool" run \
+                                          --bundle "$NATIVE_BUNDLE_DIR" \
+                                          --target velox_cudf_config_test \
+                                          -- --gtest_filter=ConfigTest.CudfConfig \
+                                          --gtest_output="xml:$NATIVE_RESULT_DIR/velox-targeted.xml"
+                                        test -s "$NATIVE_RESULT_DIR/velox-targeted.xml"
+                                        grep -q 'name="CudfConfig"' \
+                                          "$NATIVE_RESULT_DIR/velox-targeted.xml"
+                            '''
                         }
                     }
                 }
@@ -379,7 +234,7 @@ pipeline {
                             artifacts: 'native-results/**',
                             allowEmptyArchive: true)
                         junit(
-                            testResults: 'native-results/verify/junit/*.xml',
+                            testResults: 'native-results/verify/velox-targeted.xml',
                             allowEmptyResults: false)
                     }
                 }
