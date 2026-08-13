@@ -36,7 +36,7 @@ pipeline {
         ansiColor('xterm')
         buildDiscarder(logRotator(numToKeepStr: '30', daysToKeepStr: '90'))
         skipDefaultCheckout true
-        timeout(time: 3, unit: 'HOURS')
+        timeout(time: 8, unit: 'HOURS')
     }
 
     parameters {
@@ -45,40 +45,36 @@ pipeline {
         string(name: 'GITHUB_DATA', defaultValue: '',
             description: 'GitHub event JSON from the router. Leave empty for manual runs.')
 
-        string(name: 'COLT_REPO_URL',
-            defaultValue: 'https://gitlab-master.nvidia.com/alfxu/colt.git',
-            description: 'Colt repository URL.')
-        string(name: 'COLT_REF', defaultValue: 'main',
-            description: 'Pinned Colt branch or tag.')
+        string(name: 'FLUX_VERIPIPE_REPO_URL',
+            defaultValue: 'https://gitlab-master.nvidia.com/alfxu/flux-veripipe.git',
+            description: 'Repository containing the shared native build adapter.')
+        string(name: 'FLUX_VERIPIPE_REF', defaultValue: 'main',
+            description: 'Flux-Veripipe branch or commit containing the native build adapter.')
         string(name: 'GLUTEN_REPO_URL',
             defaultValue: 'https://github.com/NVIDIA/spark-gluten.git',
-            description: 'Baseline Gluten repository required by the Colt source model.')
+            description: 'Baseline Gluten repository owning the native build entrypoint.')
         string(name: 'GLUTEN_REF', defaultValue: 'dev',
             description: 'Known-good Gluten baseline ref.')
 
         choice(name: 'VELOX_TIERS',
             choices: ['velox-targeted', 'velox-targeted,velox-broad', 'velox-broad'],
-            description: 'Explicit Colt tiers. Targeted runs exact cases; broad runs their binaries.')
+            description: 'Targeted runs exact cases; broad runs their complete binaries.')
         text(name: 'VELOX_TARGETS',
             defaultValue: 'velox_cudf_config_test:ConfigTest.CudfConfig',
-            description: 'One BINARY:Suite.test target per line.')
+            description: 'First-phase fixed native gate: velox_cudf_config_test:ConfigTest.CudfConfig.')
         booleanParam(name: 'FAIL_ON_UNSTABLE', defaultValue: true,
             description: 'Make velox-broad UNSTABLE results fail the Jenkins build.')
 
-        text(name: 'PREBUILD_IMAGES',
-            defaultValue: "${common.ARTIFACTORY_NAME}/sw-spark-docker/gluten-builder:latest",
-            description: 'Ordered Colt prebuild candidates, one image per line. A match is required.')
+        string(name: 'PREBUILD_IMAGE',
+            defaultValue: "${common.ARTIFACTORY_NAME}/sw-spark-docker/gluten@sha256:" +
+                '8f08e69b69423756b9adc2603fbcd12b14b30578dbb7e6be59f48b6359354f76',
+            description: 'Immutable SYSTEM-cuDF native builder image.')
         string(name: 'CUDA_ARCH', defaultValue: '75',
-            description: 'CUDA architecture used by the Colt prebuild and Velox tests.')
-        string(name: 'GPU_TYPE', defaultValue: 'NIGHTLY_POOL',
-            description: 'Blossom lockable GPU resource label.')
-        string(name: 'COLT_RUNNER_IMAGE',
-            defaultValue: "${common.ARTIFACTORY_NAME}/sw-spark-docker/velox-colt-runner:docker25-v1",
-            description: 'Prebuilt Colt control-plane image with Docker CLI, Git, Bash, Python, and gh.')
-        string(name: 'COLT_PARALLEL', defaultValue: '4',
-            description: 'Colt Velox test/build parallelism.')
-        string(name: 'COLT_MEM_LIMIT', defaultValue: '20G',
-            description: 'Child-container memory limit; keep below the DinD sidecar limit.')
+            description: 'CUDA architecture used by the native build and Velox tests.')
+        string(name: 'GPU_TYPE', defaultValue: 'Tesla_T4',
+            description: 'Blossom GPU resource matching the fixed SM75 test build.')
+        string(name: 'BUILD_JOBS', defaultValue: '4',
+            description: 'Native Velox build parallelism.')
     }
 
     stages {
@@ -104,6 +100,9 @@ pipeline {
                         }
 
                         env.VELOX_SOURCE_REF = requestedRef
+                        if (!(requestedRef ==~ /[0-9a-fA-F]{40}/)) {
+                            error('GitHub event REF must be a full merged PR SHA')
+                        }
                         githubHelper.updateCommitStatus(
                             env.BUILD_URL, 'Running', GitHubCommitState.PENDING)
                     } else {
@@ -122,35 +121,32 @@ pipeline {
             }
         }
 
-        stage('Colt Velox verification') {
+        stage('Native Velox verification') {
             when {
                 beforeAgent true
                 beforeOptions true
                 expression { !skipped }
             }
             options {
-                // Only the GPU-enabled DinD sidecar needs a GPU. The outer
-                // container runs the Colt, Git, and Docker CLIs.
                 lock(label: "${params.GPU_TYPE}", quantity: 1, variable: 'GPU_RESOURCE')
             }
             agent {
                 kubernetes {
                     label "velox-premerge-${BUILD_TAG}"
                     cloud "${common.CLOUD_NAME}"
-                    yaml pod.getGPUDockerYAML(
-                        "${params.COLT_RUNNER_IMAGE}",
+                    yaml pod.getGPUYAML(
+                        "${params.PREBUILD_IMAGE}",
                         "${env.GPU_RESOURCE}",
-                        '8',
-                        '30Gi',
-                        true,
-                        '0')
+                        '12',
+                        '48Gi')
                 }
             }
             environment {
-                COLT_ROOT = "${WORKSPACE}/colt"
+                FLUX_ROOT = "${WORKSPACE}/flux-veripipe"
+                GLUTEN_SOURCE_DIR = "${WORKSPACE}/gluten-source"
                 VELOX_SOURCE_DIR = "${WORKSPACE}/velox-source"
-                COLT_WORKSPACE = "${WORKSPACE}/colt-workspace"
-                COLT_RUN_DIR = "${WORKSPACE}/colt-results/verify"
+                NATIVE_BUNDLE_DIR = "${WORKSPACE}/native-velox-bundle"
+                NATIVE_RESULT_DIR = "${WORKSPACE}/native-results/verify"
             }
             stages {
                 stage('Checkout') {
@@ -167,7 +163,26 @@ pipeline {
                                         script: 'git rev-parse HEAD',
                                         returnStdout: true).trim()
                                 }
-                                dir(env.COLT_ROOT) {
+                                dir(env.GLUTEN_SOURCE_DIR) {
+                                    retry(3) {
+                                        deleteDir()
+                                        withCredentials([gitUsernamePassword(
+                                            credentialsId: 'blossom-github',
+                                            gitToolName: 'git-tool')]) {
+                                            sh '''
+                                                set -eu
+                                                git init .
+                                                git remote add origin "$GLUTEN_REPO_URL"
+                                                git fetch --depth=1 origin "$GLUTEN_REF"
+                                                git checkout --force --detach FETCH_HEAD
+                                            '''
+                                        }
+                                    }
+                                    env.GLUTEN_SHA = sh(
+                                        script: 'git rev-parse HEAD',
+                                        returnStdout: true).trim()
+                                }
+                                dir(env.FLUX_ROOT) {
                                     retry(3) {
                                         deleteDir()
                                         withCredentials([gitUsernamePassword(
@@ -176,15 +191,19 @@ pipeline {
                                             sh '''
                                                 set -eu
                                                 git init .
-                                                git remote add origin "$COLT_REPO_URL"
-                                                git fetch --depth=10 --tags origin "$COLT_REF"
-                                                GIT_LFS_SKIP_SMUDGE=1 \
-                                                    git checkout --force --detach FETCH_HEAD
+                                                git remote add origin "$FLUX_VERIPIPE_REPO_URL"
+                                                git fetch --depth=1 origin "$FLUX_VERIPIPE_REF"
+                                                git checkout --force --detach FETCH_HEAD
                                             '''
                                         }
                                     }
+                                    env.FLUX_SHA = sh(
+                                        script: 'git rev-parse HEAD',
+                                        returnStdout: true).trim()
                                 }
                                 echo "Resolved Velox SHA: ${env.VELOX_SHA}"
+                                echo "Resolved Gluten SHA: ${env.GLUTEN_SHA}"
+                                echo "Resolved Flux-Veripipe SHA: ${env.FLUX_SHA}"
                             }
                         }
                     }
@@ -194,30 +213,159 @@ pipeline {
                     steps {
                         container('gpu') {
                             script {
-                                DockerUtils.loginDockerRepo(this)
-                                withCredentials([gitUsernamePassword(
-                                    credentialsId: 'blossom-github',
-                                    gitToolName: 'git-tool')]) {
-                                    withEnv([
-                                        "COLT_ROOT=${env.COLT_ROOT}",
-                                        "VELOX_REPO=${env.VELOX_SOURCE_DIR}",
-                                        "VELOX_SHA=${env.VELOX_SHA}",
-                                        "GLUTEN_REPO=${params.GLUTEN_REPO_URL.trim()}",
-                                        "GLUTEN_REF=${params.GLUTEN_REF.trim()}",
-                                        "PREBUILD_IMAGES=${params.PREBUILD_IMAGES}",
-                                        "VELOX_TARGETS=${params.VELOX_TARGETS}",
-                                        "VELOX_TIERS=${params.VELOX_TIERS}",
-                                        "FAIL_ON_UNSTABLE=${params.FAIL_ON_UNSTABLE}",
-                                        "CUDA_ARCH=${params.CUDA_ARCH.trim()}",
-                                        "COLT_WORKSPACE=${env.COLT_WORKSPACE}",
-                                        "COLT_RUN_DIR=${env.COLT_RUN_DIR}",
-                                        "COLT_RESULT_FILE=${env.COLT_RUN_DIR}/result.json",
-                                        'COLT_GPU_DEVICES=0',
-                                        "COLT_PARALLEL=${params.COLT_PARALLEL.trim()}",
-                                        "COLT_MEM_LIMIT=${params.COLT_MEM_LIMIT.trim()}",
-                                    ]) {
-                                        sh "bash '${env.VELOX_SOURCE_DIR}/scripts/ci/run-colt-velox-premerge.sh'"
-                                    }
+                                def jobs = params.BUILD_JOBS.trim()
+                                if (!(jobs ==~ /[1-9][0-9]*/)) {
+                                    error("Invalid BUILD_JOBS: ${jobs}")
+                                }
+                                def cudaArch = params.CUDA_ARCH.trim()
+                                if (cudaArch != '75') {
+                                    error("Invalid CUDA_ARCH: ${cudaArch}")
+                                }
+                                def target = params.VELOX_TARGETS.trim()
+                                if (target !=
+                                        'velox_cudf_config_test:ConfigTest.CudfConfig') {
+                                    error("Unsupported first-phase Velox target: ${target}")
+                                }
+                                withEnv([
+                                    "BUILD_JOBS=${jobs}",
+                                    "CUDA_ARCH=${cudaArch}",
+                                    "FAIL_ON_UNSTABLE=${params.FAIL_ON_UNSTABLE}",
+                                    "VELOX_TIERS=${params.VELOX_TIERS}",
+                                ]) {
+                                    sh '''
+                                        set -eu
+
+                                        mkdir -p "$NATIVE_RESULT_DIR/gtest-xml" \
+                                          "$NATIVE_RESULT_DIR/junit"
+                                        export GLUTEN_DIR="$GLUTEN_SOURCE_DIR"
+                                        export VELOX_HOME="$VELOX_SOURCE_DIR"
+                                        export DEPLOY_DIR="$NATIVE_BUNDLE_DIR"
+                                        export SPARK_FLUX_HOST_UID="$(id -u)"
+                                        export SPARK_FLUX_HOST_GID="$(id -g)"
+                                        export MAVEN_SETTINGS="$FLUX_ROOT/assets/build/maven-settings/settings.xml"
+                                        export NUM_THREADS="$BUILD_JOBS"
+                                        case ";${CUDA_ARCHITECTURES:-};" in
+                                          *";$CUDA_ARCH;"*) ;;
+                                          *)
+                                            echo "ERROR: builder image does not include SM$CUDA_ARCH" >&2
+                                            exit 1
+                                            ;;
+                                        esac
+                                        gpu_capability=$(nvidia-smi \
+                                          --query-gpu=compute_cap --format=csv,noheader,nounits | \
+                                          sed -n '1p' | tr -d '[:space:].')
+                                        test "$gpu_capability" = "$CUDA_ARCH"
+                                        export CUDA_ARCH="${CUDA_ARCH}-real"
+                                        bash "$FLUX_ROOT/assets/os/build/invoke-gluten-system-cudf-bundle.sh"
+
+                                        artifact_tool="$FLUX_ROOT/assets/os/build/native_test_artifacts.py"
+                                        python3 "$artifact_tool" verify \
+                                          --bundle "$NATIVE_BUNDLE_DIR" \
+                                          --target velox_cudf_config_test
+                                        python3 "$artifact_tool" run \
+                                          --bundle "$NATIVE_BUNDLE_DIR" \
+                                          --target velox_cudf_config_test \
+                                          -- --gtest_list_tests > "$NATIVE_RESULT_DIR/gtest-list.txt"
+                                        awk '
+                                          /^ConfigTest[.]$/ { in_suite=1; next }
+                                          in_suite && $1 == "CudfConfig" { found=1 }
+                                          END { exit !found }
+                                        ' "$NATIVE_RESULT_DIR/gtest-list.txt"
+
+                                        unset GTEST_FILTER GTEST_OUTPUT GTEST_REPEAT \
+                                          GTEST_SHARD_INDEX GTEST_TOTAL_SHARDS \
+                                          TESTBRIDGE_TEST_ONLY
+                                        targeted_rc=0
+                                        broad_rc=0
+                                        case ",$VELOX_TIERS," in
+                                        *,velox-targeted,*)
+                                          set +e
+                                          python3 "$artifact_tool" run \
+                                            --bundle "$NATIVE_BUNDLE_DIR" \
+                                            --target velox_cudf_config_test \
+                                            -- --gtest_filter=ConfigTest.CudfConfig \
+                                            --gtest_output="xml:$NATIVE_RESULT_DIR/gtest-xml/targeted.xml"
+                                          targeted_rc=$?
+                                          set -e
+                                          if [ "$targeted_rc" -eq 0 ] && \
+                                            ! grep -q 'name="CudfConfig"' \
+                                              "$NATIVE_RESULT_DIR/gtest-xml/targeted.xml"; then
+                                            targeted_rc=1
+                                          fi
+                                          if [ "$targeted_rc" -ne 0 ]; then
+                                            printf '%s\n' \
+                                              '<testsuite name="velox-targeted" tests="1" failures="1">' \
+                                              '  <testcase name="ConfigTest.CudfConfig">' \
+                                              '    <failure message="targeted native test failed" />' \
+                                              '  </testcase>' \
+                                              '</testsuite>' \
+                                              > "$NATIVE_RESULT_DIR/junit/targeted.xml"
+                                          else
+                                            printf '%s\n' \
+                                              '<testsuite name="velox-targeted" tests="1" failures="0">' \
+                                              '  <testcase name="ConfigTest.CudfConfig" />' \
+                                              '</testsuite>' \
+                                              > "$NATIVE_RESULT_DIR/junit/targeted.xml"
+                                          fi
+                                          ;;
+                                        esac
+                                        case ",$VELOX_TIERS," in
+                                        *,velox-broad,*)
+                                          set +e
+                                          python3 "$artifact_tool" run \
+                                            --bundle "$NATIVE_BUNDLE_DIR" \
+                                            --target velox_cudf_config_test \
+                                            -- --gtest_output="xml:$NATIVE_RESULT_DIR/gtest-xml/broad.xml"
+                                          broad_rc=$?
+                                          set -e
+                                          if [ "$broad_rc" -eq 0 ] && \
+                                            ! grep -q '<testcase' \
+                                              "$NATIVE_RESULT_DIR/gtest-xml/broad.xml"; then
+                                            broad_rc=1
+                                          fi
+                                          if [ "$broad_rc" -ne 0 ]; then
+                                            if [ "$FAIL_ON_UNSTABLE" = true ]; then
+                                              printf '%s\n' \
+                                                '<testsuite name="velox-broad" tests="1" failures="1">' \
+                                                '  <testcase name="velox_cudf_config_test">' \
+                                                '    <failure message="broad native test failed" />' \
+                                                '  </testcase>' \
+                                                '</testsuite>' \
+                                                > "$NATIVE_RESULT_DIR/junit/broad.xml"
+                                            else
+                                              printf '%s\n' \
+                                                '<testsuite name="velox-broad" tests="1" failures="0" skipped="1">' \
+                                                '  <testcase name="velox_cudf_config_test">' \
+                                                '    <skipped message="broad native test unstable" />' \
+                                                '  </testcase>' \
+                                                '</testsuite>' \
+                                                > "$NATIVE_RESULT_DIR/junit/broad.xml"
+                                            fi
+                                          else
+                                            printf '%s\n' \
+                                              '<testsuite name="velox-broad" tests="1" failures="0">' \
+                                              '  <testcase name="velox_cudf_config_test" />' \
+                                              '</testsuite>' \
+                                              > "$NATIVE_RESULT_DIR/junit/broad.xml"
+                                          fi
+                                          ;;
+                                        esac
+
+                                        test "$targeted_rc" -eq 0 || status=FAIL
+                                        status=${status:-PASS}
+                                        if [ "$broad_rc" -ne 0 ] && [ "$status" = PASS ]; then
+                                          status=UNSTABLE
+                                        fi
+                                        python3 -c 'import json,pathlib,sys; p,s,t,b,v,g,f=sys.argv[1:]; pathlib.Path(p).write_text(json.dumps({"schema":"VeloxNativePremergeResultV1","status":s,"returncodes":{"velox-targeted":int(t),"velox-broad":int(b)},"sources":{"velox":v,"gluten":g,"flux-veripipe":f}},indent=2,sort_keys=True)+chr(10))' \
+                                          "$NATIVE_RESULT_DIR/result.json" \
+                                          "$status" "$targeted_rc" "$broad_rc" \
+                                          "$VELOX_SHA" "$GLUTEN_SHA" "$FLUX_SHA"
+
+                                        test "$targeted_rc" -eq 0 || exit 1
+                                        if [ "$broad_rc" -ne 0 ] && [ "$FAIL_ON_UNSTABLE" = true ]; then
+                                          exit 1
+                                        fi
+                                    '''
                                 }
                             }
                         }
@@ -228,11 +376,11 @@ pipeline {
                 always {
                     container('gpu') {
                         archiveArtifacts(
-                            artifacts: 'colt-results/**',
+                            artifacts: 'native-results/**',
                             allowEmptyArchive: true)
                         junit(
-                            testResults: 'colt-results/verify/junit.xml',
-                            allowEmptyResults: true)
+                            testResults: 'native-results/verify/junit/*.xml',
+                            allowEmptyResults: false)
                     }
                 }
             }
