@@ -133,7 +133,8 @@ class UcxOutputBufferManager final : public exec::OutputBufferManager {
       std::shared_ptr<exec::Task> task,
       core::PartitionedOutputNode::Kind kind,
       int numPartitions,
-      int numOutputDrivers) override {
+      int numOutputDrivers,
+      const std::string& /*transportOptions*/) override {
     ucx_exchange::UcxOutputQueueManager::getInstanceRef()->initializeTask(
         std::move(task), kind, numPartitions, numOutputDrivers);
   }
