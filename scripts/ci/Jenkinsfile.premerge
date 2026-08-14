@@ -57,9 +57,9 @@ pipeline {
             description: 'Known-good Gluten baseline ref.')
 
         string(name: 'PREBUILD_IMAGE',
-            defaultValue: "${common.ARTIFACTORY_NAME}/sw-spark-docker/gluten@sha256:" +
-                '8f08e69b69423756b9adc2603fbcd12b14b30578dbb7e6be59f48b6359354f76',
-            description: 'Immutable SYSTEM-cuDF native builder image.')
+            defaultValue: "${common.ARTIFACTORY_NAME}/sw-spark-docker/" +
+                'spark-flux-prebuild:latest',
+            description: 'Rolling SYSTEM-cuDF native builder image.')
         string(name: 'GPU_TYPE', defaultValue: 'Tesla_T4',
             description: 'Blossom GPU resource matching the fixed SM75 test build.')
     }
@@ -149,6 +149,11 @@ pipeline {
                                     env.VELOX_SHA = sh(
                                         script: 'git rev-parse HEAD',
                                         returnStdout: true).trim()
+                                    if (env.VELOX_SOURCE_REF ==~ /[0-9a-fA-F]{40}/ &&
+                                            !env.VELOX_SHA.equalsIgnoreCase(env.VELOX_SOURCE_REF)) {
+                                        error("Velox checkout mismatch: expected " +
+                                            "${env.VELOX_SOURCE_REF}, got ${env.VELOX_SHA}")
+                                    }
                                 }
                                 dir(env.GLUTEN_SOURCE_DIR) {
                                     deleteDir()
