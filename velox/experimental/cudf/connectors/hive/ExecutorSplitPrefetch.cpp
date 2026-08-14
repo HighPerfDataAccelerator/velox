@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <deque>
 #include <future>
 #include <memory>
@@ -58,6 +59,7 @@ struct CacheHintEntry {
   bool requested{false};
   bool scheduled{false};
   bool rangeStatsAccounted{false};
+  bool highRequestPressure{false};
   std::shared_ptr<std::promise<void>> promise{
       std::make_shared<std::promise<void>>()};
   std::shared_future<void> future{promise->get_future().share()};
@@ -240,6 +242,8 @@ void logCacheHintStats(std::string_view event, std::string_view id = {}) {
       << " cacheHintWaitMaxActive=" << asyncLoadStats.waitMaxActive;
 }
 
+uint64_t highRequestPressureMaxReadyBytes();
+
 class QueryPrefetchState
     : public std::enable_shared_from_this<QueryPrefetchState> {
  public:
@@ -339,6 +343,7 @@ class QueryPrefetchState
       ExecutorSplitPrefetch::CacheHintLoad load,
       uint32_t concurrency,
       uint64_t maxReadyBytes,
+      bool highRequestPressure,
       std::shared_ptr<CacheHintFirstLoadSignal> firstLoadReady) {
     VELOX_CHECK(static_cast<bool>(load));
     auto entry = std::make_shared<CacheHintEntry>();
@@ -346,6 +351,7 @@ class QueryPrefetchState
     entry->bytes = rangeStats.uniqueBytes;
     entry->rangeStats = rangeStats;
     entry->load = std::move(load);
+    entry->highRequestPressure = highRequestPressure;
     entry->firstLoadReady = std::move(firstLoadReady);
     {
       std::lock_guard<std::mutex> lock(mutex_);
@@ -353,10 +359,20 @@ class QueryPrefetchState
         return;
       }
       if (!cacheExecutor_) {
+        const auto highPressureMaxReadyBytes =
+            highRequestPressureMaxReadyBytes();
+        const auto effectiveMaxReadyBytes =
+            highRequestPressure && highPressureMaxReadyBytes > 0
+            ? std::min(maxReadyBytes, highPressureMaxReadyBytes)
+            : maxReadyBytes;
         cacheConcurrency_ = std::max<uint32_t>(1, concurrency);
-        cacheMaxReadyBytes_ = std::max<uint64_t>(1, maxReadyBytes);
+        cacheMaxReadyBytes_ = std::max<uint64_t>(1, effectiveMaxReadyBytes);
         cacheExecutor_ =
             std::make_unique<folly::CPUThreadPoolExecutor>(cacheConcurrency_);
+        LOG(WARNING) << "CUDF_CACHE_HINT_REQUEST_PRESSURE_WINDOW "
+                     << "highRequestPressure=" << highRequestPressure
+                     << " configuredMaxReadyBytes=" << maxReadyBytes
+                     << " effectiveMaxReadyBytes=" << cacheMaxReadyBytes_;
       }
       cacheEntries_.emplace(splitKey, entry);
       cacheOrder_.push_back(entry);
@@ -562,7 +578,8 @@ class QueryPrefetchState
       cacheReservedBytes_ += entry->bytes;
       cacheExecutor_->add([self = shared_from_this(), entry]() {
         try {
-          entry->load();
+          runWithNativeS3RequestPressure(
+              entry->highRequestPressure, entry->load);
           cacheHintPrefetchedSplits.fetch_add(1, std::memory_order_relaxed);
           cacheHintPrefetchedBytes.fetch_add(
               entry->bytes, std::memory_order_relaxed);
@@ -826,6 +843,102 @@ bool findQueryExpectedSplitCount(
   return true;
 }
 
+uint64_t highRequestPressureMinExpectedSplits() {
+  static const auto minSplits = [] {
+    constexpr uint64_t kDefaultMinSplits = 670;
+    const auto* value =
+        std::getenv("GLUTEN_CPP_S3_HIGH_PRESSURE_MIN_QUERY_SPLITS");
+    if (value == nullptr || value[0] == '\0') {
+      return kDefaultMinSplits;
+    }
+    try {
+      size_t parsedCharacters{0};
+      const auto parsed = std::stoull(value, &parsedCharacters);
+      VELOX_CHECK_EQ(
+          value[parsedCharacters],
+          '\0',
+          "Invalid high-request-pressure minimum query splits: {}",
+          value);
+      return static_cast<uint64_t>(parsed);
+    } catch (const std::exception&) {
+      VELOX_FAIL(
+          "Invalid high-request-pressure minimum query splits: {}", value);
+    }
+  }();
+  return minSplits;
+}
+
+uint64_t highRequestPressureMaxExpectedSplits() {
+  static const auto maxSplits = [] {
+    const auto* value =
+        std::getenv("GLUTEN_CPP_S3_HIGH_PRESSURE_MAX_QUERY_SPLITS");
+    if (value == nullptr || value[0] == '\0') {
+      return uint64_t{0};
+    }
+    try {
+      size_t parsedCharacters{0};
+      const auto parsed = std::stoull(value, &parsedCharacters);
+      VELOX_CHECK_EQ(
+          value[parsedCharacters],
+          '\0',
+          "Invalid high-request-pressure maximum query splits: {}",
+          value);
+      return static_cast<uint64_t>(parsed);
+    } catch (const std::exception&) {
+      VELOX_FAIL(
+          "Invalid high-request-pressure maximum query splits: {}", value);
+    }
+  }();
+  return maxSplits;
+}
+
+uint64_t highRequestPressureLargeExpectedSplits() {
+  static const auto largeSplits = [] {
+    const auto* value =
+        std::getenv("GLUTEN_CPP_S3_HIGH_PRESSURE_LARGE_QUERY_SPLITS");
+    if (value == nullptr || value[0] == '\0') {
+      return uint64_t{0};
+    }
+    try {
+      size_t parsedCharacters{0};
+      const auto parsed = std::stoull(value, &parsedCharacters);
+      VELOX_CHECK_EQ(
+          value[parsedCharacters],
+          '\0',
+          "Invalid high-request-pressure large-query splits: {}",
+          value);
+      return static_cast<uint64_t>(parsed);
+    } catch (const std::exception&) {
+      VELOX_FAIL("Invalid high-request-pressure large-query splits: {}", value);
+    }
+  }();
+  return largeSplits;
+}
+
+uint64_t highRequestPressureMaxReadyBytes() {
+  static const auto maxReadyBytes = [] {
+    const auto* value =
+        std::getenv("GLUTEN_CPP_S3_HIGH_PRESSURE_PREFETCH_MAX_IN_FLIGHT_BYTES");
+    if (value == nullptr || value[0] == '\0') {
+      return uint64_t{0};
+    }
+    try {
+      size_t parsedCharacters{0};
+      const auto parsed = std::stoull(value, &parsedCharacters);
+      VELOX_CHECK_EQ(
+          value[parsedCharacters],
+          '\0',
+          "Invalid high-request-pressure prefetch byte limit: {}",
+          value);
+      return static_cast<uint64_t>(parsed);
+    } catch (const std::exception&) {
+      VELOX_FAIL(
+          "Invalid high-request-pressure prefetch byte limit: {}", value);
+    }
+  }();
+  return maxReadyBytes;
+}
+
 void publishQueryExpectedSplitCount(
     const std::string& queryId,
     uint64_t expectedSplits) {
@@ -970,6 +1083,18 @@ std::shared_ptr<QueryPrefetchState> findCacheHintStateAcrossExecutors(
 
 } // namespace
 
+bool useHighRequestPressureForExpectedSplits(
+    uint64_t expectedSplits,
+    uint64_t minExpectedSplits,
+    uint64_t maxExpectedSplits,
+    uint64_t largeExpectedSplits) {
+  const bool inBoundedBand = minExpectedSplits > 0 &&
+      expectedSplits >= minExpectedSplits &&
+      (maxExpectedSplits == 0 || expectedSplits <= maxExpectedSplits);
+  return inBoundedBand ||
+      (largeExpectedSplits > 0 && expectedSplits >= largeExpectedSplits);
+}
+
 SplitPrefetchResult::~SplitPrefetchResult() {
   if (release) {
     release(reservedBytes);
@@ -1103,6 +1228,17 @@ void ExecutorSplitPrefetch::registerCacheHint(
   if (!executor || rangeStats.uniqueBytes == 0 || !load) {
     return;
   }
+  uint64_t expectedSplits{0};
+  const auto highPressureMinSplits = highRequestPressureMinExpectedSplits();
+  const auto highPressureMaxSplits = highRequestPressureMaxExpectedSplits();
+  const auto highPressureLargeSplits = highRequestPressureLargeExpectedSplits();
+  const bool highRequestPressure =
+      findQueryExpectedSplitCount(queryId, expectedSplits) &&
+      useHighRequestPressureForExpectedSplits(
+          expectedSplits,
+          highPressureMinSplits,
+          highPressureMaxSplits,
+          highPressureLargeSplits);
   auto state = getQueryState(executor, queryId, false);
   if (!state) {
     state = getQueryState(executor, queryId, true);
@@ -1113,6 +1249,7 @@ void ExecutorSplitPrefetch::registerCacheHint(
       std::move(load),
       concurrency,
       maxReadyBytes,
+      highRequestPressure,
       std::move(firstLoadReady));
 }
 
@@ -1181,6 +1318,33 @@ void ExecutorSplitPrefetch::setExpectedSplitCount(
     return;
   }
   publishQueryExpectedSplitCount(queryId, expectedSplits);
+  const auto highPressureMinSplits = highRequestPressureMinExpectedSplits();
+  const auto highPressureMaxSplits = highRequestPressureMaxExpectedSplits();
+  const auto highPressureLargeSplits = highRequestPressureLargeExpectedSplits();
+  const bool highRequestPressure = useHighRequestPressureForExpectedSplits(
+      expectedSplits,
+      highPressureMinSplits,
+      highPressureMaxSplits,
+      highPressureLargeSplits);
+  LOG(WARNING) << "CUDF_CACHE_HINT_REQUEST_PRESSURE_QUERY_DECISION "
+               << "highRequestPressure=" << highRequestPressure
+               << " minExpectedSplits=" << highPressureMinSplits
+               << " maxExpectedSplits=" << highPressureMaxSplits
+               << " largeExpectedSplits=" << highPressureLargeSplits
+               << " expectedSplits=" << expectedSplits;
+  if (highRequestPressure) {
+    // Do not let cache-load producers race construction of the pressure
+    // client. A producer that wins that race falls back to the base client,
+    // making the initial request window depend on executor scheduling. This
+    // setup runs once per process and is completed before split registration
+    // can publish the first high-pressure cache load.
+    try {
+      prepareNativeS3HighThroughputClient();
+    } catch (const std::exception& error) {
+      LOG(ERROR) << "Failed to prepare high-throughput CRT client: "
+                 << error.what();
+    }
+  }
   if (minRegisteredSplits == 0) {
     return;
   }

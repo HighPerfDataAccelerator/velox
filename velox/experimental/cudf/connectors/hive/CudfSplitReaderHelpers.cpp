@@ -74,6 +74,8 @@ extern "C" uint64_t glutenCrtS3ReadRanges(
 
 namespace {
 
+thread_local bool nativeS3HighRequestPressure{false};
+
 using facebook::velox::cudf_velox::connector::hive::
     BufferedInputDeviceCopyHooks;
 using facebook::velox::cudf_velox::connector::hive::
@@ -1230,6 +1232,9 @@ class NativeS3SdkScheduler {
     {
       std::lock_guard<std::mutex> lock(mutex_);
       auto& queue = size <= metadataPriorityBytes_ ? priorityQueue_ : queue_;
+      if (request->highThroughput) {
+        ++queuedHighPressureRequests_;
+      }
       queue.push_back(std::move(request));
     }
     submittedRequests_.fetch_add(1, std::memory_order_relaxed);
@@ -1255,10 +1260,14 @@ class NativeS3SdkScheduler {
     request->logicalSize = size;
     request->destination = destination;
     request->directCacheFill = directCacheFill;
+    request->highThroughput = nativeS3HighRequestPressure;
     auto future = request->promise.get_future();
     {
       std::lock_guard<std::mutex> lock(mutex_);
       auto& queue = size <= metadataPriorityBytes_ ? priorityQueue_ : queue_;
+      if (request->highThroughput) {
+        ++queuedHighPressureRequests_;
+      }
       queue.push_back(std::move(request));
     }
     submittedRequests_.fetch_add(1, std::memory_order_relaxed);
@@ -1280,6 +1289,7 @@ class NativeS3SdkScheduler {
     request->key = std::move(key);
     request->offset = offset;
     request->directCacheFill = true;
+    request->highThroughput = nativeS3HighRequestPressure;
     for (const auto& destination : destinations) {
       VELOX_CHECK_LE(
           destination.size(),
@@ -1318,6 +1328,7 @@ class NativeS3SdkScheduler {
     request->key = std::move(key);
     request->offset = offset;
     request->directCacheFill = true;
+    request->highThroughput = nativeS3HighRequestPressure;
     for (const auto& destination : destinations) {
       VELOX_CHECK_LE(
           destination.size(),
@@ -1424,6 +1435,12 @@ class NativeS3SdkScheduler {
         << directCacheFillGapBytes_.load(std::memory_order_relaxed)
         << " directCacheFillScatterBuffers="
         << directCacheFillScatterBuffers_.load(std::memory_order_relaxed)
+        << " highThroughputSubmitted="
+        << highThroughputSubmittedRequests_.load(std::memory_order_relaxed)
+        << " highThroughputCompleted="
+        << highThroughputCompletedRequests_.load(std::memory_order_relaxed)
+        << " highPressurePeakInflight="
+        << highThroughputPeakInflightRequests_.load(std::memory_order_relaxed)
         << " adaptiveRanges=" << adaptiveRanges_ << " adaptiveRangePolicyCalls="
         << adaptiveRangePolicyCalls_.load(std::memory_order_relaxed)
         << " adaptiveWideRangePolicyCalls="
@@ -1440,6 +1457,28 @@ class NativeS3SdkScheduler {
 
   NativeS3SdkScheduler(const NativeS3SdkScheduler&) = delete;
   NativeS3SdkScheduler& operator=(const NativeS3SdkScheduler&) = delete;
+
+  bool prepareHighThroughputCrtClient() {
+    if (!useCrt_ || highThroughputTargetGbps_ <= baseTargetGbps_) {
+      return false;
+    }
+    if (highThroughputCrtClient_.load(std::memory_order_acquire) != nullptr) {
+      return true;
+    }
+    std::lock_guard<std::mutex> lock(highThroughputCrtClientMutex_);
+    if (highThroughputCrtClient_.load(std::memory_order_relaxed) == nullptr) {
+      auto client =
+          makeCrtClient(highThroughputTargetGbps_, highThroughputWindowBytes_);
+      highThroughputCrtClient_.store(
+          std::move(client), std::memory_order_release);
+      LOG(WARNING)
+          << "CPP_S3_CRT_ADAPTIVE_PRESSURE_CLIENT_READY baseTargetGbps="
+          << baseTargetGbps_ << " highTargetGbps=" << highThroughputTargetGbps_
+          << " baseWindowBytes=" << baseWindowBytes_
+          << " highWindowBytes=" << highThroughputWindowBytes_;
+    }
+    return true;
+  }
 
   bool prioritizeFile(const std::string& bucket, const std::string& key) {
     if (!useCrt_ || !demandPriority_) {
@@ -1474,6 +1513,8 @@ class NativeS3SdkScheduler {
     uint8_t* destination{nullptr};
     std::vector<folly::Range<char*>> scatterDestinations;
     bool directCacheFill{false};
+    bool highThroughput{false};
+    bool usedHighThroughputClient{false};
     std::promise<size_t> promise;
     std::unique_ptr<folly::Promise<size_t>> asyncPromise;
   };
@@ -1505,9 +1546,41 @@ class NativeS3SdkScheduler {
         expected, nowNs, std::memory_order_relaxed);
   }
 
+  std::shared_ptr<Aws::S3Crt::S3CrtClient> makeCrtClient(
+      size_t targetGbps,
+      size_t downloadWindowBytes) {
+    Aws::S3Crt::ClientConfiguration config;
+    if (const auto* region = std::getenv("AWS_REGION");
+        region != nullptr && region[0] != '\0') {
+      config.region = region;
+    } else if (const auto* region = std::getenv("AWS_DEFAULT_REGION");
+               region != nullptr && region[0] != '\0') {
+      config.region = region;
+    }
+    config.throughputTargetGbps = static_cast<double>(targetGbps);
+    config.partSize = envOrDefault("GLUTEN_CPP_S3_CRT_PART_BYTES", 8UL << 20);
+    config.downloadMemoryUsageWindow = downloadWindowBytes;
+    config.crtRetryStrategyConfig.crtRetryStrategyType =
+        Aws::S3Crt::S3CrtClientConfiguration::CrtRetryStrategyConfig::
+            CrtRetryStrategyType::EXPONENTIAL_BACKOFF;
+    config.crtRetryStrategyConfig.config.maxRetries =
+        envOrDefault("GLUTEN_CPP_S3_CRT_MAX_RETRIES", 5);
+    auto credentialsProvider = facebook::velox::filesystems::
+        makeSynchronizedCachingCredentialsProvider(
+            std::make_shared<Aws::Auth::DefaultAWSCredentialsProviderChain>());
+    return std::make_shared<Aws::S3Crt::S3CrtClient>(
+        std::move(credentialsProvider), config);
+  }
+
   NativeS3SdkScheduler()
       : useCrt_(envBytesOrZero("GLUTEN_CPP_S3_CRT") != 0),
         concurrency_(envOrDefault("GLUTEN_CPP_S3_SDK_CONCURRENCY", 128)),
+        highThroughputConcurrency_(
+            std::min(
+                concurrency_,
+                envOrDefault(
+                    "GLUTEN_CPP_S3_CRT_HIGH_MAX_CONCURRENCY",
+                    concurrency_))),
         rangeBytes_(envOrDefault("GLUTEN_CPP_S3_SDK_RANGE_BYTES", 4UL << 20)),
         adaptiveRanges_(envFlagOrDefault(
             "GLUTEN_CPP_S3_ADAPTIVE_RANGES",
@@ -1532,6 +1605,7 @@ class NativeS3SdkScheduler {
             envOrDefault("GLUTEN_CPP_S3_COMPLETION_KEY_MIN_BYTES", 1UL << 20)),
         diagnostics_(envBytesOrZero("GLUTEN_CPP_S3_DIAGNOSTICS") != 0) {
     VELOX_CHECK_GT(concurrency_, 0);
+    VELOX_CHECK_GT(highThroughputConcurrency_, 0);
     VELOX_CHECK_GT(rangeBytes_, 0);
     VELOX_CHECK_GT(maxCoalescedRangeBytes_, 0);
     VELOX_CHECK_GT(completionKeyContinuityMinBytes_, 0);
@@ -1549,30 +1623,24 @@ class NativeS3SdkScheduler {
                    << " maxGapOverheadDivisor=32";
     }
     if (useCrt_) {
-      Aws::S3Crt::ClientConfiguration config;
-      if (const auto* region = std::getenv("AWS_REGION");
-          region != nullptr && region[0] != '\0') {
-        config.region = region;
-      } else if (const auto* region = std::getenv("AWS_DEFAULT_REGION");
-                 region != nullptr && region[0] != '\0') {
-        config.region = region;
-      }
-      config.throughputTargetGbps = static_cast<double>(
-          envOrDefault("GLUTEN_CPP_S3_CRT_TARGET_GBPS", 25));
-      config.partSize = envOrDefault("GLUTEN_CPP_S3_CRT_PART_BYTES", 8UL << 20);
-      config.downloadMemoryUsageWindow =
+      baseTargetGbps_ = envOrDefault("GLUTEN_CPP_S3_CRT_TARGET_GBPS", 25);
+      baseWindowBytes_ =
           envOrDefault("GLUTEN_CPP_S3_CRT_DOWNLOAD_WINDOW_BYTES", 1UL << 30);
-      config.crtRetryStrategyConfig.crtRetryStrategyType =
-          Aws::S3Crt::S3CrtClientConfiguration::CrtRetryStrategyConfig::
-              CrtRetryStrategyType::EXPONENTIAL_BACKOFF;
-      config.crtRetryStrategyConfig.config.maxRetries =
-          envOrDefault("GLUTEN_CPP_S3_CRT_MAX_RETRIES", 5);
-      auto credentialsProvider = facebook::velox::filesystems::
-          makeSynchronizedCachingCredentialsProvider(
-              std::make_shared<
-                  Aws::Auth::DefaultAWSCredentialsProviderChain>());
-      crtClient_ = std::make_shared<Aws::S3Crt::S3CrtClient>(
-          std::move(credentialsProvider), config);
+      crtClient_ = makeCrtClient(baseTargetGbps_, baseWindowBytes_);
+      highThroughputTargetGbps_ =
+          envBytesOrZero("GLUTEN_CPP_S3_CRT_HIGH_TARGET_GBPS");
+      if (highThroughputTargetGbps_ > baseTargetGbps_) {
+        highThroughputWindowBytes_ = envOrDefault(
+            "GLUTEN_CPP_S3_CRT_HIGH_DOWNLOAD_WINDOW_BYTES",
+            std::max<size_t>(baseWindowBytes_, 4UL << 30));
+        LOG(WARNING)
+            << "CPP_S3_CRT_ADAPTIVE_PRESSURE configured=1 lazyClient=1 "
+            << "baseTargetGbps=" << baseTargetGbps_
+            << " highTargetGbps=" << highThroughputTargetGbps_
+            << " baseWindowBytes=" << baseWindowBytes_
+            << " highWindowBytes=" << highThroughputWindowBytes_
+            << " highMaxConcurrency=" << highThroughputConcurrency_;
+      }
     }
     if (!useCrt_) {
       workers_.reserve(concurrency_);
@@ -1606,6 +1674,9 @@ class NativeS3SdkScheduler {
   void enqueueCrtLocked(std::shared_ptr<Request> request) {
     auto& queue =
         request->size <= metadataPriorityBytes_ ? priorityQueue_ : queue_;
+    if (request->highThroughput) {
+      ++queuedHighPressureRequests_;
+    }
     queue.push_back(std::move(request));
   }
 
@@ -1614,19 +1685,43 @@ class NativeS3SdkScheduler {
       std::shared_ptr<Request> request;
       {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (stopping_ ||
-            inflightRequests_.load(std::memory_order_relaxed) >= concurrency_ ||
-            (priorityQueue_.empty() && queue_.empty())) {
+        if (stopping_ || (priorityQueue_.empty() && queue_.empty())) {
           return;
         }
-        auto& source = !priorityQueue_.empty() ? priorityQueue_ : queue_;
-        auto selected = source.begin();
+        const auto highInflight =
+            highThroughputInflightRequests_.load(std::memory_order_relaxed);
+        const bool highPressureActive =
+            highInflight > 0 || queuedHighPressureRequests_ > 0;
+        const auto effectiveConcurrency =
+            highPressureActive ? highThroughputConcurrency_ : concurrency_;
+        if (inflightRequests_.load(std::memory_order_relaxed) >=
+            effectiveConcurrency) {
+          return;
+        }
+        const auto canDispatch = [&](const auto& queued) {
+          return !queued->highThroughput ||
+              highInflight < highThroughputConcurrency_;
+        };
+        auto prioritySelected = std::find_if(
+            priorityQueue_.begin(), priorityQueue_.end(), canDispatch);
+        auto regularSelected =
+            std::find_if(queue_.begin(), queue_.end(), canDispatch);
+        if (prioritySelected == priorityQueue_.end() &&
+            regularSelected == queue_.end()) {
+          return;
+        }
+        auto& source =
+            prioritySelected != priorityQueue_.end() ? priorityQueue_ : queue_;
+        auto selected = prioritySelected != priorityQueue_.end()
+            ? prioritySelected
+            : regularSelected;
         bool selectedByDemand = false;
         if (&source == &queue_ && !demandPreferredFiles_.empty()) {
           const auto demanded = std::find_if(
-              source.begin(), source.end(), [this](const auto& queued) {
-                return demandPreferredFiles_.contains(
-                    fileIdentity(queued->bucket, queued->key));
+              source.begin(), source.end(), [&](const auto& queued) {
+                return canDispatch(queued) &&
+                    demandPreferredFiles_.contains(
+                        fileIdentity(queued->bucket, queued->key));
               });
           if (demanded != source.end()) {
             selected = demanded;
@@ -1648,8 +1743,8 @@ class NativeS3SdkScheduler {
         if (!selectedByDemand && completionKeyContinuity_ &&
             &source == &queue_ && !completionPreferredKeys_.empty()) {
           const auto preferred = std::find_if(
-              source.begin(), source.end(), [this](const auto& queued) {
-                return queued->directCacheFill &&
+              source.begin(), source.end(), [&](const auto& queued) {
+                return canDispatch(queued) && queued->directCacheFill &&
                     queued->size >= completionKeyContinuityMinBytes_ &&
                     completionPreferredKeys_.contains(queued->key);
               });
@@ -1662,8 +1757,26 @@ class NativeS3SdkScheduler {
         }
         request = std::move(*selected);
         source.erase(selected);
+        if (request->highThroughput) {
+          VELOX_CHECK_GT(queuedHighPressureRequests_, 0);
+          --queuedHighPressureRequests_;
+        }
         const auto inflight =
             inflightRequests_.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (request->highThroughput) {
+          const auto highThroughputInflight =
+              highThroughputInflightRequests_.fetch_add(
+                  1, std::memory_order_relaxed) +
+              1;
+          auto highThroughputPeak = highThroughputPeakInflightRequests_.load(
+              std::memory_order_relaxed);
+          while (highThroughputInflight > highThroughputPeak &&
+                 !highThroughputPeakInflightRequests_.compare_exchange_weak(
+                     highThroughputPeak,
+                     highThroughputInflight,
+                     std::memory_order_relaxed)) {
+          }
+        }
         auto peak = peakInflightRequests_.load(std::memory_order_relaxed);
         while (inflight > peak &&
                !peakInflightRequests_.compare_exchange_weak(
@@ -1696,7 +1809,18 @@ class NativeS3SdkScheduler {
         });
       }
       const auto started = std::chrono::steady_clock::now();
-      crtClient_->GetObjectAsync(
+      auto client = crtClient_;
+      if (request->highThroughput) {
+        const auto highThroughputClient =
+            highThroughputCrtClient_.load(std::memory_order_acquire);
+        if (highThroughputClient) {
+          client = highThroughputClient;
+          request->usedHighThroughputClient = true;
+          highThroughputSubmittedRequests_.fetch_add(
+              1, std::memory_order_relaxed);
+        }
+      }
+      client->GetObjectAsync(
           *get,
           [this, request, get, started](
               const Aws::S3Crt::S3CrtClient*,
@@ -1756,11 +1880,19 @@ class NativeS3SdkScheduler {
                 directCacheFillCompletedRequests_.fetch_add(
                     1, std::memory_order_relaxed);
               }
+              if (request->usedHighThroughputClient) {
+                highThroughputCompletedRequests_.fetch_add(
+                    1, std::memory_order_relaxed);
+              }
               if (completionKeyContinuity_ && request->directCacheFill &&
                   request->size >= completionKeyContinuityMinBytes_) {
                 std::lock_guard<std::mutex> lock(mutex_);
                 completionPreferredKeys_.insert(request->key);
               }
+            }
+            if (request->highThroughput) {
+              highThroughputInflightRequests_.fetch_sub(
+                  1, std::memory_order_relaxed);
             }
             inflightRequests_.fetch_sub(1, std::memory_order_relaxed);
             const auto completed =
@@ -1800,6 +1932,12 @@ class NativeS3SdkScheduler {
         << directCacheFillGapBytes_.load(std::memory_order_relaxed)
         << " directCacheFillScatterBuffers="
         << directCacheFillScatterBuffers_.load(std::memory_order_relaxed)
+        << " highThroughputSubmitted="
+        << highThroughputSubmittedRequests_.load(std::memory_order_relaxed)
+        << " highThroughputCompleted="
+        << highThroughputCompletedRequests_.load(std::memory_order_relaxed)
+        << " highPressurePeakInflight="
+        << highThroughputPeakInflightRequests_.load(std::memory_order_relaxed)
         << " demandKeyPriorityDispatches="
         << demandKeyPriorityDispatches_.load(std::memory_order_relaxed)
         << " completionKeyContinuityDispatches="
@@ -1870,6 +2008,7 @@ class NativeS3SdkScheduler {
 
   const bool useCrt_;
   const size_t concurrency_;
+  const size_t highThroughputConcurrency_;
   const size_t rangeBytes_;
   const bool adaptiveRanges_;
   const size_t rangeCoalesceGapBytes_;
@@ -1890,11 +2029,19 @@ class NativeS3SdkScheduler {
   std::condition_variable condition_;
   std::deque<std::shared_ptr<Request>> priorityQueue_;
   std::deque<std::shared_ptr<Request>> queue_;
+  size_t queuedHighPressureRequests_{0};
   std::unordered_set<std::string> demandPreferredFiles_;
   std::unordered_set<std::string> completionPreferredKeys_;
   bool stopping_{false};
   std::vector<std::thread> workers_;
   std::shared_ptr<Aws::S3Crt::S3CrtClient> crtClient_;
+  size_t baseTargetGbps_{0};
+  size_t baseWindowBytes_{0};
+  size_t highThroughputTargetGbps_{0};
+  size_t highThroughputWindowBytes_{0};
+  std::mutex highThroughputCrtClientMutex_;
+  std::atomic<std::shared_ptr<Aws::S3Crt::S3CrtClient>>
+      highThroughputCrtClient_;
   std::atomic<uint64_t> submittedRequests_{0};
   std::atomic<uint64_t> submittedBytes_{0};
   std::atomic<uint64_t> directCacheFillSubmittedRequests_{0};
@@ -1903,6 +2050,10 @@ class NativeS3SdkScheduler {
   std::atomic<uint64_t> directCacheFillLogicalBytes_{0};
   std::atomic<uint64_t> directCacheFillGapBytes_{0};
   std::atomic<uint64_t> directCacheFillScatterBuffers_{0};
+  std::atomic<uint64_t> highThroughputSubmittedRequests_{0};
+  std::atomic<uint64_t> highThroughputCompletedRequests_{0};
+  std::atomic<uint64_t> highThroughputInflightRequests_{0};
+  std::atomic<uint64_t> highThroughputPeakInflightRequests_{0};
   std::atomic<uint64_t> adaptiveRangePolicyCalls_{0};
   std::atomic<uint64_t> adaptiveWideRangePolicyCalls_{0};
   std::atomic<uint64_t> adaptiveGapPolicyCalls_{0};
@@ -2127,6 +2278,29 @@ std::future<T> toStdFuture(folly::Future<T> follyFuture) {
 } // namespace
 
 namespace facebook::velox::cudf_velox::connector::hive {
+
+void prepareNativeS3HighThroughputClient() {
+  NativeS3SdkScheduler::instance().prepareHighThroughputCrtClient();
+}
+
+void runWithNativeS3RequestPressure(
+    bool highThroughput,
+    const std::function<void()>& producer) {
+  VELOX_CHECK(static_cast<bool>(producer));
+  const auto previous = nativeS3HighRequestPressure;
+  nativeS3HighRequestPressure = highThroughput;
+  try {
+    producer();
+  } catch (...) {
+    nativeS3HighRequestPressure = previous;
+    throw;
+  }
+  nativeS3HighRequestPressure = previous;
+}
+
+bool nativeS3HighRequestPressureForCurrentThread() {
+  return nativeS3HighRequestPressure;
+}
 
 DirectCachePageH2dStats directCachePageH2dStats() {
   return {

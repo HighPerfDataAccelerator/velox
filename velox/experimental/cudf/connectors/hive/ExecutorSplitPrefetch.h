@@ -75,6 +75,15 @@ struct CachePrefetchPlanStats {
   uint64_t entries{0};
 };
 
+/// Returns whether a query's executor-local split count falls in the bounded
+/// request-pressure band. A zero upper bound keeps the legacy open-ended
+/// behavior.
+bool useHighRequestPressureForExpectedSplits(
+    uint64_t expectedSplits,
+    uint64_t minExpectedSplits,
+    uint64_t maxExpectedSplits,
+    uint64_t largeExpectedSplits);
+
 /// Future-backed one-shot signal for the first physical cache load. The
 /// scheduler also signals terminal completion so an early load failure cannot
 /// strand a scan. Keeping the wait side on std::shared_future preserves the

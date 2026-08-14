@@ -1635,5 +1635,61 @@ TEST(ExecutorPrefetchTest, cacheHintExpectedSplitCountAvoidsRegistrationWait) {
   ExecutorSplitPrefetch::eraseQuery(&ioExecutor, kQuery);
 }
 
+TEST(ExecutorPrefetchTest, cacheHintScopesRequestPressureByQuerySize) {
+  folly::CPUThreadPoolExecutor executor(2);
+  const std::string kLowQuery = "query-cache-low-request-pressure";
+  const std::string kHighQuery = "query-cache-high-request-pressure";
+  std::atomic<bool> lowObserved{true};
+  std::atomic<bool> highObserved{false};
+
+  ExecutorSplitPrefetch::setExpectedSplitCount(&executor, kLowQuery, 669, 0);
+  ExecutorSplitPrefetch::setExpectedSplitCount(&executor, kHighQuery, 670, 0);
+  ExecutorSplitPrefetch::registerCacheHint(
+      &executor,
+      kLowQuery,
+      "low",
+      1,
+      [&] {
+        lowObserved.store(
+            nativeS3HighRequestPressureForCurrentThread(),
+            std::memory_order_relaxed);
+      },
+      1,
+      1);
+  ExecutorSplitPrefetch::registerCacheHint(
+      &executor,
+      kHighQuery,
+      "high",
+      1,
+      [&] {
+        highObserved.store(
+            nativeS3HighRequestPressureForCurrentThread(),
+            std::memory_order_relaxed);
+      },
+      1,
+      1);
+
+  ExecutorSplitPrefetch::takeCacheHint(&executor, kLowQuery, "low");
+  ExecutorSplitPrefetch::takeCacheHint(&executor, kHighQuery, "high");
+  EXPECT_FALSE(lowObserved.load(std::memory_order_relaxed));
+  EXPECT_TRUE(highObserved.load(std::memory_order_relaxed));
+  EXPECT_FALSE(nativeS3HighRequestPressureForCurrentThread());
+
+  ExecutorSplitPrefetch::eraseQuery(&executor, kLowQuery);
+  ExecutorSplitPrefetch::eraseQuery(&executor, kHighQuery);
+}
+
+TEST(ExecutorPrefetchTest, requestPressureExpectedSplitBand) {
+  EXPECT_FALSE(useHighRequestPressureForExpectedSplits(499, 500, 600, 670));
+  EXPECT_TRUE(useHighRequestPressureForExpectedSplits(500, 500, 600, 670));
+  EXPECT_TRUE(useHighRequestPressureForExpectedSplits(600, 500, 600, 670));
+  EXPECT_FALSE(useHighRequestPressureForExpectedSplits(601, 500, 600, 670));
+  EXPECT_FALSE(useHighRequestPressureForExpectedSplits(669, 500, 600, 670));
+  EXPECT_TRUE(useHighRequestPressureForExpectedSplits(670, 500, 600, 670));
+
+  EXPECT_FALSE(useHighRequestPressureForExpectedSplits(1000, 0, 0, 0));
+  EXPECT_TRUE(useHighRequestPressureForExpectedSplits(1000, 500, 0, 0));
+}
+
 } // namespace
 } // namespace facebook::velox::cudf_velox::connector::hive

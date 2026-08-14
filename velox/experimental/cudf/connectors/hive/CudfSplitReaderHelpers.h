@@ -333,6 +333,22 @@ bool crtS3RangeReaderAvailable();
 /// for S3 reads.
 bool nativeS3ScheduledReadEnabled();
 
+/// Starts construction of the optional high-throughput CRT client. This is
+/// intended to run asynchronously once query-level request pressure is known,
+/// before cache-load producers begin issuing their bounded range requests.
+void prepareNativeS3HighThroughputClient();
+
+/// Runs a cache-load producer with a request-pressure hint scoped to the
+/// current thread. Native S3 requests submitted by the producer may use the
+/// optional high-throughput CRT client; unrelated and concurrent producers
+/// retain the base client. The hint does not alter cache readiness semantics.
+void runWithNativeS3RequestPressure(
+    bool highThroughput,
+    const std::function<void()>& producer);
+
+/// Exposed for focused tests of thread-scoped pressure propagation.
+bool nativeS3HighRequestPressureForCurrentThread();
+
 /// Emits an executor-global scheduler snapshot when native S3 diagnostics are
 /// enabled. Counters are cumulative, so the first query-exit snapshot is the
 /// exact cold-query physical request total.
