@@ -804,7 +804,13 @@ registry() {
   return states;
 }
 
-using QueryExpectedSplitCountMap = std::unordered_map<std::string, uint64_t>;
+struct QueryExpectedSplitStats {
+  uint64_t splits{0};
+  uint64_t scanNodes{0};
+};
+
+using QueryExpectedSplitStatsMap =
+    std::unordered_map<std::string, QueryExpectedSplitStats>;
 
 struct QueryFirstLoadDecisionNode {
   std::string queryId;
@@ -823,23 +829,23 @@ std::mutex& queryFirstLoadDecisionUpdateMutex() {
   return mutex;
 }
 
-std::atomic<std::shared_ptr<const QueryExpectedSplitCountMap>>&
-queryExpectedSplitCountSnapshot() {
-  static std::atomic<std::shared_ptr<const QueryExpectedSplitCountMap>>
-      snapshot{std::make_shared<const QueryExpectedSplitCountMap>()};
+std::atomic<std::shared_ptr<const QueryExpectedSplitStatsMap>>&
+queryExpectedSplitStatsSnapshot() {
+  static std::atomic<std::shared_ptr<const QueryExpectedSplitStatsMap>>
+      snapshot{std::make_shared<const QueryExpectedSplitStatsMap>()};
   return snapshot;
 }
 
-bool findQueryExpectedSplitCount(
+bool findQueryExpectedSplitStats(
     const std::string& queryId,
-    uint64_t& expectedSplits) {
+    QueryExpectedSplitStats& stats) {
   const auto snapshot =
-      queryExpectedSplitCountSnapshot().load(std::memory_order_acquire);
+      queryExpectedSplitStatsSnapshot().load(std::memory_order_acquire);
   const auto it = snapshot->find(queryId);
   if (it == snapshot->end()) {
     return false;
   }
-  expectedSplits = it->second;
+  stats = it->second;
   return true;
 }
 
@@ -939,16 +945,18 @@ uint64_t highRequestPressureMaxReadyBytes() {
   return maxReadyBytes;
 }
 
-void publishQueryExpectedSplitCount(
+void publishQueryExpectedSplitStats(
     const std::string& queryId,
-    uint64_t expectedSplits) {
+    uint64_t expectedSplits,
+    uint64_t expectedScanNodes) {
   std::lock_guard<std::mutex> lock(queryFirstLoadDecisionUpdateMutex());
   const auto snapshot =
-      queryExpectedSplitCountSnapshot().load(std::memory_order_acquire);
-  auto updated = std::make_shared<QueryExpectedSplitCountMap>(*snapshot);
-  (*updated)[queryId] = expectedSplits;
-  queryExpectedSplitCountSnapshot().store(
-      std::shared_ptr<const QueryExpectedSplitCountMap>(std::move(updated)),
+      queryExpectedSplitStatsSnapshot().load(std::memory_order_acquire);
+  auto updated = std::make_shared<QueryExpectedSplitStatsMap>(*snapshot);
+  (*updated)[queryId] = QueryExpectedSplitStats{
+      .splits = expectedSplits, .scanNodes = expectedScanNodes};
+  queryExpectedSplitStatsSnapshot().store(
+      std::shared_ptr<const QueryExpectedSplitStatsMap>(std::move(updated)),
       std::memory_order_release);
 }
 
@@ -990,17 +998,17 @@ void eraseQueryFirstLoadDecision(const std::string& queryId) {
       head, node, std::memory_order_release, std::memory_order_relaxed));
 }
 
-void eraseQueryExpectedSplitCount(const std::string& queryId) {
+void eraseQueryExpectedSplitStats(const std::string& queryId) {
   std::lock_guard<std::mutex> lock(queryFirstLoadDecisionUpdateMutex());
   const auto snapshot =
-      queryExpectedSplitCountSnapshot().load(std::memory_order_acquire);
+      queryExpectedSplitStatsSnapshot().load(std::memory_order_acquire);
   if (!snapshot->contains(queryId)) {
     return;
   }
-  auto updated = std::make_shared<QueryExpectedSplitCountMap>(*snapshot);
+  auto updated = std::make_shared<QueryExpectedSplitStatsMap>(*snapshot);
   updated->erase(queryId);
-  queryExpectedSplitCountSnapshot().store(
-      std::shared_ptr<const QueryExpectedSplitCountMap>(std::move(updated)),
+  queryExpectedSplitStatsSnapshot().store(
+      std::shared_ptr<const QueryExpectedSplitStatsMap>(std::move(updated)),
       std::memory_order_release);
 }
 
@@ -1087,12 +1095,31 @@ bool useHighRequestPressureForExpectedSplits(
     uint64_t expectedSplits,
     uint64_t minExpectedSplits,
     uint64_t maxExpectedSplits,
-    uint64_t largeExpectedSplits) {
+    uint64_t largeExpectedSplits,
+    uint64_t expectedScanNodes) {
+  constexpr uint64_t kMultiScanMinScanNodes = 3;
+  constexpr uint64_t kDefaultMultiScanMinExpectedSplits = 600;
   const bool inBoundedBand = minExpectedSplits > 0 &&
       expectedSplits >= minExpectedSplits &&
       (maxExpectedSplits == 0 || expectedSplits <= maxExpectedSplits);
-  return inBoundedBand ||
-      (largeExpectedSplits > 0 && expectedSplits >= largeExpectedSplits);
+  const bool inLargeBand =
+      largeExpectedSplits > 0 && expectedSplits >= largeExpectedSplits;
+  // Some deployments keep the original single threshold (for example 670)
+  // instead of configuring the bounded and large-query bands separately.
+  // Use 600 as the topology-aware lower bound in that case; with an explicit
+  // upper bound, start immediately above that band.
+  const auto multiScanMinExpectedSplits = maxExpectedSplits > 0
+      ? maxExpectedSplits + 1
+      : kDefaultMultiScanMinExpectedSplits;
+  const auto multiScanMaxExpectedSplits =
+      largeExpectedSplits > 0 ? largeExpectedSplits : minExpectedSplits;
+  const bool inGapBetweenBands =
+      multiScanMaxExpectedSplits > multiScanMinExpectedSplits &&
+      expectedSplits >= multiScanMinExpectedSplits &&
+      expectedSplits < multiScanMaxExpectedSplits;
+  const bool isWideMultiScan =
+      expectedScanNodes >= kMultiScanMinScanNodes && inGapBetweenBands;
+  return inBoundedBand || inLargeBand || isWideMultiScan;
 }
 
 SplitPrefetchResult::~SplitPrefetchResult() {
@@ -1228,17 +1255,18 @@ void ExecutorSplitPrefetch::registerCacheHint(
   if (!executor || rangeStats.uniqueBytes == 0 || !load) {
     return;
   }
-  uint64_t expectedSplits{0};
+  QueryExpectedSplitStats expectedStats;
   const auto highPressureMinSplits = highRequestPressureMinExpectedSplits();
   const auto highPressureMaxSplits = highRequestPressureMaxExpectedSplits();
   const auto highPressureLargeSplits = highRequestPressureLargeExpectedSplits();
   const bool highRequestPressure =
-      findQueryExpectedSplitCount(queryId, expectedSplits) &&
+      findQueryExpectedSplitStats(queryId, expectedStats) &&
       useHighRequestPressureForExpectedSplits(
-          expectedSplits,
+          expectedStats.splits,
           highPressureMinSplits,
           highPressureMaxSplits,
-          highPressureLargeSplits);
+          highPressureLargeSplits,
+          expectedStats.scanNodes);
   auto state = getQueryState(executor, queryId, false);
   if (!state) {
     state = getQueryState(executor, queryId, true);
@@ -1313,11 +1341,12 @@ void ExecutorSplitPrefetch::setExpectedSplitCount(
     folly::Executor* executor,
     const std::string& queryId,
     uint64_t expectedSplits,
-    uint64_t minRegisteredSplits) {
+    uint64_t minRegisteredSplits,
+    uint64_t expectedScanNodes) {
   if (!executor) {
     return;
   }
-  publishQueryExpectedSplitCount(queryId, expectedSplits);
+  publishQueryExpectedSplitStats(queryId, expectedSplits, expectedScanNodes);
   const auto highPressureMinSplits = highRequestPressureMinExpectedSplits();
   const auto highPressureMaxSplits = highRequestPressureMaxExpectedSplits();
   const auto highPressureLargeSplits = highRequestPressureLargeExpectedSplits();
@@ -1325,13 +1354,15 @@ void ExecutorSplitPrefetch::setExpectedSplitCount(
       expectedSplits,
       highPressureMinSplits,
       highPressureMaxSplits,
-      highPressureLargeSplits);
+      highPressureLargeSplits,
+      expectedScanNodes);
   LOG(WARNING) << "CUDF_CACHE_HINT_REQUEST_PRESSURE_QUERY_DECISION "
                << "highRequestPressure=" << highRequestPressure
                << " minExpectedSplits=" << highPressureMinSplits
                << " maxExpectedSplits=" << highPressureMaxSplits
                << " largeExpectedSplits=" << highPressureLargeSplits
-               << " expectedSplits=" << expectedSplits;
+               << " expectedSplits=" << expectedSplits
+               << " expectedScanNodes=" << expectedScanNodes;
   if (highRequestPressure) {
     // Do not let cache-load producers race construction of the pressure
     // client. A producer that wins that race falls back to the base client,
@@ -1380,13 +1411,13 @@ bool ExecutorSplitPrefetch::useFirstLoadReadyForQuery(
   if (findQueryFirstLoadDecision(queryId, decision)) {
     return decision;
   }
-  uint64_t expectedSplits{0};
-  if (findQueryExpectedSplitCount(queryId, expectedSplits)) {
-    decision = expectedSplits >= minRegisteredSplits;
+  QueryExpectedSplitStats expectedStats;
+  if (findQueryExpectedSplitStats(queryId, expectedStats)) {
+    decision = expectedStats.splits >= minRegisteredSplits;
     LOG(WARNING)
         << "CUDF_CACHE_HINT_FIRST_LOAD_QUERY_DECISION useFirstLoadReady="
         << decision << " minRegisteredSplits=" << minRegisteredSplits
-        << " expectedSplits=" << expectedSplits
+        << " expectedSplits=" << expectedStats.splits
         << " source=coordinator-expected";
     publishQueryFirstLoadDecision(queryId, decision);
     return decision;
@@ -1489,7 +1520,7 @@ void ExecutorSplitPrefetch::eraseQuery(
   }
   queryStates.clear();
   eraseQueryFirstLoadDecision(queryId);
-  eraseQueryExpectedSplitCount(queryId);
+  eraseQueryExpectedSplitStats(queryId);
   logCacheHintStats("query-exit", queryId);
   logNativeS3SchedulerStats("query-exit", queryId);
 }
@@ -1524,7 +1555,7 @@ void ExecutorSplitPrefetch::erase(folly::Executor* executor) {
   queryStates.clear();
   for (const auto& queryId : queryIds) {
     eraseQueryFirstLoadDecision(queryId);
-    eraseQueryExpectedSplitCount(queryId);
+    eraseQueryExpectedSplitStats(queryId);
   }
   state.reset();
   logCacheHintStats("executor-exit");
