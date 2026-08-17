@@ -1151,11 +1151,13 @@ void CudfSplitReader::setupReaderOptions() {
           .timestamp_type(cudfHiveConfig_->timestampType())
           .build();
 
-  // Set skip_bytes and num_bytes if available
-  if (split_->start != 0) {
+  // cuDF only supports byte bounds for a single source. Coalesced Iceberg
+  // splits contain whole files, so read every source without byte bounds.
+  if (split_->coalescedFiles.empty() && split_->start != 0) {
     readerOptions_.set_skip_bytes(split_->start);
   }
-  if (split_->size() != std::numeric_limits<uint64_t>::max()) {
+  if (split_->coalescedFiles.empty() &&
+      split_->size() != std::numeric_limits<uint64_t>::max()) {
     readerOptions_.set_num_bytes(split_->size());
   }
 
@@ -1191,9 +1193,8 @@ void CudfSplitReader::fileMetaDatas() {
       dataSource_,
       "CudfSplitReader does not have a datasource. Call setupCudfDataSource() first");
 
-  // Wrap the existing datasource without transferring ownership.
-  std::vector<std::unique_ptr<cudf::io::datasource>> sources;
-  sources.push_back(cudf::io::datasource::create(dataSource_.get()));
+  // Wrap the existing datasources without transferring ownership.
+  auto sources = makeDataSourceViews();
   fileMetaData_ = cudf::io::read_parquet_footers(sources);
   VELOX_CHECK_GE(
       fileMetaData_.size(),
