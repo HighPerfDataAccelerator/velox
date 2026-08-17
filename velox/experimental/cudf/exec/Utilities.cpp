@@ -273,11 +273,12 @@ std::vector<std::unique_ptr<cudf::table>> getConcatenatedTableBatched(
       // If adding this table would exceed the limit, flush current batch
       // [startpos, i).
       if (runningRows > 0 && runningRows + numRows > maxRows) {
-        outputTables.push_back(cudf::concatenate(
-            std::vector<cudf::table_view>(
-                boundedViews.begin() + startpos, boundedViews.begin() + i),
-            stream,
-            mr));
+        outputTables.push_back(
+            cudf::concatenate(
+                std::vector<cudf::table_view>(
+                    boundedViews.begin() + startpos, boundedViews.begin() + i),
+                stream,
+                mr));
         startpos = i;
         runningRows = 0;
       }
@@ -285,11 +286,12 @@ std::vector<std::unique_ptr<cudf::table>> getConcatenatedTableBatched(
     }
     // Flush the final batch [startpos, end).
     if (startpos < boundedViews.size()) {
-      outputTables.push_back(cudf::concatenate(
-          std::vector<cudf::table_view>(
-              boundedViews.begin() + startpos, boundedViews.end()),
-          stream,
-          mr));
+      outputTables.push_back(
+          cudf::concatenate(
+              std::vector<cudf::table_view>(
+                  boundedViews.begin() + startpos, boundedViews.end()),
+              stream,
+              mr));
     }
     orderCudfVectorDeallocationsAfterStream(tables, inputStreams, stream);
 

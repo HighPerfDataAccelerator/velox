@@ -59,11 +59,10 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <ranges>
 #include <sstream>
 #include <string_view>
 #include <unordered_map>
-
-#include <ranges>
 
 namespace facebook::velox::cudf_velox::connector::hive {
 

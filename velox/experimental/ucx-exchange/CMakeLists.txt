@@ -45,9 +45,7 @@ configure_file(
 
 add_library(velox_ucx_exchange OBJECT ${UCX_EXCHANGE_SOURCES})
 
-target_compile_options(
-  velox_ucx_exchange PRIVATE -Wno-error=deprecated-declarations
-)
+target_compile_options(velox_ucx_exchange PRIVATE -Wno-error=deprecated-declarations)
 
 target_include_directories(velox_ucx_exchange PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 
