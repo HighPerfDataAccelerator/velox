@@ -19,6 +19,7 @@
 #include "velox/exec/AggregateFunctionRegistry.h"
 #include "velox/exec/Operator.h"
 #include "velox/expression/Expr.h"
+#include "velox/expression/SignatureBinder.h"
 
 namespace facebook::velox::exec {
 
@@ -34,6 +35,18 @@ std::vector<core::LambdaTypedExprPtr> extractLambdaInputs(
   }
 
   return lambdas;
+}
+
+bool supportsSignature(
+    const AggregateFunctionEntry& entry,
+    const std::vector<TypePtr>& inputTypes) {
+  for (const auto& signature : entry.signatures) {
+    SignatureBinder binder(*signature, inputTypes, TypeCoercer::defaults());
+    if (binder.tryBind()) {
+      return true;
+    }
+  }
+  return false;
 }
 } // namespace
 
@@ -82,9 +95,24 @@ std::vector<AggregateInfo> toAggregateInfo(
       }
     }
     const auto& name = aggregate.call->name();
+    const auto* entry = getAggregateFunctionEntry(name);
+
+    // Prefer rawInputTypes because companion functions can themselves run in
+    // multi-step aggregations. Some plans retain the original aggregate's raw
+    // input types for a companion merge call. If these do not bind the
+    // companion signature, use the actual call input types instead.
+    auto functionInputTypes = aggregate.rawInputTypes;
+    if (entry && entry->metadata.companionFunction &&
+        !supportsSignature(*entry, functionInputTypes)) {
+      functionInputTypes.clear();
+      functionInputTypes.reserve(aggregate.call->inputs().size());
+      for (const auto& input : aggregate.call->inputs()) {
+        functionInputTypes.push_back(input->type());
+      }
+    }
 
     info.intermediateType =
-        resolveIntermediateType(name, aggregate.rawInputTypes);
+        resolveIntermediateType(name, functionInputTypes);
 
     // Setup aggregation mask: convert the Variable Reference name to the
     // channel (projection) index, if there is a mask.
@@ -100,7 +128,7 @@ std::vector<AggregateInfo> toAggregateInfo(
         name,
         isPartialOutput(step) ? core::AggregationNode::Step::kPartial
                               : core::AggregationNode::Step::kSingle,
-        aggregate.rawInputTypes,
+        functionInputTypes,
         aggResultType,
         operatorCtx.driverCtx()->queryConfig());
 
@@ -123,7 +151,6 @@ std::vector<AggregateInfo> toAggregateInfo(
     //    if aggregate function is not sensitive to duplicates.
     // 2. Ignore sorting properties
     //    if aggregate function is not sensitive to the order of inputs.
-    auto* entry = getAggregateFunctionEntry(name);
     const auto& metadata = entry->metadata;
     info.distinct = !metadata.ignoreDuplicates && aggregate.distinct;
     if (metadata.orderSensitive) {

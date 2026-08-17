@@ -358,5 +358,39 @@ TEST_F(AverageAggregationTest, avgDecimalCompanionMergeExtract) {
   AssertQueryBuilder(plan).assertResults(expected);
 }
 
+TEST_F(AverageAggregationTest, companionUsesCallInputTypes) {
+  const auto intermediateType = ROW({DOUBLE(), BIGINT()});
+  auto intermediateInput = makeRowVector({makeRowVector(
+      {makeFlatVector<double>({10, 20}), makeFlatVector<int64_t>({2, 4})})});
+
+  core::AggregationNode::Aggregate avgAggregate;
+  avgAggregate.call = std::make_shared<core::CallTypedExpr>(
+      DOUBLE(),
+      "spark_avg_merge_extract_DOUBLE",
+      std::vector<core::TypedExprPtr>{
+          std::make_shared<core::FieldAccessTypedExpr>(
+              intermediateType, "c0")});
+  // rawInputTypes identifies the original avg(double) signature, while the
+  // companion call consumes avg's ROW(DOUBLE, BIGINT) intermediate state.
+  avgAggregate.rawInputTypes = {DOUBLE()};
+
+  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  auto child =
+      PlanBuilder(planNodeIdGenerator).values({intermediateInput}).planNode();
+  auto plan = std::make_shared<core::AggregationNode>(
+      planNodeIdGenerator->next(),
+      core::AggregationNode::Step::kSingle,
+      std::vector<core::FieldAccessTypedExprPtr>{},
+      std::vector<core::FieldAccessTypedExprPtr>{},
+      std::vector<std::string>{"c0"},
+      std::vector{avgAggregate},
+      /*ignoreNullKeys=*/false,
+      /*noGroupsSpanBatches=*/false,
+      std::move(child));
+
+  AssertQueryBuilder(plan).assertResults(
+      makeRowVector({makeFlatVector<double>({5})}));
+}
+
 } // namespace
 } // namespace facebook::velox::functions::aggregate::sparksql::test
