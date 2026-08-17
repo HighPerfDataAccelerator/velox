@@ -170,6 +170,10 @@ class CudfSplitReader : public NvtxHelper {
   // Return whether the pushdown filter was built for the current split.
   bool hasSplitSpecificPushdownFilter() const;
 
+  // Clear split readers and data sources after a physical split has been
+  // fully processed.
+  void resetSplit();
+
   std::shared_ptr<CudfHiveConnectorSplit> split_;
   std::shared_ptr<const ::facebook::velox::connector::hive::HiveTableHandle>
       tableHandle_;
@@ -192,9 +196,6 @@ class CudfSplitReader : public NvtxHelper {
   bool prependRowIndex_{false};
 
  private:
-  // Clear splitReaders and datasources after split has been fully processed.
-  void resetSplit();
-
   // Setup the cuDF reader options
   void setupReaderOptions();
 

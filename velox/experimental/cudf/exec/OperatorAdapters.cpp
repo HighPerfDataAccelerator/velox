@@ -419,8 +419,7 @@ class UnnestAdapter : public OperatorAdapter {
     auto unnestNode =
         std::dynamic_pointer_cast<const core::UnnestNode>(planNode);
     std::vector<std::unique_ptr<exec::Operator>> result;
-    result.push_back(
-        std::make_unique<CudfUnnest>(operatorId, ctx, unnestNode));
+    result.push_back(std::make_unique<CudfUnnest>(operatorId, ctx, unnestNode));
     return result;
   }
 };
@@ -1297,13 +1296,14 @@ class ExchangeAdapter : public OperatorAdapter {
       const auto targetBytes = ctx->queryConfig().get<uint64_t>(
           CudfConfig::kCudfExchangeBatchSizeMinThresholdBytes,
           cudfConfig.exchangeBatchSizeMinThresholdBytes);
-      result.push_back(std::make_unique<CudfBatchConcat>(
-          operatorId,
-          ctx,
-          planNode,
-          planNode->outputType(),
-          targetRows,
-          targetBytes));
+      result.push_back(
+          std::make_unique<CudfBatchConcat>(
+              operatorId,
+              ctx,
+              planNode,
+              planNode->outputType(),
+              targetRows,
+              targetBytes));
     }
     return result;
   }
@@ -1328,8 +1328,7 @@ class PartitionedOutputAdapter : public OperatorAdapter {
       const core::PlanNodePtr& planNode,
       exec::DriverCtx* /*ctx*/) const override {
     auto outputNode =
-        std::dynamic_pointer_cast<const core::PartitionedOutputNode>(
-            planNode);
+        std::dynamic_pointer_cast<const core::PartitionedOutputNode>(planNode);
     return CudfConfig::getInstance().exchange && outputNode &&
         outputNode->transportKind() == core::TransportKind::kUcx;
   }
@@ -1347,18 +1346,17 @@ class PartitionedOutputAdapter : public OperatorAdapter {
       const core::PlanNodePtr& planNode,
       exec::DriverCtx* ctx,
       int32_t operatorId) const override {
-    auto* partitionOp =
-        const_cast<exec::PartitionedOutput*>(
-            dynamic_cast<const exec::PartitionedOutput*>(op));
+    auto* partitionOp = const_cast<exec::PartitionedOutput*>(
+        dynamic_cast<const exec::PartitionedOutput*>(op));
     auto outputNode =
-        std::dynamic_pointer_cast<const core::PartitionedOutputNode>(
-            planNode);
+        std::dynamic_pointer_cast<const core::PartitionedOutputNode>(planNode);
     VELOX_CHECK_NOT_NULL(partitionOp);
     VELOX_CHECK_NOT_NULL(outputNode);
 
     std::vector<std::unique_ptr<exec::Operator>> result;
-    result.push_back(std::make_unique<ucx_exchange::UcxPartitionedOutput>(
-        operatorId, ctx, outputNode, partitionOp->getEagerFlush()));
+    result.push_back(
+        std::make_unique<ucx_exchange::UcxPartitionedOutput>(
+            operatorId, ctx, outputNode, partitionOp->getEagerFlush()));
     return result;
   }
 

@@ -1400,8 +1400,7 @@ class SwitchFunction : public CudfFunction {
         return cudf::copy_if_else(
             view(left), *right.scalar, condition, stream, mr);
       }
-      return cudf::copy_if_else(
-          view(left), view(right), condition, stream, mr);
+      return cudf::copy_if_else(view(left), view(right), condition, stream, mr);
     };
 
     std::unique_ptr<cudf::column> result;
@@ -2245,10 +2244,7 @@ class RowConstructorFunction : public CudfFunction {
       : parentNullPolicy_(parentNullPolicy),
         functionName_(std::move(functionName)) {
     VELOX_CHECK_GE(
-        expr->inputs().size(),
-        1,
-        "{} expects at least 1 input",
-        functionName_);
+        expr->inputs().size(), 1, "{} expects at least 1 input", functionName_);
     numInputs_ = expr->inputs().size();
     bool hasNonLiteralInput = false;
     literals_.reserve(numInputs_);

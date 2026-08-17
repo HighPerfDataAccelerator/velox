@@ -23,11 +23,27 @@
 #include "velox/connectors/hive/HiveConnectorSplit.h"
 #include "velox/connectors/hive/iceberg/IcebergSplit.h"
 
+#include <string_view>
+
 namespace facebook::velox::cudf_velox::connector::hive::iceberg {
 
 namespace velox_connector = ::facebook::velox::connector;
 namespace velox_hive = ::facebook::velox::connector::hive;
 namespace velox_iceberg = ::facebook::velox::connector::hive::iceberg;
+
+namespace {
+std::string normalizeFilePath(std::string path) {
+  constexpr std::string_view kFilePrefix{"file:"};
+  constexpr std::string_view kS3APrefix{"s3a:"};
+  if (path.starts_with(kFilePrefix)) {
+    return path.substr(kFilePrefix.size());
+  }
+  if (path.starts_with(kS3APrefix)) {
+    path.erase(kS3APrefix.size() - 2, 1);
+  }
+  return path;
+}
+} // namespace
 
 CudfIcebergDataSource::CudfIcebergDataSource(
     const RowTypePtr& outputType,
@@ -56,6 +72,12 @@ void CudfIcebergDataSource::convertSplit(
 
   // Convert `ConnectorSplit` to `CudfHiveConnectorSplit`
   CudfHiveDataSource::convertSplit(split);
+
+  split_->coalescedFiles.reserve(icebergSplit_->coalescedFiles.size());
+  for (const auto& file : icebergSplit_->coalescedFiles) {
+    split_->coalescedFiles.push_back(
+        {normalizeFilePath(file.filePath), file.length});
+  }
 }
 
 std::unique_ptr<CudfSplitReader>
