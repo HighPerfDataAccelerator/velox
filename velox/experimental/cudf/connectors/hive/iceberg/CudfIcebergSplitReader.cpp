@@ -48,6 +48,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <exception>
 #include <limits>
 #include <tuple>
 #include <unordered_set>
@@ -110,7 +111,8 @@ CudfIcebergSplitReader::CudfIcebergSplitReader(
           useExperimentalCudfReader,
           subfieldFilterExpr),
       icebergSplit_(std::move(icebergSplit)),
-      hiveConfig_(hiveConfig) {}
+      hiveConfig_(hiveConfig),
+      initialReadColumnNames_(readColumnNames) {}
 
 void CudfIcebergSplitReader::resetSplit() {
   deletionVectorReader_.reset();
@@ -141,11 +143,101 @@ cudf::ast::expression const* CudfIcebergSplitReader::pushdownFilter() const {
 
 void CudfIcebergSplitReader::prepareSplitInternal(
     dwio::common::RuntimeStatistics& runtimeStats) {
-  // Reset delete readers and column injection
-  resetSplit();
+  fallbackSplits_.clear();
+  runtimeStats_ = &runtimeStats;
 
-  // Read file metadata and cache schema information
+  // Reset delete readers and column injection.
+  resetSplit();
+  readColumnNames_ = initialReadColumnNames_;
+
+  if (!split_->coalescedFiles.empty()) {
+    if (!loadCoalescedFileMetadataAndCheckSchemas()) {
+      VLOG(1) << "Falling back to single-file cuDF readers for an Iceberg "
+                 "multi-file split with schema evolution";
+      fallbackSplits_.push_back(
+          std::make_shared<CudfHiveConnectorSplit>(
+              split_->connectorId,
+              split_->filePath,
+              split_->start,
+              split_->length,
+              split_->splitWeight,
+              split_->infoColumns));
+      for (const auto& file : split_->coalescedFiles) {
+        fallbackSplits_.push_back(
+            std::make_shared<CudfHiveConnectorSplit>(
+                split_->connectorId,
+                file.filePath,
+                0,
+                file.length,
+                split_->splitWeight,
+                split_->infoColumns));
+      }
+      split_ = fallbackSplits_.front();
+      fallbackSplits_.pop_front();
+      CudfSplitReader::resetSplit();
+      resetSplit();
+    }
+  }
+
+  // Read file metadata and cache schema information.
   cacheSchemaFromMetadata();
+  prepareCurrentSplit(runtimeStats);
+}
+
+bool CudfIcebergSplitReader::loadCoalescedFileMetadataAndCheckSchemas() {
+  setupCudfDataSource();
+  auto sources = makeDataSourceViews();
+  const auto numSources = sources.size();
+
+  // Keep the common same-schema path in one cuDF call. Besides avoiding API
+  // setup per file, this lets the multi-source footer reader retain its I/O
+  // scheduling behavior for remote storage.
+  std::exception_ptr batchFailure;
+  try {
+    fileMetaData_ = cudf::io::read_parquet_footers(sources);
+    VELOX_CHECK_EQ(
+        fileMetaData_.size(), numSources, "Expected one footer per data file");
+    const auto& firstSchema = fileMetaData_.front().schema;
+    return std::all_of(
+        fileMetaData_.begin() + 1,
+        fileMetaData_.end(),
+        [&](const auto& metadata) { return metadata.schema == firstSchema; });
+  } catch (const cudf::logic_error&) {
+    // cuDF combines multi-source footer metadata before reader options are
+    // applied and rejects some schema-evolved groups. Read those footers
+    // independently to distinguish schema evolution from an unrelated batch
+    // reader failure.
+    batchFailure = std::current_exception();
+  }
+
+  sources = makeDataSourceViews();
+  fileMetaData_.clear();
+  fileMetaData_.reserve(numSources);
+  std::optional<std::vector<cudf::io::parquet::SchemaElement>> firstSchema;
+  for (auto& source : sources) {
+    std::vector<std::unique_ptr<cudf::io::datasource>> singleSource;
+    singleSource.push_back(std::move(source));
+    auto metadata = cudf::io::read_parquet_footers(singleSource);
+    VELOX_CHECK_EQ(metadata.size(), 1, "Expected one footer per data file");
+    if (!firstSchema.has_value()) {
+      firstSchema = metadata.front().schema;
+    } else if (*firstSchema != metadata.front().schema) {
+      return false;
+    }
+    fileMetaData_.push_back(std::move(metadata.front()));
+  }
+
+  // The individual reads succeeded with identical schemas, so the batched
+  // failure was not the schema-evolution case handled here.
+  std::rethrow_exception(batchFailure);
+}
+
+void CudfIcebergSplitReader::prepareCurrentSplit(
+    dwio::common::RuntimeStatistics& runtimeStats) {
+  readColumnNames_ = initialReadColumnNames_;
+  if (fileMetaData_.empty()) {
+    cacheSchemaFromMetadata();
+  }
 
   // Must setup delete file readers before reader construction so that it
   // can correctly determine the memory resource to construct the cuDF reader.
@@ -178,6 +270,19 @@ void CudfIcebergSplitReader::prepareSplitInternal(
   }
 
   setupReader();
+}
+
+bool CudfIcebergSplitReader::prepareNextFallbackSplit() {
+  if (fallbackSplits_.empty()) {
+    return false;
+  }
+  VELOX_CHECK_NOT_NULL(runtimeStats_);
+  split_ = fallbackSplits_.front();
+  fallbackSplits_.pop_front();
+  CudfSplitReader::resetSplit();
+  resetSplit();
+  prepareCurrentSplit(*runtimeStats_);
+  return true;
 }
 
 rmm::device_async_resource_ref
@@ -270,20 +375,25 @@ std::pair<std::size_t, std::size_t> CudfIcebergSplitReader::rowRange(
 std::optional<std::unique_ptr<cudf::table>>
 CudfIcebergSplitReader::readNextChunk() {
   std::unique_ptr<cudf::table> cudfTable;
-  if (noColumnsToRead_) {
-    if (syntheticTableProduced_) {
+  while (!cudfTable) {
+    if (noColumnsToRead_) {
+      if (!syntheticTableProduced_) {
+        syntheticTableProduced_ = true;
+        cudfTable = std::make_unique<cudf::table>(
+            std::vector<std::unique_ptr<cudf::column>>{});
+        break;
+      }
+    } else {
+      // Read the next table chunk from the cuDF reader.
+      auto chunkOpt = CudfSplitReader::readNextChunk();
+      if (chunkOpt.has_value()) {
+        cudfTable = std::move(chunkOpt.value());
+        break;
+      }
+    }
+    if (!prepareNextFallbackSplit()) {
       return std::nullopt;
     }
-    syntheticTableProduced_ = true;
-    cudfTable = std::make_unique<cudf::table>(
-        std::vector<std::unique_ptr<cudf::column>>{});
-  } else {
-    // Read the next table chunk from the cuDF reader
-    auto chunkOpt = CudfSplitReader::readNextChunk();
-    if (not chunkOpt.has_value()) {
-      return std::nullopt;
-    }
-    cudfTable = std::move(chunkOpt.value());
   }
 
   // Number of table rows before deletes.
@@ -696,22 +806,29 @@ void CudfIcebergSplitReader::cacheSchemaFromMetadata() {
 
   VELOX_CHECK_EQ(
       fileMetaData_.size(),
-      1,
-      "Expected a single parquet footer for Iceberg data file");
-  const auto& meta = fileMetaData_.front();
-  VELOX_CHECK(not meta.schema.empty(), "Parquet footer schema is empty");
-  VELOX_CHECK_GE(meta.num_rows, 0, "Parquet footer reports negative row count");
+      1 + split_->coalescedFiles.size(),
+      "Expected one parquet footer per Iceberg data file");
   std::tie(baseReadOffset_, splitRowCount_) = computeSplitRowRange();
-
-  const auto& root = meta.schema.front();
   fileColumnNames_.clear();
-  fileColumnNames_.reserve(root.children_idx.size());
-  for (const auto childIdx : root.children_idx) {
-    VELOX_CHECK_LT(
-        childIdx,
-        meta.schema.size(),
-        "Parquet schema child index out of range");
-    fileColumnNames_.insert(meta.schema[childIdx].name);
+  for (size_t i = 1; i < fileMetaData_.size(); ++i) {
+    const auto& coalescedMeta = fileMetaData_[i];
+    VELOX_CHECK_GE(
+        coalescedMeta.num_rows, 0, "Parquet footer reports negative row count");
+    splitRowCount_ += static_cast<std::size_t>(coalescedMeta.num_rows);
+  }
+
+  for (const auto& fileMeta : fileMetaData_) {
+    VELOX_CHECK(not fileMeta.schema.empty(), "Parquet footer schema is empty");
+    VELOX_CHECK_GE(
+        fileMeta.num_rows, 0, "Parquet footer reports negative row count");
+    const auto& root = fileMeta.schema.front();
+    for (const auto childIdx : root.children_idx) {
+      VELOX_CHECK_LT(
+          childIdx,
+          fileMeta.schema.size(),
+          "Parquet schema child index out of range");
+      fileColumnNames_.insert(fileMeta.schema[childIdx].name);
+    }
   }
 }
 
