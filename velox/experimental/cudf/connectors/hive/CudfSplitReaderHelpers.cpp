@@ -2489,27 +2489,27 @@ void BufferedInputDataSource::enqueueForDevice(
     uint8_t* dst) {
   auto inputStream = input_->enqueue({offset, size});
   std::shared_ptr sharedStream(std::move(inputStream));
-  pendingDeviceLoads_.push_back([dst, size, sharedStream](
-                                    rmm::cuda_stream_view stream) {
-    uint64_t copied = 0;
-    while (copied < size) {
-      const void* buffer = nullptr;
-      int32_t available = 0;
-      VELOX_CHECK(
-          sharedStream->Next(&buffer, &available),
-          "BufferedInput stream ended after {} of {} bytes",
-          copied,
-          size);
-      VELOX_CHECK_GT(available, 0);
-      const auto bytes = std::min<uint64_t>(available, size - copied);
-      CUDF_CUDA_TRY(cudaMemcpyAsync(
-          dst + copied, buffer, bytes, cudaMemcpyDefault, stream.value()));
-      copied += bytes;
-      if (bytes < static_cast<uint64_t>(available)) {
-        sharedStream->BackUp(available - bytes);
-      }
-    }
-  });
+  pendingDeviceLoads_.push_back(
+      [dst, size, sharedStream](rmm::cuda_stream_view stream) {
+        uint64_t copied = 0;
+        while (copied < size) {
+          const void* buffer = nullptr;
+          int32_t available = 0;
+          VELOX_CHECK(
+              sharedStream->Next(&buffer, &available),
+              "BufferedInput stream ended after {} of {} bytes",
+              copied,
+              size);
+          VELOX_CHECK_GT(available, 0);
+          const auto bytes = std::min<uint64_t>(available, size - copied);
+          CUDF_CUDA_TRY(cudaMemcpyAsync(
+              dst + copied, buffer, bytes, cudaMemcpyDefault, stream.value()));
+          copied += bytes;
+          if (bytes < static_cast<uint64_t>(available)) {
+            sharedStream->BackUp(available - bytes);
+          }
+        }
+      });
 }
 
 void BufferedInputDataSource::load(rmm::cuda_stream_view stream) {

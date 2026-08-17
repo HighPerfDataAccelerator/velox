@@ -111,8 +111,7 @@ std::vector<AggregateInfo> toAggregateInfo(
       }
     }
 
-    info.intermediateType =
-        resolveIntermediateType(name, functionInputTypes);
+    info.intermediateType = resolveIntermediateType(name, functionInputTypes);
 
     // Setup aggregation mask: convert the Variable Reference name to the
     // channel (projection) index, if there is a mask.
