@@ -33,6 +33,7 @@ TEST(S3ConfigTest, defaultConfig) {
   ASSERT_EQ(s3Config.endpointRegion(), std::nullopt);
   ASSERT_EQ(s3Config.accessKey(), std::nullopt);
   ASSERT_EQ(s3Config.secretKey(), std::nullopt);
+  ASSERT_EQ(s3Config.sessionToken(), std::nullopt);
   ASSERT_EQ(s3Config.iamRole(), std::nullopt);
   ASSERT_EQ(s3Config.iamRoleSessionName(), "velox-session");
   ASSERT_EQ(s3Config.payloadSigningPolicy(), "Never");
@@ -54,6 +55,7 @@ TEST(S3ConfigTest, overrideConfig) {
       {S3Config::baseConfigKey(S3Config::Keys::kEndpointRegion), "region"},
       {S3Config::baseConfigKey(S3Config::Keys::kAccessKey), "access"},
       {S3Config::baseConfigKey(S3Config::Keys::kSecretKey), "secret"},
+      {S3Config::baseConfigKey(S3Config::Keys::kSessionToken), "token"},
       {S3Config::baseConfigKey(S3Config::Keys::kIamRole), "iam"},
       {S3Config::baseConfigKey(S3Config::Keys::kIamRoleSessionName), "velox"},
       {S3Config::baseConfigKey(S3Config::Keys::kCredentialsProvider),
@@ -71,6 +73,7 @@ TEST(S3ConfigTest, overrideConfig) {
   ASSERT_EQ(s3Config.endpointRegion(), "region");
   ASSERT_EQ(s3Config.accessKey(), std::optional("access"));
   ASSERT_EQ(s3Config.secretKey(), std::optional("secret"));
+  ASSERT_EQ(s3Config.sessionToken(), std::optional("token"));
   ASSERT_EQ(s3Config.iamRole(), std::optional("iam"));
   ASSERT_EQ(s3Config.iamRoleSessionName(), "velox");
   ASSERT_EQ(s3Config.payloadSigningPolicy(), "RequestDependent");
@@ -100,6 +103,9 @@ TEST(S3ConfigTest, overrideBucketConfig) {
       {S3Config::baseConfigKey(S3Config::Keys::kSecretKey), "secret"},
       {S3Config::bucketConfigKey(S3Config::Keys::kSecretKey, bucket),
        "bucket-secret"},
+      {S3Config::baseConfigKey(S3Config::Keys::kSessionToken), "token"},
+      {S3Config::bucketConfigKey(S3Config::Keys::kSessionToken, bucket),
+       "bucket-token"},
       {S3Config::baseConfigKey(S3Config::Keys::kIamRole), "iam"},
       {S3Config::baseConfigKey(S3Config::Keys::kIamRoleSessionName), "velox"},
       {S3Config::baseConfigKey(S3Config::Keys::kCredentialsProvider),
@@ -119,6 +125,7 @@ TEST(S3ConfigTest, overrideBucketConfig) {
   ASSERT_EQ(s3Config.endpointRegion(), "region");
   ASSERT_EQ(s3Config.accessKey(), std::optional("bucket-access"));
   ASSERT_EQ(s3Config.secretKey(), std::optional("bucket-secret"));
+  ASSERT_EQ(s3Config.sessionToken(), std::optional("bucket-token"));
   ASSERT_EQ(s3Config.iamRole(), std::optional("iam"));
   ASSERT_EQ(s3Config.iamRoleSessionName(), "velox");
   ASSERT_EQ(s3Config.payloadSigningPolicy(), "Always");
