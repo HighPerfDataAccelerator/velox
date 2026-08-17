@@ -246,7 +246,8 @@ TEST_F(S3FileSystemTest, writeFileAndRead) {
   const auto filename = localPath(bucketName) + "/" + file;
   const auto s3File = s3URI(bucketName, file);
 
-  auto hiveConfig = minioServer_->hiveConfig();
+  auto hiveConfig =
+      minioServer_->hiveConfig({{"hive.s3.multipart-upload-threads", "4"}});
   filesystems::S3FileSystem s3fs(bucketName, hiveConfig);
   auto pool = memory::memoryManager()->addLeafPool("S3FileSystemTest");
   auto writeFile =
@@ -324,7 +325,8 @@ TEST_F(S3FileSystemTest, writeFileAndRead) {
 TEST_F(S3FileSystemTest, abortWrite) {
   const auto bucketName = "abortwrite";
   addBucket(bucketName);
-  auto hiveConfig = minioServer_->hiveConfig();
+  auto hiveConfig =
+      minioServer_->hiveConfig({{"hive.s3.multipart-upload-threads", "4"}});
   filesystems::S3FileSystem s3fs(bucketName, hiveConfig);
   auto pool = memory::memoryManager()->addLeafPool("S3AbortWriteTest");
 

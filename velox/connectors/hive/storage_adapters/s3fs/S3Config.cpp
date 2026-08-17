@@ -84,6 +84,14 @@ S3Config::S3Config(
       minPartSize(),
       kMaximumMultipartMinPartSize,
       "The min-part-size S3 configuration must not exceed 5GB.");
+  VELOX_CHECK_GE(
+      multipartUploadThreads(),
+      1,
+      "The multipart-upload-threads S3 configuration must be at least 1.");
+  VELOX_CHECK_LE(
+      multipartUploadThreads(),
+      16,
+      "The multipart-upload-threads S3 configuration must not exceed 16.");
 }
 
 std::optional<std::string> S3Config::endpointRegion() const {

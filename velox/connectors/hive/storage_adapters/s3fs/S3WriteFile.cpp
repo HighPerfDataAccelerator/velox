@@ -34,6 +34,10 @@
 #include <aws/s3/model/PutObjectRequest.h>
 #include <aws/s3/model/UploadPartRequest.h>
 
+#include <algorithm>
+#include <deque>
+#include <future>
+
 namespace facebook::velox::filesystems {
 
 class S3WriteFile::Impl {
@@ -43,7 +47,10 @@ class S3WriteFile::Impl {
       Aws::S3::S3Client* client,
       memory::MemoryPool* pool,
       const std::shared_ptr<S3Config>& s3Config)
-      : client_(client), pool_(pool), minPartSize_(s3Config->minPartSize()) {
+      : client_(client),
+        pool_(pool),
+        minPartSize_(s3Config->minPartSize()),
+        multipartUploadThreads_(s3Config->multipartUploadThreads()) {
     VELOX_CHECK_NOT_NULL(client);
     VELOX_CHECK_NOT_NULL(pool);
     getBucketAndKeyFromPath(path, bucket_, key_);
@@ -168,6 +175,13 @@ class S3WriteFile::Impl {
 
     RECORD_METRIC_VALUE(kMetricS3StartedUploads);
     uploadPart({currentPart_->data(), currentPart_->size()}, true);
+    waitForPendingParts();
+    std::sort(
+        uploadState_.completedParts.begin(),
+        uploadState_.completedParts.end(),
+        [](const auto& left, const auto& right) {
+          return left.GetPartNumber() < right.GetPartNumber();
+        });
     VELOX_CHECK_EQ(uploadState_.partNumber, uploadState_.completedParts.size());
     // Complete the multipart upload.
     {
@@ -196,6 +210,14 @@ class S3WriteFile::Impl {
       return;
     }
     if (!uploadState_.id.empty()) {
+      // The AWS client may still be reading request bodies owned by pending
+      // uploads. Wait for every request before aborting the multipart upload.
+      // Ignore an upload failure here: AbortMultipartUpload is the cleanup
+      // operation and must still be attempted.
+      try {
+        waitForPendingParts();
+      } catch (...) {
+      }
       Aws::S3::Model::AbortMultipartUploadRequest request;
       request.SetBucket(awsString(bucket_));
       request.SetKey(awsString(key_));
@@ -234,6 +256,11 @@ class S3WriteFile::Impl {
   };
   UploadState uploadState_;
 
+  struct PendingPart {
+    int64_t partNumber;
+    std::future<Aws::S3::Model::CompletedPart> completedPart;
+  };
+
   // Data can be smaller or larger than the minPartSize_.
   // Complete the currentPart_ and upload minPartSize_ chunks of data.
   // Save the remaining into currentPart_.
@@ -258,31 +285,75 @@ class S3WriteFile::Impl {
   void uploadPart(const std::string_view part, bool isLast = false) {
     // Only the last part can be less than minPartSize.
     VELOX_CHECK(isLast || (!isLast && (part.size() == minPartSize_)));
-    // Upload the part.
-    {
-      Aws::S3::Model::UploadPartRequest request;
-      request.SetBucket(bucket_);
-      request.SetKey(key_);
-      request.SetUploadId(uploadState_.id);
-      request.SetPartNumber(++uploadState_.partNumber);
-      request.SetContentLength(part.size());
-      request.SetBody(
-          std::make_shared<StringViewStream>(part.data(), part.size()));
-      auto outcome = client_->UploadPart(request);
-      VELOX_CHECK_AWS_OUTCOME(outcome, "Failed to upload", bucket_, key_);
-      // Append ETag and part number for this uploaded part.
-      // This will be needed for upload completion in Close().
-      auto result = outcome.GetResult();
-      Aws::S3::Model::CompletedPart part;
+    const auto partNumber = ++uploadState_.partNumber;
+    auto payload = std::make_shared<std::string>(part);
+    auto client = client_;
+    auto bucket = bucket_;
+    auto key = key_;
+    auto uploadId = uploadState_.id;
+    pendingParts_.push_back(
+        PendingPart{
+            partNumber,
+            std::async(
+                std::launch::async,
+                [client,
+                 bucket = std::move(bucket),
+                 key = std::move(key),
+                 uploadId = std::move(uploadId),
+                 partNumber,
+                 payload = std::move(payload)]() mutable {
+                  Aws::S3::Model::UploadPartRequest request;
+                  request.SetBucket(bucket);
+                  request.SetKey(key);
+                  request.SetUploadId(uploadId);
+                  request.SetPartNumber(partNumber);
+                  request.SetContentLength(payload->size());
+                  request.SetBody(
+                      std::make_shared<StringViewStream>(
+                          payload->data(), payload->size()));
+                  auto outcome = client->UploadPart(request);
+                  VELOX_CHECK_AWS_OUTCOME(
+                      outcome, "Failed to upload", bucket, key);
+                  auto result = outcome.GetResult();
+                  Aws::S3::Model::CompletedPart completedPart;
 
-      part.SetPartNumber(uploadState_.partNumber);
-      part.SetETag(result.GetETag());
-      // Don't add the checksum to the part if the checksum is empty.
-      // Some filesystems such as IBM COS require this to be not set.
-      if (!result.GetChecksumCRC32().empty()) {
-        part.SetChecksumCRC32(result.GetChecksumCRC32());
+                  completedPart.SetPartNumber(partNumber);
+                  completedPart.SetETag(result.GetETag());
+                  // Don't add the checksum to the part if the checksum is
+                  // empty. Some filesystems such as IBM COS require this to be
+                  // not set.
+                  if (!result.GetChecksumCRC32().empty()) {
+                    completedPart.SetChecksumCRC32(result.GetChecksumCRC32());
+                  }
+                  return completedPart;
+                })});
+    if (pendingParts_.size() >= multipartUploadThreads_) {
+      finishOldestPart();
+    }
+  }
+
+  void finishOldestPart() {
+    VELOX_CHECK(!pendingParts_.empty());
+    auto pending = std::move(pendingParts_.front());
+    pendingParts_.pop_front();
+    auto completedPart = pending.completedPart.get();
+    VELOX_CHECK_EQ(completedPart.GetPartNumber(), pending.partNumber);
+    uploadState_.completedParts.push_back(std::move(completedPart));
+  }
+
+  void waitForPendingParts() {
+    std::exception_ptr firstFailure;
+    while (!pendingParts_.empty()) {
+      try {
+        finishOldestPart();
+      } catch (...) {
+        if (!firstFailure) {
+          firstFailure = std::current_exception();
+        }
       }
-      uploadState_.completedParts.push_back(std::move(part));
+    }
+    if (firstFailure) {
+      std::rethrow_exception(firstFailure);
     }
   }
 
@@ -293,6 +364,8 @@ class S3WriteFile::Impl {
   std::string key_;
   size_t fileSize_ = -1;
   const size_t minPartSize_;
+  const size_t multipartUploadThreads_;
+  std::deque<PendingPart> pendingParts_;
 };
 
 S3WriteFile::S3WriteFile(
