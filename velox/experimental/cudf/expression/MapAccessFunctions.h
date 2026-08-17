@@ -13,33 +13,18 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 #pragma once
 
-#include "velox/expression/FunctionSignature.h"
+#include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
 
-#include <initializer_list>
+#include <memory>
 
 namespace facebook::velox::cudf_velox {
 
-struct ArrayAccessPolicy {
-  bool allowNegativeIndices;
-  bool nullOnNegativeIndices;
-  bool allowOutOfBound;
-  bool indexStartsAtOne;
-};
+std::shared_ptr<CudfFunction> makeMapAccessFunction(
+    const core::TypedExprPtr& expr,
+    memory::MemoryPool* pool);
 
-std::vector<exec::FunctionSignaturePtr> arrayAccessSignatures(
-    std::initializer_list<const char*> indexTypes);
-
-void registerArrayAccessFunction(
-    const std::string& name,
-    ArrayAccessPolicy policy,
-    std::vector<exec::FunctionSignaturePtr> signatures);
-
-void registerElementAtFunction(
-    const std::string& name,
-    ArrayAccessPolicy policy,
-    std::vector<exec::FunctionSignaturePtr> arraySignatures);
+bool canEvaluateMapAccess(const core::TypedExprPtr& expr);
 
 } // namespace facebook::velox::cudf_velox

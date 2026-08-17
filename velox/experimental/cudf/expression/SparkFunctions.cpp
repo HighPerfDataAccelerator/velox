@@ -117,6 +117,18 @@ class MonotonicallyIncreasingIdFunction : public CudfFunction {
 };
 
 void registerSparkArrayAccessFunctions(const std::string& prefix) {
+  // Spark element_at uses one-based array indices and returns null for
+  // out-of-bounds indices. MAP lookup shares the same registration.
+  registerElementAtFunction(
+      prefix + "element_at",
+      ArrayAccessPolicy{
+          .allowNegativeIndices = true,
+          .nullOnNegativeIndices = false,
+          .allowOutOfBound = true,
+          .indexStartsAtOne = true,
+      },
+      arrayAccessSignatures({"integer", "bigint"}));
+
   // Spark get is 0 based and returns NULL for negative or out-of-bounds
   // indices.
   registerArrayAccessFunction(
