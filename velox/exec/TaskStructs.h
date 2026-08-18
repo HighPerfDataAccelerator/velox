@@ -156,6 +156,12 @@ class SplitsStore {
     preloadingSplits_ = &preloadingSplits;
   }
 
+  /// Starts asynchronous preload for up to 'maxPreloadSplits' queued splits
+  /// without assigning a split to a driver.
+  int preloadSplits(
+      int maxPreloadSplits,
+      const ConnectorSplitPreloadFunc& preload);
+
  protected:
   bool getSplit(
       int maxPreloadSplits,

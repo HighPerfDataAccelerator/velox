@@ -49,6 +49,7 @@
 #include <limits>
 #include <optional>
 #include <streambuf>
+#include <string_view>
 #include <vector>
 
 namespace facebook::velox::cudf_velox::connector::hive {
@@ -177,6 +178,16 @@ class BufferedInputDataSource : public cudf::io::datasource {
   bool prefetchToCache(
       const std::vector<cudf::io::text::byte_range_info>& byteRanges);
 
+  /// Prepares cache/coalesced-load state without issuing physical reads and
+  /// returns the load phase. An empty function means the input is not
+  /// cache-backed.
+  std::function<void()> prepareCachePrefetch(
+      const std::vector<cudf::io::text::byte_range_info>& byteRanges);
+
+  std::function<void()> prepareCachePrefetch(
+      const std::vector<cudf::io::text::byte_range_info>& byteRanges,
+      std::function<void()> firstLoadReady);
+
   uint64_t canonicalCacheBytes(
       const std::vector<cudf::io::text::byte_range_info>& byteRanges) const;
 
@@ -186,11 +197,17 @@ class BufferedInputDataSource : public cudf::io::datasource {
   std::optional<uint64_t> cacheFileNum() const;
 
  private:
+  size_t readBuffered(size_t offset, size_t size, uint8_t* dst);
+
   void readContiguous(size_t offset, size_t size, uint8_t* dst);
 
   std::shared_ptr<facebook::velox::dwio::common::BufferedInput> input_;
   const size_t fileSize_;
+  const size_t metadataReadAheadBytes_;
   const BufferedInputDeviceCopyHooks deviceCopyHooks_;
+  std::once_flag tailCacheOnce_;
+  size_t tailCacheOffset_{0};
+  std::vector<uint8_t> tailCache_;
   std::vector<std::function<void(rmm::cuda_stream_view stream)>>
       pendingDeviceLoads_;
 };
@@ -316,21 +333,68 @@ bool crtS3RangeReaderAvailable();
 /// for S3 reads.
 bool nativeS3ScheduledReadEnabled();
 
+/// Starts construction of the optional high-throughput CRT client. This is
+/// intended to run asynchronously once query-level request pressure is known,
+/// before cache-load producers begin issuing their bounded range requests.
+void prepareNativeS3HighThroughputClient();
+
+/// Runs a cache-load producer with a request-pressure hint scoped to the
+/// current thread. Native S3 requests submitted by the producer may use the
+/// optional high-throughput CRT client; unrelated and concurrent producers
+/// retain the base client. The hint does not alter cache readiness semantics.
+void runWithNativeS3RequestPressure(
+    bool highThroughput,
+    const std::function<void()>& producer);
+
+/// Exposed for focused tests of thread-scoped pressure propagation.
+bool nativeS3HighRequestPressureForCurrentThread();
+
+/// Emits an executor-global scheduler snapshot when native S3 diagnostics are
+/// enabled. Counters are cumulative, so the first query-exit snapshot is the
+/// exact cold-query physical request total.
+void logNativeS3SchedulerStats(
+    std::string_view event,
+    std::string_view id = {});
+
 struct NativeS3ReadGroup {
   uint64_t offset{0};
   uint64_t size{0};
   std::vector<folly::Range<char*>> destinations;
 };
 
+struct NativeS3ReadPolicy {
+  uint64_t maxGapBytes{0};
+  uint64_t maxRangeBytes{0};
+};
+
+/// Chooses a bounded physical request shape from the current cache-read
+/// destinations. In adaptive mode, a single/sparse range keeps the base
+/// request bound, while dense multi-range reads may use the larger configured
+/// bound. Logical gaps are admitted only when every gap is below the
+/// configured ceiling and their aggregate overhead is at most 1/32 of the
+/// useful bytes. This keeps the policy query-agnostic and prevents request
+/// reduction from turning into unbounded read amplification.
+NativeS3ReadPolicy chooseNativeS3ReadPolicy(
+    const std::vector<folly::Range<char*>>& destinations,
+    uint64_t baseRangeBytes,
+    uint64_t maxGapBytes,
+    uint64_t maxRangeBytes,
+    bool adaptive);
+
 /// Groups caller-owned destinations into bounded file ranges. Null
 /// destinations represent logical gaps. Gaps up to 'maxGapBytes' are retained
 /// as discard spans when the resulting request does not exceed
-/// 'maxRangeBytes'. Zero gap bytes preserves exact contiguous-only grouping.
+/// 'maxRangeBytes'. When 'sliceOversizedRanges' is true, non-null destinations
+/// larger than the remaining range capacity are sliced, so 'maxRangeBytes' is
+/// a hard physical GET bound. When false, an individual destination may exceed
+/// that bound, preserving the original range-plan request shape. Zero gap
+/// bytes preserves exact contiguous-only grouping.
 std::vector<NativeS3ReadGroup> groupNativeS3ReadDestinations(
     uint64_t offset,
     const std::vector<folly::Range<char*>>& destinations,
     uint64_t maxGapBytes = 0,
-    uint64_t maxRangeBytes = std::numeric_limits<uint64_t>::max());
+    uint64_t maxRangeBytes = std::numeric_limits<uint64_t>::max(),
+    bool sliceOversizedRanges = true);
 
 class NativeS3ScatterWriteStreamBuf : public std::streambuf {
  public:
@@ -387,6 +451,18 @@ std::shared_ptr<facebook::velox::ReadFile> makeNativeScheduledS3ReadFile(
     std::shared_ptr<facebook::velox::ReadFile> readFile,
     const std::string& filePath);
 #endif
+
+/// Constructs the executor-global native AWS SDK/CRT scheduler and client.
+/// Call during executor initialization to keep one-time client setup out of
+/// the first measured scan. This performs no object reads. It is a no-op when
+/// S3 support or the native scheduler is disabled.
+void initializeNativeS3Scheduler();
+
+/// Raises queued native S3 ranges for 'filePath' ahead of speculative data
+/// ranges without shrinking the executor-global request window. Returns true
+/// when at least one queued range was marked. This is a no-op when demand
+/// priority or the native CRT scheduler is disabled, or for non-S3 paths.
+bool prioritizeNativeS3File(const std::string& filePath);
 
 /// Projected remote ranges fetched into one final-layout host buffer. This is
 /// deliberately separate from the device allocation so split preload threads

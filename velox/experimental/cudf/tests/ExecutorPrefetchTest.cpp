@@ -209,6 +209,50 @@ TEST_F(CacheHintRangeStatsTest, countsPhysicalChunkRelativeKeys) {
   EXPECT_ANY_THROW(source.canonicalCacheStats({{100, 1000}, {900, 300}}));
 }
 
+TEST_F(CacheHintRangeStatsTest, bufferedMetadataTailUsesOneReadAhead) {
+  ASSERT_EQ(setenv("GLUTEN_CPP_S3_SYNTHESIZE_PARQUET_MAGIC", "1", 1), 0);
+  ASSERT_EQ(setenv("GLUTEN_CPP_S3_METADATA_READAHEAD_BYTES", "65536", 1), 0);
+  SCOPE_EXIT {
+    unsetenv("GLUTEN_CPP_S3_SYNTHESIZE_PARQUET_MAGIC");
+    unsetenv("GLUTEN_CPP_S3_METADATA_READAHEAD_BYTES");
+  };
+
+  constexpr size_t kFileSize = 1 << 20;
+  constexpr size_t kTailSize = 1 << 16;
+  std::string content(kFileSize, '\0');
+  std::memcpy(content.data(), "PAR1", 4);
+  for (size_t i = kFileSize - kTailSize; i < content.size(); ++i) {
+    content[i] = static_cast<char>(i % 251);
+  }
+  auto readFile = std::make_shared<tests::utils::CountingReadFile>(content);
+  auto input = std::make_shared<dwio::common::BufferedInput>(readFile, *pool_);
+  BufferedInputDataSource source(input);
+
+  std::array<uint8_t, 4> magic{};
+  EXPECT_EQ(source.host_read(0, magic.size(), magic.data()), magic.size());
+  EXPECT_EQ(std::string_view(reinterpret_cast<char*>(magic.data()), 4), "PAR1");
+  EXPECT_EQ(readFile->numReads(), 0);
+
+  std::array<uint8_t, 8> trailer{};
+  EXPECT_EQ(
+      source.host_read(
+          kFileSize - trailer.size(), trailer.size(), trailer.data()),
+      trailer.size());
+  const auto readsAfterFirstTailAccess = readFile->numReads();
+  EXPECT_GT(readsAfterFirstTailAccess, 0);
+
+  std::array<uint8_t, 256> footer{};
+  EXPECT_EQ(
+      source.host_read(
+          kFileSize - kTailSize + 1024, footer.size(), footer.data()),
+      footer.size());
+  EXPECT_EQ(readFile->numReads(), readsAfterFirstTailAccess);
+  EXPECT_EQ(
+      std::string_view(reinterpret_cast<char*>(footer.data()), footer.size()),
+      std::string_view(content).substr(
+          kFileSize - kTailSize + 1024, footer.size()));
+}
+
 TEST_F(CacheHintRangeStatsTest, directCachePageH2dAvoidsHostStaging) {
   ASSERT_EQ(setenv("GLUTEN_CUDF_CACHE_H2D_INLINE", "1", 1), 0);
   SCOPE_EXIT {
@@ -578,6 +622,7 @@ TEST(ExecutorPrefetchTest, nativeScheduledReadWritesScatterBuffersDirectly) {
   auto base = std::make_shared<RecordingReadFile>();
   auto scheduled =
       makeNativeScheduledS3ReadFile(base, "s3://test-bucket/test-key");
+  EXPECT_FALSE(prioritizeNativeS3File("s3://test-bucket/test-key"));
 
   std::array<char, 3> first{};
   std::array<char, 2> second{};
@@ -621,6 +666,71 @@ TEST(ExecutorPrefetchTest, nativeScatterGroupsOnlySplitAtLogicalGaps) {
   EXPECT_EQ(groups[1].size, third.size());
   ASSERT_EQ(groups[1].destinations.size(), 1);
   EXPECT_EQ(groups[1].destinations[0].data(), third.data());
+}
+
+TEST(ExecutorPrefetchTest, nativeS3StaticReadPolicyPreservesOverrides) {
+  std::array<char, 8> first{};
+  std::array<char, 8> second{};
+  const auto policy = chooseNativeS3ReadPolicy(
+      {{first.data(), first.size()},
+       {nullptr, 3},
+       {second.data(), second.size()}},
+      /*baseRangeBytes=*/4,
+      /*maxGapBytes=*/7,
+      /*maxRangeBytes=*/13,
+      /*adaptive=*/false);
+
+  EXPECT_EQ(policy.maxGapBytes, 7);
+  EXPECT_EQ(policy.maxRangeBytes, 13);
+}
+
+TEST(ExecutorPrefetchTest, nativeS3AdaptiveReadPolicyKeepsSingleRangeBounded) {
+  std::array<char, 2'000> destination{};
+  const auto policy = chooseNativeS3ReadPolicy(
+      {{destination.data(), destination.size()}},
+      /*baseRangeBytes=*/1'000,
+      /*maxGapBytes=*/100,
+      /*maxRangeBytes=*/2'000,
+      /*adaptive=*/true);
+
+  EXPECT_EQ(policy.maxGapBytes, 0);
+  EXPECT_EQ(policy.maxRangeBytes, 1'000);
+}
+
+TEST(ExecutorPrefetchTest, nativeS3AdaptiveReadPolicyWidensDenseMultiRange) {
+  std::array<char, 1'000> first{};
+  std::array<char, 1'000> second{};
+  const auto policy = chooseNativeS3ReadPolicy(
+      {{nullptr, 500},
+       {first.data(), first.size()},
+       {nullptr, 50},
+       {second.data(), second.size()},
+       {nullptr, 500}},
+      /*baseRangeBytes=*/1'000,
+      /*maxGapBytes=*/100,
+      /*maxRangeBytes=*/2'000,
+      /*adaptive=*/true);
+
+  // Leading and trailing holes do not count. The 50-byte internal gap is
+  // below both the explicit ceiling and the 2,000 / 32 overhead budget.
+  EXPECT_EQ(policy.maxGapBytes, 50);
+  EXPECT_EQ(policy.maxRangeBytes, 2'000);
+}
+
+TEST(ExecutorPrefetchTest, nativeS3AdaptiveReadPolicyRejectsSparseRanges) {
+  std::array<char, 1'000> first{};
+  std::array<char, 1'000> second{};
+  const auto policy = chooseNativeS3ReadPolicy(
+      {{first.data(), first.size()},
+       {nullptr, 100},
+       {second.data(), second.size()}},
+      /*baseRangeBytes=*/1'000,
+      /*maxGapBytes=*/1'000,
+      /*maxRangeBytes=*/2'000,
+      /*adaptive=*/true);
+
+  EXPECT_EQ(policy.maxGapBytes, 0);
+  EXPECT_EQ(policy.maxRangeBytes, 1'000);
 }
 
 TEST(ExecutorPrefetchTest, nativeScatterCoalescesBoundedLogicalGaps) {
@@ -688,6 +798,50 @@ TEST(ExecutorPrefetchTest, nativeScatterSplitsOversizedDestination) {
   ASSERT_EQ(groups[2].destinations.size(), 1);
   EXPECT_EQ(groups[2].destinations[0].data(), destination.data() + 8);
   EXPECT_EQ(groups[2].destinations[0].size(), 2);
+}
+
+TEST(ExecutorPrefetchTest, nativeScatterCanPreserveOversizedDestination) {
+  std::array<char, 10> destination{};
+
+  const auto groups = groupNativeS3ReadDestinations(
+      10,
+      {{destination.data(), destination.size()}},
+      /*maxGapBytes=*/0,
+      /*maxRangeBytes=*/4,
+      /*sliceOversizedRanges=*/false);
+
+  ASSERT_EQ(groups.size(), 1);
+  EXPECT_EQ(groups[0].offset, 10);
+  EXPECT_EQ(groups[0].size, destination.size());
+  ASSERT_EQ(groups[0].destinations.size(), 1);
+  EXPECT_EQ(groups[0].destinations[0].data(), destination.data());
+  EXPECT_EQ(groups[0].destinations[0].size(), destination.size());
+}
+
+TEST(ExecutorPrefetchTest, nativeScatterStartsOversizeDestinationAfterGap) {
+  std::array<char, 3> first{};
+  std::array<char, 6> second{};
+  const std::vector<folly::Range<char*>> destinations{
+      {first.data(), first.size()},
+      {nullptr, 1},
+      {second.data(), second.size()}};
+
+  const auto groups = groupNativeS3ReadDestinations(
+      10, destinations, /*maxGapBytes=*/1, /*maxRangeBytes=*/5);
+
+  ASSERT_EQ(groups.size(), 3);
+  EXPECT_EQ(groups[0].offset, 10);
+  EXPECT_EQ(groups[0].size, 3);
+  ASSERT_EQ(groups[0].destinations.size(), 1);
+  EXPECT_EQ(groups[0].destinations[0].data(), first.data());
+  EXPECT_EQ(groups[1].offset, 14);
+  EXPECT_EQ(groups[1].size, 5);
+  EXPECT_EQ(groups[1].destinations[0].data(), second.data());
+  EXPECT_EQ(groups[1].destinations[0].size(), 5);
+  EXPECT_EQ(groups[2].offset, 19);
+  EXPECT_EQ(groups[2].size, 1);
+  EXPECT_EQ(groups[2].destinations[0].data(), second.data() + 5);
+  EXPECT_EQ(groups[2].destinations[0].size(), 1);
 }
 
 TEST(ExecutorPrefetchTest, nativeScatterStreamWritesExactDestinations) {
@@ -1153,6 +1307,388 @@ TEST(ExecutorPrefetchTest, stopsBeforeErasingQueryState) {
 
   ExecutorReadBroker::erase(&executor);
   broker.reset();
+}
+
+TEST(ExecutorPrefetchTest, cacheHintSplitPreloadsCompleteReadyFirst) {
+  folly::CPUThreadPoolExecutor executor(2);
+  std::promise<void> firstRelease;
+  std::promise<void> secondRelease;
+  auto firstReleaseFuture = firstRelease.get_future().share();
+  auto secondReleaseFuture = secondRelease.get_future().share();
+
+  ExecutorSplitPrefetch::registerCacheHint(
+      &executor,
+      "query-cache-ready-first",
+      "first",
+      1,
+      [firstReleaseFuture] { firstReleaseFuture.wait(); },
+      2,
+      2);
+  ExecutorSplitPrefetch::registerCacheHint(
+      &executor,
+      "query-cache-ready-first",
+      "second",
+      1,
+      [secondReleaseFuture] { secondReleaseFuture.wait(); },
+      2,
+      2);
+
+  const auto before = ExecutorSplitPrefetch::cacheHintWaitStatsForTest();
+  auto first = std::async(std::launch::async, [&] {
+    ExecutorSplitPrefetch::takeCacheHint(
+        &executor,
+        "query-cache-ready-first",
+        "first",
+        CacheHintWaitMode::kSplitPreload);
+  });
+  auto second = std::async(std::launch::async, [&] {
+    ExecutorSplitPrefetch::takeCacheHint(
+        &executor,
+        "query-cache-ready-first",
+        "second",
+        CacheHintWaitMode::kSplitPreload);
+  });
+
+  EXPECT_EQ(first.wait_for(50ms), std::future_status::timeout);
+  EXPECT_EQ(second.wait_for(50ms), std::future_status::timeout);
+  secondRelease.set_value();
+  ASSERT_EQ(second.wait_for(5s), std::future_status::ready);
+  second.get();
+  EXPECT_EQ(first.wait_for(50ms), std::future_status::timeout);
+  firstRelease.set_value();
+  ASSERT_EQ(first.wait_for(5s), std::future_status::ready);
+  first.get();
+
+  const auto after = ExecutorSplitPrefetch::cacheHintWaitStatsForTest();
+  EXPECT_EQ(after.splitPreloadWaits - before.splitPreloadWaits, 2);
+  EXPECT_EQ(after.splitPreloadReadyAtTake - before.splitPreloadReadyAtTake, 0);
+  EXPECT_GT(after.splitPreloadWaitWallNanos, before.splitPreloadWaitWallNanos);
+
+  ExecutorSplitPrefetch::eraseQuery(&executor, "query-cache-ready-first");
+}
+
+TEST(ExecutorPrefetchTest, cacheHintRangeReadyRequestReleasesAdmissionWindow) {
+  folly::CPUThreadPoolExecutor executor(2);
+  std::promise<void> firstStarted;
+  std::promise<void> unblockFirst;
+  auto unblockFirstFuture = unblockFirst.get_future().share();
+  std::promise<void> secondCompleted;
+
+  ExecutorSplitPrefetch::registerCacheHint(
+      &executor,
+      "query-cache-range-ready",
+      "first",
+      1,
+      [&] {
+        firstStarted.set_value();
+        unblockFirstFuture.wait();
+      },
+      2,
+      1);
+  ExecutorSplitPrefetch::registerCacheHint(
+      &executor,
+      "query-cache-range-ready",
+      "second",
+      1,
+      [&] { secondCompleted.set_value(); },
+      2,
+      1);
+
+  ASSERT_EQ(firstStarted.get_future().wait_for(5s), std::future_status::ready);
+  const auto before = ExecutorSplitPrefetch::cacheHintWaitStatsForTest();
+  const auto requestStart = std::chrono::steady_clock::now();
+  ExecutorSplitPrefetch::requestCacheHint(
+      &executor, "query-cache-range-ready", "first");
+  EXPECT_LT(
+      std::chrono::steady_clock::now() - requestStart, std::chrono::seconds(1));
+
+  // The first load is still active, but finishing its scan lifecycle releases
+  // admission bytes so a second file can start immediately.
+  ExecutorSplitPrefetch::releaseCacheHint(
+      &executor, "query-cache-range-ready", "first");
+  ASSERT_EQ(
+      secondCompleted.get_future().wait_for(5s), std::future_status::ready);
+  ExecutorSplitPrefetch::requestCacheHint(
+      &executor, "query-cache-range-ready", "second");
+  ExecutorSplitPrefetch::releaseCacheHint(
+      &executor, "query-cache-range-ready", "second");
+
+  const auto after = ExecutorSplitPrefetch::cacheHintWaitStatsForTest();
+  EXPECT_EQ(after.rangeReadyRequests - before.rangeReadyRequests, 2);
+  EXPECT_EQ(after.rangeReadyReleases - before.rangeReadyReleases, 2);
+  EXPECT_EQ(after.scanWaits - before.scanWaits, 0);
+  EXPECT_EQ(after.splitPreloadWaits - before.splitPreloadWaits, 0);
+
+  unblockFirst.set_value();
+  ExecutorSplitPrefetch::eraseQuery(&executor, "query-cache-range-ready");
+}
+
+TEST(ExecutorPrefetchTest, cacheHintFirstLoadGroupPrecedesFullCompletion) {
+  folly::CPUThreadPoolExecutor executor(1);
+  auto firstLoadReady = std::make_shared<CacheHintFirstLoadSignal>();
+  std::promise<void> unblockFullLoad;
+  auto unblockFullLoadFuture = unblockFullLoad.get_future().share();
+  std::atomic<bool> fullLoadCompleted{false};
+
+  ExecutorSplitPrefetch::registerCacheHint(
+      &executor,
+      "query-cache-first-load",
+      "split",
+      CacheHintRangeStats{
+          .logicalRanges = 2,
+          .logicalBytes = 2,
+          .uniqueRanges = 2,
+          .uniqueBytes = 2},
+      [&] {
+        unblockFullLoadFuture.wait();
+        fullLoadCompleted.store(true, std::memory_order_relaxed);
+      },
+      1,
+      2,
+      firstLoadReady);
+
+  const auto before = ExecutorSplitPrefetch::cacheHintWaitStatsForTest();
+  auto take = std::async(std::launch::async, [&] {
+    ExecutorSplitPrefetch::takeCacheHint(
+        &executor,
+        "query-cache-first-load",
+        "split",
+        CacheHintWaitMode::kFirstLoadGroup);
+  });
+  EXPECT_EQ(take.wait_for(50ms), std::future_status::timeout);
+  firstLoadReady->signal();
+  ASSERT_EQ(take.wait_for(5s), std::future_status::ready);
+  take.get();
+  EXPECT_FALSE(fullLoadCompleted.load(std::memory_order_relaxed));
+
+  const auto after = ExecutorSplitPrefetch::cacheHintWaitStatsForTest();
+  EXPECT_EQ(after.firstLoadGroupWaits - before.firstLoadGroupWaits, 1);
+  EXPECT_EQ(
+      after.firstLoadGroupReadyAtTake - before.firstLoadGroupReadyAtTake, 0);
+  EXPECT_GT(
+      after.firstLoadGroupWaitWallNanos, before.firstLoadGroupWaitWallNanos);
+
+  unblockFullLoad.set_value();
+  ExecutorSplitPrefetch::eraseQuery(&executor, "query-cache-first-load");
+  EXPECT_TRUE(fullLoadCompleted.load(std::memory_order_relaxed));
+}
+
+TEST(ExecutorPrefetchTest, cacheHintFirstLoadFailureDoesNotHang) {
+  folly::CPUThreadPoolExecutor executor(1);
+  auto firstLoadReady = std::make_shared<CacheHintFirstLoadSignal>();
+
+  ExecutorSplitPrefetch::registerCacheHint(
+      &executor,
+      "query-cache-first-load-failure",
+      "split",
+      CacheHintRangeStats{
+          .logicalRanges = 1,
+          .logicalBytes = 1,
+          .uniqueRanges = 1,
+          .uniqueBytes = 1},
+      [] { throw std::runtime_error("failure before first load callback"); },
+      1,
+      1,
+      firstLoadReady);
+
+  auto take = std::async(std::launch::async, [&] {
+    ExecutorSplitPrefetch::takeCacheHint(
+        &executor,
+        "query-cache-first-load-failure",
+        "split",
+        CacheHintWaitMode::kFirstLoadGroup);
+  });
+  ASSERT_EQ(take.wait_for(5s), std::future_status::ready);
+  EXPECT_NO_THROW(take.get());
+  ExecutorSplitPrefetch::eraseQuery(
+      &executor, "query-cache-first-load-failure");
+}
+
+TEST(ExecutorPrefetchTest, cacheHintFirstLoadCancellationDoesNotHang) {
+  folly::CPUThreadPoolExecutor executor(1);
+  std::promise<void> blockerStarted;
+  std::promise<void> unblockBlocker;
+  auto unblockBlockerFuture = unblockBlocker.get_future().share();
+
+  ExecutorSplitPrefetch::registerCacheHint(
+      &executor,
+      "query-cache-first-load-cancel",
+      "blocker",
+      1,
+      [&] {
+        blockerStarted.set_value();
+        unblockBlockerFuture.wait();
+      },
+      1,
+      2);
+  ASSERT_EQ(
+      blockerStarted.get_future().wait_for(5s), std::future_status::ready);
+
+  auto firstLoadReady = std::make_shared<CacheHintFirstLoadSignal>();
+  ExecutorSplitPrefetch::registerCacheHint(
+      &executor,
+      "query-cache-first-load-cancel",
+      "canceled-before-schedule",
+      CacheHintRangeStats{
+          .logicalRanges = 1,
+          .logicalBytes = 1,
+          .uniqueRanges = 1,
+          .uniqueBytes = 1},
+      [] {},
+      1,
+      2,
+      firstLoadReady);
+
+  auto take = std::async(std::launch::async, [&] {
+    ExecutorSplitPrefetch::takeCacheHint(
+        &executor,
+        "query-cache-first-load-cancel",
+        "canceled-before-schedule",
+        CacheHintWaitMode::kFirstLoadGroup);
+  });
+  EXPECT_EQ(take.wait_for(50ms), std::future_status::timeout);
+
+  auto erase = std::async(std::launch::async, [&] {
+    ExecutorSplitPrefetch::eraseQuery(
+        &executor, "query-cache-first-load-cancel");
+  });
+  ASSERT_EQ(take.wait_for(5s), std::future_status::ready);
+  EXPECT_NO_THROW(take.get());
+
+  unblockBlocker.set_value();
+  ASSERT_EQ(erase.wait_for(5s), std::future_status::ready);
+  erase.get();
+}
+
+TEST(ExecutorPrefetchTest, cacheHintQueryRegisteredSplitDecisionIsUniform) {
+  folly::CPUThreadPoolExecutor coordinatorExecutor(1);
+  folly::CPUThreadPoolExecutor ioExecutor(3);
+  const std::string kQuery = "query-cache-registered-split-decision";
+  for (uint32_t i = 0; i < 3; ++i) {
+    const auto path = fmt::format("s3://bucket/registered-{}.parquet", i);
+    ExecutorSplitPrefetch::registerSplit(
+        &coordinatorExecutor, kQuery, path, {{path, 1}});
+  }
+
+  ExecutorSplitPrefetch::registerCacheHint(
+      &ioExecutor, kQuery, "first", 4, [] {}, 3, 32);
+  EXPECT_TRUE(
+      ExecutorSplitPrefetch::useFirstLoadReadyForQuery(&ioExecutor, kQuery, 3));
+  // The query-wide result is frozen; another split cannot choose a different
+  // policy even if its caller supplies a different threshold.
+  ExecutorSplitPrefetch::registerCacheHint(
+      &ioExecutor, kQuery, "second", 4, [] {}, 3, 32);
+  EXPECT_TRUE(
+      ExecutorSplitPrefetch::useFirstLoadReadyForQuery(
+          &ioExecutor, kQuery, 100));
+
+  ExecutorSplitPrefetch::eraseQuery(&ioExecutor, kQuery);
+  // Query cleanup must evict the immutable fast-path decision. Reusing the
+  // same id with a new registered-split population must recompute it.
+  ExecutorSplitPrefetch::registerSplit(
+      &coordinatorExecutor,
+      kQuery,
+      "s3://bucket/reused.parquet",
+      {{"s3://bucket/reused.parquet", 1}});
+  EXPECT_FALSE(
+      ExecutorSplitPrefetch::useFirstLoadReadyForQuery(&ioExecutor, kQuery, 3));
+  ExecutorSplitPrefetch::eraseQuery(&ioExecutor, kQuery);
+
+  const std::string kSmallQuery = "query-cache-small-registered-split-count";
+  for (uint32_t i = 0; i < 2; ++i) {
+    const auto path = fmt::format("s3://bucket/small-{}.parquet", i);
+    ExecutorSplitPrefetch::registerSplit(
+        &coordinatorExecutor, kSmallQuery, path, {{path, 1}});
+  }
+  ExecutorSplitPrefetch::registerCacheHint(
+      &ioExecutor, kSmallQuery, "small", 4, [] {}, 3, 32);
+  EXPECT_FALSE(
+      ExecutorSplitPrefetch::useFirstLoadReadyForQuery(
+          &ioExecutor, kSmallQuery, 3));
+  ExecutorSplitPrefetch::eraseQuery(&ioExecutor, kSmallQuery);
+}
+
+TEST(ExecutorPrefetchTest, cacheHintExpectedSplitCountAvoidsRegistrationWait) {
+  folly::CPUThreadPoolExecutor coordinatorExecutor(1);
+  folly::CPUThreadPoolExecutor ioExecutor(1);
+  const std::string kQuery = "query-cache-expected-split-count";
+
+  // The coordinator knows the complete assignment before entering its
+  // per-split registration loop. No registered QueryPrefetchState exists yet.
+  ExecutorSplitPrefetch::setExpectedSplitCount(
+      &coordinatorExecutor, kQuery, 600, 600);
+  EXPECT_TRUE(
+      ExecutorSplitPrefetch::useFirstLoadReadyForQuery(
+          &ioExecutor, kQuery, 600));
+  // The first result remains query-wide even if a later caller supplies a
+  // different threshold.
+  EXPECT_TRUE(
+      ExecutorSplitPrefetch::useFirstLoadReadyForQuery(
+          &ioExecutor, kQuery, 1000));
+  ExecutorSplitPrefetch::eraseQuery(&ioExecutor, kQuery);
+
+  ExecutorSplitPrefetch::setExpectedSplitCount(
+      &coordinatorExecutor, kQuery, 599, 600);
+  EXPECT_FALSE(
+      ExecutorSplitPrefetch::useFirstLoadReadyForQuery(
+          &ioExecutor, kQuery, 600));
+  ExecutorSplitPrefetch::eraseQuery(&ioExecutor, kQuery);
+}
+
+TEST(ExecutorPrefetchTest, cacheHintScopesRequestPressureByQuerySize) {
+  folly::CPUThreadPoolExecutor executor(2);
+  const std::string kLowQuery = "query-cache-low-request-pressure";
+  const std::string kHighQuery = "query-cache-high-request-pressure";
+  std::atomic<bool> lowObserved{true};
+  std::atomic<bool> highObserved{false};
+
+  ExecutorSplitPrefetch::setExpectedSplitCount(&executor, kLowQuery, 669, 0);
+  ExecutorSplitPrefetch::setExpectedSplitCount(&executor, kHighQuery, 670, 0);
+  ExecutorSplitPrefetch::registerCacheHint(
+      &executor,
+      kLowQuery,
+      "low",
+      1,
+      [&] {
+        lowObserved.store(
+            nativeS3HighRequestPressureForCurrentThread(),
+            std::memory_order_relaxed);
+      },
+      1,
+      1);
+  ExecutorSplitPrefetch::registerCacheHint(
+      &executor,
+      kHighQuery,
+      "high",
+      1,
+      [&] {
+        highObserved.store(
+            nativeS3HighRequestPressureForCurrentThread(),
+            std::memory_order_relaxed);
+      },
+      1,
+      1);
+
+  ExecutorSplitPrefetch::takeCacheHint(&executor, kLowQuery, "low");
+  ExecutorSplitPrefetch::takeCacheHint(&executor, kHighQuery, "high");
+  EXPECT_FALSE(lowObserved.load(std::memory_order_relaxed));
+  EXPECT_TRUE(highObserved.load(std::memory_order_relaxed));
+  EXPECT_FALSE(nativeS3HighRequestPressureForCurrentThread());
+
+  ExecutorSplitPrefetch::eraseQuery(&executor, kLowQuery);
+  ExecutorSplitPrefetch::eraseQuery(&executor, kHighQuery);
+}
+
+TEST(ExecutorPrefetchTest, requestPressureExpectedSplitBand) {
+  EXPECT_FALSE(useHighRequestPressureForExpectedSplits(499, 500, 600, 670));
+  EXPECT_TRUE(useHighRequestPressureForExpectedSplits(500, 500, 600, 670));
+  EXPECT_TRUE(useHighRequestPressureForExpectedSplits(600, 500, 600, 670));
+  EXPECT_FALSE(useHighRequestPressureForExpectedSplits(601, 500, 600, 670));
+  EXPECT_FALSE(useHighRequestPressureForExpectedSplits(669, 500, 600, 670));
+  EXPECT_TRUE(useHighRequestPressureForExpectedSplits(670, 500, 600, 670));
+
+  EXPECT_FALSE(useHighRequestPressureForExpectedSplits(1000, 0, 0, 0));
+  EXPECT_TRUE(useHighRequestPressureForExpectedSplits(1000, 500, 0, 0));
 }
 
 } // namespace

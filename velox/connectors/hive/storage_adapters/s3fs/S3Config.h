@@ -78,6 +78,7 @@ class S3Config {
     kCredentialsProvider,
     kIMDSEnabled,
     kMultipartMinPartSize,
+    kMultipartUploadThreads,
     kEnd
   };
 
@@ -119,6 +120,8 @@ class S3Config {
             {Keys::kIMDSEnabled, std::make_pair("aws-imds-enabled", "true")},
             {Keys::kMultipartMinPartSize,
              std::make_pair("min-part-size", "10MB")},
+            {Keys::kMultipartUploadThreads,
+             std::make_pair("multipart-upload-threads", "1")},
         };
     return config;
   }
@@ -255,6 +258,11 @@ class S3Config {
   }
 
   size_t minPartSize() const;
+
+  uint32_t multipartUploadThreads() const {
+    return folly::to<uint32_t>(
+        config_.find(Keys::kMultipartUploadThreads)->second.value());
+  }
 
  private:
   std::unordered_map<Keys, std::optional<std::string>> config_;

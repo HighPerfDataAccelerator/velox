@@ -34,6 +34,7 @@
 #include <folly/futures/Future.h>
 
 #ifdef VELOX_ENABLE_S3
+#include "velox/connectors/hive/storage_adapters/s3fs/S3FileSystem.h"
 #include "velox/connectors/hive/storage_adapters/s3fs/S3Util.h"
 
 #include <aws/core/auth/AWSCredentialsProviderChain.h>
@@ -58,6 +59,7 @@
 #include <sstream>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 extern "C" bool glutenCrtS3RangeReaderAvailable();
@@ -71,6 +73,8 @@ extern "C" uint64_t glutenCrtS3ReadRanges(
     size_t count);
 
 namespace {
+
+thread_local bool nativeS3HighRequestPressure{false};
 
 using facebook::velox::cudf_velox::connector::hive::
     BufferedInputDeviceCopyHooks;
@@ -626,9 +630,30 @@ std::size_t envBytesOrZero(const char* name) {
   return static_cast<std::size_t>(parsed);
 }
 
+std::size_t envBytesOrDefault(const char* name, std::size_t defaultValue) {
+  const auto* value = std::getenv(name);
+  return value == nullptr || value[0] == '\0' ? defaultValue
+                                              : envBytesOrZero(name);
+}
+
 bool envFlagEnabled(const char* name) {
   const auto* value = std::getenv(name);
   return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+}
+
+bool envFlagValueEnabled(const char* value) {
+  return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0 &&
+      std::strcmp(value, "false") != 0;
+}
+
+bool envFlagOrDefault(const char* name, bool defaultValue) {
+  const auto* value = std::getenv(name);
+  return value == nullptr || value[0] == '\0' ? defaultValue
+                                              : envFlagValueEnabled(value);
+}
+
+bool adaptiveS3PrefetchEnabled() {
+  return envFlagValueEnabled(std::getenv("GLUTEN_CUDF_S3_ADAPTIVE_PREFETCH"));
 }
 
 void updateAtomicMax(std::atomic<uint64_t>& maximum, uint64_t value) {
@@ -1193,6 +1218,7 @@ class NativeS3SdkScheduler {
       const facebook::velox::FileIoContext& context = {},
       bool directCacheFill = false) {
     VELOX_CHECK_NOT_NULL(readFile);
+    markStarted();
     auto request = std::make_shared<Request>();
     request->readFile = std::move(readFile);
     request->context = context;
@@ -1206,6 +1232,9 @@ class NativeS3SdkScheduler {
     {
       std::lock_guard<std::mutex> lock(mutex_);
       auto& queue = size <= metadataPriorityBytes_ ? priorityQueue_ : queue_;
+      if (request->highThroughput) {
+        ++queuedHighPressureRequests_;
+      }
       queue.push_back(std::move(request));
     }
     submittedRequests_.fetch_add(1, std::memory_order_relaxed);
@@ -1222,17 +1251,23 @@ class NativeS3SdkScheduler {
       uint8_t* destination,
       bool directCacheFill = false) {
     VELOX_CHECK(useCrt_);
+    markStarted();
     auto request = std::make_shared<Request>();
     request->bucket = std::move(bucket);
     request->key = std::move(key);
     request->offset = offset;
     request->size = size;
+    request->logicalSize = size;
     request->destination = destination;
     request->directCacheFill = directCacheFill;
+    request->highThroughput = nativeS3HighRequestPressure;
     auto future = request->promise.get_future();
     {
       std::lock_guard<std::mutex> lock(mutex_);
       auto& queue = size <= metadataPriorityBytes_ ? priorityQueue_ : queue_;
+      if (request->highThroughput) {
+        ++queuedHighPressureRequests_;
+      }
       queue.push_back(std::move(request));
     }
     submittedRequests_.fetch_add(1, std::memory_order_relaxed);
@@ -1248,11 +1283,13 @@ class NativeS3SdkScheduler {
       std::vector<folly::Range<char*>> destinations) {
     VELOX_CHECK(useCrt_);
     VELOX_CHECK(!destinations.empty());
+    markStarted();
     auto request = std::make_shared<Request>();
     request->bucket = std::move(bucket);
     request->key = std::move(key);
     request->offset = offset;
     request->directCacheFill = true;
+    request->highThroughput = nativeS3HighRequestPressure;
     for (const auto& destination : destinations) {
       VELOX_CHECK_LE(
           destination.size(),
@@ -1278,20 +1315,191 @@ class NativeS3SdkScheduler {
     return future;
   }
 
+  folly::SemiFuture<size_t> submitCrtScatterAsync(
+      std::string bucket,
+      std::string key,
+      size_t offset,
+      std::vector<folly::Range<char*>> destinations) {
+    VELOX_CHECK(useCrt_);
+    VELOX_CHECK(!destinations.empty());
+    markStarted();
+    auto request = std::make_shared<Request>();
+    request->bucket = std::move(bucket);
+    request->key = std::move(key);
+    request->offset = offset;
+    request->directCacheFill = true;
+    request->highThroughput = nativeS3HighRequestPressure;
+    for (const auto& destination : destinations) {
+      VELOX_CHECK_LE(
+          destination.size(),
+          std::numeric_limits<size_t>::max() - request->size,
+          "Native S3 scatter request size overflow");
+      request->size += destination.size();
+      if (destination.data() != nullptr) {
+        VELOX_CHECK_LE(
+            destination.size(),
+            std::numeric_limits<size_t>::max() - request->logicalSize,
+            "Native S3 scatter logical size overflow");
+        request->logicalSize += destination.size();
+      }
+    }
+    request->scatterDestinations = std::move(destinations);
+    request->asyncPromise = std::make_unique<folly::Promise<size_t>>();
+    auto future = request->asyncPromise->getSemiFuture();
+    submittedRequests_.fetch_add(1, std::memory_order_relaxed);
+    submittedBytes_.fetch_add(request->size, std::memory_order_relaxed);
+    directCacheFillScatterBuffers_.fetch_add(
+        request->scatterDestinations.size(), std::memory_order_relaxed);
+    recordDirectCacheFillSubmission(*request);
+    enqueueCrt(std::move(request));
+    return future;
+  }
+
   size_t rangeBytes() const {
     return rangeBytes_;
   }
 
-  size_t rangeCoalesceGapBytes() const {
-    return rangeCoalesceGapBytes_;
+  facebook::velox::cudf_velox::connector::hive::NativeS3ReadPolicy readPolicy(
+      const std::vector<folly::Range<char*>>& destinations) {
+    auto policy =
+        facebook::velox::cudf_velox::connector::hive::chooseNativeS3ReadPolicy(
+            destinations,
+            rangeBytes_,
+            rangeCoalesceGapBytes_,
+            maxCoalescedRangeBytes_,
+            adaptiveRanges_);
+    if (adaptiveRanges_) {
+      adaptiveRangePolicyCalls_.fetch_add(1, std::memory_order_relaxed);
+      if (policy.maxRangeBytes >
+          std::min(rangeBytes_, maxCoalescedRangeBytes_)) {
+        adaptiveWideRangePolicyCalls_.fetch_add(1, std::memory_order_relaxed);
+      }
+      if (policy.maxGapBytes > 0) {
+        adaptiveGapPolicyCalls_.fetch_add(1, std::memory_order_relaxed);
+      }
+    }
+    return policy;
   }
 
-  size_t maxCoalescedRangeBytes() const {
-    return maxCoalescedRangeBytes_;
+  bool sliceOversizedRanges() const {
+    return sliceOversizedRanges_;
+  }
+
+  void logSnapshot(std::string_view event, std::string_view id) {
+    if (!diagnostics_) {
+      return;
+    }
+    uint64_t priorityQueuedBytes = 0;
+    uint64_t queuedBytes = 0;
+    size_t priorityQueuedRequests = 0;
+    size_t queuedRequests = 0;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      priorityQueuedRequests = priorityQueue_.size();
+      queuedRequests = queue_.size();
+      for (const auto& request : priorityQueue_) {
+        priorityQueuedBytes += request->size;
+      }
+      for (const auto& request : queue_) {
+        queuedBytes += request->size;
+      }
+    }
+    const auto submitted = submittedRequests_.load(std::memory_order_relaxed);
+    const auto completed = completedRequests_.load(std::memory_order_relaxed);
+    const auto submittedBytes = submittedBytes_.load(std::memory_order_relaxed);
+    const auto completedBytes = completedBytes_.load(std::memory_order_relaxed);
+    LOG(WARNING)
+        << (useCrt_ ? "CPP_S3_CRT_SNAPSHOT" : "CPP_S3_SDK_SNAPSHOT")
+        << " event=" << event << (id.empty() ? "" : " id=") << id
+        << " submitted=" << submitted << " completed=" << completed
+        << " inflight=" << inflightRequests_.load(std::memory_order_relaxed)
+        << " queued=" << queuedRequests
+        << " priorityQueued=" << priorityQueuedRequests
+        << " queuedBytes=" << queuedBytes
+        << " priorityQueuedBytes=" << priorityQueuedBytes << " peakInflight="
+        << peakInflightRequests_.load(std::memory_order_relaxed)
+        << " submittedBytes=" << submittedBytes
+        << " completedBytes=" << completedBytes << " avgSubmittedBytes="
+        << (submitted == 0 ? 0 : submittedBytes / submitted)
+        << " avgCompletedBytes="
+        << (completed == 0 ? 0 : completedBytes / completed)
+        << " directCacheFillSubmitted="
+        << directCacheFillSubmittedRequests_.load(std::memory_order_relaxed)
+        << " directCacheFillCompleted="
+        << directCacheFillCompletedRequests_.load(std::memory_order_relaxed)
+        << " directCacheFillBytes="
+        << directCacheFillSubmittedBytes_.load(std::memory_order_relaxed)
+        << " directCacheFillLogicalBytes="
+        << directCacheFillLogicalBytes_.load(std::memory_order_relaxed)
+        << " directCacheFillGapBytes="
+        << directCacheFillGapBytes_.load(std::memory_order_relaxed)
+        << " directCacheFillScatterBuffers="
+        << directCacheFillScatterBuffers_.load(std::memory_order_relaxed)
+        << " highThroughputSubmitted="
+        << highThroughputSubmittedRequests_.load(std::memory_order_relaxed)
+        << " highThroughputCompleted="
+        << highThroughputCompletedRequests_.load(std::memory_order_relaxed)
+        << " highPressurePeakInflight="
+        << highThroughputPeakInflightRequests_.load(std::memory_order_relaxed)
+        << " adaptiveRanges=" << adaptiveRanges_ << " adaptiveRangePolicyCalls="
+        << adaptiveRangePolicyCalls_.load(std::memory_order_relaxed)
+        << " adaptiveWideRangePolicyCalls="
+        << adaptiveWideRangePolicyCalls_.load(std::memory_order_relaxed)
+        << " adaptiveGapPolicyCalls="
+        << adaptiveGapPolicyCalls_.load(std::memory_order_relaxed)
+        << " demandKeyPriorityDispatches="
+        << demandKeyPriorityDispatches_.load(std::memory_order_relaxed)
+        << " completionKeyContinuityDispatches="
+        << completionKeyContinuityDispatches_.load(std::memory_order_relaxed)
+        << " retries=" << retryAttempts_.load(std::memory_order_relaxed)
+        << " totalTimeUs=" << totalTimeUs_.load(std::memory_order_relaxed);
   }
 
   NativeS3SdkScheduler(const NativeS3SdkScheduler&) = delete;
   NativeS3SdkScheduler& operator=(const NativeS3SdkScheduler&) = delete;
+
+  bool prepareHighThroughputCrtClient() {
+    if (!useCrt_ || highThroughputTargetGbps_ <= baseTargetGbps_) {
+      return false;
+    }
+    if (highThroughputCrtClient_.load(std::memory_order_acquire) != nullptr) {
+      return true;
+    }
+    std::lock_guard<std::mutex> lock(highThroughputCrtClientMutex_);
+    if (highThroughputCrtClient_.load(std::memory_order_relaxed) == nullptr) {
+      auto client =
+          makeCrtClient(highThroughputTargetGbps_, highThroughputWindowBytes_);
+      highThroughputCrtClient_.store(
+          std::move(client), std::memory_order_release);
+      LOG(WARNING)
+          << "CPP_S3_CRT_ADAPTIVE_PRESSURE_CLIENT_READY baseTargetGbps="
+          << baseTargetGbps_ << " highTargetGbps=" << highThroughputTargetGbps_
+          << " baseWindowBytes=" << baseWindowBytes_
+          << " highWindowBytes=" << highThroughputWindowBytes_;
+    }
+    return true;
+  }
+
+  bool prioritizeFile(const std::string& bucket, const std::string& key) {
+    if (!useCrt_ || !demandPriority_) {
+      return false;
+    }
+    bool prioritized = false;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      const auto identity = fileIdentity(bucket, key);
+      if (std::any_of(queue_.begin(), queue_.end(), [&](const auto& queued) {
+            return fileIdentity(queued->bucket, queued->key) == identity;
+          })) {
+        demandPreferredFiles_.insert(identity);
+        prioritized = true;
+      }
+    }
+    if (prioritized) {
+      dispatchCrt();
+    }
+    return prioritized;
+  }
 
  private:
   struct Request {
@@ -1305,7 +1513,10 @@ class NativeS3SdkScheduler {
     uint8_t* destination{nullptr};
     std::vector<folly::Range<char*>> scatterDestinations;
     bool directCacheFill{false};
+    bool highThroughput{false};
+    bool usedHighThroughputClient{false};
     std::promise<size_t> promise;
+    std::unique_ptr<folly::Promise<size_t>> asyncPromise;
   };
 
   static size_t envOrDefault(const char* name, size_t defaultValue) {
@@ -1326,47 +1537,110 @@ class NativeS3SdkScheduler {
         request.size - request.logicalSize, std::memory_order_relaxed);
   }
 
+  void markStarted() {
+    const auto nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           std::chrono::steady_clock::now().time_since_epoch())
+                           .count();
+    int64_t expected = 0;
+    startedNs_.compare_exchange_strong(
+        expected, nowNs, std::memory_order_relaxed);
+  }
+
+  std::shared_ptr<Aws::S3Crt::S3CrtClient> makeCrtClient(
+      size_t targetGbps,
+      size_t downloadWindowBytes) {
+    Aws::S3Crt::ClientConfiguration config;
+    if (const auto* region = std::getenv("AWS_REGION");
+        region != nullptr && region[0] != '\0') {
+      config.region = region;
+    } else if (const auto* region = std::getenv("AWS_DEFAULT_REGION");
+               region != nullptr && region[0] != '\0') {
+      config.region = region;
+    }
+    config.throughputTargetGbps = static_cast<double>(targetGbps);
+    config.partSize = envOrDefault("GLUTEN_CPP_S3_CRT_PART_BYTES", 8UL << 20);
+    config.downloadMemoryUsageWindow = downloadWindowBytes;
+    config.crtRetryStrategyConfig.crtRetryStrategyType =
+        Aws::S3Crt::S3CrtClientConfiguration::CrtRetryStrategyConfig::
+            CrtRetryStrategyType::EXPONENTIAL_BACKOFF;
+    config.crtRetryStrategyConfig.config.maxRetries =
+        envOrDefault("GLUTEN_CPP_S3_CRT_MAX_RETRIES", 5);
+    auto credentialsProvider = facebook::velox::filesystems::
+        makeSynchronizedCachingCredentialsProvider(
+            std::make_shared<Aws::Auth::DefaultAWSCredentialsProviderChain>());
+    return std::make_shared<Aws::S3Crt::S3CrtClient>(
+        std::move(credentialsProvider), config);
+  }
+
   NativeS3SdkScheduler()
       : useCrt_(envBytesOrZero("GLUTEN_CPP_S3_CRT") != 0),
         concurrency_(envOrDefault("GLUTEN_CPP_S3_SDK_CONCURRENCY", 128)),
+        highThroughputConcurrency_(
+            std::min(
+                concurrency_,
+                envOrDefault(
+                    "GLUTEN_CPP_S3_CRT_HIGH_MAX_CONCURRENCY",
+                    concurrency_))),
         rangeBytes_(envOrDefault("GLUTEN_CPP_S3_SDK_RANGE_BYTES", 4UL << 20)),
-        rangeCoalesceGapBytes_(
-            envBytesOrZero("GLUTEN_CPP_S3_RANGE_COALESCE_GAP_BYTES")),
+        adaptiveRanges_(envFlagOrDefault(
+            "GLUTEN_CPP_S3_ADAPTIVE_RANGES",
+            adaptiveS3PrefetchEnabled())),
+        rangeCoalesceGapBytes_(envBytesOrDefault(
+            "GLUTEN_CPP_S3_RANGE_COALESCE_GAP_BYTES",
+            adaptiveRanges_ ? 1UL << 20 : 0)),
         maxCoalescedRangeBytes_(envOrDefault(
             "GLUTEN_CPP_S3_MAX_COALESCED_RANGE_BYTES",
-            16UL << 20)),
+            adaptiveRanges_ ? 32UL << 20 : 16UL << 20)),
+        sliceOversizedRanges_(
+            envOrDefault("GLUTEN_CPP_S3_SLICE_OVERSIZED_RANGES", 1) != 0),
         metadataPriorityBytes_(
             envOrDefault("GLUTEN_CPP_S3_METADATA_PRIORITY_BYTES", 64UL << 10)),
-        diagnostics_(envBytesOrZero("GLUTEN_CPP_S3_DIAGNOSTICS") != 0),
-        started_(std::chrono::steady_clock::now()) {
+        demandPriority_(envFlagOrDefault(
+            "GLUTEN_CPP_S3_DEMAND_PRIORITY",
+            adaptiveS3PrefetchEnabled())),
+        completionKeyContinuity_(envFlagOrDefault(
+            "GLUTEN_CPP_S3_COMPLETION_KEY_CONTINUITY",
+            adaptiveS3PrefetchEnabled())),
+        completionKeyContinuityMinBytes_(
+            envOrDefault("GLUTEN_CPP_S3_COMPLETION_KEY_MIN_BYTES", 1UL << 20)),
+        diagnostics_(envBytesOrZero("GLUTEN_CPP_S3_DIAGNOSTICS") != 0) {
     VELOX_CHECK_GT(concurrency_, 0);
+    VELOX_CHECK_GT(highThroughputConcurrency_, 0);
     VELOX_CHECK_GT(rangeBytes_, 0);
     VELOX_CHECK_GT(maxCoalescedRangeBytes_, 0);
+    VELOX_CHECK_GT(completionKeyContinuityMinBytes_, 0);
+    if (completionKeyContinuity_) {
+      LOG(WARNING) << "CPP_S3_COMPLETION_KEY_CONTINUITY enabled=1 minBytes="
+                   << completionKeyContinuityMinBytes_;
+    }
+    if (demandPriority_) {
+      LOG(WARNING) << "CPP_S3_DEMAND_PRIORITY enabled=1";
+    }
+    if (adaptiveRanges_) {
+      LOG(WARNING) << "CPP_S3_ADAPTIVE_RANGES enabled=1 baseBytes="
+                   << rangeBytes_ << " maxBytes=" << maxCoalescedRangeBytes_
+                   << " maxGapBytes=" << rangeCoalesceGapBytes_
+                   << " maxGapOverheadDivisor=32";
+    }
     if (useCrt_) {
-      Aws::S3Crt::ClientConfiguration config;
-      if (const auto* region = std::getenv("AWS_REGION");
-          region != nullptr && region[0] != '\0') {
-        config.region = region;
-      } else if (const auto* region = std::getenv("AWS_DEFAULT_REGION");
-                 region != nullptr && region[0] != '\0') {
-        config.region = region;
-      }
-      config.throughputTargetGbps = static_cast<double>(
-          envOrDefault("GLUTEN_CPP_S3_CRT_TARGET_GBPS", 25));
-      config.partSize = envOrDefault("GLUTEN_CPP_S3_CRT_PART_BYTES", 8UL << 20);
-      config.downloadMemoryUsageWindow =
+      baseTargetGbps_ = envOrDefault("GLUTEN_CPP_S3_CRT_TARGET_GBPS", 25);
+      baseWindowBytes_ =
           envOrDefault("GLUTEN_CPP_S3_CRT_DOWNLOAD_WINDOW_BYTES", 1UL << 30);
-      config.crtRetryStrategyConfig.crtRetryStrategyType =
-          Aws::S3Crt::S3CrtClientConfiguration::CrtRetryStrategyConfig::
-              CrtRetryStrategyType::EXPONENTIAL_BACKOFF;
-      config.crtRetryStrategyConfig.config.maxRetries =
-          envOrDefault("GLUTEN_CPP_S3_CRT_MAX_RETRIES", 5);
-      auto credentialsProvider = facebook::velox::filesystems::
-          makeSynchronizedCachingCredentialsProvider(
-              std::make_shared<
-                  Aws::Auth::DefaultAWSCredentialsProviderChain>());
-      crtClient_ = std::make_shared<Aws::S3Crt::S3CrtClient>(
-          std::move(credentialsProvider), config);
+      crtClient_ = makeCrtClient(baseTargetGbps_, baseWindowBytes_);
+      highThroughputTargetGbps_ =
+          envBytesOrZero("GLUTEN_CPP_S3_CRT_HIGH_TARGET_GBPS");
+      if (highThroughputTargetGbps_ > baseTargetGbps_) {
+        highThroughputWindowBytes_ = envOrDefault(
+            "GLUTEN_CPP_S3_CRT_HIGH_DOWNLOAD_WINDOW_BYTES",
+            std::max<size_t>(baseWindowBytes_, 4UL << 30));
+        LOG(WARNING)
+            << "CPP_S3_CRT_ADAPTIVE_PRESSURE configured=1 lazyClient=1 "
+            << "baseTargetGbps=" << baseTargetGbps_
+            << " highTargetGbps=" << highThroughputTargetGbps_
+            << " baseWindowBytes=" << baseWindowBytes_
+            << " highWindowBytes=" << highThroughputWindowBytes_
+            << " highMaxConcurrency=" << highThroughputConcurrency_;
+      }
     }
     if (!useCrt_) {
       workers_.reserve(concurrency_);
@@ -1392,11 +1666,18 @@ class NativeS3SdkScheduler {
   void enqueueCrt(std::shared_ptr<Request> request) {
     {
       std::lock_guard<std::mutex> lock(mutex_);
-      auto& queue =
-          request->size <= metadataPriorityBytes_ ? priorityQueue_ : queue_;
-      queue.push_back(std::move(request));
+      enqueueCrtLocked(std::move(request));
     }
     dispatchCrt();
+  }
+
+  void enqueueCrtLocked(std::shared_ptr<Request> request) {
+    auto& queue =
+        request->size <= metadataPriorityBytes_ ? priorityQueue_ : queue_;
+    if (request->highThroughput) {
+      ++queuedHighPressureRequests_;
+    }
+    queue.push_back(std::move(request));
   }
 
   void dispatchCrt() {
@@ -1404,16 +1685,98 @@ class NativeS3SdkScheduler {
       std::shared_ptr<Request> request;
       {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (stopping_ ||
-            inflightRequests_.load(std::memory_order_relaxed) >= concurrency_ ||
-            (priorityQueue_.empty() && queue_.empty())) {
+        if (stopping_ || (priorityQueue_.empty() && queue_.empty())) {
           return;
         }
-        auto& source = !priorityQueue_.empty() ? priorityQueue_ : queue_;
-        request = std::move(source.front());
-        source.pop_front();
+        const auto highInflight =
+            highThroughputInflightRequests_.load(std::memory_order_relaxed);
+        const bool highPressureActive =
+            highInflight > 0 || queuedHighPressureRequests_ > 0;
+        const auto effectiveConcurrency =
+            highPressureActive ? highThroughputConcurrency_ : concurrency_;
+        if (inflightRequests_.load(std::memory_order_relaxed) >=
+            effectiveConcurrency) {
+          return;
+        }
+        const auto canDispatch = [&](const auto& queued) {
+          return !queued->highThroughput ||
+              highInflight < highThroughputConcurrency_;
+        };
+        auto prioritySelected = std::find_if(
+            priorityQueue_.begin(), priorityQueue_.end(), canDispatch);
+        auto regularSelected =
+            std::find_if(queue_.begin(), queue_.end(), canDispatch);
+        if (prioritySelected == priorityQueue_.end() &&
+            regularSelected == queue_.end()) {
+          return;
+        }
+        auto& source =
+            prioritySelected != priorityQueue_.end() ? priorityQueue_ : queue_;
+        auto selected = prioritySelected != priorityQueue_.end()
+            ? prioritySelected
+            : regularSelected;
+        bool selectedByDemand = false;
+        if (&source == &queue_ && !demandPreferredFiles_.empty()) {
+          const auto demanded = std::find_if(
+              source.begin(), source.end(), [&](const auto& queued) {
+                return canDispatch(queued) &&
+                    demandPreferredFiles_.contains(
+                        fileIdentity(queued->bucket, queued->key));
+              });
+          if (demanded != source.end()) {
+            selected = demanded;
+            selectedByDemand = true;
+            const auto selectedIdentity =
+                fileIdentity((*selected)->bucket, (*selected)->key);
+            const auto anotherQueued = std::find_if(
+                std::next(selected), source.end(), [&](const auto& queued) {
+                  return fileIdentity(queued->bucket, queued->key) ==
+                      selectedIdentity;
+                });
+            if (anotherQueued == source.end()) {
+              demandPreferredFiles_.erase(selectedIdentity);
+            }
+            demandKeyPriorityDispatches_.fetch_add(
+                1, std::memory_order_relaxed);
+          }
+        }
+        if (!selectedByDemand && completionKeyContinuity_ &&
+            &source == &queue_ && !completionPreferredKeys_.empty()) {
+          const auto preferred = std::find_if(
+              source.begin(), source.end(), [&](const auto& queued) {
+                return canDispatch(queued) && queued->directCacheFill &&
+                    queued->size >= completionKeyContinuityMinBytes_ &&
+                    completionPreferredKeys_.contains(queued->key);
+              });
+          if (preferred != source.end()) {
+            selected = preferred;
+            completionPreferredKeys_.erase((*selected)->key);
+            completionKeyContinuityDispatches_.fetch_add(
+                1, std::memory_order_relaxed);
+          }
+        }
+        request = std::move(*selected);
+        source.erase(selected);
+        if (request->highThroughput) {
+          VELOX_CHECK_GT(queuedHighPressureRequests_, 0);
+          --queuedHighPressureRequests_;
+        }
         const auto inflight =
             inflightRequests_.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (request->highThroughput) {
+          const auto highThroughputInflight =
+              highThroughputInflightRequests_.fetch_add(
+                  1, std::memory_order_relaxed) +
+              1;
+          auto highThroughputPeak = highThroughputPeakInflightRequests_.load(
+              std::memory_order_relaxed);
+          while (highThroughputInflight > highThroughputPeak &&
+                 !highThroughputPeakInflightRequests_.compare_exchange_weak(
+                     highThroughputPeak,
+                     highThroughputInflight,
+                     std::memory_order_relaxed)) {
+          }
+        }
         auto peak = peakInflightRequests_.load(std::memory_order_relaxed);
         while (inflight > peak &&
                !peakInflightRequests_.compare_exchange_weak(
@@ -1446,7 +1809,18 @@ class NativeS3SdkScheduler {
         });
       }
       const auto started = std::chrono::steady_clock::now();
-      crtClient_->GetObjectAsync(
+      auto client = crtClient_;
+      if (request->highThroughput) {
+        const auto highThroughputClient =
+            highThroughputCrtClient_.load(std::memory_order_acquire);
+        if (highThroughputClient) {
+          client = highThroughputClient;
+          request->usedHighThroughputClient = true;
+          highThroughputSubmittedRequests_.fetch_add(
+              1, std::memory_order_relaxed);
+        }
+      }
+      client->GetObjectAsync(
           *get,
           [this, request, get, started](
               const Aws::S3Crt::S3CrtClient*,
@@ -1480,10 +1854,19 @@ class NativeS3SdkScheduler {
                     request->size,
                     "Short native S3 CRT scatter response");
               }
-              request->promise.set_value(request->size);
+              if (request->asyncPromise) {
+                request->asyncPromise->setValue(request->size);
+              } else {
+                request->promise.set_value(request->size);
+              }
               succeeded = true;
             } catch (...) {
-              request->promise.set_exception(std::current_exception());
+              if (request->asyncPromise) {
+                request->asyncPromise->setException(
+                    folly::exception_wrapper(std::current_exception()));
+              } else {
+                request->promise.set_exception(std::current_exception());
+              }
             }
             const auto elapsedUs =
                 std::chrono::duration_cast<std::chrono::microseconds>(
@@ -1497,6 +1880,19 @@ class NativeS3SdkScheduler {
                 directCacheFillCompletedRequests_.fetch_add(
                     1, std::memory_order_relaxed);
               }
+              if (request->usedHighThroughputClient) {
+                highThroughputCompletedRequests_.fetch_add(
+                    1, std::memory_order_relaxed);
+              }
+              if (completionKeyContinuity_ && request->directCacheFill &&
+                  request->size >= completionKeyContinuityMinBytes_) {
+                std::lock_guard<std::mutex> lock(mutex_);
+                completionPreferredKeys_.insert(request->key);
+              }
+            }
+            if (request->highThroughput) {
+              highThroughputInflightRequests_.fetch_sub(
+                  1, std::memory_order_relaxed);
             }
             inflightRequests_.fetch_sub(1, std::memory_order_relaxed);
             const auto completed =
@@ -1511,9 +1907,12 @@ class NativeS3SdkScheduler {
     if (!diagnostics_ || completed % 256 != 0) {
       return;
     }
-    const auto elapsed = std::chrono::duration<double>(
-                             std::chrono::steady_clock::now() - started_)
-                             .count();
+    const auto nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           std::chrono::steady_clock::now().time_since_epoch())
+                           .count();
+    const auto startedNs = startedNs_.load(std::memory_order_relaxed);
+    VELOX_CHECK_GT(startedNs, 0);
+    const auto elapsed = (nowNs - startedNs) / 1e9;
     const auto bytes = completedBytes_.load(std::memory_order_relaxed);
     LOG(WARNING)
         << (useCrt_ ? "CPP_S3_CRT" : "CPP_S3_SDK") << " completed=" << completed
@@ -1533,6 +1932,16 @@ class NativeS3SdkScheduler {
         << directCacheFillGapBytes_.load(std::memory_order_relaxed)
         << " directCacheFillScatterBuffers="
         << directCacheFillScatterBuffers_.load(std::memory_order_relaxed)
+        << " highThroughputSubmitted="
+        << highThroughputSubmittedRequests_.load(std::memory_order_relaxed)
+        << " highThroughputCompleted="
+        << highThroughputCompletedRequests_.load(std::memory_order_relaxed)
+        << " highPressurePeakInflight="
+        << highThroughputPeakInflightRequests_.load(std::memory_order_relaxed)
+        << " demandKeyPriorityDispatches="
+        << demandKeyPriorityDispatches_.load(std::memory_order_relaxed)
+        << " completionKeyContinuityDispatches="
+        << completionKeyContinuityDispatches_.load(std::memory_order_relaxed)
         << " retries=" << retryAttempts_.load(std::memory_order_relaxed)
         << " elapsedSeconds=" << elapsed
         << " payloadGbps=" << (elapsed == 0 ? 0.0 : bytes * 8.0 / elapsed / 1e9)
@@ -1599,19 +2008,40 @@ class NativeS3SdkScheduler {
 
   const bool useCrt_;
   const size_t concurrency_;
+  const size_t highThroughputConcurrency_;
   const size_t rangeBytes_;
+  const bool adaptiveRanges_;
   const size_t rangeCoalesceGapBytes_;
   const size_t maxCoalescedRangeBytes_;
+  const bool sliceOversizedRanges_;
   const size_t metadataPriorityBytes_;
+  const bool demandPriority_;
+  const bool completionKeyContinuity_;
+  const size_t completionKeyContinuityMinBytes_;
   const bool diagnostics_;
-  const std::chrono::steady_clock::time_point started_;
+  static std::string fileIdentity(
+      const std::string& bucket,
+      const std::string& key) {
+    return bucket + '\n' + key;
+  }
+  std::atomic<int64_t> startedNs_{0};
   std::mutex mutex_;
   std::condition_variable condition_;
   std::deque<std::shared_ptr<Request>> priorityQueue_;
   std::deque<std::shared_ptr<Request>> queue_;
+  size_t queuedHighPressureRequests_{0};
+  std::unordered_set<std::string> demandPreferredFiles_;
+  std::unordered_set<std::string> completionPreferredKeys_;
   bool stopping_{false};
   std::vector<std::thread> workers_;
   std::shared_ptr<Aws::S3Crt::S3CrtClient> crtClient_;
+  size_t baseTargetGbps_{0};
+  size_t baseWindowBytes_{0};
+  size_t highThroughputTargetGbps_{0};
+  size_t highThroughputWindowBytes_{0};
+  std::mutex highThroughputCrtClientMutex_;
+  std::atomic<std::shared_ptr<Aws::S3Crt::S3CrtClient>>
+      highThroughputCrtClient_;
   std::atomic<uint64_t> submittedRequests_{0};
   std::atomic<uint64_t> submittedBytes_{0};
   std::atomic<uint64_t> directCacheFillSubmittedRequests_{0};
@@ -1620,6 +2050,15 @@ class NativeS3SdkScheduler {
   std::atomic<uint64_t> directCacheFillLogicalBytes_{0};
   std::atomic<uint64_t> directCacheFillGapBytes_{0};
   std::atomic<uint64_t> directCacheFillScatterBuffers_{0};
+  std::atomic<uint64_t> highThroughputSubmittedRequests_{0};
+  std::atomic<uint64_t> highThroughputCompletedRequests_{0};
+  std::atomic<uint64_t> highThroughputInflightRequests_{0};
+  std::atomic<uint64_t> highThroughputPeakInflightRequests_{0};
+  std::atomic<uint64_t> adaptiveRangePolicyCalls_{0};
+  std::atomic<uint64_t> adaptiveWideRangePolicyCalls_{0};
+  std::atomic<uint64_t> adaptiveGapPolicyCalls_{0};
+  std::atomic<uint64_t> demandKeyPriorityDispatches_{0};
+  std::atomic<uint64_t> completionKeyContinuityDispatches_{0};
   std::atomic<uint64_t> completedRequests_{0};
   std::atomic<uint64_t> completedBytes_{0};
   std::atomic<uint64_t> inflightRequests_{0};
@@ -1665,6 +2104,63 @@ class NativeScheduledS3ReadFile final : public facebook::velox::ReadFile {
     return readRanges(offset, buffers, context);
   }
 
+  bool hasPreadvAsync() const override {
+    return envFlagOrDefault(
+               "GLUTEN_CPP_S3_ASYNC_CACHE_READ_GROUPS",
+               adaptiveS3PrefetchEnabled()) &&
+        envBytesOrZero("GLUTEN_CPP_S3_CRT") != 0;
+  }
+
+  folly::SemiFuture<uint64_t> preadvAsync(
+      uint64_t offset,
+      const std::vector<folly::Range<char*>>& buffers,
+      const facebook::velox::FileIoContext& context) const override {
+    if (!hasPreadvAsync()) {
+      return facebook::velox::ReadFile::preadvAsync(offset, buffers, context);
+    }
+    auto& scheduler = NativeS3SdkScheduler::instance();
+    const auto policy = scheduler.readPolicy(buffers);
+    auto groups = facebook::velox::cudf_velox::connector::hive::
+        groupNativeS3ReadDestinations(
+            offset,
+            buffers,
+            policy.maxGapBytes,
+            policy.maxRangeBytes,
+            scheduler.sliceOversizedRanges());
+    std::vector<folly::SemiFuture<size_t>> pending;
+    pending.reserve(groups.size());
+    uint64_t submittedBytes = 0;
+    for (const auto& group : groups) {
+      submittedBytes += group.size;
+    }
+    for (auto& group : groups) {
+      pending.push_back(scheduler.submitCrtScatterAsync(
+          bucket_, key_, group.offset, std::move(group.destinations)));
+    }
+    uint64_t logicalBytes = 0;
+    for (const auto& buffer : buffers) {
+      VELOX_CHECK_LE(
+          buffer.size(),
+          std::numeric_limits<uint64_t>::max() - logicalBytes,
+          "Native scheduled S3 async read size overflow");
+      logicalBytes += buffer.size();
+    }
+    return folly::collectAll(std::move(pending))
+        .deferValue([this, submittedBytes, logicalBytes](
+                        std::vector<folly::Try<size_t>> results) {
+          uint64_t completedBytes = 0;
+          for (auto& result : results) {
+            completedBytes += std::move(result).value();
+          }
+          VELOX_CHECK_EQ(
+              completedBytes,
+              submittedBytes,
+              "Short executor-global asynchronous native S3 read");
+          bytesRead_.fetch_add(submittedBytes, std::memory_order_relaxed);
+          return logicalBytes;
+        });
+  }
+
   bool shouldCoalesce() const override {
     return readFile_->shouldCoalesce();
   }
@@ -1697,12 +2193,14 @@ class NativeScheduledS3ReadFile final : public facebook::velox::ReadFile {
     uint64_t logicalBytes = 0;
     uint64_t submittedBytes = 0;
     if (useCrt) {
+      const auto policy = scheduler.readPolicy(buffers);
       auto groups = facebook::velox::cudf_velox::connector::hive::
           groupNativeS3ReadDestinations(
               offset,
               buffers,
-              scheduler.rangeCoalesceGapBytes(),
-              scheduler.maxCoalescedRangeBytes());
+              policy.maxGapBytes,
+              policy.maxRangeBytes,
+              scheduler.sliceOversizedRanges());
       pending.reserve(groups.size());
       for (auto& group : groups) {
         submittedBytes += group.size;
@@ -1780,6 +2278,29 @@ std::future<T> toStdFuture(folly::Future<T> follyFuture) {
 } // namespace
 
 namespace facebook::velox::cudf_velox::connector::hive {
+
+void prepareNativeS3HighThroughputClient() {
+  NativeS3SdkScheduler::instance().prepareHighThroughputCrtClient();
+}
+
+void runWithNativeS3RequestPressure(
+    bool highThroughput,
+    const std::function<void()>& producer) {
+  VELOX_CHECK(static_cast<bool>(producer));
+  const auto previous = nativeS3HighRequestPressure;
+  nativeS3HighRequestPressure = highThroughput;
+  try {
+    producer();
+  } catch (...) {
+    nativeS3HighRequestPressure = previous;
+    throw;
+  }
+  nativeS3HighRequestPressure = previous;
+}
+
+bool nativeS3HighRequestPressureForCurrentThread() {
+  return nativeS3HighRequestPressure;
+}
 
 DirectCachePageH2dStats directCachePageH2dStats() {
   return {
@@ -1868,11 +2389,83 @@ BoundedCachePageRegistration makeBoundedCachePageRegistration(
 }
 
 #ifdef VELOX_ENABLE_S3
+NativeS3ReadPolicy chooseNativeS3ReadPolicy(
+    const std::vector<folly::Range<char*>>& destinations,
+    uint64_t baseRangeBytes,
+    uint64_t maxGapBytes,
+    uint64_t maxRangeBytes,
+    bool adaptive) {
+  VELOX_CHECK_GT(baseRangeBytes, 0);
+  VELOX_CHECK_GT(maxRangeBytes, 0);
+  if (!adaptive) {
+    return {.maxGapBytes = maxGapBytes, .maxRangeBytes = maxRangeBytes};
+  }
+
+  const auto boundedBaseRangeBytes = std::min(baseRangeBytes, maxRangeBytes);
+  uint64_t logicalBytes{0};
+  uint64_t pendingGapBytes{0};
+  uint64_t internalGapBytes{0};
+  uint64_t largestInternalGapBytes{0};
+  uint64_t dataRanges{0};
+  bool sawData{false};
+  for (const auto& destination : destinations) {
+    if (destination.empty()) {
+      continue;
+    }
+    if (destination.data() == nullptr) {
+      if (sawData) {
+        VELOX_CHECK_LE(
+            destination.size(),
+            std::numeric_limits<uint64_t>::max() - pendingGapBytes,
+            "Native S3 adaptive gap byte count overflow");
+        pendingGapBytes += destination.size();
+      }
+      continue;
+    }
+    VELOX_CHECK_LE(
+        destination.size(),
+        std::numeric_limits<uint64_t>::max() - logicalBytes,
+        "Native S3 adaptive logical byte count overflow");
+    logicalBytes += destination.size();
+    if (sawData) {
+      VELOX_CHECK_LE(
+          pendingGapBytes,
+          std::numeric_limits<uint64_t>::max() - internalGapBytes,
+          "Native S3 adaptive internal gap byte count overflow");
+      internalGapBytes += pendingGapBytes;
+      largestInternalGapBytes =
+          std::max(largestInternalGapBytes, pendingGapBytes);
+    }
+    pendingGapBytes = 0;
+    sawData = true;
+    ++dataRanges;
+  }
+
+  NativeS3ReadPolicy policy{
+      .maxGapBytes = 0, .maxRangeBytes = boundedBaseRangeBytes};
+  if (dataRanges < 2 || logicalBytes < boundedBaseRangeBytes) {
+    return policy;
+  }
+
+  // A dense multi-range read can amortize request latency without materially
+  // increasing bytes transferred. Keep at least 32 useful bytes for every
+  // byte of admitted logical gap. Leading/trailing holes are never admitted.
+  const auto gapBudgetBytes = logicalBytes / 32;
+  if (internalGapBytes > gapBudgetBytes ||
+      largestInternalGapBytes > maxGapBytes) {
+    return policy;
+  }
+  policy.maxGapBytes = largestInternalGapBytes;
+  policy.maxRangeBytes = maxRangeBytes;
+  return policy;
+}
+
 std::vector<NativeS3ReadGroup> groupNativeS3ReadDestinations(
     uint64_t offset,
     const std::vector<folly::Range<char*>>& destinations,
     uint64_t maxGapBytes,
-    uint64_t maxRangeBytes) {
+    uint64_t maxRangeBytes,
+    bool sliceOversizedRanges) {
   VELOX_CHECK_GT(maxRangeBytes, 0);
   std::vector<NativeS3ReadGroup> groups;
   uint64_t logicalOffset = offset;
@@ -1885,16 +2478,10 @@ std::vector<NativeS3ReadGroup> groupNativeS3ReadDestinations(
       logicalOffset += destination.size();
       continue;
     }
-    uint64_t destinationOffset = 0;
-    while (destinationOffset < destination.size()) {
-      const auto chunkSize = std::min<uint64_t>(
-          maxRangeBytes, destination.size() - destinationOffset);
-      folly::Range<char*> chunk{
-          destination.data() + static_cast<size_t>(destinationOffset),
-          static_cast<size_t>(chunkSize)};
+    if (!sliceOversizedRanges) {
       bool startGroup = groups.empty();
       uint64_t gapBytes = 0;
-      uint64_t coalescedSize = chunkSize;
+      uint64_t coalescedSize = destination.size();
       if (!startGroup) {
         const auto& group = groups.back();
         VELOX_CHECK_LE(
@@ -1905,11 +2492,11 @@ std::vector<NativeS3ReadGroup> groupNativeS3ReadDestinations(
         VELOX_CHECK_LE(groupEnd, logicalOffset);
         gapBytes = logicalOffset - groupEnd;
         VELOX_CHECK_LE(
-            chunkSize,
+            destination.size(),
             std::numeric_limits<uint64_t>::max() - logicalOffset,
             "Native S3 coalesced range end overflow");
-        const auto chunkEnd = logicalOffset + chunkSize;
-        coalescedSize = chunkEnd - group.offset;
+        const auto destinationEnd = logicalOffset + destination.size();
+        coalescedSize = destinationEnd - group.offset;
         startGroup = gapBytes > maxGapBytes || coalescedSize > maxRangeBytes;
       }
       if (startGroup) {
@@ -1917,15 +2504,57 @@ std::vector<NativeS3ReadGroup> groupNativeS3ReadDestinations(
             NativeS3ReadGroup{
                 .offset = logicalOffset, .size = 0, .destinations = {}});
         gapBytes = 0;
-        coalescedSize = chunkSize;
+        coalescedSize = destination.size();
       }
       auto& group = groups.back();
       if (gapBytes != 0) {
         group.destinations.emplace_back(nullptr, gapBytes);
       }
       group.size = coalescedSize;
-      group.destinations.push_back(chunk);
-      destinationOffset += chunkSize;
+      group.destinations.push_back(destination);
+      logicalOffset += destination.size();
+      continue;
+    }
+    uint64_t consumed = 0;
+    while (consumed < destination.size()) {
+      bool startGroup = groups.empty();
+      uint64_t gapBytes = 0;
+      uint64_t available = maxRangeBytes;
+      if (!startGroup) {
+        const auto& group = groups.back();
+        VELOX_CHECK_LE(
+            group.size,
+            std::numeric_limits<uint64_t>::max() - group.offset,
+            "Native S3 scatter group end overflow");
+        const auto groupEnd = group.offset + group.size;
+        VELOX_CHECK_LE(groupEnd, logicalOffset);
+        gapBytes = logicalOffset - groupEnd;
+        startGroup =
+            gapBytes > maxGapBytes || gapBytes > maxRangeBytes - group.size;
+        if (!startGroup) {
+          available = maxRangeBytes - group.size - gapBytes;
+          startGroup =
+              available == 0 || destination.size() - consumed > available;
+        }
+      }
+      if (startGroup) {
+        groups.push_back(
+            NativeS3ReadGroup{
+                .offset = logicalOffset, .size = 0, .destinations = {}});
+        gapBytes = 0;
+        available = maxRangeBytes;
+      }
+      auto& group = groups.back();
+      if (gapBytes != 0) {
+        group.destinations.emplace_back(nullptr, gapBytes);
+        group.size += gapBytes;
+      }
+      const auto chunkSize =
+          std::min<uint64_t>(destination.size() - consumed, available);
+      VELOX_CHECK_GT(chunkSize, 0);
+      group.destinations.emplace_back(destination.data() + consumed, chunkSize);
+      group.size += chunkSize;
+      consumed += chunkSize;
       logicalOffset += chunkSize;
     }
   }
@@ -1992,6 +2621,45 @@ bool crtS3RangeReaderAvailable() {
 bool nativeS3ScheduledReadEnabled() {
   return envBytesOrZero("GLUTEN_CPP_S3_CRT") != 0 ||
       envBytesOrZero("GLUTEN_CPP_S3_AWS_SDK") != 0;
+}
+
+void logNativeS3SchedulerStats(std::string_view event, std::string_view id) {
+#ifdef VELOX_ENABLE_S3
+  if (nativeS3ScheduledReadEnabled()) {
+    NativeS3SdkScheduler::instance().logSnapshot(event, id);
+  }
+#endif
+}
+
+void initializeNativeS3Scheduler() {
+#ifdef VELOX_ENABLE_S3
+  if (!nativeS3ScheduledReadEnabled()) {
+    return;
+  }
+  const auto start = std::chrono::steady_clock::now();
+  const auto initializedAwsSdk = facebook::velox::filesystems::initializeS3();
+  static_cast<void>(NativeS3SdkScheduler::instance());
+  const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - start)
+                             .count();
+  LOG(WARNING) << "Native S3 scheduler initialized eagerly in " << elapsedMs
+               << " ms; crt=" << (envBytesOrZero("GLUTEN_CPP_S3_CRT") != 0)
+               << "; initializedAwsSdk=" << initializedAwsSdk;
+#endif
+}
+
+bool prioritizeNativeS3File(const std::string& filePath) {
+#ifdef VELOX_ENABLE_S3
+  if (!nativeS3ScheduledReadEnabled() || !filePath.starts_with("s3://")) {
+    return false;
+  }
+  auto bucketAndObject = kvikio::S3Endpoint::parse_s3_url(filePath);
+  return NativeS3SdkScheduler::instance().prioritizeFile(
+      bucketAndObject.first, bucketAndObject.second);
+#else
+  static_cast<void>(filePath);
+  return false;
+#endif
 }
 
 std::shared_ptr<facebook::velox::ReadFile> makeNativeScheduledS3ReadFile(
@@ -2470,6 +3138,8 @@ BufferedInputDataSource::BufferedInputDataSource(
     std::optional<BufferedInputDeviceCopyHooks> deviceCopyHooks)
     : input_(std::move(input)),
       fileSize_(input_->getReadFile()->size()),
+      metadataReadAheadBytes_(
+          envBytesOrZero("GLUTEN_CPP_S3_METADATA_READAHEAD_BYTES")),
       deviceCopyHooks_(
           deviceCopyHooks.has_value() ? std::move(deviceCopyHooks.value())
                                       : defaultBufferedInputDeviceCopyHooks()) {
@@ -2537,8 +3207,54 @@ bool BufferedInputDataSource::prefetchToCache(
         {static_cast<uint64_t>(range.offset()),
          static_cast<uint64_t>(range.size())});
   }
-  cached->prefetchSync(regions);
+  const auto inlineLoad = envFlagEnabled("GLUTEN_CUDF_CACHE_HINT_INLINE_LOAD");
+  if (inlineLoad) {
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true, std::memory_order_relaxed)) {
+      LOG(WARNING) << "CUDF_CACHE_HINT_INLINE_LOAD enabled=1";
+    }
+  }
+  cached->prefetchSync(regions, inlineLoad);
   return true;
+}
+
+std::function<void()> BufferedInputDataSource::prepareCachePrefetch(
+    const std::vector<cudf::io::text::byte_range_info>& byteRanges) {
+  return prepareCachePrefetch(byteRanges, /*firstLoadReady=*/{});
+}
+
+std::function<void()> BufferedInputDataSource::prepareCachePrefetch(
+    const std::vector<cudf::io::text::byte_range_info>& byteRanges,
+    std::function<void()> firstLoadReady) {
+  auto* cached =
+      dynamic_cast<facebook::velox::dwio::common::CachedBufferedInput*>(
+          input_.get());
+  if (cached == nullptr) {
+    return {};
+  }
+  std::vector<facebook::velox::common::Region> regions;
+  regions.reserve(byteRanges.size());
+  for (const auto& range : byteRanges) {
+    regions.push_back(
+        {static_cast<uint64_t>(range.offset()),
+         static_cast<uint64_t>(range.size())});
+  }
+  const auto asyncPhysicalGroups =
+      envFlagEnabled("GLUTEN_CPP_S3_ASYNC_CACHE_READ_GROUPS");
+  const auto preallocatePins = !asyncPhysicalGroups ||
+      envFlagEnabled("GLUTEN_CUDF_CACHE_HINT_PREALLOCATE_PINS");
+  static std::atomic<bool> logged{false};
+  if (!logged.exchange(true, std::memory_order_relaxed)) {
+    LOG(WARNING) << "CUDF_CACHE_HINT_PREPARE_LOADS enabled=1 preallocatePins="
+                 << preallocatePins
+                 << " asyncPhysicalGroups=" << asyncPhysicalGroups;
+  }
+  return cached->preparePrefetch(
+      regions,
+      /*inlineLoad=*/true,
+      preallocatePins,
+      asyncPhysicalGroups,
+      std::move(firstLoadReady));
 }
 
 uint64_t BufferedInputDataSource::canonicalCacheBytes(
@@ -2600,7 +3316,7 @@ BufferedInputDataSource::host_read(size_t offset, size_t size) {
   }
   const size_t readSize = std::min(size, fileSize_ - offset);
   std::vector<uint8_t> data(readSize);
-  readContiguous(offset, readSize, data.data());
+  readBuffered(offset, readSize, data.data());
   return cudf::io::datasource::buffer::create(std::move(data));
 }
 
@@ -2610,6 +3326,38 @@ BufferedInputDataSource::host_read(size_t offset, size_t size, uint8_t* dst) {
     return 0;
   }
   const size_t readSize = std::min(size, fileSize_ - offset);
+  return readBuffered(offset, readSize, dst);
+}
+
+size_t BufferedInputDataSource::readBuffered(
+    size_t offset,
+    size_t readSize,
+    uint8_t* dst) {
+  if (readSize == 0) {
+    return 0;
+  }
+  VELOX_CHECK_NOT_NULL(dst);
+  if (offset == 0 && readSize == 4 &&
+      envBytesOrZero("GLUTEN_CPP_S3_SYNTHESIZE_PARQUET_MAGIC") != 0) {
+    static constexpr uint8_t kParquetMagic[] = {'P', 'A', 'R', '1'};
+    std::memcpy(dst, kParquetMagic, sizeof(kParquetMagic));
+    return sizeof(kParquetMagic);
+  }
+  const auto tailReadSize = std::min(metadataReadAheadBytes_, fileSize_);
+  const auto tailOffset = fileSize_ - tailReadSize;
+  if (tailReadSize != 0 && readSize <= tailReadSize && offset >= tailOffset) {
+    std::call_once(tailCacheOnce_, [this, tailOffset, tailReadSize]() {
+      tailCacheOffset_ = tailOffset;
+      tailCache_.resize(tailReadSize);
+      readContiguous(tailOffset, tailReadSize, tailCache_.data());
+    });
+    VELOX_CHECK_LE(
+        readSize,
+        tailCache_.size() - (offset - tailCacheOffset_),
+        "Buffered S3 metadata read exceeds tail cache");
+    std::memcpy(dst, tailCache_.data() + offset - tailCacheOffset_, readSize);
+    return readSize;
+  }
   readContiguous(offset, readSize, dst);
   return readSize;
 }

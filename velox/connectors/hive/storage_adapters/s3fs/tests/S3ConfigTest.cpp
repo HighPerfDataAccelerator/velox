@@ -40,6 +40,7 @@ TEST(S3ConfigTest, defaultConfig) {
   ASSERT_EQ(s3Config.bucket(), "");
   ASSERT_EQ(s3Config.useIMDS(), true);
   ASSERT_EQ(s3Config.minPartSize(), 10485760);
+  ASSERT_EQ(s3Config.multipartUploadThreads(), 1);
 }
 
 TEST(S3ConfigTest, overrideConfig) {
@@ -58,7 +59,8 @@ TEST(S3ConfigTest, overrideConfig) {
       {S3Config::baseConfigKey(S3Config::Keys::kCredentialsProvider),
        "my-credentials-provider"},
       {S3Config::baseConfigKey(S3Config::Keys::kIMDSEnabled), "false"},
-      {S3Config::baseConfigKey(S3Config::Keys::kMultipartMinPartSize), "20MB"}};
+      {S3Config::baseConfigKey(S3Config::Keys::kMultipartMinPartSize), "20MB"},
+      {S3Config::baseConfigKey(S3Config::Keys::kMultipartUploadThreads), "4"}};
   auto configBase =
       std::make_shared<config::ConfigBase>(std::move(configFromFile));
   auto s3Config = S3Config("bucket", configBase);
@@ -78,6 +80,7 @@ TEST(S3ConfigTest, overrideConfig) {
   ASSERT_EQ(s3Config.credentialsProvider(), "my-credentials-provider");
   ASSERT_EQ(s3Config.useIMDS(), false);
   ASSERT_EQ(s3Config.minPartSize(), 20971520);
+  ASSERT_EQ(s3Config.multipartUploadThreads(), 4);
 }
 
 TEST(S3ConfigTest, overrideBucketConfig) {
@@ -168,6 +171,16 @@ TEST(S3ConfigTest, minPartSizeValidationBucketConfig) {
   VELOX_ASSERT_THROW(
       S3Config(bucket, configBase),
       "The min-part-size S3 configuration must not exceed 5GB");
+}
+
+TEST(S3ConfigTest, multipartUploadThreadsValidation) {
+  for (const auto& value : {"0", "17"}) {
+    auto config = std::make_shared<config::ConfigBase>(
+        std::unordered_map<std::string, std::string>{
+            {S3Config::baseConfigKey(S3Config::Keys::kMultipartUploadThreads),
+             value}});
+    VELOX_ASSERT_THROW(S3Config("bucket", config), "multipart-upload-threads");
+  }
 }
 
 } // namespace

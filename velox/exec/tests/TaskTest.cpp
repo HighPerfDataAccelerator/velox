@@ -804,6 +804,63 @@ TEST_F(TaskTest, preloadedSplitsAreConsumedInReadyOrder) {
   task->requestCancel().wait();
 }
 
+TEST_F(TaskTest, primesSplitPreloadsWithoutConsuming) {
+  auto data = makeRowVector({makeFlatVector<int32_t>({1, 2, 3})});
+  auto task = Task::create(
+      "task-prime-preload",
+      PlanBuilder().tableScan(asRowType(data->type())).planFragment(),
+      0,
+      core::QueryCtx::create(),
+      Task::ExecutionMode::kSerial,
+      exec::Consumer{});
+
+  auto first = makeHiveConnectorSplit("file:/tmp/first");
+  auto second = makeHiveConnectorSplit("file:/tmp/second");
+  task->addSplit("0", exec::Split(first));
+  task->addSplit("0", exec::Split(second));
+  task->noMoreSplits("0");
+
+  int32_t preloadCalls = 0;
+  ConnectorSplitPreloadFunc preload =
+      [&](const std::shared_ptr<connector::ConnectorSplit>& connectorSplit) {
+        ++preloadCalls;
+        connectorSplit->dataSource =
+            std::make_unique<AsyncSource<connector::DataSource>>(
+                []() -> std::unique_ptr<connector::DataSource> {
+                  VELOX_FAIL("Primed preload completion");
+                });
+        connectorSplit->dataSource->prepare();
+      };
+
+  task->preloadSplits(kUngroupedGroupId, "0", /*maxPreloadSplits=*/2, preload);
+  EXPECT_EQ(preloadCalls, 2);
+  EXPECT_EQ(task->taskStats().numQueuedTableScanSplits, 2);
+  EXPECT_TRUE(first->dataSource->hasValue());
+  EXPECT_TRUE(second->dataSource->hasValue());
+
+  // Priming is idempotent and does not assign either split to a driver.
+  task->preloadSplits(kUngroupedGroupId, "0", /*maxPreloadSplits=*/2, preload);
+  EXPECT_EQ(preloadCalls, 2);
+  EXPECT_EQ(task->taskStats().numQueuedTableScanSplits, 2);
+
+  exec::Split split;
+  ContinueFuture splitFuture = ContinueFuture::makeEmpty();
+  EXPECT_EQ(
+      task->getSplitOrFuture(
+          /*driverId=*/0,
+          kUngroupedGroupId,
+          "0",
+          /*maxPreloadSplits=*/2,
+          preload,
+          split,
+          splitFuture),
+      BlockingReason::kNotBlocked);
+  EXPECT_EQ(preloadCalls, 2);
+  EXPECT_EQ(task->taskStats().numQueuedTableScanSplits, 1);
+
+  task->requestCancel().wait();
+}
+
 TEST_F(TaskTest, wrongPlanNodeForSplit) {
   auto connectorSplit = std::make_shared<connector::hive::HiveConnectorSplit>(
       "test",

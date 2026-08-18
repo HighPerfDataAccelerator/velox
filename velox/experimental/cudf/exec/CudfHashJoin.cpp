@@ -49,6 +49,7 @@
 #include <cudf/search.hpp>
 #include <cudf/stream_compaction.hpp>
 #include <cudf/unary.hpp>
+#include <cudf/version_config.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_uvector.hpp>
@@ -406,6 +407,8 @@ void CudfHashJoinBuild::doNoMoreInput() {
   std::vector<std::shared_ptr<cudf::hash_join>> hashObjects;
   for (auto i = 0; i < tbls.size(); i++) {
     hashObjects.push_back(
+#if CUDF_VERSION_MAJOR > 26 || \
+    (CUDF_VERSION_MAJOR == 26 && CUDF_VERSION_MINOR >= 8)
         (buildHashJoin) ? std::make_shared<cudf::hash_join>(
                               tbls[i]->view().select(buildKeyIndices),
                               cudf::nullable_join::YES,
@@ -414,6 +417,13 @@ void CudfHashJoinBuild::doNoMoreInput() {
                               stream,
                               get_temp_mr())
                         : nullptr);
+#else
+        (buildHashJoin) ? std::make_shared<cudf::hash_join>(
+                              tbls[i]->view().select(buildKeyIndices),
+                              cudf::null_equality::UNEQUAL,
+                              stream)
+                        : nullptr);
+#endif
     if (buildHashJoin) {
       VELOX_CHECK_NOT_NULL(hashObjects.back());
     }
@@ -938,7 +948,10 @@ CudfHashJoinProbe::JoinOutput CudfHashJoinProbe::filteredOutputIndices(
           rightIndicesCol,
           tree_.back(),
           joinKind,
+#if CUDF_VERSION_MAJOR > 26 || \
+    (CUDF_VERSION_MAJOR == 26 && CUDF_VERSION_MINOR >= 8)
           std::nullopt,
+#endif
           stream,
           get_temp_mr());
 
@@ -1099,7 +1112,10 @@ std::vector<CudfHashJoinProbe::JoinOutput> CudfHashJoinProbe::leftJoin(
                 rightIndicesCol,
                 tree_.back(),
                 cudf::join_kind::INNER_JOIN,
+#if CUDF_VERSION_MAJOR > 26 || \
+    (CUDF_VERSION_MAJOR == 26 && CUDF_VERSION_MINOR >= 8)
                 std::nullopt,
+#endif
                 stream,
                 get_temp_mr());
 
@@ -1440,7 +1456,10 @@ std::vector<CudfHashJoinProbe::JoinOutput> CudfHashJoinProbe::fullJoin(
               rightIndicesCol,
               tree_.back(),
               cudf::join_kind::INNER_JOIN,
+#if CUDF_VERSION_MAJOR > 26 || \
+    (CUDF_VERSION_MAJOR == 26 && CUDF_VERSION_MINOR >= 8)
               std::nullopt,
+#endif
               stream,
               get_temp_mr());
 
@@ -1760,7 +1779,10 @@ CudfHashJoinProbe::leftSemiProjectJoin(
           rightIndicesSpan,
           tree_.back(),
           cudf::join_kind::INNER_JOIN,
+#if CUDF_VERSION_MAJOR > 26 || \
+    (CUDF_VERSION_MAJOR == 26 && CUDF_VERSION_MINOR >= 8)
           std::nullopt,
+#endif
           stream,
           get_temp_mr());
 
@@ -1858,7 +1880,10 @@ CudfHashJoinProbe::leftSemiProjectJoin(
               toSpan(syntheticRight->view()),
               tree_.back(),
               cudf::join_kind::INNER_JOIN,
+#if CUDF_VERSION_MAJOR > 26 || \
+    (CUDF_VERSION_MAJOR == 26 && CUDF_VERSION_MINOR >= 8)
               std::nullopt,
+#endif
               stream,
               get_temp_mr());
 
@@ -2174,7 +2199,10 @@ CudfHashJoinProbe::rightSemiProjectJoin(
             rightIndicesCol,
             tree_.back(),
             cudf::join_kind::INNER_JOIN,
+#if CUDF_VERSION_MAJOR > 26 || \
+    (CUDF_VERSION_MAJOR == 26 && CUDF_VERSION_MINOR >= 8)
             std::nullopt,
+#endif
             stream,
             get_temp_mr());
         astFilteredRightIndices = std::move(filteredIndices.second);

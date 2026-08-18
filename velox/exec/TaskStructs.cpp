@@ -55,6 +55,7 @@ bool SplitsStore::getSplit(
     Split& split) {
   int readySplitIndex = -1;
   if (maxPreloadSplits > 0) {
+    maxPreloadSplits = preloadSplits(maxPreloadSplits, preload);
     for (int i = 0, end = std::min<size_t>(maxPreloadSplits, splits_.size());
          i < end;
          ++i) {
@@ -63,12 +64,7 @@ bool SplitsStore::getSplit(
         continue;
       }
       auto& connectorSplit = splits_[i].connectorSplit;
-      if (!connectorSplit->dataSource) {
-        // Initializes split->dataSource.
-        preload(connectorSplit);
-        preloadingSplits_->insert(connectorSplit);
-      } else if (
-          readySplitIndex == -1 && connectorSplit->dataSource->hasValue()) {
+      if (readySplitIndex == -1 && connectorSplit->dataSource->hasValue()) {
         readySplitIndex = i;
         preloadingSplits_->erase(connectorSplit);
       }
@@ -102,6 +98,29 @@ bool SplitsStore::getSplit(
     taskStats_->firstSplitStartTimeMs = taskStats_->lastSplitStartTimeMs;
   }
   return true;
+}
+
+int SplitsStore::preloadSplits(
+    int maxPreloadSplits,
+    const ConnectorSplitPreloadFunc& preload) {
+  if (maxPreloadSplits <= 0 || !preload) {
+    return 0;
+  }
+  VELOX_CHECK_NOT_NULL(preloadingSplits_);
+  for (int i = 0, end = std::min<size_t>(maxPreloadSplits, splits_.size());
+       i < end;
+       ++i) {
+    if (splits_[i].isBarrier()) {
+      VELOX_CHECK(!remoteSplit_);
+      continue;
+    }
+    auto& connectorSplit = splits_[i].connectorSplit;
+    if (!connectorSplit->dataSource) {
+      preload(connectorSplit);
+      preloadingSplits_->insert(connectorSplit);
+    }
+  }
+  return maxPreloadSplits;
 }
 
 bool SplitsStore::tryGetBarrier(

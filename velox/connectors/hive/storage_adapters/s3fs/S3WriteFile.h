@@ -47,8 +47,9 @@ class S3Config;
 /// https://docs.aws.amazon.com/AmazonS3/latest/userguide/mpuoverview.html
 /// https://github.com/apache/arrow/blob/main/cpp/src/arrow/filesystem/s3fs.cc
 /// S3WriteFile is not thread-safe.
-/// UploadPart is currently synchronous during append and flush.
-/// TODO: Evaluate and add option for asynchronous part uploads.
+/// UploadPart is synchronous by default. Set hive.s3.multipart-upload-threads
+/// above one to issue a bounded number of part uploads concurrently. Part
+/// metadata is sorted before completion, preserving byte order.
 /// TODO: Implement retry on failure.
 class S3WriteFile : public WriteFile {
  public:
