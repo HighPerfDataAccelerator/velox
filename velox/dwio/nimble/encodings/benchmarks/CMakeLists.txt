@@ -11,6 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+add_library(nimble_encoding_benchmark_data INTERFACE)
+
+velox_add_test_headers(
+  nimble_encoding_benchmark_data
+  DeltaBenchmarkData.h
+  FixedBitWidthBenchmarkData.h
+  SparseBoolBenchmarkData.h
+)
+
 add_executable(
   nimble_fixed_bit_width_benchmark
   FixedBitWidthBenchmark.cpp
