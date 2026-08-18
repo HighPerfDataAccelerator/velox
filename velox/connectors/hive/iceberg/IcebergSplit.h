@@ -103,6 +103,25 @@ struct HiveIcebergSplit : public connector::hive::HiveConnectorSplit {
       const std::unordered_map<int32_t, std::optional<std::string>>&
           identityPartitionKeys = {},
       std::vector<IcebergCoalescedFile> coalescedFiles = {});
+
+  // Compatibility overload for callers that predate identity partition keys.
+  HiveIcebergSplit(
+      const std::string& connectorId,
+      const std::string& filePath,
+      dwio::common::FileFormat fileFormat,
+      uint64_t start,
+      uint64_t length,
+      const std::unordered_map<std::string, std::optional<std::string>>&
+          partitionKeys,
+      std::optional<int32_t> tableBucketNumber,
+      const std::unordered_map<std::string, std::string>& customSplitInfo,
+      const std::shared_ptr<std::string>& extraFileInfo,
+      bool cacheable,
+      std::vector<IcebergDeleteFile> deletes,
+      const std::unordered_map<std::string, std::string>& infoColumns,
+      std::optional<FileProperties> fileProperties,
+      int64_t dataSequenceNumber,
+      std::vector<IcebergCoalescedFile> coalescedFiles);
 };
 
 /// Builds Iceberg splits with named parameters.

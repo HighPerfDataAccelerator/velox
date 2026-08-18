@@ -2280,7 +2280,9 @@ std::future<T> toStdFuture(folly::Future<T> follyFuture) {
 namespace facebook::velox::cudf_velox::connector::hive {
 
 void prepareNativeS3HighThroughputClient() {
+#ifdef VELOX_ENABLE_S3
   NativeS3SdkScheduler::instance().prepareHighThroughputCrtClient();
+#endif
 }
 
 void runWithNativeS3RequestPressure(
@@ -3130,6 +3132,22 @@ std::unique_ptr<cudf::io::datasource::buffer> KvikioS3DataSource::device_read(
       offset, requestedSize, static_cast<uint8_t*>(data.data()), stream);
   data.resize(readSize, stream);
   return cudf::io::datasource::buffer::create(std::move(data));
+}
+#endif
+
+#ifndef VELOX_ENABLE_S3
+bool nativeS3ScheduledReadEnabled() {
+  return false;
+}
+
+void logNativeS3SchedulerStats(
+    std::string_view /*event*/,
+    std::string_view /*id*/) {}
+
+void initializeNativeS3Scheduler() {}
+
+bool prioritizeNativeS3File(const std::string& /*filePath*/) {
+  return false;
 }
 #endif
 

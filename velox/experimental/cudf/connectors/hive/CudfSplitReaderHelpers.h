@@ -329,33 +329,6 @@ class CrtS3DataSource final : public cudf::io::datasource {
 
 bool crtS3RangeReaderAvailable();
 
-/// Returns true when the executor-global native AWS SDK scheduler is selected
-/// for S3 reads.
-bool nativeS3ScheduledReadEnabled();
-
-/// Starts construction of the optional high-throughput CRT client. This is
-/// intended to run asynchronously once query-level request pressure is known,
-/// before cache-load producers begin issuing their bounded range requests.
-void prepareNativeS3HighThroughputClient();
-
-/// Runs a cache-load producer with a request-pressure hint scoped to the
-/// current thread. Native S3 requests submitted by the producer may use the
-/// optional high-throughput CRT client; unrelated and concurrent producers
-/// retain the base client. The hint does not alter cache readiness semantics.
-void runWithNativeS3RequestPressure(
-    bool highThroughput,
-    const std::function<void()>& producer);
-
-/// Exposed for focused tests of thread-scoped pressure propagation.
-bool nativeS3HighRequestPressureForCurrentThread();
-
-/// Emits an executor-global scheduler snapshot when native S3 diagnostics are
-/// enabled. Counters are cumulative, so the first query-exit snapshot is the
-/// exact cold-query physical request total.
-void logNativeS3SchedulerStats(
-    std::string_view event,
-    std::string_view id = {});
-
 struct NativeS3ReadGroup {
   uint64_t offset{0};
   uint64_t size{0};
@@ -451,6 +424,34 @@ std::shared_ptr<facebook::velox::ReadFile> makeNativeScheduledS3ReadFile(
     std::shared_ptr<facebook::velox::ReadFile> readFile,
     const std::string& filePath);
 #endif
+
+/// Returns true when the executor-global native AWS SDK scheduler is selected
+/// for S3 reads.
+bool nativeS3ScheduledReadEnabled();
+
+/// Starts construction of the optional high-throughput CRT client. This is
+/// intended to run asynchronously once query-level request pressure is known,
+/// before cache-load producers begin issuing their bounded range requests. It
+/// is a no-op when Velox is built without S3 support.
+void prepareNativeS3HighThroughputClient();
+
+/// Runs a cache-load producer with a request-pressure hint scoped to the
+/// current thread. Native S3 requests submitted by the producer may use the
+/// optional high-throughput CRT client; unrelated and concurrent producers
+/// retain the base client. The hint does not alter cache readiness semantics.
+void runWithNativeS3RequestPressure(
+    bool highThroughput,
+    const std::function<void()>& producer);
+
+/// Exposed for focused tests of thread-scoped pressure propagation.
+bool nativeS3HighRequestPressureForCurrentThread();
+
+/// Emits an executor-global scheduler snapshot when native S3 diagnostics are
+/// enabled. Counters are cumulative, so the first query-exit snapshot is the
+/// exact cold-query physical request total.
+void logNativeS3SchedulerStats(
+    std::string_view event,
+    std::string_view id = {});
 
 /// Constructs the executor-global native AWS SDK/CRT scheduler and client.
 /// Call during executor initialization to keep one-time client setup out of

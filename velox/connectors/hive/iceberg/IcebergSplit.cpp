@@ -101,6 +101,41 @@ HiveIcebergSplit::HiveIcebergSplit(
       dataSequenceNumber(dataSequenceNumber),
       identityPartitionKeys(identityPartitionKeys) {}
 
+HiveIcebergSplit::HiveIcebergSplit(
+    const std::string& connectorId,
+    const std::string& filePath,
+    dwio::common::FileFormat fileFormat,
+    uint64_t start,
+    uint64_t length,
+    const std::unordered_map<std::string, std::optional<std::string>>&
+        partitionKeys,
+    std::optional<int32_t> tableBucketNumber,
+    const std::unordered_map<std::string, std::string>& customSplitInfo,
+    const std::shared_ptr<std::string>& extraFileInfo,
+    bool cacheable,
+    std::vector<IcebergDeleteFile> deletes,
+    const std::unordered_map<std::string, std::string>& infoColumns,
+    std::optional<FileProperties> properties,
+    int64_t dataSequenceNumber,
+    std::vector<IcebergCoalescedFile> coalescedFiles)
+    : HiveIcebergSplit(
+          connectorId,
+          filePath,
+          fileFormat,
+          start,
+          length,
+          partitionKeys,
+          tableBucketNumber,
+          customSplitInfo,
+          extraFileInfo,
+          cacheable,
+          std::move(deletes),
+          infoColumns,
+          properties,
+          dataSequenceNumber,
+          std::unordered_map<int32_t, std::optional<std::string>>{},
+          std::move(coalescedFiles)) {}
+
 std::shared_ptr<HiveIcebergSplit> IcebergSplitBuilder::build() const {
   return std::make_shared<HiveIcebergSplit>(
       connectorId_,
