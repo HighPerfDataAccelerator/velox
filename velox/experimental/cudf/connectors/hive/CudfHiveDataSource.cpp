@@ -43,6 +43,45 @@ namespace facebook::velox::cudf_velox::connector::hive {
 using namespace facebook::velox::connector;
 using namespace facebook::velox::connector::hive;
 
+namespace {
+
+bool isSupportedCudfReaderFilterType(const TypePtr& type) {
+  if (type == nullptr) {
+    return false;
+  }
+
+  switch (type->kind()) {
+    case TypeKind::ARRAY:
+    case TypeKind::MAP:
+    case TypeKind::ROW:
+    case TypeKind::UNKNOWN:
+      return false;
+    default:
+      return true;
+  }
+}
+
+TypePtr topLevelSubfieldType(
+    const hive::HiveTableHandle& tableHandle,
+    const RowTypePtr& outputType,
+    const common::Subfield& field) {
+  if (!field.valid()) {
+    return nullptr;
+  }
+
+  const auto& baseName = field.baseName();
+  if (tableHandle.dataColumns() &&
+      tableHandle.dataColumns()->containsChild(baseName)) {
+    return tableHandle.dataColumns()->findChild(baseName);
+  }
+  if (outputType && outputType->containsChild(baseName)) {
+    return outputType->findChild(baseName);
+  }
+  return nullptr;
+}
+
+} // namespace
+
 CudfHiveDataSource::CudfHiveDataSource(
     const RowTypePtr& outputType,
     const ConnectorTableHandlePtr& tableHandle,
@@ -62,8 +101,19 @@ CudfHiveDataSource::CudfHiveDataSource(
       outputType_(outputType),
       pool_(connectorQueryCtx->memoryPool()),
       expressionEvaluator_(connectorQueryCtx->expressionEvaluator()) {
+  tableHandle_ =
+      std::dynamic_pointer_cast<const hive::HiveTableHandle>(tableHandle);
+  VELOX_CHECK_NOT_NULL(
+      tableHandle_, "TableHandle must be an instance of HiveTableHandle");
+
+  auto addReadColumn = [&](std::string_view name) {
+    auto readName = toTopLevelReadColumnName(name);
+    if (readColumnSet_.emplace(readName).second) {
+      readColumnNames_.emplace_back(std::move(readName));
+    }
+  };
+
   // Set up column projection if needed
-  auto readColumnTypes = outputType_->children();
   for (const auto& outputName : outputType_->names()) {
     auto it = columnHandles.find(outputName);
     VELOX_CHECK(
@@ -72,38 +122,89 @@ CudfHiveDataSource::CudfHiveDataSource(
         outputName);
 
     auto* handle = static_cast<const hive::HiveColumnHandle*>(it->second.get());
-    readColumnSet_.emplace(handle->name());
-    readColumnNames_.emplace_back(handle->name());
+    auto outputReadName = toTopLevelReadColumnName(handle->name());
+    outputReadColumnNames_.emplace_back(outputReadName);
+    addReadColumn(outputReadName);
   }
 
-  tableHandle_ =
-      std::dynamic_pointer_cast<const hive::HiveTableHandle>(tableHandle);
-  VELOX_CHECK_NOT_NULL(
-      tableHandle_, "TableHandle must be an instance of HiveTableHandle");
-
-  // Copy subfield filters.
+  // Copy subfield filters. Keep the originals separate from filters extracted
+  // from the remaining expression so unsupported reader filters can only fall
+  // back when the post-scan expression contains an equivalent predicate.
+  common::SubfieldFilters originalSubfieldFilters;
   for (const auto& [k, v] : tableHandle_->subfieldFilters()) {
+    originalSubfieldFilters.emplace(k.clone(), v->clone());
     subfieldFilters_.emplace(k.clone(), v->clone());
   }
 
   // Extract additional simple filters from remainingFilter (same as CPU path).
   // This extracts single-column filters like "col = 'X'" or "col <> 'Y'" from
   // complex expressions and adds them to subfieldFilters_ for pushdown.
+  common::SubfieldFilters extractedSubfieldFilters;
   double sampleRate = tableHandle_->sampleRate();
   auto remainingFilter =
       facebook::velox::connector::hive::extractFiltersFromRemainingFilter(
           tableHandle_->remainingFilter(),
           expressionEvaluator_,
-          subfieldFilters_,
+          extractedSubfieldFilters,
           sampleRate);
+  for (auto& [field, filter] : extractedSubfieldFilters) {
+    if (auto it = subfieldFilters_.find(field); it != subfieldFilters_.end()) {
+      filter = filter->mergeWith(it->second.get());
+    }
+    subfieldFilters_.insert_or_assign(field.clone(), filter);
+  }
 
   // Add fields in the filter to the columns to read if not there
   for (const auto& [field, _] : subfieldFilters_) {
-    if (readColumnSet_.count(field.toString()) == 0) {
-      readColumnSet_.emplace(field.toString());
-      readColumnNames_.emplace_back(field.toString());
-    }
+    addReadColumn(field.toString());
   }
+
+  common::SubfieldFilters readerSubfieldFilters;
+  bool skippedReaderFilter = false;
+  for (const auto& [field, filter] : subfieldFilters_) {
+    const auto& path = field.path();
+    if (path.size() != 1) {
+      if (auto original = originalSubfieldFilters.find(field);
+          original != originalSubfieldFilters.end()) {
+        auto extracted = extractedSubfieldFilters.find(field);
+        if (extracted == extractedSubfieldFilters.end() ||
+            original->second->toString() != extracted->second->toString()) {
+          VELOX_UNSUPPORTED(
+              "Nested cuDF reader filter '{}' requires an equivalent "
+              "post-scan predicate",
+              field.toString());
+        }
+      }
+      skippedReaderFilter = true;
+      VLOG(1) << "Skipping nested cuDF reader filter pushdown for subfield: "
+              << field.toString();
+      continue;
+    }
+
+    const auto type = topLevelSubfieldType(*tableHandle_, outputType_, field);
+    if (!isSupportedCudfReaderFilterType(type)) {
+      if (auto original = originalSubfieldFilters.find(field);
+          original != originalSubfieldFilters.end()) {
+        auto extracted = extractedSubfieldFilters.find(field);
+        if (extracted == extractedSubfieldFilters.end() ||
+            original->second->toString() != extracted->second->toString()) {
+          VELOX_UNSUPPORTED(
+              "Complex cuDF reader filter '{}' requires an equivalent "
+              "post-scan predicate",
+              field.toString());
+        }
+      }
+      skippedReaderFilter = true;
+      VLOG(1) << "Skipping complex cuDF reader filter pushdown for subfield: "
+              << field.toString();
+      continue;
+    }
+
+    readerSubfieldFilters.emplace(field.clone(), filter);
+  }
+
+  const auto postScanFilter =
+      skippedReaderFilter ? tableHandle_->remainingFilter() : remainingFilter;
   // Optimize (rewrites + constant folding) the remaining filter before
   // evaluator selection so CudfFunctions never see scalar-only operand sets.
   // TODO: ConnectorQueryCtx does not expose the session QueryCtx, only an
@@ -115,8 +216,8 @@ CudfHiveDataSource::CudfHiveDataSource(
   // constructor dereferences the QueryCtx unconditionally; a null QueryCtx
   // would crash.
   auto optimizeQueryCtx = core::QueryCtx::create();
-  optimizedRemainingFilter_ = remainingFilter
-      ? expression::optimize(remainingFilter, optimizeQueryCtx.get(), pool_)
+  optimizedRemainingFilter_ = postScanFilter
+      ? expression::optimize(postScanFilter, optimizeQueryCtx.get(), pool_)
       : nullptr;
   if (optimizedRemainingFilter_) {
     // Add fields referenced by the filter to the columns to read. Collect from
@@ -124,10 +225,7 @@ CudfHiveDataSource::CudfHiveDataSource(
     // they reference. Read-column order does not affect results: the data
     // source projects its output to the requested output type.
     for (const auto& name : referencedInputFields(optimizedRemainingFilter_)) {
-      if (readColumnSet_.count(name) == 0) {
-        readColumnSet_.emplace(name);
-        readColumnNames_.emplace_back(name);
-      }
+      addReadColumn(name);
     }
 
     // TODO: Prune struct columns to the subfields referenced by the remaining
@@ -143,10 +241,13 @@ CudfHiveDataSource::CudfHiveDataSource(
 
   // Build a combined AST for all subfield filters once. This is query-constant
   // and doesn't depend on split-specific state.
-  if (!subfieldFilters_.empty()) {
+  if (!readerSubfieldFilters.empty()) {
     auto const readerFilterType = getTableRowType();
     subfieldFilterExpr_ = &createAstFromSubfieldFilters(
-        subfieldFilters_, subfieldTree_, subfieldScalars_, readerFilterType);
+        readerSubfieldFilters,
+        subfieldTree_,
+        subfieldScalars_,
+        readerFilterType);
   }
 
   VELOX_CHECK_NOT_NULL(fileHandleFactory_, "No FileHandleFactory present");
@@ -385,6 +486,26 @@ const RowTypePtr CudfHiveDataSource::getTableRowType() {
   }
   cachedTableRowType_ = outputType_;
   return cachedTableRowType_;
+}
+
+std::string CudfHiveDataSource::toTopLevelReadColumnName(
+    std::string_view name) const {
+  if (tableHandle_ && tableHandle_->dataColumns()) {
+    const auto& dataColumns = tableHandle_->dataColumns();
+    if (dataColumns->containsChild(name)) {
+      return std::string{name};
+    }
+
+    const auto dot = name.find('.');
+    if (dot != std::string_view::npos) {
+      const auto topLevelName = name.substr(0, dot);
+      if (dataColumns->containsChild(topLevelName)) {
+        return std::string{topLevelName};
+      }
+    }
+  }
+
+  return std::string{name};
 }
 
 } // namespace facebook::velox::cudf_velox::connector::hive
