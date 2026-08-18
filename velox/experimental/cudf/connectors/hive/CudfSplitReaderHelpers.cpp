@@ -3173,7 +3173,7 @@ void BufferedInputDataSource::enqueueForDevice(
       VELOX_CHECK_GT(available, 0);
       const auto bytes = std::min<uint64_t>(available, size - copied);
       CUDF_CUDA_TRY(cudaMemcpyAsync(
-          dst + copied, buffer, bytes, cudaMemcpyHostToDevice, stream.value()));
+          dst + copied, buffer, bytes, cudaMemcpyDefault, stream.value()));
       copied += bytes;
       if (bytes < static_cast<uint64_t>(available)) {
         sharedStream->BackUp(available - bytes);
@@ -3485,7 +3485,7 @@ std::future<size_t> BufferedInputDataSource::device_read_async(
                           dst,
                           hostBuffer->data(),
                           hostBuffer->size(),
-                          cudaMemcpyHostToDevice,
+                          cudaMemcpyDefault,
                           stream.value()));
                       return hostBuffer->size();
                     });
@@ -4004,7 +4004,7 @@ FetchedDeviceByteRanges fetchByteRangesAsync(
                       dest,
                       hostBuffer->data(),
                       hostBuffer->size(),
-                      cudaMemcpyHostToDevice,
+                      cudaMemcpyDefault,
                       stream.value()));
                   return ioSize;
                 }));

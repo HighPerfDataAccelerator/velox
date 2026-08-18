@@ -286,6 +286,15 @@ RowVectorPtr CudfBatchConcat::doGetOutput() {
   return nullptr;
 }
 
+void CudfBatchConcat::doClose() {
+  buffer_.clear();
+  while (!outputQueue_.empty()) {
+    outputQueue_.pop();
+  }
+  currentNumRows_ = 0;
+  Operator::close();
+}
+
 bool CudfBatchConcat::isFinished() {
   const bool finished = noMoreInput_ && buffer_.empty() && outputQueue_.empty();
   if (finished && !summaryLogged_ && logConcatConfig()) {

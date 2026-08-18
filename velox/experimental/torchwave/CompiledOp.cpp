@@ -201,15 +201,31 @@ std::string tensorToString(const Tensor& t) {
   return ss.str();
 }
 
-std::string dumpOpParams(const KernelOperation& op, uint8_t* paramBase) {
+std::string dumpOpParams(
+    const KernelOperation& op,
+    uint8_t* paramBase,
+    const OpInvocation* invocation) {
   std::stringstream ss;
   const auto& inputs = op.orderedInputs();
   auto numInputs = op.numInputs();
   for (size_t i = 0; i < inputs.size(); ++i) {
     auto offset = op.paramOffset(inputs[i]);
     bool isOutput = static_cast<int32_t>(i) >= numInputs;
+    // The generated code refers to operands by param offset (b0 = param(1040)).
+    // Print the formal and actual value ids alongside it so a dumped kernel
+    // line can be tied back to a graph value (the actual id is what
+    // --trace_values takes).
+    auto formalId = inputs[i]->id();
+    auto actualId = formalId;
+    if (invocation != nullptr) {
+      auto it = invocation->bindings().find(formalId);
+      if (it != invocation->bindings().end()) {
+        actualId = it->second;
+      }
+    }
     ss << "  " << (isOutput ? "output" : "input") << "[" << i
-       << "] offset=" << offset;
+       << "] offset=" << offset << " %" << formalId << " -> %" << actualId
+       << " (" << inputs[i]->name() << ")";
     if (inputs[i]->type().kind() == nativert::Type::Kind::Tensor) {
       auto* t = reinterpret_cast<Tensor*>(paramBase + offset);
       ss << " " << tensorToString(*t);
@@ -346,12 +362,17 @@ std::vector<int64_t> paramIntListByName(
         ": expected prim.ListPack producer for '",
         name,
         "'");
+    // The pack was resolved through idToValue, which is keyed by actual ids, so
+    // its operands are already actual Values. 'map' is keyed by formal ids and
+    // normally has no entry for them; fall back to the id as-is, the same way
+    // repeatReserve resolves its self tensor.
     std::vector<int64_t> result;
     for (const auto& elem : producer->inputs()) {
-      auto elemIt = map.find(elem.value->id());
-      TORCH_CHECK(
-          elemIt != map.end(), node->target(), ": ListPack element not in map");
-      result.push_back(frame.getIValue(elemIt->second).toInt());
+      auto elemId = elem.value->id();
+      if (auto elemIt = map.find(elemId); elemIt != map.end()) {
+        elemId = elemIt->second;
+      }
+      result.push_back(frame.getIValue(elemId).toInt());
     }
     return result;
   }
@@ -666,6 +687,21 @@ StandaloneShortcut standaloneShortcutForTarget(std::string_view target) {
   if (target == "torch.ops.aten.narrow.default") {
     return StandaloneShortcut::kNarrow;
   }
+  if (target == "prim.ListUnpack") {
+    return StandaloneShortcut::kListUnpack;
+  }
+  if (target == "torch.ops.aten.unbind.int") {
+    return StandaloneShortcut::kUnbind;
+  }
+  if (target == "torch.ops.aten.split_with_sizes.default") {
+    return StandaloneShortcut::kSplitWithSizes;
+  }
+  if (target == "torch.ops.aten.squeeze.dim") {
+    return StandaloneShortcut::kSqueezeDim;
+  }
+  if (target == "torch.ops.aten.expand.default") {
+    return StandaloneShortcut::kExpand;
+  }
   return StandaloneShortcut::kNone;
 }
 } // namespace
@@ -678,18 +714,26 @@ Launch::Launch(
   standaloneShortcut = standaloneShortcutForTarget(standaloneNode->target());
   // prim.ListPack is metadata-only only when it builds a TensorList; a SymInt /
   // int list packs scalars, which the kListPack shortcut cannot handle, so
-  // leave those on the generic path.
+  // leave those on the generic path. The same holds for the unpack: its input
+  // is the list, so the type to check is the operand's, not the output's.
   if (standaloneShortcut == StandaloneShortcut::kListPack &&
       (standaloneNode->outputs().empty() ||
        standaloneNode->outputs()[0]->type().kind() !=
            nativert::Type::Kind::TensorList)) {
     standaloneShortcut = StandaloneShortcut::kNone;
   }
+  if (standaloneShortcut == StandaloneShortcut::kListUnpack &&
+      (standaloneNode->inputs().empty() ||
+       standaloneNode->inputs()[0].value->type().kind() !=
+           nativert::Type::Kind::TensorList)) {
+    standaloneShortcut = StandaloneShortcut::kNone;
+  }
   auto* meta = Registry::metadata(standaloneNode->target());
   // prim.ListPack has no registry entry but is metadata-only by definition;
   // every other op's metadata-only status comes from its Metadata.
-  metadataOnly =
-      meta ? meta->metadataOnly : (standaloneNode->target() == "prim.ListPack");
+  metadataOnly = meta ? meta->metadataOnly
+                      : (standaloneNode->target() == "prim.ListPack" ||
+                         standaloneNode->target() == "prim.ListUnpack");
   if (!meta || meta->argumentMeta.empty()) {
     return;
   }
@@ -1157,15 +1201,21 @@ CompositeKernel::CompositeKernel(
       std::vector<int32_t> normalParam, normalOutput, normalAlt, gatherParam;
       std::unordered_set<int32_t> seenGather;
       for (size_t i = 0; i < paramOffs.size(); ++i) {
-        if (ownDims.count(paramOffs[i])) {
-          if (seenGather.insert(paramOffs[i]).second) {
-            gatherParam.push_back(paramOffs[i]);
-          }
-        } else {
-          normalParam.push_back(paramOffs[i]);
-          normalOutput.push_back(outputOffs.at(i));
-          normalAlt.push_back(altOffs.at(i));
+        bool isOwnDims = ownDims.count(paramOffs[i]) > 0;
+        if (isOwnDims && seenGather.insert(paramOffs[i]).second) {
+          gatherParam.push_back(paramOffs[i]);
         }
+        // An entry with an alt slot broadcast-inits that copy, not the primary,
+        // and the two do not share 'status', so an own-dims primary is no
+        // reason to skip it. Skipping left the alt Tensor at the host's
+        // kUninited zero fill -- null storage, and the expression reading
+        // through it faulted.
+        if (altOffs.at(i) == -1 && isOwnDims) {
+          continue;
+        }
+        normalParam.push_back(paramOffs[i]);
+        normalOutput.push_back(outputOffs.at(i));
+        normalAlt.push_back(altOffs.at(i));
       }
 
       if (!normalParam.empty() || !gatherParam.empty()) {
@@ -1507,6 +1557,9 @@ void fillLaunchParams(
             paramBase + launch.tensorOffsets[i]);
       }
     }
+    TORCH_CHECK(
+        launch.scalarsInFrame.size() == launch.scalarOffsets.size(),
+        "scalarsInFrame/scalarOffsets size mismatch");
     for (size_t i = 0; i < launch.scalarsInFrame.size(); ++i) {
       fillScalarParam(
           frame.getIValue(launch.scalarsInFrame[i]),
@@ -1585,6 +1638,13 @@ void fillLaunchParams(
   }
 
   // Fill output params, recording values and offsets.
+  //
+  // Every index into a 'launch' vector below is bounds-checked where it is
+  // used -- by this loop's own bound, or by an explicit size test in the same
+  // condition. ParameterUncheckedArrayBounds credits neither, only an
+  // emptiness assert on the parameter, which would state a false invariant:
+  // an op with no tensor-typed outputs legitimately has these empty.
+  // NOLINTBEGIN(facebook-hte-ParameterUncheckedArrayBounds)
   for (size_t i = 0; i < launch.actualOutputs.size(); ++i) {
     auto* formalValue = orderedInputs[numInputs + i];
     if (formalValue->type().kind() == nativert::Type::Kind::TensorList) {
@@ -1667,6 +1727,7 @@ void fillLaunchParams(
         returnBegin,
         returnEnd);
   }
+  // NOLINTEND(facebook-hte-ParameterUncheckedArrayBounds)
 
   // Fill constant params (first time only, constants don't change).
   auto constantOffset = kernelOp->constantAreaOffset();
@@ -1747,6 +1808,18 @@ void allocateLaunchOutputs(
   const auto& actualOutputs = launch.actualOutputs;
   const auto& outputTypes = launch.actualOutputTypes;
 
+  // Outputs that another output aliases in place (its aliasSelfId). These are
+  // materialized whole-tensor bases -- e.g. the elementwise 'self' of a fused
+  // tw.select_scatter -- and must keep their own shape, not be resized to the
+  // op's largest elementwise input (which is the scatter 'src', smaller than
+  // 'self') by the largestId shortcut below.
+  folly::F14FastSet<nativert::ValueId> aliasSelfTargets;
+  for (const auto& desc : descs) {
+    if (desc.aliasSelfId) {
+      aliasSelfTargets.insert(*desc.aliasSelfId);
+    }
+  }
+
   // Shortcut: if largestId is set, resize tensor outputs to match it.
   if (largestId >= 0) {
     auto& largestIv = frame.getIValue(largestId);
@@ -1807,6 +1880,18 @@ void allocateLaunchOutputs(
         continue;
       }
       auto actualId = actualOutputs[i];
+      // A materialized whole-tensor base that a later output aliases in place
+      // (e.g. the elementwise 'self' of a fused tw.select_scatter) is sized by
+      // its own shape, not the op's largest elementwise input. Reserved here,
+      // ahead of the aliasing output, so that output inherits self's full shape
+      // via the alias() below.
+      if (aliasSelfTargets.count(actualId) &&
+          descs[i].sizeExpr.op != SizeShortcut::kNone) {
+        auto exprDims = descs[i].sizeExpr.dims(&frame);
+        std::vector<int64_t> ownDims(exprDims.begin(), exprDims.end());
+        ensureCudaTensor(frame, types, actualId, ownDims);
+        continue;
+      }
       if (descs[i].aliasSelfId) {
         auto& selfIv = frame.getIValue(*descs[i].aliasSelfId);
         if (selfIv.isTensor()) {
@@ -2142,10 +2227,50 @@ void CompositeInvocation::gatherLaunches(
             state.kernelMap,
             idToValue,
             reusableIds_);
-        // If any tensor input or output is None, skip this kernel
-        // (set numElements=0 so makeGrid assigns 0 blocks).
-        for (auto inputId : data.actualInputs) {
-          auto& iv = state.frame->getIValue(inputId);
+        // If a tensor input this kernel does NOT produce itself is None, skip
+        // the kernel (set numElements=0 so makeGrid assigns 0 blocks). Two
+        // kinds of input can be None without meaning "not ready":
+        //
+        //  - A value the op computes itself. Its producer is one of the op's
+        //    own nodes, so the launch writes it before the code that reads it
+        //    (ordered by the op's internal barriers); it is simply not
+        //    materialized yet at host sizing time.
+        //  - A non-tensor. An absent optional argument -- clamp's `min`, say --
+        //    is legitimately None and says nothing about readiness.
+        //
+        // Counting either one starved the launch to a single block: it zeroed
+        // numElements and left the cg path to rebuild a size from static
+        // shapes alone.
+        const auto& opInputs = launch.op->orderedInputs();
+        const auto& opNodes = launch.op->allNodes();
+        auto numOpInputs = static_cast<size_t>(launch.op->numInputs());
+        // orderedInputs is the inputs followed by the outputs, and
+        // actualInputs is translated from its first numInputs entries, so
+        // these two sizes always agree. Scanning fewer than all the actual
+        // inputs would let a None slip past and starve the launch to a single
+        // block, so this is checked rather than clamped.
+        TORCH_CHECK(
+            data.actualInputs.size() == numOpInputs &&
+                numOpInputs <= opInputs.size(),
+            "Kernel op input count mismatch: ",
+            data.actualInputs.size(),
+            " actual vs ",
+            numOpInputs,
+            " formal of ",
+            opInputs.size(),
+            " ordered");
+        for (size_t k = 0; k < numOpInputs; ++k) {
+          const auto* formal = opInputs[k];
+          auto kind = formal->type().kind();
+          if (kind != nativert::Type::Kind::Tensor &&
+              kind != nativert::Type::Kind::TensorList) {
+            continue;
+          }
+          const auto* producer = formal->producer();
+          if (producer != nullptr && opNodes.count(producer) > 0) {
+            continue;
+          }
+          auto& iv = state.frame->getIValue(data.actualInputs[k]);
           if (iv.isNone()) {
             data.numElements = 0;
             break;
@@ -3084,7 +3209,7 @@ void CompositeInvocation::launch(
       setOpCodes(deviceBlocks, 0, numBlocks, kDebugNoOp, stream);
 
       if (groupAndCooperative) {
-        auto* inv = sv.kernels[launchIdx].invocation;
+        auto* inv = sv.kernels.at(launchIdx).invocation;
         if (!launched.insert(reinterpret_cast<intptr_t>(inv)).second) {
           continue;
         }
@@ -3133,7 +3258,8 @@ void CompositeInvocation::launch(
           auto* kernelOp = sv.kernels[launchIdx].launch->op;
           opText = kernelOp->toString(sv.kernels[launchIdx].invocation);
           auto* opParams = pinnedBase + sv.paramOffsets.at(launchIdx);
-          paramText = dumpOpParams(*kernelOp, opParams);
+          paramText = dumpOpParams(
+              *kernelOp, opParams, sv.kernels[launchIdx].invocation);
         }
         LOG(ERROR) << "debug_single_ops: block " << active << " opCode "
                    << opCode << " blockInOp " << pinnedBlocks[active].blockInOp

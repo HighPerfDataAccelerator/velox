@@ -2385,6 +2385,10 @@ void CudfGroupby::doClose() {
   finalRunLevels_.clear();
   bufferedResult_.reset();
   inputs_.clear();
+  aggregators_.clear();
+  intermediateAggregators_.clear();
+  partialAggregators_.clear();
+  finalAggregators_.clear();
   Operator::close();
 }
 

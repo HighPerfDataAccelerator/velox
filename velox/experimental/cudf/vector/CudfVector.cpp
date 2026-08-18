@@ -244,4 +244,9 @@ uint64_t CudfVector::estimateFlatSize() const {
   return flatSize_;
 }
 
+uint64_t CudfVector::retainedSizeImpl(
+    uint64_t& /*totalStringBufferSize*/) const {
+  return flatSize_;
+}
+
 } // namespace facebook::velox::cudf_velox

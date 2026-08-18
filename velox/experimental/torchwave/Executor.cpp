@@ -41,6 +41,9 @@
 #include "velox/experimental/wave/common/Cuda.h"
 #include "velox/experimental/wave/common/GpuArena.h"
 
+// Owned by velox/experimental/wave/common/Compile.cu; see initialize().
+DECLARE_bool(cuda_lineinfo);
+
 // Forward declaration of the CUDA runtime call used to synchronize the default
 // stream. This translation unit is built in a CPU-configured target without the
 // CUDA headers; the symbol resolves from the CUDA runtime linked into the final
@@ -173,6 +176,13 @@ void initialize() {
     return;
   }
   facebook::velox::wave::setDevice(device);
+  // Wave takes its NVRTC options from gflags, not from an API, and freezes
+  // them in ensureInit() on the first compile. So a WaveConfig knob that
+  // affects codegen has to be pushed into the gflag before that point, which
+  // is here -- CompiledKernel::initialize() below is what triggers ensureInit.
+  if (WaveConfig::get().kernelLineInfo) {
+    FLAGS_cuda_lineinfo = true;
+  }
   // Run the one-time NVRTC/system-header initialization here, on the
   // (main) thread that sets up the executor, unless it was already done
   // elsewhere. ensureInit() touches the filesystem and publishes the shared
@@ -1273,7 +1283,7 @@ void WaveGraphExecutor::adjustCosts(ExecutionState& state) {
     int32_t blockStart = 0;
     for (size_t li = 0; li < sv.kernels.size(); ++li) {
       int32_t nBlocks =
-          li < sv.numBlocksPerLaunch.size() ? sv.numBlocksPerLaunch[li] : 0;
+          li < sv.numBlocksPerLaunch.size() ? sv.numBlocksPerLaunch.at(li) : 0;
       for (int32_t b = 0; b < nBlocks; ++b) {
         auto idx = blockStart + b;
         if (idx < static_cast<int32_t>(debugBlocks.size())) {
@@ -1452,6 +1462,7 @@ std::string WaveGraphExecutor::makePerfReport(
         standaloneUs,
         interpUs);
   }
+  ss << "WaveConfig: " << WaveConfig::get().toString() << "\n";
 
   // Per-node, per-step report.
   // Group launches by sequenceNumber.
@@ -1813,8 +1824,7 @@ std::string WaveGraphExecutor::errorString() const {
     int32_t blockIdx{0};
     int32_t opCode{0};
     int32_t line{0};
-    int64_t extra0{0};
-    int64_t extra1{0};
+    std::array<int64_t, 6> extra{};
     std::string message;
   };
 
@@ -1834,8 +1844,8 @@ std::string WaveGraphExecutor::errorString() const {
         entry.blockIdx = static_cast<int32_t>(bi);
         entry.opCode = dbg.op;
         entry.line = dbg.line;
-        entry.extra0 = dbg.extra[0];
-        entry.extra1 = dbg.extra[1];
+        std::copy(
+            std::begin(dbg.extra), std::end(dbg.extra), entry.extra.begin());
         entry.message =
             std::string(dbg.message, strnlen(dbg.message, sizeof(dbg.message)));
         errorsByOp[{meta.sequenceNumber, dbg.op}].push_back(entry);
@@ -1892,8 +1902,16 @@ std::string WaveGraphExecutor::errorString() const {
     }
     for (const auto& entry : entries) {
       ss << "  Seq " << entry.sequenceNumber << " step " << entry.stepIdx
-         << " TB " << entry.blockIdx << " L " << entry.line << " "
-         << entry.extra0 << " " << entry.extra1;
+         << " TB " << entry.blockIdx << " L " << entry.line;
+      // Trailing zeroes are unset fields, not measurements: a site that reports
+      // two values would otherwise read as one reporting six.
+      size_t numExtra = entry.extra.size();
+      while (numExtra > 2 && entry.extra[numExtra - 1] == 0) {
+        --numExtra;
+      }
+      for (size_t i = 0; i < numExtra; ++i) {
+        ss << " " << entry.extra[i];
+      }
       if (!entry.message.empty()) {
         ss << " " << entry.message;
       }
