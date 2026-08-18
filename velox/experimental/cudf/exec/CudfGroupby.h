@@ -205,7 +205,7 @@ class CudfGroupby : public CudfOperatorBase {
   // compaction overrides that suffix with the intermediate step.
   bool streamingEnabled_{true};
   const int32_t groupbyStreamingMaxDistinctKeys_;
-  const bool partialIdentityAggregationEnabled_;
+  bool partialIdentityAggregationEnabled_;
   const int64_t maxPartialAggregationMemoryUsage_;
   int64_t numInputRows_ = 0;
 
