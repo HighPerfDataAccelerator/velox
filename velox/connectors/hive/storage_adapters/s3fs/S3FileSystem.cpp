@@ -331,9 +331,13 @@ class S3FileSystem::Impl {
   std::shared_ptr<Aws::Auth::AWSCredentialsProvider>
   getAccessKeySecretKeyCredentialsProvider(
       const std::string& accessKey,
-      const std::string& secretKey) const {
+      const std::string& secretKey,
+      const std::optional<std::string>& sessionToken) const {
     return std::make_shared<Aws::Auth::SimpleAWSCredentialsProvider>(
-        awsString(accessKey), awsString(secretKey));
+        awsString(accessKey),
+        awsString(secretKey),
+        sessionToken.has_value() ? awsString(sessionToken.value())
+                                 : Aws::String());
   }
 
   // Return a default AWSCredentialsProvider.
@@ -364,6 +368,7 @@ class S3FileSystem::Impl {
 
     auto accessKey = s3Config.accessKey();
     auto secretKey = s3Config.secretKey();
+    const auto sessionToken = s3Config.sessionToken();
     const auto iamRole = s3Config.iamRole();
 
     int keyCount = accessKey.has_value() + secretKey.has_value();
@@ -373,6 +378,9 @@ class S3FileSystem::Impl {
     VELOX_USER_CHECK(
         (keyCount != 1),
         "Invalid configuration: both access key and secret key must be specified");
+    VELOX_USER_CHECK(
+        !sessionToken.has_value() || keyCount == 2,
+        "Invalid configuration: session token requires both access key and secret key");
 
     int configCount = (accessKey.has_value() && secretKey.has_value()) +
         iamRole.has_value() + s3Config.useInstanceCredentials();
@@ -382,7 +390,7 @@ class S3FileSystem::Impl {
 
     if (accessKey.has_value() && secretKey.has_value()) {
       return getAccessKeySecretKeyCredentialsProvider(
-          accessKey.value(), secretKey.value());
+          accessKey.value(), secretKey.value(), sessionToken);
     }
 
     if (s3Config.useInstanceCredentials()) {

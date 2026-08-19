@@ -79,6 +79,15 @@ TEST_F(S3FileSystemTest, writeAndRead) {
 TEST_F(S3FileSystemTest, invalidCredentialsConfig) {
   {
     std::unordered_map<std::string, std::string> config(
+        {{"hive.s3.aws-session-token", "dummy-token"}});
+    auto hiveConfig =
+        std::make_shared<const config::ConfigBase>(std::move(config));
+    VELOX_ASSERT_THROW(
+        filesystems::S3FileSystem("", hiveConfig),
+        "Invalid configuration: session token requires both access key and secret key");
+  }
+  {
+    std::unordered_map<std::string, std::string> config(
         {{"hive.s3.use-instance-credentials", "true"},
          {"hive.s3.iam-role", "dummy-iam-role"}});
     auto hiveConfig =
@@ -123,6 +132,20 @@ TEST_F(S3FileSystemTest, invalidCredentialsConfig) {
         filesystems::S3FileSystem("", hiveConfig),
         "Invalid configuration: both access key and secret key must be specified");
   }
+}
+
+TEST_F(S3FileSystemTest, temporaryCredentials) {
+  auto hiveConfig = std::make_shared<const config::ConfigBase>(
+      std::unordered_map<std::string, std::string>{
+          {"hive.s3.aws-access-key", "access"},
+          {"hive.s3.aws-secret-key", "secret"},
+          {"hive.s3.aws-session-token", "token"}});
+  filesystems::S3FileSystem s3fs("", hiveConfig);
+
+  const auto credentials = s3fs.getCredentialSnapshot();
+  EXPECT_EQ(credentials.accessKeyId, "access");
+  EXPECT_EQ(credentials.secretAccessKey, "secret");
+  EXPECT_EQ(credentials.sessionToken, "token");
 }
 
 TEST_F(S3FileSystemTest, missingFile) {
