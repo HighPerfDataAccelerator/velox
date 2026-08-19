@@ -1332,6 +1332,7 @@ void ExecutorSplitPrefetch::setExpectedSplitCount(
                << " maxExpectedSplits=" << highPressureMaxSplits
                << " largeExpectedSplits=" << highPressureLargeSplits
                << " expectedSplits=" << expectedSplits;
+#ifdef VELOX_ENABLE_S3
   if (highRequestPressure) {
     // Do not let cache-load producers race construction of the pressure
     // client. A producer that wins that race falls back to the base client,
@@ -1345,6 +1346,7 @@ void ExecutorSplitPrefetch::setExpectedSplitCount(
                  << error.what();
     }
   }
+#endif
   if (minRegisteredSplits == 0) {
     return;
   }
@@ -1491,7 +1493,9 @@ void ExecutorSplitPrefetch::eraseQuery(
   eraseQueryFirstLoadDecision(queryId);
   eraseQueryExpectedSplitCount(queryId);
   logCacheHintStats("query-exit", queryId);
+#ifdef VELOX_ENABLE_S3
   logNativeS3SchedulerStats("query-exit", queryId);
+#endif
 }
 
 void ExecutorSplitPrefetch::erase(folly::Executor* executor) {
@@ -1528,7 +1532,9 @@ void ExecutorSplitPrefetch::erase(folly::Executor* executor) {
   }
   state.reset();
   logCacheHintStats("executor-exit");
+#ifdef VELOX_ENABLE_S3
   logNativeS3SchedulerStats("executor-exit");
+#endif
 }
 
 } // namespace facebook::velox::cudf_velox::connector::hive
