@@ -877,6 +877,57 @@ TEST_F(TableScanTest, remainingFilterExtraction) {
       << "Expected no remaining filter time when filter is fully extracted";
 }
 
+TEST_F(TableScanTest, nestedRemainingFilter) {
+  auto geo = makeRowVector(
+      {"country_iso_code", "city"},
+      {makeNullableFlatVector<StringView>(
+           {"US", std::nullopt, "CA", std::nullopt}),
+       makeFlatVector<StringView>({"Seattle", "Paris", "Toronto", "Tokyo"})});
+  auto vector = makeRowVector(
+      {"id", "geo"}, {makeFlatVector<int64_t>({1, 2, 3, 4}), geo});
+  auto rowType = asRowType(vector->type());
+  auto filePath = TempFilePath::create();
+  writeToFile(filePath->getPath(), {vector});
+  createDuckDbTable({vector});
+
+  facebook::velox::connector::ColumnHandleMap assignments;
+  assignments["id"] =
+      facebook::velox::exec::test::HiveConnectorTestBase::regularColumn(
+          "id", BIGINT());
+  auto plan = PlanBuilder(pool_.get())
+                  .startTableScan()
+                  .connectorId(kCudfHiveConnectorId)
+                  .outputType(ROW({"id"}, {BIGINT()}))
+                  .dataColumns(rowType)
+                  .assignments(assignments)
+                  .subfieldFilter("geo.country_iso_code is not null")
+                  .remainingFilter("geo.country_iso_code is not null")
+                  .endTableScan()
+                  .planNode();
+
+  assertQuery(
+      plan,
+      {filePath},
+      "SELECT id FROM tmp WHERE geo.country_iso_code IS NOT NULL");
+
+  auto pushdownOnlyPlan =
+      PlanBuilder(pool_.get())
+          .startTableScan()
+          .connectorId(kCudfHiveConnectorId)
+          .outputType(ROW({"id"}, {BIGINT()}))
+          .dataColumns(rowType)
+          .assignments(assignments)
+          .subfieldFilter("geo.country_iso_code is not null")
+          .endTableScan()
+          .planNode();
+  VELOX_ASSERT_THROW(
+      assertQuery(
+          pushdownOnlyPlan,
+          {filePath},
+          "SELECT id FROM tmp WHERE geo.country_iso_code IS NOT NULL"),
+      "requires an equivalent post-scan predicate");
+}
+
 TEST_F(TableScanTest, decimalSubfieldFilter) {
   auto rowType = ROW({"c0", "c1"}, {DECIMAL(5, 2), BIGINT()});
   auto vector = makeRowVector(
