@@ -579,6 +579,21 @@ TEST_F(CudfExpressionSelectionTest, signatureArrayAccess) {
   }
 }
 
+TEST_F(CudfExpressionSelectionTest, signatureMapAccess) {
+  auto mapRowType = ROW({
+      {"map_col", MAP(VARCHAR(), VARCHAR())},
+      {"key_col", VARCHAR()},
+  });
+
+  auto literalKey = parseAndInferTypedExpr(
+      "element_at(map_col, 'id')", mapRowType, execCtx_.get());
+  ASSERT_TRUE(canExprRunOnGpu(literalKey, queryCtx_.get(), pool_.get()));
+
+  auto columnKey = parseAndInferTypedExpr(
+      "element_at(map_col, key_col)", mapRowType, execCtx_.get());
+  ASSERT_TRUE(canExprRunOnGpu(columnKey, queryCtx_.get(), pool_.get()));
+}
+
 TEST_F(CudfExpressionSelectionTest, signatureSparkGetSmallIntegralIndices) {
   auto arrayRowType = ROW({
       {"arr", ARRAY(INTEGER())},

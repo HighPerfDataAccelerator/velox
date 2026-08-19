@@ -52,7 +52,7 @@ T constantScalarValue(
 void registerPrestoArrayAccessFunctions(const std::string& prefix) {
   // Presto element_at is 1-based, allows negative indices from the end, and
   // returns NULL for out-of-bounds indices.
-  registerArrayAccessFunction(
+  registerElementAtFunction(
       prefix + "element_at",
       ArrayAccessPolicy{
           .allowNegativeIndices = true,

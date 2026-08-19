@@ -30,6 +30,7 @@ add_library(
   DecimalExpressionKernelsGpu.cu
   ExpressionEvaluator.cpp
   JitExpression.cpp
+  MapAccessFunctions.cpp
   NullMask.cpp
   PrestoFunctions.cpp
   prestosql/DateAddFunction.cpp

@@ -17,6 +17,7 @@
 #include "velox/experimental/cudf/expression/ArrayAccessFunctions.h"
 #include "velox/experimental/cudf/expression/CommonFunctions.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
+#include "velox/experimental/cudf/expression/MapAccessFunctions.h"
 
 namespace facebook::velox::cudf_velox {
 
@@ -27,13 +28,12 @@ std::vector<exec::FunctionSignaturePtr> arrayAccessSignatures(
   std::vector<exec::FunctionSignaturePtr> signatures;
   signatures.reserve(indexTypes.size());
   for (const auto* indexType : indexTypes) {
-    signatures.push_back(
-        FunctionSignatureBuilder()
-            .typeVariable("T")
-            .returnType("T")
-            .argumentType("array(T)")
-            .argumentType(indexType)
-            .build());
+    signatures.push_back(FunctionSignatureBuilder()
+                             .typeVariable("T")
+                             .returnType("T")
+                             .argumentType("array(T)")
+                             .argumentType(indexType)
+                             .build());
   }
   return signatures;
 }
@@ -51,6 +51,37 @@ void registerArrayAccessFunction(
         return makeArrayAccessFunction(expr, policy, pool);
       },
       signatures);
+}
+
+void registerElementAtFunction(
+    const std::string& name,
+    ArrayAccessPolicy policy,
+    std::vector<exec::FunctionSignaturePtr> arraySignatures) {
+  using exec::FunctionSignatureBuilder;
+
+  arraySignatures.push_back(FunctionSignatureBuilder()
+                                .typeVariable("K")
+                                .typeVariable("V")
+                                .returnType("V")
+                                .argumentType("map(K,V)")
+                                .argumentType("K")
+                                .build());
+  registerCudfFunction(
+      name,
+      [policy](
+          const std::string&,
+          const core::TypedExprPtr& expr,
+          memory::MemoryPool* pool) {
+        return expr->inputs()[0]->type()->kind() == TypeKind::MAP
+            ? makeMapAccessFunction(expr, pool)
+            : makeArrayAccessFunction(expr, policy, pool);
+      },
+      arraySignatures,
+      true,
+      [](const core::TypedExprPtr& expr) {
+        return expr->inputs()[0]->type()->kind() != TypeKind::MAP ||
+            canEvaluateMapAccess(expr);
+      });
 }
 
 } // namespace facebook::velox::cudf_velox

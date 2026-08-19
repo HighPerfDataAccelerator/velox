@@ -2229,6 +2229,108 @@ class ArrayConstructorFunction : public CudfFunction {
   size_t numInputs_{0};
 };
 
+class MapConstructorFunction : public CudfFunction {
+ public:
+  MapConstructorFunction(
+      const core::TypedExprPtr& expr,
+      memory::MemoryPool* pool) {
+    VELOX_CHECK_EQ(
+        expr->type()->kind(), TypeKind::MAP, "map output must be MAP");
+    VELOX_CHECK_GE(
+        expr->inputs().size(), 2, "map expects at least one key/value pair");
+    VELOX_CHECK_EQ(
+        expr->inputs().size() % 2,
+        0,
+        "map expects alternating key/value arguments");
+
+    numInputs_ = expr->inputs().size();
+    numPairs_ = numInputs_ / 2;
+    literals_.reserve(numInputs_);
+
+    bool hasNonLiteralInput = false;
+    for (const auto& input : expr->inputs()) {
+      if (input->isConstantKind()) {
+        literals_.push_back(makeScalarFromConstantExpr(input, pool));
+      } else {
+        hasNonLiteralInput = true;
+        literals_.push_back(nullptr);
+      }
+    }
+    VELOX_CHECK(
+        hasNonLiteralInput,
+        "map with only literal inputs must be constant-folded before GPU evaluation");
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    VELOX_CHECK(!inputColumns.empty(), "map requires non-literal inputs");
+    const auto outputSize = asView(inputColumns[0]).size();
+
+    std::vector<std::unique_ptr<cudf::column>> literalColumns;
+    std::vector<cudf::column_view> keyViews;
+    std::vector<cudf::column_view> valueViews;
+    literalColumns.reserve(numInputs_);
+    keyViews.reserve(numPairs_);
+    valueViews.reserve(numPairs_);
+
+    size_t nextInputColumnIndex = 0;
+    for (size_t i = 0; i < numInputs_; ++i) {
+      cudf::column_view view;
+      if (literals_[i]) {
+        literalColumns.push_back(cudf::make_column_from_scalar(
+            *literals_[i], outputSize, stream, mr));
+        view = literalColumns.back()->view();
+      } else {
+        VELOX_CHECK_LT(nextInputColumnIndex, inputColumns.size());
+        view = asView(inputColumns[nextInputColumnIndex++]);
+      }
+      if (i % 2 == 0) {
+        keyViews.push_back(view);
+      } else {
+        valueViews.push_back(view);
+      }
+    }
+    VELOX_CHECK_EQ(nextInputColumnIndex, inputColumns.size());
+
+    auto keys =
+        cudf::interleave_columns(cudf::table_view(keyViews), stream, mr);
+    VELOX_USER_CHECK(!keys->has_nulls(), "Cannot use null as map key");
+    auto values =
+        cudf::interleave_columns(cudf::table_view(valueViews), stream, mr);
+
+    std::vector<std::unique_ptr<cudf::column>> entryChildren;
+    entryChildren.reserve(2);
+    entryChildren.push_back(std::move(keys));
+    entryChildren.push_back(std::move(values));
+    auto entries = cudf::make_structs_column(
+        outputSize * static_cast<cudf::size_type>(numPairs_),
+        std::move(entryChildren),
+        0,
+        rmm::device_buffer{},
+        stream,
+        mr);
+
+    cudf::numeric_scalar<cudf::size_type> firstOffset(0, true, stream, mr);
+    cudf::numeric_scalar<cudf::size_type> offsetStep(
+        static_cast<cudf::size_type>(numPairs_), true, stream, mr);
+    auto offsets =
+        cudf::sequence(outputSize + 1, firstOffset, offsetStep, stream, mr);
+    return cudf::make_lists_column(
+        outputSize,
+        std::move(offsets),
+        std::move(entries),
+        0,
+        rmm::device_buffer{});
+  }
+
+ private:
+  std::vector<std::unique_ptr<cudf::scalar>> literals_;
+  size_t numInputs_{0};
+  size_t numPairs_{0};
+};
+
 enum class RowParentNullPolicy {
   kNever,
   kAnyInputNull,
@@ -2488,6 +2590,31 @@ bool registerBuiltinFunctions(const std::string& prefix) {
            .argumentType("T")
            .variableArity("T")
            .build()});
+
+  registerCudfFunction(
+      prefix + "map",
+      [](const std::string&,
+         const core::TypedExprPtr& expr,
+         memory::MemoryPool* pool) {
+        return std::make_shared<MapConstructorFunction>(expr, pool);
+      },
+      {},
+      true,
+      [](const core::TypedExprPtr& expr) {
+        if (expr->type()->kind() != TypeKind::MAP ||
+            expr->inputs().size() < 2 || expr->inputs().size() % 2 != 0) {
+          return false;
+        }
+        const auto& keyType = expr->type()->childAt(0);
+        const auto& valueType = expr->type()->childAt(1);
+        for (size_t i = 0; i < expr->inputs().size(); ++i) {
+          const auto& expectedType = i % 2 == 0 ? keyType : valueType;
+          if (!expr->inputs()[i]->type()->equivalent(*expectedType)) {
+            return false;
+          }
+        }
+        return true;
+      });
 
   // row_constructor is a special form and doesn't have a prefix in its name.
   registerCudfFunction(

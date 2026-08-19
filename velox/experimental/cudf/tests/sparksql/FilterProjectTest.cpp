@@ -189,6 +189,30 @@ TEST_F(CudfFilterProjectTest, sparkExpressionParity) {
   }
 }
 
+TEST_F(CudfFilterProjectTest, mapConstructor) {
+  auto input = makeRowVector({
+      makeNullableFlatVector<int64_t>({1, std::nullopt, -7, 42}),
+      makeNullableFlatVector<std::string>(
+          {"one", "nullable", std::nullopt, "forty-two"}),
+      makeNullableFlatVector<std::string>(
+          {"id", "nullable", "missing", std::nullopt}),
+  });
+
+  for (const auto& expression : {
+           "map('fallback_probe', cast(c0 as varchar))",
+           "map('left', c1, 'right', cast(c0 as varchar))",
+           "element_at(map('id', cast(c0 as varchar), 'nullable', "
+           "cast(null as varchar)), 'id')",
+           "length(element_at(map('id', cast(c0 as varchar), 'nullable', "
+           "cast(null as varchar)), 'id'))",
+           "element_at(map('id', cast(c0 as varchar), 'nullable', c1), c2)",
+           "element_at(map('id', cast(c0 as varchar)), 'missing')",
+       }) {
+    SCOPED_TRACE(expression);
+    assertExpressionMatchesCpu(expression, input, input->rowType());
+  }
+}
+
 TEST_F(CudfFilterProjectTest, multiBranchSwitchWithRegexpExtract) {
   auto input = makeRowVector({
       makeFlatVector<int64_t>({1, 0, 0, 42, -1}),
@@ -200,7 +224,7 @@ TEST_F(CudfFilterProjectTest, multiBranchSwitchWithRegexpExtract) {
   assertExpressionMatchesCpu(
       "CASE WHEN c0 = 1 THEN c2 "
       "WHEN c1 = 2 THEN regexp_extract(c2, '(.*?) android', 1) "
-      "WHEN c0 = 42 THEN 'answer' ELSE '--' END",
+      "WHEN equalto(c0, 42) THEN 'answer' ELSE '--' END",
       input,
       input->rowType());
 }
