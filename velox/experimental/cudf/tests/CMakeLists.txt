@@ -22,6 +22,7 @@ set(CUDF_TEST_DEFAULT_LIBS velox_cudf_exec velox_exec velox_exec_test_lib velox_
 # .github/workflows/linux-build-base.yml only look at this single
 # directory.
 set(CUDF_TESTS_OUTPUT_DIR ${CMAKE_CURRENT_BINARY_DIR})
+set(CUDF_STANDALONE_TEST_SUPPORT_SOURCE ${CMAKE_CURRENT_LIST_DIR}/StandaloneTestSupport.cpp)
 
 # Adds a cudf test target with standard boilerplate.
 #
@@ -45,7 +46,7 @@ function(velox_add_cudf_test)
     set(ARG_TIMEOUT 300)
   endif()
 
-  add_executable(${ARG_NAME} ${ARG_SOURCES})
+  add_executable(${ARG_NAME} ${ARG_SOURCES} ${CUDF_STANDALONE_TEST_SUPPORT_SOURCE})
   set_target_properties(${ARG_NAME} PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CUDF_TESTS_OUTPUT_DIR})
   add_test(NAME ${ARG_NAME} COMMAND ${ARG_NAME} WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
   set_tests_properties(${ARG_NAME} PROPERTIES LABELS cuda_driver TIMEOUT ${ARG_TIMEOUT})
