@@ -945,9 +945,9 @@ struct BloomFilterAggAggregator : ReduceAggregator {
     stream.synchronize();
 
     for (cudf::size_type i = 0; i < numRows; ++i) {
-      if (!hostNulls.empty() && !cudf::bit_is_set(hostNulls.data(), i))) {
-          VELOX_USER_FAIL("First argument of bloom_filter_agg cannot be null");
-        }
+      if (!hostNulls.empty() && !cudf::bit_is_set(hostNulls.data(), i)) {
+        VELOX_USER_FAIL("First argument of bloom_filter_agg cannot be null");
+      }
       insertValue(hostValues[static_cast<size_t>(i)]);
     }
     return makeSerializedBloomColumn(bloom, initialized, stream, mr);
@@ -1006,9 +1006,9 @@ struct BloomFilterAggAggregator : ReduceAggregator {
 
     const auto base = hostOffsets.front();
     for (cudf::size_type i = 0; i < sketchColumn.size(); ++i) {
-      if (!hostNulls.empty() && !cudf::bit_is_set(hostNulls.data(), i))) {
-          continue;
-        }
+      if (!hostNulls.empty() && !cudf::bit_is_set(hostNulls.data(), i)) {
+        continue;
+      }
       const auto start = hostOffsets[static_cast<size_t>(i)] - base;
       const auto end = hostOffsets[static_cast<size_t>(i) + 1] - base;
       if (end <= start) {
