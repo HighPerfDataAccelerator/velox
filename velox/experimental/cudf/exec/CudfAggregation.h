@@ -19,11 +19,13 @@
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
+#include "velox/core/ITypedExpr.h"
 #include "velox/exec/Operator.h"
 #include "velox/expression/FunctionSignature.h"
 
 #include <optional>
 #include <string_view>
+#include <vector>
 
 namespace facebook::velox::cudf_velox {
 
@@ -67,6 +69,9 @@ struct ResolvedAggregateInfo {
   // Routing keys off the function family, not the physical batch type (which is
   // VARBINARY/STRING on intermediate and final steps).
   bool isDecimalAggregate;
+  // Extra call arguments after the first aggregation input, e.g. constant
+  // estimatedNumItems/numBits for bloom_filter_agg.
+  std::vector<core::TypedExprPtr> extraInputs;
 };
 
 // Parse aggregate inputs from the aggregation node and resolve companion steps,

@@ -206,6 +206,12 @@ std::vector<ResolvedAggregateInfo> resolveAggregateInfos(
     const auto isDecimalAggregate = aggregate.rawInputTypes.size() == 1 &&
         aggregate.rawInputTypes[0]->isDecimal();
 
+    std::vector<core::TypedExprPtr> extraInputs;
+    if (aggregate.call->inputs().size() > 1) {
+      extraInputs.assign(
+          aggregate.call->inputs().begin() + 1, aggregate.call->inputs().end());
+    }
+
     params.emplace_back(
         companionStep,
         aggregate.call->name(),
@@ -215,7 +221,8 @@ std::vector<ResolvedAggregateInfo> resolveAggregateInfos(
         isCountFunctionName(aggregate.call->name())
             ? std::make_optional(getCountInputKind(aggregate, constants[i]))
             : std::nullopt,
-        isDecimalAggregate);
+        isDecimalAggregate,
+        std::move(extraInputs));
   }
   return params;
 }
@@ -279,6 +286,11 @@ AggregationInputChannels buildAggregationInputChannels(
       } else if (
           auto constant =
               dynamic_cast<const core::ConstantTypedExpr*>(arg.get())) {
+        if (!aggInputs.empty()) {
+          // Extra constant arguments (bloom_filter_agg estimatedNumItems and
+          // numBits) are not aggregation input columns.
+          continue;
+        }
         result.constants[i] = constant->toConstantVector(operatorCtx.pool());
         aggInputs.push_back(fallbackChannel);
       } else {

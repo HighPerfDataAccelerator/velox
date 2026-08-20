@@ -14,14 +14,23 @@
  * limitations under the License.
  */
 
+#include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/AggregationRegistry.h"
 #include "velox/experimental/cudf/exec/SparkAggregateFunctions.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
+#include "velox/experimental/cudf/expression/SparkFunctions.h"
 
+#include "velox/common/base/BloomFilter.h"
 #include "velox/common/base/tests/GTestUtils.h"
+#include "velox/exec/tests/utils/AssertQueryBuilder.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
 #include "velox/functions/lib/aggregates/tests/utils/AggregationTestBase.h"
 #include "velox/functions/sparksql/aggregates/Register.h"
+#include "velox/functions/sparksql/registration/Register.h"
+#include "velox/vector/SimpleVector.h"
+
+#include <folly/ScopeGuard.h>
+#include <folly/hash/Hash.h>
 
 using namespace facebook::velox::exec::test;
 using namespace facebook::velox::functions::aggregate::test;
@@ -32,18 +41,32 @@ class AggregationTest : public AggregationTestBase {
  protected:
   void SetUp() override {
     AggregationTestBase::SetUp();
+    functions::sparksql::registerFunctions("");
     functions::aggregate::sparksql::registerAggregateFunctions("");
     filesystems::registerLocalFileSystem();
     // After register supports function prefix, we could register the function
     // with spark_ to align with sparksql AverageAggregationTest, the
     // function name overwrite may not work well in some condition.
     cudf_velox::registerCudf();
+    cudf_velox::registerSparkFunctions("");
     cudf_velox::registerSparkAggregateFunctions("");
   }
 
   void TearDown() override {
     cudf_velox::unregisterCudf();
     cudf_velox::unregisterAggregateFunctions();
+  }
+
+  VectorPtr getSerializedBloomFilter(int32_t capacity) {
+    BloomFilter<> bloomFilter;
+    bloomFilter.reset(capacity);
+    for (auto i = 0; i < 9; ++i) {
+      bloomFilter.insert(folly::hasher<int64_t>()(i));
+    }
+    std::string data;
+    data.resize(bloomFilter.serializedSize());
+    bloomFilter.serialize(data.data());
+    return makeConstant(StringView(data), 1, VARBINARY());
   }
 };
 
@@ -125,6 +148,65 @@ TEST_F(AggregationTest, groupedCollectListOfRow) {
           .finalAggregation()
           .planNode();
   assertQuery(partialFinal, expected);
+}
+
+TEST_F(AggregationTest, bloomFilterAgg) {
+  auto& cudfConfig = cudf_velox::CudfConfig::getInstance();
+  const auto previousFallback = cudfConfig.allowCpuFallback;
+  auto restoreFallback =
+      folly::makeGuard([&] { cudfConfig.allowCpuFallback = previousFallback; });
+  cudfConfig.allowCpuFallback = false;
+  auto vectors = makeRowVector({makeFlatVector<int64_t>(
+      100, [](vector_size_t row) { return row % 9; })});
+  auto expected = makeRowVector({getSerializedBloomFilter(11)});
+  auto plan = PlanBuilder()
+                  .values({vectors})
+                  .partialAggregation({}, {"bloom_filter_agg(c0, 5, 64)"})
+                  .finalAggregation()
+                  .planNode();
+  assertQuery(plan, expected);
+
+  auto single = PlanBuilder()
+                    .values({vectors})
+                    .singleAggregation({}, {"bloom_filter_agg(c0, 5, 64)"})
+                    .planNode();
+  assertQuery(single, expected);
+}
+
+TEST_F(AggregationTest, bloomFilterAggFromXxHash64) {
+  auto& cudfConfig = cudf_velox::CudfConfig::getInstance();
+  const auto previousFallback = cudfConfig.allowCpuFallback;
+  auto restoreFallback =
+      folly::makeGuard([&] { cudfConfig.allowCpuFallback = previousFallback; });
+  cudfConfig.allowCpuFallback = false;
+  auto keys = makeFlatVector<int64_t>({1, 2, 3, 4, 5, 1, 2});
+  auto input = makeRowVector({keys});
+  auto plan = PlanBuilder()
+                  .values({input})
+                  .project({"xxhash64_with_seed(cast(42 as bigint), c0) AS h"})
+                  .singleAggregation({}, {"bloom_filter_agg(h, 5, 64)"})
+                  .planNode();
+  auto gpu = AssertQueryBuilder(plan).copyResults(pool());
+  ASSERT_EQ(gpu->size(), 1);
+  ASSERT_FALSE(gpu->childAt(0)->isNullAt(0));
+
+  auto containPlan =
+      PlanBuilder()
+          .values({input})
+          .project({"xxhash64_with_seed(cast(42 as bigint), c0) AS h"})
+          .planNode();
+  auto hashes = AssertQueryBuilder(containPlan).copyResults(pool());
+  auto serialized = gpu->childAt(0)->as<SimpleVector<StringView>>()->valueAt(0);
+  std::string data(serialized.data(), serialized.size());
+  for (auto i = 0; i < hashes->size(); ++i) {
+    auto hash = hashes->childAt(0)->as<SimpleVector<int64_t>>()->valueAt(i);
+    ASSERT_TRUE(
+        BloomFilter<>::mayContain(
+            data.c_str(), folly::hasher<int64_t>()(hash)));
+  }
+  ASSERT_FALSE(
+      BloomFilter<>::mayContain(
+          data.c_str(), folly::hasher<int64_t>()(int64_t{123456789})));
 }
 
 } // namespace facebook::velox::exec::sparksql::test
