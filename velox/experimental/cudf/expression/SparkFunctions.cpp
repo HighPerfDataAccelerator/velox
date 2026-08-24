@@ -20,7 +20,9 @@
 #include "velox/experimental/cudf/expression/SparkFunctions.h"
 #include "velox/experimental/cudf/expression/sparksql/DateAddFunction.h"
 #include "velox/experimental/cudf/expression/sparksql/HashFunction.h"
+#include "velox/experimental/cudf/expression/sparksql/MightContainFunction.h"
 #include "velox/experimental/cudf/expression/sparksql/SubStringFunction.h"
+#include "velox/experimental/cudf/expression/sparksql/XxHash64Function.h"
 
 #include "velox/expression/FunctionSignature.h"
 #include "velox/functions/sparksql/SparkQueryConfig.h"
@@ -176,6 +178,52 @@ void registerSparkFunctions(const std::string& prefix) {
            .build()},
       true,
       sparksql::HashFunction::canEvaluate);
+
+  registerCudfFunction(
+      prefix + "xxhash64_with_seed",
+      [](const std::string&,
+         const core::TypedExprPtr& expr,
+         memory::MemoryPool* pool) {
+        return std::make_shared<sparksql::XxHash64Function>(expr, pool);
+      },
+      {FunctionSignatureBuilder()
+           .returnType("bigint")
+           .constantArgumentType("bigint")
+           .argumentType("any")
+           .variableArity("any")
+           .build()},
+      true,
+      sparksql::XxHash64Function::canEvaluate);
+
+  registerCudfFunction(
+      prefix + "might_contain",
+      [](const std::string&,
+         const core::TypedExprPtr& expr,
+         memory::MemoryPool* pool) {
+        return std::make_shared<sparksql::MightContainFunction>(expr, pool);
+      },
+      {FunctionSignatureBuilder()
+           .returnType("boolean")
+           .constantArgumentType("varbinary")
+           .argumentType("tinyint")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("boolean")
+           .constantArgumentType("varbinary")
+           .argumentType("smallint")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("boolean")
+           .constantArgumentType("varbinary")
+           .argumentType("integer")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("boolean")
+           .constantArgumentType("varbinary")
+           .argumentType("bigint")
+           .build()},
+      true,
+      sparksql::MightContainFunction::canEvaluate);
 
   registerCudfFunction(
       prefix + "date_add",

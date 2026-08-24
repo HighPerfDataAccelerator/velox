@@ -32,6 +32,7 @@
 #include "velox/functions/sparksql/SparkQueryConfig.h"
 #include "velox/functions/sparksql/registration/Register.h"
 #include "velox/type/Type.h"
+#include "velox/type/Variant.h"
 
 #include <folly/ScopeGuard.h>
 #include <gtest/gtest.h>
@@ -642,6 +643,40 @@ TEST_F(CudfExpressionSelectionTest, signatureVarargsHashWithSeed) {
     // Treat compile-time validation failure as unsupported.
     SUCCEED();
   }
+}
+
+TEST_F(CudfExpressionSelectionTest, signatureVarargsXxHash64WithSeed) {
+  facebook::velox::functions::sparksql::registerFunctions();
+
+  auto multiCol = optimizeTypedExpr(
+      "xxhash64_with_seed(42, a, b)",
+      rowType_,
+      queryCtx_.get(),
+      execCtx_.get());
+  ASSERT_FALSE(canExprRunOnGpu(multiCol, queryCtx_.get(), pool_.get()));
+
+  auto singleCol = optimizeTypedExpr(
+      "xxhash64_with_seed(42, a)", rowType_, queryCtx_.get(), execCtx_.get());
+  ASSERT_TRUE(canExprRunOnGpu(singleCol, queryCtx_.get(), pool_.get()));
+}
+
+TEST_F(CudfExpressionSelectionTest, signatureMightContain) {
+  facebook::velox::functions::sparksql::registerFunctions();
+
+  auto bloom = std::make_shared<core::ConstantTypedExpr>(
+      VARBINARY(), variant::binary(std::string(16, '\0')));
+  auto key = std::make_shared<core::FieldAccessTypedExpr>(BIGINT(), "a");
+  auto expr = std::make_shared<core::CallTypedExpr>(
+      BOOLEAN(), std::vector<core::TypedExprPtr>{bloom, key}, "might_contain");
+  ASSERT_TRUE(canExprRunOnGpu(expr, queryCtx_.get(), pool_.get()));
+
+  auto nonConstBloom =
+      std::make_shared<core::FieldAccessTypedExpr>(VARBINARY(), "bloom");
+  auto nonConstExpr = std::make_shared<core::CallTypedExpr>(
+      BOOLEAN(),
+      std::vector<core::TypedExprPtr>{nonConstBloom, key},
+      "might_contain");
+  ASSERT_FALSE(canExprRunOnGpu(nonConstExpr, queryCtx_.get(), pool_.get()));
 }
 
 TEST_F(CudfExpressionSelectionTest, signatureTypeVariableCoalesce) {

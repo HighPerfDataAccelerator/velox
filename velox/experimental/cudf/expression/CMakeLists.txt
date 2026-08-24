@@ -37,7 +37,9 @@ add_library(
   SparkFunctions.cpp
   sparksql/DateAddFunction.cpp
   sparksql/HashFunction.cpp
+  sparksql/MightContainFunction.cpp
   sparksql/SubStringFunction.cpp
+  sparksql/XxHash64Function.cpp
   SubfieldFiltersToAst.cpp
 )
 
