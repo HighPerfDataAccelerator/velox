@@ -130,6 +130,7 @@ jobs:
           ccache -s
 
       - uses: apache/infrastructure-actions/stash/save@3354c1565d4b0e335b78a76aedd82153a9e144d4
+        if: ${{ !cancelled() }}
         with:
           path: ${{ env.CCACHE_DIR }}
           key: ccache-macos-1-macos-15-${{ matrix.type }}
