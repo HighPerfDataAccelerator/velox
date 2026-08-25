@@ -13,7 +13,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/expression/sparksql/XxHash64Function.h"
 
 #include "velox/common/memory/Memory.h"
@@ -45,13 +44,12 @@ bool XxHash64Function::canEvaluate(const core::TypedExprPtr& expr) {
     return false;
   }
 
-  // Multi-column xxhash64_with_seed runs on GPU via cuDF xxhash_64, which
-  // combines columns with a constant seed instead of Spark's iterative
-  // seed-chaining (rapidsai/cudf#21720). When CPU fallback is allowed, reject
-  // this shape so it stays on CPU; when fallback is disabled, preserve the
-  // existing forced-GPU behavior used by hash_with_seed.
+  // Multi-column xxhash64_with_seed cannot run on GPU via cuDF xxhash_64:
+  // cuDF combines columns with a constant seed instead of Spark's iterative
+  // seed-chaining (rapidsai/cudf#21720). Always reject this shape so callers
+  // either use CPU fallback or fail closed instead of returning wrong hashes.
   const bool hasMultipleDataColumns = expr->inputs().size() > 2;
-  return !hasMultipleDataColumns || !CudfConfig::getInstance().allowCpuFallback;
+  return !hasMultipleDataColumns;
 }
 
 XxHash64Function::XxHash64Function(

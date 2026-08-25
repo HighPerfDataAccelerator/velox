@@ -22,6 +22,7 @@
 #include "velox/experimental/cudf/expression/JitExpression.h"
 #include "velox/experimental/cudf/expression/PrestoFunctions.h"
 #include "velox/experimental/cudf/expression/SparkFunctions.h"
+#include "velox/experimental/cudf/expression/sparksql/XxHash64Function.h"
 #include "velox/experimental/cudf/tests/utils/ExpressionTestUtil.h"
 
 #include "velox/common/memory/Memory.h"
@@ -140,6 +141,24 @@ TEST_F(CudfExpressionSelectionTest, sparkExpressionCoverage) {
       "array");
   ASSERT_TRUE(canExprRunOnGpu(arrayExpr, queryCtx_.get(), pool_.get()));
   ASSERT_NE(createCudfExpression(arrayExpr, rowType_, pool_.get()), nullptr);
+}
+
+TEST_F(CudfExpressionSelectionTest, sparkXxHash64RejectsMultipleColumns) {
+  auto singleColumn = optimizeTypedExpr(
+      "xxhash64_with_seed(cast(42 as bigint), a)",
+      rowType_,
+      queryCtx_.get(),
+      execCtx_.get(),
+      {.parseIntegerAsBigint = false, .functionPrefix = ""});
+  EXPECT_TRUE(sparksql::XxHash64Function::canEvaluate(singleColumn));
+
+  auto multipleColumns = optimizeTypedExpr(
+      "xxhash64_with_seed(cast(42 as bigint), a, b)",
+      rowType_,
+      queryCtx_.get(),
+      execCtx_.get(),
+      {.parseIntegerAsBigint = false, .functionPrefix = ""});
+  EXPECT_FALSE(sparksql::XxHash64Function::canEvaluate(multipleColumns));
 }
 
 TEST_F(CudfExpressionSelectionTest, multiBranchSwitch) {
