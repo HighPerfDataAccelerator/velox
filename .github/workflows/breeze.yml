@@ -15,9 +15,10 @@
 name: Breeze Linux Build
 
 on:
-  push:
+  workflow_dispatch: {}
+  pull_request:
     branches:
-      - main
+      - dev
     paths:
       - velox/experimental/breeze/**
       - velox/external/perfetto/**
@@ -25,8 +26,9 @@ on:
       - scripts/setup-ubuntu.sh
       - scripts/setup-helper-functions.sh
       - .github/workflows/breeze.yml
-
-  pull_request:
+  push:
+    branches:
+      - main
     paths:
       - velox/experimental/breeze/**
       - velox/external/perfetto/**
@@ -45,8 +47,16 @@ concurrency:
 jobs:
   ubuntu-debug:
     runs-on: ubuntu-22.04
-    # prevent errors when forks ff their main branch
-    if: ${{ github.repository == 'facebookincubator/velox' }}
+    timeout-minutes: 5
+    # Preserve the upstream main build and expose only the GitHub-hosted CPU
+    # lane to HPA pull requests and explicit canary dispatches.
+    if: >-
+      ${{
+        github.repository == 'facebookincubator/velox' ||
+        (github.repository == 'HighPerfDataAccelerator/velox' &&
+         (github.event_name == 'pull_request' ||
+          github.event_name == 'workflow_dispatch'))
+      }}
     name: Ubuntu debug
     defaults:
       run:
