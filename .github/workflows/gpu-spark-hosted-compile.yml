@@ -149,7 +149,6 @@ jobs:
             --env PKG_CONFIG_PATH=/workspace/hosted-deps/ucx/lib/pkgconfig:/workspace/hosted-deps/ucx/lib64/pkgconfig \
             --env VELOX_DEPENDENCY_SOURCE=SYSTEM \
             --env cudf_SOURCE=BUNDLED \
-            --env faiss_SOURCE=BUNDLED \
             --mount "type=bind,source=$GITHUB_WORKSPACE,target=/workspace" \
             --workdir /workspace \
             "$BUILD_IMAGE" -lc '
@@ -158,7 +157,7 @@ jobs:
               source /opt/rh/gcc-toolset-14/enable
               dnf -y install rdma-core-devel
 
-              BUILD_PROFILE=adapters USE_CLANG=false source .github/scripts/cmake-flags.sh
+              BUILD_PROFILE=gpu-spark-hosted source .github/scripts/cmake-flags.sh
               export CUDA_ARCHITECTURES=70
               export CUDA_COMPILER=/usr/local/cuda-12.9/bin/nvcc
               export CUDA_FLAGS="-ccbin /opt/rh/gcc-toolset-14/root/usr/bin"

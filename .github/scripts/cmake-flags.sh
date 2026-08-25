@@ -25,6 +25,8 @@
 #   * dep-graph            — Dep-graph generator action; same as adapters minus
 #                            WAVE/CUDF (they gate experimental code, which the
 #                            selective-build planner short-circuits to full).
+#   * gpu-spark-hosted     — Minimal cuDF/UCX production-object compile on a
+#                            standard GitHub-hosted runner.
 #   * ubuntu-debug         — Ubuntu debug with system dependencies.
 #   * ubuntu-bundled-deps  — Ubuntu debug with velox's BUNDLED dependency
 #                            resolution; mirrors ubuntu-debug minus
@@ -43,6 +45,14 @@
 #   EXTRA_CMAKE_FLAGS=("${CMAKE_FLAGS[@]}" -DVELOX_ENABLE_X=ON)
 
 case "${BUILD_PROFILE:?BUILD_PROFILE must be set before sourcing cmake-flags.sh}" in
+gpu-spark-hosted)
+  CMAKE_FLAGS=(
+    -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+    -DVELOX_MONO_LIBRARY=OFF
+    -DVELOX_ENABLE_CUDF=ON
+  )
+  ;;
+
 adapters | dep-graph)
   # adapters and dep-graph are sister profiles: dep-graph regenerates
   # the planner's source-of-truth graph for what adapters builds, so
