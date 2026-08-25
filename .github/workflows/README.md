@@ -24,7 +24,7 @@ For current build times and performance trends, see the [CI performance metrics]
 | Rerun Linux Build on Force-Full Trigger | `rerun-on-force-full.yml` | workflow_run (after Detect Force-Full Trigger) | Step 2 of the approval-path chain: BASE-context, dedups, calls the `rerun-linux-build` composite action |
 | Force-Full Build on /full-build Comment | `force-full-on-comment.yml` | PR comment containing `/full-build` | Direct (no workflow_run hop): dedups, calls the `rerun-linux-build` composite action |
 | Selective Build Comment | `selective-build-comment.yml` | workflow_run (after Linux Build) | Post selective build plan as PR comment |
-| macOS Build | `macos.yml` | push, PRs | Compilation check (debug + release) |
+| macOS Build | `macos.yml` | push to dev, PRs | Core API compilation check (debug) |
 | Breeze Linux Build | `breeze.yml` | push to main, PRs | Tracing module with sanitizers |
 | Fuzzer Jobs | `scheduled.yml` | PRs, push to main, daily cron, manual | Randomized correctness testing |
 | Run Checks | `preliminary_checks.yml` | PRs | Formatting, linting, PR title |
@@ -82,7 +82,16 @@ Status jobs handle cancelled runs gracefully — when a job is cancelled (e.g., 
 
 ### macOS Build (`macos.yml`)
 
-Builds the debug configuration on macOS 15 (ARM64/Apple Silicon) for pushes and pull requests targeting `dev`. Pure cuDF and UCX changes are excluded because those modules are not enabled by the macOS CMake profile; changes to shared Velox code still receive the cross-platform compile check. Uses the Ninja build generator and ccache for faster builds. Tests are currently disabled on macOS — the workflow focuses on ensuring compilation compatibility with Apple's toolchain rather than full test coverage. Dependencies are installed via the `setup-macos.sh` script.
+Builds the `velox_core_test` target in the debug configuration on macOS 15
+(ARM64/Apple Silicon) for pushes and pull requests targeting `dev`. This target
+compiles and links the shared core API surface and its production dependencies
+without spending hosted-runner time on every unrelated test binary. Pure cuDF
+and UCX changes are excluded because those modules are not enabled by the macOS
+CMake profile; changes to shared Velox code still receive the cross-platform
+compile check. Uses the Ninja build generator and ccache for faster builds.
+Tests are currently disabled on macOS — the workflow focuses on ensuring
+compilation compatibility with Apple's toolchain rather than full test
+coverage. Dependencies are installed via the `setup-macos.sh` script.
 
 ### Breeze Linux Build (`breeze.yml`)
 

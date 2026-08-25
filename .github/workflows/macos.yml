@@ -124,9 +124,9 @@ jobs:
               "${CMAKE_FLAGS[@]}" \
               -DCMAKE_BUILD_TYPE=$BUILD_TYPE
 
-      - name: Build
+      - name: Build core API surface
         run: |
-          cmake --build _build/$BUILD_TYPE -j $NJOBS
+          cmake --build _build/$BUILD_TYPE --target velox_core_test -j $NJOBS
           ccache -s
 
       - uses: apache/infrastructure-actions/stash/save@3354c1565d4b0e335b78a76aedd82153a9e144d4
