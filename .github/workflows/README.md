@@ -18,12 +18,13 @@ For current build times and performance trends, see the [CI performance metrics]
 
 | Workflow | File | Triggers | Purpose |
 |----------|------|----------|---------|
+| GPU Spark Hosted Compile | `gpu-spark-hosted-compile.yml` | push to dev, PRs, manual | Compile cuDF and UCX production objects on a standard GitHub-hosted runner without requiring a GPU |
 | Linux Build using GCC | `linux-build.yml` + `linux-build-base.yml` | push to main, PRs | Main build & test (3 configs); selective by default, full on push / sticky-approval |
 | Detect Force-Full Trigger | `detect-force-full.yml` | PR approving review | Step 1 of the approval-path chain: trivial trigger for the workflow_run hand-off (needed because fork PR reviews get a read-only token) |
 | Rerun Linux Build on Force-Full Trigger | `rerun-on-force-full.yml` | workflow_run (after Detect Force-Full Trigger) | Step 2 of the approval-path chain: BASE-context, dedups, calls the `rerun-linux-build` composite action |
 | Force-Full Build on /full-build Comment | `force-full-on-comment.yml` | PR comment containing `/full-build` | Direct (no workflow_run hop): dedups, calls the `rerun-linux-build` composite action |
 | Selective Build Comment | `selective-build-comment.yml` | workflow_run (after Linux Build) | Post selective build plan as PR comment |
-| macOS Build | `macos.yml` | push, PRs | Compilation check (debug + release) |
+| macOS Build | `macos.yml` | push to dev, PRs | Core API compilation check (debug) |
 | Breeze Linux Build | `breeze.yml` | push to main, PRs | Tracing module with sanitizers |
 | Fuzzer Jobs | `scheduled.yml` | PRs, push to main, daily cron, manual | Randomized correctness testing |
 | Run Checks | `preliminary_checks.yml` | PRs | Formatting, linting, PR title |
@@ -39,6 +40,22 @@ For current build times and performance trends, see the [CI performance metrics]
 | Ubuntu Bundled Deps | `ubuntu-bundled-deps.yml` | nightly, manual, PRs (dep scripts) | Build-from-source validation |
 
 ## Core Build & Test
+
+### GPU Spark Hosted Compile (`gpu-spark-hosted-compile.yml`)
+
+Uses the existing adapters CI image and a minimal cuDF CMake profile on a
+standard four-core GitHub-hosted runner. It configures the complete cuDF build
+graph without unrelated cloud adapters, then asks Ninja to compile only
+Velox-owned production objects under
+`velox/experimental/cudf` and `velox/experimental/ucx-exchange`. Building
+objects directly avoids compiling and linking all of libcudf while still
+checking C++, CUDA, generated-header, and public API compatibility.
+The current adapters image does not include UCX, so the workflow installs it
+through `scripts/setup-centos-adapters.sh` and caches the resulting prefix.
+
+This lane does not link the resulting libraries or execute GPU tests. Those
+remain responsibilities of the full adapters and `cudf-tests` jobs on larger
+and GPU-backed runners.
 
 ### Linux Build using GCC (`linux-build.yml` + `linux-build-base.yml`)
 
@@ -65,7 +82,16 @@ Status jobs handle cancelled runs gracefully — when a job is cancelled (e.g., 
 
 ### macOS Build (`macos.yml`)
 
-Builds Velox on macOS 15 (ARM64/Apple Silicon) with both debug and release configurations. Triggered on pushes to any branch and on pull requests when relevant files change. Uses the Ninja build generator and ccache for faster builds. Tests are currently disabled on macOS — the workflow focuses on ensuring compilation compatibility with Apple's toolchain rather than full test coverage. Dependencies are installed via the `setup-macos.sh` script.
+Builds the `velox_core_test` target in the debug configuration on macOS 15
+(ARM64/Apple Silicon) for pushes and pull requests targeting `dev`. This target
+compiles and links the shared core API surface and its production dependencies
+without spending hosted-runner time on every unrelated test binary. Pure cuDF
+and UCX changes are excluded because those modules are not enabled by the macOS
+CMake profile; changes to shared Velox code still receive the cross-platform
+compile check. Uses the Ninja build generator and ccache for faster builds.
+Tests are currently disabled on macOS — the workflow focuses on ensuring
+compilation compatibility with Apple's toolchain rather than full test
+coverage. Dependencies are installed via the `setup-macos.sh` script.
 
 ### Breeze Linux Build (`breeze.yml`)
 

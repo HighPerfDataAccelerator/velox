@@ -594,290 +594,242 @@ TEST_F(PlanNodeTest, aggregationNodeNoGroupsSpanBatches) {
   }
 }
 
-TEST_F(PlanNodeTest, exchangeNodeTransportTypeSerialization) {
-  // Round-trip with kUcx transport.
-  {
-    auto node = std::make_shared<ExchangeNode>(
-        "exchange1", rowType_, "presto", ExchangeNode::TransportType::kUcx);
-    auto serialized = node->serialize();
-    ASSERT_EQ(serialized["transportType"].asString(), "UCX");
-    auto deserialized = std::dynamic_pointer_cast<const ExchangeNode>(
-        ExchangeNode::create(serialized, nullptr));
-    ASSERT_EQ(deserialized->transportType(), ExchangeNode::TransportType::kUcx);
-  }
-
-  // Round-trip with kHttp transport.
-  {
-    auto node = std::make_shared<ExchangeNode>(
-        "exchange2", rowType_, "presto", ExchangeNode::TransportType::kHttp);
-    auto serialized = node->serialize();
-    ASSERT_EQ(serialized["transportType"].asString(), "HTTP");
-    auto deserialized = std::dynamic_pointer_cast<const ExchangeNode>(
-        ExchangeNode::create(serialized, nullptr));
-    ASSERT_EQ(
-        deserialized->transportType(), ExchangeNode::TransportType::kHttp);
-  }
-
-  // Backward compatibility: missing transportType field defaults to kHttp.
-  {
-    auto node = std::make_shared<ExchangeNode>(
-        "exchange3", rowType_, "presto", ExchangeNode::TransportType::kUcx);
-    auto serialized = node->serialize();
-    serialized.erase("transportType");
-    auto deserialized = std::dynamic_pointer_cast<const ExchangeNode>(
-        ExchangeNode::create(serialized, nullptr));
-    ASSERT_EQ(
-        deserialized->transportType(), ExchangeNode::TransportType::kHttp);
-  }
-}
-
-TEST_F(PlanNodeTest, partitionedOutputNodeTransportTypeSerialization) {
+TEST_F(PlanNodeTest, partitionedOutputNodeTransportKindSerialization) {
   auto source = std::make_shared<ValuesNode>("source", rowData_);
   const auto serdeKind = "presto";
 
   // Round-trip with kUcx transport.
   {
     auto node = PartitionedOutputNode::single(
-        "po1",
-        rowType_,
-        serdeKind,
-        source,
-        PartitionedOutputNode::TransportType::kUcx);
+        "po1", rowType_, serdeKind, std::string{TransportKind::kUcx}, source);
     auto serialized = node->serialize();
-    ASSERT_EQ(serialized["transportType"].asString(), "UCX");
+    ASSERT_EQ(serialized["transportKind"].asString(), "UCX");
     auto deserialized = std::dynamic_pointer_cast<const PartitionedOutputNode>(
         PartitionedOutputNode::create(serialized, nullptr));
-    ASSERT_EQ(
-        deserialized->transportType(),
-        PartitionedOutputNode::TransportType::kUcx);
+    ASSERT_EQ(deserialized->transportKind(), std::string{TransportKind::kUcx});
   }
 
-  // Round-trip with kHttp transport.
+  // Round-trip with in-memory transport.
   {
     auto node = PartitionedOutputNode::single(
         "po2",
         rowType_,
         serdeKind,
-        source,
-        PartitionedOutputNode::TransportType::kHttp);
+        std::string{TransportKind::kInMemory},
+        source);
     auto serialized = node->serialize();
-    ASSERT_EQ(serialized["transportType"].asString(), "HTTP");
+    ASSERT_EQ(serialized["transportKind"].asString(), "in-memory");
     auto deserialized = std::dynamic_pointer_cast<const PartitionedOutputNode>(
         PartitionedOutputNode::create(serialized, nullptr));
     ASSERT_EQ(
-        deserialized->transportType(),
-        PartitionedOutputNode::TransportType::kHttp);
+        deserialized->transportKind(), std::string{TransportKind::kInMemory});
   }
 
-  // Backward compatibility: missing transportType field defaults to kHttp.
+  // Backward compatibility: missing transportKind defaults to in-memory.
   {
     auto node = PartitionedOutputNode::single(
-        "po3",
-        rowType_,
-        serdeKind,
-        source,
-        PartitionedOutputNode::TransportType::kUcx);
+        "po3", rowType_, serdeKind, std::string{TransportKind::kUcx}, source);
     auto serialized = node->serialize();
-    serialized.erase("transportType");
+    serialized.erase("transportKind");
     auto deserialized = std::dynamic_pointer_cast<const PartitionedOutputNode>(
         PartitionedOutputNode::create(serialized, nullptr));
     ASSERT_EQ(
-        deserialized->transportType(),
-        PartitionedOutputNode::TransportType::kHttp);
+        deserialized->transportKind(), std::string{TransportKind::kInMemory});
   }
-  // The FixedPointNode constructor and the state declarations validate their
-  // inputs up front, so a malformed plan fails at construction rather than at
-  // execution.
-  TEST_F(PlanNodeTest, fixedPointValidation) {
-    auto vecSchema = ROW("x", BIGINT());
-    auto htSchema = ROW({"k", "v"}, BIGINT());
+}
 
-    // A single body that reads the output entry -- the minimal valid body,
-    // reused as the valid baseline that each case mutates one field of.
-    auto body =
-        std::make_shared<StateSourceNode>("b", "n", vecSchema, /*delta=*/true);
-    auto vectorN = [&] {
-      return std::make_shared<VectorStateDeclaration>(
-          "n", vecSchema, /*initialPlan=*/nullptr, /*append=*/true);
-    };
+// The FixedPointNode constructor and the state declarations validate their
+// inputs up front, so a malformed plan fails at construction rather than at
+// execution.
+TEST_F(PlanNodeTest, fixedPointValidation) {
+  auto vecSchema = ROW("x", BIGINT());
+  auto htSchema = ROW({"k", "v"}, BIGINT());
 
-    // maxIterations must be positive.
-    VELOX_ASSERT_USER_THROW(
-        std::make_shared<FixedPointNode>(
-            "fp",
-            std::vector<StateDeclarationPtr>{vectorN()},
-            std::vector<PlanNodePtr>{body},
-            ConvergenceConfig{
-                .maxIterations = 0, .errorWhenMaxIterationReached = false},
-            "n"),
-        "maxIterations must be positive");
+  // A single body that reads the output entry -- the minimal valid body,
+  // reused as the valid baseline that each case mutates one field of.
+  auto body =
+      std::make_shared<StateSourceNode>("b", "n", vecSchema, /*delta=*/true);
+  auto vectorN = [&] {
+    return std::make_shared<VectorStateDeclaration>(
+        "n", vecSchema, /*initialPlan=*/nullptr, /*append=*/true);
+  };
 
-    // A hash table needs at least one key column, and every key must be in the
-    // schema -- checked when the declaration is built.
-    VELOX_ASSERT_USER_THROW(
-        std::make_shared<HashTableStateDeclaration>(
-            "h", htSchema, std::vector<std::string>{}),
-        "at least one key column");
-    VELOX_ASSERT_USER_THROW(
-        std::make_shared<HashTableStateDeclaration>(
-            "h", htSchema, std::vector<std::string>{"missing"}),
-        "key column is not in the schema");
-    VELOX_ASSERT_USER_THROW(
-        std::make_shared<HashTableStateDeclaration>(
-            "h", htSchema, std::vector<std::string>{"k", "k"}),
-        "key columns must be unique");
+  // maxIterations must be positive.
+  VELOX_ASSERT_USER_THROW(
+      std::make_shared<FixedPointNode>(
+          "fp",
+          std::vector<StateDeclarationPtr>{vectorN()},
+          std::vector<PlanNodePtr>{body},
+          ConvergenceConfig{
+              .maxIterations = 0, .errorWhenMaxIterationReached = false},
+          "n"),
+      "maxIterations must be positive");
 
-    // StateHashJoin needs a non-null probe source and at least one probe key.
-    VELOX_ASSERT_USER_THROW(
-        std::make_shared<StateHashJoinNode>(
-            "j", "h", std::vector<std::string>{"k"}, htSchema, nullptr),
-        "non-null probe source");
-    VELOX_ASSERT_USER_THROW(
-        std::make_shared<StateHashJoinNode>(
-            "j", "h", std::vector<std::string>{}, htSchema, body),
-        "at least one probe key");
+  // A hash table needs at least one key column, and every key must be in the
+  // schema -- checked when the declaration is built.
+  VELOX_ASSERT_USER_THROW(
+      std::make_shared<HashTableStateDeclaration>(
+          "h", htSchema, std::vector<std::string>{}),
+      "at least one key column");
+  VELOX_ASSERT_USER_THROW(
+      std::make_shared<HashTableStateDeclaration>(
+          "h", htSchema, std::vector<std::string>{"missing"}),
+      "key column is not in the schema");
+  VELOX_ASSERT_USER_THROW(
+      std::make_shared<HashTableStateDeclaration>(
+          "h", htSchema, std::vector<std::string>{"k", "k"}),
+      "key columns must be unique");
 
-    // State declaration names must be unique across all kinds.
-    VELOX_ASSERT_USER_THROW(
-        std::make_shared<FixedPointNode>(
-            "fp",
-            std::vector<StateDeclarationPtr>{
-                vectorN(),
-                std::make_shared<VectorStateDeclaration>("n", vecSchema)},
-            std::vector<PlanNodePtr>{body},
-            ConvergenceConfig{
-                .maxIterations = 5, .errorWhenMaxIterationReached = false},
-            "n"),
-        "duplicate state declaration name");
+  // StateHashJoin needs a non-null probe source and at least one probe key.
+  VELOX_ASSERT_USER_THROW(
+      std::make_shared<StateHashJoinNode>(
+          "j", "h", std::vector<std::string>{"k"}, htSchema, nullptr),
+      "non-null probe source");
+  VELOX_ASSERT_USER_THROW(
+      std::make_shared<StateHashJoinNode>(
+          "j", "h", std::vector<std::string>{}, htSchema, body),
+      "at least one probe key");
 
-    // A StateSource must reference a declared vector entry.
-    auto typoBody = std::make_shared<StateSourceNode>(
-        "b", "typo", vecSchema, /*delta=*/true);
-    VELOX_ASSERT_USER_THROW(
-        std::make_shared<FixedPointNode>(
-            "fp",
-            std::vector<StateDeclarationPtr>{vectorN()},
-            std::vector<PlanNodePtr>{typoBody},
-            ConvergenceConfig{
-                .maxIterations = 5, .errorWhenMaxIterationReached = false},
-            "n"),
-        "StateSource references no declared vector state entry");
+  // State declaration names must be unique across all kinds.
+  VELOX_ASSERT_USER_THROW(
+      std::make_shared<FixedPointNode>(
+          "fp",
+          std::vector<StateDeclarationPtr>{
+              vectorN(),
+              std::make_shared<VectorStateDeclaration>("n", vecSchema)},
+          std::vector<PlanNodePtr>{body},
+          ConvergenceConfig{
+              .maxIterations = 5, .errorWhenMaxIterationReached = false},
+          "n"),
+      "duplicate state declaration name");
 
-    // errorWhenMaxIterationReached requires a convergence plan (a null plan
-    // never converges, so it would always fail).
-    VELOX_ASSERT_USER_THROW(
-        std::make_shared<FixedPointNode>(
-            "fp",
-            std::vector<StateDeclarationPtr>{vectorN()},
-            std::vector<PlanNodePtr>{body},
-            ConvergenceConfig{
-                .maxIterations = 5, .errorWhenMaxIterationReached = true},
-            "n"),
-        "errorWhenMaxIterationReached requires a convergence plan");
+  // A StateSource must reference a declared vector entry.
+  auto typoBody =
+      std::make_shared<StateSourceNode>("b", "typo", vecSchema, /*delta=*/true);
+  VELOX_ASSERT_USER_THROW(
+      std::make_shared<FixedPointNode>(
+          "fp",
+          std::vector<StateDeclarationPtr>{vectorN()},
+          std::vector<PlanNodePtr>{typoBody},
+          ConvergenceConfig{
+              .maxIterations = 5, .errorWhenMaxIterationReached = false},
+          "n"),
+      "StateSource references no declared vector state entry");
 
-    // A convergence plan must emit exactly one BOOLEAN column.
-    auto nonBoolConvergence =
-        std::make_shared<StateSourceNode>("c", "n", vecSchema, /*delta=*/false);
-    VELOX_ASSERT_USER_THROW(
-        std::make_shared<FixedPointNode>(
-            "fp",
-            std::vector<StateDeclarationPtr>{vectorN()},
-            std::vector<PlanNodePtr>{body},
-            ConvergenceConfig{.plan = nonBoolConvergence, .maxIterations = 5},
-            "n"),
-        "convergence plan output column must be BOOLEAN");
+  // errorWhenMaxIterationReached requires a convergence plan (a null plan
+  // never converges, so it would always fail).
+  VELOX_ASSERT_USER_THROW(
+      std::make_shared<FixedPointNode>(
+          "fp",
+          std::vector<StateDeclarationPtr>{vectorN()},
+          std::vector<PlanNodePtr>{body},
+          ConvergenceConfig{
+              .maxIterations = 5, .errorWhenMaxIterationReached = true},
+          "n"),
+      "errorWhenMaxIterationReached requires a convergence plan");
 
-    auto twoColSchema = ROW({"a", "b"}, BOOLEAN());
-    auto twoColConvergence = std::make_shared<StateSourceNode>(
-        "c", "flags", twoColSchema, /*delta=*/false);
-    VELOX_ASSERT_USER_THROW(
-        std::make_shared<FixedPointNode>(
-            "fp",
-            std::vector<StateDeclarationPtr>{
-                vectorN(),
-                std::make_shared<VectorStateDeclaration>(
-                    "flags", twoColSchema)},
-            std::vector<PlanNodePtr>{body},
-            ConvergenceConfig{.plan = twoColConvergence, .maxIterations = 5},
-            "n"),
-        "exactly one output column");
+  // A convergence plan must emit exactly one BOOLEAN column.
+  auto nonBoolConvergence =
+      std::make_shared<StateSourceNode>("c", "n", vecSchema, /*delta=*/false);
+  VELOX_ASSERT_USER_THROW(
+      std::make_shared<FixedPointNode>(
+          "fp",
+          std::vector<StateDeclarationPtr>{vectorN()},
+          std::vector<PlanNodePtr>{body},
+          ConvergenceConfig{.plan = nonBoolConvergence, .maxIterations = 5},
+          "n"),
+      "convergence plan output column must be BOOLEAN");
 
-    // A StateHashJoin output arity must equal probe columns plus the hash
-    // table's payload columns.
-    auto badArityJoin = std::make_shared<StateHashJoinNode>(
-        "j",
-        "h",
-        std::vector<std::string>{"x"},
-        vecSchema,
-        std::make_shared<StateSourceNode>("b", "n", vecSchema, /*delta=*/true));
-    VELOX_ASSERT_USER_THROW(
-        std::make_shared<FixedPointNode>(
-            "fp",
-            std::vector<StateDeclarationPtr>{
-                vectorN(),
-                std::make_shared<HashTableStateDeclaration>(
-                    "h", htSchema, std::vector<std::string>{"k"})},
-            std::vector<PlanNodePtr>{badArityJoin},
-            ConvergenceConfig{
-                .maxIterations = 5, .errorWhenMaxIterationReached = false},
-            "n"),
-        "output arity must equal probe columns plus hash table payload columns");
+  auto twoColSchema = ROW({"a", "b"}, BOOLEAN());
+  auto twoColConvergence = std::make_shared<StateSourceNode>(
+      "c", "flags", twoColSchema, /*delta=*/false);
+  VELOX_ASSERT_USER_THROW(
+      std::make_shared<FixedPointNode>(
+          "fp",
+          std::vector<StateDeclarationPtr>{
+              vectorN(),
+              std::make_shared<VectorStateDeclaration>("flags", twoColSchema)},
+          std::vector<PlanNodePtr>{body},
+          ConvergenceConfig{.plan = twoColConvergence, .maxIterations = 5},
+          "n"),
+      "exactly one output column");
 
-    // A StateHashJoin's leading probe key column types must match the hash
-    // table's build key types (keys-first on both sides).
-    auto varcharProbe = ROW("k", VARCHAR());
-    auto badKeyTypeJoin = std::make_shared<StateHashJoinNode>(
-        "j",
-        "h",
-        std::vector<std::string>{"k"},
-        ROW({"k", "v"}, {VARCHAR(), BIGINT()}),
-        std::make_shared<StateSourceNode>(
-            "s", "probe", varcharProbe, /*delta=*/true));
-    VELOX_ASSERT_USER_THROW(
-        std::make_shared<FixedPointNode>(
-            "fp",
-            std::vector<StateDeclarationPtr>{
-                std::make_shared<VectorStateDeclaration>("probe", varcharProbe),
-                std::make_shared<HashTableStateDeclaration>(
-                    "h", htSchema, std::vector<std::string>{"k"})},
-            std::vector<PlanNodePtr>{badKeyTypeJoin},
-            ConvergenceConfig{
-                .maxIterations = 5, .errorWhenMaxIterationReached = false},
-            "probe"),
-        "probe key column type at channel 0 must match the hash table build key");
+  // A StateHashJoin output arity must equal probe columns plus the hash
+  // table's payload columns.
+  auto badArityJoin = std::make_shared<StateHashJoinNode>(
+      "j",
+      "h",
+      std::vector<std::string>{"x"},
+      vecSchema,
+      std::make_shared<StateSourceNode>("b", "n", vecSchema, /*delta=*/true));
+  VELOX_ASSERT_USER_THROW(
+      std::make_shared<FixedPointNode>(
+          "fp",
+          std::vector<StateDeclarationPtr>{
+              vectorN(),
+              std::make_shared<HashTableStateDeclaration>(
+                  "h", htSchema, std::vector<std::string>{"k"})},
+          std::vector<PlanNodePtr>{badArityJoin},
+          ConvergenceConfig{
+              .maxIterations = 5, .errorWhenMaxIterationReached = false},
+          "n"),
+      "output arity must equal probe columns plus hash table payload columns");
 
-    // A null body plan is rejected with a clean error rather than crashing.
-    VELOX_ASSERT_USER_THROW(
-        std::make_shared<FixedPointNode>(
-            "fp",
-            std::vector<StateDeclarationPtr>{vectorN()},
-            std::vector<PlanNodePtr>{nullptr},
-            ConvergenceConfig{
-                .maxIterations = 5, .errorWhenMaxIterationReached = false},
-            "n"),
-        "plan 0 must not be null");
+  // A StateHashJoin's leading probe key column types must match the hash
+  // table's build key types (keys-first on both sides).
+  auto varcharProbe = ROW("k", VARCHAR());
+  auto badKeyTypeJoin = std::make_shared<StateHashJoinNode>(
+      "j",
+      "h",
+      std::vector<std::string>{"k"},
+      ROW({"k", "v"}, {VARCHAR(), BIGINT()}),
+      std::make_shared<StateSourceNode>(
+          "s", "probe", varcharProbe, /*delta=*/true));
+  VELOX_ASSERT_USER_THROW(
+      std::make_shared<FixedPointNode>(
+          "fp",
+          std::vector<StateDeclarationPtr>{
+              std::make_shared<VectorStateDeclaration>("probe", varcharProbe),
+              std::make_shared<HashTableStateDeclaration>(
+                  "h", htSchema, std::vector<std::string>{"k"})},
+          std::vector<PlanNodePtr>{badKeyTypeJoin},
+          ConvergenceConfig{
+              .maxIterations = 5, .errorWhenMaxIterationReached = false},
+          "probe"),
+      "probe key column type at channel 0 must match the hash table build key");
 
-    // Hash table key columns must be the leading schema columns (keys-first).
-    VELOX_ASSERT_USER_THROW(
-        std::make_shared<HashTableStateDeclaration>(
-            "h", ROW({"v", "k"}, BIGINT()), std::vector<std::string>{"k"}),
-        "leading schema columns in order");
+  // A null body plan is rejected with a clean error rather than crashing.
+  VELOX_ASSERT_USER_THROW(
+      std::make_shared<FixedPointNode>(
+          "fp",
+          std::vector<StateDeclarationPtr>{vectorN()},
+          std::vector<PlanNodePtr>{nullptr},
+          ConvergenceConfig{
+              .maxIterations = 5, .errorWhenMaxIterationReached = false},
+          "n"),
+      "plan 0 must not be null");
 
-    // An initial plan must not read state -- it runs in Phase 1 before state
-    // exists.
-    auto stateReadingInitial =
-        std::make_shared<StateSourceNode>("s", "n", vecSchema, /*delta=*/true);
-    VELOX_ASSERT_USER_THROW(
-        std::make_shared<FixedPointNode>(
-            "fp",
-            std::vector<StateDeclarationPtr>{
-                std::make_shared<VectorStateDeclaration>(
-                    "n", vecSchema, stateReadingInitial, /*append=*/true)},
-            std::vector<PlanNodePtr>{body},
-            ConvergenceConfig{
-                .maxIterations = 5, .errorWhenMaxIterationReached = false},
-            "n"),
-        "initial plan must not read state");
-  }
+  // Hash table key columns must be the leading schema columns (keys-first).
+  VELOX_ASSERT_USER_THROW(
+      std::make_shared<HashTableStateDeclaration>(
+          "h", ROW({"v", "k"}, BIGINT()), std::vector<std::string>{"k"}),
+      "leading schema columns in order");
+
+  // An initial plan must not read state -- it runs in Phase 1 before state
+  // exists.
+  auto stateReadingInitial =
+      std::make_shared<StateSourceNode>("s", "n", vecSchema, /*delta=*/true);
+  VELOX_ASSERT_USER_THROW(
+      std::make_shared<FixedPointNode>(
+          "fp",
+          std::vector<StateDeclarationPtr>{
+              std::make_shared<VectorStateDeclaration>(
+                  "n", vecSchema, stateReadingInitial, /*append=*/true)},
+          std::vector<PlanNodePtr>{body},
+          ConvergenceConfig{
+              .maxIterations = 5, .errorWhenMaxIterationReached = false},
+          "n"),
+      "initial plan must not read state");
+}
 
 } // namespace

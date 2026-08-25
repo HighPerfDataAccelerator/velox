@@ -58,7 +58,7 @@ class TaskOutputManagerTest : public HiveConnectorTestBase {
 
   std::shared_ptr<Task> startTask(
       const std::string& taskId,
-      core::PartitionedOutputNode::TransportType transport,
+      std::string_view transportKind,
       core::QueryConfig queryConfig = core::QueryConfig{{}}) {
     auto output = std::dynamic_pointer_cast<const core::PartitionedOutputNode>(
         PlanBuilder()
@@ -66,7 +66,7 @@ class TaskOutputManagerTest : public HiveConnectorTestBase {
             .partitionedOutputBroadcast()
             .planNode());
     auto plan = core::PartitionedOutputNode::Builder(*output)
-                    .transportType(transport)
+                    .transportKind(std::string{transportKind})
                     .build();
     auto task = Task::create(
         taskId,
@@ -93,8 +93,7 @@ TEST_F(TaskOutputManagerTest, selectionAndCancellationCleanup) {
   auto cleanup =
       folly::makeGuard([&]() { queueManager->removeTask(ucxTaskId); });
 
-  auto ucxTask =
-      startTask(ucxTaskId, core::PartitionedOutputNode::TransportType::kUcx);
+  auto ucxTask = startTask(ucxTaskId, core::TransportKind::kUcx);
   ASSERT_TRUE(queueManager->stats(ucxTaskId).has_value());
 
   std::atomic_bool cancellationDelivered{false};
@@ -111,16 +110,15 @@ TEST_F(TaskOutputManagerTest, selectionAndCancellationCleanup) {
   queueManager->removeTask(ucxTaskId);
   cleanup.dismiss();
 
-  const std::string httpTaskId = "http-output-manager-lifecycle";
-  auto httpTask =
-      startTask(httpTaskId, core::PartitionedOutputNode::TransportType::kHttp);
-  EXPECT_FALSE(queueManager->stats(httpTaskId).has_value());
-  httpTask->requestAbort().wait();
+  const std::string inMemoryTaskId = "in-memory-output-manager-lifecycle";
+  auto inMemoryTask = startTask(inMemoryTaskId, core::TransportKind::kInMemory);
+  EXPECT_FALSE(queueManager->stats(inMemoryTaskId).has_value());
+  inMemoryTask->requestAbort().wait();
 
   const std::string disabledTaskId = "disabled-ucx-output-manager-lifecycle";
   auto disabledTask = startTask(
       disabledTaskId,
-      core::PartitionedOutputNode::TransportType::kUcx,
+      core::TransportKind::kUcx,
       core::QueryConfig(
           std::unordered_map<std::string, std::string>{
               {cudf_velox::CudfConfig::kCudfEnabled, "false"}}));

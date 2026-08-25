@@ -49,13 +49,27 @@ target_compile_options(velox_ucx_exchange PRIVATE -Wno-error=deprecated-declarat
 
 target_include_directories(velox_ucx_exchange PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 
-find_package(ucxx CONFIG REQUIRED)
-find_package(ucx REQUIRED)
+if(NOT TARGET ucxx::ucxx)
+  find_package(ucxx CONFIG REQUIRED)
+endif()
+if(NOT TARGET ucx::ucp)
+  find_package(ucx REQUIRED)
+endif()
+if(NOT TARGET nvtx3::nvtx3-cpp)
+  find_package(nvtx3 REQUIRED)
+endif()
 
 target_link_libraries(
   velox_ucx_exchange
   PUBLIC ucxx::ucxx ucx::ucp
-  PRIVATE cudf::cudf CUDA::cudart CUDA::cuda_driver Folly::folly velox_core ucx::ucs
+  PRIVATE
+    cudf::cudf
+    nvtx3::nvtx3-cpp
+    CUDA::cudart
+    CUDA::cuda_driver
+    Folly::folly
+    velox_core
+    ucx::ucs
 )
 
 if(VELOX_BUILD_TESTING)

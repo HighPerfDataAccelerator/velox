@@ -1,0 +1,186 @@
+# Copyright (c) Facebook, Inc. and its affiliates.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: GPU Spark Hosted Compile
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches:
+      - dev
+    paths:
+      - velox/experimental/cudf/**
+      - velox/experimental/ucx-exchange/**
+      - velox/functions/sparksql/**
+      - velox/common/**
+      - velox/core/**
+      - velox/exec/**
+      - velox/vector/**
+      - CMakeLists.txt
+      - CMake/**
+      - Makefile
+      - scripts/setup-centos-adapters.sh
+      - scripts/setup-centos9.sh
+      - scripts/setup-common.sh
+      - scripts/setup-helper-functions.sh
+      - scripts/setup-versions.sh
+      - .github/scripts/cmake-flags.sh
+      - .github/workflows/gpu-spark-hosted-compile.yml
+  pull_request:
+    branches:
+      - dev
+    paths:
+      - velox/experimental/cudf/**
+      - velox/experimental/ucx-exchange/**
+      - velox/functions/sparksql/**
+      - velox/common/**
+      - velox/core/**
+      - velox/exec/**
+      - velox/vector/**
+      - CMakeLists.txt
+      - CMake/**
+      - Makefile
+      - scripts/setup-centos-adapters.sh
+      - scripts/setup-centos9.sh
+      - scripts/setup-common.sh
+      - scripts/setup-helper-functions.sh
+      - scripts/setup-versions.sh
+      - .github/scripts/cmake-flags.sh
+      - .github/workflows/gpu-spark-hosted-compile.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.repository }}-${{ github.head_ref || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  compile:
+    name: cuDF and UCX object compile
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    env:
+      BUILD_IMAGE: ghcr.io/facebookincubator/velox-dev@sha256:480989697666235f5d5c4ea7cdb26145b9722fc6db6e0cc2fe0bcfa369ffa199
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Restore UCX
+        id: ucx-cache
+        uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: hosted-deps/ucx
+          key: hosted-ucx-${{ runner.os }}-1.20.1-v1
+
+      - name: Restore compiler cache
+        uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: ccache
+          key: hosted-gpu-spark-${{ runner.os }}-${{ hashFiles('CMake/resolve_dependency_modules/cudf.cmake', '.github/scripts/cmake-flags.sh') }}-${{ github.sha }}
+          restore-keys: |
+            hosted-gpu-spark-${{ runner.os }}-
+
+      - name: Pull build image
+        run: |
+          docker pull "$BUILD_IMAGE"
+
+      - name: Build UCX dependency
+        if: steps.ucx-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p hosted-deps/ucx
+          docker run --rm \
+            --entrypoint /bin/bash \
+            --env BUILD_THREADS=4 \
+            --env DEPENDENCY_DIR=/tmp/velox-hosted-deps \
+            --env INSTALL_PREFIX=/workspace/hosted-deps/ucx \
+            --env UCX_VERSION=1.20.1 \
+            --mount "type=bind,source=$GITHUB_WORKSPACE,target=/workspace" \
+            --workdir /workspace \
+            "$BUILD_IMAGE" -lc '
+              set -euo pipefail
+              mkdir -p "$DEPENDENCY_DIR"
+              source scripts/setup-centos-adapters.sh
+              install_ucx
+            '
+
+      - name: Save UCX
+        if: steps.ucx-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: hosted-deps/ucx
+          key: hosted-ucx-${{ runner.os }}-1.20.1-v1
+
+      - name: Configure and compile GPU Spark objects
+        run: |
+          mkdir -p ccache
+          docker run --rm \
+            --entrypoint /bin/bash \
+            --env CCACHE_DIR=/workspace/ccache \
+            --env CCACHE_MAXSIZE=2G \
+            --env CCACHE_NOHASHDIR=true \
+            --env CMAKE_PREFIX_PATH=/workspace/hosted-deps/ucx \
+            --env CPATH=/workspace/hosted-deps/ucx/include \
+            --env LD_LIBRARY_PATH=/workspace/hosted-deps/ucx/lib:/workspace/hosted-deps/ucx/lib64 \
+            --env LIBRARY_PATH=/workspace/hosted-deps/ucx/lib:/workspace/hosted-deps/ucx/lib64 \
+            --env PKG_CONFIG_PATH=/workspace/hosted-deps/ucx/lib/pkgconfig:/workspace/hosted-deps/ucx/lib64/pkgconfig \
+            --env VELOX_DEPENDENCY_SOURCE=SYSTEM \
+            --env cudf_SOURCE=BUNDLED \
+            --mount "type=bind,source=$GITHUB_WORKSPACE,target=/workspace" \
+            --workdir /workspace \
+            "$BUILD_IMAGE" -lc '
+              set -euo pipefail
+              git config --global --add safe.directory /workspace
+              source /opt/rh/gcc-toolset-14/enable
+              dnf -y install rdma-core-devel
+
+              BUILD_PROFILE=gpu-spark-hosted source .github/scripts/cmake-flags.sh
+              export CUDA_ARCHITECTURES=70
+              export CUDA_COMPILER=/usr/local/cuda-12.9/bin/nvcc
+              export CUDA_FLAGS="-ccbin /opt/rh/gcc-toolset-14/root/usr/bin"
+
+              CC=gcc CXX=g++ make cmake \
+                BUILD_DIR=hosted-gpu-spark \
+                BUILD_TYPE=Release \
+                VELOX_BUILD_TESTING=OFF \
+                MAX_HIGH_MEM_JOBS=2 \
+                MAX_LINK_JOBS=1 \
+                EXTRA_CMAKE_FLAGS="${CMAKE_FLAGS[*]}"
+
+              mapfile -t objects < <(
+                ninja -C _build/hosted-gpu-spark -t targets all |
+                  sed -nE "s#^(velox/experimental/(cudf|ucx-exchange)/[^:]+\\.o):.*#\\1#p"
+              )
+              if (( ${#objects[@]} == 0 )); then
+                echo "::error::CMake generated no cuDF or UCX object targets."
+                exit 1
+              fi
+
+              printf "Compiling %d Velox GPU object targets.\n" "${#objects[@]}"
+              printf "%s\n" "${objects[@]}"
+              ninja -C _build/hosted-gpu-spark -j 4 "${objects[@]}"
+              ccache -s
+            '
