@@ -22,7 +22,7 @@
 
 namespace facebook::velox::cudf_velox::test {
 
-TEST(ConfigTest, CudfConfig) {
+TEST(ConfigTest, cudfConfig) {
   CudfConfig defaults;
   EXPECT_FALSE(defaults.concatOptimizationEnabled);
   EXPECT_TRUE(defaults.exchangeConcatOptimizationEnabled);

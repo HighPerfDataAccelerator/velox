@@ -798,6 +798,9 @@ class LegacyStringFieldReader final : public FieldReader {
         scatterBitmap);
     size_t totalLength = 0;
     const bool hasNulls = (nonNullCount != rowCount);
+    // A column that is entirely null over this batch would make both passes
+    // over |rowCount| below run only to move nothing.
+    const bool allNull = (nonNullCount == 0);
     if (!hasNulls) {
       vector->resetNulls();
       for (uint32_t i = 0; i < rowCount; ++i) {
@@ -805,9 +808,11 @@ class LegacyStringFieldReader final : public FieldReader {
       }
     } else {
       vector->setNullCount(rowCount - nonNullCount);
-      for (uint32_t i = 0; i < rowCount; ++i) {
-        if (!vector->isNullAt(i)) {
-          totalLength += buffer_[i].length();
+      if (!allNull) {
+        for (uint32_t i = 0; i < rowCount; ++i) {
+          if (!vector->isNullAt(i)) {
+            totalLength += buffer_[i].length();
+          }
         }
       }
     }
@@ -824,7 +829,7 @@ class LegacyStringFieldReader final : public FieldReader {
             velox::StringView(dataPtr + currentOffset, buffer_[i].length());
         currentOffset += buffer_[i].length();
       }
-    } else {
+    } else if (!allNull) {
       for (uint32_t i = 0; i < rowCount; ++i) {
         if (!vector->isNullAt(i)) {
           std::copy(
@@ -3374,7 +3379,26 @@ class MergedFlatMapFieldReader final
     }
 
     velox::VectorPtr& valuesVector = vector->mapValues();
+    // The key vector holds one entry per map entry, but VectorInitializer above
+    // sized it from rowCount, which shrinks its values buffer to
+    // rowCount * sizeof(T). The resize below is what puts that back -- except
+    // FlatVector::resize returns early when handed the size the vector already
+    // has, which happens whenever two consecutive batches carry the same entry
+    // count. The vector is then left claiming totalMapEntries entries over a
+    // rowCount-sized buffer. Nothing notices on a plain read, because only
+    // wrapping the vector in a dictionary -- what a filtered read does when it
+    // drops rows -- ever validates it, and only in a debug build.
+    //
+    // Dropping to zero first makes the growth path always run. Capacity
+    // survives the shrink, so this costs no allocation.
+    //
+    // The zero-entry case is deliberately left alone: a batch with no entries
+    // keeps the previous batch's key length, which is the same inconsistency in
+    // miniature. Clearing it here regresses flat map feature projection
+    // (koski's NimbleTableTest.FeatureProjection*), so it needs its own
+    // investigation rather than a drive-by fix.
     if (totalMapEntries > 0) {
+      keysVector->resize(0, false);
       keysVector->resize(totalMapEntries, false);
       velox::BaseVector::prepareForReuse(valuesVector, totalMapEntries);
     }
@@ -3464,6 +3488,29 @@ class MergedFlatMapFieldReader final
 
     auto& elements = arrayValues->elements();
     elements->resize(totalElements);
+    // For arrays-of-arrays values, the per-node copyRanges() below grows the
+    // innermost element buffer incrementally, causing quadratic
+    // reallocate+memcpy. Pre-size it to an upper bound then shrink to 0, which
+    // retains the capacity so each copy stays within it.
+    if (auto* nestedArray = elements->as<velox::ArrayVector>()) {
+      velox::vector_size_t nestedTotal = 0;
+      for (auto& nodeValue : nodeValues_) {
+        auto* sourceArray =
+            nodeValue->wrappedVector()->asUnchecked<velox::ArrayVector>();
+        // This is only an upper-bound estimate for the common unencoded case;
+        // encoded inner elements are skipped and simply fall back to the
+        // incremental growth path.
+        if (auto* sourceNested =
+                sourceArray->elements()->as<velox::ArrayVector>()) {
+          nestedTotal += sourceNested->elements()->size();
+        }
+      }
+      if (nestedTotal > 0) {
+        auto& nestedElements = nestedArray->elements();
+        nestedElements->resize(nestedTotal);
+        nestedElements->resize(0);
+      }
+    }
     auto* valuesOffsets = arrayValues->mutableOffsets(totalMapEntries)
                               ->asMutable<velox::vector_size_t>();
     auto* valuesSizes = arrayValues->mutableSizes(totalMapEntries)

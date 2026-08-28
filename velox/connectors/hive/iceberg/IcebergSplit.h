@@ -81,7 +81,9 @@ struct HiveIcebergSplit : public connector::hive::HiveConnectorSplit {
       std::optional<FileProperties> fileProperties = std::nullopt,
       int64_t dataSequenceNumber = 0,
       const std::unordered_map<int32_t, std::optional<std::string>>&
-          identityPartitionKeys = {});
+          identityPartitionKeys = {},
+      std::optional<dwio::common::ColumnMappingMode> columnMappingMode =
+          std::nullopt);
 
   // For tests only
   HiveIcebergSplit(
@@ -102,7 +104,31 @@ struct HiveIcebergSplit : public connector::hive::HiveConnectorSplit {
       int64_t dataSequenceNumber = 0,
       const std::unordered_map<int32_t, std::optional<std::string>>&
           identityPartitionKeys = {},
+      std::optional<dwio::common::ColumnMappingMode> columnMappingMode =
+          std::nullopt,
       std::vector<IcebergCoalescedFile> coalescedFiles = {});
+
+  // Compatibility overload for downstream callers that pass coalesced files
+  // immediately after identity partition keys.
+  HiveIcebergSplit(
+      const std::string& connectorId,
+      const std::string& filePath,
+      dwio::common::FileFormat fileFormat,
+      uint64_t start,
+      uint64_t length,
+      const std::unordered_map<std::string, std::optional<std::string>>&
+          partitionKeys,
+      std::optional<int32_t> tableBucketNumber,
+      const std::unordered_map<std::string, std::string>& customSplitInfo,
+      const std::shared_ptr<std::string>& extraFileInfo,
+      bool cacheable,
+      std::vector<IcebergDeleteFile> deletes,
+      const std::unordered_map<std::string, std::string>& infoColumns,
+      std::optional<FileProperties> fileProperties,
+      int64_t dataSequenceNumber,
+      const std::unordered_map<int32_t, std::optional<std::string>>&
+          identityPartitionKeys,
+      std::vector<IcebergCoalescedFile> coalescedFiles);
 
   // Compatibility overload for callers that predate identity partition keys.
   HiveIcebergSplit(
@@ -184,6 +210,11 @@ class IcebergSplitBuilder {
     return *this;
   }
 
+  IcebergSplitBuilder& columnMappingMode(dwio::common::ColumnMappingMode mode) {
+    columnMappingMode_ = mode;
+    return *this;
+  }
+
   std::shared_ptr<HiveIcebergSplit> build() const;
 
  private:
@@ -198,6 +229,7 @@ class IcebergSplitBuilder {
   int64_t dataSequenceNumber_{0};
   std::unordered_map<int32_t, std::optional<std::string>>
       identityPartitionKeys_;
+  std::optional<dwio::common::ColumnMappingMode> columnMappingMode_;
 };
 
 } // namespace facebook::velox::connector::hive::iceberg

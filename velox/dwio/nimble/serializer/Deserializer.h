@@ -90,6 +90,14 @@ class Deserializer {
       const std::vector<std::string_view>& data,
       velox::VectorPtr& output) const;
 
+  /// Decodes a sequence of serialized batches and records the number of rows
+  /// each input batch contributes to `output` in `outputRowCounts`.
+  /// Per-batch rowRange handling matches the overload above.
+  void deserialize(
+      const std::vector<std::string_view>& data,
+      velox::VectorPtr& output,
+      std::vector<uint32_t>& outputRowCounts) const;
+
   /// Decodes each batch in `data`, appending only the rows in
   /// `rowRanges[i]` for `data[i]`. The output is the concatenation of the
   /// selected rows across batches, in order.
@@ -119,6 +127,27 @@ class Deserializer {
   ///     otherwise).
   void deserialize(
       const std::vector<std::string_view>& data,
+      const std::vector<nimble::RowRange>& rowRanges,
+      velox::VectorPtr& output) const;
+
+  /// Decodes a single serialized batch, appending only the rows in
+  /// `rowRanges`.
+  ///
+  /// Each range is relative to the rows the batch exposes, matching the
+  /// multi-batch overload above: a kTablet batch windowed to `[500, 600)`
+  /// combined with caller range `[0, 50)` selects physical rows
+  /// `[500, 550)`.
+  ///
+  /// Equivalent output to concatenating, over `rowRanges` in order,
+  ///   deserialize(data).slice(r.startRow, r.numRows())
+  /// but rows outside the ranges are never materialized.
+  ///
+  /// Preconditions:
+  ///   * `rowRanges` is sorted ascending and non-overlapping.
+  ///   * For each `r`: `r.startRow <= r.endRow` and `r.endRow <= ` the
+  ///     number of rows `data` exposes.
+  void deserialize(
+      std::string_view data,
       const std::vector<nimble::RowRange>& rowRanges,
       velox::VectorPtr& output) const;
 
@@ -160,10 +189,13 @@ class Deserializer {
   // `rowRanges` to decode whatever range each batch exposes (its header
   // rowRange, or the whole batch); pass a `data.size()`-sized `rowRanges`
   // to narrow within that range per batch (`rowRanges[i]` for `data[i]`).
+  // When set, `outputRowCounts` receives the number of rows contributed by
+  // each input batch.
   void deserializeImpl(
       folly::Range<const std::string_view*> data,
       folly::Range<const nimble::RowRange*> rowRanges,
-      velox::VectorPtr& output) const;
+      velox::VectorPtr& output,
+      std::vector<uint32_t>* outputRowCounts) const;
 
   // Open run of non-barrier batches that can be decoded together.
   struct DecodeRun {
@@ -214,21 +246,26 @@ class Deserializer {
       OutputProjection& outputProjection);
 
   // Queues `batch`'s streams onto the pending decode run and records the
-  // batch's effective rowRange in `runRanges_` (run-local coordinates).
+  // batch's effective rowRanges in `runRanges_` (run-local coordinates).
+  // The batch is parsed and its stream segments registered once regardless
+  // of how many ranges are supplied.
   //
-  // `rowRange` narrows within the range the batch already exposes (the
-  // kTablet header rowRange, or the full batch for other versions) and is
-  // relative to that range's start, so it cannot widen the window or
-  // address rows outside it. When set, requires
-  // `rowRange->startRow <= rowRange->endRow <= exposed numRows()`.
+  // Each range in `rowRanges` narrows within the range the batch already
+  // exposes (the kTablet header rowRange, or the full batch for other
+  // versions) and is relative to that range's start, so it cannot widen the
+  // window or address rows outside it. Requires each
+  // `startRow <= endRow <= exposed numRows()`, and the ranges to be sorted
+  // ascending and non-overlapping. An empty `rowRanges` selects the whole
+  // exposed range.
   //
   // If the batch requires a null barrier, `decodeRun` fires before and
-  // after queuing so the barrier batch decodes standalone. A rowRange
-  // applies there too: a barrier batch is a one-batch run, which is exactly
-  // the unit the range narrows.
-  void appendBatch(
+  // after queuing so the barrier batch decodes standalone. Ranges apply
+  // there too: a barrier batch is a one-batch run, which is exactly
+  // the unit they narrow. Returns the number of rows this batch adds to
+  // the output.
+  uint32_t appendBatch(
       std::string_view batch,
-      std::optional<nimble::RowRange> rowRange,
+      folly::Range<const nimble::RowRange*> rowRanges,
       DecodeRun& run,
       velox::VectorPtr& output) const;
 
@@ -302,8 +339,8 @@ class Deserializer {
   static constexpr uint32_t kInvalidInMapOffset =
       std::numeric_limits<uint32_t>::max();
 
-  // Reverse lookup from a FlatMap child value-stream offset to its in-map
-  // stream offset. Entries that are not FlatMap child value streams use
+  // Reverse lookup from a FlatMap child presence-stream offset to its in-map
+  // stream offset. Entries that are not FlatMap child presence streams use
   // kInvalidInMapOffset.
   std::vector<uint32_t> valueOffsetToInMap_;
 

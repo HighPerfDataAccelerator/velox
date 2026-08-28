@@ -1128,7 +1128,11 @@ SerializationTest::SerializeResult SerializationTest::serializeTablet(
 
     // Build kTablet: [header][raw stream data...][trailer].
     auto headerIOBuf = serde::createTabletChunkHeader(
-        {.rowCount = stripeRows, .rowRange = RowRange{0, stripeRows}});
+        {.rowCount = stripeRows,
+         .streamEncodingUsesVarintRowCount =
+             tablet->properties().compactRowCountEncoding(),
+         .streamHasChunkHeader = true,
+         .rowRange = RowRange{0, stripeRows}});
     std::string headerBuf(
         reinterpret_cast<const char*>(headerIOBuf.data()),
         headerIOBuf.length());
@@ -2645,7 +2649,8 @@ TEST_F(SerializationTest, deserializesInputWithoutStreamVarintRowCountFlag) {
   serialized[sizeof(uint8_t) + varint::varintSize(kRows)] =
       static_cast<char>(serde::detail::makeFlagsByte(
           /*requiresNullBarrier=*/false,
-          /*streamEncodingUsesVarintRowCount=*/false));
+          /*streamEncodingUsesVarintRowCount=*/false,
+          /*streamHasChunkHeader=*/false));
 
   Deserializer deserializer{
       SchemaReader::getSchema(serializer.schemaBuilder().schemaNodes()),
@@ -5014,7 +5019,11 @@ TEST_F(SerializationTest, zstdThreadLocalDCtxHighParallelism) {
     const auto stripeRows = tablet->stripeRowCount(stripeIdx);
 
     auto headerIOBuf = serde::createTabletChunkHeader(
-        {.rowCount = stripeRows, .rowRange = RowRange{0, stripeRows}});
+        {.rowCount = stripeRows,
+         .streamEncodingUsesVarintRowCount =
+             tablet->properties().compactRowCountEncoding(),
+         .streamHasChunkHeader = true,
+         .rowRange = RowRange{0, stripeRows}});
     std::string headerBuf(
         reinterpret_cast<const char*>(headerIOBuf.data()),
         headerIOBuf.length());
@@ -5126,7 +5135,11 @@ TEST_F(SerializationTest, zstdThreadLocalDCtxConcurrentDeserializers) {
       const auto stripeRows = tablet->stripeRowCount(si);
 
       auto headerIOBuf = serde::createTabletChunkHeader(
-          {.rowCount = stripeRows, .rowRange = RowRange{0, stripeRows}});
+          {.rowCount = stripeRows,
+           .streamEncodingUsesVarintRowCount =
+               tablet->properties().compactRowCountEncoding(),
+           .streamHasChunkHeader = true,
+           .rowRange = RowRange{0, stripeRows}});
       std::string headerBuf(
           reinterpret_cast<const char*>(headerIOBuf.data()),
           headerIOBuf.length());
@@ -5286,7 +5299,11 @@ TEST_F(SerializationTest, zstdThreadLocalDCtxFlatMapWithParallelDecode) {
     const auto stripeRows = tablet->stripeRowCount(stripeIdx);
 
     auto headerIOBuf = serde::createTabletChunkHeader(
-        {.rowCount = stripeRows, .rowRange = RowRange{0, stripeRows}});
+        {.rowCount = stripeRows,
+         .streamEncodingUsesVarintRowCount =
+             tablet->properties().compactRowCountEncoding(),
+         .streamHasChunkHeader = true,
+         .rowRange = RowRange{0, stripeRows}});
     std::string headerBuf(
         reinterpret_cast<const char*>(headerIOBuf.data()),
         headerIOBuf.length());
@@ -5396,7 +5413,11 @@ TEST_F(SerializationTest, zstdThreadLocalDCtxRepeatedBatches) {
     const auto stripeRows = tablet->stripeRowCount(stripeIdx);
 
     auto headerIOBuf = serde::createTabletChunkHeader(
-        {.rowCount = stripeRows, .rowRange = RowRange{0, stripeRows}});
+        {.rowCount = stripeRows,
+         .streamEncodingUsesVarintRowCount =
+             tablet->properties().compactRowCountEncoding(),
+         .streamHasChunkHeader = true,
+         .rowRange = RowRange{0, stripeRows}});
     std::string headerBuf(
         reinterpret_cast<const char*>(headerIOBuf.data()),
         headerIOBuf.length());
@@ -5822,6 +5843,92 @@ velox::VectorPtr createMapVector(
 }
 
 } // namespace
+
+TEST_F(SerializationTest, predefinedFlatMapKeysUseEncodingLayout) {
+  constexpr velox::vector_size_t kNumRows = 256;
+  const auto mapType = velox::MAP(velox::INTEGER(), velox::INTEGER());
+  const auto rowType = velox::ROW({{"features", mapType}});
+
+  auto keys =
+      velox::BaseVector::create(velox::INTEGER(), kNumRows, pool_.get());
+  auto values =
+      velox::BaseVector::create(velox::INTEGER(), kNumRows, pool_.get());
+  auto offsets = velox::allocateOffsets(kNumRows, pool_.get());
+  auto sizes = velox::allocateSizes(kNumRows, pool_.get());
+  auto* rawOffsets = offsets->asMutable<velox::vector_size_t>();
+  auto* rawSizes = sizes->asMutable<velox::vector_size_t>();
+  for (velox::vector_size_t row = 0; row < kNumRows; ++row) {
+    keys->asFlatVector<int32_t>()->set(row, 1);
+    values->asFlatVector<int32_t>()->set(row, row);
+    rawOffsets[row] = row;
+    rawSizes[row] = 1;
+  }
+  auto map = std::make_shared<velox::MapVector>(
+      pool_.get(),
+      mapType,
+      nullptr,
+      kNumRows,
+      std::move(offsets),
+      std::move(sizes),
+      std::move(keys),
+      std::move(values));
+  auto input = std::make_shared<velox::RowVector>(
+      pool_.get(),
+      rowType,
+      nullptr,
+      kNumRows,
+      std::vector<velox::VectorPtr>{std::move(map)});
+
+  using StreamIdentifiers = EncodingLayoutTree::StreamIdentifiers;
+  const EncodingLayoutTree layout{
+      Kind::Row,
+      {},
+      "",
+      {EncodingLayoutTree{
+          Kind::FlatMap,
+          {},
+          "",
+          {EncodingLayoutTree{
+              Kind::Scalar,
+              {{StreamIdentifiers::Scalar::ScalarStream,
+                EncodingLayout{
+                    EncodingType::Trivial, {}, CompressionType::Uncompressed}}},
+              "1"}}}}};
+  Serializer serializer{
+      SerializerOptions{
+          .version = SerializationVersion::kSerialization,
+          .flatMapColumns = {{"features", {"1"}}},
+          .encodingLayoutTree = layout,
+          .compressionOptions = CompressionOptions{}},
+      rowType,
+      pool_.get()};
+  const std::string serialized{
+      serializer.serialize(input, OrderedRanges::of(0, kNumRows))};
+
+  const auto schema =
+      SchemaReader::getSchema(serializer.schemaBuilder().schemaNodes());
+  const auto valueStreamOffset = schema->asRow()
+                                     .childAt(0)
+                                     ->asFlatMap()
+                                     .childAt(0)
+                                     ->asScalar()
+                                     .scalarDescriptor()
+                                     .offset();
+  const DeserializerOptions deserializerOptions{.hasHeader = true};
+  serde::StreamDataParser parser{pool_.get(), deserializerOptions};
+  parser.initialize(serialized);
+  bool foundValueStream = false;
+  parser.iterateStreams([&](uint32_t offset, std::string_view streamData) {
+    if (offset != valueStreamOffset) {
+      return;
+    }
+    foundValueStream = true;
+    ASSERT_FALSE(streamData.empty());
+    EXPECT_EQ(
+        static_cast<EncodingType>(streamData.front()), EncodingType::Trivial);
+  });
+  EXPECT_TRUE(foundValueStream);
+}
 
 TEST_P(SerializationTest, flatmapColumnsKeysSchemaConsistency) {
   // Two serializers with the same 8 predefined keys, 200 rows each, should

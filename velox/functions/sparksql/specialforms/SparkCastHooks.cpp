@@ -15,10 +15,16 @@
  */
 
 #include "velox/functions/sparksql/specialforms/SparkCastHooks.h"
+
 #include <cmath>
+#include <exception>
+
+#include "velox/common/base/VeloxException.h"
 #include "velox/functions/lib/string/StringImpl.h"
+#include "velox/functions/sparksql/SparkQueryConfig.h"
 #include "velox/functions/sparksql/TimestampUtils.h"
 #include "velox/type/TimestampConversion.h"
+#include "velox/type/Type.h"
 #include "velox/type/tz/TimeZoneMap.h"
 
 namespace facebook::velox::functions::sparksql {
@@ -135,6 +141,10 @@ Expected<Timestamp> SparkCastHooks::castBooleanToTimestamp(bool val) const {
   return Timestamp::fromMicrosNoError(val ? 1 : 0);
 }
 
+bool SparkCastHooks::decimalToFloatHighPrecisionCastEnabled() const {
+  return SparkQueryConfig{config_}.decimalToFloatHighPrecisionCastEnabled();
+}
+
 Expected<int32_t> SparkCastHooks::castStringToDate(
     const StringView& dateString) const {
   // Allows all patterns supported by Spark:
@@ -150,6 +160,19 @@ Expected<int32_t> SparkCastHooks::castStringToDate(
   //   "1970-01-01 (BC)"
   return util::fromDateString(
       removeWhiteSpaces(dateString), util::ParseMode::kSparkCast);
+}
+
+Expected<int64_t> SparkCastHooks::castStringToTime(
+    StringView timeString,
+    const tz::TimeZone* /*timeZone*/,
+    int64_t /*sessionStartTimeMs*/) const {
+  try {
+    return TIME_MICRO_UTC()->valueToTime(timeString, /*requireSeconds=*/false);
+  } catch (const VeloxException& e) {
+    return folly::makeUnexpected(Status::UserError(e.message()));
+  } catch (const std::exception& e) {
+    return folly::makeUnexpected(Status::UserError(e.what()));
+  }
 }
 
 Expected<float> SparkCastHooks::castStringToReal(const StringView& data) const {
