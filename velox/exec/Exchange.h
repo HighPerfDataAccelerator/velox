@@ -69,7 +69,7 @@ class Exchange : public SourceOperator {
 
   bool isFinished() override;
 
-  std::shared_ptr<ExchangeClient> releaseExchangeClient() {
+  std::shared_ptr<InMemoryExchangeClient> releaseExchangeClient() {
     return std::move(exchangeClient_);
   }
 
