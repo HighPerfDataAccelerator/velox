@@ -117,8 +117,10 @@ std::unique_ptr<cudf::column> reduceMinMaxWithInputType(
         core::AggregationNode::Step step,                                 \
         uint32_t inputIndex,                                              \
         VectorPtr constant,                                               \
-        const TypePtr& resultType)                                        \
-        : ReduceAggregator(step, inputIndex, constant, resultType) {}     \
+        const TypePtr& resultType,                                        \
+        std::optional<uint32_t> maskIndex)                                \
+        : ReduceAggregator(                                               \
+              step, inputIndex, constant, resultType, maskIndex) {}       \
                                                                           \
     std::unique_ptr<cudf::column> doReduce(                               \
         cudf::table_view const& input,                                    \
@@ -128,8 +130,12 @@ std::unique_ptr<cudf::column> reduceMinMaxWithInputType(
         rmm::device_async_resource_ref mr) override {                     \
       auto const aggRequest =                                             \
           cudf::make_##name##_aggregation<cudf::reduce_aggregation>();    \
+      auto const injected = cudf_velox::materializeMaskedColumn(          \
+          input, inputIndex, maskIndex, stream, get_temp_mr());           \
+      auto const reduceInput =                                            \
+          injected ? injected->view() : input.column(inputIndex);         \
       return reduceMinMaxWithInputType(                                   \
-          input.column(inputIndex), *aggRequest, outputType, stream, mr); \
+          reduceInput, *aggRequest, outputType, stream, mr);              \
     }                                                                     \
   };
 
