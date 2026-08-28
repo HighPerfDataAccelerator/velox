@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #include "velox/experimental/cudf/CudfConfig.h"
+#include "velox/experimental/cudf/exec/CudfConversion.h"
 #include "velox/experimental/cudf/exec/CudfValues.h"
 #include "velox/experimental/cudf/exec/CudfWindow.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
@@ -278,6 +279,10 @@ TEST_F(
   values.close();
 }
 
+// Streaming full-partition COUNT across batches: partition k=1 arrives in two
+// inputs, then k=2 starts. With a 1-byte active-row cap the still-open
+// partition must spill on each add (not wait until the group ends), then
+// replay so every k=1 row still sees count=4.
 TEST_F(AdapterOperatorTest, streamingFullPartitionCountSpillsActivePartition) {
   cudf_velox::CudfWindow::testingSetStreamingMemoryLimits(1, 1);
   SCOPE_EXIT {
@@ -310,6 +315,11 @@ TEST_F(AdapterOperatorTest, streamingFullPartitionCountSpillsActivePartition) {
 
   auto task = AssertQueryBuilder(plan)
                   .maxDrivers(1)
+                  // Keep each Values batch as its own GPU input. The default
+                  // CudfFromVelox target of 100000 rows coalesces these tiny
+                  // partitions into one batch, so the active group would spill
+                  // only once instead of once per input.
+                  .config(cudf_velox::CudfFromVelox::kGpuBatchSizeRows, "1")
                   .spillDirectory(spillDirectory->getPath())
                   .assertResults(expected);
   EXPECT_TRUE(wasCudfWindowUsed(task));
@@ -712,6 +722,10 @@ TEST_F(AdapterOperatorTest, streamingRangeSumProducesOutputBeforeNoMoreInput) {
   values.close();
 }
 
+// Streaming RANGE SUM with multi-column ORDER BY: peer (a=10, b=5) spans two
+// inputs, then a later peer arrives. With a 1-byte active-row cap the open
+// peer must spill on each add, then replay so the peer sum stays 6 and the
+// following running sum stays 10.
 TEST_F(AdapterOperatorTest, streamingRangeSumSpillsActivePeer) {
   cudf_velox::CudfWindow::testingSetStreamingMemoryLimits(1, 1);
   SCOPE_EXIT {
@@ -759,6 +773,11 @@ TEST_F(AdapterOperatorTest, streamingRangeSumSpillsActivePeer) {
 
   auto task = AssertQueryBuilder(plan)
                   .maxDrivers(1)
+                  // Keep each Values batch as its own GPU input. The default
+                  // CudfFromVelox target of 100000 rows coalesces these tiny
+                  // peers into one batch, so the active group would spill only
+                  // once instead of once per input.
+                  .config(cudf_velox::CudfFromVelox::kGpuBatchSizeRows, "1")
                   .spillDirectory(spillDirectory->getPath())
                   .assertResults(expected);
   EXPECT_TRUE(wasCudfWindowUsed(task));
