@@ -2625,45 +2625,6 @@ bool nativeS3ScheduledReadEnabled() {
       envBytesOrZero("GLUTEN_CPP_S3_AWS_SDK") != 0;
 }
 
-void logNativeS3SchedulerStats(std::string_view event, std::string_view id) {
-#ifdef VELOX_ENABLE_S3
-  if (nativeS3ScheduledReadEnabled()) {
-    NativeS3SdkScheduler::instance().logSnapshot(event, id);
-  }
-#endif
-}
-
-void initializeNativeS3Scheduler() {
-#ifdef VELOX_ENABLE_S3
-  if (!nativeS3ScheduledReadEnabled()) {
-    return;
-  }
-  const auto start = std::chrono::steady_clock::now();
-  const auto initializedAwsSdk = facebook::velox::filesystems::initializeS3();
-  static_cast<void>(NativeS3SdkScheduler::instance());
-  const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-                             std::chrono::steady_clock::now() - start)
-                             .count();
-  LOG(WARNING) << "Native S3 scheduler initialized eagerly in " << elapsedMs
-               << " ms; crt=" << (envBytesOrZero("GLUTEN_CPP_S3_CRT") != 0)
-               << "; initializedAwsSdk=" << initializedAwsSdk;
-#endif
-}
-
-bool prioritizeNativeS3File(const std::string& filePath) {
-#ifdef VELOX_ENABLE_S3
-  if (!nativeS3ScheduledReadEnabled() || !filePath.starts_with("s3://")) {
-    return false;
-  }
-  auto bucketAndObject = kvikio::S3Endpoint::parse_s3_url(filePath);
-  return NativeS3SdkScheduler::instance().prioritizeFile(
-      bucketAndObject.first, bucketAndObject.second);
-#else
-  static_cast<void>(filePath);
-  return false;
-#endif
-}
-
 std::shared_ptr<facebook::velox::ReadFile> makeNativeScheduledS3ReadFile(
     std::shared_ptr<facebook::velox::ReadFile> readFile,
     const std::string& filePath) {
@@ -3139,17 +3100,49 @@ std::unique_ptr<cudf::io::datasource::buffer> KvikioS3DataSource::device_read(
 bool nativeS3ScheduledReadEnabled() {
   return false;
 }
-
-void logNativeS3SchedulerStats(
-    std::string_view /*event*/,
-    std::string_view /*id*/) {}
-
-void initializeNativeS3Scheduler() {}
-
-bool prioritizeNativeS3File(const std::string& /*filePath*/) {
-  return false;
-}
 #endif
+
+void logNativeS3SchedulerStats(std::string_view event, std::string_view id) {
+#ifdef VELOX_ENABLE_S3
+  if (nativeS3ScheduledReadEnabled()) {
+    NativeS3SdkScheduler::instance().logSnapshot(event, id);
+  }
+#else
+  static_cast<void>(event);
+  static_cast<void>(id);
+#endif
+}
+
+void initializeNativeS3Scheduler() {
+#ifdef VELOX_ENABLE_S3
+  if (!nativeS3ScheduledReadEnabled()) {
+    return;
+  }
+  const auto start = std::chrono::steady_clock::now();
+  const auto initializedAwsSdk = facebook::velox::filesystems::initializeS3();
+  static_cast<void>(NativeS3SdkScheduler::instance());
+  const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - start)
+                             .count();
+  LOG(WARNING) << "Native S3 scheduler initialized eagerly in " << elapsedMs
+               << " ms; crt=" << (envBytesOrZero("GLUTEN_CPP_S3_CRT") != 0)
+               << "; initializedAwsSdk=" << initializedAwsSdk;
+#endif
+}
+
+bool prioritizeNativeS3File(const std::string& filePath) {
+#ifdef VELOX_ENABLE_S3
+  if (!nativeS3ScheduledReadEnabled() || !filePath.starts_with("s3://")) {
+    return false;
+  }
+  auto bucketAndObject = kvikio::S3Endpoint::parse_s3_url(filePath);
+  return NativeS3SdkScheduler::instance().prioritizeFile(
+      bucketAndObject.first, bucketAndObject.second);
+#else
+  static_cast<void>(filePath);
+  return false;
+#endif
+}
 
 BufferedInputDataSource::BufferedInputDataSource(
     std::shared_ptr<facebook::velox::dwio::common::BufferedInput> input,

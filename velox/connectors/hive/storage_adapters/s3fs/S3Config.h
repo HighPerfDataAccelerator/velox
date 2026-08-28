@@ -64,6 +64,7 @@ class S3Config {
     kEndpointRegion,
     kAccessKey,
     kSecretKey,
+    kSessionToken,
     kPathStyleAccess,
     kSSLEnabled,
     kUseInstanceCredentials,
@@ -97,6 +98,8 @@ class S3Config {
              std::make_pair("endpoint.region", std::nullopt)},
             {Keys::kAccessKey, std::make_pair("aws-access-key", std::nullopt)},
             {Keys::kSecretKey, std::make_pair("aws-secret-key", std::nullopt)},
+            {Keys::kSessionToken,
+             std::make_pair("aws-session-token", std::nullopt)},
             {Keys::kPathStyleAccess,
              std::make_pair("path-style-access", "false")},
             {Keys::kSSLEnabled, std::make_pair("ssl.enabled", "true")},
@@ -169,6 +172,11 @@ class S3Config {
   /// Secret key to use
   std::optional<std::string> secretKey() const {
     return config_.find(Keys::kSecretKey)->second;
+  }
+
+  /// Session token to use with temporary access and secret keys.
+  std::optional<std::string> sessionToken() const {
+    return config_.find(Keys::kSessionToken)->second;
   }
 
   /// Virtual addressing is used for AWS S3 and is the default
