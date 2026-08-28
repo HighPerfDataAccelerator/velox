@@ -241,7 +241,7 @@ std::optional<Timestamp> int64ToTimestamp(
   }
   if (logicalType.has_value() &&
       logicalType->getType() == thrift::LogicalType::Type::TIMESTAMP) {
-    const auto& unit = logicalType->get_TIMESTAMP().unit();
+    auto unit = logicalType->get_TIMESTAMP().unit();
     if (unit->getType() == thrift::TimeUnit::Type::MILLIS) {
       return Timestamp::fromMillis(value.value());
     } else if (unit->getType() == thrift::TimeUnit::Type::NANOS) {

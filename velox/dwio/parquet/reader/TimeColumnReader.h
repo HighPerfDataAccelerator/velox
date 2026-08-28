@@ -40,7 +40,7 @@ class TimeColumnReader : public IntegerColumnReader {
         std::static_pointer_cast<const ParquetTypeWithId>(fileType_);
     if (auto logicalType = typeWithId->logicalType_) {
       VELOX_CHECK(logicalType->getType() == thrift::LogicalType::Type::TIME);
-      const auto unit = logicalType->get_TIME().unit();
+      auto unit = logicalType->get_TIME().unit();
       VELOX_CHECK(
           unit->getType() == thrift::TimeUnit::Type::MILLIS ||
               unit->getType() == thrift::TimeUnit::Type::MICROS,

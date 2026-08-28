@@ -98,7 +98,7 @@ class TimestampColumnReader : public IntegerColumnReader {
       if (auto logicalType = typeWithId->logicalType_) {
         VELOX_CHECK(
             logicalType->getType() == thrift::LogicalType::Type::TIMESTAMP);
-        const auto& unit = logicalType->get_TIMESTAMP().unit();
+        auto unit = logicalType->get_TIMESTAMP().unit();
         if (unit->getType() == thrift::TimeUnit::Type::MILLIS) {
           filePrecision_ = TimestampPrecision::kMilliseconds;
         } else if (unit->getType() == thrift::TimeUnit::Type::MICROS) {

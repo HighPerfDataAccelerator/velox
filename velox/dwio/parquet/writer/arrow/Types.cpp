@@ -416,7 +416,7 @@ std::shared_ptr<const LogicalType> LogicalType::fromThrift(
     case Type::DATE:
       return DateLogicalType::make();
     case Type::TIME: {
-      const auto& thrift_unit = type.get_TIME().unit();
+      auto thrift_unit = type.get_TIME().unit();
       LogicalType::TimeUnit::Unit unit;
       if (thrift_unit->getType() == TimeUnitType::MILLIS) {
         unit = LogicalType::TimeUnit::kMillis;
@@ -430,7 +430,7 @@ std::shared_ptr<const LogicalType> LogicalType::fromThrift(
       return TimeLogicalType::make(*type.get_TIME().isAdjustedToUTC(), unit);
     }
     case Type::TIMESTAMP: {
-      const auto& thrift_unit = type.get_TIMESTAMP().unit();
+      auto thrift_unit = type.get_TIMESTAMP().unit();
       LogicalType::TimeUnit::Unit unit;
       if (thrift_unit->getType() == TimeUnitType::MILLIS) {
         unit = LogicalType::TimeUnit::kMillis;
