@@ -99,11 +99,12 @@ class TimestampColumnReader : public IntegerColumnReader {
         VELOX_CHECK(
             logicalType->getType() == thrift::LogicalType::Type::TIMESTAMP);
         auto unit = logicalType->get_TIMESTAMP().unit();
-        if (unit->getType() == thrift::TimeUnit::Type::MILLIS) {
+        const auto unitType = unit->getType();
+        if (unitType == thrift::TimeUnit::Type::MILLIS) {
           filePrecision_ = TimestampPrecision::kMilliseconds;
-        } else if (unit->getType() == thrift::TimeUnit::Type::MICROS) {
+        } else if (unitType == thrift::TimeUnit::Type::MICROS) {
           filePrecision_ = TimestampPrecision::kMicroseconds;
-        } else if (unit->getType() == thrift::TimeUnit::Type::NANOS) {
+        } else if (unitType == thrift::TimeUnit::Type::NANOS) {
           filePrecision_ = TimestampPrecision::kNanoseconds;
         } else {
           VELOX_UNREACHABLE();
