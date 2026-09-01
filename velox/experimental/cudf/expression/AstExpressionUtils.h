@@ -536,7 +536,33 @@ cudf::ast::expression const& AstContext::pushExprToTree(
   };
 
   if (!detail::isAstExprSupported(expr)) {
-    return compileSubExpression();
+    // TIMESTAMP is gated from AST/JIT evaluation (see
+    // containsAstUnsupportedType), so a two-sided comparison such as
+    // gt(p_ts, b_ts) would otherwise try to precompute the whole predicate
+    // and fail with sideIdx == -2. cuDF AST comparison operators still
+    // accept timestamp column_references, so compile the comparison from
+    // native field refs instead of precomputing across both join sides.
+    const bool timestampInputField = expr->isFieldAccessKind() &&
+        expr->type() && expr->type()->isTimestamp() &&
+        expr->asUnchecked<core::FieldAccessTypedExpr>()->isInputColumn();
+    if (timestampInputField) {
+      // Fall through to kFieldAccess and emit a column_reference.
+    } else if (expr->isCallKind()) {
+      const auto name = stripPrefix(
+          expr->asUnchecked<core::CallTypedExpr>()->name(),
+          CudfConfig::getInstance().functionNamePrefix);
+      auto it = binaryOps.find(name);
+      if (it != binaryOps.end() && len == 2 &&
+          (expr->inputs()[0]->type()->isTimestamp() ||
+           expr->inputs()[1]->type()->isTimestamp())) {
+        auto const& op1 = pushExprToTree(expr->inputs()[0]);
+        auto const& op2 = pushExprToTree(expr->inputs()[1]);
+        return tree.push(Operation{it->second, op1, op2});
+      }
+      return compileSubExpression();
+    } else {
+      return compileSubExpression();
+    }
   }
 
   switch (expr->kind()) {

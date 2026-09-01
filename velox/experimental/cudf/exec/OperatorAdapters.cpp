@@ -620,8 +620,7 @@ class NestedLoopJoinBuildAdapter : public CudfNestedLoopJoinBaseAdapter {
 
     std::vector<std::unique_ptr<exec::Operator>> result;
     result.push_back(
-        std::make_unique<CudfNestedLoopJoinBuild>(
-            operatorId, ctx, joinPlanNode));
+        makeCudfNestedLoopJoinBuild(operatorId, ctx, joinPlanNode));
     return result;
   }
 };
