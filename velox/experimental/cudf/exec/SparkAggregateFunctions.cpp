@@ -125,6 +125,48 @@ void registerSparkAggregateFunctions(const std::string& prefix) {
       prefix + "collect_list",
       core::AggregationNode::Step::kFinal,
       collectionMergeSignature);
+
+  // Spark runtime bloom filters are uncorrelated scalar subqueries, so the
+  // native path is a global CudfReduce. Do not advertise these signatures in
+  // the groupby registry: grouped bloom_filter_agg is not implemented.
+  auto bloomRawOneArg = FunctionSignatureBuilder()
+                            .returnType("varbinary")
+                            .argumentType("bigint")
+                            .build();
+  auto bloomRawTwoArg = FunctionSignatureBuilder()
+                            .returnType("varbinary")
+                            .argumentType("bigint")
+                            .constantArgumentType("bigint")
+                            .build();
+  auto bloomRawThreeArg = FunctionSignatureBuilder()
+                              .returnType("varbinary")
+                              .argumentType("bigint")
+                              .constantArgumentType("bigint")
+                              .constantArgumentType("bigint")
+                              .build();
+  auto bloomMerge = FunctionSignatureBuilder()
+                        .returnType("varbinary")
+                        .argumentType("varbinary")
+                        .build();
+  for (auto step : {
+           core::AggregationNode::Step::kPartial,
+           core::AggregationNode::Step::kSingle,
+       }) {
+    appendReduceAggregationFunctionForStep(
+        prefix + "bloom_filter_agg", step, bloomRawOneArg);
+    appendReduceAggregationFunctionForStep(
+        prefix + "bloom_filter_agg", step, bloomRawTwoArg);
+    appendReduceAggregationFunctionForStep(
+        prefix + "bloom_filter_agg", step, bloomRawThreeArg);
+  }
+  appendReduceAggregationFunctionForStep(
+      prefix + "bloom_filter_agg",
+      core::AggregationNode::Step::kIntermediate,
+      bloomMerge);
+  appendReduceAggregationFunctionForStep(
+      prefix + "bloom_filter_agg",
+      core::AggregationNode::Step::kFinal,
+      bloomMerge);
 }
 
 } // namespace facebook::velox::cudf_velox

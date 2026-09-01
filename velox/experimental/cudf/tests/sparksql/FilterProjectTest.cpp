@@ -21,15 +21,21 @@
 #include "velox/experimental/cudf/tests/CudfFunctionBaseTest.h"
 #include "velox/experimental/cudf/tests/utils/ExpressionTestUtil.h"
 
+#include "velox/common/base/BloomFilter.h"
 #include "velox/common/base/tests/GTestUtils.h"
+#include "velox/core/Expressions.h"
 #include "velox/dwio/common/tests/utils/BatchMaker.h"
 #include "velox/exec/tests/utils/AssertQueryBuilder.h"
 #include "velox/exec/tests/utils/OperatorTestBase.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
+#include "velox/expression/Expr.h"
 #include "velox/functions/prestosql/ArrayConstructor.h"
 #include "velox/functions/sparksql/registration/Register.h"
 #include "velox/parse/TypeResolver.h"
 #include "velox/type/TimestampConversion.h"
+#include "velox/type/Variant.h"
+
+#include <folly/hash/Hash.h>
 
 using namespace facebook::velox::exec::test;
 using namespace facebook::velox;
@@ -153,6 +159,48 @@ TEST_F(CudfFilterProjectTest, hashWithSeed) {
       }),
   });
   facebook::velox::test::assertEqualVectors(expected, hashResults);
+}
+
+TEST_F(CudfFilterProjectTest, xxhash64WithSeed) {
+  auto input = makeRowVector({
+      makeNullableFlatVector<int64_t>(
+          {INT64_MAX, INT64_MIN, 0, 42, std::nullopt}),
+  });
+  assertExpressionMatchesCpu(
+      "xxhash64_with_seed(cast(42 as bigint), c0)", input, input->rowType());
+}
+
+TEST_F(CudfFilterProjectTest, mightContain) {
+  constexpr int32_t kSize = 10;
+  BloomFilter<> bloomFilter;
+  bloomFilter.reset(kSize);
+  for (auto i = 0; i < kSize; ++i) {
+    bloomFilter.insert(folly::hasher<int64_t>()(i));
+  }
+  std::string serialized;
+  serialized.resize(bloomFilter.serializedSize());
+  bloomFilter.serialize(serialized.data());
+
+  auto keys =
+      makeNullableFlatVector<int64_t>({0, 1, 9, 10, 123451, std::nullopt});
+  auto input = makeRowVector({keys});
+  auto bloomExpr = std::make_shared<core::ConstantTypedExpr>(
+      VARBINARY(), variant::binary(serialized));
+  auto keyExpr = std::make_shared<core::FieldAccessTypedExpr>(BIGINT(), "c0");
+  auto expr = std::make_shared<core::CallTypedExpr>(
+      BOOLEAN(),
+      std::vector<core::TypedExprPtr>{bloomExpr, keyExpr},
+      "might_contain");
+
+  auto gpu = evaluate(expr, input);
+
+  auto selected = SelectivityVector(keys->size());
+  exec::ExprSet cpuExpr({expr}, &execCtx_);
+  auto data = makeRowVector({keys});
+  exec::EvalCtx evalCtx(&execCtx_, &cpuExpr, data.get());
+  std::vector<VectorPtr> cpuResults(1);
+  cpuExpr.eval(selected, evalCtx, cpuResults);
+  facebook::velox::test::assertEqualVectors(cpuResults[0], gpu);
 }
 
 TEST_F(CudfFilterProjectTest, sparkExpressionParity) {

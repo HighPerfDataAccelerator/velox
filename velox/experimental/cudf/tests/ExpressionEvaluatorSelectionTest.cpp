@@ -22,6 +22,7 @@
 #include "velox/experimental/cudf/expression/JitExpression.h"
 #include "velox/experimental/cudf/expression/PrestoFunctions.h"
 #include "velox/experimental/cudf/expression/SparkFunctions.h"
+#include "velox/experimental/cudf/expression/sparksql/XxHash64Function.h"
 #include "velox/experimental/cudf/tests/utils/ExpressionTestUtil.h"
 
 #include "velox/common/memory/Memory.h"
@@ -32,6 +33,7 @@
 #include "velox/functions/sparksql/SparkQueryConfig.h"
 #include "velox/functions/sparksql/registration/Register.h"
 #include "velox/type/Type.h"
+#include "velox/type/Variant.h"
 
 #include <folly/ScopeGuard.h>
 #include <gtest/gtest.h>
@@ -139,6 +141,24 @@ TEST_F(CudfExpressionSelectionTest, sparkExpressionCoverage) {
       "array");
   ASSERT_TRUE(canExprRunOnGpu(arrayExpr, queryCtx_.get(), pool_.get()));
   ASSERT_NE(createCudfExpression(arrayExpr, rowType_, pool_.get()), nullptr);
+}
+
+TEST_F(CudfExpressionSelectionTest, sparkXxHash64RejectsMultipleColumns) {
+  auto singleColumn = optimizeTypedExpr(
+      "xxhash64_with_seed(cast(42 as bigint), a)",
+      rowType_,
+      queryCtx_.get(),
+      execCtx_.get(),
+      {.parseIntegerAsBigint = false, .functionPrefix = ""});
+  EXPECT_TRUE(sparksql::XxHash64Function::canEvaluate(singleColumn));
+
+  auto multipleColumns = optimizeTypedExpr(
+      "xxhash64_with_seed(cast(42 as bigint), a, b)",
+      rowType_,
+      queryCtx_.get(),
+      execCtx_.get(),
+      {.parseIntegerAsBigint = false, .functionPrefix = ""});
+  EXPECT_FALSE(sparksql::XxHash64Function::canEvaluate(multipleColumns));
 }
 
 TEST_F(CudfExpressionSelectionTest, multiBranchSwitch) {
@@ -642,6 +662,40 @@ TEST_F(CudfExpressionSelectionTest, signatureVarargsHashWithSeed) {
     // Treat compile-time validation failure as unsupported.
     SUCCEED();
   }
+}
+
+TEST_F(CudfExpressionSelectionTest, signatureVarargsXxHash64WithSeed) {
+  facebook::velox::functions::sparksql::registerFunctions();
+
+  auto multiCol = optimizeTypedExpr(
+      "xxhash64_with_seed(42, a, b)",
+      rowType_,
+      queryCtx_.get(),
+      execCtx_.get());
+  ASSERT_FALSE(canExprRunOnGpu(multiCol, queryCtx_.get(), pool_.get()));
+
+  auto singleCol = optimizeTypedExpr(
+      "xxhash64_with_seed(42, a)", rowType_, queryCtx_.get(), execCtx_.get());
+  ASSERT_TRUE(canExprRunOnGpu(singleCol, queryCtx_.get(), pool_.get()));
+}
+
+TEST_F(CudfExpressionSelectionTest, signatureMightContain) {
+  facebook::velox::functions::sparksql::registerFunctions();
+
+  auto bloom = std::make_shared<core::ConstantTypedExpr>(
+      VARBINARY(), variant::binary(std::string(16, '\0')));
+  auto key = std::make_shared<core::FieldAccessTypedExpr>(BIGINT(), "a");
+  auto expr = std::make_shared<core::CallTypedExpr>(
+      BOOLEAN(), std::vector<core::TypedExprPtr>{bloom, key}, "might_contain");
+  ASSERT_TRUE(canExprRunOnGpu(expr, queryCtx_.get(), pool_.get()));
+
+  auto nonConstBloom =
+      std::make_shared<core::FieldAccessTypedExpr>(VARBINARY(), "bloom");
+  auto nonConstExpr = std::make_shared<core::CallTypedExpr>(
+      BOOLEAN(),
+      std::vector<core::TypedExprPtr>{nonConstBloom, key},
+      "might_contain");
+  ASSERT_FALSE(canExprRunOnGpu(nonConstExpr, queryCtx_.get(), pool_.get()));
 }
 
 TEST_F(CudfExpressionSelectionTest, signatureTypeVariableCoalesce) {
