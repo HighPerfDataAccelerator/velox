@@ -197,10 +197,14 @@ TEST_F(CudfFilterProjectTest, multiBranchSwitchWithRegexpExtract) {
           {"first", "Pixel android", "unused", std::nullopt, "fallback"}),
   });
 
+  // Write WHEN predicates as equalto(...) rather than c0 = 1. DuckParser
+  // maps SQL `=` to Presto `eq`, which Spark does not register. Distinct
+  // comparison subjects keep this as searched CASE (`switch`), not simple
+  // CASE.
   assertExpressionMatchesCpu(
-      "CASE WHEN c0 = 1 THEN c2 "
-      "WHEN c1 = 2 THEN regexp_extract(c2, '(.*?) android', 1) "
-      "WHEN c0 = 42 THEN 'answer' ELSE '--' END",
+      "CASE WHEN equalto(c0, 1) THEN c2 "
+      "WHEN equalto(c1, 2) THEN regexp_extract(c2, '(.*?) android', 1) "
+      "WHEN equalto(c0, 42) THEN 'answer' ELSE '--' END",
       input,
       input->rowType());
 }
