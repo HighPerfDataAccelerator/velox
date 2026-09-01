@@ -24,6 +24,10 @@
 #include "velox/common/memory/MallocAllocator.h"
 #include "velox/dwio/common/CachedBufferedInput.h"
 
+#include <cudf/io/parquet_io_utils.hpp>
+
+#include <rmm/cuda_stream.hpp>
+
 #include <folly/ScopeGuard.h>
 #include <folly/executors/CPUThreadPoolExecutor.h>
 #include <gmock/gmock.h>
@@ -32,6 +36,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <future>
@@ -298,12 +303,12 @@ TEST_F(CacheHintRangeStatsTest, directCachePageH2dAvoidsHostStaging) {
   BufferedInputDataSource source(input, std::move(hooks));
   std::vector<uint8_t> fakeDevice(kReadSize);
   const auto statsBefore = directCachePageH2dStats();
+  auto read = source.device_read_async(
+      kOffset, kReadSize, fakeDevice.data(), rmm::cuda_stream_view{});
+  EXPECT_TRUE(copySizes.empty());
   EXPECT_EQ(
-      source
-          .device_read_async(
-              kOffset, kReadSize, fakeDevice.data(), rmm::cuda_stream_view{})
-          .get(),
-      kReadSize);
+      read.wait_for(std::chrono::seconds{0}), std::future_status::deferred);
+  EXPECT_EQ(read.get(), kReadSize);
   EXPECT_EQ(copyThread, callerThread);
 
   EXPECT_EQ(
@@ -328,6 +333,99 @@ TEST_F(CacheHintRangeStatsTest, directCachePageH2dAvoidsHostStaging) {
   retained.clear();
   EXPECT_TRUE(retainedWeak.expired());
   EXPECT_TRUE(streamDestroyed->load(std::memory_order_acquire));
+}
+
+TEST_F(
+    CacheHintRangeStatsTest,
+    deferredCacheH2dDoesNotHoldCudfSubmissionMutex) {
+  ASSERT_EQ(setenv("GLUTEN_CUDF_CACHE_H2D_INLINE", "1", 1), 0);
+  SCOPE_EXIT {
+    unsetenv("GLUTEN_CUDF_CACHE_H2D_INLINE");
+  };
+
+  struct Gate {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool firstEntered{false};
+    bool secondEntered{false};
+    bool releaseFirst{false};
+  } gate;
+
+  folly::CPUThreadPoolExecutor executor(2);
+  auto makeInput = [&]() {
+    return std::make_shared<FakeCachedBufferedInput>(
+        std::string(4096, 'x'),
+        *pool_,
+        &executor,
+        4096,
+        std::make_shared<std::atomic<uint64_t>>(0),
+        std::make_shared<std::atomic<bool>>(false));
+  };
+  auto makeHooks = [&](bool first) {
+    return BufferedInputDeviceCopyHooks{
+        .copy =
+            [&, first](uint8_t*, const void*, size_t, rmm::cuda_stream_view) {
+              std::unique_lock lock(gate.mutex);
+              (first ? gate.firstEntered : gate.secondEntered) = true;
+              gate.cv.notify_all();
+              if (first) {
+                gate.cv.wait(lock, [&] { return gate.releaseFirst; });
+              }
+            },
+        .retainUntilComplete = [](std::shared_ptr<void>,
+                                  rmm::cuda_stream_view) {}};
+  };
+
+  BufferedInputDataSource firstSource(makeInput(), makeHooks(true));
+  BufferedInputDataSource secondSource(makeInput(), makeHooks(false));
+  rmm::cuda_stream firstStream;
+  rmm::cuda_stream secondStream;
+  auto fetch = [](BufferedInputDataSource& source,
+                  rmm::cuda_stream_view stream) {
+    std::array<cudf::io::text::byte_range_info, 1> ranges{{{0, 1}}};
+    auto [buffers, spans, completion] =
+        cudf::io::parquet::fetch_byte_ranges_to_device_async(
+            source,
+            cudf::host_span<const cudf::io::text::byte_range_info>{
+                ranges.data(), ranges.size()},
+            stream,
+            cudf::get_current_device_resource_ref());
+    completion.get();
+  };
+
+  auto first = std::async(
+      std::launch::async, fetch, std::ref(firstSource), firstStream.view());
+  bool firstEntered;
+  {
+    std::unique_lock lock(gate.mutex);
+    firstEntered =
+        gate.cv.wait_for(lock, 5s, [&] { return gate.firstEntered; });
+  }
+  EXPECT_TRUE(firstEntered);
+  if (!firstEntered) {
+    {
+      std::lock_guard lock(gate.mutex);
+      gate.releaseFirst = true;
+    }
+    gate.cv.notify_all();
+    first.get();
+    return;
+  }
+
+  auto second = std::async(
+      std::launch::async, fetch, std::ref(secondSource), secondStream.view());
+  bool secondEnteredWhileFirstBlocked;
+  {
+    std::unique_lock lock(gate.mutex);
+    secondEnteredWhileFirstBlocked =
+        gate.cv.wait_for(lock, 500ms, [&] { return gate.secondEntered; });
+    gate.releaseFirst = true;
+    gate.cv.notify_all();
+  }
+
+  first.get();
+  second.get();
+  EXPECT_TRUE(secondEnteredWhileFirstBlocked);
 }
 
 TEST_F(CacheHintRangeStatsTest, boundedCachePageRegistrationFallsBack) {
