@@ -147,6 +147,9 @@ bool canBeEvaluatedByCudf(
     memory::MemoryPool* pool);
 
 // Utility functions shared by groupby and reduce validation.
+
+// Substitute a FieldAccess through a source Project so GPU eligibility sees
+// the originating expression rather than the projected column name.
 core::TypedExprPtr expandFieldReference(
     const core::TypedExprPtr& expr,
     const core::PlanNode* sourceNode);

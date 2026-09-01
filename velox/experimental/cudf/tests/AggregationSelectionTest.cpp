@@ -219,7 +219,9 @@ TEST_F(CudfAggregationSelectionTest, globalAggregationUnsupported) {
       canBeEvaluatedByCudf(*aggregationNode, queryCtx_.get(), pool_.get()));
 }
 
-// Test complex groupby clause with expressions
+// Grouping keys are FieldAccess names on the Project output. Eligibility must
+// expand those names to the originating expressions so a GPU-unsupported
+// projection such as to_big_endian_64(c0) still rejects CudfGroupby.
 TEST_F(CudfAggregationSelectionTest, complexGroupbyClauseExpressions) {
   auto plan =
       PlanBuilder()
@@ -550,6 +552,18 @@ TEST_F(CudfAggregationSelectionTest, comprehensiveTypeSupportValidation) {
           std::make_shared<core::FieldAccessTypedExpr>(VARCHAR(), "c6")},
       "max");
 
+  // MIN/MAX BOOLEAN signatures
+  auto minBooleanExpr = std::make_shared<core::CallTypedExpr>(
+      BOOLEAN(),
+      std::vector<core::TypedExprPtr>{
+          std::make_shared<core::FieldAccessTypedExpr>(BOOLEAN(), "c7")},
+      "min");
+  auto maxBooleanExpr = std::make_shared<core::CallTypedExpr>(
+      BOOLEAN(),
+      std::vector<core::TypedExprPtr>{
+          std::make_shared<core::FieldAccessTypedExpr>(BOOLEAN(), "c7")},
+      "max");
+
   // AVG signatures
   auto avgSmallintExpr = std::make_shared<core::CallTypedExpr>(
       DOUBLE(),
@@ -625,6 +639,11 @@ TEST_F(CudfAggregationSelectionTest, comprehensiveTypeSupportValidation) {
       canAggregationBeEvaluatedByCudf(*maxVarcharExpr, queryCtx_.get()));
 
   ASSERT_TRUE(
+      canAggregationBeEvaluatedByCudf(*minBooleanExpr, queryCtx_.get()));
+  ASSERT_TRUE(
+      canAggregationBeEvaluatedByCudf(*maxBooleanExpr, queryCtx_.get()));
+
+  ASSERT_TRUE(
       canAggregationBeEvaluatedByCudf(*avgSmallintExpr, queryCtx_.get()));
   ASSERT_TRUE(
       canAggregationBeEvaluatedByCudf(*avgIntegerExpr, queryCtx_.get()));
@@ -632,7 +651,9 @@ TEST_F(CudfAggregationSelectionTest, comprehensiveTypeSupportValidation) {
   ASSERT_TRUE(canAggregationBeEvaluatedByCudf(*avgDoubleExpr, queryCtx_.get()));
 }
 
-// Test invalid aggregation signatures
+// avg(varchar) and sum(varchar) are not registered. max(array) is also
+// outside the min/max type set; max(boolean) is registered and is covered
+// in comprehensiveTypeSupportValidation.
 TEST_F(CudfAggregationSelectionTest, invalidTypeCombinationsRejected) {
   // avg on varchar
   auto avgVarcharExpr = std::make_shared<core::CallTypedExpr>(
@@ -648,19 +669,19 @@ TEST_F(CudfAggregationSelectionTest, invalidTypeCombinationsRejected) {
           std::make_shared<core::FieldAccessTypedExpr>(VARCHAR(), "c6")},
       "sum");
 
-  // max on boolean
-  auto maxBooleanExpr = std::make_shared<core::CallTypedExpr>(
-      BOOLEAN(),
+  // max on array
+  auto maxArrayExpr = std::make_shared<core::CallTypedExpr>(
+      ARRAY(INTEGER()),
       std::vector<core::TypedExprPtr>{
-          std::make_shared<core::FieldAccessTypedExpr>(BOOLEAN(), "c7")},
+          std::make_shared<core::FieldAccessTypedExpr>(
+              ARRAY(INTEGER()), "c_arr")},
       "max");
 
   ASSERT_FALSE(
       canAggregationBeEvaluatedByCudf(*avgVarcharExpr, queryCtx_.get()));
   ASSERT_FALSE(
       canAggregationBeEvaluatedByCudf(*sumVarcharExpr, queryCtx_.get()));
-  ASSERT_FALSE(
-      canAggregationBeEvaluatedByCudf(*maxBooleanExpr, queryCtx_.get()));
+  ASSERT_FALSE(canAggregationBeEvaluatedByCudf(*maxArrayExpr, queryCtx_.get()));
 }
 
 // Test `distinct` aggregations should be rejected early (otherwise the throw

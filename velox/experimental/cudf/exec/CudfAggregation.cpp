@@ -21,6 +21,7 @@
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
 
 #include "velox/core/Expressions.h"
+#include "velox/core/PlanNode.h"
 #include "velox/exec/Aggregate.h"
 #include "velox/exec/AggregateFunctionRegistry.h"
 #include "velox/expression/Expr.h"
@@ -503,11 +504,28 @@ bool canBeEvaluatedByCudf(
 core::TypedExprPtr expandFieldReference(
     const core::TypedExprPtr& expr,
     const core::PlanNode* sourceNode) {
-  if (!sourceNode) {
-    return expr;
+  // Eligibility must see the originating Project expression, not just the
+  // projected field name. Grouping by `to_big_endian_64(c0) AS endian_c0`
+  // is a FieldAccess to a real Project output column; remapping identity
+  // aliases would treat that as GPU-ok even though cuDF cannot evaluate
+  // to_big_endian_64. Runtime input-channel mapping still uses
+  // normalizeProjectInputReferences, which only rewrites unresolved aliases.
+  if (expr->kind() == core::ExprKind::kFieldAccess && sourceNode) {
+    if (auto projectNode = dynamic_cast<const core::ProjectNode*>(sourceNode)) {
+      auto fieldExpr =
+          std::dynamic_pointer_cast<const core::FieldAccessTypedExpr>(expr);
+      if (fieldExpr) {
+        const auto& projections = projectNode->projections();
+        const auto& names = projectNode->names();
+        for (size_t i = 0; i < names.size(); ++i) {
+          if (names[i] == fieldExpr->name()) {
+            return projections[i];
+          }
+        }
+      }
+    }
   }
-  return normalizeProjectInputReferences(
-      expr, sourceNode, asRowType(sourceNode->outputType()));
+  return expr;
 }
 
 bool canGroupingKeysBeEvaluatedByCudf(
