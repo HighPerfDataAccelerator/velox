@@ -21,7 +21,6 @@
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
 
 #include "velox/core/Expressions.h"
-#include "velox/core/PlanNode.h"
 #include "velox/exec/Aggregate.h"
 #include "velox/exec/AggregateFunctionRegistry.h"
 #include "velox/expression/Expr.h"
@@ -504,12 +503,7 @@ bool canBeEvaluatedByCudf(
 core::TypedExprPtr expandFieldReference(
     const core::TypedExprPtr& expr,
     const core::PlanNode* sourceNode) {
-  // Eligibility must see the originating Project expression, not just the
-  // projected field name. Grouping by `to_big_endian_64(c0) AS endian_c0`
-  // is a FieldAccess to a real Project output column; remapping identity
-  // aliases would treat that as GPU-ok even though cuDF cannot evaluate
-  // to_big_endian_64. Runtime input-channel mapping still uses
-  // normalizeProjectInputReferences, which only rewrites unresolved aliases.
+  // If this is a field reference and we have a source projection, expand it
   if (expr->kind() == core::ExprKind::kFieldAccess && sourceNode) {
     if (auto projectNode = dynamic_cast<const core::ProjectNode*>(sourceNode)) {
       auto fieldExpr =
