@@ -15,6 +15,7 @@
  */
 
 #include "velox/experimental/cudf/CudfConfig.h"
+#include "velox/experimental/cudf/exec/CudfConversion.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 
 #include "velox/common/base/tests/GTestUtils.h"
@@ -99,6 +100,7 @@ TEST_F(CudfNestedLoopJoinTest, buildByteLimitAndCleanup) {
 
   VELOX_ASSERT_THROW(
       AssertQueryBuilder(plan)
+          .config(cudf_velox::CudfFromVelox::kGpuBatchSizeRows, "1")
           .config(
               cudf_velox::CudfConfig::kCudfNestedLoopJoinMaxBuildBytes, "16")
           .copyResults(pool()),
