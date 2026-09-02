@@ -133,16 +133,6 @@ class CudfNestedLoopJoinBuild : public CudfOperatorBase {
   ContinueFuture future_{ContinueFuture::makeEmpty()};
 };
 
-/// Constructs the build operator in the same translation unit that defines
-/// CudfNestedLoopJoinBuild.  Keep external adapters on this factory instead of
-/// inlining make_unique<CudfNestedLoopJoinBuild>: doing so prevents a stale
-/// caller object from baking in an older concrete class size after the build
-/// operator gains or removes private state.
-std::unique_ptr<exec::Operator> makeCudfNestedLoopJoinBuild(
-    int32_t operatorId,
-    exec::DriverCtx* driverCtx,
-    std::shared_ptr<const core::NestedLoopJoinNode> joinNode);
-
 /// Performs nested loop join using cuDF APIs.
 ///
 /// Supports inner, left, right, full outer, and left semi project joins.

@@ -173,14 +173,6 @@ CudfNestedLoopJoinBuild::CudfNestedLoopJoinBuild(
           CudfConfig::kCudfNestedLoopJoinMaxBuildBytes,
           std::numeric_limits<uint64_t>::max())) {}
 
-std::unique_ptr<exec::Operator> makeCudfNestedLoopJoinBuild(
-    int32_t operatorId,
-    exec::DriverCtx* driverCtx,
-    std::shared_ptr<const core::NestedLoopJoinNode> joinNode) {
-  return std::make_unique<CudfNestedLoopJoinBuild>(
-      operatorId, driverCtx, std::move(joinNode));
-}
-
 // Accumulates input batches in memory.
 // All batches are kept as CudfVectors (GPU memory) until join completes.
 void CudfNestedLoopJoinBuild::doAddInput(RowVectorPtr input) {
@@ -1221,7 +1213,8 @@ exec::OperatorSupplier CudfNestedLoopJoinBridgeTranslator::toOperatorSupplier(
   if (auto joinNode =
           std::dynamic_pointer_cast<const core::NestedLoopJoinNode>(node)) {
     return [joinNode](int32_t operatorId, exec::DriverCtx* ctx) {
-      return makeCudfNestedLoopJoinBuild(operatorId, ctx, joinNode);
+      return std::make_unique<CudfNestedLoopJoinBuild>(
+          operatorId, ctx, joinNode);
     };
   }
   return nullptr;
