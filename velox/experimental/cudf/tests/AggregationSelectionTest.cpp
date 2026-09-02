@@ -550,6 +550,18 @@ TEST_F(CudfAggregationSelectionTest, comprehensiveTypeSupportValidation) {
           std::make_shared<core::FieldAccessTypedExpr>(VARCHAR(), "c6")},
       "max");
 
+  // MIN/MAX BOOLEAN signatures
+  auto minBooleanExpr = std::make_shared<core::CallTypedExpr>(
+      BOOLEAN(),
+      std::vector<core::TypedExprPtr>{
+          std::make_shared<core::FieldAccessTypedExpr>(BOOLEAN(), "c7")},
+      "min");
+  auto maxBooleanExpr = std::make_shared<core::CallTypedExpr>(
+      BOOLEAN(),
+      std::vector<core::TypedExprPtr>{
+          std::make_shared<core::FieldAccessTypedExpr>(BOOLEAN(), "c7")},
+      "max");
+
   // AVG signatures
   auto avgSmallintExpr = std::make_shared<core::CallTypedExpr>(
       DOUBLE(),
@@ -625,6 +637,11 @@ TEST_F(CudfAggregationSelectionTest, comprehensiveTypeSupportValidation) {
       canAggregationBeEvaluatedByCudf(*maxVarcharExpr, queryCtx_.get()));
 
   ASSERT_TRUE(
+      canAggregationBeEvaluatedByCudf(*minBooleanExpr, queryCtx_.get()));
+  ASSERT_TRUE(
+      canAggregationBeEvaluatedByCudf(*maxBooleanExpr, queryCtx_.get()));
+
+  ASSERT_TRUE(
       canAggregationBeEvaluatedByCudf(*avgSmallintExpr, queryCtx_.get()));
   ASSERT_TRUE(
       canAggregationBeEvaluatedByCudf(*avgIntegerExpr, queryCtx_.get()));
@@ -648,19 +665,10 @@ TEST_F(CudfAggregationSelectionTest, invalidTypeCombinationsRejected) {
           std::make_shared<core::FieldAccessTypedExpr>(VARCHAR(), "c6")},
       "sum");
 
-  // max on boolean
-  auto maxBooleanExpr = std::make_shared<core::CallTypedExpr>(
-      BOOLEAN(),
-      std::vector<core::TypedExprPtr>{
-          std::make_shared<core::FieldAccessTypedExpr>(BOOLEAN(), "c7")},
-      "max");
-
   ASSERT_FALSE(
       canAggregationBeEvaluatedByCudf(*avgVarcharExpr, queryCtx_.get()));
   ASSERT_FALSE(
       canAggregationBeEvaluatedByCudf(*sumVarcharExpr, queryCtx_.get()));
-  ASSERT_FALSE(
-      canAggregationBeEvaluatedByCudf(*maxBooleanExpr, queryCtx_.get()));
 }
 
 // Test `distinct` aggregations should be rejected early (otherwise the throw
