@@ -75,14 +75,17 @@ struct CachePrefetchPlanStats {
   uint64_t entries{0};
 };
 
-/// Returns whether a query's executor-local split count falls in the bounded
-/// request-pressure band. A zero upper bound keeps the legacy open-ended
-/// behavior.
+/// Returns whether a query's executor-local split topology needs the
+/// high-throughput request profile. In addition to the configured bounded and
+/// large-query split bands, a multi-scan query fills the gap between those
+/// bands. This distinguishes a wide scan graph from a same-sized two-table
+/// scan without making a per-split client decision.
 bool useHighRequestPressureForExpectedSplits(
     uint64_t expectedSplits,
     uint64_t minExpectedSplits,
     uint64_t maxExpectedSplits,
-    uint64_t largeExpectedSplits);
+    uint64_t largeExpectedSplits,
+    uint64_t expectedScanNodes = 0);
 
 /// Future-backed one-shot signal for the first physical cache load. The
 /// scheduler also signals terminal completion so an early load failure cannot
@@ -224,7 +227,8 @@ class ExecutorSplitPrefetch {
       folly::Executor* executor,
       const std::string& queryId,
       uint64_t expectedSplits,
-      uint64_t minRegisteredSplits);
+      uint64_t minRegisteredSplits,
+      uint64_t expectedScanNodes = 0);
 
   /// Makes one query-wide first-load decision from the physical splits already
   /// known by the coordinator. The first decision is frozen so every scan in

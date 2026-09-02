@@ -1734,14 +1734,19 @@ TEST(ExecutorPrefetchTest, cacheHintExpectedSplitCountAvoidsRegistrationWait) {
 }
 
 TEST(ExecutorPrefetchTest, cacheHintScopesRequestPressureByQuerySize) {
-  folly::CPUThreadPoolExecutor executor(2);
+  folly::CPUThreadPoolExecutor executor(3);
   const std::string kLowQuery = "query-cache-low-request-pressure";
   const std::string kHighQuery = "query-cache-high-request-pressure";
+  const std::string kWideQuery = "query-cache-wide-request-pressure";
   std::atomic<bool> lowObserved{true};
   std::atomic<bool> highObserved{false};
+  std::atomic<bool> wideObserved{false};
 
-  ExecutorSplitPrefetch::setExpectedSplitCount(&executor, kLowQuery, 669, 0);
-  ExecutorSplitPrefetch::setExpectedSplitCount(&executor, kHighQuery, 670, 0);
+  ExecutorSplitPrefetch::setExpectedSplitCount(&executor, kLowQuery, 649, 0, 2);
+  ExecutorSplitPrefetch::setExpectedSplitCount(
+      &executor, kHighQuery, 670, 0, 2);
+  ExecutorSplitPrefetch::setExpectedSplitCount(
+      &executor, kWideQuery, 649, 0, 6);
   ExecutorSplitPrefetch::registerCacheHint(
       &executor,
       kLowQuery,
@@ -1766,15 +1771,30 @@ TEST(ExecutorPrefetchTest, cacheHintScopesRequestPressureByQuerySize) {
       },
       1,
       1);
+  ExecutorSplitPrefetch::registerCacheHint(
+      &executor,
+      kWideQuery,
+      "wide",
+      1,
+      [&] {
+        wideObserved.store(
+            nativeS3HighRequestPressureForCurrentThread(),
+            std::memory_order_relaxed);
+      },
+      1,
+      1);
 
   ExecutorSplitPrefetch::takeCacheHint(&executor, kLowQuery, "low");
   ExecutorSplitPrefetch::takeCacheHint(&executor, kHighQuery, "high");
+  ExecutorSplitPrefetch::takeCacheHint(&executor, kWideQuery, "wide");
   EXPECT_FALSE(lowObserved.load(std::memory_order_relaxed));
   EXPECT_TRUE(highObserved.load(std::memory_order_relaxed));
+  EXPECT_TRUE(wideObserved.load(std::memory_order_relaxed));
   EXPECT_FALSE(nativeS3HighRequestPressureForCurrentThread());
 
   ExecutorSplitPrefetch::eraseQuery(&executor, kLowQuery);
   ExecutorSplitPrefetch::eraseQuery(&executor, kHighQuery);
+  ExecutorSplitPrefetch::eraseQuery(&executor, kWideQuery);
 }
 
 TEST(ExecutorPrefetchTest, requestPressureExpectedSplitBand) {
@@ -1784,6 +1804,22 @@ TEST(ExecutorPrefetchTest, requestPressureExpectedSplitBand) {
   EXPECT_FALSE(useHighRequestPressureForExpectedSplits(601, 500, 600, 670));
   EXPECT_FALSE(useHighRequestPressureForExpectedSplits(669, 500, 600, 670));
   EXPECT_TRUE(useHighRequestPressureForExpectedSplits(670, 500, 600, 670));
+
+  // Same split count, different scan topology: two-table scans retain the
+  // base profile while a wider scan graph fills the bounded/large-band gap.
+  EXPECT_TRUE(useHighRequestPressureForExpectedSplits(600, 500, 600, 670, 2));
+  EXPECT_FALSE(useHighRequestPressureForExpectedSplits(601, 500, 600, 670, 2));
+  EXPECT_TRUE(useHighRequestPressureForExpectedSplits(601, 500, 600, 670, 3));
+  EXPECT_FALSE(useHighRequestPressureForExpectedSplits(649, 500, 600, 670, 2));
+  EXPECT_TRUE(useHighRequestPressureForExpectedSplits(649, 500, 600, 670, 3));
+  EXPECT_TRUE(useHighRequestPressureForExpectedSplits(649, 500, 600, 670, 6));
+  EXPECT_FALSE(useHighRequestPressureForExpectedSplits(669, 500, 600, 670, 2));
+  EXPECT_TRUE(useHighRequestPressureForExpectedSplits(669, 500, 600, 670, 3));
+  EXPECT_FALSE(useHighRequestPressureForExpectedSplits(499, 500, 600, 670, 6));
+
+  // The legacy single-threshold configuration gets the same topology-aware
+  // gap without requiring two additional environment variables.
+  EXPECT_TRUE(useHighRequestPressureForExpectedSplits(649, 670, 0, 0, 6));
 
   EXPECT_FALSE(useHighRequestPressureForExpectedSplits(1000, 0, 0, 0));
   EXPECT_TRUE(useHighRequestPressureForExpectedSplits(1000, 500, 0, 0));
