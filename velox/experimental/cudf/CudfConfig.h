@@ -77,6 +77,10 @@ struct CudfConfig {
       "cudf.order_by_max_output_rows"};
   static constexpr const char* kCudfExchangeConcatOptimizationEnabled{
       "cudf.exchange_concat_optimization_enabled"};
+  static constexpr const char* kCudfStreamingGroupbyEnabled{
+      "cudf.streaming_groupby_enabled"};
+  static constexpr const char* kCudfStreamingGroupbyCapacityMultiplier{
+      "cudf.streaming_groupby_capacity_multiplier"};
   static constexpr const char* kCudfTimestampUnit{"cudf.timestamp_unit"};
   // The value could be either spark or presto.
   static constexpr const char* kCudfFunctionEngine{"cudf.function_engine"};
@@ -187,6 +191,15 @@ struct CudfConfig {
   /// Maximum bytes and rows returned by one OrderBy output batch.
   uint64_t orderByOutputChunkBytes{32ULL << 20};
   int32_t orderByMaxOutputRows{262144};
+
+  /// Use libcudf's persistent streaming_groupby for eligible final grouped
+  /// aggregations. This is opt-in while it supports only a subset of the
+  /// aggregation combinations supported by the regular cuDF groupby path.
+  bool streamingGroupbyEnabled{false};
+
+  /// Multiplier used to derive streaming_groupby's initial logical capacity
+  /// from the first batch and to grow capacity when it is exhausted.
+  double streamingGroupbyCapacityMultiplier{2.0};
 
   /// Minimum rows to accumulate before GPU-side concatenation in
   /// `CudfBatchConcat` (default 100k).

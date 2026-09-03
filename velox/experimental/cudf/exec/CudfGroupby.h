@@ -21,12 +21,60 @@
 #include <cudf/groupby.hpp>
 
 #include <optional>
+#include <string_view>
+#include <utility>
 
 namespace facebook::velox::cudf_velox {
 
 namespace test {
 class CudfGroupbyTestHelper;
 }
+
+class CudaEvent;
+
+inline constexpr std::string_view kStreamingGroupbyUsedStat{
+    "streamingGroupbyUsed"};
+inline constexpr std::string_view kStreamingGroupbyRebuildsStat{
+    "streamingGroupbyRebuilds"};
+
+// Type-specific adapter between Velox final-aggregation state and libcudf's
+// flattened streaming_groupby request/result interface. prepareInput() must be
+// called before addStreamingRequest(). The prepared input and result indices
+// assigned by these methods must remain stable when requests are recreated for
+// a capacity rebuild.
+struct StreamingGroupbyAggregator {
+  // Index in the unpermuted operator input and the final Velox result type.
+  column_index_t inputIndex;
+  TypePtr resultType;
+
+  // Appends the input columns required by this aggregate and records their
+  // positions in the prepared streaming_groupby input table.
+  virtual void prepareInput(
+      cudf::table_view input,
+      std::vector<cudf::column_view>& preparedColumns) = 0;
+
+  // Appends requests using the positions recorded by prepareInput() and records
+  // their result positions.
+  virtual void addStreamingRequest(
+      std::vector<cudf::groupby::streaming_aggregation_request>& requests) = 0;
+
+  // Consumes the result positions recorded by addStreamingRequest().
+  virtual std::unique_ptr<cudf::column> makeOutputColumn(
+      std::vector<cudf::groupby::aggregation_result>& results,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) = 0;
+
+  virtual ~StreamingGroupbyAggregator() = default;
+
+ protected:
+  StreamingGroupbyAggregator(column_index_t inputIndex, TypePtr resultType)
+      : inputIndex(inputIndex), resultType(std::move(resultType)) {}
+
+  column_index_t prepareColumn(
+      cudf::table_view input,
+      std::vector<cudf::column_view>& preparedColumns,
+      std::optional<column_index_t> childIndex = std::nullopt) const;
+};
 
 struct GroupbyAggregator {
   core::AggregationNode::Step step;
@@ -114,6 +162,15 @@ std::vector<std::unique_ptr<GroupbyAggregator>> toGroupbyAggregators(
     std::vector<std::optional<uint32_t>> const& maskChannels,
     std::optional<core::AggregationNode::Step> forcedStep = std::nullopt);
 
+std::optional<std::vector<std::unique_ptr<StreamingGroupbyAggregator>>>
+toStreamingGroupbyAggregators(
+    const core::AggregationNode& aggregationNode,
+    const RowTypePtr& inputType,
+    const std::vector<column_index_t>& aggregationInputChannels,
+    const TypePtr& outputType,
+    const std::vector<VectorPtr>& constants,
+    const std::vector<std::optional<uint32_t>>& maskChannels);
+
 // Groupby-specific validation
 bool canGroupbyBeEvaluatedByCudf(
     const core::AggregationNode& aggregationNode,
@@ -182,6 +239,20 @@ class CudfGroupby : public CudfOperatorBase {
 
   CudfVectorPtr releaseAndResetBufferedResult();
 
+  bool initializeStreamingGroupby(
+      const RowTypePtr& inputRowSchema,
+      const std::vector<VectorPtr>& constants,
+      const std::vector<std::optional<uint32_t>>& maskChannels);
+
+  cudf::table_view makeStreamingGroupbyInputView(cudf::table_view input);
+
+  std::unique_ptr<cudf::groupby::streaming_groupby> createStreamingGroupby(
+      size_t capacity);
+
+  void computeFinalGroupbyDynamically(CudfVectorPtr input);
+
+  CudfVectorPtr finalizeStreamingGroupby();
+
   void prepareInputForStateStream(const CudfVectorPtr& input);
 
   void computePartialGroupbyStreaming(CudfVectorPtr tbl);
@@ -231,6 +302,10 @@ class CudfGroupby : public CudfOperatorBase {
   bool streamingEnabled_{true};
   const int32_t groupbyStreamingMaxDistinctKeys_;
   const bool partialIdentityAggregationEnabled_;
+  // Upstream's dynamically growing streaming_groupby path is disabled if
+  // companion aggregates are present.
+  bool incrementalAggregationEnabled_{true};
+  bool streamingGroupbyEnabled_{false};
   const int64_t maxPartialAggregationMemoryUsage_;
   int64_t numInputRows_ = 0;
 
@@ -278,6 +353,13 @@ class CudfGroupby : public CudfOperatorBase {
   uint64_t finalRunMergeCount_{0};
 
   friend class test::CudfGroupbyTestHelper;
+
+  std::vector<std::unique_ptr<StreamingGroupbyAggregator>>
+      streamingGroupbyAggregators_;
+  std::unique_ptr<cudf::groupby::streaming_groupby> streamingGroupby_;
+  std::optional<rmm::cuda_stream_view> streamingGroupbyStream_;
+  std::unique_ptr<CudaEvent> streamingGroupbyEvent_;
+  size_t streamingGroupbyCapacity_{0};
 };
 
 } // namespace facebook::velox::cudf_velox
