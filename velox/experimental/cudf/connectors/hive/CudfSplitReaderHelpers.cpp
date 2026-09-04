@@ -3474,14 +3474,9 @@ std::future<size_t> BufferedInputDataSource::device_read_async(
       return copied;
     };
     if (envFlagEnabled("GLUTEN_CUDF_CACHE_H2D_INLINE")) {
-      std::promise<size_t> promise;
-      auto future = promise.get_future();
-      try {
-        promise.set_value(copyFromCache());
-      } catch (...) {
-        promise.set_exception(std::current_exception());
-      }
-      return future;
+      // cuDF may invoke this callback under a process-wide submission mutex.
+      // Run the copy when cuDF waits on the future, after leaving that mutex.
+      return std::async(std::launch::deferred, std::move(copyFromCache));
     }
     auto future = folly::via(executor).thenValue(
         [copyFromCache = std::move(copyFromCache)](auto&&) mutable {
