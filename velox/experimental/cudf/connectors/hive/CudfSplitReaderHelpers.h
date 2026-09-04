@@ -329,10 +329,6 @@ class CrtS3DataSource final : public cudf::io::datasource {
 
 bool crtS3RangeReaderAvailable();
 
-/// Returns true when the executor-global native AWS SDK scheduler is selected
-/// for S3 reads.
-bool nativeS3ScheduledReadEnabled();
-
 struct NativeS3ReadGroup {
   uint64_t offset{0};
   uint64_t size{0};
@@ -428,6 +424,10 @@ std::shared_ptr<facebook::velox::ReadFile> makeNativeScheduledS3ReadFile(
     std::shared_ptr<facebook::velox::ReadFile> readFile,
     const std::string& filePath);
 #endif
+
+/// Returns true when the executor-global native AWS SDK scheduler is selected
+/// for S3 reads.
+bool nativeS3ScheduledReadEnabled();
 
 /// Starts construction of the optional high-throughput CRT client. This is
 /// intended to run asynchronously once query-level request pressure is known,

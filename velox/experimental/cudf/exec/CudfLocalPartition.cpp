@@ -30,12 +30,23 @@
 #include <cudf/partitioning.hpp>
 #include <cudf/search.hpp>
 
+#include <limits>
+
 namespace facebook::velox::cudf_velox {
 
 namespace {
 template <class... Deriveds, class Base>
 bool isAnyOf(const Base* p) {
   return ((dynamic_cast<const Deriveds*>(p) != nullptr) || ...);
+}
+
+int64_t retainedBytes(const CudfVector& vector) {
+  const auto bytes = vector.retainedSize();
+  VELOX_CHECK_LE(
+      bytes,
+      std::numeric_limits<int64_t>::max(),
+      "CudfVector is too large for local exchange byte accounting");
+  return static_cast<int64_t>(bytes);
 }
 } // namespace
 
@@ -193,11 +204,8 @@ void CudfLocalPartition::enqueuePartition(
   }
 
   ContinueFuture future;
-  // LocalExchangeMemoryManager accounts bytes, not rows.  Passing size()
-  // under-counts a GPU batch by orders of magnitude and effectively disables
-  // the existing local-exchange backpressure.
   auto blockingReason = queues_[partitionIndex]->enqueue(
-      cudfVector, cudfVector->estimateFlatSize(), &future);
+      cudfVector, retainedBytes(*cudfVector), &future);
   if (blockingReason != exec::BlockingReason::kNotBlocked) {
     blockingReasons_.push_back(blockingReason);
     futures_.push_back(std::move(future));
@@ -326,11 +334,8 @@ void CudfLocalPartition::doAddInput(RowVectorPtr input) {
   } else {
     // Single partition case.
     ContinueFuture future;
-    // CudfVector's retainedSize() does not represent the device table payload.
-    // Use the same flat-byte estimate reported by operator statistics so the
-    // LocalExchangeMemoryManager's byte high-water mark can engage.
     auto blockingReason =
-        queues_[0]->enqueue(input, input->estimateFlatSize(), &future);
+        queues_[0]->enqueue(input, retainedBytes(*cudfVector), &future);
     if (blockingReason != exec::BlockingReason::kNotBlocked) {
       blockingReasons_.push_back(blockingReason);
       futures_.push_back(std::move(future));

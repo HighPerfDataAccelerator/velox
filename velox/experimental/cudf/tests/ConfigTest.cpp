@@ -22,7 +22,7 @@
 
 namespace facebook::velox::cudf_velox::test {
 
-TEST(ConfigTest, CudfConfig) {
+TEST(ConfigTest, cudfConfig) {
   CudfConfig defaults;
   EXPECT_FALSE(defaults.concatOptimizationEnabled);
   EXPECT_TRUE(defaults.exchangeConcatOptimizationEnabled);
@@ -46,9 +46,13 @@ TEST(ConfigTest, CudfConfig) {
       {CudfConfig::kCudfExchangeBatchSizeMinThresholdBytes, "8388608"},
       {CudfConfig::kCudfHashJoinLoadFactor, "0.7"},
       {CudfConfig::kCudfOrderByMergeFanIn, "7"},
-      {CudfConfig::kCudfWindowSortedRunBytes, "134217728"}};
+      {CudfConfig::kCudfWindowSortedRunBytes, "134217728"},
+      {CudfConfig::kCudfStreamingGroupbyEnabled, "true"},
+      {CudfConfig::kCudfStreamingGroupbyCapacityMultiplier, "3.5"}};
 
   CudfConfig config;
+  ASSERT_FALSE(config.streamingGroupbyEnabled);
+  ASSERT_EQ(config.streamingGroupbyCapacityMultiplier, 2.0);
   config.initialize(std::move(options));
   ASSERT_EQ(config.enabled, false);
   ASSERT_EQ(config.debugEnabled, true);
@@ -58,6 +62,8 @@ TEST(ConfigTest, CudfConfig) {
   ASSERT_EQ(config.exchangeConcatOptimizationEnabled, false);
   ASSERT_EQ(config.exchangeBatchSizeMinThresholdBytes, 8388608);
   ASSERT_DOUBLE_EQ(config.hashJoinLoadFactor, 0.7);
+  ASSERT_EQ(config.streamingGroupbyEnabled, true);
+  ASSERT_EQ(config.streamingGroupbyCapacityMultiplier, 3.5);
   ASSERT_EQ(config.allowCpuFallback, false);
   ASSERT_EQ(config.groupbyStreamingMaxDistinctKeys, 16777216);
   ASSERT_EQ(config.orderBySortedRunBytes, 67108864);

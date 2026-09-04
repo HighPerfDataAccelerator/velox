@@ -129,7 +129,7 @@ class CudfHiveDataSource : public DataSource, public NvtxHelper {
   size_t completedBytes_{0};
   int64_t numFilesCoalesced_{0};
 
-  dwio::common::RuntimeStatistics runtimeStats_;
+  dwio::common::RuntimeStats runtimeStats_;
 
   std::unique_ptr<CudfSplitReader> cudfSplitReader_;
 

@@ -203,6 +203,11 @@ void CudfHashJoinProbe::doClose() {
   tree_ = {};
 }
 
+void CudfHashJoinBuild::doClose() {
+  inputs_.clear();
+  Operator::close();
+}
+
 void CudfHashJoinBridge::setHashTable(
     std::optional<CudfHashJoinBridge::hash_type> hashObject) {
   if (CudfConfig::getInstance().debugEnabled) {

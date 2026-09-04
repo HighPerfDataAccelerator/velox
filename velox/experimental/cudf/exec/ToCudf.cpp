@@ -16,13 +16,9 @@
 
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/CudfConversion.h"
-#include "velox/experimental/cudf/exec/CudfGroupby.h"
 #include "velox/experimental/cudf/exec/CudfHashJoin.h"
 #include "velox/experimental/cudf/exec/CudfNestedLoopJoin.h"
 #include "velox/experimental/cudf/exec/CudfOperator.h"
-#include "velox/experimental/cudf/exec/CudfOrderBy.h"
-#include "velox/experimental/cudf/exec/CudfReduce.h"
-#include "velox/experimental/cudf/exec/CudfTopN.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/OperatorAdapters.h"
 #include "velox/experimental/cudf/exec/PrestoAggregateFunctions.h"
@@ -54,7 +50,6 @@
 
 #include <iostream>
 #include <limits>
-
 static const std::string kCudfAdapterName = "cuDF";
 
 namespace facebook::velox::cudf_velox {
@@ -133,7 +128,8 @@ class UcxOutputBufferManager final : public exec::OutputBufferManager {
       std::shared_ptr<exec::Task> task,
       core::PartitionedOutputNode::Kind kind,
       int numPartitions,
-      int numOutputDrivers) override {
+      int numOutputDrivers,
+      const std::string& /*transportOptions*/) override {
     ucx_exchange::UcxOutputQueueManager::getInstanceRef()->initializeTask(
         std::move(task), kind, numPartitions, numOutputDrivers);
   }
@@ -188,6 +184,15 @@ core::PlanNodePtr CompileState::getPlanNode(const core::PlanNodeId& id) const {
   return driverFactory_.consumerNode;
 }
 
+core::PlanNodePtr CompileState::resolveOperatorPlanNode(
+    const exec::Operator* op) const {
+  const auto& id = op->planNodeId();
+  if (!id.empty() && id != "N/A") {
+    return getPlanNode(id);
+  }
+  return driverFactory_.consumerNode;
+}
+
 bool CompileState::compile(bool allowCpuFallback) {
   auto operators = driver_.operators();
 
@@ -205,12 +210,6 @@ bool CompileState::compile(bool allowCpuFallback) {
   bool replacementsMade = false;
   auto ctx = driver_.driverCtx();
 
-  // Helper to check if planNodeId is valid (some operators like CallbackSink
-  // have "N/A")
-  auto isValidPlanNodeId = [](const core::PlanNodeId& id) {
-    return !id.empty() && id != "N/A";
-  };
-
   // Use adapter registry for GPU Operator Replacement
   auto& registry = OperatorAdapterRegistry::getInstance();
 
@@ -220,13 +219,16 @@ bool CompileState::compile(bool allowCpuFallback) {
   };
 
   auto getOperatorProperties =
-      [&registry, this, &isValidPlanNodeId, ctx](const exec::Operator* op) {
+      [&registry, this, ctx](const exec::Operator* op) {
         OperatorProperties props;
         auto adapter = registry.findAdapter(op);
         props.adapter = adapter;
-        if (adapter && isValidPlanNodeId(op->planNodeId())) {
-          static_cast<OperatorAdapter::Properties&>(props) =
-              adapter->properties(op, getPlanNode(op->planNodeId()), ctx);
+        if (adapter) {
+          auto planNode = resolveOperatorPlanNode(op);
+          if (planNode) {
+            static_cast<OperatorAdapter::Properties&>(props) =
+                adapter->properties(op, planNode, ctx);
+          }
         }
         if (isAnyOf<CudfOperator>(op)) {
           // CudfOperator is always fully GPU compatible
@@ -281,11 +283,7 @@ bool CompileState::compile(bool allowCpuFallback) {
 
     auto id = oper->operatorId();
 
-    // Cache planNode for this operator (avoid multiple lookups)
-    core::PlanNodePtr planNode = nullptr;
-    if (isValidPlanNodeId(oper->planNodeId())) {
-      planNode = getPlanNode(oper->planNodeId());
-    }
+    auto planNode = resolveOperatorPlanNode(oper);
 
     // Source plan nodes (for example a fused GPU table scan) have no upstream
     // RowVector to convert.  operatorIndex == 0 also covers real external
@@ -372,19 +370,27 @@ bool CompileState::compile(bool allowCpuFallback) {
     }
 
     if (debugEnabled) {
-      VLOG(1) << "Operator: ID " << oper->operatorId() << ": "
-              << oper->toString() << ", keepOperator = " << keepOperator
-              << ", isPureCpuOperator = " << isPureCpuOperator
-              << ", replaceOp.size() = " << replaceOp.size()
-              << ", previousOperatorIsNotGpu = " << previousOperatorIsNotGpu
-              << ", nextOperatorIsNotGpu = " << nextOperatorIsNotGpu
-              << ", isLastOperatorOfTask = " << isLastOperatorOfTask
-              << ", canRunOnGPU[" << operatorIndex
-              << "] = " << thisOpProps.canRunOnGPU << ", acceptsGpuInput["
-              << operatorIndex << "] = " << thisOpProps.acceptsGpuInput
-              << ", producesGpuOutput[" << operatorIndex
-              << "] = " << thisOpProps.producesGpuOutput
-              << ", planNode = " << bool(planNode);
+      LOG(INFO) << "Operator: ID " << oper->operatorId() << ": "
+                << oper->toString() << ", keepOperator = " << keepOperator
+                << ", isPureCpuOperator = " << isPureCpuOperator
+                << ", replaceOp.size() = " << replaceOp.size()
+                << ", previousOperatorIsNotGpu = " << previousOperatorIsNotGpu
+                << ", nextOperatorIsNotGpu = " << nextOperatorIsNotGpu
+                << ", isLastOperatorOfTask = " << isLastOperatorOfTask
+                << ", canRunOnGPU[" << operatorIndex
+                << "] = " << thisOpProps.canRunOnGPU << ", acceptsGpuInput["
+                << operatorIndex << "] = " << thisOpProps.acceptsGpuInput
+                << ", producesGpuOutput[" << operatorIndex
+                << "] = " << thisOpProps.producesGpuOutput
+                << ", planNode = " << bool(planNode);
+    }
+    if (isPureCpuOperator) {
+      LOG(WARNING) << "Replacement with cuDF operator failed. "
+                   << (allowCpuFallback ? "Falling back to CPU execution"
+                                        : "No fallback allowed");
+      LOG(WARNING) << "Replacement Failed Operator: " << oper->toString();
+      LOG(WARNING) << "Replacement Failed PlanNode: "
+                   << (planNode ? planNode->toString(true, false) : "null");
     }
     if (!allowCpuFallback) {
       // condition is if GPU replacement success or if CPU operators itself is
@@ -688,6 +694,14 @@ void CudfConfig::initialize(
   if (config.find(kCudfExchangeConcatOptimizationEnabled) != config.end()) {
     exchangeConcatOptimizationEnabled =
         folly::to<bool>(config[kCudfExchangeConcatOptimizationEnabled]);
+  }
+  if (config.find(kCudfStreamingGroupbyEnabled) != config.end()) {
+    streamingGroupbyEnabled =
+        folly::to<bool>(config[kCudfStreamingGroupbyEnabled]);
+  }
+  if (config.find(kCudfStreamingGroupbyCapacityMultiplier) != config.end()) {
+    streamingGroupbyCapacityMultiplier =
+        folly::to<double>(config[kCudfStreamingGroupbyCapacityMultiplier]);
   }
   if (config.find(kCudfFunctionNamePrefix) != config.end()) {
     functionNamePrefix = config[kCudfFunctionNamePrefix];

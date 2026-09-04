@@ -34,7 +34,10 @@ HiveIcebergSplit::HiveIcebergSplit(
     bool cacheable,
     const std::unordered_map<std::string, std::string>& infoColumns,
     std::optional<FileProperties> properties,
-    int64_t dataSequenceNumber)
+    int64_t dataSequenceNumber,
+    const std::unordered_map<int32_t, std::optional<std::string>>&
+        identityPartitionKeys,
+    std::optional<dwio::common::ColumnMappingMode> columnMappingMode)
     : HiveConnectorSplit(
           connectorId,
           filePath,
@@ -51,8 +54,10 @@ HiveIcebergSplit::HiveIcebergSplit(
           infoColumns,
           properties,
           std::nullopt,
-          std::nullopt),
-      dataSequenceNumber(dataSequenceNumber) {
+          std::nullopt,
+          columnMappingMode),
+      dataSequenceNumber(dataSequenceNumber),
+      identityPartitionKeys(identityPartitionKeys) {
   // TODO: Deserialize _extraFileInfo to get deleteFiles;
 }
 
@@ -73,6 +78,9 @@ HiveIcebergSplit::HiveIcebergSplit(
     const std::unordered_map<std::string, std::string>& infoColumns,
     std::optional<FileProperties> properties,
     int64_t dataSequenceNumber,
+    const std::unordered_map<int32_t, std::optional<std::string>>&
+        identityPartitionKeys,
+    std::optional<dwio::common::ColumnMappingMode> columnMappingMode,
     std::vector<IcebergCoalescedFile> coalescedFiles)
     : HiveConnectorSplit(
           connectorId,
@@ -90,10 +98,86 @@ HiveIcebergSplit::HiveIcebergSplit(
           infoColumns,
           properties,
           std::nullopt,
-          std::nullopt),
+          std::nullopt,
+          columnMappingMode),
       deleteFiles(std::move(deletes)),
       coalescedFiles(std::move(coalescedFiles)),
-      dataSequenceNumber(dataSequenceNumber) {}
+      dataSequenceNumber(dataSequenceNumber),
+      identityPartitionKeys(identityPartitionKeys) {}
+
+HiveIcebergSplit::HiveIcebergSplit(
+    const std::string& connectorId,
+    const std::string& filePath,
+    dwio::common::FileFormat fileFormat,
+    uint64_t start,
+    uint64_t length,
+    const std::unordered_map<std::string, std::optional<std::string>>&
+        partitionKeys,
+    std::optional<int32_t> tableBucketNumber,
+    const std::unordered_map<std::string, std::string>& customSplitInfo,
+    const std::shared_ptr<std::string>& extraFileInfo,
+    bool cacheable,
+    std::vector<IcebergDeleteFile> deletes,
+    const std::unordered_map<std::string, std::string>& infoColumns,
+    std::optional<FileProperties> properties,
+    int64_t dataSequenceNumber,
+    const std::unordered_map<int32_t, std::optional<std::string>>&
+        identityPartitionKeys,
+    std::vector<IcebergCoalescedFile> coalescedFiles)
+    : HiveIcebergSplit(
+          connectorId,
+          filePath,
+          fileFormat,
+          start,
+          length,
+          partitionKeys,
+          tableBucketNumber,
+          customSplitInfo,
+          extraFileInfo,
+          cacheable,
+          std::move(deletes),
+          infoColumns,
+          properties,
+          dataSequenceNumber,
+          identityPartitionKeys,
+          std::nullopt,
+          std::move(coalescedFiles)) {}
+
+HiveIcebergSplit::HiveIcebergSplit(
+    const std::string& connectorId,
+    const std::string& filePath,
+    dwio::common::FileFormat fileFormat,
+    uint64_t start,
+    uint64_t length,
+    const std::unordered_map<std::string, std::optional<std::string>>&
+        partitionKeys,
+    std::optional<int32_t> tableBucketNumber,
+    const std::unordered_map<std::string, std::string>& customSplitInfo,
+    const std::shared_ptr<std::string>& extraFileInfo,
+    bool cacheable,
+    std::vector<IcebergDeleteFile> deletes,
+    const std::unordered_map<std::string, std::string>& infoColumns,
+    std::optional<FileProperties> properties,
+    int64_t dataSequenceNumber,
+    std::vector<IcebergCoalescedFile> coalescedFiles)
+    : HiveIcebergSplit(
+          connectorId,
+          filePath,
+          fileFormat,
+          start,
+          length,
+          partitionKeys,
+          tableBucketNumber,
+          customSplitInfo,
+          extraFileInfo,
+          cacheable,
+          std::move(deletes),
+          infoColumns,
+          properties,
+          dataSequenceNumber,
+          std::unordered_map<int32_t, std::optional<std::string>>{},
+          std::nullopt,
+          std::move(coalescedFiles)) {}
 
 std::shared_ptr<HiveIcebergSplit> IcebergSplitBuilder::build() const {
   return std::make_shared<HiveIcebergSplit>(
@@ -110,6 +194,8 @@ std::shared_ptr<HiveIcebergSplit> IcebergSplitBuilder::build() const {
       deleteFiles_,
       infoColumns_,
       std::nullopt,
-      dataSequenceNumber_);
+      dataSequenceNumber_,
+      identityPartitionKeys_,
+      columnMappingMode_);
 }
 } // namespace facebook::velox::connector::hive::iceberg

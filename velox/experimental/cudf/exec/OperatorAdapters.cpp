@@ -27,6 +27,7 @@
 #include "velox/experimental/cudf/exec/CudfGroupby.h"
 #include "velox/experimental/cudf/exec/CudfHashJoin.h"
 #include "velox/experimental/cudf/exec/CudfLimit.h"
+#include "velox/experimental/cudf/exec/CudfLocalMerge.h"
 #include "velox/experimental/cudf/exec/CudfLocalPartition.h"
 #include "velox/experimental/cudf/exec/CudfMarkDistinct.h"
 #include "velox/experimental/cudf/exec/CudfNestedLoopJoin.h"
@@ -58,6 +59,7 @@
 #include "velox/exec/Limit.h"
 #include "velox/exec/LocalPartition.h"
 #include "velox/exec/MarkDistinct.h"
+#include "velox/exec/Merge.h"
 #include "velox/exec/NestedLoopJoinBuild.h"
 #include "velox/exec/NestedLoopJoinProbe.h"
 #include "velox/exec/OrderBy.h"
@@ -891,11 +893,30 @@ class LocalExchangeAdapter : public OperatorAdapter {
     return dynamic_cast<const exec::LocalExchange*>(op) != nullptr;
   }
 
+  // LocalExchange consumes whatever the producing pipeline enqueued, so it
+  // only yields device-resident vectors when that pipeline's LocalPartition
+  // was replaced by CudfLocalPartition. Both operators are built from the same
+  // LocalPartitionNode, so the producer's predicate can be evaluated directly
+  // here. Claiming GPU output unconditionally would suppress the CudfFromVelox
+  // insertion in front of downstream GPU operators, which then receive host
+  // RowVectors and fail on the CudfVector cast.
   bool canRunOnGPU(
       const exec::Operator* /*op*/,
-      const core::PlanNodePtr& /*planNode*/,
+      const core::PlanNodePtr& planNode,
       exec::DriverCtx* /*ctx*/) const override {
-    return true;
+    auto localPartitionPlanNode =
+        std::dynamic_pointer_cast<const core::LocalPartitionNode>(planNode);
+    bool canRun = localPartitionPlanNode &&
+        CudfLocalPartition::shouldReplace(localPartitionPlanNode);
+    if (!canRun) {
+      LOG_FALLBACK(
+          "LocalExchangeAdapter {}, PlanNode id: {}",
+          !localPartitionPlanNode
+              ? "planNode is not LocalPartitionNode"
+              : "CudfLocalPartition::shouldReplace returned false",
+          planNode->id());
+    }
+    return canRun;
   }
 
   bool acceptsGpuInput() const override {
@@ -1087,7 +1108,8 @@ class EnforceSingleRowAdapter : public OperatorAdapter {
   }
 };
 
-/// CallbackSinkAdapter - Keeps original operator
+/// CallbackSinkAdapter - Keeps original operator (accepts GPU input when part
+/// of LocalMergeNode)
 class CallbackSinkAdapter : public OperatorAdapter {
  public:
   CallbackSinkAdapter() : OperatorAdapter("CallbackSink") {}
@@ -1100,14 +1122,19 @@ class CallbackSinkAdapter : public OperatorAdapter {
       const exec::Operator* /*op*/,
       const core::PlanNodePtr& planNode,
       exec::DriverCtx* /*ctx*/) const override {
-    LOG_FALLBACK(
-        "CallbackSink operator not supported on cuDF, PlanNode id: {}",
-        planNode->id());
-    return false;
+    auto supported = planNode &&
+        std::dynamic_pointer_cast<const core::LocalMergeNode>(planNode) !=
+            nullptr;
+    if (!supported) {
+      LOG_FALLBACK(
+          "CallbackSink operator not supported on cuDF, PlanNode id: {}",
+          planNode ? planNode->id() : "null");
+    }
+    return supported;
   }
 
   bool acceptsGpuInput() const override {
-    return false;
+    return true;
   }
 
   bool producesGpuOutput() const override {
@@ -1124,6 +1151,51 @@ class CallbackSinkAdapter : public OperatorAdapter {
 
   bool keepOperator() const override {
     return true;
+  }
+};
+
+/// LocalMergeAdapter - Replaces CPU LocalMerge with GPU CudfLocalMerge
+class LocalMergeAdapter : public OperatorAdapter {
+ public:
+  LocalMergeAdapter() : OperatorAdapter("LocalMerge") {}
+
+  bool canHandle(const exec::Operator* op) const override {
+    return dynamic_cast<const exec::LocalMerge*>(op) != nullptr;
+  }
+
+  bool canRunOnGPU(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* /*ctx*/) const override {
+    return planNode &&
+        std::dynamic_pointer_cast<const core::LocalMergeNode>(planNode) !=
+        nullptr;
+  }
+
+  bool acceptsGpuInput() const override {
+    return false;
+  }
+
+  bool producesGpuOutput() const override {
+    return true;
+  }
+
+  std::vector<std::unique_ptr<exec::Operator>> createReplacements(
+      const exec::Operator* op,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* ctx,
+      int32_t operatorId) const override {
+    auto localMergePlanNode =
+        std::dynamic_pointer_cast<const core::LocalMergeNode>(planNode);
+
+    std::vector<std::unique_ptr<exec::Operator>> result;
+    result.push_back(
+        std::make_unique<CudfLocalMerge>(operatorId, ctx, localMergePlanNode));
+    return result;
+  }
+
+  bool keepOperator() const override {
+    return false;
   }
 };
 
@@ -1387,6 +1459,7 @@ void registerAllOperatorAdapters() {
   registry.registerAdapter(std::make_unique<LimitAdapter>());
   registry.registerAdapter(std::make_unique<LocalPartitionAdapter>());
   registry.registerAdapter(std::make_unique<LocalExchangeAdapter>());
+  registry.registerAdapter(std::make_unique<LocalMergeAdapter>());
   registry.registerAdapter(std::make_unique<AssignUniqueIdAdapter>());
   registry.registerAdapter(std::make_unique<MarkDistinctAdapter>());
   registry.registerAdapter(std::make_unique<EnforceSingleRowAdapter>());

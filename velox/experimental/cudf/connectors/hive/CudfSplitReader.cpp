@@ -390,7 +390,8 @@ CudfSplitReader::CudfSplitReader(
       pool_(connectorQueryCtx->memoryPool()),
       useExperimentalCudfReader_(useExperimentalCudfReader),
       baseReaderOpts_(pool_),
-      subfieldFilterExpr_(subfieldFilterExpr) {
+      subfieldFilterExpr_(subfieldFilterExpr),
+      pushdownFilterExpr_(subfieldFilterExpr) {
   baseReaderOpts_.setDataIoStats(ioStatistics_);
   baseReaderOpts_.setMetadataIoStats(ioStatistics_);
   facebook::velox::connector::hive::configureReaderOptions(
@@ -406,7 +407,7 @@ CudfSplitReader::~CudfSplitReader() {
 
 void CudfSplitReader::setDataSourceContext(
     const ConnectorQueryCtx* connectorQueryCtx,
-    dwio::common::RuntimeStatistics& /*runtimeStats*/,
+    dwio::common::RuntimeStats& /*runtimeStats*/,
     cudf::ast::expression const* subfieldFilterExpr) {
   connectorQueryCtx_ = connectorQueryCtx;
   subfieldFilterExpr_ = subfieldFilterExpr;
@@ -421,7 +422,7 @@ void CudfSplitReader::setupReader() {
 }
 
 void CudfSplitReader::prepareSplitInternal(
-    dwio::common::RuntimeStatistics& /*runtimeStats*/) {
+    dwio::common::RuntimeStats& /*runtimeStats*/) {
   setupReader();
   if (useExperimentalCudfReader_ && split_->filePath.starts_with("s3://")) {
     if (experimentalPrepareHostOnlyEnabled()) {
@@ -432,8 +433,7 @@ void CudfSplitReader::prepareSplitInternal(
   }
 }
 
-void CudfSplitReader::prepareSplit(
-    dwio::common::RuntimeStatistics& runtimeStats) {
+void CudfSplitReader::prepareSplit(dwio::common::RuntimeStats& runtimeStats) {
   // Reset existing split and split readers, if any
   resetSplit();
 
@@ -804,14 +804,20 @@ void CudfSplitReader::resetSplit() {
   fileMetaData_.clear();
   cachePrefetchHintWaited_ = false;
   cachePrefetchDemandPrioritized_ = false;
+  pushdownFilterExpr_ = subfieldFilterExpr_;
+  hasSplitSpecificPushdownFilter_ = false;
 }
 
 cudf::ast::expression const* CudfSplitReader::pushdownFilter() const {
-  return subfieldFilter();
+  return pushdownFilterExpr_;
 }
 
 cudf::ast::expression const* CudfSplitReader::subfieldFilter() const {
   return subfieldFilterExpr_;
+}
+
+bool CudfSplitReader::hasSplitSpecificPushdownFilter() const {
+  return hasSplitSpecificPushdownFilter_;
 }
 
 void CudfSplitReader::setupCudfDataSource() {
@@ -1345,6 +1351,18 @@ void CudfSplitReader::fileMetaDatas() {
       fileMetaData_.size(),
       1,
       "CudfSplitReader failed to read any parquet metadatas");
+
+  if (pushdownFilterBuilder_) {
+    VELOX_CHECK_EQ(
+        fileMetaData_.size(),
+        1,
+        "Split-specific pushdown filters require exactly one Parquet metadata");
+    pushdownFilterExpr_ = pushdownFilterBuilder_(fileMetaData_.front());
+    VELOX_CHECK_NOT_NULL(
+        pushdownFilterExpr_,
+        "Split-specific pushdown filter builder must return an expression");
+    hasSplitSpecificPushdownFilter_ = true;
+  }
 }
 
 void CudfSplitReader::createCudfReader() {
