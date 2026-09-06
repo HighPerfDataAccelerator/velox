@@ -31,6 +31,8 @@
 #include "velox/parse/TypeResolver.h"
 #include "velox/type/TimestampConversion.h"
 
+#include <folly/ScopeGuard.h>
+
 using namespace facebook::velox::exec::test;
 using namespace facebook::velox;
 
@@ -187,6 +189,96 @@ TEST_F(CudfFilterProjectTest, sparkExpressionParity) {
     SCOPED_TRACE(expression);
     assertExpressionMatchesCpu(expression, input, input->rowType());
   }
+}
+
+TEST_F(CudfFilterProjectTest, trimSpaceSemantics) {
+  auto& config = CudfConfig::getInstance();
+  const auto previousAllowCpuFallback = config.allowCpuFallback;
+  SCOPE_EXIT {
+    config.allowCpuFallback = previousAllowCpuFallback;
+  };
+  config.allowCpuFallback = false;
+
+  auto input = makeRowVector({makeNullableFlatVector<std::string>(
+      {" leading",
+       "trailing ",
+       " both ",
+       "plain",
+       "",
+       "   ",
+       std::nullopt,
+       "\t tab \t "})});
+
+  assertExpressionMatchesCpu("trim(c0)", input, input->rowType());
+
+  auto plan = PlanBuilder()
+                  .setParseOptions(options_)
+                  .values({input})
+                  .project({"trim(c0) AS result"})
+                  .planNode();
+  auto expected = makeRowVector({makeNullableFlatVector<std::string>(
+      {"leading",
+       "trailing",
+       "both",
+       "plain",
+       "",
+       "",
+       std::nullopt,
+       "\t tab \t"})});
+  AssertQueryBuilder(plan).assertResults(expected);
+}
+
+TEST_F(CudfFilterProjectTest, trimNestedSplitGetUsesCudfFilterProject) {
+  auto& config = CudfConfig::getInstance();
+  const auto previousAllowCpuFallback = config.allowCpuFallback;
+  SCOPE_EXIT {
+    config.allowCpuFallback = previousAllowCpuFallback;
+  };
+  config.allowCpuFallback = false;
+  ASSERT_FALSE(config.allowCpuFallback);
+
+  auto input = makeRowVector({makeNullableFlatVector<std::string>(
+      {"sku_  prepaid  ",
+       "sku_postpaid ",
+       "sku_   ",
+       "sku_plain",
+       "missing",
+       std::nullopt,
+       "sku_\tkept\t ",
+       "sku__third"})});
+  const std::string expression = "trim(get(split(c0, '_', -1), 1))";
+
+  assertExpressionMatchesCpu(expression, input, input->rowType());
+
+  auto plan = PlanBuilder()
+                  .setParseOptions(options_)
+                  .values({input})
+                  .project({expression + " AS result"})
+                  .planNode();
+  auto expected = makeRowVector({makeNullableFlatVector<std::string>(
+      {"prepaid",
+       "postpaid",
+       "",
+       "plain",
+       std::nullopt,
+       std::nullopt,
+       "\tkept\t",
+       ""})});
+
+  std::shared_ptr<exec::Task> task;
+  auto result = AssertQueryBuilder(plan).copyResults(pool(), task);
+  facebook::velox::test::assertEqualVectors(expected, result);
+
+  bool usedCudfFilterProject = false;
+  bool usedCpuFilterProject = false;
+  for (const auto& pipeline : task->taskStats().pipelineStats) {
+    for (const auto& op : pipeline.operatorStats) {
+      usedCudfFilterProject |= op.operatorType == "CudfFilterProject";
+      usedCpuFilterProject |= op.operatorType == "FilterProject";
+    }
+  }
+  EXPECT_TRUE(usedCudfFilterProject);
+  EXPECT_FALSE(usedCpuFilterProject);
 }
 
 TEST_F(CudfFilterProjectTest, multiBranchSwitchWithRegexpExtract) {
