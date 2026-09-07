@@ -39,15 +39,23 @@
 #include <cudf/concatenate.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/detail/utilities/stream_pool.hpp>
+#include <cudf/filling.hpp>
 #include <cudf/lists/lists_column_view.hpp>
 #include <cudf/reduction.hpp>
+#include <cudf/reduction/distinct_count.hpp>
 #include <cudf/replace.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
 #include <cudf/unary.hpp>
 
+#include <cuda_runtime_api.h>
+
+#include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <limits>
 #include <mutex>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace {
 
@@ -74,6 +82,12 @@ constexpr const char* kFinalAggregationMergeBytes =
     "cudfFinalAggregationMergeBytes";
 constexpr const char* kFinalAggregationMaxLevel =
     "cudfFinalAggregationMaxLevel";
+constexpr const char* kFinalAggregationOnlineMergeAdmissionCount =
+    "cudfFinalAggregationOnlineMergeAdmissionCount";
+constexpr const char* kFinalAggregationOnlineMergeAdmissionWaitNanos =
+    "cudfFinalAggregationOnlineMergeAdmissionWaitNanos";
+constexpr const char* kFinalAggregationOnlineMergeMemoryAdmissionMisses =
+    "cudfFinalAggregationOnlineMergeMemoryAdmissionMisses";
 constexpr const char* kFinalStreamingBatches = "cudfFinalStreamingBatches";
 constexpr const char* kFinalStreamingInputRows = "cudfFinalStreamingInputRows";
 constexpr const char* kFinalStreamingDistinctKeys =
@@ -82,6 +96,12 @@ constexpr const char* kFinalStreamingOutputRows =
     "cudfFinalStreamingOutputRows";
 constexpr const char* kFinalStreamingFallbackProbeColumnsReleased =
     "cudfFinalStreamingFallbackProbeColumnsReleased";
+constexpr const char* kFinalUniqueKeyPassThroughChecks =
+    "cudfFinalUniqueKeyPassThroughChecks";
+constexpr const char* kFinalUniqueKeyPassThroughRows =
+    "cudfFinalUniqueKeyPassThroughRows";
+constexpr const char* kFinalUniqueKeyPassThroughHits =
+    "cudfFinalUniqueKeyPassThroughHits";
 constexpr const char* kIntermediateAggregationInputRuns =
     "cudfIntermediateAggregationInputRuns";
 constexpr const char* kIntermediateAggregationRunMerges =
@@ -114,7 +134,7 @@ cudf::column_view withoutTopLevelNullMask(cudf::column_view input) {
       children);
 }
 
-bool serializeLargeIntermediateAggregationMergesEnabled() {
+bool serializeLargeAggregationWorkEnabled() {
   static const bool enabled = [] {
     const auto* value = std::getenv("GLUTEN_CUDF_SERIALIZE_LARGE_FINAL_AGG");
     if (value == nullptr) {
@@ -127,7 +147,31 @@ bool serializeLargeIntermediateAggregationMergesEnabled() {
   return enabled;
 }
 
-uint64_t largeIntermediateAggregationSerializeBytes() {
+bool deferLevelledFinalAggregationMergesEnabled() {
+  static const bool enabled = [] {
+    const auto* value =
+        std::getenv("GLUTEN_CUDF_DEFER_LEVELLED_FINAL_AGG_MERGES");
+    if (value == nullptr) {
+      return false;
+    }
+    const std::string_view setting{value};
+    return !setting.empty() && setting != "0" && setting != "false" &&
+        setting != "off" && setting != "no";
+  }();
+  return enabled;
+}
+
+bool oneShotFinalCollectListEnabled() {
+  const auto* value = std::getenv("GLUTEN_CUDF_ONE_SHOT_FINAL_COLLECT_LIST");
+  if (value == nullptr) {
+    return false;
+  }
+  const std::string_view setting{value};
+  return !setting.empty() && setting != "0" && setting != "false" &&
+      setting != "off" && setting != "no";
+}
+
+uint64_t largeAggregationSerializeBytes() {
   static const uint64_t threshold = []() -> uint64_t {
     constexpr uint64_t kDefaultThreshold = 8ULL << 30;
     const auto* value =
@@ -144,9 +188,156 @@ uint64_t largeIntermediateAggregationSerializeBytes() {
   return threshold;
 }
 
-std::mutex& largeIntermediateAggregationMutex() {
+std::mutex& largeAggregationMutex() {
   static std::mutex mutex;
   return mutex;
+}
+
+uint64_t finalOnlineMergeAdmissionBytes() {
+  static const uint64_t threshold = []() -> uint64_t {
+    constexpr uint64_t kDefaultThreshold = 4ULL << 30;
+    const auto* value =
+        std::getenv("GLUTEN_CUDF_FINAL_ONLINE_MERGE_ADMISSION_BYTES");
+    if (value == nullptr || *value == '\0') {
+      return kDefaultThreshold;
+    }
+    char* end = nullptr;
+    const auto parsed = std::strtoull(value, &end, 10);
+    return end != value && *end == '\0' && parsed > 0
+        ? static_cast<uint64_t>(parsed)
+        : kDefaultThreshold;
+  }();
+  return threshold;
+}
+
+uint32_t finalOnlineMergeMaxConcurrency() {
+  static const uint32_t concurrency = []() -> uint32_t {
+    const auto* value =
+        std::getenv("GLUTEN_CUDF_FINAL_ONLINE_MERGE_MAX_CONCURRENCY");
+    if (value == nullptr || *value == '\0') {
+      return 0;
+    }
+    char* end = nullptr;
+    const auto parsed = std::strtoul(value, &end, 10);
+    return end != value && *end == '\0' && parsed > 0 && parsed <= 64
+        ? static_cast<uint32_t>(parsed)
+        : 0;
+  }();
+  return concurrency;
+}
+
+uint64_t finalOnlineMergeMinHeadroomBytes() {
+  static const uint64_t bytes = []() -> uint64_t {
+    constexpr uint64_t kDefaultBytes = 8ULL << 30;
+    const auto* value =
+        std::getenv("GLUTEN_CUDF_FINAL_ONLINE_MERGE_MIN_HEADROOM_BYTES");
+    if (value == nullptr || *value == '\0') {
+      return kDefaultBytes;
+    }
+    char* end = nullptr;
+    const auto parsed = std::strtoull(value, &end, 10);
+    return end != value && *end == '\0' ? static_cast<uint64_t>(parsed)
+                                        : kDefaultBytes;
+  }();
+  return bytes;
+}
+
+struct FinalOnlineMergeAdmissionState {
+  std::mutex mutex;
+  std::condition_variable changed;
+  std::unordered_map<int, uint32_t> activeByDevice;
+  std::unordered_map<int, uint64_t> reservedBytesByDevice;
+};
+
+FinalOnlineMergeAdmissionState& finalOnlineMergeAdmissionState() {
+  static FinalOnlineMergeAdmissionState state;
+  return state;
+}
+
+class FinalOnlineMergeConcurrencyPermit {
+ public:
+  FinalOnlineMergeConcurrencyPermit(
+      int device,
+      uint32_t maxConcurrency,
+      uint64_t requestedBytes,
+      uint64_t capacityBytes)
+      : device_{device}, reservedBytes_{requestedBytes} {
+    auto& state = finalOnlineMergeAdmissionState();
+    std::unique_lock<std::mutex> lock(state.mutex);
+    state.changed.wait(lock, [&] {
+      const auto active = state.activeByDevice[device_];
+      const auto reserved = state.reservedBytesByDevice[device_];
+      const bool soleOversizedGrant =
+          requestedBytes > capacityBytes && active == 0;
+      const bool memoryAvailable = requestedBytes <= capacityBytes &&
+          reserved <= capacityBytes - requestedBytes;
+      return active < maxConcurrency && (soleOversizedGrant || memoryAvailable);
+    });
+    ++state.activeByDevice[device_];
+    state.reservedBytesByDevice[device_] += reservedBytes_;
+    active_ = true;
+  }
+
+  ~FinalOnlineMergeConcurrencyPermit() {
+    if (!active_) {
+      return;
+    }
+    auto& state = finalOnlineMergeAdmissionState();
+    {
+      std::lock_guard<std::mutex> lock(state.mutex);
+      const auto it = state.activeByDevice.find(device_);
+      if (it == state.activeByDevice.end() || it->second == 0) {
+        LOG(ERROR) << "Invalid FINAL online merge concurrency release device="
+                   << device_;
+        return;
+      }
+      if (--it->second == 0) {
+        state.activeByDevice.erase(it);
+      }
+      const auto reservedIt = state.reservedBytesByDevice.find(device_);
+      if (reservedIt == state.reservedBytesByDevice.end() ||
+          reservedIt->second < reservedBytes_) {
+        LOG(ERROR) << "Invalid FINAL online merge byte release device="
+                   << device_ << " bytes=" << reservedBytes_;
+        return;
+      }
+      if ((reservedIt->second -= reservedBytes_) == 0) {
+        state.reservedBytesByDevice.erase(reservedIt);
+      }
+    }
+    state.changed.notify_all();
+  }
+
+  FinalOnlineMergeConcurrencyPermit(const FinalOnlineMergeConcurrencyPermit&) =
+      delete;
+  FinalOnlineMergeConcurrencyPermit& operator=(
+      const FinalOnlineMergeConcurrencyPermit&) = delete;
+
+ private:
+  int device_{-1};
+  uint64_t reservedBytes_{0};
+  bool active_{false};
+};
+
+struct FinalOnlineMergeAsyncRelease {
+  std::unique_ptr<FinalOnlineMergeConcurrencyPermit> concurrencyPermit;
+  std::optional<cudf_velox::DeviceMemoryAdmissionReservation>
+      deviceMemoryReservation;
+};
+
+void CUDART_CB releaseFinalOnlineMergeAdmission(void* opaque) {
+  delete static_cast<FinalOnlineMergeAsyncRelease*>(opaque);
+}
+
+uint64_t estimateFinalOnlineMergeTransientBytes(uint64_t inputBytes) {
+  // The two source runs are already live. Budget a new concatenation roughly
+  // equal to their flat size, a same-order groupby output, and 25% scratch.
+  constexpr uint64_t kNumerator = 9;
+  constexpr uint64_t kDenominator = 4;
+  if (inputBytes > std::numeric_limits<uint64_t>::max() / kNumerator) {
+    return std::numeric_limits<uint64_t>::max();
+  }
+  return inputBytes * kNumerator / kDenominator;
 }
 
 size_t aggregationRunLevel(uint64_t representedRows) {
@@ -1009,6 +1200,37 @@ struct GroupbyCollectListAggregator : GroupbyAggregator {
     return std::move(results[outputIdx_].results[0]);
   }
 
+  bool supportsPartialIdentity() const override {
+    return step == core::AggregationNode::Step::kPartial && constant == nullptr;
+  }
+
+  std::unique_ptr<cudf::column> makePartialIdentityColumn(
+      cudf::table_view const& tbl,
+      std::unique_ptr<cudf::column> inputOwner,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) override {
+    VELOX_CHECK(supportsPartialIdentity());
+    auto input = tbl.column(inputIndex);
+    VELOX_USER_CHECK_EQ(
+        input.null_count(),
+        0,
+        "collect_list partial identity requires non-null raw input");
+
+    auto elements = inputOwner
+        ? std::move(inputOwner)
+        : std::make_unique<cudf::column>(input, stream, mr);
+    cudf::numeric_scalar<cudf::size_type> firstOffset(0, true, stream, mr);
+    cudf::numeric_scalar<cudf::size_type> offsetStep(1, true, stream, mr);
+    auto offsets =
+        cudf::sequence(input.size() + 1, firstOffset, offsetStep, stream, mr);
+    return cudf::make_lists_column(
+        input.size(),
+        std::move(offsets),
+        std::move(elements),
+        0,
+        rmm::device_buffer{});
+  }
+
  private:
   uint32_t outputIdx_{0};
   std::unique_ptr<cudf::column> nonNullMergeInput_;
@@ -1114,9 +1336,10 @@ bool canGroupbyAggregationBeEvaluatedByCudf(
 // Simple companion aggregates need no additional in-operator state compaction:
 // PARTIAL can aggregate and emit each incoming page once, while FINAL and
 // SINGLE can concatenate their pages and aggregate once at end of input. This
-// avoids repeatedly regrouping high-cardinality intermediate states. Keep newer
-// aggregate families on the levelled or persistent-streaming paths until their
-// one-shot semantics and memory bounds have been validated here.
+// avoids repeatedly regrouping high-cardinality intermediate states. A FINAL
+// collect_list merge has the same one-shot property, but its retained lists can
+// be large, so keep it behind an explicit experiment flag and the large-work
+// serialization gate below.
 bool canUseOneShotCompanionAggregation(
     const core::AggregationNode& aggregationNode) {
   if (aggregationNode.groupingKeys().empty() ||
@@ -1133,9 +1356,31 @@ bool canUseOneShotCompanionAggregation(
           return false;
         }
         const auto name = getOriginalName(aggregate.call->name());
-        return name == prefix + "sum" || name == prefix + "count" ||
-            name == prefix + "min" || name == prefix + "max" ||
-            name == prefix + "avg";
+        const bool experimentalFinalCollectList =
+            oneShotFinalCollectListEnabled() &&
+            aggregationNode.step() == core::AggregationNode::Step::kFinal &&
+            name == prefix + "collect_list";
+        return experimentalFinalCollectList || name == prefix + "sum" ||
+            name == prefix + "count" || name == prefix + "min" ||
+            name == prefix + "max" || name == prefix + "avg";
+      });
+}
+
+bool isFinalCollectListOnly(const core::AggregationNode& aggregationNode) {
+  if (!oneShotFinalCollectListEnabled() ||
+      aggregationNode.step() != core::AggregationNode::Step::kFinal ||
+      aggregationNode.groupingKeys().empty() ||
+      aggregationNode.aggregates().empty()) {
+    return false;
+  }
+
+  const auto prefix = CudfConfig::getInstance().functionNamePrefix;
+  return std::all_of(
+      aggregationNode.aggregates().begin(),
+      aggregationNode.aggregates().end(),
+      [&](const auto& aggregate) {
+        return !aggregate.distinct && !aggregate.mask &&
+            getOriginalName(aggregate.call->name()) == prefix + "collect_list";
       });
 }
 
@@ -1289,6 +1534,27 @@ void CudfGroupby::initialize() {
       outputType_,
       aggregationInput.constants);
 
+  // A FINAL collect_list whose keys are all distinct can pass its intermediate
+  // list columns through unchanged.  Restrict the optimization to a pure
+  // source-column permutation so a hit can transfer column ownership without
+  // materializing another full-width table.  The exact distinct-key check is
+  // performed at finalization; this flag only records structural eligibility.
+  if (isFinalCollectListOnly(*aggregationNode_) && !ignoreNullKeys_ &&
+      precomputedInputEvaluators_.empty() &&
+      aggregationInputChannels_.size() == outputType_->size()) {
+    std::unordered_set<column_index_t> seenChannels;
+    uniqueFinalCollectListPassThroughEligible_ = true;
+    for (size_t i = 0; i < aggregationInputChannels_.size(); ++i) {
+      const auto channel = aggregationInputChannels_[i];
+      if (channel >= inputType_->size() ||
+          !seenChannels.insert(channel).second ||
+          !inputType_->childAt(channel)->equivalent(*outputType_->childAt(i))) {
+        uniqueFinalCollectListPassThroughEligible_ = false;
+        break;
+      }
+    }
+  }
+
   // Companion names encode their effective aggregation step. Streaming is
   // safe when that step agrees with the plan node: each input batch can then
   // be compacted using the intermediate aggregators and finalized normally.
@@ -1325,7 +1591,7 @@ void CudfGroupby::initialize() {
                   return aggregator->supportsPartialIdentity();
                 }),
         "partial identity aggregation currently supports only non-constant "
-        "SUM, MIN, and MAX companion aggregates");
+        "SUM, MIN, MAX, and non-null COLLECT_LIST companion aggregates");
     LOG(INFO) << "CUDF_GROUPBY_PARTIAL_IDENTITY node=" << diagnosticNodeId_
               << " state=enabled keys=" << groupingKeyOutputChannels_.size()
               << " aggregates=" << aggregators_.size();
@@ -1688,6 +1954,16 @@ void CudfGroupby::addFinalAggregationRun(FinalAggregationRun run) {
         kFinalAggregationMaxLevel, RuntimeCounter(static_cast<int64_t>(level)));
   }
 
+  // High-cardinality FINAL runs retain nearly all input rows. Repeated binary
+  // merges then read and rewrite the full state at every level. When the
+  // large-final drain is serialized, retaining the independently reduced
+  // pages and merging them once at drain time uses less total GPU work while
+  // keeping the transient concat/output allocation inside the safety gate.
+  if (deferLevelledFinalAggregationMergesEnabled()) {
+    finalDeferredRuns_.push_back(std::move(run));
+    return;
+  }
+
   for (;;) {
     if (finalRunLevels_.size() <= level) {
       finalRunLevels_.resize(level + 1);
@@ -1731,6 +2007,57 @@ CudfGroupby::FinalAggregationRun CudfGroupby::mergeFinalAggregationRuns(
   const auto representedRows =
       addRepresentedRows(left.representedRows, right.representedRows);
 
+  const auto maxOnlineMergeConcurrency = finalOnlineMergeMaxConcurrency();
+  const bool admitOnlineMerge = !finalizing && maxOnlineMergeConcurrency > 0 &&
+      inputBytes >= finalOnlineMergeAdmissionBytes();
+  std::unique_ptr<FinalOnlineMergeConcurrencyPermit> onlineMergePermit;
+  std::optional<cudf_velox::DeviceMemoryAdmissionReservation>
+      deviceMemoryReservation;
+  int64_t onlineMergeAdmissionWaitNanos = 0;
+  bool deviceMemoryAdmissionMissed = false;
+  if (admitOnlineMerge) {
+    // Inputs can arrive on four independent FINAL streams. Make their prior
+    // allocations visible to the headroom snapshot, then admit only the large
+    // merge's transient concat/output footprint. This changes scheduling, not
+    // the merge tree or aggregation implementation.
+    const auto headroom = cudf_velox::captureDeviceAllocationHeadroom();
+    const auto estimatedTransientBytes =
+        estimateFinalOnlineMergeTransientBytes(inputBytes);
+    const auto configuredHeadroom = finalOnlineMergeMinHeadroomBytes();
+    const auto admissionCapacity =
+        headroom.allocatableBytes() > configuredHeadroom
+        ? static_cast<uint64_t>(headroom.allocatableBytes()) -
+            configuredHeadroom
+        : uint64_t{0};
+    const auto waitStart = std::chrono::steady_clock::now();
+    onlineMergePermit = std::make_unique<FinalOnlineMergeConcurrencyPermit>(
+        headroom.device,
+        maxOnlineMergeConcurrency,
+        estimatedTransientBytes,
+        admissionCapacity);
+    onlineMergeAdmissionWaitNanos =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - waitStart)
+            .count();
+
+    // Cooperate with the exchange's device admission accounting as well. The
+    // local permit remains authoritative for FINAL progress: a miss can occur
+    // when a short-lived hash window reserved the same snapshot immediately
+    // before this atomic attempt.
+    deviceMemoryReservation = cudf_velox::tryAcquireDeviceMemoryAdmission(
+        headroom.device, estimatedTransientBytes, admissionCapacity);
+    deviceMemoryAdmissionMissed = !deviceMemoryReservation.has_value();
+    LOG(INFO) << "CUDF_GROUPBY_FINAL_ONLINE_MERGE_ADMISSION node="
+              << diagnosticNodeId_ << " inputBytes=" << inputBytes
+              << " estimatedTransientBytes=" << estimatedTransientBytes
+              << " cudaFreeBytes=" << headroom.freeBytes
+              << " poolReusableBytes=" << headroom.reusablePoolBytes()
+              << " admissionCapacityBytes=" << admissionCapacity
+              << " maxConcurrency=" << maxOnlineMergeConcurrency
+              << " waitNanos=" << onlineMergeAdmissionWaitNanos
+              << " deviceReservation=" << deviceMemoryReservation.has_value();
+  }
+
   std::vector<CudfVectorPtr> inputs;
   inputs.reserve(2);
   inputs.push_back(std::move(left.data));
@@ -1746,6 +2073,24 @@ CudfGroupby::FinalAggregationRun CudfGroupby::mergeFinalAggregationRuns(
       get_output_mr(),
       finalInputKeysSorted_);
   VELOX_CHECK_NOT_NULL(output);
+  if (admitOnlineMerge) {
+    // The permit protects actual device residency, not only host-side kernel
+    // launch. Drop the temporary concatenation on this stream, then enqueue a
+    // host callback behind every merge kernel and deallocation. The driver can
+    // immediately continue feeding the pipeline while the callback returns
+    // credit only after the admitted work has really completed.
+    concatenated.reset();
+    auto* release = new FinalOnlineMergeAsyncRelease{
+        std::move(onlineMergePermit), std::move(deviceMemoryReservation)};
+    const auto status = cudaLaunchHostFunc(
+        stateStream_.value(), releaseFinalOnlineMergeAdmission, release);
+    if (status != cudaSuccess) {
+      LOG(ERROR) << "cudaLaunchHostFunc failed for FINAL online merge "
+                 << "admission release: " << cudaGetErrorString(status);
+      stateStream_.synchronize();
+      delete release;
+    }
+  }
 
   ++finalRunMergeCount_;
   {
@@ -1763,6 +2108,18 @@ CudfGroupby::FinalAggregationRun CudfGroupby::mergeFinalAggregationRuns(
     lockedStats->addRuntimeStat(
         kFinalAggregationMaxLevel,
         RuntimeCounter(static_cast<int64_t>(outputLevel)));
+    if (admitOnlineMerge) {
+      lockedStats->addRuntimeStat(
+          kFinalAggregationOnlineMergeAdmissionCount, RuntimeCounter(1));
+      lockedStats->addRuntimeStat(
+          kFinalAggregationOnlineMergeAdmissionWaitNanos,
+          RuntimeCounter(onlineMergeAdmissionWaitNanos));
+      if (deviceMemoryAdmissionMissed) {
+        lockedStats->addRuntimeStat(
+            kFinalAggregationOnlineMergeMemoryAdmissionMisses,
+            RuntimeCounter(1));
+      }
+    }
   }
 
   if (deviceMemoryDiagnosticsEnabled() &&
@@ -1788,6 +2145,70 @@ CudfGroupby::FinalAggregationRun CudfGroupby::mergeFinalAggregationRuns(
 }
 
 CudfVectorPtr CudfGroupby::drainFinalAggregationRuns() {
+  if (!finalDeferredRuns_.empty()) {
+    VELOX_CHECK(
+        finalRunLevels_.empty(),
+        "Deferred and levelled FINAL aggregation runs cannot be mixed");
+
+    int64_t inputRows = 0;
+    uint64_t inputBytes = 0;
+    uint64_t representedRows = 0;
+    std::vector<CudfVectorPtr> inputs;
+    inputs.reserve(finalDeferredRuns_.size());
+    for (auto& run : finalDeferredRuns_) {
+      VELOX_CHECK_NOT_NULL(run.data);
+      VELOX_CHECK_LE(
+          run.data->size(), std::numeric_limits<int64_t>::max() - inputRows);
+      inputRows += static_cast<int64_t>(run.data->size());
+      const auto runBytes = run.data->estimateFlatSize();
+      VELOX_CHECK_LE(
+          runBytes, std::numeric_limits<uint64_t>::max() - inputBytes);
+      inputBytes += runBytes;
+      representedRows =
+          addRepresentedRows(representedRows, run.representedRows);
+      inputs.push_back(std::move(run.data));
+    }
+    finalDeferredRuns_.clear();
+
+    if (inputs.size() == 1) {
+      return std::move(inputs.front());
+    }
+
+    auto concatenated = getConcatenatedTable(
+        std::move(inputs), bufferedResultType_, stateStream_, get_temp_mr());
+    auto output = doGroupByAggregation(
+        concatenated->view(),
+        groupingKeyOutputChannels_,
+        intermediateAggregators_,
+        bufferedResultType_,
+        stateStream_,
+        get_output_mr(),
+        finalInputKeysSorted_);
+    VELOX_CHECK_NOT_NULL(output);
+
+    ++finalRunMergeCount_;
+    const auto outputLevel = aggregationRunLevel(representedRows);
+    {
+      auto lockedStats = stats_.wlock();
+      lockedStats->addRuntimeStat(
+          kFinalAggregationRunMerges, RuntimeCounter(1));
+      lockedStats->addRuntimeStat(
+          kFinalAggregationFinalizeMerges, RuntimeCounter(1));
+      lockedStats->addRuntimeStat(
+          kFinalAggregationMergeRows, RuntimeCounter(inputRows));
+      VELOX_CHECK_LE(
+          inputBytes,
+          static_cast<uint64_t>(std::numeric_limits<int64_t>::max()));
+      lockedStats->addRuntimeStat(
+          kFinalAggregationMergeBytes,
+          RuntimeCounter(static_cast<int64_t>(inputBytes)));
+      lockedStats->addRuntimeStat(
+          kFinalAggregationMaxLevel,
+          RuntimeCounter(static_cast<int64_t>(outputLevel)));
+    }
+    return output;
+  }
+
   size_t retainedRuns = 0;
   uint64_t retainedRows = 0;
   uint64_t retainedBytes = 0;
@@ -2006,13 +2427,11 @@ CudfGroupby::mergeIntermediateAggregationRuns(
   // multi-GiB concatenate and groupby operations concurrently on the same
   // GPU, increasing both peak memory and Q18 latency. Retain that behavior for
   // PARTIAL/SINGLE runs while leaving the new FINAL streaming state untouched.
-  const bool serializeLargeMerge =
-      serializeLargeIntermediateAggregationMergesEnabled() &&
-      inputBytes >= largeIntermediateAggregationSerializeBytes();
+  const bool serializeLargeMerge = serializeLargeAggregationWorkEnabled() &&
+      inputBytes >= largeAggregationSerializeBytes();
   std::unique_lock<std::mutex> largeMergeLock;
   if (serializeLargeMerge) {
-    largeMergeLock =
-        std::unique_lock<std::mutex>{largeIntermediateAggregationMutex()};
+    largeMergeLock = std::unique_lock<std::mutex>{largeAggregationMutex()};
     stateStream_.synchronize();
   }
 
@@ -2281,6 +2700,42 @@ RowVectorPtr CudfGroupby::doGetOutput() {
   // At this point isPartialOutput_ is false (handled above) and noMoreInput_
   // is true (guarded by the check above).
   if (streamingEnabled_) {
+    // A levelled FINAL operator can transiently need memory for all retained
+    // runs, their concatenation, and the groupby output at once. Multiple
+    // local drivers reaching noMoreInput together amplify that peak. Keep the
+    // ingest and online-merge paths parallel, but optionally serialize only
+    // this large drain/finalize region across the executor. This is a
+    // conservative safety valve; device-headroom-aware admission can replace
+    // it without changing the operator boundary.
+    uint64_t retainedFinalBytes = 0;
+    if (!isPartialOutput_ && !isSingleStep_ &&
+        finalAggregationMode_ == FinalAggregationMode::kLevelled) {
+      for (const auto& level : finalRunLevels_) {
+        if (level.has_value()) {
+          const auto runBytes = level->data->estimateFlatSize();
+          VELOX_CHECK_LE(
+              runBytes,
+              std::numeric_limits<uint64_t>::max() - retainedFinalBytes);
+          retainedFinalBytes += runBytes;
+        }
+      }
+      for (const auto& run : finalDeferredRuns_) {
+        const auto runBytes = run.data->estimateFlatSize();
+        VELOX_CHECK_LE(
+            runBytes,
+            std::numeric_limits<uint64_t>::max() - retainedFinalBytes);
+        retainedFinalBytes += runBytes;
+      }
+    }
+    const bool serializeLargeFinal = serializeLargeAggregationWorkEnabled() &&
+        retainedFinalBytes >= largeAggregationSerializeBytes();
+    std::unique_lock<std::mutex> largeFinalLock;
+    if (serializeLargeFinal) {
+      largeFinalLock = std::unique_lock<std::mutex>{largeAggregationMutex()};
+      stateStream_.synchronize();
+      LOG(INFO) << "CUDF_GROUPBY_FINAL_SERIALIZED node=" << diagnosticNodeId_
+                << " retainedBytes=" << retainedFinalBytes;
+    }
     if (isSingleStep_ && !bufferedResult_) {
       bufferedResult_ = drainIntermediateAggregationRuns();
     }
@@ -2330,7 +2785,83 @@ RowVectorPtr CudfGroupby::doGetOutput() {
     return nullptr;
   }
 
+  uint64_t retainedInputBytes = 0;
+  if (!isPartialOutput_ && serializeLargeAggregationWorkEnabled()) {
+    for (const auto& input : inputs_) {
+      const auto inputBytes = input->estimateFlatSize();
+      VELOX_CHECK_LE(
+          inputBytes,
+          std::numeric_limits<uint64_t>::max() - retainedInputBytes);
+      retainedInputBytes += inputBytes;
+    }
+  }
+  const bool serializeLargeOneShot = !isPartialOutput_ &&
+      serializeLargeAggregationWorkEnabled() &&
+      retainedInputBytes >= largeAggregationSerializeBytes();
+  std::unique_lock<std::mutex> largeOneShotLock;
+  if (serializeLargeOneShot) {
+    largeOneShotLock = std::unique_lock<std::mutex>{largeAggregationMutex()};
+    LOG(INFO) << "CUDF_GROUPBY_ONE_SHOT_SERIALIZED node=" << diagnosticNodeId_
+              << " retainedBytes=" << retainedInputBytes;
+  }
+
   auto stream = cudfGlobalStreamPool().get_stream();
+
+  bool uniqueFinalKeys = false;
+  if (uniqueFinalCollectListPassThroughEligible_ && !inputs_.empty()) {
+    std::vector<cudf::table_view> keyTables;
+    std::vector<rmm::cuda_stream_view> inputStreams;
+    keyTables.reserve(inputs_.size());
+    inputStreams.reserve(inputs_.size());
+    uint64_t inputRows = 0;
+    bool aggregateInputsHaveNulls = false;
+    const auto numKeys = groupingKeyOutputChannels_.size();
+    for (const auto& input : inputs_) {
+      VELOX_CHECK_NOT_NULL(input);
+      const auto inputView = input->getTableView();
+      keyTables.push_back(inputView.select(
+          groupingKeyInputChannels_.begin(), groupingKeyInputChannels_.end()));
+      inputStreams.push_back(input->stream());
+      inputRows = addRepresentedRows(
+          inputRows, static_cast<uint64_t>(inputView.num_rows()));
+      for (size_t i = numKeys; i < aggregationInputChannels_.size(); ++i) {
+        if (inputView.column(aggregationInputChannels_[i]).has_nulls()) {
+          aggregateInputsHaveNulls = true;
+          break;
+        }
+      }
+    }
+
+    if (!aggregateInputsHaveNulls) {
+      cudf::detail::join_streams(inputStreams, stream);
+      auto concatenatedKeys =
+          cudf::concatenate(keyTables, stream, get_temp_mr());
+      const auto distinctKeys = cudf::distinct_count(
+          concatenatedKeys->view(), cudf::null_equality::EQUAL, stream);
+      uniqueFinalKeys = static_cast<uint64_t>(distinctKeys) == inputRows;
+      concatenatedKeys.reset();
+      // Reclaim the exact-probe hash table and key concat before allocating
+      // the full-width concat.  This is what keeps a single p4 destination
+      // lane below the device-memory high-water mark.
+      stream.synchronize();
+      {
+        auto lockedStats = stats_.wlock();
+        lockedStats->addRuntimeStat(
+            kFinalUniqueKeyPassThroughChecks, RuntimeCounter(1));
+        lockedStats->addRuntimeStat(
+            kFinalUniqueKeyPassThroughRows,
+            RuntimeCounter(static_cast<int64_t>(inputRows)));
+        if (uniqueFinalKeys) {
+          lockedStats->addRuntimeStat(
+              kFinalUniqueKeyPassThroughHits, RuntimeCounter(1));
+        }
+      }
+      LOG(INFO) << "CUDF_GROUPBY_FINAL_UNIQUE_KEY_PROBE node="
+                << diagnosticNodeId_ << " rows=" << inputRows
+                << " distinctKeys=" << distinctKeys
+                << " passthrough=" << uniqueFinalKeys;
+    }
+  }
 
   auto tbl = getConcatenatedTable(
       std::exchange(inputs_, {}), inputType_, stream, get_temp_mr());
@@ -2345,6 +2876,20 @@ RowVectorPtr CudfGroupby::doGetOutput() {
 
   VELOX_CHECK_NOT_NULL(tbl);
 
+  if (uniqueFinalKeys) {
+    auto inputColumns = tbl->release();
+    std::vector<std::unique_ptr<cudf::column>> outputColumns;
+    outputColumns.reserve(aggregationInputChannels_.size());
+    for (const auto channel : aggregationInputChannels_) {
+      VELOX_CHECK_NOT_NULL(inputColumns.at(channel));
+      outputColumns.push_back(std::move(inputColumns.at(channel)));
+    }
+    auto outputTable = std::make_unique<cudf::table>(std::move(outputColumns));
+    const auto outputRows = outputTable->num_rows();
+    return std::make_shared<cudf_velox::CudfVector>(
+        pool(), outputType_, outputRows, std::move(outputTable), stream);
+  }
+
   auto preparedInput = prepareAggregationInput(
       tbl->view(),
       tbl->num_rows(),
@@ -2353,13 +2898,18 @@ RowVectorPtr CudfGroupby::doGetOutput() {
       get_temp_mr());
   auto permutedInputView = preparedInput.tableView.select(
       aggregationInputChannels_.begin(), aggregationInputChannels_.end());
-  return doGroupByAggregation(
+  auto result = doGroupByAggregation(
       permutedInputView,
       groupingKeyOutputChannels_,
       aggregators_,
       outputType_,
       stream,
       get_output_mr());
+  if (serializeLargeOneShot) {
+    // Keep the concat and groupby temporaries inside the serialized region.
+    stream.synchronize();
+  }
+  return result;
 }
 
 void CudfGroupby::doNoMoreInput() {
@@ -2383,6 +2933,7 @@ void CudfGroupby::doClose() {
   intermediateRunLevels_.clear();
   intermediateBufferedBytes_ = 0;
   finalRunLevels_.clear();
+  finalDeferredRuns_.clear();
   bufferedResult_.reset();
   inputs_.clear();
   Operator::close();

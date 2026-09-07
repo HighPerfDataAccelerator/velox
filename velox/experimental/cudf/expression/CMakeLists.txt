@@ -35,6 +35,7 @@ add_library(
   prestosql/DateAddFunction.cpp
   prestosql/DatePlusIntervalFunction.cpp
   SparkFunctions.cpp
+  StringExpressionKernels.cu
   sparksql/DateAddFunction.cpp
   sparksql/HashFunction.cpp
   sparksql/SubStringFunction.cpp

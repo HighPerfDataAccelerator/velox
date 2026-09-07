@@ -86,6 +86,17 @@ class OperatorAdapter {
       exec::DriverCtx* ctx,
       int32_t operatorId) const = 0;
 
+  /// Create GPU input operators to insert immediately before an original
+  /// operator retained by keepOperator(). Most retained operators do not need
+  /// an input adapter and use the empty default.
+  virtual std::vector<std::unique_ptr<exec::Operator>> createInputAdapters(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& /*planNode*/,
+      exec::DriverCtx* /*ctx*/,
+      int32_t /*operatorId*/) const {
+    return {};
+  }
+
   /// Check if the original operator should be kept (not replaced). Returns
   /// true if the original operator should be kept, false otherwise.
   virtual bool keepOperator() const {

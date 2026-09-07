@@ -601,9 +601,16 @@ void UcxPartitionedOutput::advanceActiveFlush() {
   auto slices = cudf::slice(tableView, {activeNextRow_, end}, stream);
   VELOX_CHECK_EQ(slices.size(), 1);
 
-  auto partitionInput = slices[0];
+  // A full-source view already has normalized nested offsets. Reusing it is
+  // important for the common producer flush: copying the complete ~1 GiB
+  // STRUCT table here adds a large D2D operation and retains another full
+  // table until hash partitioning and packing finish. Only a proper windowed
+  // slice needs materialization to realign STRUCT children with its parent.
+  const bool coversEntireSource = activeNextRow_ == 0 && end == tableRows;
+  auto partitionInput = coversEntireSource ? tableView : slices[0];
   std::unique_ptr<cudf::table> materializedPartitionInput;
-  if (numPartitions_ > 1 && containsStructColumn(partitionInput)) {
+  if (numPartitions_ > 1 && !coversEntireSource &&
+      containsStructColumn(partitionInput)) {
     // libcudf partition requires STRUCT children to align with their sliced
     // parent. Materialize this bounded window to normalize nested offsets.
     materializedPartitionInput = std::make_unique<cudf::table>(

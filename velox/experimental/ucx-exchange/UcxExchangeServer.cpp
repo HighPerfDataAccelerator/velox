@@ -220,13 +220,19 @@ void UcxExchangeServer::setState(ServerState newState) {
 // This constructor is private
 UcxExchangeServer::UcxExchangeServer(
     const std::shared_ptr<Communicator> communicator,
-    std::shared_ptr<EndpointRef> endpointRef,
+    std::shared_ptr<EndpointRef> controlEndpointRef,
+    uint64_t remoteWorkerId,
+    std::string remoteDataHost,
+    uint16_t remoteDataPort,
     const PartitionKey& key,
     bool isIntraNodeTransfer)
-    : CommElement(communicator, endpointRef),
+    : CommElement(communicator, std::move(controlEndpointRef)),
       partitionKey_(key),
       partitionKeyHash_(fnv1a_32(partitionKey_.toString())),
       isIntraNodeTransfer_(isIntraNodeTransfer),
+      remoteWorkerId_(remoteWorkerId),
+      remoteDataHost_(std::move(remoteDataHost)),
+      remoteDataPort_(remoteDataPort),
       queueMgr_(UcxOutputQueueManager::getInstanceRef()) {
   setState(ServerState::Created);
 
@@ -240,11 +246,20 @@ UcxExchangeServer::UcxExchangeServer(
 // static
 std::shared_ptr<UcxExchangeServer> UcxExchangeServer::create(
     const std::shared_ptr<Communicator> communicator,
-    std::shared_ptr<EndpointRef> endpointRef,
+    std::shared_ptr<EndpointRef> controlEndpointRef,
+    uint64_t remoteWorkerId,
+    std::string remoteDataHost,
+    uint16_t remoteDataPort,
     const PartitionKey& key,
     bool isIntraNodeTransfer) {
   auto ptr = std::shared_ptr<UcxExchangeServer>(new UcxExchangeServer(
-      communicator, endpointRef, key, isIntraNodeTransfer));
+      communicator,
+      std::move(controlEndpointRef),
+      remoteWorkerId,
+      std::move(remoteDataHost),
+      remoteDataPort,
+      key,
+      isIntraNodeTransfer));
   return ptr;
 }
 
@@ -254,10 +269,33 @@ void UcxExchangeServer::process() {
     return;
   }
   switch (state_) {
-    case ServerState::Created:
+    case ServerState::Created: {
+      if (!isIntraNodeTransfer_ && !dataEndpointRef_) {
+        auto communicator = tryCommunicator();
+        if (!communicator) {
+          close();
+          return;
+        }
+        try {
+          dataEndpointRef_ = communicator->getOrCreateDataEndpoint(
+              remoteWorkerId_, remoteDataHost_, remoteDataPort_);
+          dataEndpointRef_->addCommElem(getSelfPtr());
+        } catch (const std::exception& e) {
+          LOG(ERROR) << "Failed to create deferred UCX bulk-data endpoint: "
+                     << "task=" << partitionKey_.toString()
+                     << " remoteWorkerId=" << remoteWorkerId_
+                     << " error=" << e.what();
+          if (endpointRef_) {
+            communicator->deferEndpointCleanup(endpointRef_);
+          }
+          close();
+          return;
+        }
+      }
       setState(ServerState::ReadyToTransfer);
       wakeCommunicator();
       break;
+    }
     case ServerState::ReadyToTransfer:
       // Count-only / rendezvous push (Presto-style): no consumer credit
       // request. Go straight to dequeue + send; the data tagSend blocks at
@@ -377,6 +415,10 @@ void UcxExchangeServer::process() {
       if (endpointRef_) {
         endpointRef_->removeCommElem(getSelfPtr());
         endpointRef_ = nullptr;
+      }
+      if (dataEndpointRef_) {
+        dataEndpointRef_->removeCommElem(getSelfPtr());
+        dataEndpointRef_ = nullptr;
       }
       break;
   };
@@ -579,7 +621,8 @@ void UcxExchangeServer::sendData() {
     auto metaCtx = std::make_shared<MetaSendContext>();
     metaCtx->metadata = serializedMetadata;
 
-    metaRequest_ = endpointRef_->endpoint_->tagSend(
+    VELOX_CHECK_NOT_NULL(dataEndpointRef_);
+    metaRequest_ = dataEndpointRef_->endpoint_->tagSend(
         metaCtx->metadata.get(),
         serMetaSize,
         ucxx::Tag{metadataTag},
@@ -658,7 +701,7 @@ void UcxExchangeServer::sendData() {
               << (useHostStaging ? "host-staged" : "direct-device")
               << " send for " << bytes_ << " bytes";
 
-      dataRequest_ = endpointRef_->endpoint_->tagSend(
+      dataRequest_ = dataEndpointRef_->endpoint_->tagSend(
           sendBuffer,
           static_cast<size_t>(bytes_),
           ucxx::Tag{dataTag},

@@ -26,15 +26,13 @@
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/unary.hpp>
 
+#include <cerrno>
+#include <cstdlib>
+#include <limits>
+
 namespace facebook::velox::cudf_velox {
 
 namespace {
-
-// Bound expanding-operator output before it reaches blocking consumers such
-// as OrderBy. This is input rows (not bytes); at a 10x expansion factor it
-// yields batches around a few hundred MiB.
-// Parquet reader chunk/pass limits remain independent and unbounded.
-constexpr cudf::size_type kMaxUnnestInputRowsPerOutput = 262144;
 
 column_index_t fieldChannel(
     const RowTypePtr& inputType,
@@ -101,7 +99,8 @@ CudfUnnest::CudfUnnest(
           NvtxMethodFlag::kAll,
           std::nullopt,
           unnestNode),
-      hasOrdinality_{unnestNode->hasOrdinality()} {
+      hasOrdinality_{unnestNode->hasOrdinality()},
+      maxInputRowsPerOutput_{configuredMaxInputRowsPerOutput()} {
   VELOX_CHECK(
       canRunOnGPU(unnestNode),
       "cuDF Unnest currently supports only single ARRAY unnest without outer marker");
@@ -112,6 +111,22 @@ CudfUnnest::CudfUnnest(
     replicateChannels_.push_back(fieldChannel(inputType, field));
   }
   unnestChannel_ = fieldChannel(inputType, unnestNode->unnestVariables()[0]);
+}
+
+cudf::size_type CudfUnnest::configuredMaxInputRowsPerOutput() {
+  const auto* value = std::getenv("GLUTEN_CUDF_UNNEST_INPUT_ROWS_PER_OUTPUT");
+  if (value == nullptr || *value == '\0') {
+    return kDefaultMaxInputRowsPerOutput;
+  }
+  errno = 0;
+  char* end = nullptr;
+  const auto parsed = std::strtoull(value, &end, 10);
+  if (errno == ERANGE || end == value || *end != '\0' || parsed == 0 ||
+      parsed > static_cast<unsigned long long>(
+                   std::numeric_limits<cudf::size_type>::max())) {
+    return kDefaultMaxInputRowsPerOutput;
+  }
+  return static_cast<cudf::size_type>(parsed);
 }
 
 void CudfUnnest::doAddInput(RowVectorPtr input) {
@@ -132,8 +147,8 @@ RowVectorPtr CudfUnnest::doGetOutput() {
     auto stream = cudfInput->stream();
     auto* inputPool = input_->pool();
     const auto inputSize = static_cast<cudf::size_type>(input_->size());
-    const auto end =
-        std::min(inputSize, inputRowOffset_ + kMaxUnnestInputRowsPerOutput);
+    const auto end = inputRowOffset_ +
+        std::min(maxInputRowsPerOutput_, inputSize - inputRowOffset_);
 
     const auto inputView = cudfInput->getTableView();
     std::vector<cudf::column_view> explodeInputColumns;

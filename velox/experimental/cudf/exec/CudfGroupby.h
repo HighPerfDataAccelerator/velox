@@ -219,6 +219,11 @@ class CudfGroupby : public CudfOperatorBase {
   bool finalInputKeysSorted_{false};
   std::vector<cudf::order> finalInputColumnOrder_;
   std::vector<cudf::null_order> finalInputNullOrder_;
+  // An exact distinct-key probe can prove that a FINAL collect_list merge is
+  // an identity operation: every intermediate singleton list already is the
+  // final value for its key.  Keep this disabled unless the input/output
+  // channel layout permits a zero-copy ownership transfer after concat.
+  bool uniqueFinalCollectListPassThroughEligible_{false};
 
   std::vector<CudfVectorPtr> inputs_;
   TypePtr inputType_;
@@ -249,6 +254,9 @@ class CudfGroupby : public CudfOperatorBase {
   // merged only with a peer at the same level, preventing the previous
   // state-plus-every-batch quadratic re-aggregation pattern.
   std::vector<std::optional<FinalAggregationRun>> finalRunLevels_;
+  // Optional large-FINAL path: retain independently reduced pages and combine
+  // all of them once inside the serialized drain/finalize region.
+  std::vector<FinalAggregationRun> finalDeferredRuns_;
   uint64_t finalInputRunCount_{0};
   uint64_t finalRunMergeCount_{0};
 

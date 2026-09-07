@@ -348,6 +348,21 @@ TEST_F(CudfStringFunctionTest, concatThreeColumns) {
   assertQuery(plan, "SELECT concat(c0, c1, c2) AS result FROM tmp");
 }
 
+TEST_F(CudfStringFunctionTest, concatLiteralSeparator) {
+  auto input = makeRowVector(
+      {makeNullableFlatVector<std::string>({"left", std::nullopt, ""}),
+       makeNullableFlatVector<int32_t>({7, -12, std::nullopt})});
+  createDuckDbTable({input});
+
+  auto plan = PlanBuilder()
+                  .values({input})
+                  .project({"concat(c0, ':', cast(c1 as varchar)) AS result"})
+                  .planNode();
+
+  assertQuery(
+      plan, "SELECT concat(c0, ':', cast(c1 as varchar)) AS result FROM tmp");
+}
+
 TEST_F(CudfStringFunctionTest, concatColumnAndLiteral) {
   auto input = makeRowVector({makeFlatVector<std::string>({"hello", "world"})});
   createDuckDbTable({input});

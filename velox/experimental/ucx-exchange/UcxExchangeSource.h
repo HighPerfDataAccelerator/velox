@@ -36,16 +36,28 @@
 #include <rmm/mr/cuda_memory_resource.hpp>
 #include <rmm/mr/pool_memory_resource.hpp>
 
+#include <chrono>
+
 namespace facebook::velox::ucx_exchange {
 
 struct UcxExchangeMetrics {
   UcxExchangeMetrics()
       : numPackedColumns_(RuntimeMetric(RuntimeCounter::Unit::kNone)),
         totalBytes_(RuntimeCounter::Unit::kBytes),
-        rttPerRequest_(RuntimeMetric(RuntimeCounter::Unit::kNanos)) {}
+        rttPerRequest_(RuntimeCounter::Unit::kNanos),
+        metadataWaitNanos_(RuntimeCounter::Unit::kNanos),
+        receiveAllocationNanos_(RuntimeCounter::Unit::kNanos),
+        dataWaitNanos_(RuntimeCounter::Unit::kNanos),
+        metadataCallbackNanos_(RuntimeCounter::Unit::kNanos),
+        dataCallbackNanos_(RuntimeCounter::Unit::kNanos) {}
   RuntimeMetric numPackedColumns_; // total number of packed columns received.
   RuntimeMetric totalBytes_; // total number of bytes received
   RuntimeMetric rttPerRequest_;
+  RuntimeMetric metadataWaitNanos_;
+  RuntimeMetric receiveAllocationNanos_;
+  RuntimeMetric dataWaitNanos_;
+  RuntimeMetric metadataCallbackNanos_;
+  RuntimeMetric dataCallbackNanos_;
 };
 
 /// The UcxExchangeSource is the client that communicates with the remote
@@ -335,6 +347,11 @@ class UcxExchangeSource
 
   // Some metrics/counters:
   UcxExchangeMetrics metrics_;
+
+  using Clock = std::chrono::steady_clock;
+  Clock::time_point requestStart_{};
+  Clock::time_point metadataStart_{};
+  Clock::time_point dataStart_{};
 
   // The outstanding request - there can only be one outstanding request
   // at any point in time. Used for handshake, metadata and data.

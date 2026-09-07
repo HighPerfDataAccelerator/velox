@@ -32,9 +32,38 @@
 #include "velox/functions/prestosql/window/WindowFunctionsRegistration.h"
 #include "velox/functions/sparksql/window/WindowFunctionsRegistration.h"
 
+#include <cstdlib>
+#include <optional>
+
 using namespace facebook::velox;
 using namespace facebook::velox::exec;
 using namespace facebook::velox::exec::test;
+
+namespace {
+
+class ScopedEnvVar {
+ public:
+  ScopedEnvVar(const char* name, const char* value) : name_(name) {
+    if (const auto* oldValue = std::getenv(name)) {
+      oldValue_ = oldValue;
+    }
+    setenv(name, value, 1);
+  }
+
+  ~ScopedEnvVar() {
+    if (oldValue_) {
+      setenv(name_.c_str(), oldValue_->c_str(), 1);
+    } else {
+      unsetenv(name_.c_str());
+    }
+  }
+
+ private:
+  std::string name_;
+  std::optional<std::string> oldValue_;
+};
+
+} // namespace
 
 class AdapterOperatorTest : public OperatorTestBase {
  protected:
@@ -71,6 +100,18 @@ class AdapterOperatorTest : public OperatorTestBase {
     for (const auto& pipelineStats : stats.pipelineStats) {
       for (const auto& operatorStats : pipelineStats.operatorStats) {
         if (operatorStats.operatorType == "CudfUnnest") {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  bool wasCudfBatchConcatUsed(const std::shared_ptr<exec::Task>& task) {
+    auto stats = task->taskStats();
+    for (const auto& pipelineStats : stats.pipelineStats) {
+      for (const auto& operatorStats : pipelineStats.operatorStats) {
+        if (operatorStats.operatorType == "CudfBatchConcat") {
           return true;
         }
       }
@@ -121,6 +162,37 @@ TEST_F(AdapterOperatorTest, singleArrayUnnestUsesCudf) {
   });
 
   facebook::velox::test::assertEqualVectors(expected, result);
+  EXPECT_TRUE(wasCudfUnnestUsed(task));
+}
+
+TEST_F(AdapterOperatorTest, configuredPreUnnestConcatUsesCudf) {
+  ScopedEnvVar concatBytes("GLUTEN_CUDF_PRE_UNNEST_CONCAT_BYTES", "67108864");
+  auto first = makeRowVector({
+      makeFlatVector<int64_t>({10, 20}),
+      makeArrayVector<int32_t>(
+          2,
+          [](auto row) { return row + 1; },
+          [](auto row, auto index) { return row * 10 + index; }),
+  });
+  auto second = makeRowVector({
+      makeFlatVector<int64_t>({30}),
+      makeArrayVector<int32_t>(
+          1,
+          [](auto) { return 3; },
+          [](auto, auto index) { return 20 + index; }),
+  });
+  auto plan =
+      PlanBuilder().values({first, second}).unnest({"c0"}, {"c1"}).planNode();
+
+  std::shared_ptr<exec::Task> task;
+  auto result = AssertQueryBuilder(plan).copyResults(pool(), task);
+  auto expected = makeRowVector({
+      makeFlatVector<int64_t>({10, 20, 20, 30, 30, 30}),
+      makeFlatVector<int32_t>({0, 10, 11, 20, 21, 22}),
+  });
+
+  facebook::velox::test::assertEqualVectors(expected, result);
+  EXPECT_TRUE(wasCudfBatchConcatUsed(task));
   EXPECT_TRUE(wasCudfUnnestUsed(task));
 }
 

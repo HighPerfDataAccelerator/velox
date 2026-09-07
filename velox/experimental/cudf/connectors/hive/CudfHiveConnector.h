@@ -43,6 +43,12 @@ class CudfHiveConnector final
       const ColumnHandleMap& columnHandles,
       ConnectorQueryCtx* connectorQueryCtx) override final;
 
+  std::unique_ptr<DataSink> createDataSink(
+      RowTypePtr inputType,
+      ConnectorInsertTableHandlePtr connectorInsertTableHandle,
+      ConnectorQueryCtx* connectorQueryCtx,
+      CommitStrategy commitStrategy) override final;
+
   bool canAddDynamicFilter() const override {
     return false;
   }
@@ -50,8 +56,6 @@ class CudfHiveConnector final
   bool supportsSplitPreload() const override {
     return true;
   }
-
-  // TODO (dm): Re-add data sink
 
  protected:
   // TODO (dm): rename parquetconfig

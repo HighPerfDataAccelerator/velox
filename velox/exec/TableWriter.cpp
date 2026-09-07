@@ -148,22 +148,39 @@ void TableWriter::addInput(RowVectorPtr input) {
     return;
   }
 
-  std::vector<VectorPtr> mappedChildren;
-  mappedChildren.reserve(inputMapping_.size());
-  for (const auto i : inputMapping_) {
-    mappedChildren.emplace_back(input->childAt(i));
+  RowVectorPtr mappedInput;
+  if (input->childrenSize() == 0) {
+    // Device-resident row vectors (for example CudfVector) intentionally do
+    // not expose Velox child vectors. Preserve the opaque vector when the
+    // TableWrite mapping is identity; the connector data sink understands the
+    // device representation and can consume it without a device-to-host
+    // materialization.
+    VELOX_CHECK_EQ(inputMapping_.size(), input->type()->size());
+    for (column_index_t i = 0; i < inputMapping_.size(); ++i) {
+      VELOX_CHECK_EQ(inputMapping_[i], i);
+    }
+    VELOX_CHECK_NULL(
+        statsCollector_,
+        "Column statistics are not supported for opaque row vectors");
+    mappedInput = std::move(input);
+  } else {
+    std::vector<VectorPtr> mappedChildren;
+    mappedChildren.reserve(inputMapping_.size());
+    for (const auto i : inputMapping_) {
+      mappedChildren.emplace_back(input->childAt(i));
+    }
+
+    mappedInput = std::make_shared<RowVector>(
+        input->pool(),
+        mappedInputType_,
+        input->nulls(),
+        input->size(),
+        mappedChildren,
+        input->getNullCount());
   }
 
-  const auto mappedInput = std::make_shared<RowVector>(
-      input->pool(),
-      mappedInputType_,
-      input->nulls(),
-      input->size(),
-      mappedChildren,
-      input->getNullCount());
-
   dataSink_->appendData(mappedInput);
-  numWrittenRows_ += input->size();
+  numWrittenRows_ += mappedInput->size();
   updateStats(dataSink_->stats());
 
   if (statsCollector_ != nullptr) {

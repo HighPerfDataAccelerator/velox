@@ -21,6 +21,7 @@
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluatorRegistry.h"
 #include "velox/experimental/cudf/expression/NullMask.h"
+#include "velox/experimental/cudf/expression/StringExpressionKernels.h"
 
 #include "velox/common/base/Exceptions.h"
 #include "velox/common/memory/Memory.h"
@@ -225,6 +226,37 @@ VectorPtr toConstantVector(
   VELOX_CHECK(expr->isConstantKind());
   const auto* c = expr->asUnchecked<core::ConstantTypedExpr>();
   return c->hasValueVector() ? c->valueVector() : c->toConstantVector(pool);
+}
+
+std::unique_ptr<cudf::column> makeRepeatedComplexConstantColumn(
+    const VectorPtr& valueVector,
+    cudf::size_type size,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) {
+  // Convert the single Velox complex value once, then repeat it on GPU to
+  // produce a normal column with the current input batch's row count.
+  auto literal =
+      BaseVector::create(valueVector->type(), 1, valueVector->pool());
+  SelectivityVector singleRow(1);
+  std::vector<vector_size_t> sourceRows(1, 0);
+  literal->copy(valueVector.get(), singleRow, sourceRows.data());
+
+  auto rowVector = std::make_shared<RowVector>(
+      valueVector->pool(),
+      ROW({"literal"}, {valueVector->type()}),
+      BufferPtr(nullptr),
+      1,
+      std::vector<VectorPtr>{literal});
+  auto table =
+      with_arrow::toCudfTable(rowVector, valueVector->pool(), stream, mr);
+  auto columns = table->release();
+  VELOX_CHECK_EQ(columns.size(), 1);
+
+  auto repeated =
+      cudf::repeat(cudf::table_view{{columns[0]->view()}}, size, stream, mr);
+  auto repeatedColumns = repeated->release();
+  VELOX_CHECK_EQ(repeatedColumns.size(), 1);
+  return std::move(repeatedColumns[0]);
 }
 
 std::string constantToString(
@@ -529,6 +561,28 @@ bool isNumericToVarcharCast(
       (isIntegralNonDecimalType(sourceType) || isFloatingPointType(sourceType));
 }
 
+bool isStringLiteralIntegralCastConcat(const core::TypedExprPtr& expr) {
+  if (!expr->isCallKind()) {
+    return false;
+  }
+  const auto& name = expr->asUnchecked<core::CallTypedExpr>()->name();
+  const auto expectedName =
+      CudfConfig::getInstance().functionNamePrefix + "concat";
+  if ((name != "concat" && name != expectedName) ||
+      expr->inputs().size() != 3 ||
+      expr->inputs()[0]->type()->kind() != TypeKind::VARCHAR ||
+      !expr->inputs()[1]->isConstantKind() ||
+      expr->inputs()[1]->type()->kind() != TypeKind::VARCHAR ||
+      expr->inputs()[1]->asUnchecked<core::ConstantTypedExpr>()->isNull() ||
+      !expr->inputs()[2]->isCastKind() ||
+      expr->inputs()[2]->type()->kind() != TypeKind::VARCHAR) {
+    return false;
+  }
+  const auto& castInputs = expr->inputs()[2]->inputs();
+  return castInputs.size() == 1 &&
+      isIntegralNonDecimalType(castInputs.front()->type());
+}
+
 class CastFunction : public CudfFunction {
  public:
   enum class CastMode {
@@ -593,11 +647,22 @@ class CastFunction : public CudfFunction {
 
 class CardinalityFunction : public CudfFunction {
  public:
-  CardinalityFunction(const core::TypedExprPtr& expr) {
-    // Cardinality doesn't need any pre-computed scalars, just validates input
-    // count
-    VELOX_CHECK_EQ(
-        expr->inputs().size(), 1, "cardinality expects exactly 1 input");
+  CardinalityFunction(
+      const core::TypedExprPtr& expr,
+      memory::MemoryPool* pool) {
+    // Spark size(array, legacySizeOfNull) carries a constant compatibility
+    // flag as its second argument. Cardinality itself has one argument.
+    VELOX_CHECK(
+        expr->inputs().size() == 1 || expr->inputs().size() == 2,
+        "cardinality/size expects 1 or 2 inputs");
+    if (expr->inputs().size() == 2) {
+      VELOX_CHECK(
+          expr->inputs()[1]->isConstantKind(),
+          "size legacySizeOfNull must be constant");
+      legacySizeOfNull_ = toConstantVector(expr->inputs()[1], pool)
+                              ->as<SimpleVector<bool>>()
+                              ->valueAt(0);
+    }
   }
 
   ColumnOrView eval(
@@ -605,8 +670,16 @@ class CardinalityFunction : public CudfFunction {
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr) const override {
     auto inputCol = asView(inputColumns[0]);
-    return cudf::lists::count_elements(inputCol, stream, mr);
+    auto counts = cudf::lists::count_elements(inputCol, stream, mr);
+    if (!legacySizeOfNull_ || !counts->has_nulls()) {
+      return counts;
+    }
+    cudf::numeric_scalar<int32_t> minusOne(-1, true, stream, mr);
+    return cudf::replace_nulls(counts->view(), minusOne, stream, mr);
   }
+
+ private:
+  bool legacySizeOfNull_{false};
 };
 
 class IsNullFunction : public CudfFunction {
@@ -2101,6 +2174,7 @@ class ConcatFunction : public CudfFunction {
         inputIndexToLiteral_[i] = constantToString(expr->inputs()[i], pool);
       }
     }
+    fusedIntegralCastSuffix_ = isStringLiteralIntegralCastConcat(expr);
   }
 
   ColumnOrView eval(
@@ -2118,6 +2192,38 @@ class ConcatFunction : public CudfFunction {
     // literals, and the output size will be 1.
     const size_t outputSize =
         inputColumns.empty() ? 1u : asView(inputColumns[0]).size();
+
+    if (fusedIntegralCastSuffix_) {
+      VELOX_CHECK_EQ(inputColumns.size(), 2);
+      return concatStringLiteralIntegral(
+          asView(inputColumns[0]),
+          inputIndexToLiteral_.at(1),
+          asView(inputColumns[1]),
+          stream,
+          mr);
+    }
+
+    // concat(column, <literal>, column) is a very common delimiter pattern.
+    // Passing the literal as cuDF's scalar row separator avoids materializing
+    // a full strings column containing the same delimiter for every row.  A
+    // valid empty-string null replacement and separate_nulls=YES preserve the
+    // existing Spark concat semantics used by the general path below.
+    if (numInputs_ == 3 && inputIndexToLiteral_.size() == 1 &&
+        inputIndexToLiteral_.contains(1)) {
+      VELOX_CHECK_EQ(inputColumns.size(), 2);
+      std::vector<cudf::column_view> columnViews{
+          asView(inputColumns[0]), asView(inputColumns[1])};
+      cudf::string_scalar separator(
+          inputIndexToLiteral_.at(1), true, stream, mr);
+      cudf::string_scalar emptyString("", true, stream, mr);
+      return cudf::strings::concatenate(
+          cudf::table_view(columnViews),
+          separator,
+          emptyString,
+          cudf::strings::separator_on_nulls::YES,
+          stream,
+          mr);
+    }
 
     // Iterate the inputs, building a vector of column views, either a literal
     // from the map, or the next input column. We also keep a vector of the
@@ -2157,6 +2263,7 @@ class ConcatFunction : public CudfFunction {
  private:
   std::map<int, std::string> inputIndexToLiteral_;
   size_t numInputs_{0};
+  bool fusedIntegralCastSuffix_{false};
 };
 
 class ArrayConstructorFunction : public CudfFunction {
@@ -2448,16 +2555,21 @@ bool registerBuiltinFunctions(const std::string& prefix) {
            .constantArgumentType("bigint")
            .build()});
 
-  registerCudfFunction(
-      prefix + "cardinality",
+  registerCudfFunctions(
+      {prefix + "cardinality", prefix + "size"},
       [](const std::string&,
          const core::TypedExprPtr& expr,
-         memory::MemoryPool*) {
-        return std::make_shared<CardinalityFunction>(expr);
+         memory::MemoryPool* pool) {
+        return std::make_shared<CardinalityFunction>(expr, pool);
       },
       {FunctionSignatureBuilder()
            .returnType("integer")
            .argumentType("array(any)")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("integer")
+           .argumentType("array(any)")
+           .constantArgumentType("boolean")
            .build()});
 
   // Coalesce is special form and doesn't have a prefix in its name.
@@ -3125,6 +3237,11 @@ std::shared_ptr<FunctionExpression> FunctionExpression::create(
   node->expr_ = expr;
   node->inputRowSchema_ = inputRowSchema;
 
+  if (expr->isConstantKind() && expr->type()->kind() == TypeKind::ARRAY) {
+    node->constantValue_ = toConstantVector(expr, pool);
+    return node;
+  }
+
   auto name = exprRegistryName(expr);
   node->function_ = createCudfFunction(name, expr, pool);
 
@@ -3154,7 +3271,11 @@ std::shared_ptr<FunctionExpression> FunctionExpression::create(
   }
 
   if (node->function_ || isFieldAccess || isDereference) {
-    for (const auto& input : expr->inputs()) {
+    const bool fusedIntegralCastConcat =
+        isStringLiteralIntegralCastConcat(expr);
+    for (size_t inputIndex = 0; inputIndex < expr->inputs().size();
+         ++inputIndex) {
+      const auto& input = expr->inputs()[inputIndex];
       // Constant inputs are inlined by the cuDF function, and an InputTypedExpr
       // child marks an input-column field reference whose value eval() reads
       // directly from the input columns; neither needs its own subexpression.
@@ -3163,8 +3284,11 @@ std::shared_ptr<FunctionExpression> FunctionExpression::create(
         // createCudfExpression (e.g. AST for arithmetic, Function for
         // string ops).  Field references are handled as leaf
         // FunctionExpressions.
+        const auto& subexpression = fusedIntegralCastConcat && inputIndex == 2
+            ? input->inputs().front()
+            : input;
         node->subexpressions_.push_back(createCudfExpression(
-            input,
+            subexpression,
             inputRowSchema,
             pool,
             currentCudfFunctionQueryConfig(),
@@ -3231,6 +3355,11 @@ ColumnOrView FunctionExpression::eval(
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr,
     bool finalize) {
+  if (constantValue_) {
+    return makeRepeatedComplexConstantColumn(
+        constantValue_, inputRowCount, stream, mr);
+  }
+
   // Top-level field access (or chain of field accesses on input columns) maps
   // directly to a column_view zero-copy.
   if (isInputFieldReference(expr_)) {
@@ -3296,11 +3425,16 @@ ColumnOrView FunctionExpression::eval(
 }
 
 void FunctionExpression::close() {
+  constantValue_.reset();
   function_.reset();
   subexpressions_.clear();
 }
 
 bool FunctionExpression::canEvaluate(const core::TypedExprPtr& expr) {
+  if (expr->isConstantKind()) {
+    return expr->type()->kind() == TypeKind::ARRAY;
+  }
+
   if (isInputFieldReference(expr)) {
     return true;
   }

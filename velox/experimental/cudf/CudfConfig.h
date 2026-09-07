@@ -77,6 +77,10 @@ struct CudfConfig {
       "cudf.order_by_max_output_rows"};
   static constexpr const char* kCudfExchangeConcatOptimizationEnabled{
       "cudf.exchange_concat_optimization_enabled"};
+  static constexpr const char* kCudfTableWriteConcatEnabled{
+      "cudf.table_write_concat_enabled"};
+  static constexpr const char* kCudfTableWriteConcatBytes{
+      "cudf.table_write_concat_bytes"};
   static constexpr const char* kCudfTimestampUnit{"cudf.timestamp_unit"};
   // The value could be either spark or presto.
   static constexpr const char* kCudfFunctionEngine{"cudf.function_engine"};
@@ -242,6 +246,13 @@ struct CudfConfig {
   /// This field is intentionally appended so incremental builds that reuse
   /// stable UCX objects preserve the offsets of every pre-existing field.
   bool exchangeConcatOptimizationEnabled{true};
+
+  /// Whether to coalesce device-resident input immediately before a cuDF
+  /// TableWrite. This is independent of aggregation concat and defaults off
+  /// for compatibility. The row target continues to reuse the exchange target;
+  /// cudf.table_write_concat_bytes can override only the writer byte target so
+  /// increasing Parquet encode batches does not also enlarge exchange batches.
+  bool tableWriteConcatEnabled{false};
 };
 
 } // namespace facebook::velox::cudf_velox

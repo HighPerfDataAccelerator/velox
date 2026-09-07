@@ -264,18 +264,17 @@ velox_add_cudf_test(
   LIBS velox_cudf_hive_connector velox_cudf_exec GTest::gmock
 )
 
-# Disabling writer tests until we re-add writing ability to CudfHiveConnector
-# velox_add_cudf_test(
-#   NAME velox_cudf_table_write_test
-#   SOURCES Main.cpp TableWriteTest.cpp
-#   LIBS
-#     velox_cudf_exec_test_lib
-#     velox_cudf_hive_connector
-#     velox_exec
-#     velox_exec_test_lib
-#     velox_test_util
-#     fmt::fmt
-# )
+velox_add_cudf_test(
+  NAME velox_cudf_table_write_test
+  SOURCES Main.cpp TableWriteTest.cpp
+  LIBS
+    velox_cudf_exec_test_lib
+    velox_cudf_hive_connector
+    velox_exec
+    velox_exec_test_lib
+    velox_test_util
+    fmt::fmt
+)
 
 velox_add_cudf_test(
   NAME velox_cudf_tocudf_selection_test

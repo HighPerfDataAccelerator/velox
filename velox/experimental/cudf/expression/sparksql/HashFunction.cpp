@@ -63,9 +63,16 @@ HashFunction::HashFunction(
   const auto vec = seedExpr->hasValueVector()
       ? seedExpr->valueVector()
       : seedExpr->toConstantVector(pool);
-  int32_t seedValue = vec->as<SimpleVector<int32_t>>()->valueAt(0);
-  VELOX_CHECK_GE(seedValue, 0);
-  seedValue_ = seedValue;
+  const auto functionName = expr->asUnchecked<core::CallTypedExpr>()->name();
+  xxhash64_ = functionName.find("xxhash64_with_seed") != std::string::npos;
+  if (xxhash64_) {
+    seedValue_ =
+        static_cast<uint64_t>(vec->as<SimpleVector<int64_t>>()->valueAt(0));
+  } else {
+    const auto seedValue = vec->as<SimpleVector<int32_t>>()->valueAt(0);
+    VELOX_CHECK_GE(seedValue, 0);
+    seedValue_ = static_cast<uint32_t>(seedValue);
+  }
 }
 
 ColumnOrView HashFunction::eval(
@@ -74,8 +81,11 @@ ColumnOrView HashFunction::eval(
     rmm::device_async_resource_ref mr) const {
   VELOX_CHECK(!inputColumns.empty());
   auto inputTableView = convertToTableView(inputColumns);
+  if (xxhash64_) {
+    return cudf::hashing::xxhash_64(inputTableView, seedValue_, stream, mr);
+  }
   return cudf::hashing::murmurhash3_x86_32(
-      inputTableView, seedValue_, stream, mr);
+      inputTableView, static_cast<uint32_t>(seedValue_), stream, mr);
 }
 
 } // namespace facebook::velox::cudf_velox::sparksql

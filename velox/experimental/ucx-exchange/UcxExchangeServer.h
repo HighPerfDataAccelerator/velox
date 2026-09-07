@@ -59,7 +59,10 @@ class UcxExchangeServer
   ///        determined by checking if the peer's IP is in the local IP set.
   static std::shared_ptr<UcxExchangeServer> create(
       const std::shared_ptr<Communicator> communicator,
-      std::shared_ptr<EndpointRef> endpointRef,
+      std::shared_ptr<EndpointRef> controlEndpointRef,
+      uint64_t remoteWorkerId,
+      std::string remoteDataHost,
+      uint16_t remoteDataPort,
       const PartitionKey& key,
       bool isIntraNodeTransfer);
 
@@ -81,7 +84,10 @@ class UcxExchangeServer
  private:
   explicit UcxExchangeServer(
       const std::shared_ptr<Communicator> communicator,
-      std::shared_ptr<EndpointRef> endpointRef,
+      std::shared_ptr<EndpointRef> controlEndpointRef,
+      uint64_t remoteWorkerId,
+      std::string remoteDataHost,
+      uint16_t remoteDataPort,
       const PartitionKey& key,
       bool isIntraNodeTransfer);
 
@@ -124,6 +130,18 @@ class UcxExchangeServer
   /// if peer's actual IP is in the local IP set). When true, data is passed
   /// via IntraNodeTransferRegistry instead of UCXX transfer.
   bool isIntraNodeTransfer_{false};
+
+  /// Endpoint used only for bulk metadata/data TAG sends. The inherited
+  /// endpointRef_ remains the peer-error-handled control endpoint.
+  std::shared_ptr<EndpointRef> dataEndpointRef_;
+
+  /// The peer's data listener is advertised in the AM handshake, but the bulk
+  /// endpoint is deliberately created later from process(). Creating an
+  /// endpoint inside a UCX callback re-enters worker progress and can time out
+  /// the control endpoint before its HandshakeResponse is sent.
+  const uint64_t remoteWorkerId_;
+  const std::string remoteDataHost_;
+  const uint16_t remoteDataPort_;
 
   std::atomic<ServerState> state_;
   std::shared_ptr<cudf::packed_columns> dataPtr_{nullptr};
