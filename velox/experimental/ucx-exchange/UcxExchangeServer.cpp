@@ -288,8 +288,8 @@ void UcxExchangeServer::process() {
           // second listener connection and its multi-second wire-up bubble.
           dataEndpointRef_ = endpointRef_;
           LOG(INFO) << "Reusing UCX control endpoint for bulk data: task="
-                    << partitionKey_.toString() << " peer="
-                    << endpointRef_->getPeerAddress();
+                    << partitionKey_.toString()
+                    << " peer=" << endpointRef_->getPeerAddress();
           setState(ServerState::ReadyToTransfer);
           wakeCommunicator();
           break;

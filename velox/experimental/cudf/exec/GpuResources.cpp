@@ -284,8 +284,7 @@ cuda::mr::any_resource<cuda::mr::device_accessible> createMemoryResource(
   const auto registration = beginMemoryResourceRegistration();
   const auto* cudaBinningValue =
       std::getenv("GLUTEN_CUDF_CUDA_SMALL_ALLOCATION_BINNING");
-  const bool useCudaBinning =
-      mode == "binning" ||
+  const bool useCudaBinning = mode == "binning" ||
       (mode == "cuda" && cudaBinningValue != nullptr &&
        std::string_view{cudaBinningValue} == "1");
   if (useCudaBinning) {

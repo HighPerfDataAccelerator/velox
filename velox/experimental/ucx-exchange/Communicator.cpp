@@ -40,8 +40,7 @@ namespace facebook::velox::ucx_exchange {
 namespace {
 
 bool controlPeerErrorHandlingEnabled() {
-  const char* value =
-      std::getenv("GLUTEN_UCX_CONTROL_PEER_ERROR_HANDLING");
+  const char* value = std::getenv("GLUTEN_UCX_CONTROL_PEER_ERROR_HANDLING");
   return value == nullptr || value[0] == '\0' ||
       !(value[0] == '0' && value[1] == '\0');
 }
@@ -579,9 +578,7 @@ std::shared_ptr<EndpointRef> Communicator::assocEndpointRef(
   // otherwise dominates the whole query and the coordinator already provides
   // task-level failure propagation.
   auto ep = worker_->createEndpointFromHostname(
-      hostPort.hostname,
-      hostPort.port,
-      controlPeerErrorHandlingEnabled());
+      hostPort.hostname, hostPort.port, controlPeerErrorHandlingEnabled());
   std::shared_ptr<EndpointRef> epRef = nullptr;
   if (ep != nullptr) {
     epRef = std::make_shared<EndpointRef>(
