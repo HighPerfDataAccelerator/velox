@@ -151,6 +151,7 @@ const std::unordered_map<std::string, Op> prestoBinaryOps = {
     {"and", Op::NULL_LOGICAL_AND},
     {"or", Op::NULL_LOGICAL_OR},
     {"mod", Op::MOD},
+    {"pmod", Op::PYMOD},
 };
 
 const std::unordered_map<std::string, Op> sparkBinaryOps = {

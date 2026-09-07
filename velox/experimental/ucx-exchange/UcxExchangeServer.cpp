@@ -96,6 +96,16 @@ bool intraNodeProducerPollRequeueEnabled() {
   return enabled;
 }
 
+bool reuseControlEndpointForBulk() {
+  static const bool enabled = [] {
+    const char* value =
+        std::getenv("GLUTEN_UCX_REUSE_CONTROL_ENDPOINT_FOR_BULK");
+    return value != nullptr && value[0] != '\0' &&
+        !(value[0] == '0' && value[1] == '\0');
+  }();
+  return enabled;
+}
+
 int64_t intraNodeProducerPollRequeueLimit() {
   static const int64_t limit = [] {
     const char* value =
@@ -271,6 +281,19 @@ void UcxExchangeServer::process() {
   switch (state_) {
     case ServerState::Created: {
       if (!isIntraNodeTransfer_ && !dataEndpointRef_) {
+        if (reuseControlEndpointForBulk()) {
+          // UCX endpoints are bidirectional. The accepted control endpoint is
+          // already connected to this source and can carry tagged GPU buffers
+          // as well as the small handshake response. Reusing it removes the
+          // second listener connection and its multi-second wire-up bubble.
+          dataEndpointRef_ = endpointRef_;
+          LOG(INFO) << "Reusing UCX control endpoint for bulk data: task="
+                    << partitionKey_.toString() << " peer="
+                    << endpointRef_->getPeerAddress();
+          setState(ServerState::ReadyToTransfer);
+          wakeCommunicator();
+          break;
+        }
         auto communicator = tryCommunicator();
         if (!communicator) {
           close();
@@ -412,6 +435,11 @@ void UcxExchangeServer::process() {
       break;
     case ServerState::Done:
       close();
+      // In control-endpoint reuse mode both members reference the same
+      // EndpointRef and this server was registered on it only once.
+      if (dataEndpointRef_ == endpointRef_) {
+        dataEndpointRef_.reset();
+      }
       if (endpointRef_) {
         endpointRef_->removeCommElem(getSelfPtr());
         endpointRef_ = nullptr;

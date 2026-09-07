@@ -122,7 +122,8 @@ rmm::device_async_resource_ref get_output_mr();
 /**
  * @brief Creates a memory resource based on the given mode.
  *
- * @param mode rmm::mr::pool_memory_resource mode.
+ * @param mode The RMM resource mode. "binning" caches allocations up to 4 MiB
+ * while sending larger allocations directly to the CUDA upstream resource.
  * @param percent The initial percent of GPU memory to allocate for pool or
  * arena resources, or the retained-memory release threshold for async.
  */

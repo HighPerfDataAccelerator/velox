@@ -19,6 +19,7 @@
 #include <ucxx/api.h>
 #include <ucxx/utils/ucx.h>
 #include <algorithm>
+#include <cstdlib>
 #include <iostream>
 #include "velox/common/base/Exceptions.h"
 #include "velox/experimental/cudf/CudfConfig.h"
@@ -35,6 +36,17 @@ using namespace facebook::velox::cudf_velox;
 DEFINE_bool(velox_ucx_exchange, false, "Enable Velox UCX exchange.");
 
 namespace facebook::velox::ucx_exchange {
+
+namespace {
+
+bool controlPeerErrorHandlingEnabled() {
+  const char* value =
+      std::getenv("GLUTEN_UCX_CONTROL_PEER_ERROR_HANDLING");
+  return value == nullptr || value[0] == '\0' ||
+      !(value[0] == '0' && value[1] == '\0');
+}
+
+} // namespace
 
 // static
 std::once_flag Communicator::onceFlag;
@@ -438,11 +450,15 @@ void Communicator::run() {
       while (auto comms = workQueue_.pop()) {
         comms->process();
         ++workItemsProcessed_;
-        // Progress after each work item to allow UCXX to advance
-        // its internal state (complete sends/receives, fire callbacks).
-        // Use non-blocking progress here to avoid blocking between
-        // work items -- we want to drain the queue promptly.
-        worker_->progress();
+        // Give UCX one non-blocking progress opportunity between work items.
+        // Worker::progress() drains all currently actionable UCX work (and can
+        // process deferred cancellation), which serializes endpoint wire-up:
+        // the first exchange source can spend seconds establishing its
+        // connection before the remaining peers have even submitted their
+        // handshakes.  progressOnce() preserves the deadlock-avoidance intent
+        // here while allowing the work queue to submit every peer promptly;
+        // the outer loop continues progressing all requests concurrently.
+        worker_->progressOnce();
       }
 
       if (!pendingEndpointRemoval_.empty()) {
@@ -558,11 +574,14 @@ std::shared_ptr<EndpointRef> Communicator::assocEndpointRef(
     ep->addCommElem(comms);
     return ep;
   }
-  // Socket endpoints are control-plane endpoints. Always enable peer error
-  // handling so AM reply endpoints are valid and failures are reported. Bulk
-  // exchange traffic uses getOrCreateDataEndpoint() instead.
+  // Peer error handling remains the safe default. It can be disabled for the
+  // short-lived local benchmark path, where UCX's additional endpoint wire-up
+  // otherwise dominates the whole query and the coordinator already provides
+  // task-level failure propagation.
   auto ep = worker_->createEndpointFromHostname(
-      hostPort.hostname, hostPort.port, true);
+      hostPort.hostname,
+      hostPort.port,
+      controlPeerErrorHandlingEnabled());
   std::shared_ptr<EndpointRef> epRef = nullptr;
   if (ep != nullptr) {
     epRef = std::make_shared<EndpointRef>(
@@ -708,7 +727,8 @@ void Communicator::listenerCallback(ucp_conn_request_h conn_request) {
   // shared. This guarantees that between any two nodes, there will be at most 2
   // endpoints, one per direction. For compatibility reasons, both incoming and
   // outgoing endpoints are represented using the EndpointRef.
-  auto endpoint = listener_->createEndpointFromConnRequest(conn_request, true);
+  auto endpoint = listener_->createEndpointFromConnRequest(
+      conn_request, controlPeerErrorHandlingEnabled());
   // Pass the peer's actual address to EndpointRef for diagnostics.
   auto epRef = std::make_shared<EndpointRef>(
       endpoint, std::string(ip_str), std::string(port_str));

@@ -3018,6 +3018,7 @@ bool registerBuiltinFunctions(const std::string& prefix) {
   registerBinaryOp({prefix + "multiply"}, cudf::binary_operator::MUL);
   registerBinaryOp({prefix + "divide"}, cudf::binary_operator::DIV);
   registerBinaryOp({prefix + "mod"}, cudf::binary_operator::MOD);
+  registerBinaryOp({prefix + "pmod"}, cudf::binary_operator::PYMOD);
 
   //
   // regular comparison operators

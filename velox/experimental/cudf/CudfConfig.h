@@ -125,7 +125,9 @@ struct CudfConfig {
   bool allowCpuFallback{true};
 
   /// Memory resource for cuDF.
-  /// Possible values are (cuda, pool, async, arena, managed, managed_pool).
+  /// Possible values include cuda, binning, pool, async, arena, managed, and
+  /// managed_pool. "binning" caches allocations up to 4 MiB and lets larger
+  /// allocations fall through to cuda_memory_resource.
   std::string memoryResource{"async"};
 
   /// The initial percent of GPU memory to allocate for pool or arena memory
