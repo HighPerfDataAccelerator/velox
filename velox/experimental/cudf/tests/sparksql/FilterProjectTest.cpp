@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-#include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/CudfFilterProject.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/expression/SparkFunctions.h"
@@ -187,6 +186,77 @@ TEST_F(CudfFilterProjectTest, sparkExpressionParity) {
     SCOPED_TRACE(expression);
     assertExpressionMatchesCpu(expression, input, input->rowType());
   }
+}
+
+TEST_F(CudfFilterProjectTest, trim) {
+  auto input = makeRowVector({makeNullableFlatVector<std::string>(
+      {" leading",
+       "trailing ",
+       " both ",
+       "plain",
+       "",
+       "   ",
+       std::nullopt,
+       "\t tab \t "})});
+
+  auto plan = PlanBuilder()
+                  .setParseOptions(options_)
+                  .values({input})
+                  .project({"trim(c0) AS result"})
+                  .planNode();
+  auto expected = makeRowVector({makeNullableFlatVector<std::string>(
+      {"leading",
+       "trailing",
+       "both",
+       "plain",
+       "",
+       "",
+       std::nullopt,
+       "\t tab \t"})});
+  AssertQueryBuilder(plan).assertResults(expected);
+}
+
+TEST_F(CudfFilterProjectTest, trimNestedSplitGetUsesCudfFilterProject) {
+  auto input = makeRowVector({makeNullableFlatVector<std::string>(
+      {"sku_  prepaid  ",
+       "sku_postpaid ",
+       "sku_   ",
+       "sku_plain",
+       "missing",
+       std::nullopt,
+       "sku_\tkept\t ",
+       "sku__third"})});
+  const std::string expression = "trim(get(split(c0, '_', -1), 1))";
+
+  auto plan = PlanBuilder()
+                  .setParseOptions(options_)
+                  .values({input})
+                  .project({expression + " AS result"})
+                  .planNode();
+  auto expected = makeRowVector({makeNullableFlatVector<std::string>(
+      {"prepaid",
+       "postpaid",
+       "",
+       "plain",
+       std::nullopt,
+       std::nullopt,
+       "\tkept\t",
+       ""})});
+
+  std::shared_ptr<exec::Task> task;
+  auto result = AssertQueryBuilder(plan).copyResults(pool(), task);
+  facebook::velox::test::assertEqualVectors(expected, result);
+
+  bool usedCudfFilterProject = false;
+  bool usedCpuFilterProject = false;
+  for (const auto& pipeline : task->taskStats().pipelineStats) {
+    for (const auto& op : pipeline.operatorStats) {
+      usedCudfFilterProject |= op.operatorType == "CudfFilterProject";
+      usedCpuFilterProject |= op.operatorType == "FilterProject";
+    }
+  }
+  EXPECT_TRUE(usedCudfFilterProject);
+  EXPECT_FALSE(usedCpuFilterProject);
 }
 
 TEST_F(CudfFilterProjectTest, multiBranchSwitchWithRegexpExtract) {
