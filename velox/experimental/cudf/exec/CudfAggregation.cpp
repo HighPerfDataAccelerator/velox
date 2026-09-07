@@ -503,11 +503,23 @@ bool canBeEvaluatedByCudf(
 core::TypedExprPtr expandFieldReference(
     const core::TypedExprPtr& expr,
     const core::PlanNode* sourceNode) {
-  if (!sourceNode) {
-    return expr;
+  // If this is a field reference and we have a source projection, expand it
+  if (expr->kind() == core::ExprKind::kFieldAccess && sourceNode) {
+    if (auto projectNode = dynamic_cast<const core::ProjectNode*>(sourceNode)) {
+      auto fieldExpr =
+          std::dynamic_pointer_cast<const core::FieldAccessTypedExpr>(expr);
+      if (fieldExpr) {
+        const auto& projections = projectNode->projections();
+        const auto& names = projectNode->names();
+        for (size_t i = 0; i < names.size(); ++i) {
+          if (names[i] == fieldExpr->name()) {
+            return projections[i];
+          }
+        }
+      }
+    }
   }
-  return normalizeProjectInputReferences(
-      expr, sourceNode, asRowType(sourceNode->outputType()));
+  return expr;
 }
 
 bool canGroupingKeysBeEvaluatedByCudf(
