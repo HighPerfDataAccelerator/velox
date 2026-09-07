@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-#include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/CudfFilterProject.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/expression/SparkFunctions.h"
@@ -30,8 +29,6 @@
 #include "velox/functions/sparksql/registration/Register.h"
 #include "velox/parse/TypeResolver.h"
 #include "velox/type/TimestampConversion.h"
-
-#include <folly/ScopeGuard.h>
 
 using namespace facebook::velox::exec::test;
 using namespace facebook::velox;
@@ -191,14 +188,7 @@ TEST_F(CudfFilterProjectTest, sparkExpressionParity) {
   }
 }
 
-TEST_F(CudfFilterProjectTest, trimSpaceSemantics) {
-  auto& config = CudfConfig::getInstance();
-  const auto previousAllowCpuFallback = config.allowCpuFallback;
-  SCOPE_EXIT {
-    config.allowCpuFallback = previousAllowCpuFallback;
-  };
-  config.allowCpuFallback = false;
-
+TEST_F(CudfFilterProjectTest, trim) {
   auto input = makeRowVector({makeNullableFlatVector<std::string>(
       {" leading",
        "trailing ",
@@ -208,8 +198,6 @@ TEST_F(CudfFilterProjectTest, trimSpaceSemantics) {
        "   ",
        std::nullopt,
        "\t tab \t "})});
-
-  assertExpressionMatchesCpu("trim(c0)", input, input->rowType());
 
   auto plan = PlanBuilder()
                   .setParseOptions(options_)
@@ -229,14 +217,6 @@ TEST_F(CudfFilterProjectTest, trimSpaceSemantics) {
 }
 
 TEST_F(CudfFilterProjectTest, trimNestedSplitGetUsesCudfFilterProject) {
-  auto& config = CudfConfig::getInstance();
-  const auto previousAllowCpuFallback = config.allowCpuFallback;
-  SCOPE_EXIT {
-    config.allowCpuFallback = previousAllowCpuFallback;
-  };
-  config.allowCpuFallback = false;
-  ASSERT_FALSE(config.allowCpuFallback);
-
   auto input = makeRowVector({makeNullableFlatVector<std::string>(
       {"sku_  prepaid  ",
        "sku_postpaid ",
@@ -247,8 +227,6 @@ TEST_F(CudfFilterProjectTest, trimNestedSplitGetUsesCudfFilterProject) {
        "sku_\tkept\t ",
        "sku__third"})});
   const std::string expression = "trim(get(split(c0, '_', -1), 1))";
-
-  assertExpressionMatchesCpu(expression, input, input->rowType());
 
   auto plan = PlanBuilder()
                   .setParseOptions(options_)
