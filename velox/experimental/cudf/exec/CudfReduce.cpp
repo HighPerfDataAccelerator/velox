@@ -25,19 +25,32 @@
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
 
+#include "velox/common/base/BloomFilter.h"
+#include "velox/core/Expressions.h"
+#include "velox/core/QueryConfig.h"
 #include "velox/exec/Aggregate.h"
 #include "velox/exec/AggregateFunctionRegistry.h"
 #include "velox/exec/Task.h"
 #include "velox/expression/Expr.h"
+#include "velox/functions/sparksql/SparkQueryConfig.h"
 #include "velox/type/Type.h"
+#include "velox/vector/SimpleVector.h"
 
 #include <cudf/binaryop.hpp>
 #include <cudf/column/column_factories.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/reduction/approx_distinct_count.hpp>
+#include <cudf/scalar/scalar.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/unary.hpp>
+#include <cudf/utilities/bit.hpp>
 #include <cudf/utilities/error.hpp>
+
+#include <folly/hash/Hash.h>
+
+#include <algorithm>
+#include <string>
 
 namespace {
 
@@ -721,8 +734,299 @@ struct ApproxDistinctAggregator : ReduceAggregator {
   std::int32_t precision_;
 };
 
+int64_t constantInt64Value(const core::TypedExprPtr& expr) {
+  VELOX_CHECK(
+      expr->isConstantKind(), "bloom_filter_agg extra arg must be constant");
+  const auto* constant = expr->asUnchecked<core::ConstantTypedExpr>();
+  VELOX_USER_CHECK(
+      !constant->isNull(), "bloom_filter_agg extra argument cannot be null");
+
+  auto readFromVector = [](const VectorPtr& vec) -> int64_t {
+    switch (vec->typeKind()) {
+      case TypeKind::TINYINT:
+        return vec->as<SimpleVector<int8_t>>()->valueAt(0);
+      case TypeKind::SMALLINT:
+        return vec->as<SimpleVector<int16_t>>()->valueAt(0);
+      case TypeKind::INTEGER:
+        return vec->as<SimpleVector<int32_t>>()->valueAt(0);
+      case TypeKind::BIGINT:
+        return vec->as<SimpleVector<int64_t>>()->valueAt(0);
+      default:
+        VELOX_FAIL(
+            "bloom_filter_agg extra argument must be integer, got {}",
+            vec->type()->toString());
+    }
+  };
+
+  if (constant->hasValueVector()) {
+    return readFromVector(constant->valueVector());
+  }
+  switch (constant->type()->kind()) {
+    case TypeKind::TINYINT:
+      return constant->value().value<int8_t>();
+    case TypeKind::SMALLINT:
+      return constant->value().value<int16_t>();
+    case TypeKind::INTEGER:
+      return constant->value().value<int32_t>();
+    case TypeKind::BIGINT:
+      return constant->value().value<int64_t>();
+    default:
+      VELOX_FAIL(
+          "bloom_filter_agg extra argument must be integer, got {}",
+          constant->type()->toString());
+  }
+}
+
+std::unique_ptr<cudf::column> makeHostBytesStringColumn(
+    const std::string& data,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) {
+  const auto size = static_cast<cudf::size_type>(data.size());
+  cudf::size_type offsets[2] = {0, size};
+  rmm::device_buffer offsetsDevice{2 * sizeof(cudf::size_type), stream, mr};
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+      offsetsDevice.data(),
+      offsets,
+      2 * sizeof(cudf::size_type),
+      cudaMemcpyHostToDevice,
+      stream.value()));
+
+  rmm::device_buffer chars{data.size(), stream, mr};
+  if (!data.empty()) {
+    CUDF_CUDA_TRY(cudaMemcpyAsync(
+        chars.data(),
+        data.data(),
+        data.size(),
+        cudaMemcpyHostToDevice,
+        stream.value()));
+  }
+  stream.synchronize();
+
+  auto offsetsColumn = std::make_unique<cudf::column>(
+      cudf::data_type{cudf::type_id::INT32},
+      2,
+      std::move(offsetsDevice),
+      rmm::device_buffer{},
+      0);
+  return cudf::make_strings_column(
+      1, std::move(offsetsColumn), std::move(chars), 0, rmm::device_buffer{});
+}
+
+std::unique_ptr<cudf::column> makeSerializedBloomColumn(
+    const BloomFilter<>& bloom,
+    bool initialized,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) {
+  if (!initialized) {
+    cudf::string_scalar nullScalar("", false, stream, mr);
+    return cudf::make_column_from_scalar(nullScalar, 1, stream, mr);
+  }
+  std::string data;
+  data.resize(bloom.serializedSize());
+  bloom.serialize(data.data());
+  return makeHostBytesStringColumn(data, stream, mr);
+}
+
+struct BloomFilterAggAggregator : ReduceAggregator {
+  BloomFilterAggAggregator(
+      core::AggregationNode::Step step,
+      uint32_t inputIndex,
+      VectorPtr constant,
+      const TypePtr& resultType,
+      std::vector<core::TypedExprPtr> extraInputs,
+      const core::QueryConfig* queryConfig)
+      : ReduceAggregator(step, inputIndex, std::move(constant), resultType),
+        extraInputs_(std::move(extraInputs)) {
+    initCapacity(queryConfig);
+  }
+
+  std::unique_ptr<cudf::column> doReduce(
+      cudf::table_view const& input,
+      TypePtr const& /* outputType */,
+      vector_size_t inputRowCount,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) override {
+    if (exec::isRawInput(step)) {
+      return reduceRaw(input, inputRowCount, stream, mr);
+    }
+    return reduceMerge(input, stream, mr);
+  }
+
+ private:
+  void initCapacity(const core::QueryConfig* queryConfig) {
+    int64_t defaultExpectedNumItems = 1'000'000;
+    int64_t defaultNumBits = 8'388'608;
+    int64_t maxNumBits = 67'108'864;
+    int64_t maxNumItems = 4'000'000;
+    if (queryConfig != nullptr) {
+      functions::sparksql::SparkQueryConfig spark{*queryConfig};
+      defaultExpectedNumItems = spark.bloomFilterExpectedNumItems();
+      defaultNumBits = spark.bloomFilterNumBits();
+      maxNumBits = spark.bloomFilterMaxNumBits();
+      maxNumItems = spark.bloomFilterMaxNumItems();
+    }
+
+    int64_t estimatedNumItems;
+    int64_t numBits;
+    if (extraInputs_.size() >= 2) {
+      estimatedNumItems = constantInt64Value(extraInputs_[0]);
+      numBits = constantInt64Value(extraInputs_[1]);
+    } else if (extraInputs_.size() == 1) {
+      estimatedNumItems = constantInt64Value(extraInputs_[0]);
+      numBits = BloomFilter<>::optimalNumOfBits(estimatedNumItems, maxNumItems);
+    } else {
+      estimatedNumItems = defaultExpectedNumItems;
+      numBits = defaultNumBits;
+    }
+    VELOX_USER_CHECK_GT(
+        estimatedNumItems, 0, "estimatedNumItems must be positive");
+    VELOX_USER_CHECK_GT(numBits, 0, "numBits must be positive");
+    capacity_ = static_cast<int32_t>(std::min(numBits, maxNumBits) / 16);
+  }
+
+  std::unique_ptr<cudf::column> reduceRaw(
+      cudf::table_view const& input,
+      vector_size_t inputRowCount,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) {
+    BloomFilter<> bloom;
+    bool initialized = false;
+
+    auto insertValue = [&](int64_t value) {
+      if (!initialized) {
+        bloom.reset(capacity_);
+        initialized = true;
+      }
+      bloom.insert(folly::hasher<int64_t>()(value));
+    };
+
+    if (constant != nullptr) {
+      VELOX_USER_CHECK(
+          !constant->isNullAt(0),
+          "First argument of bloom_filter_agg cannot be null");
+      VELOX_CHECK_EQ(constant->typeKind(), TypeKind::BIGINT);
+      if (inputRowCount > 0) {
+        insertValue(constant->as<SimpleVector<int64_t>>()->valueAt(0));
+      }
+      return makeSerializedBloomColumn(bloom, initialized, stream, mr);
+    }
+
+    VELOX_CHECK_GT(input.num_columns(), inputIndex);
+    auto inputCol = input.column(inputIndex);
+    const auto numRows = inputCol.size();
+    if (numRows == 0) {
+      return makeSerializedBloomColumn(bloom, false, stream, mr);
+    }
+
+    VELOX_CHECK(
+        inputCol.type().id() == cudf::type_id::INT64 ||
+            inputCol.type().id() == cudf::type_id::UINT64,
+        "bloom_filter_agg raw input must be BIGINT");
+
+    std::vector<int64_t> hostValues(static_cast<size_t>(numRows));
+    CUDF_CUDA_TRY(cudaMemcpyAsync(
+        hostValues.data(),
+        inputCol.data<int64_t>(),
+        static_cast<size_t>(numRows) * sizeof(int64_t),
+        cudaMemcpyDeviceToHost,
+        stream.value()));
+
+    std::vector<cudf::bitmask_type> hostNulls;
+    if (inputCol.nullable() && inputCol.null_mask() != nullptr) {
+      const auto bytes = cudf::bitmask_allocation_size_bytes(numRows);
+      hostNulls.resize(bytes / sizeof(cudf::bitmask_type));
+      CUDF_CUDA_TRY(cudaMemcpyAsync(
+          hostNulls.data(),
+          inputCol.null_mask(),
+          bytes,
+          cudaMemcpyDeviceToHost,
+          stream.value()));
+    }
+    stream.synchronize();
+
+    for (cudf::size_type i = 0; i < numRows; ++i) {
+      if (!hostNulls.empty() && !cudf::bit_is_set(hostNulls.data(), i)) {
+        VELOX_USER_FAIL("First argument of bloom_filter_agg cannot be null");
+      }
+      insertValue(hostValues[static_cast<size_t>(i)]);
+    }
+    return makeSerializedBloomColumn(bloom, initialized, stream, mr);
+  }
+
+  std::unique_ptr<cudf::column> reduceMerge(
+      cudf::table_view const& input,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) {
+    VELOX_CHECK_GT(input.num_columns(), inputIndex);
+    auto sketchColumn = input.column(inputIndex);
+    BloomFilter<> bloom;
+    bool initialized = false;
+    if (sketchColumn.size() == 0) {
+      return makeSerializedBloomColumn(bloom, false, stream, mr);
+    }
+
+    auto stringsCol = cudf::strings_column_view(sketchColumn);
+    auto offsetsCol = stringsCol.offsets();
+    auto charsPtr = stringsCol.chars_begin(stream);
+    const auto numOffsets = sketchColumn.size() + 1;
+    std::vector<cudf::size_type> hostOffsets(static_cast<size_t>(numOffsets));
+    CUDF_CUDA_TRY(cudaMemcpyAsync(
+        hostOffsets.data(),
+        offsetsCol.begin<cudf::size_type>(),
+        static_cast<size_t>(numOffsets) * sizeof(cudf::size_type),
+        cudaMemcpyDeviceToHost,
+        stream.value()));
+
+    std::vector<cudf::bitmask_type> hostNulls;
+    if (sketchColumn.nullable() && sketchColumn.null_mask() != nullptr) {
+      const auto bytes =
+          cudf::bitmask_allocation_size_bytes(sketchColumn.size());
+      hostNulls.resize(bytes / sizeof(cudf::bitmask_type));
+      CUDF_CUDA_TRY(cudaMemcpyAsync(
+          hostNulls.data(),
+          sketchColumn.null_mask(),
+          bytes,
+          cudaMemcpyDeviceToHost,
+          stream.value()));
+    }
+    stream.synchronize();
+
+    const auto charsSize =
+        static_cast<size_t>(hostOffsets.back() - hostOffsets.front());
+    std::vector<char> hostChars(charsSize);
+    if (charsSize > 0) {
+      CUDF_CUDA_TRY(cudaMemcpyAsync(
+          hostChars.data(),
+          charsPtr + hostOffsets.front(),
+          charsSize,
+          cudaMemcpyDeviceToHost,
+          stream.value()));
+      stream.synchronize();
+    }
+
+    const auto base = hostOffsets.front();
+    for (cudf::size_type i = 0; i < sketchColumn.size(); ++i) {
+      if (!hostNulls.empty() && !cudf::bit_is_set(hostNulls.data(), i)) {
+        continue;
+      }
+      const auto start = hostOffsets[static_cast<size_t>(i)] - base;
+      const auto end = hostOffsets[static_cast<size_t>(i) + 1] - base;
+      if (end <= start) {
+        continue;
+      }
+      bloom.merge(hostChars.data() + start);
+      initialized = true;
+    }
+    return makeSerializedBloomColumn(bloom, initialized, stream, mr);
+  }
+
+  std::vector<core::TypedExprPtr> extraInputs_;
+  int32_t capacity_{0};
+};
+
 std::unique_ptr<ReduceAggregator> createReduceAggregator(
-    const ResolvedAggregateInfo& p) {
+    const ResolvedAggregateInfo& p,
+    const core::QueryConfig* queryConfig) {
   auto const& kind = p.kind;
   auto prefix = cudf_velox::CudfConfig::getInstance().functionNamePrefix;
   if (kind.rfind(prefix + "sum", 0) == 0) {
@@ -752,6 +1056,14 @@ std::unique_ptr<ReduceAggregator> createReduceAggregator(
   } else if (kind.rfind(prefix + "approx_distinct", 0) == 0) {
     return std::make_unique<ApproxDistinctAggregator>(
         p.companionStep, p.inputIndex, p.constant, p.resultType);
+  } else if (kind.rfind(prefix + "bloom_filter_agg", 0) == 0) {
+    return std::make_unique<BloomFilterAggAggregator>(
+        p.companionStep,
+        p.inputIndex,
+        p.constant,
+        p.resultType,
+        p.extraInputs,
+        queryConfig);
   } else {
     VELOX_NYI("Reduce aggregation not yet supported, kind: {}", kind);
   }
@@ -765,14 +1077,15 @@ std::vector<std::unique_ptr<ReduceAggregator>> toReduceAggregators(
     core::AggregationNode const& aggregationNode,
     core::AggregationNode::Step step,
     TypePtr const& outputType,
-    std::vector<VectorPtr> const& constants) {
+    std::vector<VectorPtr> const& constants,
+    const core::QueryConfig* queryConfig) {
   auto params =
       resolveAggregateInfos(aggregationNode, step, outputType, constants);
 
   std::vector<std::unique_ptr<ReduceAggregator>> aggregators;
   aggregators.reserve(params.size());
   for (const auto& p : params) {
-    aggregators.push_back(createReduceAggregator(p));
+    aggregators.push_back(createReduceAggregator(p, queryConfig));
   }
   return aggregators;
 }
@@ -871,7 +1184,8 @@ void CudfReduce::initialize() {
       *aggregationNode_,
       aggregationNode_->step(),
       outputType_,
-      aggregationInput.constants);
+      aggregationInput.constants,
+      &operatorCtx_->driverCtx()->queryConfig());
 
   aggregationNode_.reset();
 }
