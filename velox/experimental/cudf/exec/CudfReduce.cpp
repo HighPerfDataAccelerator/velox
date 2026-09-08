@@ -111,32 +111,36 @@ std::unique_ptr<cudf::column> reduceMinMaxWithInputType(
   return resultCol;
 }
 
-#define DEFINE_MIN_MAX_REDUCE_AGGREGATOR(Name, name)                      \
-  struct Reduce##Name##Aggregator : ReduceAggregator {                    \
-    Reduce##Name##Aggregator(                                             \
-        core::AggregationNode::Step step,                                 \
-        uint32_t inputIndex,                                              \
-        VectorPtr constant,                                               \
-        const TypePtr& resultType,                                        \
-        std::optional<uint32_t> maskIndex)                                \
-        : ReduceAggregator(                                               \
-              step, inputIndex, constant, resultType, maskIndex) {}       \
-                                                                          \
-    std::unique_ptr<cudf::column> doReduce(                               \
-        cudf::table_view const& input,                                    \
-        TypePtr const& outputType,                                        \
-        vector_size_t /* inputRowCount */,                                \
-        rmm::cuda_stream_view stream,                                     \
-        rmm::device_async_resource_ref mr) override {                     \
-      auto const aggRequest =                                             \
-          cudf::make_##name##_aggregation<cudf::reduce_aggregation>();    \
-      auto const injected = cudf_velox::materializeMaskedColumn(          \
-          input, inputIndex, maskIndex, stream, get_temp_mr());           \
-      auto const reduceInput =                                            \
-          injected ? injected->view() : input.column(inputIndex);         \
-      return reduceMinMaxWithInputType(                                   \
-          reduceInput, *aggRequest, outputType, stream, mr);              \
-    }                                                                     \
+#define DEFINE_MIN_MAX_REDUCE_AGGREGATOR(Name, name)                   \
+  struct Reduce##Name##Aggregator : ReduceAggregator {                 \
+    Reduce##Name##Aggregator(                                          \
+        core::AggregationNode::Step step,                              \
+        uint32_t inputIndex,                                           \
+        VectorPtr constant,                                            \
+        const TypePtr& resultType,                                     \
+        std::optional<uint32_t> maskIndex)                             \
+        : ReduceAggregator(                                            \
+              step,                                                    \
+              inputIndex,                                              \
+              constant,                                                \
+              resultType,                                              \
+              maskIndex) {}                                            \
+                                                                       \
+    std::unique_ptr<cudf::column> doReduce(                            \
+        cudf::table_view const& input,                                 \
+        TypePtr const& outputType,                                     \
+        vector_size_t /* inputRowCount */,                             \
+        rmm::cuda_stream_view stream,                                  \
+        rmm::device_async_resource_ref mr) override {                  \
+      auto const aggRequest =                                          \
+          cudf::make_##name##_aggregation<cudf::reduce_aggregation>(); \
+      auto const injected = cudf_velox::materializeMaskedColumn(       \
+          input, inputIndex, maskIndex, stream, get_temp_mr());        \
+      auto const reduceInput =                                         \
+          injected ? injected->view() : input.column(inputIndex);      \
+      return reduceMinMaxWithInputType(                                \
+          reduceInput, *aggRequest, outputType, stream, mr);           \
+    }                                                                  \
   };
 
 DEFINE_MIN_MAX_REDUCE_AGGREGATOR(Min, min)
