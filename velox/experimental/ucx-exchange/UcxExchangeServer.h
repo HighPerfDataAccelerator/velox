@@ -33,6 +33,8 @@
 
 namespace facebook::velox::ucx_exchange {
 
+struct DataSendContext;
+
 class UcxExchangeServer
     : public CommElement,
       public std::enable_shared_from_this<UcxExchangeServer> {
@@ -44,6 +46,7 @@ class UcxExchangeServer
     DataRequestReady,
     WaitingForDataFromQueue,
     DataReady,
+    WaitingForHostStage,
     WaitingForSendComplete,
     WaitingForIntraNodeRetrieve,
     Done,
@@ -100,6 +103,10 @@ class UcxExchangeServer
 
   /// @brief Sends metadata and data to the connected receiver.
   void sendData();
+
+  /// Posts a data send after any required device-to-host staging has
+  /// completed. Must run on the communicator thread.
+  void postDataSend(const std::shared_ptr<DataSendContext>& dataCtx);
 
   /// @brief Completion handler after data has been sent.
   void sendComplete(ucs_status_t status, std::shared_ptr<void> arg);
@@ -171,6 +178,12 @@ class UcxExchangeServer
   // and must therefore exist until the upcall is done.
   std::shared_ptr<ucxx::Request> metaRequest_{nullptr};
   std::shared_ptr<ucxx::Request> dataRequest_{nullptr};
+
+  // Retains an asynchronously staged payload between the CUDA stream callback
+  // and the communicator-thread UCX send. The CUDA callback owns another
+  // reference, so closing the server cannot free pinned memory while the copy
+  // is still in flight.
+  std::shared_ptr<DataSendContext> pendingDataSend_{nullptr};
 
   // Completed UCXX requests are kept alive here to prevent use-after-free.
   // UCP's ucp_wireup_replay_pending_requests can fire callbacks on already-
