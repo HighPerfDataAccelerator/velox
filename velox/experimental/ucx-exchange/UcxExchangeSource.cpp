@@ -16,8 +16,11 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <limits>
+#include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include <cudf/contiguous_split.hpp>
@@ -75,6 +78,8 @@ receiverStateNames() {
           {UcxExchangeSource::ReceiverState::WaitingForReceiveCredit,
            "WaitingForReceiveCredit"},
           {UcxExchangeSource::ReceiverState::WaitingForData, "WaitingForData"},
+          {UcxExchangeSource::ReceiverState::WaitingForHostStage,
+           "WaitingForHostStage"},
           {UcxExchangeSource::ReceiverState::WaitingForIntraNodeData,
            "WaitingForIntraNodeData"},
           {UcxExchangeSource::ReceiverState::Done, "Done"},
@@ -100,6 +105,102 @@ int64_t maxInFlightRecvHostBytes() {
 }
 
 std::atomic<int64_t> inFlightRecvHostBytes{0};
+
+bool pinnedReceiveHostStagingEnabled() {
+  static const bool enabled = [] {
+    const auto* value = std::getenv("GLUTEN_UCX_PINNED_RECV_STAGING");
+    return value != nullptr && std::string_view(value) == "1";
+  }();
+  return enabled;
+}
+
+class PinnedReceiveBufferPool {
+ public:
+  static PinnedReceiveBufferPool& instance() {
+    static PinnedReceiveBufferPool pool;
+    return pool;
+  }
+
+  std::shared_ptr<uint8_t> acquire(size_t requested) {
+    const auto capacity = sizeClass(requested);
+    uint8_t* data = nullptr;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      auto& buffers = buffers_[capacity];
+      if (!buffers.empty()) {
+        data = buffers.back();
+        buffers.pop_back();
+        cachedBytes_ -= capacity;
+      }
+    }
+    if (data == nullptr) {
+      void* allocation = nullptr;
+      if (cudaHostAlloc(&allocation, capacity, cudaHostAllocPortable) !=
+          cudaSuccess) {
+        cudaGetLastError();
+        return nullptr;
+      }
+      data = static_cast<uint8_t*>(allocation);
+    }
+    return std::shared_ptr<uint8_t>(data, [capacity](uint8_t* buffer) {
+      PinnedReceiveBufferPool::instance().release(buffer, capacity);
+    });
+  }
+
+ private:
+  static size_t sizeClass(size_t requested) {
+    constexpr size_t kMinimumClass = 64UL << 10;
+    size_t capacity = kMinimumClass;
+    while (capacity < requested &&
+           capacity <= std::numeric_limits<size_t>::max() / 2) {
+      capacity *= 2;
+    }
+    return capacity < requested ? requested : capacity;
+  }
+
+  static size_t maxCachedBytes() {
+    constexpr size_t kDefault = 512ULL << 20;
+    const auto* value = std::getenv("GLUTEN_UCX_PINNED_RECV_POOL_MAX_BYTES");
+    if (value == nullptr || value[0] == '\0') {
+      return kDefault;
+    }
+    char* end = nullptr;
+    const auto parsed = std::strtoull(value, &end, 10);
+    return end != value && *end == '\0' ? static_cast<size_t>(parsed)
+                                        : kDefault;
+  }
+
+  void release(uint8_t* data, size_t capacity) {
+    bool cache = false;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (capacity <= maxCachedBytes_ &&
+          cachedBytes_ <= maxCachedBytes_ - capacity) {
+        buffers_[capacity].push_back(data);
+        cachedBytes_ += capacity;
+        cache = true;
+      }
+    }
+    if (!cache) {
+      cudaFreeHost(data);
+    }
+  }
+
+  ~PinnedReceiveBufferPool() {
+    for (auto& [capacity, buffers] : buffers_) {
+      for (auto* data : buffers) {
+        cudaFreeHost(data);
+      }
+    }
+  }
+
+  PinnedReceiveBufferPool() : maxCachedBytes_(maxCachedBytes()) {}
+
+  std::mutex mutex_;
+  std::unordered_map<size_t, std::vector<uint8_t*>> buffers_;
+  size_t cachedBytes_{0};
+  const size_t maxCachedBytes_;
+};
 
 rmm::mr::statistics_resource_adaptor& receiveDeviceMemoryResource() {
   // Allocate UCX receive pages from the same async resource as cuDF operators.
@@ -357,6 +458,35 @@ void UcxExchangeSource::process() {
     case ReceiverState::WaitingForData:
       // Waiting for data is handled by an upcall from UCXX. Nothing to do.
       break;
+    case ReceiverState::WaitingForHostStage: {
+      VELOX_CHECK_NOT_NULL(pendingHostStage_);
+      VELOX_CHECK_NOT_NULL(pendingHostStage_->hostStageEvent);
+      const auto eventStatus =
+          cudaEventQuery(pendingHostStage_->hostStageEvent);
+      if (eventStatus == cudaErrorNotReady) {
+        wakeCommunicator();
+        break;
+      }
+      CUDF_CUDA_TRY(eventStatus);
+      CUDF_CUDA_TRY(cudaEventDestroy(pendingHostStage_->hostStageEvent));
+      pendingHostStage_->hostStageEvent = nullptr;
+      metrics_.hostCopyWaitNanos_.addValue(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() -
+              pendingHostStage_->hostStageStart)
+              .count());
+      pendingHostStage_->pinnedHostData.reset();
+      if (reservedGlobalHostReceiveBytes_ > 0) {
+        releaseRecvHostBytes(reservedGlobalHostReceiveBytes_);
+        reservedGlobalHostReceiveBytes_ = 0;
+      }
+      auto received = std::move(pendingHostStage_);
+      finishDataReceive(received);
+      setStateIf(
+          ReceiverState::WaitingForHostStage, ReceiverState::ReadyToReceive);
+      wakeCommunicator();
+      break;
+    }
     case ReceiverState::WaitingForIntraNodeData:
       // Poll for intra-node transfer data
       waitForIntraNodeData();
@@ -371,6 +501,7 @@ void UcxExchangeSource::process() {
 void UcxExchangeSource::cleanUp() {
   releaseReceiveReservation();
   pendingReceive_.reset();
+  pendingHostStage_.reset();
 
   uint32_t value = static_cast<uint32_t>(getState());
   if (value != static_cast<uint32_t>(ReceiverState::Done)) {
@@ -470,6 +601,8 @@ folly::F14FastMap<std::string, RuntimeMetric> UcxExchangeSource::metrics()
   map["ucxExchangeSource.receiveAllocationNanos"] =
       metrics_.receiveAllocationNanos_;
   map["ucxExchangeSource.dataWaitNanos"] = metrics_.dataWaitNanos_;
+  map["ucxExchangeSource.asyncHostCopyBytes"] = metrics_.asyncHostCopyBytes_;
+  map["ucxExchangeSource.hostCopyWaitNanos"] = metrics_.hostCopyWaitNanos_;
   map["ucxExchangeSource.metadataCallbackNanos"] =
       metrics_.metadataCallbackNanos_;
   map["ucxExchangeSource.dataCallbackNanos"] = metrics_.dataCallbackNanos_;
@@ -934,16 +1067,27 @@ bool UcxExchangeSource::tryStartDataReceive(
   void* receiveBuffer = ptr->dataBuf->data();
   if (useHostStaging) {
     const auto receiveSize = static_cast<size_t>(ptr->metadata.dataSizeBytes);
-    if (dataReceiveBuffer_ == nullptr) {
-      dataReceiveBuffer_ = std::make_shared<std::vector<uint8_t>>(receiveSize);
-    } else if (dataReceiveBuffer_->size() < receiveSize) {
-      dataReceiveBuffer_->resize(receiveSize);
+    if (pinnedReceiveHostStagingEnabled()) {
+      ptr->pinnedHostData =
+          PinnedReceiveBufferPool::instance().acquire(receiveSize);
     }
-    ptr->hostData = dataReceiveBuffer_;
-    receiveBuffer = ptr->hostData->data();
+    if (ptr->pinnedHostData != nullptr) {
+      receiveBuffer = ptr->pinnedHostData.get();
+    } else {
+      if (dataReceiveBuffer_ == nullptr) {
+        dataReceiveBuffer_ =
+            std::make_shared<std::vector<uint8_t>>(receiveSize);
+      } else if (dataReceiveBuffer_->size() < receiveSize) {
+        dataReceiveBuffer_->resize(receiveSize);
+      }
+      ptr->hostData = dataReceiveBuffer_;
+      receiveBuffer = ptr->hostData->data();
+    }
   }
   VLOG(2) << toString() << " posting "
-          << (useHostStaging ? "host-staged" : "direct-device")
+          << (ptr->pinnedHostData != nullptr
+                  ? "pinned-host-staged"
+                  : (useHostStaging ? "pageable-host-staged" : "direct-device"))
           << " receive for " << ptr->metadata.dataSizeBytes << " bytes";
 
   uint64_t dataTag = getDataTag(partitionKeyHash_, sequenceNumber_);
@@ -1030,7 +1174,46 @@ void UcxExchangeSource::onData(ucs_status_t status, std::shared_ptr<void> arg) {
     std::shared_ptr<DataAndMetadata> ptr =
         std::static_pointer_cast<DataAndMetadata>(arg);
 
-    if (ptr->hostData != nullptr) {
+    if (ptr->pinnedHostData != nullptr) {
+      const auto eventStatus = cudaEventCreateWithFlags(
+          &ptr->hostStageEvent, cudaEventDisableTiming);
+      if (eventStatus == cudaSuccess) {
+        ptr->hostStageStart = std::chrono::steady_clock::now();
+        CUDF_CUDA_TRY(cudaMemcpyAsync(
+            ptr->dataBuf->data(),
+            ptr->pinnedHostData.get(),
+            ptr->metadata.dataSizeBytes,
+            cudaMemcpyHostToDevice,
+            ptr->stream.value()));
+        CUDF_CUDA_TRY(
+            cudaEventRecord(ptr->hostStageEvent, ptr->stream.value()));
+        metrics_.asyncHostCopyBytes_.addValue(ptr->metadata.dataSizeBytes);
+        pendingHostStage_ = ptr;
+        setStateIf(
+            ReceiverState::WaitingForData, ReceiverState::WaitingForHostStage);
+        wakeCommunicator();
+        metrics_.dataCallbackNanos_.addValue(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                Clock::now() - callbackStart)
+                .count());
+        return;
+      }
+      cudaGetLastError();
+      LOG(WARNING) << toString()
+                   << " could not create async H2D completion event: "
+                   << cudaGetErrorString(eventStatus)
+                   << "; falling back to synchronous pinned staging";
+      CUDF_CUDA_TRY(cudaMemcpy(
+          ptr->dataBuf->data(),
+          ptr->pinnedHostData.get(),
+          ptr->metadata.dataSizeBytes,
+          cudaMemcpyHostToDevice));
+      ptr->pinnedHostData.reset();
+      if (reservedGlobalHostReceiveBytes_ > 0) {
+        releaseRecvHostBytes(reservedGlobalHostReceiveBytes_);
+        reservedGlobalHostReceiveBytes_ = 0;
+      }
+    } else if (ptr->hostData != nullptr) {
       CUDF_CUDA_TRY(cudaMemcpy(
           ptr->dataBuf->data(),
           ptr->hostData->data(),
@@ -1045,25 +1228,7 @@ void UcxExchangeSource::onData(ucs_status_t status, std::shared_ptr<void> arg) {
     // The source-level pageable fallback buffer is intentionally retained and
     // reused by the next serial host-staged receive.
 
-    metrics_.numPackedColumns_.addValue(1);
-    metrics_.totalBytes_.addValue(ptr->metadata.dataSizeBytes);
-
-    // Create packed_columns from the received metadata and data buffer
-    cudf::packed_columns packedCols(
-        std::move(ptr->metadata.cudfMetadata), std::move(ptr->dataBuf));
-
-    // Unpack to get the table_view and create a packed_table
-    cudf::table_view tableView = cudf::unpack(packedCols);
-    auto packedTable = std::make_unique<cudf::packed_table>(
-        cudf::packed_table{tableView, std::move(packedCols)});
-
-    // Bundle the packed_table with the stream that was used for allocation
-    auto data = std::make_unique<PackedTableWithStream>(
-        std::move(packedTable), ptr->stream);
-
-    const int64_t reservedReceiveBytes = reservedReceiveBytes_;
-    enqueue(std::move(data), reservedReceiveBytes);
-    reservedReceiveBytes_ = 0;
+    finishDataReceive(ptr);
     setStateIf(ReceiverState::WaitingForData, ReceiverState::ReadyToReceive);
   }
   wakeCommunicator();
@@ -1071,6 +1236,24 @@ void UcxExchangeSource::onData(ucs_status_t status, std::shared_ptr<void> arg) {
       std::chrono::duration_cast<std::chrono::nanoseconds>(
           Clock::now() - callbackStart)
           .count());
+}
+
+void UcxExchangeSource::finishDataReceive(
+    const std::shared_ptr<DataAndMetadata>& ptr) {
+  metrics_.numPackedColumns_.addValue(1);
+  metrics_.totalBytes_.addValue(ptr->metadata.dataSizeBytes);
+
+  cudf::packed_columns packedCols(
+      std::move(ptr->metadata.cudfMetadata), std::move(ptr->dataBuf));
+  cudf::table_view tableView = cudf::unpack(packedCols);
+  auto packedTable = std::make_unique<cudf::packed_table>(
+      cudf::packed_table{tableView, std::move(packedCols)});
+  auto data = std::make_unique<PackedTableWithStream>(
+      std::move(packedTable), ptr->stream);
+
+  const int64_t reservedReceiveBytes = reservedReceiveBytes_;
+  enqueue(std::move(data), reservedReceiveBytes);
+  reservedReceiveBytes_ = 0;
 }
 
 void UcxExchangeSource::receiveHandshakeResponse() {
