@@ -318,11 +318,26 @@ struct DataSendContext {
   // host staging buffer alive with the request and let UCX move host memory.
   std::shared_ptr<std::vector<uint8_t>> hostData;
   std::shared_ptr<PinnedSendBuffer> pinnedHostData;
+  cudaEvent_t stageEvent{nullptr};
   int64_t reservedHostBytes{0};
   std::chrono::time_point<std::chrono::high_resolution_clock> stageStart;
 
   ~DataSendContext() {
+    destroyStageEvent(/*synchronize=*/true);
     releaseHostReservation();
+  }
+
+  void destroyStageEvent(bool synchronize = false) {
+    if (stageEvent == nullptr) {
+      return;
+    }
+    // Destructors must not throw. On cancellation, wait before member
+    // destruction returns the pinned buffer to the pool.
+    if (synchronize) {
+      cudaEventSynchronize(stageEvent);
+    }
+    cudaEventDestroy(stageEvent);
+    stageEvent = nullptr;
   }
 
   bool reserveHostBytes(int64_t bytes) {
@@ -340,11 +355,6 @@ struct DataSendContext {
       reservedHostBytes = 0;
     }
   }
-};
-
-struct HostStageCallbackContext {
-  std::shared_ptr<UcxExchangeServer> server;
-  std::shared_ptr<DataSendContext> data;
 };
 
 void UcxExchangeServer::setState(ServerState newState) {
@@ -533,9 +543,24 @@ void UcxExchangeServer::process() {
       std::shared_ptr<DataSendContext> dataCtx;
       {
         std::lock_guard<std::recursive_mutex> lock(dataMutex_);
-        dataCtx = std::move(pendingDataSend_);
+        dataCtx = pendingDataSend_;
       }
       VELOX_CHECK_NOT_NULL(dataCtx);
+      VELOX_CHECK_NOT_NULL(dataCtx->stageEvent);
+      const auto eventStatus = cudaEventQuery(dataCtx->stageEvent);
+      if (eventStatus == cudaErrorNotReady) {
+        // Requeue at the tail so other UCX work progresses while the D2H copy
+        // runs. The communicator already busy-progresses active exchanges.
+        wakeCommunicator();
+        break;
+      }
+      CUDF_CUDA_TRY(eventStatus);
+      dataCtx->destroyStageEvent();
+      {
+        std::lock_guard<std::recursive_mutex> lock(dataMutex_);
+        VELOX_CHECK(pendingDataSend_ == dataCtx);
+        pendingDataSend_.reset();
+      }
       postDataSend(dataCtx);
       break;
     }
@@ -851,51 +876,39 @@ void UcxExchangeServer::sendData() {
             dataCtx->pinnedHostData->data() != nullptr) {
           // The packed buffer was produced on producerStream. Queueing the
           // D2H copy on that same stream preserves producer ordering without
-          // blocking the communicator thread. The host callback only wakes
-          // the communicator after the pinned buffer is ready for UCX.
+          // blocking the communicator thread. An event lets the communicator
+          // poll completion without executing application code in a CUDA host
+          // callback.
           dataCtx->stageStart = std::chrono::high_resolution_clock::now();
+          const auto eventStatus = cudaEventCreateWithFlags(
+              &dataCtx->stageEvent, cudaEventDisableTiming);
+          if (eventStatus != cudaSuccess) {
+            cudaGetLastError();
+            LOG(WARNING) << "@" << partitionKey_.taskId
+                         << " failed to create async D2H completion event: "
+                         << cudaGetErrorString(eventStatus)
+                         << "; falling back to synchronous pinned staging";
+            CUDF_CUDA_TRY(cudaStreamSynchronize(producerStream.value()));
+            CUDF_CUDA_TRY(cudaMemcpy(
+                dataCtx->pinnedHostData->data(),
+                dataCtx->data->gpu_data->data(),
+                bytes_,
+                cudaMemcpyDeviceToHost));
+            postDataSend(dataCtx);
+            return;
+          }
           CUDF_CUDA_TRY(cudaMemcpyAsync(
               dataCtx->pinnedHostData->data(),
               dataCtx->data->gpu_data->data(),
               bytes_,
               cudaMemcpyDeviceToHost,
               producerStream.value()));
+          CUDF_CUDA_TRY(
+              cudaEventRecord(dataCtx->stageEvent, producerStream.value()));
           pendingDataSend_ = dataCtx;
           setState(ServerState::WaitingForHostStage);
-          auto callback = std::make_unique<HostStageCallbackContext>();
-          callback->server = getSelfPtr();
-          callback->data = dataCtx;
-          const auto callbackStatus = cudaLaunchHostFunc(
-              producerStream.value(),
-              [](void* raw) {
-                std::unique_ptr<HostStageCallbackContext> context(
-                    static_cast<HostStageCallbackContext*>(raw));
-                auto self = context->server;
-                if (auto communicator = self->tryCommunicator()) {
-                  // Queue ownership keeps the server and its pending pinned
-                  // buffer alive after this CUDA callback returns. This also
-                  // ensures cudaFreeHost never runs from a CUDA callback.
-                  communicator->addToWorkQueue(self);
-                } else {
-                  // CUDA forbids calling cudaFreeHost from a stream callback.
-                  // At process shutdown there is no communicator thread left
-                  // to retire the buffer safely, so retain this final context
-                  // for OS cleanup instead of invoking CUDA from here.
-                  context.release();
-                }
-              },
-              callback.get());
-          if (callbackStatus == cudaSuccess) {
-            callback.release();
-            return;
-          }
-
-          // cudaLaunchHostFunc can fail under callback-resource pressure.
-          // Preserve correctness with a synchronous completion of the copy;
-          // subsequent packets can still use the opt-in asynchronous path.
-          cudaGetLastError();
-          pendingDataSend_.reset();
-          CUDF_CUDA_TRY(cudaStreamSynchronize(producerStream.value()));
+          wakeCommunicator();
+          return;
         } else {
           dataCtx->pinnedHostData.reset();
           dataCtx->hostData = std::make_shared<std::vector<uint8_t>>(bytes_);
