@@ -210,6 +210,11 @@ class IcebergSplitBuilder {
     return *this;
   }
 
+  IcebergSplitBuilder& physicalFilePath(std::string path) {
+    physicalFilePath_ = std::move(path);
+    return *this;
+  }
+
   IcebergSplitBuilder& columnMappingMode(dwio::common::ColumnMappingMode mode) {
     columnMappingMode_ = mode;
     return *this;
@@ -219,6 +224,7 @@ class IcebergSplitBuilder {
 
  private:
   const std::string filePath_;
+  std::string physicalFilePath_;
   std::string connectorId_;
   dwio::common::FileFormat fileFormat_{dwio::common::FileFormat::DWRF};
   uint64_t start_{0};

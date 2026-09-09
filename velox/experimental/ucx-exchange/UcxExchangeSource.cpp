@@ -995,8 +995,10 @@ void UcxExchangeSource::onData(ucs_status_t status, std::shared_ptr<void> arg) {
         cudf::packed_table{tableView, std::move(packedCols)});
 
     // Bundle the packed_table with the stream that was used for allocation
+    // and the producer's row count, which the packed table cannot report for
+    // itself when it has no columns.
     auto data = std::make_unique<PackedTableWithStream>(
-        std::move(packedTable), ptr->stream);
+        std::move(packedTable), ptr->stream, ptr->metadata.numRows);
 
     const int64_t reservedReceiveBytes = reservedReceiveBytes_;
     enqueue(std::move(data), reservedReceiveBytes);
@@ -1128,12 +1130,14 @@ void UcxExchangeSource::waitForIntraNodeData() {
   }
 
   intraNodePollCount_ = 0;
-  onIntraNodeData(std::move(result->data), result->stream, result->atEnd);
+  onIntraNodeData(
+      std::move(result->data), result->stream, result->numRows, result->atEnd);
 }
 
 void UcxExchangeSource::onIntraNodeData(
     std::shared_ptr<cudf::packed_columns> data,
     rmm::cuda_stream_view producerStream,
+    vector_size_t numRows,
     bool atEnd) {
   // Check if close() was called
   if (closed_.load(std::memory_order_acquire)) {
@@ -1202,8 +1206,8 @@ void UcxExchangeSource::onIntraNodeData(
   auto packedTable = std::make_unique<cudf::packed_table>(
       cudf::packed_table{tableView, std::move(packedCols)});
 
-  auto tableWithStream =
-      std::make_unique<PackedTableWithStream>(std::move(packedTable), stream);
+  auto tableWithStream = std::make_unique<PackedTableWithStream>(
+      std::move(packedTable), stream, numRows);
 
   enqueue(std::move(tableWithStream));
 

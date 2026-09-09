@@ -29,6 +29,8 @@
 #include <unordered_set>
 #include <vector>
 
+#include "velox/vector/TypeAliases.h"
+
 namespace facebook::velox::ucx_exchange {
 
 /// @brief Key for identifying intra-node transfer entries in the registry.
@@ -39,10 +41,12 @@ struct IntraNodeTransferKey {
   uint32_t sequenceNumber;
 
   bool operator<(const IntraNodeTransferKey& other) const {
-    if (taskId != other.taskId)
+    if (taskId != other.taskId) {
       return taskId < other.taskId;
-    if (destination != other.destination)
+    }
+    if (destination != other.destination) {
       return destination < other.destination;
+    }
     return sequenceNumber < other.sequenceNumber;
   }
 };
@@ -51,6 +55,10 @@ struct IntraNodeTransferKey {
 struct IntraNodeTransferResult {
   std::shared_ptr<cudf::packed_columns> data;
   rmm::cuda_stream_view stream{rmm::cuda_stream_default};
+  /// Logical rows in 'data'. Carried explicitly for the same reason the remote
+  /// path puts a row count on the wire: a packed table with no columns cannot
+  /// report its own row count.
+  vector_size_t numRows{0};
   bool atEnd{false}; // True if this is the end-of-stream marker
 };
 
@@ -61,6 +69,8 @@ struct IntraNodeTransferResult {
 struct IntraNodeTransferEntry {
   std::shared_ptr<cudf::packed_columns> data;
   rmm::cuda_stream_view stream{rmm::cuda_stream_default};
+  vector_size_t numRows{
+      0}; // Logical rows in 'data'; see IntraNodeTransferResult.
   bool atEnd{false}; // True if this is the end-of-stream marker
   std::promise<void> retrievedPromise; // Server waits on this after publishing
   std::condition_variable dataAvailable; // Source waits on this for data
@@ -101,12 +111,14 @@ class IntraNodeTransferRegistry {
   /// so that the GPU data is ready when the consumer reads it.
   /// @param key The unique key identifying this transfer (taskId, dest, seq)
   /// @param data The packed_columns data to share (nullptr for atEnd)
+  /// @param numRows Logical rows in 'data'; 0 for atEnd
   /// @param atEnd True if this is the end-of-stream marker
   /// @return A future that completes when source has retrieved the data
   [[nodiscard]] std::future<void> publish(
       const IntraNodeTransferKey& key,
       std::shared_ptr<cudf::packed_columns> data,
       rmm::cuda_stream_view stream,
+      vector_size_t numRows,
       bool atEnd,
       std::function<void()> onRetrieved = {});
 

@@ -285,6 +285,7 @@ void UcxExchangeServer::process() {
             static_cast<int64_t>(sequenceNumber_),
             [weakQueue](
                 std::shared_ptr<cudf::packed_columns> data,
+                vector_size_t numRows,
                 int64_t sequence,
                 std::vector<int64_t> remainingBytes) {
               auto self = weakQueue.lock();
@@ -328,6 +329,7 @@ void UcxExchangeServer::process() {
                   self->dataPtr_ == nullptr,
                   "Data pointer exists: Illegal state!");
               self->dataPtr_ = std::move(data);
+              self->dataNumRows_ = numRows;
               self->setState(ServerState::DataReady);
               self->wakeCommunicator();
             });
@@ -490,9 +492,11 @@ void UcxExchangeServer::sendData() {
               key,
               dataPtr_,
               stream,
+              dataNumRows_,
               /*atEnd=*/false,
               makeIntraNodeRetrieveWakeup());
       dataPtr_.reset();
+      dataNumRows_ = 0;
       intraNodeAtEndPublished_ = false;
 
       // Go dormant until the source retrieves the entry and the registry wakeup
@@ -515,6 +519,7 @@ void UcxExchangeServer::sendData() {
               key,
               nullptr,
               rmm::cuda_stream_default,
+              /*numRows=*/0,
               /*atEnd=*/true,
               makeIntraNodeRetrieveWakeup());
       intraNodeAtEndPublished_ = true;
@@ -552,6 +557,7 @@ void UcxExchangeServer::sendData() {
       metadataMsg->cudfMetadata =
           std::make_unique<std::vector<uint8_t>>(*dataPtr_->metadata);
       metadataMsg->dataSizeBytes = dataPtr_->gpu_data->size();
+      metadataMsg->numRows = dataNumRows_;
       metadataMsg->remainingBytes = {};
       metadataMsg->atEnd = false;
     } else {
@@ -559,6 +565,7 @@ void UcxExchangeServer::sendData() {
               << partitionKey_.toString();
       metadataMsg->cudfMetadata = nullptr;
       metadataMsg->dataSizeBytes = 0;
+      metadataMsg->numRows = 0;
       metadataMsg->remainingBytes = {};
       metadataMsg->atEnd = true;
     }
@@ -723,7 +730,7 @@ void UcxExchangeServer::sendComplete(
     auto duration = end - sendStart_;
     auto micros =
         std::chrono::duration_cast<std::chrono::microseconds>(duration).count();
-    auto throughput = bytes_ / micros;
+    auto throughput = (micros > 0) ? (bytes_ / micros) : 0;
 
     VLOG(3) << "@" << partitionKey_.taskId << " duration: "
             << std::chrono::duration_cast<std::chrono::milliseconds>(duration)
@@ -734,6 +741,7 @@ void UcxExchangeServer::sendComplete(
 
     this->sequenceNumber_++;
     dataPtr_.reset(); // release memory.
+    dataNumRows_ = 0;
     VLOG(3) << "@" << partitionKey_.taskId
             << " Releasing dataPtr_ in sendComplete.";
     setState(ServerState::ReadyToTransfer);
