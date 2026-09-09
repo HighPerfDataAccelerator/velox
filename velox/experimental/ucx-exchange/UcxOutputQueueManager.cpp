@@ -199,7 +199,7 @@ void UcxOutputQueueManager::getData(
     }
   });
   if (taskRemoved) {
-    notify(nullptr, sequence, {});
+    notify(nullptr, /*numRows=*/0, sequence, {});
     return;
   }
   outputQueue->getData(destination, maxBytes, sequence, notify);
