@@ -33,6 +33,7 @@
 #include <stdexcept>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace facebook::velox::cudf_velox::connector::hive {
 namespace {
@@ -60,6 +61,8 @@ struct CacheHintEntry {
   bool scheduled{false};
   bool rangeStatsAccounted{false};
   bool highRequestPressure{false};
+  bool firstLoadPhysicallyReady{false};
+  bool cacheAdmissionReleased{false};
   std::shared_ptr<std::promise<void>> promise{
       std::make_shared<std::promise<void>>()};
   std::shared_future<void> future{promise->get_future().share()};
@@ -244,6 +247,30 @@ void logCacheHintStats(std::string_view event, std::string_view id = {}) {
 
 uint64_t highRequestPressureMaxReadyBytes();
 
+bool decoupledFirstLoadAdmissionEnabled() {
+  const auto* value =
+      std::getenv("GLUTEN_CUDF_CACHE_HINT_DECOUPLE_FIRST_LOAD_ADMISSION");
+  return value != nullptr &&
+      (std::string_view(value) == "1" || std::string_view(value) == "true");
+}
+
+uint32_t decoupledFirstLoadAdmissionCapacity(uint32_t fallback) {
+  const auto* value = std::getenv(
+      "GLUTEN_CUDF_CACHE_HINT_DECOUPLED_FIRST_LOAD_ADMISSION_CAPACITY");
+  if (value == nullptr || value[0] == '\0') {
+    return fallback;
+  }
+  try {
+    size_t parsedCharacters{0};
+    const auto parsed = std::stoul(value, &parsedCharacters);
+    VELOX_CHECK_EQ(value[parsedCharacters], '\0');
+    VELOX_CHECK_GT(parsed, 0);
+    return static_cast<uint32_t>(parsed);
+  } catch (const std::exception&) {
+    VELOX_FAIL("Invalid decoupled first-load admission capacity: {}", value);
+  }
+}
+
 class QueryPrefetchState
     : public std::enable_shared_from_this<QueryPrefetchState> {
  public:
@@ -367,15 +394,32 @@ class QueryPrefetchState
             : maxReadyBytes;
         cacheConcurrency_ = std::max<uint32_t>(1, concurrency);
         cacheMaxReadyBytes_ = std::max<uint64_t>(1, effectiveMaxReadyBytes);
-        cacheExecutor_ =
-            std::make_unique<folly::CPUThreadPoolExecutor>(cacheConcurrency_);
+        decoupledFirstLoadAdmission_ = decoupledFirstLoadAdmissionEnabled();
+        firstLoadAdmissionCapacity_ = decoupledFirstLoadAdmission_
+            ? decoupledFirstLoadAdmissionCapacity(cacheConcurrency_)
+            : cacheConcurrency_;
+        cacheExecutor_ = std::make_unique<folly::CPUThreadPoolExecutor>(
+            decoupledFirstLoadAdmission_ ? cacheConcurrency_ * 2
+                                         : cacheConcurrency_);
         LOG(WARNING) << "CUDF_CACHE_HINT_REQUEST_PRESSURE_WINDOW "
                      << "highRequestPressure=" << highRequestPressure
                      << " configuredMaxReadyBytes=" << maxReadyBytes
-                     << " effectiveMaxReadyBytes=" << cacheMaxReadyBytes_;
+                     << " effectiveMaxReadyBytes=" << cacheMaxReadyBytes_
+                     << " decoupledFirstLoadAdmission="
+                     << decoupledFirstLoadAdmission_
+                     << " firstLoadAdmissionCapacity="
+                     << firstLoadAdmissionCapacity_;
       }
       cacheEntries_.emplace(splitKey, entry);
       cacheOrder_.push_back(entry);
+      if (decoupledFirstLoadAdmission_ && entry->firstLoadReady) {
+        std::weak_ptr<QueryPrefetchState> weakSelf = shared_from_this();
+        entry->firstLoadReady->setOnSignal([weakSelf, entry]() {
+          if (const auto self = weakSelf.lock()) {
+            self->onFirstLoadPhysicallyReady(entry);
+          }
+        });
+      }
     }
     addRangePlan(rangeStats);
     const auto planned =
@@ -386,6 +430,24 @@ class QueryPrefetchState
       logCacheHintStats("first-planned", splitKey);
     }
     pumpCacheHints();
+  }
+
+  void releaseFirstLoadAdmission(const std::string& splitKey) {
+    bool released{false};
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (!decoupledFirstLoadAdmission_ ||
+          firstLoadAdmissions_.erase(splitKey) == 0) {
+        return;
+      }
+      VELOX_CHECK_GT(firstLoadAdmissionsActive_, 0);
+      --firstLoadAdmissionsActive_;
+      grantFirstLoadAdmissionsLocked();
+      released = true;
+    }
+    if (released) {
+      pumpCacheHints();
+    }
   }
 
   void takeCacheHint(const std::string& splitKey, CacheHintWaitMode waitMode) {
@@ -511,6 +573,7 @@ class QueryPrefetchState
     std::unique_ptr<folly::CPUThreadPoolExecutor> cacheExecutor;
     std::vector<std::shared_ptr<SplitEntry>> canceled;
     std::vector<std::shared_ptr<CacheHintEntry>> canceledCacheHints;
+    std::vector<std::shared_ptr<CacheHintEntry>> cacheHintSignals;
     {
       std::lock_guard<std::mutex> lock(mutex_);
       if (stopped_) {
@@ -533,6 +596,9 @@ class QueryPrefetchState
       }
       cacheOrder_.clear();
       for (const auto& [key, entry] : cacheEntries_) {
+        if (entry->firstLoadReady) {
+          cacheHintSignals.push_back(entry);
+        }
         if (!entry->rangeStatsAccounted) {
           entry->rangeStatsAccounted = true;
           addUnusedRanges(entry->rangeStats);
@@ -546,10 +612,10 @@ class QueryPrefetchState
       entry->promise->set_exception(failure);
     }
     for (const auto& entry : canceledCacheHints) {
-      if (entry->firstLoadReady) {
-        entry->firstLoadReady->signal();
-      }
       entry->promise->set_value();
+    }
+    for (const auto& entry : cacheHintSignals) {
+      entry->firstLoadReady->fulfill();
     }
     // CPUThreadPoolExecutor destruction joins all active reads. This method is
     // called outside registry locks and on the query-cleanup thread, so the
@@ -559,6 +625,43 @@ class QueryPrefetchState
   }
 
  private:
+  void onFirstLoadPhysicallyReady(
+      const std::shared_ptr<CacheHintEntry>& entry) {
+    bool pump{false};
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (stopped_ || entry->firstLoadPhysicallyReady) {
+        return;
+      }
+      entry->firstLoadPhysicallyReady = true;
+      if (!entry->cacheAdmissionReleased) {
+        VELOX_CHECK_GT(cacheActive_, 0);
+        --cacheActive_;
+        entry->cacheAdmissionReleased = true;
+        pump = true;
+      }
+      firstLoadReadyOrder_.push_back(entry);
+      grantFirstLoadAdmissionsLocked();
+    }
+    if (pump) {
+      pumpCacheHints();
+    }
+  }
+
+  void grantFirstLoadAdmissionsLocked() {
+    while (firstLoadAdmissionsActive_ < firstLoadAdmissionCapacity_ &&
+           !firstLoadReadyOrder_.empty()) {
+      auto entry = std::move(firstLoadReadyOrder_.front());
+      firstLoadReadyOrder_.pop_front();
+      if (firstLoadAdmissions_.contains(entry->key)) {
+        continue;
+      }
+      firstLoadAdmissions_.insert(entry->key);
+      ++firstLoadAdmissionsActive_;
+      entry->firstLoadReady->fulfill();
+    }
+  }
+
   void pumpCacheHints() {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!cacheExecutor_ || stopped_) {
@@ -606,7 +709,10 @@ class QueryPrefetchState
         entry->promise->set_value();
         {
           std::lock_guard<std::mutex> lock(self->mutex_);
-          --self->cacheActive_;
+          if (!entry->cacheAdmissionReleased) {
+            VELOX_CHECK_GT(self->cacheActive_, 0);
+            --self->cacheActive_;
+          }
         }
         const auto completed =
             cacheHintPrefetchedSplits.load(std::memory_order_relaxed) +
@@ -779,8 +885,13 @@ class QueryPrefetchState
   uint64_t reservedBytes_{0};
   uint32_t cacheConcurrency_{0};
   uint32_t cacheActive_{0};
+  uint32_t firstLoadAdmissionCapacity_{0};
+  uint32_t firstLoadAdmissionsActive_{0};
   uint64_t cacheMaxReadyBytes_{0};
   uint64_t cacheReservedBytes_{0};
+  std::deque<std::shared_ptr<CacheHintEntry>> firstLoadReadyOrder_;
+  std::unordered_set<std::string> firstLoadAdmissions_;
+  bool decoupledFirstLoadAdmission_{false};
   bool cacheFirstLoadDecisionMade_{false};
   bool cacheUseFirstLoadReady_{false};
   bool initialized_{false};
@@ -1131,11 +1242,33 @@ SplitPrefetchResult::~SplitPrefetchResult() {
 CacheHintFirstLoadSignal::CacheHintFirstLoadSignal()
     : future_(promise_.get_future().share()) {}
 
+void CacheHintFirstLoadSignal::setOnSignal(std::function<void()> onSignal) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  VELOX_CHECK(!signaled_.load(std::memory_order_acquire));
+  onSignal_ = std::move(onSignal);
+}
+
 void CacheHintFirstLoadSignal::signal() {
   bool expected = false;
   if (signaled_.compare_exchange_strong(
           expected, true, std::memory_order_acq_rel)) {
+    std::function<void()> onSignal;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      onSignal = onSignal_;
+    }
+    if (onSignal) {
+      onSignal();
+      return;
+    }
+    fulfill();
+  }
+}
+
+void CacheHintFirstLoadSignal::fulfill() {
+  try {
     promise_.set_value();
+  } catch (const std::future_error&) {
   }
 }
 
@@ -1286,6 +1419,18 @@ void ExecutorSplitPrefetch::takeCacheHint(
     const std::string& queryId,
     const std::string& splitKey) {
   takeCacheHint(executor, queryId, splitKey, CacheHintWaitMode::kScan);
+}
+
+void ExecutorSplitPrefetch::releaseFirstLoadAdmission(
+    folly::Executor* executor,
+    const std::string& queryId,
+    const std::string& splitKey) {
+  if (!executor) {
+    return;
+  }
+  if (auto state = getQueryState(executor, queryId, false)) {
+    state->releaseFirstLoadAdmission(splitKey);
+  }
 }
 
 void ExecutorSplitPrefetch::takeCacheHint(

@@ -1571,6 +1571,84 @@ TEST(ExecutorPrefetchTest, cacheHintFirstLoadGroupPrecedesFullCompletion) {
   EXPECT_TRUE(fullLoadCompleted.load(std::memory_order_relaxed));
 }
 
+TEST(ExecutorPrefetchTest, decoupledFirstLoadPipelinesIoAndBoundsScans) {
+  ASSERT_EQ(
+      setenv("GLUTEN_CUDF_CACHE_HINT_DECOUPLE_FIRST_LOAD_ADMISSION", "1", 1),
+      0);
+  ASSERT_EQ(
+      setenv(
+          "GLUTEN_CUDF_CACHE_HINT_DECOUPLED_FIRST_LOAD_ADMISSION_CAPACITY",
+          "1",
+          1),
+      0);
+  auto restoreEnvironment = folly::makeGuard([] {
+    unsetenv("GLUTEN_CUDF_CACHE_HINT_DECOUPLE_FIRST_LOAD_ADMISSION");
+    unsetenv("GLUTEN_CUDF_CACHE_HINT_DECOUPLED_FIRST_LOAD_ADMISSION_CAPACITY");
+  });
+
+  folly::CPUThreadPoolExecutor executor(1);
+  constexpr auto kQuery = "query-cache-decoupled-first-load";
+  auto firstReady = std::make_shared<CacheHintFirstLoadSignal>();
+  auto secondReady = std::make_shared<CacheHintFirstLoadSignal>();
+  std::promise<void> firstPhysicalReady;
+  std::promise<void> secondPhysicalReady;
+  std::promise<void> unblockFullLoads;
+  auto unblockFullLoadsFuture = unblockFullLoads.get_future().share();
+
+  ExecutorSplitPrefetch::registerCacheHint(
+      &executor,
+      kQuery,
+      "first",
+      CacheHintRangeStats{
+          .logicalRanges = 1,
+          .logicalBytes = 1,
+          .uniqueRanges = 1,
+          .uniqueBytes = 1},
+      [&] {
+        firstPhysicalReady.set_value();
+        firstReady->signal();
+        unblockFullLoadsFuture.wait();
+      },
+      1,
+      2,
+      firstReady);
+  ExecutorSplitPrefetch::registerCacheHint(
+      &executor,
+      kQuery,
+      "second",
+      CacheHintRangeStats{
+          .logicalRanges = 1,
+          .logicalBytes = 1,
+          .uniqueRanges = 1,
+          .uniqueBytes = 1},
+      [&] {
+        secondPhysicalReady.set_value();
+        secondReady->signal();
+        unblockFullLoadsFuture.wait();
+      },
+      1,
+      2,
+      secondReady);
+
+  ASSERT_EQ(
+      firstPhysicalReady.get_future().wait_for(5s), std::future_status::ready);
+  // The first physical range releases the sole I/O slot even though its full
+  // cache fill remains blocked, allowing the second load to start.
+  ASSERT_EQ(
+      secondPhysicalReady.get_future().wait_for(5s), std::future_status::ready);
+  ASSERT_EQ(firstReady->future().wait_for(5s), std::future_status::ready);
+  EXPECT_EQ(secondReady->future().wait_for(50ms), std::future_status::timeout);
+
+  // Only one physically-ready reader may enter the GPU pipeline at a time.
+  // Releasing the first output admits the second without waiting for either
+  // full cache fill to finish.
+  ExecutorSplitPrefetch::releaseFirstLoadAdmission(&executor, kQuery, "first");
+  ASSERT_EQ(secondReady->future().wait_for(5s), std::future_status::ready);
+
+  unblockFullLoads.set_value();
+  ExecutorSplitPrefetch::eraseQuery(&executor, kQuery);
+}
+
 TEST(ExecutorPrefetchTest, cacheHintFirstLoadFailureDoesNotHang) {
   folly::CPUThreadPoolExecutor executor(1);
   auto firstLoadReady = std::make_shared<CacheHintFirstLoadSignal>();

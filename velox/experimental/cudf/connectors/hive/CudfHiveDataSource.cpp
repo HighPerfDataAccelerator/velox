@@ -438,6 +438,10 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
       : with_arrow::toVeloxColumn(
             cudfTable->view(), pool_, outputType_, stream, get_temp_mr());
   stream.synchronize();
+  if (auto cudfOutput = std::dynamic_pointer_cast<CudfVector>(output)) {
+    cudfOutput->setOnDestroy(
+        cudfSplitReader_->cachePrefetchFirstLoadAdmissionReleaser());
+  }
 
   VELOX_CHECK_NOT_NULL(output, "Cudf to Velox conversion yielded a nullptr");
 

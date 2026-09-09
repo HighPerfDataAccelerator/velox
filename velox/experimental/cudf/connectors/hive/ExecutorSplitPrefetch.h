@@ -25,6 +25,7 @@
 #include <functional>
 #include <future>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -95,7 +96,11 @@ class CacheHintFirstLoadSignal {
  public:
   CacheHintFirstLoadSignal();
 
+  void setOnSignal(std::function<void()> onSignal);
+
   void signal();
+
+  void fulfill();
 
   const std::shared_future<void>& future() const {
     return future_;
@@ -103,6 +108,8 @@ class CacheHintFirstLoadSignal {
 
  private:
   std::atomic<bool> signaled_{false};
+  std::mutex mutex_;
+  std::function<void()> onSignal_;
   std::promise<void> promise_;
   std::shared_future<void> future_;
 };
@@ -203,6 +210,11 @@ class ExecutorSplitPrefetch {
       const std::string& queryId,
       const std::string& splitKey,
       CacheHintWaitMode waitMode);
+
+  static void releaseFirstLoadAdmission(
+      folly::Executor* executor,
+      const std::string& queryId,
+      const std::string& splitKey);
 
   /// Marks a cache hint as demanded and eligible for scheduling without
   /// waiting for the entire hint. Demand reads then synchronize on the

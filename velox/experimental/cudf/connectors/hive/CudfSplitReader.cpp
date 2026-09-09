@@ -806,6 +806,19 @@ void CudfSplitReader::resetSplit() {
   cachePrefetchDemandPrioritized_ = false;
 }
 
+std::function<void()> CudfSplitReader::cachePrefetchFirstLoadAdmissionReleaser()
+    const {
+  if (!cachePrefetchQueryId_ || !cachePrefetchHintKey_) {
+    return {};
+  }
+  const auto queryId = *cachePrefetchQueryId_;
+  const auto splitKey = *cachePrefetchHintKey_;
+  return [executor = executor_, queryId, splitKey]() {
+    ExecutorSplitPrefetch::releaseFirstLoadAdmission(
+        executor, queryId, splitKey);
+  };
+}
+
 cudf::ast::expression const* CudfSplitReader::pushdownFilter() const {
   return subfieldFilter();
 }
