@@ -159,6 +159,11 @@ uint64_t targetBytesPerUcxChunk(const core::QueryConfig& queryConfig) {
   return queryConfig.ucxPartitionedOutputBatchBytes();
 }
 
+uint64_t destinationCoalesceBytes() {
+  return static_cast<uint64_t>(
+      positiveEnvironmentOverride("GLUTEN_UCX_DESTINATION_COALESCE_BYTES"));
+}
+
 cudf::size_type rowsPerUcxChunk(
     cudf::size_type rows,
     uint64_t bytes,
@@ -236,10 +241,12 @@ UcxPartitionedOutput::UcxPartitionedOutput(
       maxOutputBufferSize_(ctx->queryConfig().maxOutputBufferSize()),
       targetRowsPerChunk_(targetRowsPerUcxChunk(ctx->queryConfig())),
       targetBytesPerChunk_(targetBytesPerUcxChunk(ctx->queryConfig())),
+      destinationCoalesceBytes_(destinationCoalesceBytes()),
       hashPartitionInputBatchRows_(
           maxRowsPerHashPartitionCall(ctx->queryConfig())),
       hashPartitionWindowRows_(
-          maxRowsPerHashPartitionWindow(ctx->queryConfig())) {
+          maxRowsPerHashPartitionWindow(ctx->queryConfig())),
+      destinationAccumulators_(numPartitions_) {
   this->initPartitionKeys(planNode);
   auto sources = planNode->sources();
   std::vector<std::string> inNames, outNames;
@@ -312,6 +319,7 @@ void UcxPartitionedOutput::flushPending() {
     pendingRows_ = 0;
     pendingFlatBytes_ = 0;
     clearActiveFlush();
+    clearCoalescedOutput();
     for (int i = 0; i < numPartitions_; i++) {
       sharedQueueManager()->deleteResults(this->taskId(), i);
     }
@@ -680,6 +688,13 @@ RowVectorPtr UcxPartitionedOutput::getOutput() {
   // A final work unit may have completed but filled the queue. Defer EOS until
   // its future has been moved by isBlocked() and resumed by the Driver.
   if (noMoreInput_ && !hasActiveFlush() && pendingInputs_.empty() &&
+      blockingReason_ == exec::BlockingReason::kNotBlocked &&
+      flushNextCoalescedDestination()) {
+    updateBackpressure();
+    return nullptr;
+  }
+  if (noMoreInput_ && !hasActiveFlush() && pendingInputs_.empty() &&
+      !hasCoalescedOutput() &&
       blockingReason_ == exec::BlockingReason::kNotBlocked) {
     sharedQueueManager()->noMoreData(this->taskId());
     finished_ = true;
@@ -1030,9 +1045,8 @@ void UcxPartitionedOutput::splitAndEnqueue(
   auto contiguousTables = cudf::contiguous_split(
       tableView, offsets, stream, cudf::get_current_device_resource_ref());
 
-  // Synchronize the stream to ensure CUDA operations complete before enqueuing.
-  // UCXX/UCX is not stream-aware, so without syncing, data could be sent before
-  // the GPU kernels have finished writing to the buffers.
+  // Synchronize before either publishing or retaining the pieces. A retained
+  // packed table may be concatenated later on a different input stream.
   stream.synchronize();
 
   VELOX_CHECK_EQ(
@@ -1053,6 +1067,9 @@ void UcxPartitionedOutput::splitAndEnqueue(
         targetRowsPerChunk_,
         targetBytesPerChunk_);
     if (rowsPerChunk < partitionRows) {
+      // Preserve FIFO order: a previously accumulated prefix must be
+      // published before an oversized page is split and published directly.
+      flushCoalescedDestination(i);
       VLOG(2) << "UcxPartitionedOutput chunking task=" << taskId()
               << " destination=" << i << " rows=" << partitionRows
               << " bytes=" << partitionBytes << " rowsPerChunk=" << rowsPerChunk
@@ -1081,6 +1098,17 @@ void UcxPartitionedOutput::splitAndEnqueue(
       continue;
     }
 
+    if (destinationCoalesceBytes_ > 0) {
+      auto& accumulator = destinationAccumulators_[i];
+      accumulator.bytes += partitionBytes;
+      accumulator.rows += partitionRows;
+      accumulator.pieces.push_back(std::move(contiguousTables[i]));
+      if (accumulator.bytes >= destinationCoalesceBytes_) {
+        flushCoalescedDestination(i);
+      }
+      continue;
+    }
+
     auto packedColsPtr = std::make_unique<cudf::packed_columns>(
         std::move(contiguousTables[i].data.metadata),
         std::move(contiguousTables[i].data.gpu_data));
@@ -1092,6 +1120,92 @@ void UcxPartitionedOutput::splitAndEnqueue(
         std::move(packedColsPtr),
         partitionTable.table.num_rows());
   }
+}
+
+bool UcxPartitionedOutput::flushCoalescedDestination(int destination) {
+  VELOX_CHECK_GE(destination, 0);
+  VELOX_CHECK_LT(destination, destinationAccumulators_.size());
+  auto& accumulator = destinationAccumulators_[destination];
+  if (accumulator.pieces.empty()) {
+    return false;
+  }
+
+  VELOX_CHECK_GT(accumulator.rows, 0);
+  VELOX_CHECK_LE(
+      accumulator.rows,
+      static_cast<int64_t>(std::numeric_limits<int32_t>::max()));
+  auto queueManager = sharedQueueManager();
+  if (accumulator.pieces.size() == 1) {
+    auto packedCols = std::make_unique<cudf::packed_columns>(
+        std::move(accumulator.pieces.front().data.metadata),
+        std::move(accumulator.pieces.front().data.gpu_data));
+    queueManager->enqueue(
+        taskId(),
+        destination,
+        std::move(packedCols),
+        static_cast<int32_t>(accumulator.rows));
+  } else {
+    std::vector<cudf::table_view> views;
+    views.reserve(accumulator.pieces.size());
+    for (const auto& piece : accumulator.pieces) {
+      views.push_back(piece.table);
+    }
+    const auto stream = accumulator.pieces.back().data.gpu_data->stream();
+    auto combined = cudf::concatenate(
+        views, stream, cudf::get_current_device_resource_ref());
+    auto packed = cudf::pack(
+        combined->view(), stream, cudf::get_current_device_resource_ref());
+    stream.synchronize();
+    auto packedCols = std::make_unique<cudf::packed_columns>(
+        std::move(packed.metadata), std::move(packed.gpu_data));
+    queueManager->enqueue(
+        taskId(),
+        destination,
+        std::move(packedCols),
+        static_cast<int32_t>(accumulator.rows));
+  }
+
+  VLOG(2) << "UcxPartitionedOutput coalesced destination task=" << taskId()
+          << " destination=" << destination
+          << " pieces=" << accumulator.pieces.size()
+          << " sourceBytes=" << accumulator.bytes
+          << " rows=" << accumulator.rows;
+  accumulator.pieces.clear();
+  accumulator.bytes = 0;
+  accumulator.rows = 0;
+  return true;
+}
+
+bool UcxPartitionedOutput::flushNextCoalescedDestination() {
+  if (destinationCoalesceBytes_ == 0 || destinationAccumulators_.empty()) {
+    return false;
+  }
+  for (size_t offset = 0; offset < destinationAccumulators_.size(); ++offset) {
+    const auto destination =
+        (nextCoalescedDestination_ + offset) % destinationAccumulators_.size();
+    if (flushCoalescedDestination(static_cast<int>(destination))) {
+      nextCoalescedDestination_ =
+          (destination + 1) % destinationAccumulators_.size();
+      return true;
+    }
+  }
+  return false;
+}
+
+bool UcxPartitionedOutput::hasCoalescedOutput() const {
+  return std::any_of(
+      destinationAccumulators_.begin(),
+      destinationAccumulators_.end(),
+      [](const auto& accumulator) { return !accumulator.pieces.empty(); });
+}
+
+void UcxPartitionedOutput::clearCoalescedOutput() {
+  for (auto& accumulator : destinationAccumulators_) {
+    accumulator.pieces.clear();
+    accumulator.bytes = 0;
+    accumulator.rows = 0;
+  }
+  nextCoalescedDestination_ = 0;
 }
 
 } // namespace facebook::velox::ucx_exchange

@@ -49,6 +49,26 @@
 #include "velox/experimental/ucx-exchange/tests/UcxTestData.h"
 #include "velox/experimental/ucx-exchange/tests/UcxTestHelpers.h"
 
+#ifdef VELOX_ENABLE_S3
+extern "C" bool glutenCrtS3RangeReaderAvailable() {
+  return false;
+}
+
+extern "C" uint64_t glutenCrtS3ObjectSize(const char*) {
+  return 0;
+}
+
+extern "C" uint64_t glutenCrtS3ReadRanges(
+    const char*,
+    uint8_t*,
+    const uint64_t*,
+    const uint64_t*,
+    const uint64_t*,
+    size_t) {
+  return 0;
+}
+#endif
+
 using namespace facebook::velox;
 using namespace facebook::velox::exec;
 using namespace facebook::velox::core;
@@ -1564,6 +1584,89 @@ TEST_P(UcxExchangeTest, batchAccumulationTest) {
         sinkDriver->numChunksReceived(), static_cast<uint64_t>(numChunks));
     queueManager_->removeTask(srcTaskId);
   }
+}
+
+// Destination payload sizing is independent from source flush sizing. Many
+// small hash inputs should become one page per destination when the coalescing
+// target is not reached before EOS; the residual pages must still be flushed.
+TEST_P(UcxExchangeTest, destinationCoalescingAcrossSourceFlushes) {
+  const auto p = GetParam();
+  if (p.numSrcDrivers != 1 || p.numDstDrivers != 1 || p.numPartitions != 1 ||
+      p.numChunks != 100 || p.numUpstreamTasks != 1 ||
+      p.tableType != TableType::NARROW) {
+    GTEST_SKIP() << "destinationCoalescingAcrossSourceFlushes: runs only once";
+  }
+
+  auto& config = cudf_velox::CudfConfig::getInstance();
+  const bool originalIntraNode = config.intraNodeExchange;
+  config.intraNodeExchange = true;
+  ASSERT_EQ(
+      setenv("GLUTEN_UCX_DESTINATION_COALESCE_BYTES", "1073741824", 1), 0);
+  SCOPE_EXIT {
+    unsetenv("GLUTEN_UCX_DESTINATION_COALESCE_BYTES");
+    config.intraNodeExchange = originalIntraNode;
+  };
+
+  constexpr int kNumChunks = 20;
+  constexpr int kRowsPerChunk = 100;
+  constexpr int kNumPartitions = 2;
+  const std::string taskPrefix = getUniqueTaskPrefix();
+  const std::string sourceTaskId = taskPrefix + "sourceTask0";
+  auto data = std::make_shared<UcxTestData>();
+  data->initialize(kRowsPerChunk);
+
+  std::unordered_map<std::string, std::string> extraConfig{
+      {core::QueryConfig::kUcxPartitionedOutputBatchRows,
+       std::to_string(kRowsPerChunk)}};
+  auto sourceTask = createPartitionedOutputTask(
+      sourceTaskId,
+      pool_,
+      UcxTestData::kTestRowType,
+      kNumPartitions,
+      {"c0"},
+      FOUR_GBYTES,
+      extraConfig);
+  queueManager_->initializeTask(
+      sourceTask,
+      core::PartitionedOutputNode::Kind::kPartitioned,
+      kNumPartitions,
+      1);
+
+  auto source = std::make_shared<SourceDriverMock>(
+      sourceTask, 1, kNumChunks, kRowsPerChunk, data);
+  std::vector<std::shared_ptr<SinkDriverMock>> sinks;
+  for (int destination = 0; destination < kNumPartitions; ++destination) {
+    core::PlanNodeId exchangeNodeId;
+    auto sinkTask = createExchangeTask(
+        taskPrefix + "sinkTask" + std::to_string(destination),
+        UcxTestData::kTestRowType,
+        destination,
+        exchangeNodeId);
+    auto sink = std::make_shared<SinkDriverMock>(sinkTask, 1, nullptr);
+    std::vector<exec::Split> splits{
+        remoteSplit(sourceTaskId, destination)};
+    sink->addSplits(splits);
+    sinks.push_back(std::move(sink));
+  }
+
+  source->run();
+  for (auto& sink : sinks) {
+    sink->run();
+  }
+  source->joinThreads();
+
+  uint64_t totalRows = 0;
+  uint64_t totalPages = 0;
+  for (auto& sink : sinks) {
+    sink->joinThreads();
+    totalRows += sink->numRows();
+    totalPages += sink->numChunksReceived();
+    EXPECT_LE(sink->numChunksReceived(), 1);
+  }
+  EXPECT_EQ(totalRows, kNumChunks * kRowsPerChunk);
+  EXPECT_GT(totalPages, 0);
+  EXPECT_LE(totalPages, kNumPartitions);
+  queueManager_->removeTask(sourceTaskId);
 }
 
 TEST_P(UcxExchangeTest, rangePartitionSupportsSlicedStructs) {
