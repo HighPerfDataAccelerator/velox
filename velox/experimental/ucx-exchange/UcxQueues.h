@@ -262,9 +262,10 @@ class UcxOutputQueue : public std::enable_shared_from_this<UcxOutputQueue> {
   // Methods that update the statistics.
   void updateStatsWithEnqueuedLocked(int64_t bytes, int64_t rows);
 
-  // updates the counters and returns promises if the queuedBytes_ counter falls
-  // below the continueSize_ low water mark. These promises then need to be
-  // realized outside the lock.
+  // Updates the counters and returns producer promises that can be resumed.
+  // With producerCreditBytes_ configured, releases at most one producer per
+  // credit-sized queue drain instead of waking every driver at one task-wide
+  // low-water mark.
   void updateStatsWithFreedLocked(
       int64_t bytes,
       int64_t numPackedCols,
@@ -317,6 +318,14 @@ class UcxOutputQueue : public std::enable_shared_from_this<UcxOutputQueue> {
   // When 'queuedBytes_' goes below 'continueSize_', blocked producers are
   // resumed.
   uint64_t continueSize_{0};
+
+  // Optional byte-granular producer wakeup. Zero preserves the legacy
+  // task-wide low-water behavior. A positive value approximates one producer
+  // work unit and prevents a thundering herd of output drivers from resuming
+  // together after the queue drains.
+  uint64_t producerCreditBytes_{0};
+  uint64_t nextProducerWakeupBytes_{0};
+  bool producerWakeupArmed_{false};
 
   // Total number of drivers expected to produce results. This number will
   // decrease in the end of grouped execution, when we understand the real
