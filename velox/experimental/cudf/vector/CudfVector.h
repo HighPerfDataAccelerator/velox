@@ -24,6 +24,7 @@
 
 #include <rmm/cuda_stream_view.hpp>
 
+#include <functional>
 #include <memory>
 #include <utility>
 #include <variant>
@@ -75,6 +76,10 @@ class CudfVector : public RowVector {
 
   ~CudfVector() override;
 
+  void setOnDestroy(std::function<void()> onDestroy) {
+    onDestroy_ = std::make_unique<DestroyCallback>(std::move(onDestroy));
+  }
+
   rmm::cuda_stream_view stream() const {
     return stream_;
   }
@@ -97,11 +102,31 @@ class CudfVector : public RowVector {
   uint64_t estimateFlatSize() const override;
 
  private:
+  struct DestroyCallback {
+    explicit DestroyCallback(std::function<void()> callback)
+        : callback{std::move(callback)} {}
+
+    ~DestroyCallback() noexcept {
+      if (callback) {
+        try {
+          callback();
+        } catch (...) {
+        }
+      }
+    }
+
+    std::function<void()> callback;
+  };
+
   struct SharedTableSlice {
     std::shared_ptr<cudf::table> owner;
     cudf::table_view view;
     rmm::cuda_stream_view ownerStream;
   };
+
+  // This declaration precedes tableStorage_ so the table is destroyed before
+  // a cache-read admission is returned to another source driver.
+  std::unique_ptr<DestroyCallback> onDestroy_;
 
   // Storage for either an owned table or packed table.
   // Only one is active at a time - using variant enforces this at compile time.

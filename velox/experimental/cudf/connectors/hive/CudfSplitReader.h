@@ -37,6 +37,7 @@
 #include <cudf/io/parquet_schema.hpp>
 #include <cudf/io/types.hpp>
 
+#include <functional>
 namespace facebook::velox::cudf_velox::connector::hive {
 
 using namespace facebook::velox::connector;
@@ -85,6 +86,8 @@ class CudfSplitReader : public NvtxHelper {
   rmm::cuda_stream_view stream() const {
     return stream_;
   }
+
+  std::function<void()> cachePrefetchFirstLoadAdmissionReleaser() const;
 
  protected:
   // Performs split-specific setup after base reader state is reset.
