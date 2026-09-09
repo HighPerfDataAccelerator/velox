@@ -27,6 +27,7 @@
 
 #include <cudf/filling.hpp>
 #include <cudf/scalar/scalar.hpp>
+#include <cudf/strings/strip.hpp>
 
 #include <folly/Synchronized.h>
 #include <folly/container/F14Map.h>
@@ -114,6 +115,33 @@ class MonotonicallyIncreasingIdFunction : public CudfFunction {
  private:
   int64_t partitionBase_{0};
   std::shared_ptr<MonotonicallyIncreasingIdState> state_;
+};
+
+class TrimFunction : public CudfFunction {
+ public:
+  explicit TrimFunction(const core::TypedExprPtr& expr) {
+    VELOX_CHECK_EQ(expr->inputs().size(), 1, "trim expects one input");
+    VELOX_CHECK(
+        expr->inputs()[0]->type()->kind() == TypeKind::VARCHAR,
+        "trim input must be VARCHAR");
+    VELOX_CHECK(
+        expr->type()->kind() == TypeKind::VARCHAR,
+        "trim output must be VARCHAR");
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    VELOX_CHECK_EQ(inputColumns.size(), 1, "trim expects one input column");
+    cudf::string_scalar space(" ", true, stream, mr);
+    return cudf::strings::strip(
+        cudf::strings_column_view(asView(inputColumns[0])),
+        cudf::strings::side_type::BOTH,
+        space,
+        stream,
+        mr);
+  }
 };
 
 void registerSparkArrayAccessFunctions(const std::string& prefix) {
@@ -223,6 +251,16 @@ void registerSparkFunctions(const std::string& prefix) {
         return std::make_shared<MonotonicallyIncreasingIdFunction>(expr);
       },
       {FunctionSignatureBuilder().returnType("bigint").build()});
+
+  registerCudfFunction(
+      prefix + "trim",
+      [](const std::string&,
+         const core::TypedExprPtr& expr,
+         memory::MemoryPool*) { return std::make_shared<TrimFunction>(expr); },
+      {FunctionSignatureBuilder()
+           .returnType("varchar")
+           .argumentType("varchar")
+           .build()});
 
   registerSparkArrayAccessFunctions(prefix);
 }
