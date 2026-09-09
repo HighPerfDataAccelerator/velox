@@ -1643,8 +1643,7 @@ TEST_P(UcxExchangeTest, destinationCoalescingAcrossSourceFlushes) {
         destination,
         exchangeNodeId);
     auto sink = std::make_shared<SinkDriverMock>(sinkTask, 1, nullptr);
-    std::vector<exec::Split> splits{
-        remoteSplit(sourceTaskId, destination)};
+    std::vector<exec::Split> splits{remoteSplit(sourceTaskId, destination)};
     sink->addSplits(splits);
     sinks.push_back(std::move(sink));
   }

@@ -357,8 +357,8 @@ TEST_F(UcxOutputQueueManagerTest, byteCreditWakesProducersGradually) {
           std::to_string(pageBytes).c_str(),
           1),
       0);
-  auto task = createSourceTask(
-      taskId, pool_, UcxTestData::kTestRowType, pageBytes * 2);
+  auto task =
+      createSourceTask(taskId, pool_, UcxTestData::kTestRowType, pageBytes * 2);
   queueManager_->removeTask(taskId);
   queueManager_->initializeTask(
       task,
@@ -367,8 +367,7 @@ TEST_F(UcxOutputQueueManagerTest, byteCreditWakesProducersGradually) {
       2 /* numDrivers */);
   ASSERT_EQ(unsetenv("GLUTEN_UCX_PRODUCER_CREDIT_BYTES"), 0);
 
-  queueManager_->enqueue(
-      taskId, destination, std::move(sample), rows);
+  queueManager_->enqueue(taskId, destination, std::move(sample), rows);
   enqueue(taskId, destination, rows);
   enqueue(taskId, destination, rows);
 
