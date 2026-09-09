@@ -1023,6 +1023,26 @@ TEST_F(AggregationTest, partialAggregationMemoryLimit) {
           .customStats.count("flushRowCount"));
 }
 
+TEST_F(AggregationTest, partialIdentityAggregationFallsBackForUnsupportedAggs) {
+  auto data = makeRowVector({
+      makeFlatVector<int64_t>({1, 1, 2, 2}),
+      makeFlatVector<int64_t>({10, 20, 30, 40}),
+  });
+  createDuckDbTable({data});
+
+  AssertQueryBuilder(duckDbQueryRunner_)
+      .config(
+          cudf_velox::CudfConfig::kCudfPartialIdentityAggregation, true)
+      .plan(
+          PlanBuilder()
+              .values({data})
+              .partialAggregation({"c0"}, {"sum(c1)", "count(0)"})
+              .finalAggregation()
+              .planNode())
+      .assertResults(
+          "SELECT c0, sum(c1), count(*) FROM tmp GROUP BY c0");
+}
+
 TEST_F(AggregationTest, partialAggregationUsesBalancedRunMerges) {
   std::vector<RowVectorPtr> vectors;
   constexpr int32_t kBatches = 8;

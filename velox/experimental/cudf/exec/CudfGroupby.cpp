@@ -1316,19 +1316,23 @@ void CudfGroupby::initialize() {
   }
 
   if (partialIdentityAggregationEnabled_) {
-    VELOX_USER_CHECK(
-        streamingEnabled_ &&
-            std::all_of(
-                aggregators_.begin(),
-                aggregators_.end(),
-                [](const auto& aggregator) {
-                  return aggregator->supportsPartialIdentity();
-                }),
-        "partial identity aggregation currently supports only non-constant "
-        "SUM, MIN, and MAX companion aggregates");
-    LOG(INFO) << "CUDF_GROUPBY_PARTIAL_IDENTITY node=" << diagnosticNodeId_
-              << " state=enabled keys=" << groupingKeyOutputChannels_.size()
-              << " aggregates=" << aggregators_.size();
+    const bool supportsPartialIdentity = streamingEnabled_ &&
+        std::all_of(
+            aggregators_.begin(),
+            aggregators_.end(),
+            [](const auto& aggregator) {
+              return aggregator->supportsPartialIdentity();
+            });
+    if (!supportsPartialIdentity) {
+      LOG(WARNING) << "CUDF_GROUPBY_PARTIAL_IDENTITY node="
+                   << diagnosticNodeId_
+                   << " state=disabled reason=unsupported_aggregation_shape";
+      partialIdentityAggregationEnabled_ = false;
+    } else {
+      LOG(INFO) << "CUDF_GROUPBY_PARTIAL_IDENTITY node=" << diagnosticNodeId_
+                << " state=enabled keys=" << groupingKeyOutputChannels_.size()
+                << " aggregates=" << aggregators_.size();
+    }
   }
 
   if (deviceMemoryDiagnosticsEnabled()) {
