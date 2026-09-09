@@ -60,6 +60,21 @@ class CudfVector : public RowVector {
       std::unique_ptr<cudf::packed_table>&& packedTable,
       rmm::cuda_stream_view stream);
 
+  /// Constructs a zero-copy view over a shared cudf::table. The owner remains
+  /// alive until every slice has been consumed. Destruction orders the
+  /// owner's allocation stream after this slice's final consumer stream so
+  /// asynchronous kernels cannot race the shared buffers' deallocation.
+  CudfVector(
+      velox::memory::MemoryPool* pool,
+      TypePtr type,
+      vector_size_t size,
+      std::shared_ptr<cudf::table> tableOwner,
+      cudf::table_view tableSlice,
+      rmm::cuda_stream_view ownerStream,
+      uint64_t flatSize);
+
+  ~CudfVector() override;
+
   rmm::cuda_stream_view stream() const {
     return stream_;
   }
@@ -82,11 +97,18 @@ class CudfVector : public RowVector {
   uint64_t estimateFlatSize() const override;
 
  private:
+  struct SharedTableSlice {
+    std::shared_ptr<cudf::table> owner;
+    cudf::table_view view;
+    rmm::cuda_stream_view ownerStream;
+  };
+
   // Storage for either an owned table or packed table.
   // Only one is active at a time - using variant enforces this at compile time.
   using TableStorage = std::variant<
       std::unique_ptr<cudf::table>,
-      std::unique_ptr<cudf::packed_table>>;
+      std::unique_ptr<cudf::packed_table>,
+      SharedTableSlice>;
   TableStorage tableStorage_;
 
   // Table view - always valid, points to either table_->view() or

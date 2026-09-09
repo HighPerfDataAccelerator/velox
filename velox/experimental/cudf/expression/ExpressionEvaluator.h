@@ -203,6 +203,9 @@ class FunctionExpression : public CudfExpression {
       rmm::device_async_resource_ref mr);
 
   core::TypedExprPtr expr_;
+  // Materialized one-row value for a standalone complex constant projection.
+  // Scalar constants are handled by AST expressions or inlined by functions.
+  VectorPtr constantValue_;
   std::shared_ptr<CudfFunction> function_;
   std::vector<std::shared_ptr<CudfExpression>> subexpressions_;
   // Index of the dereferenced field inside its parent ROW for nested

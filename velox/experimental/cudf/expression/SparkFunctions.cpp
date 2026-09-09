@@ -206,6 +206,22 @@ void registerSparkFunctions(const std::string& prefix) {
       sparksql::HashFunction::canEvaluate);
 
   registerCudfFunction(
+      prefix + "xxhash64_with_seed",
+      [](const std::string&,
+         const core::TypedExprPtr& expr,
+         memory::MemoryPool* pool) {
+        return std::make_shared<sparksql::HashFunction>(expr, pool);
+      },
+      {FunctionSignatureBuilder()
+           .returnType("bigint")
+           .constantArgumentType("bigint")
+           .argumentType("any")
+           .variableArity("any")
+           .build()},
+      true,
+      sparksql::HashFunction::canEvaluate);
+
+  registerCudfFunction(
       prefix + "date_add",
       [](const std::string&,
          const core::TypedExprPtr& expr,

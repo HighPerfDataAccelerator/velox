@@ -23,6 +23,7 @@
 #include "velox/experimental/cudf/tests/utils/CudfHiveConnectorTestBase.h"
 #include "velox/experimental/cudf/tests/utils/CudfPlanBuilder.h"
 
+#include "folly/ScopeGuard.h"
 #include "folly/dynamic.h"
 #include "velox/common/base/Fs.h"
 #include "velox/common/testutil/TempDirectoryPath.h"
@@ -39,6 +40,7 @@
 #include <re2/re2.h>
 
 #include <string>
+#include <unordered_set>
 
 using namespace facebook::velox;
 using namespace facebook::velox::core;
@@ -597,6 +599,113 @@ class TableWriteTest : public CudfHiveConnectorTestBase {
 
 class BasicTableWriteTest : public CudfHiveConnectorTestBase {};
 
+TEST_F(BasicTableWriteTest, coalescesDeviceInputBeforeWrite) {
+  constexpr vector_size_t kRowsPerBatch = 1'024;
+  constexpr int32_t kInputBatches = 8;
+  std::vector<RowVectorPtr> data;
+  data.reserve(kInputBatches);
+  for (int32_t batch = 0; batch < kInputBatches; ++batch) {
+    data.push_back(makeRowVector(
+        {makeFlatVector<int64_t>(kRowsPerBatch, [batch](auto row) {
+          return batch * kRowsPerBatch + row;
+        })}));
+  }
+
+  auto generator = std::make_shared<core::PlanNodeIdGenerator>();
+  std::vector<core::PlanNodePtr> sources;
+  sources.reserve(data.size());
+  for (const auto& batch : data) {
+    sources.push_back(PlanBuilder(generator).values({batch}).planNode());
+  }
+  auto fragmentedSource =
+      PlanBuilder(generator).localPartitionRoundRobin(sources).planNode();
+
+  auto targetDirectoryPath = TempDirectoryPath::create();
+  core::PlanNodeId tableWriteNodeId;
+  auto plan = PlanBuilder(generator)
+                  .addNode([&](auto, auto) { return fragmentedSource; })
+                  .addNode(cudfTableWrite(targetDirectoryPath->getPath()))
+                  .capturePlanNodeId(tableWriteNodeId)
+                  .planNode();
+
+  std::shared_ptr<Task> task;
+  auto results =
+      AssertQueryBuilder(plan)
+          .config(CudfConfig::kCudfTableWriteConcatEnabled, "true")
+          .config(
+              CudfConfig::kCudfExchangeBatchSizeMinThreshold,
+              std::to_string(4 * kRowsPerBatch))
+          // A tiny exchange target must not fragment writer input when the
+          // writer-specific byte target is explicitly disabled.
+          .config(CudfConfig::kCudfExchangeBatchSizeMinThresholdBytes, "1")
+          .config(CudfConfig::kCudfTableWriteConcatBytes, "0")
+          .copyResults(pool(), task);
+  ASSERT_EQ(results->size(), 2);
+
+  const auto planStats = toPlanStats(task->taskStats());
+  const auto& nodeStats = planStats.at(tableWriteNodeId);
+  const auto concatIt = nodeStats.operatorStats.find("CudfBatchConcat");
+  ASSERT_NE(concatIt, nodeStats.operatorStats.end());
+  EXPECT_EQ(concatIt->second->inputVectors, kInputBatches);
+  EXPECT_EQ(concatIt->second->outputVectors, 2);
+
+  const auto writerIt = nodeStats.operatorStats.find("TableWrite");
+  ASSERT_NE(writerIt, nodeStats.operatorStats.end());
+  EXPECT_EQ(writerIt->second->inputVectors, 2);
+  EXPECT_EQ(writerIt->second->inputRows, kInputBatches * kRowsPerBatch);
+}
+
+TEST_F(BasicTableWriteTest, localFinalLanesGatherIntoSingleWriter) {
+  constexpr vector_size_t kRowsPerBatch = 1'024;
+  constexpr int32_t kInputBatches = 8;
+  std::vector<RowVectorPtr> data;
+  data.reserve(kInputBatches);
+  for (int32_t batch = 0; batch < kInputBatches; ++batch) {
+    data.push_back(makeRowVector(
+        {makeFlatVector<int64_t>(kRowsPerBatch, [batch](auto row) {
+          return batch * kRowsPerBatch + row;
+        })}));
+  }
+
+  auto targetDirectoryPath = TempDirectoryPath::create();
+  core::PlanNodeId parallelProjectNodeId;
+  core::PlanNodeId tableWriteNodeId;
+  auto plan = PlanBuilder()
+                  .values(data)
+                  .localPartition({"c0"})
+                  .project({"c0"})
+                  .capturePlanNodeId(parallelProjectNodeId)
+                  .localGather()
+                  .addNode(cudfTableWrite(targetDirectoryPath->getPath()))
+                  .capturePlanNodeId(tableWriteNodeId)
+                  .planNode();
+
+  std::shared_ptr<Task> task;
+  auto results =
+      AssertQueryBuilder(plan)
+          .maxDrivers(4)
+          .config(CudfConfig::kCudfTableWriteConcatEnabled, "true")
+          .config(
+              CudfConfig::kCudfExchangeBatchSizeMinThreshold,
+              std::to_string(4 * kRowsPerBatch))
+          .config(CudfConfig::kCudfExchangeBatchSizeMinThresholdBytes, "0")
+          .copyResults(pool(), task);
+  ASSERT_EQ(results->size(), 2);
+
+  const auto planStats = toPlanStats(task->taskStats());
+  EXPECT_EQ(planStats.at(parallelProjectNodeId).numDrivers, 4);
+
+  const auto& writeStats = planStats.at(tableWriteNodeId);
+  const auto concatIt = writeStats.operatorStats.find("CudfBatchConcat");
+  ASSERT_NE(concatIt, writeStats.operatorStats.end());
+  EXPECT_EQ(concatIt->second->numDrivers, 1);
+
+  const auto writerIt = writeStats.operatorStats.find("TableWrite");
+  ASSERT_NE(writerIt, writeStats.operatorStats.end());
+  EXPECT_EQ(writerIt->second->numDrivers, 1);
+  EXPECT_EQ(writerIt->second->inputRows, kInputBatches * kRowsPerBatch);
+}
+
 TEST_F(BasicTableWriteTest, roundTrip) {
   vector_size_t size = 1'000;
   auto data = makeRowVector({
@@ -638,7 +747,7 @@ TEST_F(BasicTableWriteTest, roundTrip) {
                      ->as<FlatVector<StringView>>();
   ASSERT_TRUE(details->isNullAt(0));
   ASSERT_FALSE(details->isNullAt(1));
-  folly::dynamic obj = folly::parseJson(details->valueAt(1));
+  folly::dynamic obj = folly::parseJson(std::string_view(details->valueAt(1)));
 
   ASSERT_EQ(size, obj["rowCount"].asInt());
   auto fileWriteInfos = obj["fileWriteInfos"];
@@ -679,7 +788,7 @@ TEST_F(BasicTableWriteTest, targetFileName) {
   auto results = AssertQueryBuilder(plan).copyResults(pool());
   auto* details = results->childAt(TableWriteTraits::kFragmentChannel)
                       ->asUnchecked<SimpleVector<StringView>>();
-  auto detail = folly::parseJson(details->valueAt(1));
+  auto detail = folly::parseJson(std::string_view(details->valueAt(1)));
   auto fileWriteInfos = detail["fileWriteInfos"];
   ASSERT_EQ(1, fileWriteInfos.size());
   ASSERT_EQ(fileWriteInfos[0]["writeFileName"].asString(), kFileName);
@@ -693,6 +802,119 @@ TEST_F(BasicTableWriteTest, targetFileName) {
       .split(makeCudfHiveConnectorSplit(
           fmt::format("{}/{}", directory->getPath(), kFileName)))
       .assertResults(data);
+}
+
+TEST_F(BasicTableWriteTest, parallelDirectWriteAddsLaneToTargetFileName) {
+  ASSERT_EQ(setenv("GLUTEN_CUDF_PARALLEL_DIRECT_WRITE_LANES", "4", 1), 0);
+  SCOPE_EXIT {
+    unsetenv("GLUTEN_CUDF_PARALLEL_DIRECT_WRITE_LANES");
+  };
+
+  constexpr const char* kFileName = "test.snappy.parquet";
+  constexpr const char* kLaneFileName = "test.snappy-flux-lane-00.parquet";
+  auto data = makeRowVector({makeFlatVector<int64_t>(10, folly::identity)});
+  auto directory = TempDirectoryPath::create();
+  auto plan = PlanBuilder()
+                  .values({data})
+                  .addNode(cudfTableWrite(
+                      directory->getPath(),
+                      dwio::common::FileFormat::PARQUET,
+                      {},
+                      nullptr,
+                      kFileName))
+                  .planNode();
+
+  auto results = AssertQueryBuilder(plan).copyResults(pool());
+  auto* details = results->childAt(TableWriteTraits::kFragmentChannel)
+                      ->asUnchecked<SimpleVector<StringView>>();
+  auto detail = folly::parseJson(std::string_view(details->valueAt(1)));
+  auto fileWriteInfos = detail["fileWriteInfos"];
+  ASSERT_EQ(1, fileWriteInfos.size());
+  ASSERT_EQ(fileWriteInfos[0]["writeFileName"].asString(), kLaneFileName);
+
+  plan = PlanBuilder()
+             .startTableScan()
+             .outputType(asRowType(data->type()))
+             .tableHandle(CudfHiveConnectorTestBase::makeTableHandle())
+             .endTableScan()
+             .planNode();
+  AssertQueryBuilder(plan)
+      .split(makeCudfHiveConnectorSplit(
+          fmt::format("{}/{}", directory->getPath(), kLaneFileName)))
+      .assertResults(data);
+}
+
+TEST_F(BasicTableWriteTest, parallelDirectWriteUsesFourLocalLanes) {
+  ASSERT_EQ(setenv("GLUTEN_CUDF_PARALLEL_DIRECT_WRITE_LANES", "4", 1), 0);
+  SCOPE_EXIT {
+    unsetenv("GLUTEN_CUDF_PARALLEL_DIRECT_WRITE_LANES");
+  };
+
+  constexpr vector_size_t kRowsPerBatch = 8'192;
+  constexpr int32_t kInputBatches = 8;
+  constexpr int64_t kTotalRows = kRowsPerBatch * kInputBatches;
+  std::vector<RowVectorPtr> data;
+  data.reserve(kInputBatches);
+  for (int32_t batch = 0; batch < kInputBatches; ++batch) {
+    data.push_back(makeRowVector(
+        {makeFlatVector<int64_t>(kRowsPerBatch, [batch](auto row) {
+          return batch * kRowsPerBatch + row;
+        })}));
+  }
+
+  auto directory = TempDirectoryPath::create();
+  core::PlanNodeId tableWriteNodeId;
+  auto plan = PlanBuilder()
+                  .values(data)
+                  // Model the keyed-FINAL local exchange: one remote owner
+                  // task fans its rows into four device-local pipelines.
+                  .localPartition({"c0"})
+                  .project({"c0"})
+                  .addNode(cudfTableWrite(
+                      directory->getPath(),
+                      dwio::common::FileFormat::PARQUET,
+                      {},
+                      nullptr,
+                      "part.parquet"))
+                  .capturePlanNodeId(tableWriteNodeId)
+                  .planNode();
+
+  std::shared_ptr<Task> task;
+  auto results =
+      AssertQueryBuilder(plan).maxDrivers(4).copyResults(pool(), task);
+
+  const auto planStats = toPlanStats(task->taskStats());
+  const auto& writeStats = planStats.at(tableWriteNodeId);
+  const auto writerIt = writeStats.operatorStats.find("TableWrite");
+  ASSERT_NE(writerIt, writeStats.operatorStats.end());
+  EXPECT_EQ(writerIt->second->numDrivers, 4);
+  EXPECT_EQ(writerIt->second->inputRows, kTotalRows);
+
+  int64_t writtenRows = 0;
+  std::unordered_set<std::string> fileNames;
+  auto* rowCounts = results->childAt(TableWriteTraits::kRowCountChannel)
+                        ->asUnchecked<SimpleVector<int64_t>>();
+  auto* details = results->childAt(TableWriteTraits::kFragmentChannel)
+                      ->asUnchecked<SimpleVector<StringView>>();
+  for (vector_size_t row = 0; row < results->size(); ++row) {
+    if (!rowCounts->isNullAt(row)) {
+      writtenRows += rowCounts->valueAt(row);
+    }
+    if (!details->isNullAt(row)) {
+      auto detail = folly::parseJson(std::string_view(details->valueAt(row)));
+      auto fileWriteInfos = detail["fileWriteInfos"];
+      ASSERT_EQ(fileWriteInfos.size(), 1);
+      fileNames.insert(fileWriteInfos[0]["writeFileName"].asString());
+    }
+  }
+  EXPECT_EQ(writtenRows, kTotalRows);
+  ASSERT_EQ(fileNames.size(), 4);
+  for (const auto& fileName : fileNames) {
+    EXPECT_NE(fileName.find("-flux-lane-"), std::string::npos);
+    EXPECT_TRUE(
+        std::filesystem::exists(
+            std::filesystem::path(directory->getPath()) / fileName));
+  }
 }
 
 class UnpartitionedTableWriterTest

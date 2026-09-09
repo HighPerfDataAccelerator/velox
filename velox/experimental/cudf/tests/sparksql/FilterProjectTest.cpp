@@ -182,6 +182,7 @@ TEST_F(CudfFilterProjectTest, sparkExpressionParity) {
            "regexp_extract(c2, '(.*?) android', 1)",
            "regexp_extract(c2, 'android', 0)",
            "array_constructor(c1, add(c1, 1), 7)",
+           "pmod(c0, cast(5 as bigint))",
        }) {
     SCOPED_TRACE(expression);
     assertExpressionMatchesCpu(expression, input, input->rowType());

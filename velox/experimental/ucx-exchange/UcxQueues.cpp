@@ -18,6 +18,7 @@
 #include "velox/experimental/cudf/exec/GpuResources.h"
 
 #include <atomic>
+#include <cstdlib>
 #include <limits>
 #include <sstream>
 
@@ -27,6 +28,20 @@ namespace {
 std::atomic<int64_t> diagnosticGlobalQueuedBytes{0};
 std::atomic<int64_t> diagnosticGlobalQueuedColumns{0};
 std::atomic<int64_t> diagnosticGlobalQueueGiB{0};
+
+uint64_t producerCreditBytes() {
+  const char* value = std::getenv("GLUTEN_UCX_PRODUCER_CREDIT_BYTES");
+  if (value == nullptr) {
+    return 0;
+  }
+  try {
+    return std::stoull(value);
+  } catch (...) {
+    LOG(WARNING) << "Ignoring invalid GLUTEN_UCX_PRODUCER_CREDIT_BYTES="
+                 << value;
+    return 0;
+  }
+}
 
 void updateDiagnosticGlobalQueue(
     int64_t bytes,
@@ -259,7 +274,10 @@ UcxOutputQueue::UcxOutputQueue(
     uint32_t numDestinations,
     uint32_t numDrivers,
     core::PartitionedOutputNode::Kind kind)
-    : task_(task), kind_(kind), numDrivers_(numDrivers) {
+    : task_(task),
+      kind_(kind),
+      producerCreditBytes_(producerCreditBytes()),
+      numDrivers_(numDrivers) {
   if (task_) {
     maxSize_ = task_->queryCtx()->queryConfig().maxOutputBufferSize();
     continueSize_ = (maxSize_ * kContinuePct) / 100;
@@ -375,6 +393,15 @@ bool UcxOutputQueue::checkBlocked(ContinueFuture* future) {
             << " waitingProducers=" << (promises_.size() + 1);
     promises_.emplace_back("UcxOutputQueue::checkBlocked");
     *future = promises_.back().getSemiFuture();
+    if (producerCreditBytes_ > 0) {
+      // Refresh the next grant from the latest high-water point. Concurrent
+      // producers may overshoot the soft task cap before observing it; using
+      // the current occupancy keeps subsequent grants one work unit apart.
+      nextProducerWakeupBytes_ = queuedBytes_ > producerCreditBytes_
+          ? queuedBytes_ - producerCreditBytes_
+          : 0;
+      producerWakeupArmed_ = true;
+    }
     return true;
   }
   return false;
@@ -779,9 +806,28 @@ void UcxOutputQueue::updateStatsWithFreedLocked(
   updateDiagnosticGlobalQueue(-bytes, -numPackedCols, "dequeue", task_);
   logDeviceQueueResidencyLocked("dequeue");
 
-  // Check whether queue is below low-water mark and return outstanding
-  // promises
-  if (queuedBytes_ <= continueSize_ && !promises_.empty()) {
+  if (producerCreditBytes_ > 0 && producerWakeupArmed_ &&
+      queuedBytes_ <= nextProducerWakeupBytes_ && !promises_.empty()) {
+    // Grant exactly one producer for each credit-sized drain. Keeping the
+    // remaining promises parked avoids the task-wide stop/start wave that is
+    // especially visible with many GPU output drivers.
+    VLOG(2) << "[BACKPRESSURE] task=" << (task_ ? task_->taskId() : "n/a")
+            << " CREDIT-UNBLOCKING 1 producer"
+            << " queuedBytes=" << queuedBytes_
+            << " creditBytes=" << producerCreditBytes_
+            << " waitingProducers=" << promises_.size();
+    promises.push_back(std::move(promises_.back()));
+    promises_.pop_back();
+    if (promises_.empty()) {
+      producerWakeupArmed_ = false;
+    } else {
+      nextProducerWakeupBytes_ = queuedBytes_ > producerCreditBytes_
+          ? queuedBytes_ - producerCreditBytes_
+          : 0;
+    }
+  } else if (
+      producerCreditBytes_ == 0 && queuedBytes_ <= continueSize_ &&
+      !promises_.empty()) {
     VLOG(2) << "[BACKPRESSURE] task=" << (task_ ? task_->taskId() : "n/a")
             << " UNBLOCKING " << promises_.size() << " producers"
             << " queuedBytes=" << queuedBytes_

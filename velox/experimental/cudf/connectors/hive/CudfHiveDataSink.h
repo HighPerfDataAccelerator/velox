@@ -347,6 +347,7 @@ class CudfHiveDataSink : public DataSink {
   // Below are structures for partitions from all inputs. writerInfo_ and
   // writers_ are both indexed by partitionId.
   std::unique_ptr<cudf::io::chunked_parquet_writer> writer_;
+  std::optional<rmm::cuda_stream_view> writerStream_;
 
   std::vector<cudf::io::sorting_column> sortingColumns_;
 

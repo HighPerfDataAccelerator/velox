@@ -86,6 +86,17 @@ class OperatorAdapter {
       exec::DriverCtx* ctx,
       int32_t operatorId) const = 0;
 
+  /// Create GPU input operators to insert immediately before an original
+  /// operator retained by keepOperator(). Most retained operators do not need
+  /// an input adapter and use the empty default.
+  virtual std::vector<std::unique_ptr<exec::Operator>> createInputAdapters(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& /*planNode*/,
+      exec::DriverCtx* /*ctx*/,
+      int32_t /*operatorId*/) const {
+    return {};
+  }
+
   /// Check if the original operator should be kept (not replaced). Returns
   /// true if the original operator should be kept, false otherwise.
   virtual bool keepOperator() const {
@@ -133,5 +144,13 @@ class OperatorAdapterRegistry {
 /// This function should be called from registerCudf() to register all
 /// operator adapters with the registry.
 void registerAllOperatorAdapters();
+
+/// Registers the already-wired remote task URLs with a UCX exchange client
+/// without consuming the Task's RemoteConnectorSplits. Returns false if the
+/// exchange operator has not been created or was not replaced by UCX.
+bool primeUcxExchangeClient(
+    const std::string& taskId,
+    const core::PlanNodeId& planNodeId,
+    const std::vector<std::string>& remoteTaskIds);
 
 } // namespace facebook::velox::cudf_velox

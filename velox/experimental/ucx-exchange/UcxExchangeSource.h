@@ -36,16 +36,32 @@
 #include <rmm/mr/cuda_memory_resource.hpp>
 #include <rmm/mr/pool_memory_resource.hpp>
 
+#include <chrono>
+
 namespace facebook::velox::ucx_exchange {
 
 struct UcxExchangeMetrics {
   UcxExchangeMetrics()
       : numPackedColumns_(RuntimeMetric(RuntimeCounter::Unit::kNone)),
         totalBytes_(RuntimeCounter::Unit::kBytes),
-        rttPerRequest_(RuntimeMetric(RuntimeCounter::Unit::kNanos)) {}
+        rttPerRequest_(RuntimeCounter::Unit::kNanos),
+        metadataWaitNanos_(RuntimeCounter::Unit::kNanos),
+        receiveAllocationNanos_(RuntimeCounter::Unit::kNanos),
+        dataWaitNanos_(RuntimeCounter::Unit::kNanos),
+        asyncHostCopyBytes_(RuntimeCounter::Unit::kBytes),
+        hostCopyWaitNanos_(RuntimeCounter::Unit::kNanos),
+        metadataCallbackNanos_(RuntimeCounter::Unit::kNanos),
+        dataCallbackNanos_(RuntimeCounter::Unit::kNanos) {}
   RuntimeMetric numPackedColumns_; // total number of packed columns received.
   RuntimeMetric totalBytes_; // total number of bytes received
   RuntimeMetric rttPerRequest_;
+  RuntimeMetric metadataWaitNanos_;
+  RuntimeMetric receiveAllocationNanos_;
+  RuntimeMetric dataWaitNanos_;
+  RuntimeMetric asyncHostCopyBytes_;
+  RuntimeMetric hostCopyWaitNanos_;
+  RuntimeMetric metadataCallbackNanos_;
+  RuntimeMetric dataCallbackNanos_;
 };
 
 /// The UcxExchangeSource is the client that communicates with the remote
@@ -72,6 +88,7 @@ class UcxExchangeSource
     WaitingForMetadata,
     WaitingForReceiveCredit,
     WaitingForData,
+    WaitingForHostStage,
     WaitingForIntraNodeData,
     Done,
   };
@@ -163,7 +180,19 @@ class UcxExchangeSource
     MetadataMsg metadata;
     std::unique_ptr<rmm::device_buffer> dataBuf;
     std::shared_ptr<std::vector<uint8_t>> hostData;
+    std::shared_ptr<uint8_t> pinnedHostData;
+    cudaEvent_t hostStageEvent{nullptr};
+    std::chrono::steady_clock::time_point hostStageStart{};
     rmm::cuda_stream_view stream; // The stream used to allocate dataBuf
+
+    ~DataAndMetadata() {
+      if (hostStageEvent != nullptr) {
+        // Cancellation may destroy the request while H2D is still using the
+        // pinned source. Preserve its lifetime before returning it to the pool.
+        cudaEventSynchronize(hostStageEvent);
+        cudaEventDestroy(hostStageEvent);
+      }
+    }
   };
 
   // Metadata receives are strictly serial for a source. Reuse one fixed-size
@@ -239,6 +268,9 @@ class UcxExchangeSource
   /// @param status indication by transport layer of transfer status
   /// @param arg
   void onData(ucs_status_t status, std::shared_ptr<void> arg);
+
+  /// Publishes a received packed page after any host-to-device stage is done.
+  void finishDataReceive(const std::shared_ptr<DataAndMetadata>& ptr);
 
   /// @brief Initiates receiving the HandshakeResponse from server.
   void receiveHandshakeResponse();
@@ -330,11 +362,17 @@ class UcxExchangeSource
   // when the queue drains to kBackpressureLowWaterMark.
   std::atomic<bool> backpressureActive_{false};
   std::shared_ptr<DataAndMetadata> pendingReceive_;
+  std::shared_ptr<DataAndMetadata> pendingHostStage_;
   int64_t reservedReceiveBytes_{0};
   int64_t reservedGlobalHostReceiveBytes_{0};
 
   // Some metrics/counters:
   UcxExchangeMetrics metrics_;
+
+  using Clock = std::chrono::steady_clock;
+  Clock::time_point requestStart_{};
+  Clock::time_point metadataStart_{};
+  Clock::time_point dataStart_{};
 
   // The outstanding request - there can only be one outstanding request
   // at any point in time. Used for handshake, metadata and data.

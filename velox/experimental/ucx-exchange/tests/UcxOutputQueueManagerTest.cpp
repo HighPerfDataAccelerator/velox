@@ -22,6 +22,7 @@
 #include <folly/synchronization/EventCount.h>
 #include <gtest/gtest.h>
 #include <rmm/device_buffer.hpp>
+#include <cstdlib>
 #include <limits>
 #include <memory>
 #include <vector>
@@ -339,6 +340,59 @@ TEST_F(UcxOutputQueueManagerTest, basicPartitioned) {
 
   queueManager_->removeTask(taskId);
   EXPECT_TRUE(task->isFinished());
+}
+
+TEST_F(UcxOutputQueueManagerTest, byteCreditWakesProducersGradually) {
+  const std::string taskId = "byteCreditWakesProducersGradually";
+  const int destination = 0;
+  const vector_size_t rows = 100;
+
+  auto sample = makePackedColumns(rows);
+  const auto pageBytes = sample->gpu_data->size();
+  ASSERT_GT(pageBytes, 0);
+
+  ASSERT_EQ(
+      setenv(
+          "GLUTEN_UCX_PRODUCER_CREDIT_BYTES",
+          std::to_string(pageBytes).c_str(),
+          1),
+      0);
+  auto task =
+      createSourceTask(taskId, pool_, UcxTestData::kTestRowType, pageBytes * 2);
+  queueManager_->removeTask(taskId);
+  queueManager_->initializeTask(
+      task,
+      core::PartitionedOutputNode::Kind::kPartitioned,
+      1 /* numDestinations */,
+      2 /* numDrivers */);
+  ASSERT_EQ(unsetenv("GLUTEN_UCX_PRODUCER_CREDIT_BYTES"), 0);
+
+  queueManager_->enqueue(taskId, destination, std::move(sample), rows);
+  enqueue(taskId, destination, rows);
+  enqueue(taskId, destination, rows);
+
+  ContinueFuture first = ContinueFuture::makeEmpty();
+  ContinueFuture second = ContinueFuture::makeEmpty();
+  ASSERT_TRUE(queueManager_->checkBlocked(taskId, &first));
+  ASSERT_TRUE(queueManager_->checkBlocked(taskId, &second));
+  ASSERT_FALSE(first.isReady());
+  ASSERT_FALSE(second.isReady());
+
+  // One credit-sized dequeue grants only one producer. The implementation is
+  // deliberately LIFO, but the ordering is not part of the contract.
+  fetch(taskId, destination);
+  EXPECT_NE(first.isReady(), second.isReady());
+
+  fetch(taskId, destination);
+  EXPECT_TRUE(first.isReady());
+  EXPECT_TRUE(second.isReady());
+
+  noMoreData(taskId);
+  noMoreData(taskId);
+  fetch(taskId, destination);
+  fetchEndMarker(taskId, destination);
+  queueManager_->deleteResults(taskId, destination);
+  queueManager_->removeTask(taskId);
 }
 
 TEST_F(UcxOutputQueueManagerTest, v1RepeatedFetchAdvancesQueue) {

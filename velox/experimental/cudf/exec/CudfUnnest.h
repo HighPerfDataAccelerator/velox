@@ -25,6 +25,13 @@ namespace facebook::velox::cudf_velox {
 
 class CudfUnnest : public CudfOperatorBase {
  public:
+  // Bound input rows retained by one expanding Unnest output. The pre-Unnest
+  // concat adapter uses the same ceiling so batching cannot silently create a
+  // larger explode work unit than CudfUnnest itself will process.
+  static constexpr cudf::size_type kDefaultMaxInputRowsPerOutput = 262144;
+
+  static cudf::size_type configuredMaxInputRowsPerOutput();
+
   CudfUnnest(
       int32_t operatorId,
       exec::DriverCtx* driverCtx,
@@ -52,6 +59,7 @@ class CudfUnnest : public CudfOperatorBase {
   std::vector<column_index_t> replicateChannels_;
   column_index_t unnestChannel_;
   bool hasOrdinality_;
+  const cudf::size_type maxInputRowsPerOutput_;
   cudf::size_type inputRowOffset_{0};
 };
 

@@ -340,6 +340,23 @@ bool CompileState::compile(bool allowCpuFallback) {
         // adapter is present and keepOperator is 1, so this is GPU compatible
         // operator. so this CPU operators is allowed even if fallback is
         // disabled.
+        if (planNode && thisOpProps.canRunOnGPU) {
+          auto inputAdapters =
+              adapter->createInputAdapters(oper, planNode, ctx, id);
+          if (!inputAdapters.empty()) {
+            const auto numInputAdapters = inputAdapters.size();
+            operatorsOffset += numInputAdapters;
+            [[maybe_unused]] auto replaced = driverFactory_.replaceOperators(
+                driver_,
+                replacingOperatorIndex,
+                replacingOperatorIndex,
+                std::move(inputAdapters));
+            // The retained operator moved right by the number of prepended
+            // adapters. Keep subsequent replacement coordinates on it.
+            replacingOperatorIndex += numInputAdapters;
+            replacementsMade = true;
+          }
+        }
         isPureCpuOperator = false;
       }
     } else {
@@ -608,6 +625,10 @@ void CudfConfig::initialize(
   if (config.find(kCudfExchangeBatchSizeMinThresholdBytes) != config.end()) {
     exchangeBatchSizeMinThresholdBytes =
         folly::to<uint64_t>(config[kCudfExchangeBatchSizeMinThresholdBytes]);
+  }
+  if (config.find(kCudfTableWriteConcatEnabled) != config.end()) {
+    tableWriteConcatEnabled =
+        folly::to<bool>(config[kCudfTableWriteConcatEnabled]);
   }
   if (config.find(kCudfBatchSizeMaxThreshold) != config.end()) {
     batchSizeMaxThreshold =

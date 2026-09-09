@@ -150,6 +150,18 @@ class Communicator {
     return workerId_;
   }
 
+  /// Returns the port of the data-only listener. Connections accepted by this
+  /// listener have peer error handling disabled and never carry AM traffic.
+  [[nodiscard]] uint16_t getDataListenerPort() const;
+
+  /// Returns a per-worker endpoint for bulk TAG sends. Unlike the socket
+  /// control endpoint, this endpoint intentionally disables peer error
+  /// handling so UCX can select CUDA zero-copy rendezvous over SRD.
+  [[nodiscard]] std::shared_ptr<EndpointRef> getOrCreateDataEndpoint(
+      uint64_t remoteWorkerId,
+      std::string_view remoteHost,
+      uint16_t remotePort);
+
   bool isShuttingDown() const {
     return shuttingDown_.load(std::memory_order_acquire);
   }
@@ -179,8 +191,15 @@ class Communicator {
   // Invoked when a client connects to the listener.
   void listenerCallback(ucp_conn_request_h conn_request);
 
+  // Accepts a bulk-data connection with error handling disabled. Data
+  // endpoints carry TAG traffic only, so they don't require an AM reply_ep.
+  void dataListenerCallback(ucp_conn_request_h conn_request);
+
   // Wrapper to map the C-style callback to the listener method.
   static void cStyleListenerCallback(
+      ucp_conn_request_h conn_request,
+      void* arg);
+  static void cStyleDataListenerCallback(
       ucp_conn_request_h conn_request,
       void* arg);
 
@@ -195,6 +214,7 @@ class Communicator {
   std::shared_ptr<ucxx::Context> context_;
   std::shared_ptr<ucxx::Worker> worker_;
   std::shared_ptr<ucxx::Listener> listener_;
+  std::shared_ptr<ucxx::Listener> dataListener_;
   uint16_t port_;
   std::string coordinatorURL_;
   std::atomic<bool> running_{false};
@@ -235,6 +255,14 @@ class Communicator {
 
   // Shared endpoints keyed by remote host:port.
   std::map<HostPort, std::shared_ptr<EndpointRef>> endpoints_;
+
+  // Bulk-data endpoints keyed by the remote communicator's stable worker id.
+  std::map<uint64_t, std::shared_ptr<EndpointRef>> dataEndpoints_;
+
+  // Incoming halves of data-only socket connections. Receives are posted on
+  // the worker by tag, so these need no CommElement association; the owning
+  // references keep the UCP endpoints alive until communicator shutdown.
+  std::vector<std::shared_ptr<ucxx::Endpoint>> incomingDataEndpoints_;
 
   // Signals the UCXX worker to wake up from a blocking
   // progressWorkerEvent() call. Thread-safe. No-op if worker_ is null

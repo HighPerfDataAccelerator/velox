@@ -33,6 +33,8 @@
 
 namespace facebook::velox::ucx_exchange {
 
+struct DataSendContext;
+
 class UcxExchangeServer
     : public CommElement,
       public std::enable_shared_from_this<UcxExchangeServer> {
@@ -44,6 +46,7 @@ class UcxExchangeServer
     DataRequestReady,
     WaitingForDataFromQueue,
     DataReady,
+    WaitingForHostStage,
     WaitingForSendComplete,
     WaitingForIntraNodeRetrieve,
     Done,
@@ -59,7 +62,10 @@ class UcxExchangeServer
   ///        determined by checking if the peer's IP is in the local IP set.
   static std::shared_ptr<UcxExchangeServer> create(
       const std::shared_ptr<Communicator> communicator,
-      std::shared_ptr<EndpointRef> endpointRef,
+      std::shared_ptr<EndpointRef> controlEndpointRef,
+      uint64_t remoteWorkerId,
+      std::string remoteDataHost,
+      uint16_t remoteDataPort,
       const PartitionKey& key,
       bool isIntraNodeTransfer);
 
@@ -81,7 +87,10 @@ class UcxExchangeServer
  private:
   explicit UcxExchangeServer(
       const std::shared_ptr<Communicator> communicator,
-      std::shared_ptr<EndpointRef> endpointRef,
+      std::shared_ptr<EndpointRef> controlEndpointRef,
+      uint64_t remoteWorkerId,
+      std::string remoteDataHost,
+      uint16_t remoteDataPort,
       const PartitionKey& key,
       bool isIntraNodeTransfer);
 
@@ -94,6 +103,10 @@ class UcxExchangeServer
 
   /// @brief Sends metadata and data to the connected receiver.
   void sendData();
+
+  /// Posts a data send after any required device-to-host staging has
+  /// completed. Must run on the communicator thread.
+  void postDataSend(const std::shared_ptr<DataSendContext>& dataCtx);
 
   /// @brief Completion handler after data has been sent.
   void sendComplete(ucs_status_t status, std::shared_ptr<void> arg);
@@ -125,6 +138,18 @@ class UcxExchangeServer
   /// via IntraNodeTransferRegistry instead of UCXX transfer.
   bool isIntraNodeTransfer_{false};
 
+  /// Endpoint used only for bulk metadata/data TAG sends. The inherited
+  /// endpointRef_ remains the peer-error-handled control endpoint.
+  std::shared_ptr<EndpointRef> dataEndpointRef_;
+
+  /// The peer's data listener is advertised in the AM handshake, but the bulk
+  /// endpoint is deliberately created later from process(). Creating an
+  /// endpoint inside a UCX callback re-enters worker progress and can time out
+  /// the control endpoint before its HandshakeResponse is sent.
+  const uint64_t remoteWorkerId_;
+  const std::string remoteDataHost_;
+  const uint16_t remoteDataPort_;
+
   std::atomic<ServerState> state_;
   std::shared_ptr<cudf::packed_columns> dataPtr_{nullptr};
   /// Protects dataPtr_. Must be recursive because sendData() holds the lock
@@ -153,6 +178,12 @@ class UcxExchangeServer
   // and must therefore exist until the upcall is done.
   std::shared_ptr<ucxx::Request> metaRequest_{nullptr};
   std::shared_ptr<ucxx::Request> dataRequest_{nullptr};
+
+  // Retains an asynchronously staged payload between the CUDA stream callback
+  // and the communicator-thread UCX send. The CUDA callback owns another
+  // reference, so closing the server cannot free pinned memory while the copy
+  // is still in flight.
+  std::shared_ptr<DataSendContext> pendingDataSend_{nullptr};
 
   // Completed UCXX requests are kept alive here to prevent use-after-free.
   // UCP's ucp_wireup_replay_pending_requests can fire callbacks on already-

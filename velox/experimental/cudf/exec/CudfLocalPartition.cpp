@@ -303,24 +303,33 @@ void CudfLocalPartition::doAddInput(RowVectorPtr input) {
 
     auto partitionedTables =
         cudf::split(partitionedTable->view(), partitionOffsets, stream);
+    auto sharedPartitionedTable =
+        std::shared_ptr<cudf::table>(std::move(partitionedTable));
+    const auto inputFlatSize = cudfVector->estimateFlatSize();
+    const auto inputRows = cudfVector->size();
 
-    // DM: We should investigate if keeping partitionedTables alive and using
-    // the table view in partitionData is more efficient than creating a new
-    // table each time. Currently out of scope because it would need a new
-    // type of RowVector that can hold a table view and shared_ptr to the
-    // table.
+    // hash_partition already materialized one partition-ordered table. Keep
+    // that table shared and enqueue non-owning slices instead of deep-copying
+    // every partition a second time. CudfVector orders owner deallocation
+    // after each lane's final consumer stream.
     for (int i = 0; i < numPartitions_; ++i) {
       auto partitionData = partitionedTables[i];
       if (partitionData.num_rows() == 0) {
         continue;
       }
 
+      const auto partitionFlatSize = static_cast<uint64_t>(
+          static_cast<unsigned __int128>(inputFlatSize) *
+          partitionData.num_rows() / inputRows);
+
       auto partitionCudfVector = std::make_shared<CudfVector>(
           pool(),
           outputType_,
           partitionData.num_rows(),
-          std::make_unique<cudf::table>(partitionData, stream, get_output_mr()),
-          stream);
+          sharedPartitionedTable,
+          partitionData,
+          stream,
+          partitionFlatSize);
       enqueuePartition(i, partitionCudfVector);
     }
   } else {

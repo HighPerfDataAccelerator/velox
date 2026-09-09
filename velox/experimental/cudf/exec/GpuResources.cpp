@@ -23,6 +23,7 @@
 #include <cudf/utilities/prefetch.hpp>
 
 #include <rmm/mr/arena_memory_resource.hpp>
+#include <rmm/mr/binning_memory_resource.hpp>
 #include <rmm/mr/cuda_async_managed_memory_resource.hpp>
 #include <rmm/mr/cuda_async_memory_resource.hpp>
 #include <rmm/mr/cuda_memory_resource.hpp>
@@ -281,7 +282,21 @@ cuda::mr::any_resource<cuda::mr::device_accessible> createMemoryResource(
     std::string_view mode,
     int percent) {
   const auto registration = beginMemoryResourceRegistration();
-  if (mode == "cuda") {
+  const auto* cudaBinningValue =
+      std::getenv("GLUTEN_CUDF_CUDA_SMALL_ALLOCATION_BINNING");
+  const bool useCudaBinning = mode == "binning" ||
+      (mode == "cuda" && cudaBinningValue != nullptr &&
+       std::string_view{cudaBinningValue} == "1");
+  if (useCudaBinning) {
+    // Cache the short-lived small allocations that otherwise serialize on
+    // cudaMalloc/cudaFree, while allowing large scan and exchange allocations
+    // to fall through to cuda_memory_resource.  The 4 KiB..4 MiB geometric
+    // bins preallocate roughly 1 GiB in total and grow only to the observed
+    // high-water mark of each small size class.  In particular, unlike arena,
+    // this resource does not impose a fixed maximum on multi-GiB allocations.
+    return rmm::mr::binning_memory_resource(
+        rmm::mr::cuda_memory_resource{}, 12, 22);
+  } else if (mode == "cuda") {
     return rmm::mr::cuda_memory_resource{};
   } else if (mode == "pool") {
     return rmm::mr::pool_memory_resource(
@@ -328,7 +343,7 @@ cuda::mr::any_resource<cuda::mr::device_accessible> createMemoryResource(
   }
   VELOX_FAIL(
       "Unknown memory resource mode: " + std::string(mode) +
-      "\nExpecting: cuda, pool, async, arena, managed, prefetch_managed, " +
+      "\nExpecting: cuda, binning, pool, async, arena, managed, prefetch_managed, " +
       "managed_pool, prefetch_managed_pool, managed_async, prefetch_managed_async");
 }
 

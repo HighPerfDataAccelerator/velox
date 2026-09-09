@@ -108,6 +108,38 @@ void logDefaultStreamIfNeeded(
                << process::StackTrace().toString();
 }
 
+// Makes future work, including deallocation, on ownerStream wait until all
+// work already submitted to consumerStream has completed. CUDA event
+// destruction is asynchronous with respect to recorded device work.
+void orderOwnerAfterConsumer(
+    rmm::cuda_stream_view ownerStream,
+    rmm::cuda_stream_view consumerStream) noexcept {
+  if (ownerStream.value() == consumerStream.value()) {
+    return;
+  }
+
+  cudaEvent_t event{};
+  auto status = cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
+  if (status == cudaSuccess) {
+    status = cudaEventRecord(event, consumerStream.value());
+  }
+  if (status == cudaSuccess) {
+    status = cudaStreamWaitEvent(ownerStream.value(), event, 0);
+  }
+  if (event != nullptr) {
+    const auto destroyStatus = cudaEventDestroy(event);
+    if (status == cudaSuccess) {
+      status = destroyStatus;
+    }
+  }
+  if (status != cudaSuccess) {
+    LOG(ERROR) << "Failed to order shared cuDF table deallocation after "
+               << "consumer stream: " << cudaGetErrorString(status)
+               << "; synchronizing the consumer stream as a safety fallback";
+    cudaStreamSynchronize(consumerStream.value());
+  }
+}
+
 } // namespace
 
 CudfVector::CudfVector(
@@ -156,12 +188,52 @@ CudfVector::CudfVector(
   flatSize_ = packedPtr->data.gpu_data->size();
 }
 
+CudfVector::CudfVector(
+    velox::memory::MemoryPool* pool,
+    TypePtr type,
+    vector_size_t size,
+    std::shared_ptr<cudf::table> tableOwner,
+    cudf::table_view tableSlice,
+    rmm::cuda_stream_view ownerStream,
+    uint64_t flatSize)
+    : RowVector(
+          pool,
+          std::move(type),
+          BufferPtr(nullptr),
+          size,
+          std::vector<VectorPtr>(),
+          std::nullopt),
+      tableStorage_{
+          SharedTableSlice{std::move(tableOwner), tableSlice, ownerStream}},
+      tabView_{tableSlice},
+      stream_{ownerStream},
+      flatSize_{flatSize} {
+  logDefaultStreamIfNeeded(stream_, "CudfVector(shared_table_slice)");
+  VELOX_CHECK_NOT_NULL(
+      std::get<SharedTableSlice>(tableStorage_).owner,
+      "Shared cuDF table slice requires an owner");
+}
+
+CudfVector::~CudfVector() {
+  if (auto* shared = std::get_if<SharedTableSlice>(&tableStorage_);
+      shared != nullptr && shared->owner != nullptr) {
+    orderOwnerAfterConsumer(shared->ownerStream, stream_);
+  }
+}
+
 std::unique_ptr<cudf::table> CudfVector::release() {
   flatSize_ = 0;
   if (auto* tablePtr =
           std::get_if<std::unique_ptr<cudf::table>>(&tableStorage_)) {
     // Constructed from owned table - just move it out
     return std::move(*tablePtr);
+  }
+  if (auto* shared = std::get_if<SharedTableSlice>(&tableStorage_)) {
+    auto materializedTable =
+        std::make_unique<cudf::table>(tabView_, stream_, get_temp_mr());
+    orderOwnerAfterConsumer(shared->ownerStream, stream_);
+    shared->owner.reset();
+    return materializedTable;
   }
   // Constructed from packed_table - materialize a table from the view.
   // This copies the data since the view references the packed buffer.
@@ -206,6 +278,14 @@ bool CudfVector::rebindStream(rmm::cuda_stream_view stream) {
     }
 
     (*packedPtr)->data.gpu_data->set_stream(stream);
+    stream_ = stream;
+    return true;
+  }
+
+  if (auto* shared = std::get_if<SharedTableSlice>(&tableStorage_)) {
+    if (!shared->owner) {
+      return false;
+    }
     stream_ = stream;
     return true;
   }

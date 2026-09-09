@@ -1138,6 +1138,92 @@ TEST_F(AggregationTest, partialIdentityDoesNotRequireStreamingCapacity) {
       .assertResults("SELECT c0, sum(c1), min(c1) FROM tmp GROUP BY c0");
 }
 
+TEST_F(AggregationTest, partialIdentityCollectList) {
+  auto vectors = {
+      makeRowVector(
+          {makeFlatVector<int64_t>({1, 1, 2}),
+           makeFlatVector<int64_t>({10, 20, 30})}),
+      makeRowVector(
+          {makeFlatVector<int64_t>({1, 2, 2}),
+           makeFlatVector<int64_t>({40, 50, 60})}),
+  };
+  createDuckDbTable(vectors);
+
+  auto plan = PlanBuilder()
+                  .values(vectors)
+                  .partialAggregation({"c0"}, {"array_agg(c1)"})
+                  .finalAggregation()
+                  .planNode();
+  AssertQueryBuilder(duckDbQueryRunner_)
+      .config(cudf_velox::CudfConfig::kCudfPartialIdentityAggregation, "true")
+      .plan(plan)
+      .assertResults("SELECT c0, array_agg(c1) FROM tmp GROUP BY c0");
+}
+
+TEST_F(AggregationTest, uniqueFinalCollectListPassThroughAndDuplicateFallback) {
+  const auto* previous = std::getenv("GLUTEN_CUDF_ONE_SHOT_FINAL_COLLECT_LIST");
+  const std::optional<std::string> previousValue = previous == nullptr
+      ? std::nullopt
+      : std::make_optional<std::string>(previous);
+  ASSERT_EQ(setenv("GLUTEN_CUDF_ONE_SHOT_FINAL_COLLECT_LIST", "1", 1), 0);
+  SCOPE_EXIT {
+    if (previousValue.has_value()) {
+      setenv(
+          "GLUTEN_CUDF_ONE_SHOT_FINAL_COLLECT_LIST", previousValue->c_str(), 1);
+    } else {
+      unsetenv("GLUTEN_CUDF_ONE_SHOT_FINAL_COLLECT_LIST");
+    }
+  };
+
+  const auto run = [&](const std::vector<RowVectorPtr>& vectors,
+                       bool expectPassThrough) {
+    createDuckDbTable(vectors);
+    core::PlanNodeId finalAggId;
+    auto task =
+        AssertQueryBuilder(duckDbQueryRunner_)
+            .config(
+                cudf_velox::CudfConfig::kCudfGroupbyStreamingMaxDistinctKeys,
+                "0")
+            .config(
+                cudf_velox::CudfConfig::kCudfPartialIdentityAggregation, "true")
+            .maxDrivers(1)
+            .plan(
+                PlanBuilder()
+                    .values(vectors)
+                    .partialAggregation({"c0"}, {"array_agg(c1)"})
+                    .finalAggregation()
+                    .capturePlanNodeId(finalAggId)
+                    .planNode())
+            .assertResults("SELECT c0, array_agg(c1) FROM tmp GROUP BY c0");
+    const auto& stats =
+        toPlanStats(task->taskStats()).at(finalAggId).customStats;
+    ASSERT_EQ(stats.at("cudfFinalUniqueKeyPassThroughChecks").sum, 1);
+    EXPECT_EQ(
+        stats.count("cudfFinalUniqueKeyPassThroughHits"),
+        expectPassThrough ? 1 : 0);
+    if (expectPassThrough) {
+      EXPECT_EQ(
+          stats.at("cudfFinalUniqueKeyPassThroughRows").sum,
+          vectors[0]->size() + vectors[1]->size());
+    }
+  };
+
+  run({makeRowVector(
+           {makeFlatVector<int64_t>({1, 2}),
+            makeFlatVector<int64_t>({10, 20})}),
+       makeRowVector(
+           {makeFlatVector<int64_t>({3, 4}),
+            makeFlatVector<int64_t>({30, 40})})},
+      true);
+  run({makeRowVector(
+           {makeFlatVector<int64_t>({1, 2}),
+            makeFlatVector<int64_t>({10, 20})}),
+       makeRowVector(
+           {makeFlatVector<int64_t>({1, 2}),
+            makeFlatVector<int64_t>({30, 40})})},
+      false);
+}
+
 TEST_F(AggregationTest, partialIdentityMaterializesPackedInputBeforeViews) {
   SCOPED_TESTVALUE_SET(
       "facebook::velox::cudf_velox::CudfGroupby::doAddInput::input",

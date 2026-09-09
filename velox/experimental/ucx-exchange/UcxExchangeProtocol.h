@@ -79,6 +79,10 @@ struct HandshakeMsg {
   /// Generated randomly at Communicator startup. The server compares this
   /// against its own workerId to detect same-process (intra-node) transfers.
   uint64_t workerId{0};
+  /// Port of the source's data-only listener. The socket endpoint carrying
+  /// this handshake always uses peer error handling. The server connects to
+  /// this separate listener with error handling disabled for bulk TAG traffic.
+  uint16_t dataPort{0};
 };
 
 /// @brief Response sent from server to source after handshake.

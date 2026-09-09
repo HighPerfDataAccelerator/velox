@@ -26,6 +26,7 @@ TEST(ConfigTest, CudfConfig) {
   CudfConfig defaults;
   EXPECT_FALSE(defaults.concatOptimizationEnabled);
   EXPECT_TRUE(defaults.exchangeConcatOptimizationEnabled);
+  EXPECT_FALSE(defaults.tableWriteConcatEnabled);
   EXPECT_EQ(defaults.batchSizeMinThreshold, 100000);
   EXPECT_EQ(defaults.exchangeBatchSizeMinThreshold, 32000000);
   EXPECT_EQ(defaults.exchangeBatchSizeMinThresholdBytes, 0);
@@ -43,6 +44,7 @@ TEST(ConfigTest, CudfConfig) {
       {CudfConfig::kCudfOrderByOutputChunkBytes, "134217728"},
       {CudfConfig::kCudfOrderByMaxOutputRows, "1048576"},
       {CudfConfig::kCudfExchangeConcatOptimizationEnabled, "false"},
+      {CudfConfig::kCudfTableWriteConcatEnabled, "true"},
       {CudfConfig::kCudfExchangeBatchSizeMinThresholdBytes, "8388608"},
       {CudfConfig::kCudfHashJoinLoadFactor, "0.7"},
       {CudfConfig::kCudfOrderByMergeFanIn, "7"},
@@ -56,6 +58,7 @@ TEST(ConfigTest, CudfConfig) {
   ASSERT_EQ(config.memoryPercent, 25);
   ASSERT_EQ(config.functionNamePrefix, "presto");
   ASSERT_EQ(config.exchangeConcatOptimizationEnabled, false);
+  ASSERT_EQ(config.tableWriteConcatEnabled, true);
   ASSERT_EQ(config.exchangeBatchSizeMinThresholdBytes, 8388608);
   ASSERT_DOUBLE_EQ(config.hashJoinLoadFactor, 0.7);
   ASSERT_EQ(config.allowCpuFallback, false);

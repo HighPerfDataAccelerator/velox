@@ -76,8 +76,15 @@ void UcxExchangeClient::close() {
 }
 
 folly::F14FastMap<std::string, RuntimeMetric> UcxExchangeClient::stats() const {
-  // TODO: Implement stats collection.
   folly::F14FastMap<std::string, RuntimeMetric> stats;
+  for (const auto& source : sources_) {
+    for (const auto& [name, metric] : source->metrics()) {
+      auto [it, inserted] = stats.try_emplace(name, metric);
+      if (!inserted) {
+        it->second.merge(metric);
+      }
+    }
+  }
   return stats;
 }
 

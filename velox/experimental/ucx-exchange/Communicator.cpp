@@ -19,6 +19,7 @@
 #include <ucxx/api.h>
 #include <ucxx/utils/ucx.h>
 #include <algorithm>
+#include <cstdlib>
 #include <iostream>
 #include "velox/common/base/Exceptions.h"
 #include "velox/experimental/cudf/CudfConfig.h"
@@ -35,6 +36,16 @@ using namespace facebook::velox::cudf_velox;
 DEFINE_bool(velox_ucx_exchange, false, "Enable Velox UCX exchange.");
 
 namespace facebook::velox::ucx_exchange {
+
+namespace {
+
+bool controlPeerErrorHandlingEnabled() {
+  const char* value = std::getenv("GLUTEN_UCX_CONTROL_PEER_ERROR_HANDLING");
+  return value == nullptr || value[0] == '\0' ||
+      !(value[0] == '0' && value[1] == '\0');
+}
+
+} // namespace
 
 // static
 std::once_flag Communicator::onceFlag;
@@ -140,6 +151,24 @@ void Communicator::shutdown() {
   }
 }
 
+/* static */ void Communicator::cStyleDataListenerCallback(
+    ucp_conn_request_h conn_request,
+    void* arg) {
+  try {
+    Communicator* instance = static_cast<Communicator*>(arg);
+    if (instance == nullptr || instance->isShuttingDown()) {
+      return;
+    }
+    instance->dataListenerCallback(conn_request);
+  } catch (const std::exception& e) {
+    LOG(ERROR) << "Ignoring UCX data-listener callback during shutdown: "
+               << e.what();
+  } catch (...) {
+    LOG(ERROR) << "Ignoring unknown UCX data-listener callback failure during "
+                  "shutdown";
+  }
+}
+
 Communicator::~Communicator() {
   // Normal owners call shutdown() after joining run(). Keep destruction safe
   // during partial initialization and static finalization as a last resort.
@@ -161,6 +190,7 @@ bool Communicator::releaseResourcesAfterRun() {
   // Stop accepting connections before releasing any element or endpoint. The
   // worker remains alive until all UCXX-backed children have been released.
   listener_.reset();
+  dataListener_.reset();
 
   // Drop every parent-to-child reference while the singleton/local caller
   // still keeps this Communicator alive. CommElement holds only a weak
@@ -192,9 +222,13 @@ bool Communicator::releaseResourcesAfterRun() {
   std::vector<std::shared_ptr<EndpointRef>> pendingEndpoints;
   pendingEndpoints.swap(pendingEndpointRemoval_);
   std::map<HostPort, std::shared_ptr<EndpointRef>> endpoints;
+  std::map<uint64_t, std::shared_ptr<EndpointRef>> dataEndpoints;
+  std::vector<std::shared_ptr<ucxx::Endpoint>> incomingDataEndpoints;
   {
     std::lock_guard<std::recursive_mutex> lock(endpointsMutex_);
     endpoints.swap(endpoints_);
+    dataEndpoints.swap(dataEndpoints_);
+    incomingDataEndpoints.swap(incomingDataEndpoints_);
   }
   std::map<ucp_ep_h, std::shared_ptr<EndpointRef>> acceptedEndpoints;
   acceptedEndpoints.swap(acceptor_.handleToEndpointRef_);
@@ -229,12 +263,34 @@ bool Communicator::releaseResourcesAfterRun() {
   for (const auto& [_, endpoint] : endpoints) {
     closeEndpoint(endpoint);
   }
+  for (const auto& [_, endpoint] : dataEndpoints) {
+    closeEndpoint(endpoint);
+  }
   for (const auto& [_, endpoint] : acceptedEndpoints) {
     closeEndpoint(endpoint);
   }
+  for (const auto& endpoint : incomingDataEndpoints) {
+    if (!endpoint) {
+      continue;
+    }
+    try {
+      if (endpoint->isAlive()) {
+        endpoint->closeBlocking();
+      }
+    } catch (const std::exception& e) {
+      LOG(ERROR) << "Ignoring incoming data endpoint close failure during "
+                    "terminal UCX shutdown: "
+                 << e.what();
+    } catch (...) {
+      LOG(ERROR) << "Ignoring unknown incoming data endpoint close failure "
+                    "during terminal UCX shutdown";
+    }
+  }
   pendingEndpoints.clear();
   endpoints.clear();
+  dataEndpoints.clear();
   acceptedEndpoints.clear();
+  incomingDataEndpoints.clear();
 
   if (worker_) {
     // close() above canceled element-owned requests. Cancel any additional
@@ -311,6 +367,10 @@ void Communicator::run() {
 
   listener_ = worker_->createListener(
       port_, Communicator::cStyleListenerCallback, this);
+  dataListener_ = worker_->createListener(
+      0, Communicator::cStyleDataListenerCallback, this);
+  LOG(INFO) << "UCX listeners ready: controlPort=" << listener_->getPort()
+            << " dataPort=" << dataListener_->getPort();
 
   // Setup the active message callback that handles the
   // initial handshake and creates the senders.
@@ -389,11 +449,15 @@ void Communicator::run() {
       while (auto comms = workQueue_.pop()) {
         comms->process();
         ++workItemsProcessed_;
-        // Progress after each work item to allow UCXX to advance
-        // its internal state (complete sends/receives, fire callbacks).
-        // Use non-blocking progress here to avoid blocking between
-        // work items -- we want to drain the queue promptly.
-        worker_->progress();
+        // Give UCX one non-blocking progress opportunity between work items.
+        // Worker::progress() drains all currently actionable UCX work (and can
+        // process deferred cancellation), which serializes endpoint wire-up:
+        // the first exchange source can spend seconds establishing its
+        // connection before the remaining peers have even submitted their
+        // handshakes.  progressOnce() preserves the deadlock-avoidance intent
+        // here while allowing the work queue to submit every peer promptly;
+        // the outer loop continues progressing all requests concurrently.
+        worker_->progressOnce();
       }
 
       if (!pendingEndpointRemoval_.empty()) {
@@ -509,19 +573,18 @@ std::shared_ptr<EndpointRef> Communicator::assocEndpointRef(
     ep->addCommElem(comms);
     return ep;
   }
-  // endpoint doesn't exist. Need to connect. Enable error handling.
+  // Peer error handling remains the safe default. It can be disabled for the
+  // short-lived local benchmark path, where UCX's additional endpoint wire-up
+  // otherwise dominates the whole query and the coordinator already provides
+  // task-level failure propagation.
   auto ep = worker_->createEndpointFromHostname(
-      hostPort.hostname,
-      hostPort.port,
-      CudfConfig::getInstance().ucxxErrorHandling);
+      hostPort.hostname, hostPort.port, controlPeerErrorHandlingEnabled());
   std::shared_ptr<EndpointRef> epRef = nullptr;
   if (ep != nullptr) {
     epRef = std::make_shared<EndpointRef>(
         ep, hostPort.hostname, std::to_string(hostPort.port));
     epRef->addCommElem(comms);
-    if (CudfConfig::getInstance().ucxxErrorHandling) {
-      ep->setCloseCallback(EndpointRef::onClose, epRef);
-    }
+    ep->setCloseCallback(EndpointRef::onClose, epRef);
     endpoints_.insert(std::pair{hostPort, epRef});
   }
   return epRef;
@@ -611,6 +674,35 @@ uint16_t Communicator::getListenerPort() const {
   return port_;
 }
 
+uint16_t Communicator::getDataListenerPort() const {
+  VELOX_CHECK_NOT_NULL(dataListener_, "UCX data listener is not initialized");
+  return dataListener_->getPort();
+}
+
+std::shared_ptr<EndpointRef> Communicator::getOrCreateDataEndpoint(
+    uint64_t remoteWorkerId,
+    std::string_view remoteHost,
+    uint16_t remotePort) {
+  VELOX_CHECK_NE(remoteWorkerId, 0, "Remote UCX worker id is zero");
+  VELOX_CHECK(!remoteHost.empty(), "Remote UCX data host is empty");
+  VELOX_CHECK_NE(remotePort, 0, "Remote UCX data port is zero");
+  std::lock_guard<std::recursive_mutex> lock(endpointsMutex_);
+  if (auto it = dataEndpoints_.find(remoteWorkerId);
+      it != dataEndpoints_.end()) {
+    return it->second;
+  }
+  auto endpoint = worker_->createEndpointFromHostname(
+      std::string(remoteHost), remotePort, false);
+  VELOX_CHECK_NOT_NULL(endpoint, "Failed to create UCX bulk-data endpoint");
+  auto endpointRef = std::make_shared<EndpointRef>(
+      endpoint, std::string(remoteHost), std::to_string(remotePort));
+  dataEndpoints_.emplace(remoteWorkerId, endpointRef);
+  LOG(INFO) << "Created UCX bulk-data endpoint with error handling disabled: "
+            << "remoteWorkerId=" << remoteWorkerId << " peer=" << remoteHost
+            << ":" << remotePort;
+  return endpointRef;
+}
+
 /// @brief The callback method that is invoked when a client connects.
 void Communicator::listenerCallback(ucp_conn_request_h conn_request) {
   if (shuttingDown_.load(std::memory_order_acquire)) {
@@ -633,13 +725,11 @@ void Communicator::listenerCallback(ucp_conn_request_h conn_request) {
   // endpoints, one per direction. For compatibility reasons, both incoming and
   // outgoing endpoints are represented using the EndpointRef.
   auto endpoint = listener_->createEndpointFromConnRequest(
-      conn_request, CudfConfig::getInstance().ucxxErrorHandling);
+      conn_request, controlPeerErrorHandlingEnabled());
   // Pass the peer's actual address to EndpointRef for diagnostics.
   auto epRef = std::make_shared<EndpointRef>(
       endpoint, std::string(ip_str), std::string(port_str));
-  if (CudfConfig::getInstance().ucxxErrorHandling) {
-    endpoint->setCloseCallback(EndpointRef::onClose, epRef);
-  }
+  endpoint->setCloseCallback(EndpointRef::onClose, epRef);
   // Add this endpoint reference to the list of endpoints.
   // NOTE: This runs inside a UCX listener callback (during worker progress),
   // so we must not throw — throwing from a UCX callback is undefined behavior.
@@ -661,6 +751,29 @@ void Communicator::listenerCallback(ucp_conn_request_h conn_request) {
     }
   }
   acceptor_.registerEndpointRef(epRef);
+}
+
+void Communicator::dataListenerCallback(ucp_conn_request_h conn_request) {
+  if (shuttingDown_.load(std::memory_order_acquire)) {
+    return;
+  }
+  char ipStr[INET6_ADDRSTRLEN];
+  char portStr[INET6_ADDRSTRLEN];
+  ucp_conn_request_attr_t attr{};
+  attr.field_mask = UCP_CONN_REQUEST_ATTR_FIELD_CLIENT_ADDR;
+  ucxx::utils::ucsErrorThrow(ucp_conn_request_query(conn_request, &attr));
+  ucxx::utils::sockaddr_get_ip_port_str(
+      &attr.client_address, ipStr, portStr, INET6_ADDRSTRLEN);
+
+  auto endpoint =
+      dataListener_->createEndpointFromConnRequest(conn_request, false);
+  VELOX_CHECK_NOT_NULL(endpoint, "Failed to accept UCX bulk-data endpoint");
+  {
+    std::lock_guard<std::recursive_mutex> lock(endpointsMutex_);
+    incomingDataEndpoints_.push_back(endpoint);
+  }
+  LOG(INFO) << "Accepted UCX bulk-data endpoint with error handling disabled: "
+            << "peer=" << ipStr << ":" << portStr;
 }
 
 } // namespace facebook::velox::ucx_exchange

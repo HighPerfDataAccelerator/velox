@@ -100,6 +100,8 @@ void Acceptor::cStyleAMCallback(
         65536,
         "Handshake destination is invalid: {}",
         handshake.destination);
+    VELOX_CHECK_NE(
+        handshake.dataPort, 0, "Handshake UCX data listener port is zero");
 
     // Create a exchangeServer based on the information received in the initial
     // handshake.
@@ -147,7 +149,13 @@ void Acceptor::cStyleAMCallback(
     }
 
     auto exchangeServer = UcxExchangeServer::create(
-        communicator, epRef, key, isIntraNodeTransfer);
+        communicator,
+        epRef,
+        handshake.workerId,
+        epRef->getPeerIp(),
+        handshake.dataPort,
+        key,
+        isIntraNodeTransfer);
 
     // Add this exchangeServer to the endpoint reference.
     epRef->addCommElem(exchangeServer);

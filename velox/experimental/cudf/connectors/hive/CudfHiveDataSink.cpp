@@ -29,6 +29,7 @@
 #include "velox/exec/OperatorUtils.h"
 
 #include <cudf/copying.hpp>
+#include <cudf/detail/utilities/stream_pool.hpp>
 #include <cudf/io/parquet.hpp>
 #include <cudf/io/types.hpp>
 #include <cudf/table/table.hpp>
@@ -37,6 +38,8 @@
 #include <boost/lexical_cast.hpp>
 #include <boost/uuid/uuid_generators.hpp>
 #include <boost/uuid/uuid_io.hpp>
+
+#include <cstdlib>
 
 using facebook::velox::common::testutil::TestValue;
 
@@ -73,6 +76,100 @@ uint64_t getFinishTimeSliceLimitMsFromCudfHiveConfig(
 
 std::string makeUuid() {
   return boost::lexical_cast<std::string>(boost::uuids::random_generator()());
+}
+
+int parallelDirectWriteLanes() {
+  const auto* raw = std::getenv("GLUTEN_CUDF_PARALLEL_DIRECT_WRITE_LANES");
+  if (raw == nullptr || *raw == '\0') {
+    return 1;
+  }
+  char* end = nullptr;
+  const auto requested = std::strtol(raw, &end, 10);
+  if (end == raw || *end != '\0' || requested < 1) {
+    LOG(WARNING) << "CudfHiveDataSink: ignoring invalid "
+                 << "GLUTEN_CUDF_PARALLEL_DIRECT_WRITE_LANES='" << raw << "'";
+    return 1;
+  }
+  return static_cast<int>(std::clamp<long>(requested, 1, 4));
+}
+
+std::string addWriterLaneSuffix(std::string fileName, int driverId) {
+  const auto suffix = fmt::format("-flux-lane-{:02d}", driverId);
+  const auto extension = fileName.rfind('.');
+  if (extension == std::string::npos) {
+    return fileName + suffix;
+  }
+  fileName.insert(extension, suffix);
+  return fileName;
+}
+
+bool destinationWriteLanesEnabled(const config::ConfigBase* sessions) {
+  return sessions != nullptr &&
+      sessions->get<bool>(
+          "spark.gluten.sql.columnar.backend.velox.flux."
+          "keyedFinalDestinationLanes",
+          false);
+}
+
+bool hasFluxTaskReplicaSuffix(const std::string& taskId) {
+  const auto marker = taskId.rfind("-p");
+  if (marker == std::string::npos || marker + 2 == taskId.size()) {
+    return false;
+  }
+  return std::all_of(
+      taskId.begin() + marker + 2, taskId.end(), [](unsigned char c) {
+        return std::isdigit(c) != 0;
+      });
+}
+
+std::string addFluxTaskReplicaSuffix(
+    std::string fileName,
+    const std::string& taskId) {
+  // Flux task IDs end in "-p<replica>".  Different destination-owner tasks
+  // share Spark's one injected target filename, so include that replica in
+  // the native filename.  Peer identity is already unique at the Spark task
+  // (and attempt-directory) level.
+  const auto marker = taskId.rfind("-p");
+  VELOX_CHECK_NE(
+      marker,
+      std::string::npos,
+      "Destination-lane TableWrite task has no Flux replica suffix: {}",
+      taskId);
+  const auto replica = taskId.substr(marker + 2);
+  VELOX_CHECK(
+      !replica.empty() &&
+          std::all_of(
+              replica.begin(),
+              replica.end(),
+              [](unsigned char c) { return std::isdigit(c) != 0; }),
+      "Invalid Flux task replica suffix in task ID: {}",
+      taskId);
+  const auto suffix = fmt::format("-flux-task-p{}", replica);
+  const auto extension = fileName.rfind('.');
+  if (extension == std::string::npos) {
+    return fileName + suffix;
+  }
+  fileName.insert(extension, suffix);
+  return fileName;
+}
+
+std::string localWriteDirectory(std::string path) {
+  if (path.rfind("file://", 0) == 0) {
+    path.erase(0, 7);
+  } else if (path.rfind("file:", 0) == 0) {
+    path.erase(0, 5);
+  } else if (path.rfind("fuse://", 0) == 0) {
+    path.erase(0, 7);
+  } else if (path.rfind("fuse:", 0) == 0) {
+    path.erase(0, 5);
+  }
+  return path;
+}
+
+bool isLocalWriteDirectory(const std::string& path) {
+  return path.find("://") == std::string::npos ||
+      path.rfind("file://", 0) == 0 || path.rfind("file:", 0) == 0 ||
+      path.rfind("fuse://", 0) == 0 || path.rfind("fuse:", 0) == 0;
 }
 
 cudf::io::compression_type getCompressionType(
@@ -156,21 +253,39 @@ CudfHiveDataSink::CudfHiveDataSink(
 void CudfHiveDataSink::appendData(RowVectorPtr input) {
   checkRunning();
 
-  // Convert the input RowVectorPtr to cudf::table
-  auto stream = cudfGlobalStreamPool().get_stream();
-  auto cudfInput =
-      with_arrow::toCudfTable(input, input->pool(), stream, get_temp_mr());
-  stream.synchronize();
-  VELOX_CHECK_NOT_NULL(
-      cudfInput, "Failed to convert input RowVectorPtr to cudf::table");
+  auto cudfVector = std::dynamic_pointer_cast<CudfVector>(input);
+  auto stream =
+      cudfVector ? cudfVector->stream() : cudfGlobalStreamPool().get_stream();
+  std::unique_ptr<cudf::table> convertedInput;
+  cudf::table_view inputView;
+  if (cudfVector) {
+    // CudfVector already owns a device-resident table. Keep the write path on
+    // device. The chunked writer is stream ordered, so synchronizing the host
+    // here only inserts a producer/writer bubble. Converting through Arrow
+    // would materialize on host and defeats the purpose of the cuDF connector.
+    inputView = cudfVector->getTableView();
+  } else {
+    convertedInput =
+        with_arrow::toCudfTable(input, input->pool(), stream, get_temp_mr());
+    VELOX_CHECK_NOT_NULL(
+        convertedInput, "Failed to convert input RowVectorPtr to cudf::table");
+    inputView = convertedInput->view();
+  }
 
   // Check if the writer doesn't already exist
   if (writer_ == nullptr) {
-    writer_ = createCudfWriter(cudfInput->view(), stream);
+    writerStream_ = stream;
+    writer_ = createCudfWriter(inputView, stream);
+  } else if (stream.value() != writerStream_->value()) {
+    // Operators normally keep a driver lane on one CUDA stream. Preserve
+    // correctness for a cross-stream input without blocking the CPU: make the
+    // writer stream wait for the input producer on the device.
+    const std::vector<rmm::cuda_stream_view> inputStreams{stream};
+    cudf::detail::join_streams(inputStreams, *writerStream_);
   }
 
   // Write the table to the sink
-  writer_->write(cudfInput->view());
+  writer_->write(inputView);
   writerInfo_->inputSizeInBytes += input->estimateFlatSize();
   writerInfo_->numWrittenRows += input->size();
 }
@@ -188,23 +303,46 @@ CudfHiveDataSink::createCudfWriter(
 
   // Create a sink and writer
   const auto& locationHandle = insertTableHandle_->locationHandle();
-  const auto targetFileName = locationHandle->targetFileName().empty()
+  auto targetFileName = locationHandle->targetFileName().empty()
       ? fmt::format("{}{}", makeUuid(), ".parquet")
       : locationHandle->targetFileName();
+  const auto& taskId = connectorQueryCtx_->taskId();
+  // Connector session properties are intentionally narrower than the task's
+  // QueryConfig and may omit the Flux destination-lane switch.  The native
+  // task ID is the authoritative replica identity, so use it whenever it is
+  // present.  This also makes the single-replica p0 case harmlessly unique.
+  if (destinationWriteLanesEnabled(connectorQueryCtx_->sessionProperties()) ||
+      hasFluxTaskReplicaSuffix(taskId)) {
+    targetFileName =
+        addFluxTaskReplicaSuffix(std::move(targetFileName), taskId);
+    LOG(WARNING) << "CudfHiveDataSink: destination-owner task " << taskId
+                 << " -> " << targetFileName;
+  }
+  if (parallelDirectWriteLanes() > 1) {
+    targetFileName = addWriterLaneSuffix(
+        std::move(targetFileName), connectorQueryCtx_->driverId());
+    LOG(WARNING) << "CudfHiveDataSink: parallel direct-write driver "
+                 << connectorQueryCtx_->driverId() << " -> " << targetFileName;
+  }
 
   auto writerParameters = CudfHiveWriterParameters(
       CudfHiveWriterParameters::UpdateMode::kNew,
       targetFileName,
       locationHandle->targetPath());
 
-  const auto writePath = fs::path(writerParameters.writeDirectory()) /
-      writerParameters.writeFileName();
+  auto sinkDirectory = writerParameters.writeDirectory();
+  if (isLocalWriteDirectory(sinkDirectory)) {
+    sinkDirectory = localWriteDirectory(std::move(sinkDirectory));
+    fs::create_directories(sinkDirectory);
+  }
 
   makeWriterOptions(writerParameters);
 
   // Create writer options for the given sink
-  const auto sinkInfo = cudf::io::sink_info(
-      fmt::format("{}/{}", locationHandle->targetPath(), targetFileName));
+  const auto sinkInfo =
+      cudf::io::sink_info(fmt::format("{}/{}", sinkDirectory, targetFileName));
+  LOG(WARNING) << "CudfHiveDataSink: opening output " << sinkDirectory << "/"
+               << targetFileName;
   auto cudfWriterOptions =
       cudf::io::chunked_parquet_writer_options::builder(sinkInfo)
           .metadata(tableInputMetadata)
@@ -401,6 +539,9 @@ std::vector<std::string> CudfHiveDataSink::close() {
   // clang-format off
     auto partitionUpdateJson = folly::toJson(
      folly::dynamic::object
+        ("name", "")
+        ("updateMode", CudfHiveWriterParameters::updateModeToString(
+          writerInfo_->writerParameters.updateMode()))
         ("writePath", writerInfo_->writerParameters.writeDirectory())
         ("targetPath", writerInfo_->writerParameters.targetDirectory())
         ("fileWriteInfos", folly::dynamic::array(
@@ -426,7 +567,10 @@ void CudfHiveDataSink::abort() {
 void CudfHiveDataSink::closeInternal() {
   VELOX_CHECK_NE(state_, State::kRunning);
   VELOX_CHECK_NE(state_, State::kFinishing);
-  VELOX_CHECK_NOT_NULL(writer_, "CudfHiveDataSink has no writer");
+  if (writer_ == nullptr) {
+    VELOX_CHECK_EQ(state_, State::kAborted);
+    return;
+  }
 
   TestValue::adjust(
       "facebook::velox::connector::hive::CudfHiveDataSink::closeInternal",
@@ -437,6 +581,7 @@ void CudfHiveDataSink::closeInternal() {
 
   // Reset the unique pointers to Cudf writer and options
   writer_.reset();
+  writerStream_.reset();
 }
 
 std::shared_ptr<memory::MemoryPool> CudfHiveDataSink::createWriterPool() {

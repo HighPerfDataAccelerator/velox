@@ -64,6 +64,7 @@
 #include "velox/exec/PartitionedOutput.h"
 #include "velox/exec/StreamingAggregation.h"
 #include "velox/exec/TableScan.h"
+#include "velox/exec/TableWriter.h"
 #include "velox/exec/Task.h"
 #include "velox/exec/TopN.h"
 #include "velox/exec/TopNRowNumber.h"
@@ -71,6 +72,9 @@
 #include "velox/exec/Values.h"
 #include "velox/exec/Window.h"
 
+#include <cerrno>
+#include <cstdlib>
+#include <limits>
 #include <mutex>
 #include <unordered_map>
 
@@ -94,6 +98,22 @@ struct TaskPipelineKey {
   };
 };
 
+struct TaskPlanNodeKey {
+  std::string taskId;
+  core::PlanNodeId planNodeId;
+
+  bool operator==(const TaskPlanNodeKey& other) const {
+    return taskId == other.taskId && planNodeId == other.planNodeId;
+  }
+
+  struct Hash {
+    std::size_t operator()(const TaskPlanNodeKey& key) const {
+      return std::hash<std::string>{}(key.taskId) ^
+          (std::hash<std::string>{}(key.planNodeId) << 1);
+    }
+  };
+};
+
 using UcxExchangeClientMap = std::unordered_map<
     TaskPipelineKey,
     std::weak_ptr<ucx_exchange::UcxExchangeClient>,
@@ -104,12 +124,61 @@ UcxExchangeClientMap& getUcxExchangeClientMap() {
   return instance;
 }
 
+using UcxExchangePlanNodeClientMap = std::unordered_map<
+    TaskPlanNodeKey,
+    std::weak_ptr<ucx_exchange::UcxExchangeClient>,
+    TaskPlanNodeKey::Hash>;
+
+UcxExchangePlanNodeClientMap& getUcxExchangePlanNodeClientMap() {
+  static UcxExchangePlanNodeClientMap instance;
+  return instance;
+}
+
 std::mutex& getUcxExchangeClientMapMutex() {
   static std::mutex instance;
   return instance;
 }
 
+uint64_t preUnnestConcatBytes() {
+  const auto* value = std::getenv("GLUTEN_CUDF_PRE_UNNEST_CONCAT_BYTES");
+  if (value == nullptr || *value == '\0') {
+    return 0;
+  }
+  errno = 0;
+  char* end = nullptr;
+  const auto parsed = std::strtoull(value, &end, 10);
+  if (errno == ERANGE || end == value || *end != '\0') {
+    return 0;
+  }
+  return static_cast<uint64_t>(parsed);
+}
+
 } // namespace
+
+bool primeUcxExchangeClient(
+    const std::string& taskId,
+    const core::PlanNodeId& planNodeId,
+    const std::vector<std::string>& remoteTaskIds) {
+  std::shared_ptr<ucx_exchange::UcxExchangeClient> client;
+  {
+    std::lock_guard<std::mutex> lock(getUcxExchangeClientMapMutex());
+    auto& clientMap = getUcxExchangePlanNodeClientMap();
+    const auto it = clientMap.find({taskId, planNodeId});
+    if (it == clientMap.end() || !(client = it->second.lock())) {
+      if (it != clientMap.end()) {
+        clientMap.erase(it);
+      }
+      return false;
+    }
+    clientMap.erase(it);
+  }
+
+  for (const auto& remoteTaskId : remoteTaskIds) {
+    client->addRemoteTaskId(remoteTaskId);
+  }
+  client->noMoreRemoteTasks();
+  return true;
+}
 
 /// OperatorAdapterRegistry Implementation
 OperatorAdapterRegistry& OperatorAdapterRegistry::getInstance() {
@@ -199,6 +268,98 @@ class TableScanAdapter : public OperatorAdapter {
       exec::DriverCtx* /*ctx*/,
       int32_t /*operatorId*/) const override {
     return {}; // Keep original operator
+  }
+
+  bool keepOperator() const override {
+    return true;
+  }
+};
+
+/// TableWriteAdapter - Keeps Velox's control operator while allowing it to
+/// consume device-resident CudfVectors. The cudf Hive connector selected by
+/// the plan owns the actual GPU parquet DataSink.
+class TableWriteAdapter : public OperatorAdapter {
+ public:
+  TableWriteAdapter() : OperatorAdapter("TableWrite") {}
+
+  bool canHandle(const exec::Operator* op) const override {
+    return dynamic_cast<const exec::TableWriter*>(op) != nullptr;
+  }
+
+  bool canRunOnGPU(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* /*ctx*/) const override {
+    auto tableWriteNode =
+        std::dynamic_pointer_cast<const core::TableWriteNode>(planNode);
+    if (!tableWriteNode) {
+      LOG_FALLBACK(
+          "TableWrite planNode is not TableWriteNode, PlanNode id: {}",
+          planNode->id());
+      return false;
+    }
+
+    const auto& connector = velox::connector::ConnectorRegistry::tryGet(
+        tableWriteNode->insertTableHandle()->connectorId());
+    const auto cudfHiveConnector = std::dynamic_pointer_cast<
+        facebook::velox::cudf_velox::connector::hive::CudfHiveConnector>(
+        connector);
+    if (!cudfHiveConnector) {
+      LOG_FALLBACK(
+          "TableWrite connector is not CudfHiveConnector, PlanNode id: {}",
+          planNode->id());
+      return false;
+    }
+    return true;
+  }
+
+  bool acceptsGpuInput() const override {
+    return true;
+  }
+
+  bool producesGpuOutput() const override {
+    return false;
+  }
+
+  std::vector<std::unique_ptr<exec::Operator>> createReplacements(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& /*planNode*/,
+      exec::DriverCtx* /*ctx*/,
+      int32_t /*operatorId*/) const override {
+    return {};
+  }
+
+  std::vector<std::unique_ptr<exec::Operator>> createInputAdapters(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* ctx,
+      int32_t operatorId) const override {
+    const auto& cudfConfig = CudfConfig::getInstance();
+    const auto enabled = ctx->queryConfig().get<bool>(
+        CudfConfig::kCudfTableWriteConcatEnabled,
+        cudfConfig.tableWriteConcatEnabled);
+    if (!enabled) {
+      return {};
+    }
+
+    const auto targetRows = ctx->queryConfig().get<int32_t>(
+        CudfConfig::kCudfExchangeBatchSizeMinThreshold,
+        cudfConfig.exchangeBatchSizeMinThreshold);
+    const auto exchangeTargetBytes = ctx->queryConfig().get<uint64_t>(
+        CudfConfig::kCudfExchangeBatchSizeMinThresholdBytes,
+        cudfConfig.exchangeBatchSizeMinThresholdBytes);
+    const auto targetBytes = ctx->queryConfig().get<uint64_t>(
+        CudfConfig::kCudfTableWriteConcatBytes, exchangeTargetBytes);
+    std::vector<std::unique_ptr<exec::Operator>> adapters;
+    adapters.push_back(
+        std::make_unique<CudfBatchConcat>(
+            operatorId,
+            ctx,
+            planNode,
+            planNode->sources().at(0)->outputType(),
+            targetRows,
+            targetBytes));
+    return adapters;
   }
 
   bool keepOperator() const override {
@@ -419,6 +580,18 @@ class UnnestAdapter : public OperatorAdapter {
     auto unnestNode =
         std::dynamic_pointer_cast<const core::UnnestNode>(planNode);
     std::vector<std::unique_ptr<exec::Operator>> result;
+    const auto concatBytes = preUnnestConcatBytes();
+    if (concatBytes > 0) {
+      result.push_back(
+          std::make_unique<CudfBatchConcat>(
+              operatorId,
+              ctx,
+              unnestNode,
+              unnestNode->sources()[0]->outputType(),
+              static_cast<int32_t>(
+                  CudfUnnest::configuredMaxInputRowsPerOutput()),
+              concatBytes));
+    }
     result.push_back(std::make_unique<CudfUnnest>(operatorId, ctx, unnestNode));
     return result;
   }
@@ -1281,6 +1454,8 @@ class ExchangeAdapter : public OperatorAdapter {
       } else {
         exchangeOp->resetExchangeClient();
       }
+      getUcxExchangePlanNodeClientMap()[{op->taskId(), planNode->id()}] =
+          client;
     }
 
     std::vector<std::unique_ptr<exec::Operator>> result;
@@ -1374,6 +1549,7 @@ void registerAllOperatorAdapters() {
 
   // Register all adapters
   registry.registerAdapter(std::make_unique<TableScanAdapter>());
+  registry.registerAdapter(std::make_unique<TableWriteAdapter>());
   registry.registerAdapter(std::make_unique<FilterProjectAdapter>());
   registry.registerAdapter(std::make_unique<AggregationAdapter>());
   registry.registerAdapter(std::make_unique<UnnestAdapter>());

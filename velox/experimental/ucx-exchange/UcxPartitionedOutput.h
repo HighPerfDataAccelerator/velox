@@ -91,6 +91,18 @@ class UcxPartitionedOutput : public exec::Operator,
       std::vector<cudf::size_type> offsets,
       rmm::cuda_stream_view stream);
 
+  /// Publishes one destination accumulator as a single packed page. Returns
+  /// false when the destination has no buffered pieces.
+  bool flushCoalescedDestination(int destination);
+
+  /// Publishes the next non-empty destination accumulator. Used at EOS to
+  /// preserve backpressure between residual destination pages.
+  bool flushNextCoalescedDestination();
+
+  bool hasCoalescedOutput() const;
+
+  void clearCoalescedOutput();
+
   const std::weak_ptr<UcxOutputQueueManager> queueManager_;
   std::vector<column_index_t> partitionKeyIndices_;
   std::string rangeBoundsJson_;
@@ -162,10 +174,23 @@ class UcxPartitionedOutput : public exec::Operator,
   const int64_t targetRowsPerChunk_;
   /// Configured byte threshold for flushing and destination chunking.
   const uint64_t targetBytesPerChunk_;
+  /// Optional per-destination target independent from source residency. A
+  /// positive value coalesces destination pieces across source windows before
+  /// publishing them to UCX. It is deliberately env-gated until qualification
+  /// establishes a safe default for concurrent GPU drivers.
+  const uint64_t destinationCoalesceBytes_;
   /// Optional libcudf hash_partition safety limit. Zero disables slicing.
   const int64_t hashPartitionInputBatchRows_;
   /// Source-row window for recombining safely sliced hash output.
   const int64_t hashPartitionWindowRows_;
+
+  struct DestinationAccumulator {
+    std::vector<cudf::packed_table> pieces;
+    uint64_t bytes{0};
+    int64_t rows{0};
+  };
+  std::vector<DestinationAccumulator> destinationAccumulators_;
+  size_t nextCoalescedDestination_{0};
 };
 
 } // namespace facebook::velox::ucx_exchange
