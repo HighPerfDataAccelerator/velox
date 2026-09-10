@@ -21,17 +21,18 @@ die() {
   exit 2
 }
 
-(($# == 3)) ||
-  die "Usage: $0 GLUTEN_DIR RESULT_DIR CUDF_VERSION_INFO"
+(($# == 4)) ||
+  die "Usage: $0 VELOX_HOME GLUTEN_DIR RESULT_DIR CUDF_VERSION_INFO"
 
-gluten_dir=$1
-result_dir=$2
-cudf_version_info=$3
-script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-velox_home="$(cd -- "${script_dir}/../.." && pwd -P)"
+velox_home=$1
+gluten_dir=$2
+result_dir=$3
+cudf_version_info=$4
 cuda_arch=${CUDA_ARCH:-75-real}
 num_threads=${NUM_THREADS:-4}
 
+[[ -d ${velox_home} ]] || die "Velox directory is missing: ${velox_home}"
+velox_home="$(cd -- "${velox_home}" && pwd -P)"
 [[ -d ${gluten_dir} ]] || die "Spark-Gluten directory is missing: ${gluten_dir}"
 gluten_dir="$(cd -- "${gluten_dir}" && pwd -P)"
 build_entrypoint="${gluten_dir}/dev/builddeps-veloxbe.sh"
