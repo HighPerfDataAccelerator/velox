@@ -92,10 +92,15 @@ export UCX_MODULE_DIR=/usr/local/lib/ucx
 unset GTEST_FILTER GTEST_OUTPUT GTEST_REPEAT \
   GTEST_SHARD_INDEX GTEST_TOTAL_SHARDS TESTBRIDGE_TEST_ONLY
 
+set +e
 "${test_binary}" "--gtest_output=xml:${junit_path}"
+test_status=$?
+set -e
 
 [[ -s ${junit_path} ]] || die "GTest did not produce JUnit XML: ${junit_path}"
 if ! grep -q 'status="run"' "${junit_path}"; then
   echo "ERROR: GTest selected no tests: ${junit_path}" >&2
   exit 1
 fi
+
+exit "${test_status}"
