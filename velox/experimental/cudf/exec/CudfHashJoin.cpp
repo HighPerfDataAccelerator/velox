@@ -2115,7 +2115,7 @@ CudfHashJoinProbe::rightSemiProjectJoin(
         scalars_,
         probeType_,
         stream);
-    extendedLeftView = createExtendedTableView(leftTableView, leftPrecomputed);
+    extendedLeftView = makeExtendedTableView(leftTableView, leftPrecomputed);
   }
 
   for (size_t i = 0; i < rightTables.size(); ++i) {
