@@ -2234,8 +2234,9 @@ RowVectorPtr CudfHashJoinProbe::rightSemiProjectOutput(
     std::vector<std::unique_ptr<cudf::column>> rightCols;
     rightCols.reserve(rightInput.num_columns());
     for (cudf::size_type j = 0; j < rightInput.num_columns(); ++j) {
-      rightCols.push_back(std::make_unique<cudf::column>(
-          rightInput.column(j), stream, get_output_mr()));
+      rightCols.push_back(
+          std::make_unique<cudf::column>(
+              rightInput.column(j), stream, get_output_mr()));
     }
     outputLayout_.scatterBuildColumns(outputCols, rightCols);
 

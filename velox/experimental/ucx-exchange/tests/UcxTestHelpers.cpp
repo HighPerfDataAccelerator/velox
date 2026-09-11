@@ -130,8 +130,7 @@ std::shared_ptr<Task> createPartitionedOutputTask(
   auto planFragment =
       exec::test::PlanBuilder()
           .values({rowVector})
-          .partitionedOutput(
-              partitionKeys, numPartitions, replicateNullsAndAny)
+          .partitionedOutput(partitionKeys, numPartitions, replicateNullsAndAny)
           .planFragment();
   if (partitionFunctionSpec) {
     auto output = std::dynamic_pointer_cast<const core::PartitionedOutputNode>(
