@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <span>
 #include <string>
@@ -37,6 +38,7 @@
 #include "velox/common/time/Timer.h"
 #include "velox/dwio/common/ExecutorBarrier.h"
 #include "velox/dwio/nimble/common/Exceptions.h"
+#include "velox/dwio/nimble/common/FeatureGate.h"
 #include "velox/dwio/nimble/common/Types.h"
 #include "velox/dwio/nimble/encodings/SharedDictionaryCatalog.h"
 #include "velox/dwio/nimble/encodings/SharedDictionaryEncoding.h"
@@ -47,7 +49,7 @@
 #include "velox/dwio/nimble/index/HashIndexWriter.h"
 #include "velox/dwio/nimble/index/IndexSerialization.h"
 #include "velox/dwio/nimble/index/SortedIndexWriter.h"
-#include "velox/dwio/nimble/index/VectorIndexWriter.h"
+#include "velox/dwio/nimble/index/VectorIndexWriter.h" // @manual=//velox/dwio/nimble/index:index
 #include "velox/dwio/nimble/tablet/Constants.h"
 #include "velox/dwio/nimble/tablet/FileProperties.h"
 #include "velox/dwio/nimble/tablet/IndexGenerated.h"
@@ -82,6 +84,9 @@ class WriterContext : public FieldWriterContext {
       : FieldWriterContext{memoryPool, options.reclaimerFactory(), options.vectorDecoderVisitor},
         options_{std::move(options)},
         hasStripeDictionaryConfig_{hasStripeDictionaryConfig(options_)},
+        stripeStatsWriteEnabled_{featureGate()->enabled(
+            FeatureGate::FeatureSet::kStripeStatsWrite,
+            /*defaultValue=*/false)},
         logger_{
             this->options_.metricsLogger == nullptr
                 ? std::make_shared<MetricsLogger>()
@@ -95,6 +100,12 @@ class WriterContext : public FieldWriterContext {
 
   const WriterOptions& options() const {
     return options_;
+  }
+
+  // Whether the stripe-stats write path (per-stripe snapshot + merge + section)
+  // is enabled. Resolved once at construction so it cannot flip mid-file.
+  bool stripeStatsWriteEnabled() const {
+    return stripeStatsWriteEnabled_;
   }
 
   bool hasStripeDictionaryConfig() const {
@@ -243,6 +254,7 @@ class WriterContext : public FieldWriterContext {
 
   const WriterOptions options_;
   const bool hasStripeDictionaryConfig_;
+  const bool stripeStatsWriteEnabled_;
   velox::CpuWallTiming encodingTiming_;
   velox::CpuWallTiming writeTiming_;
   velox::CpuWallTiming ingestionTiming_;
@@ -706,7 +718,9 @@ bool isSharedDictionaryScalarKind(ScalarKind scalarKind) {
       scalarKind == ScalarKind::Binary;
 }
 
-bool isSharedDictionaryVeloxType(const velox::Type& type) {
+bool isSharedDictionaryLogicalType(const velox::Type& type) {
+  // Enumerated exhaustively rather than defaulted, so adding a TypeKind is a
+  // compile-time decision about shared-dictionary eligibility.
   switch (type.kind()) {
     case velox::TypeKind::TINYINT:
     case velox::TypeKind::SMALLINT:
@@ -715,9 +729,23 @@ bool isSharedDictionaryVeloxType(const velox::Type& type) {
     case velox::TypeKind::VARCHAR:
     case velox::TypeKind::VARBINARY:
       return true;
-    default:
+    case velox::TypeKind::BOOLEAN:
+    case velox::TypeKind::REAL:
+    case velox::TypeKind::DOUBLE:
+    case velox::TypeKind::TIMESTAMP:
+    case velox::TypeKind::HUGEINT:
+    case velox::TypeKind::ARRAY:
+    case velox::TypeKind::MAP:
+    case velox::TypeKind::ROW:
+    case velox::TypeKind::UNKNOWN:
+    case velox::TypeKind::FUNCTION:
+    case velox::TypeKind::OPAQUE:
+    case velox::TypeKind::INVALID:
       return false;
   }
+  NIMBLE_UNREACHABLE(
+      fmt::format(
+          "Unknown Velox type kind: {}.", static_cast<int>(type.kind())));
 }
 
 template <typename T>
@@ -1403,7 +1431,7 @@ DictionaryConfigs collectDictionaryConfigs(
         "node {}.",
         valueNodeId);
     NIMBLE_USER_CHECK(
-        isSharedDictionaryVeloxType(*valueType.type()),
+        isSharedDictionaryLogicalType(*valueType.type()),
         "Shared dictionary column '{}' must resolve to an integer or string "
         "scalar, array element, or map value, got {}.",
         columnDictionary.fieldPath,
@@ -1765,6 +1793,28 @@ void configureAddedFlatMapField(
         context.schemaBuilder());
   }
 }
+
+// Returns nullptr when no vector index is configured. The implementation comes
+// from the caller so that this target links no similarity-search library.
+std::unique_ptr<index::VectorIndexWriter> createVectorIndexWriter(
+    const WriterOptions& options,
+    const velox::TypePtr& type,
+    velox::memory::MemoryPool* pool) {
+  if (options.vectorIndexConfigs.empty()) {
+    return nullptr;
+  }
+  NIMBLE_USER_CHECK(
+      options.vectorIndexWriterFactory != nullptr,
+      "WriterOptions::vectorIndexWriterFactory must be set when "
+      "vectorIndexConfigs is not empty. Depend on "
+      "//velox/dwio/nimble/index:vector_index and use "
+      "index::VectorIndexWriter::create.");
+  auto writer = options.vectorIndexWriterFactory(
+      options.vectorIndexConfigs, velox::asRowType(type), pool);
+  NIMBLE_CHECK_NOT_NULL(
+      writer, "Vector index writer factory returned a null writer");
+  return writer;
+}
 } // namespace
 
 std::unique_ptr<index::IndexWriter> Writer::createClusterIndexWriter(
@@ -1890,13 +1940,10 @@ Writer::Writer(
           context_->options(),
           type,
           &(*context_->bufferMemoryPool()))},
-      vectorIndexWriter_{
-          context_->options().vectorIndexConfigs.empty()
-              ? nullptr
-              : index::VectorIndexWriter::create(
-                    context_->options().vectorIndexConfigs,
-                    velox::asRowType(type),
-                    &(*context_->bufferMemoryPool()))},
+      vectorIndexWriter_{createVectorIndexWriter(
+          context_->options(),
+          type,
+          &(*context_->bufferMemoryPool()))},
       tabletWriter_{TabletWriter::create(
           file_.get(),
           *encodingMemoryPool_,
@@ -2126,6 +2173,7 @@ void Writer::writeMetadata() {
 }
 
 void Writer::writeColumnStats() {
+  context_->finalizeFileStatsFromStripes();
   // When enableStatsConsistencyCheck is true, verify that fileRawSize
   // (accumulated via RawSizeUtils) matches the root column statistics.
   if (context_->options().enableStatsConsistencyCheck) {
@@ -2141,6 +2189,14 @@ void Writer::writeColumnStats() {
     Buffer buffer{*encodingMemoryPool_};
     tabletWriter_->writeOptionalSection(
         std::string(kVectorizedStatsSection), fileStats.serialize(buffer));
+    if (context_->stripeStatsWriteEnabled()) {
+      VectorizedStripeStats stripeStats{
+          context_->stripeStats(), encodingMemoryPool_.get()};
+      Buffer stripeStatsBuffer{*encodingMemoryPool_};
+      tabletWriter_->writeOptionalSection(
+          std::string(kStripeStatsSection),
+          stripeStats.serialize(stripeStatsBuffer));
+    }
   } else {
     flatbuffers::FlatBufferBuilder builder;
     builder.Finish(
@@ -2384,9 +2440,6 @@ std::unique_ptr<velox::dwio::common::FileMetadata> Writer::close() {
     }
     writeStripe();
     rootWriter_->close();
-    if (context_->options().enableStatsCollection) {
-      context_->finalizeStatsCollectors();
-    }
 
     writeMetadata();
     if (context_->options().enableStatsCollection) {
@@ -2665,6 +2718,42 @@ uint32_t Writer::encodingConcurrency(uint32_t streamCount) const {
   return std::min({streamCount, options.maxEncodeParallelism, maxByStreams});
 }
 
+namespace {
+
+// Encode tasks are dispatched in fixed-size batches that each wait on their
+// slowest member, so a batch mixing one large stream with small ones leaves
+// most of it idle. Grouping comparable sizes into the same batch keeps the
+// batch maximum close to its mean. Sizes are read before materialize(), so
+// this is the buffered size rather than the encoded one -- good enough to
+// rank by, and it costs no extra pass over the data.
+void sortByBufferedSizeDescending(
+    std::vector<uint32_t>& indices,
+    const std::vector<std::pair<uint32_t, std::unique_ptr<StreamData>>>&
+        streams) {
+  std::stable_sort(
+      indices.begin(), indices.end(), [&streams](uint32_t lhs, uint32_t rhs) {
+        return streams[lhs].second->memoryUsed() >
+            streams[rhs].second->memoryUsed();
+      });
+}
+
+} // namespace
+
+std::vector<uint32_t> Writer::encodeOrder(uint32_t streamCount) const {
+  std::vector<uint32_t> orderedIndices(streamCount);
+  std::iota(orderedIndices.begin(), orderedIndices.end(), 0u);
+  sortByBufferedSizeDescending(orderedIndices, context_->streams());
+  return orderedIndices;
+}
+
+std::vector<uint32_t> Writer::encodeOrder(
+    std::span<const uint32_t> streamIndices) const {
+  std::vector<uint32_t> orderedIndices{
+      streamIndices.begin(), streamIndices.end()};
+  sortByBufferedSizeDescending(orderedIndices, context_->streams());
+  return orderedIndices;
+}
+
 void Writer::ensureEncodingScratchBufferPools(uint32_t poolCount) {
   if (context_->options().maxCachedEncodingScratchBuffers == 0) {
     NIMBLE_CHECK(
@@ -2753,6 +2842,7 @@ void Writer::writeStreams() {
       NIMBLE_CHECK(
           encodingExecutor,
           "Encoding executor is required for parallel encoding.");
+      const auto orderedIndices = encodeOrder(streamCount);
       std::atomic_uint32_t nextStream{0};
       velox::dwio::common::ExecutorBarrier barrier{encodingExecutor};
       for (uint32_t taskId = 0; taskId < concurrency; ++taskId) {
@@ -2766,11 +2856,12 @@ void Writer::writeStreams() {
                   const_cast<uint32_t*>(&taskId));
               const auto startCpuNanos = velox::process::threadCpuNanos();
               while (true) {
-                const auto streamIndex =
+                const auto fetchIndex =
                     nextStream.fetch_add(1, std::memory_order_relaxed);
-                if (streamIndex >= streamCount) {
+                if (fetchIndex >= streamCount) {
                   break;
                 }
+                const auto streamIndex = orderedIndices[fetchIndex];
                 auto& [nodeId, streamData] = streams[streamIndex];
                 uint64_t streamSize{0};
                 processStream(
@@ -2992,6 +3083,7 @@ bool Writer::writeChunks(
       NIMBLE_CHECK(
           encodingExecutor,
           "Encoding executor is required for parallel encoding.");
+      const auto orderedIndices = encodeOrder(streamIndices);
       std::atomic_uint32_t nextStream{0};
       velox::dwio::common::ExecutorBarrier barrier{encodingExecutor};
       for (uint32_t taskId = 0; taskId < concurrency; ++taskId) {
@@ -3009,7 +3101,7 @@ bool Writer::writeChunks(
             if (inputIndex >= streamCount) {
               break;
             }
-            const auto streamIndex = streamIndices[inputIndex];
+            const auto streamIndex = orderedIndices[inputIndex];
             auto& [nodeId, streamData] = streams[streamIndex];
             const auto offset = streamData->descriptor().offset();
             uint64_t streamSize{0};
@@ -3123,8 +3215,15 @@ bool Writer::writeStripe() {
   } else {
     writeStreams();
   }
-
   writeStripeDictionaryStreams();
+
+  // Must run after writeStripeDictionaryStreams(), which still charges the
+  // stripe's alphabet bytes to the stats collectors: snapshotting first would
+  // shift those bytes into the next stripe and drop them for the last one.
+  if (context_->options().enableStatsCollection &&
+      context_->stripeStatsWriteEnabled()) {
+    context_->finalizeStripeStatsCollectors();
+  }
 
   uint64_t stripeSize{0};
   {
