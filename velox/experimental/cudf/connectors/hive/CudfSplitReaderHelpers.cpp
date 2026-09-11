@@ -3096,6 +3096,12 @@ std::unique_ptr<cudf::io::datasource::buffer> KvikioS3DataSource::device_read(
 }
 #endif
 
+#ifndef VELOX_ENABLE_S3
+bool nativeS3ScheduledReadEnabled() {
+  return false;
+}
+#endif
+
 void logNativeS3SchedulerStats(std::string_view event, std::string_view id) {
 #ifdef VELOX_ENABLE_S3
   if (nativeS3ScheduledReadEnabled()) {
@@ -3164,27 +3170,27 @@ void BufferedInputDataSource::enqueueForDevice(
     uint8_t* dst) {
   auto inputStream = input_->enqueue({offset, size});
   std::shared_ptr sharedStream(std::move(inputStream));
-  pendingDeviceLoads_.push_back([dst, size, sharedStream](
-                                    rmm::cuda_stream_view stream) {
-    uint64_t copied = 0;
-    while (copied < size) {
-      const void* buffer = nullptr;
-      int32_t available = 0;
-      VELOX_CHECK(
-          sharedStream->Next(&buffer, &available),
-          "BufferedInput stream ended after {} of {} bytes",
-          copied,
-          size);
-      VELOX_CHECK_GT(available, 0);
-      const auto bytes = std::min<uint64_t>(available, size - copied);
-      CUDF_CUDA_TRY(cudaMemcpyAsync(
-          dst + copied, buffer, bytes, cudaMemcpyHostToDevice, stream.value()));
-      copied += bytes;
-      if (bytes < static_cast<uint64_t>(available)) {
-        sharedStream->BackUp(available - bytes);
-      }
-    }
-  });
+  pendingDeviceLoads_.push_back(
+      [dst, size, sharedStream](rmm::cuda_stream_view stream) {
+        uint64_t copied = 0;
+        while (copied < size) {
+          const void* buffer = nullptr;
+          int32_t available = 0;
+          VELOX_CHECK(
+              sharedStream->Next(&buffer, &available),
+              "BufferedInput stream ended after {} of {} bytes",
+              copied,
+              size);
+          VELOX_CHECK_GT(available, 0);
+          const auto bytes = std::min<uint64_t>(available, size - copied);
+          CUDF_CUDA_TRY(cudaMemcpyAsync(
+              dst + copied, buffer, bytes, cudaMemcpyDefault, stream.value()));
+          copied += bytes;
+          if (bytes < static_cast<uint64_t>(available)) {
+            sharedStream->BackUp(available - bytes);
+          }
+        }
+      });
 }
 
 void BufferedInputDataSource::load(rmm::cuda_stream_view stream) {
@@ -3485,7 +3491,7 @@ std::future<size_t> BufferedInputDataSource::device_read_async(
                           dst,
                           hostBuffer->data(),
                           hostBuffer->size(),
-                          cudaMemcpyHostToDevice,
+                          cudaMemcpyDefault,
                           stream.value()));
                       return hostBuffer->size();
                     });
@@ -4004,7 +4010,7 @@ FetchedDeviceByteRanges fetchByteRangesAsync(
                       dest,
                       hostBuffer->data(),
                       hostBuffer->size(),
-                      cudaMemcpyHostToDevice,
+                      cudaMemcpyDefault,
                       stream.value()));
                   return ioSize;
                 }));

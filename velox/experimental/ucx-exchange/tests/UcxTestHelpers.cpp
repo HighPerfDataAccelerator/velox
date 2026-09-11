@@ -19,6 +19,8 @@
 #include <cudf/column/column_factories.hpp>
 #include <cudf/strings/detail/utilities.hpp>
 #include <cudf/strings/strings_column_view.hpp>
+#include <cudf/utilities/memory_resource.hpp>
+#include <rmm/device_buffer.hpp>
 
 using namespace facebook::velox;
 using namespace facebook::velox::exec;
@@ -106,6 +108,7 @@ std::shared_ptr<Task> createPartitionedOutputTask(
     const std::vector<std::string>& partitionKeys,
     uint64_t kMaxOutputBufferSize,
     const std::unordered_map<std::string, std::string>& extraConfig,
+    bool replicateNullsAndAny,
     core::PartitionFunctionSpecPtr partitionFunctionSpec) {
   VLOG(3) << "Creating PartitionedOutput task with " << numPartitions
           << " partitions";
@@ -124,10 +127,11 @@ std::shared_ptr<Task> createPartitionedOutputTask(
       pool.get(), rowType, BufferPtr(nullptr), vectorSize, vecPtrs);
 
   // Build the plan: Values -> PartitionedOutput
-  auto planFragment = exec::test::PlanBuilder()
-                          .values({rowVector})
-                          .partitionedOutput(partitionKeys, numPartitions)
-                          .planFragment();
+  auto planFragment =
+      exec::test::PlanBuilder()
+          .values({rowVector})
+          .partitionedOutput(partitionKeys, numPartitions, replicateNullsAndAny)
+          .planFragment();
   if (partitionFunctionSpec) {
     auto output = std::dynamic_pointer_cast<const core::PartitionedOutputNode>(
         planFragment.planNode);

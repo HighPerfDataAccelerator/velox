@@ -230,11 +230,11 @@ RowVectorPtr CudfBatchConcat::doGetOutput() {
       (currentNumRows_ >= targetRows_ ||
        (targetBytes_ != 0 && currentNumBytes_ >= targetBytes_) ||
        noMoreInput_)) {
-    // Preserve the zero-copy Exchange fast path when a single received batch
-    // already satisfies the target (or is the final tail batch). CudfVector
-    // carries its producing stream, so downstream operators can consume it
-    // directly without rebinding allocation ownership to another stream.
-    if (buffer_.size() == 1) {
+    // Concatenating a single column-bearing input only materializes a copy of
+    // the same table. Preserve the zero-copy Exchange fast path and its
+    // producing stream. Zero-column inputs still need the batching helper below
+    // to preserve their row count and enforce the maximum batch-size threshold.
+    if (buffer_.size() == 1 && outputType_->size() > 0) {
       auto output = std::move(buffer_.front());
       buffer_.clear();
       currentNumRows_ = 0;
@@ -284,6 +284,15 @@ RowVectorPtr CudfBatchConcat::doGetOutput() {
   }
 
   return nullptr;
+}
+
+void CudfBatchConcat::doClose() {
+  buffer_.clear();
+  while (!outputQueue_.empty()) {
+    outputQueue_.pop();
+  }
+  currentNumRows_ = 0;
+  Operator::close();
 }
 
 bool CudfBatchConcat::isFinished() {

@@ -86,6 +86,8 @@ std::shared_ptr<facebook::velox::exec::Task> createExchangeTask(
 /// round-robin)
 /// @param kMaxOutputBufferSize Maximum output buffer size
 /// @return Shared pointer to the created Task
+/// @param replicateNullsAndAny Whether rows with a null partition key, plus one
+/// arbitrary row, must reach every destination
 std::shared_ptr<facebook::velox::exec::Task> createPartitionedOutputTask(
     std::string_view taskId,
     std::shared_ptr<facebook::velox::memory::MemoryPool> pool,
@@ -94,6 +96,7 @@ std::shared_ptr<facebook::velox::exec::Task> createPartitionedOutputTask(
     const std::vector<std::string>& partitionKeys = {},
     uint64_t kMaxOutputBufferSize = FOUR_GBYTES,
     const std::unordered_map<std::string, std::string>& extraConfig = {},
+    bool replicateNullsAndAny = false,
     core::PartitionFunctionSpecPtr partitionFunctionSpec = nullptr);
 
 /// @brief Helper function to create a CudfVector for testing.
