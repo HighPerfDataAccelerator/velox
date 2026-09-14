@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #include <fmt/format.h>
+#include <ucxx/request_tag_builder.h>
 #include <cstring>
 
 #include "velox/experimental/cudf/CudfConfig.h"
@@ -173,22 +174,24 @@ void Acceptor::cStyleAMCallback(
             << " tag=" << std::hex << responseTag;
 
     // Fire-and-forget: we don't need to track this request completion
-    epRef->endpoint_->tagSend(
-        response.get(),
-        sizeof(*response),
-        ucxx::Tag{responseTag},
-        false,
-        [response, keyStr = key.toString(), peerAddress](
-            ucs_status_t status, std::shared_ptr<void> arg) {
-          if (status == UCS_OK) {
-            VLOG(3) << "HandshakeResponse sent successfully to " << keyStr
-                    << " peer=" << peerAddress;
-          } else {
-            VLOG(0) << "Failed to send HandshakeResponse to " << keyStr << ": "
-                    << ucs_status_string(status) << " peer=" << peerAddress;
-          }
-        },
-        response);
+    (void)epRef->endpoint_
+        ->tagSendBuilder(
+            response.get(), sizeof(*response), ucxx::Tag{responseTag})
+        .pythonFuture(false)
+        .callbackFunction(
+            [response, keyStr = key.toString(), peerAddress](
+                ucs_status_t status, std::shared_ptr<void> arg) {
+              if (status == UCS_OK) {
+                VLOG(3) << "HandshakeResponse sent successfully to " << keyStr
+                        << " peer=" << peerAddress;
+              } else {
+                VLOG(0) << "Failed to send HandshakeResponse to " << keyStr
+                        << ": " << ucs_status_string(status)
+                        << " peer=" << peerAddress;
+              }
+            })
+        .callbackData(response)
+        .build();
   } catch (const std::exception& e) {
     rejectHandshake(ep, e.what());
   } catch (...) {

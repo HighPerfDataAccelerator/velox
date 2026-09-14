@@ -17,6 +17,7 @@
 #include <glog/logging.h>
 #include <malloc.h>
 #include <rmm/cuda_stream_view.hpp>
+#include <ucxx/request_tag_builder.h>
 #include <algorithm>
 #include <cstdlib>
 #include <limits>
@@ -586,13 +587,15 @@ void UcxExchangeServer::sendData() {
     auto metaCtx = std::make_shared<MetaSendContext>();
     metaCtx->metadata = serializedMetadata;
 
-    metaRequest_ = endpointRef_->endpoint_->tagSend(
-        metaCtx->metadata.get(),
-        serMetaSize,
-        ucxx::Tag{metadataTag},
-        false,
-        [tid = partitionKey_.toString(), metadataTag, weakMeta](
-            ucs_status_t status, std::shared_ptr<void> arg) {
+    metaRequest_ = endpointRef_->endpoint_
+                       ->tagSendBuilder(
+                           metaCtx->metadata.get(),
+                           serMetaSize,
+                           ucxx::Tag{metadataTag})
+                       .pythonFuture(false)
+                       .callbackFunction(
+                           [tid = partitionKey_.toString(), metadataTag, weakMeta](
+                               ucs_status_t status, std::shared_ptr<void> arg) {
           // Release the metadata buffer from the context. The context
           // shell stays alive with the Request; only the payload is freed.
           auto ctx = std::static_pointer_cast<MetaSendContext>(arg);
@@ -621,8 +624,9 @@ void UcxExchangeServer::sendData() {
             self->setState(ServerState::Done);
             self->wakeCommunicator();
           }
-        },
-        metaCtx);
+        })
+                       .callbackData(metaCtx)
+                       .build();
 
     // send the data chunk (if any)
     if (dataPtr_) {
@@ -665,12 +669,15 @@ void UcxExchangeServer::sendData() {
               << (useHostStaging ? "host-staged" : "direct-device")
               << " send for " << bytes_ << " bytes";
 
-      dataRequest_ = endpointRef_->endpoint_->tagSend(
-          sendBuffer,
-          static_cast<size_t>(bytes_),
-          ucxx::Tag{dataTag},
-          false,
-          [weakData](ucs_status_t status, std::shared_ptr<void> arg) {
+      dataRequest_ = endpointRef_->endpoint_
+                         ->tagSendBuilder(
+                             sendBuffer,
+                             static_cast<size_t>(bytes_),
+                             ucxx::Tag{dataTag})
+                         .pythonFuture(false)
+                         .callbackFunction([weakData](
+                                               ucs_status_t status,
+                                               std::shared_ptr<void> arg) {
             // Release both payload buffers from the context. completedRequests_
             // deliberately retains the UCXX Request (and therefore
             // callbackData) for wireup replay safety, so leaving hostData in
@@ -697,8 +704,9 @@ void UcxExchangeServer::sendData() {
             // The holders are destroyed here, releasing the GPU buffer if
             // sendComplete() already reset the server's dataPtr_, and always
             // releasing the completed transfer's host staging allocation.
-          },
-          dataCtx);
+          })
+                         .callbackData(dataCtx)
+                         .build();
     } else {
       // Data pointer is null, so no more data will be coming.
       VLOG(3) << "@" << partitionKey_.taskId

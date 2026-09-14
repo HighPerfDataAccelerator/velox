@@ -25,6 +25,8 @@
 #include <folly/Uri.h>
 #include <rmm/mr/cuda_memory_resource.hpp>
 #include <rmm/mr/statistics_resource_adaptor.hpp>
+#include <ucxx/request_am_builder.h>
+#include <ucxx/request_tag_builder.h>
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/ucx-exchange/IntraNodeTransferRegistry.h"
@@ -571,18 +573,21 @@ void UcxExchangeSource::sendHandshake() {
   // Pass handshakeReq as the callback arg to keep the send buffer alive until
   // the async amSend completes. UCXX stores it as shared_ptr<void> but the
   // type-erased deleter still calls ~HandshakeMsg correctly.
-  request_ = endpointRef_->endpoint_->amSend(
-      handshakeReq.get(),
-      sizeof(*handshakeReq),
-      UCS_MEMORY_TYPE_HOST,
-      info,
-      false,
-      [weak](ucs_status_t status, std::shared_ptr<void> arg) {
-        if (auto self = weak.lock()) {
-          self->onHandshake(status, arg);
-        }
-      },
-      handshakeReq);
+  request_ = endpointRef_->endpoint_
+                 ->amSendBuilder(
+                     handshakeReq.get(),
+                     sizeof(*handshakeReq),
+                     UCS_MEMORY_TYPE_HOST)
+                 .receiverCallbackInfo(info)
+                 .pythonFuture(false)
+                 .callbackFunction(
+                     [weak](ucs_status_t status, std::shared_ptr<void> arg) {
+                       if (auto self = weak.lock()) {
+                         self->onHandshake(status, arg);
+                       }
+                     })
+                 .callbackData(handshakeReq)
+                 .build();
 }
 
 void UcxExchangeSource::onHandshake(
@@ -647,19 +652,23 @@ void UcxExchangeSource::getMetadata() {
   // Use weak_ptr to prevent use-after-free if close() is called during callback
   std::weak_ptr<UcxExchangeSource> weak = weak_from_this();
   retireRequest(request_, completedRequests_);
-  request_ = endpointRef_->endpoint_->tagRecv(
-      reinterpret_cast<void*>(metadataReq->data()),
-      kMaxMetaBufSize,
-      ucxx::Tag{metadataTag},
-      ucxx::TagMaskFull,
-      false,
-      [weak](ucs_status_t status, std::shared_ptr<void> arg) {
-        auto metadata = std::static_pointer_cast<std::vector<uint8_t>>(arg);
-        if (auto self = weak.lock()) {
-          self->onMetadata(status, metadata);
-        }
-      },
-      metadataReq);
+  request_ = endpointRef_->endpoint_
+                 ->tagRecvBuilder(
+                     reinterpret_cast<void*>(metadataReq->data()),
+                     kMaxMetaBufSize,
+                     ucxx::Tag{metadataTag},
+                     ucxx::TagMaskFull)
+                 .pythonFuture(false)
+                 .callbackFunction(
+                     [weak](ucs_status_t status, std::shared_ptr<void> arg) {
+                       auto metadata =
+                           std::static_pointer_cast<std::vector<uint8_t>>(arg);
+                       if (auto self = weak.lock()) {
+                         self->onMetadata(status, metadata);
+                       }
+                     })
+                 .callbackData(metadataReq)
+                 .build();
 }
 
 void UcxExchangeSource::onMetadata(
@@ -799,7 +808,7 @@ bool UcxExchangeSource::tryStartDataReceive(
         stream,
         cuda::mr::any_resource<cuda::mr::device_accessible>{
             recvMemoryResource});
-    CUDF_CUDA_TRY(cudaStreamSynchronize(stream.value()));
+    CUDF_CUDA_TRY(cudaStreamSynchronize(stream.get()));
   };
   try {
     allocateReceiveBuffer();
@@ -910,18 +919,21 @@ bool UcxExchangeSource::tryStartDataReceive(
 
   std::weak_ptr<UcxExchangeSource> weak = weak_from_this();
   retireRequest(request_, completedRequests_);
-  request_ = endpointRef_->endpoint_->tagRecv(
-      receiveBuffer,
-      ptr->metadata.dataSizeBytes,
-      ucxx::Tag{dataTag},
-      ucxx::TagMaskFull,
-      false,
-      [weak](ucs_status_t status, std::shared_ptr<void> arg) {
-        if (auto self = weak.lock()) {
-          self->onData(status, arg);
-        }
-      },
-      ptr);
+  request_ = endpointRef_->endpoint_
+                 ->tagRecvBuilder(
+                     receiveBuffer,
+                     ptr->metadata.dataSizeBytes,
+                     ucxx::Tag{dataTag},
+                     ucxx::TagMaskFull)
+                 .pythonFuture(false)
+                 .callbackFunction(
+                     [weak](ucs_status_t status, std::shared_ptr<void> arg) {
+                       if (auto self = weak.lock()) {
+                         self->onData(status, arg);
+                       }
+                     })
+                 .callbackData(ptr)
+                 .build();
   pendingReceive_.reset();
   return true;
 }
@@ -1019,18 +1031,21 @@ void UcxExchangeSource::receiveHandshakeResponse() {
   // Use weak_ptr to prevent use-after-free if close() is called during callback
   std::weak_ptr<UcxExchangeSource> weak = weak_from_this();
   retireRequest(request_, completedRequests_);
-  request_ = endpointRef_->endpoint_->tagRecv(
-      responseBuffer.get(),
-      sizeof(*responseBuffer),
-      ucxx::Tag{responseTag},
-      ucxx::TagMaskFull,
-      false,
-      [weak](ucs_status_t status, std::shared_ptr<void> arg) {
-        if (auto self = weak.lock()) {
-          self->onHandshakeResponse(status, arg);
-        }
-      },
-      responseBuffer);
+  request_ = endpointRef_->endpoint_
+                 ->tagRecvBuilder(
+                     responseBuffer.get(),
+                     sizeof(*responseBuffer),
+                     ucxx::Tag{responseTag},
+                     ucxx::TagMaskFull)
+                 .pythonFuture(false)
+                 .callbackFunction(
+                     [weak](ucs_status_t status, std::shared_ptr<void> arg) {
+                       if (auto self = weak.lock()) {
+                         self->onHandshakeResponse(status, arg);
+                       }
+                     })
+                 .callbackData(responseBuffer)
+                 .build();
 }
 
 void UcxExchangeSource::onHandshakeResponse(
@@ -1193,7 +1208,7 @@ void UcxExchangeSource::onIntraNodeData(
   // shared owner and the producer host-synchronizes before publishing).
   auto stream = sharedPage
       ? facebook::velox::cudf_velox::cudfGlobalStreamPool().get_stream()
-      : producerStream;
+      : cuda::stream_ref{producerStream.value()};
   cudf::packed_columns packedCols(
       sharedPage ? std::make_unique<std::vector<uint8_t>>(*data->metadata)
                  : std::move(data->metadata),
