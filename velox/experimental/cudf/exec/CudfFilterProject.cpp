@@ -285,6 +285,7 @@ void CudfFilterProject::initialize() {
     literalProjections_.reserve(nonIdentityProjectionChannels.size());
     nullComplexLiteralProjections_.reserve(
         nonIdentityProjectionChannels.size());
+    complexLiteralProjections_.reserve(nonIdentityProjectionChannels.size());
   } else {
     for (column_index_t i = 0; i < outputType_->size(); ++i) {
       identityProjections_.emplace_back(i, i);
@@ -358,11 +359,16 @@ void CudfFilterProject::initialize() {
     if (optimized->isConstantKind()) {
       const auto* constant = optimized->asUnchecked<core::ConstantTypedExpr>();
       if (!optimized->type()->isPrimitiveType()) {
-        VELOX_CHECK(
-            constant->isNull(),
-            "Only null complex literal projections are supported by cuDF");
-        nullComplexLiteralProjections_.push_back(
-            {optimized->type(), outputChannel});
+        if (constant->isNull()) {
+          nullComplexLiteralProjections_.push_back(
+              {optimized->type(), outputChannel});
+        } else {
+          auto value = constant->hasValueVector()
+              ? constant->valueVector()
+              : constant->toConstantVector(pool);
+          complexLiteralProjections_.push_back(
+              {std::move(value), outputChannel});
+        }
       } else {
         literalProjections_.emplace_back(literalScalars_.size(), outputChannel);
         literalScalars_.push_back(makeScalarFromConstantExpr(optimized, pool));
@@ -381,6 +387,11 @@ void CudfFilterProject::initialize() {
         queryCtx));
   }
 
+  hasMaterializingExpression_ = hasFilter_ ||
+      !projectEvaluators_.empty() || !literalProjections_.empty() ||
+      !nullComplexLiteralProjections_.empty() ||
+      !complexLiteralProjections_.empty();
+
   filter_.reset();
   project_.reset();
 }
@@ -389,7 +400,55 @@ void CudfFilterProject::doAddInput(RowVectorPtr input) {
   input_ = std::move(input);
 }
 
+bool CudfFilterProject::requiresTransformWorkspace() const {
+  return hasMaterializingExpression_ && input_ != nullptr && input_->size() > 0;
+}
+
+exec::BlockingReason CudfFilterProject::isBlocked(ContinueFuture* future) {
+  if (!requiresTransformWorkspace() || workspaceAdmission_.has_value()) {
+    return exec::BlockingReason::kNotBlocked;
+  }
+
+  auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input_);
+  VELOX_CHECK_NOT_NULL(
+      cudfInput, "CudfFilterProject expects CudfVector input");
+
+  // Job 144 has wide 400--450 MiB projection batches.  The output allocation
+  // can coexist briefly with the complete input and evaluator temporaries.
+  // Use the input's real flat size with a 512-MiB floor instead of a static
+  // multi-GiB lease, which would unnecessarily serialize ordinary filters.
+  constexpr uint64_t kMinimumTransformWorkspaceBytes = 512ULL << 20;
+  const auto workspaceBytes = std::max<uint64_t>(
+      kMinimumTransformWorkspaceBytes,
+      static_cast<uint64_t>(cudfInput->estimateFlatSize()));
+  VELOX_CHECK_NOT_NULL(future);
+  ContinueFuture workspaceFuture;
+  auto workspace = tryAcquireDeviceMemoryWorkspace(
+      customPool(kCudfDeviceMemoryResourceTag),
+      this,
+      workspaceBytes,
+      CudfConfig::getInstance().deviceMemoryMinHeadroomBytes,
+      DeviceMemoryWorkspacePriority::kTransform,
+      &workspaceRequest_,
+      &workspaceFuture);
+  if (!workspace.has_value()) {
+    *future = std::move(workspaceFuture);
+    return exec::BlockingReason::kWaitForArbitration;
+  }
+  workspaceAdmission_.emplace(std::move(workspace.value()));
+  addRuntimeStat(
+      "filterProjectWorkspaceBytes",
+      RuntimeCounter(workspaceBytes, RuntimeCounter::Unit::kBytes));
+  return exec::BlockingReason::kNotBlocked;
+}
+
 RowVectorPtr CudfFilterProject::doGetOutput() {
+  SCOPE_EXIT {
+    workspaceAdmission_.reset();
+  };
+  VELOX_CHECK(
+      !requiresTransformWorkspace() || workspaceAdmission_.has_value(),
+      "CudfFilterProject GPU work requires device workspace admission");
   if (allInputProcessed()) {
     return nullptr;
   }
@@ -579,6 +638,22 @@ std::vector<std::unique_ptr<cudf::column>> CudfFilterProject::project(
         literal.type, outputSize, stream, get_output_mr());
   }
 
+  for (const auto& literal : complexLiteralProjections_) {
+    auto expanded = BaseVector::wrapInConstant(
+        outputSize, 0, literal.value);
+    auto row = std::make_shared<RowVector>(
+        operatorCtx_->pool(),
+        ROW({"literal"}, {literal.value->type()}),
+        nullptr,
+        outputSize,
+        std::vector<VectorPtr>{std::move(expanded)});
+    auto table = with_arrow::toCudfTable(
+        row, operatorCtx_->pool(), stream, get_output_mr());
+    auto columns = table->release();
+    VELOX_CHECK_EQ(columns.size(), 1);
+    outputColumns[literal.outputChannel] = std::move(columns.front());
+  }
+
   // Count occurrences of each inputChannel, and move columns if they occur only
   // once
   std::unordered_map<column_index_t, int> inputChannelCount;
@@ -635,6 +710,7 @@ void CudfFilterProject::doClose() {
   projectExpressionCache_.reset();
   filterExpressionCache_.reset();
   literalScalars_.clear();
+  complexLiteralProjections_.clear();
   input_.reset();
 }
 

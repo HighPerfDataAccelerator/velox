@@ -28,8 +28,12 @@
 #include "velox/type/Type.h"
 
 #include <cudf/io/parquet.hpp>
+#include <cudf/io/orc.hpp>
 #include <cudf/io/types.hpp>
 #include <cudf/types.hpp>
+
+#include <optional>
+#include <variant>
 
 namespace facebook::velox::cudf_velox::connector::hive {
 
@@ -192,12 +196,19 @@ class CudfHiveInsertTableHandle : public ConnectorInsertTableHandle {
       std::optional<common::CompressionKind> compressionKind = {},
       const std::unordered_map<std::string, std::string>& serdeParameters = {},
       const std::shared_ptr<dwio::common::WriterOptions>& writerOptions =
-          nullptr)
+          nullptr,
+      dwio::common::FileFormat storageFormat =
+          dwio::common::FileFormat::PARQUET)
       : inputColumns_(std::move(inputColumns)),
         locationHandle_(std::move(locationHandle)),
         compressionKind_(compressionKind),
         serdeParameters_(serdeParameters),
-        writerOptions_(writerOptions) {
+        writerOptions_(writerOptions),
+        storageFormat_(storageFormat) {
+    VELOX_CHECK(
+        storageFormat_ == dwio::common::FileFormat::PARQUET ||
+            storageFormat_ == dwio::common::FileFormat::ORC,
+        "CudfHive DataSink only supports Parquet and ORC writes.");
     if (compressionKind.has_value()) {
       VELOX_CHECK(
           compressionKind.value() != common::CompressionKind_MAX,
@@ -259,10 +270,9 @@ class CudfHiveInsertTableHandle : public ConnectorInsertTableHandle {
   const std::vector<std::shared_ptr<const CudfHiveColumnHandle>> inputColumns_;
   const std::shared_ptr<const LocationHandle> locationHandle_;
   const std::optional<common::CompressionKind> compressionKind_;
-  const dwio::common::FileFormat storageFormat_ =
-      dwio::common::FileFormat::PARQUET;
   const std::unordered_map<std::string, std::string> serdeParameters_;
   const std::shared_ptr<dwio::common::WriterOptions> writerOptions_;
+  const dwio::common::FileFormat storageFormat_;
 };
 
 class CudfHiveDataSink : public DataSink {
@@ -306,10 +316,16 @@ class CudfHiveDataSink : public DataSink {
   };
 
  private:
-  // Creates a new cudf chunked parquet writer.
-  std::unique_ptr<cudf::io::chunked_parquet_writer> createCudfWriter(
+  using CudfWriter = std::variant<
+      std::unique_ptr<cudf::io::chunked_parquet_writer>,
+      std::unique_ptr<cudf::io::orc_chunked_writer>>;
+
+  // Creates a device-resident cuDF writer for the requested table format.
+  CudfWriter createCudfWriter(
       cudf::table_view cudfTable,
       rmm::cuda_stream_view stream);
+  void writeCudf(cudf::table_view cudfTable);
+  void closeCudf();
   cudf::io::table_input_metadata createCudfTableInputMetadata(
       cudf::table_view cudfTable);
 
@@ -346,7 +362,10 @@ class CudfHiveDataSink : public DataSink {
 
   // Below are structures for partitions from all inputs. writerInfo_ and
   // writers_ are both indexed by partitionId.
-  std::unique_ptr<cudf::io::chunked_parquet_writer> writer_;
+  std::optional<CudfWriter> writer_;
+  std::optional<rmm::cuda_stream_view> writerStream_;
+  bool loggedDeviceInput_{false};
+  int64_t writtenBytes_{0};
 
   std::vector<cudf::io::sorting_column> sortingColumns_;
 

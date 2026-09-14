@@ -16,6 +16,7 @@
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/expression/AstExpression.h"
+#include "velox/experimental/cudf/expression/AstExpressionUtils.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
 #include "velox/experimental/cudf/expression/JitExpression.h"
 #include "velox/experimental/cudf/tests/utils/ExpressionTestUtil.h"
@@ -153,6 +154,20 @@ TEST_F(CudfLogicalFunctionsTest, isNullInteger) {
       "c0 IS NULL",
       "c0 IS NULL AS r",
       "SELECT c0 IS NULL AS r FROM tmp");
+}
+
+// Spark emits the unseparated function name in Substrait plans.
+TEST_F(CudfLogicalFunctionsTest, sparkIsNullAlias) {
+  auto inputType = ROW({"c0"}, {INTEGER()});
+  core::TypedExprPtr expr = std::make_shared<core::CallTypedExpr>(
+      BOOLEAN(),
+      std::vector<core::TypedExprPtr>{
+          std::make_shared<core::FieldAccessTypedExpr>(INTEGER(), "c0")},
+      "isnull");
+
+  EXPECT_TRUE(cudf_velox::detail::isAstExprSupported(expr));
+  EXPECT_NE(
+      cudf_velox::createCudfExpression(expr, inputType, pool()), nullptr);
 }
 
 // IsNullFunction: nullable VARCHAR column. Exercises string-typed input.

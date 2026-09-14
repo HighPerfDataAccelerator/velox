@@ -247,6 +247,19 @@ bool hasRecvDeviceCredit(int64_t bytes) {
 
 std::atomic<int64_t> lastReportedReceiveDevicePeakBucket{0};
 
+// Do not allocate remote receive buffers on cuDF's global compute-stream
+// pool.  The communicator must synchronize an async allocation before handing
+// its pointer to UCX.  A global-pool stream may already contain operator work,
+// which turns that required allocation fence into an unrelated compute fence
+// on the single UCX progress thread.  This stream contains allocation/free
+// bookkeeping only; after receive completion the device_buffer is rebound to
+// the consumer stream so subsequent work and deallocation remain ordered.
+rmm::cuda_stream_view directReceiveAllocationStream() {
+  static thread_local rmm::cuda_stream stream{
+      rmm::cuda_stream::flags::non_blocking};
+  return stream.view();
+}
+
 bool tryReserveRecvHostBytes(int64_t bytes) {
   VELOX_CHECK_GE(bytes, 0);
   auto current = inFlightRecvHostBytes.load(std::memory_order_relaxed);
@@ -320,6 +333,7 @@ UcxExchangeSource::UcxExchangeSource(
     const std::shared_ptr<UcxExchangeQueue> queue)
     : CommElement(communicator),
       host_(host),
+      samePhysicalHost_(host_ == communicator->getListenerIp()),
       port_(port),
       taskId_(taskId),
       partitionKey_(partitionKey),
@@ -419,6 +433,9 @@ void UcxExchangeSource::process() {
         }
       }
       if (shouldPause) {
+        if (!queueBackpressureStart_.has_value()) {
+          queueBackpressureStart_ = std::chrono::steady_clock::now();
+        }
         if (newlyBackpressured) {
           VLOG(1) << "[BACKPRESSURE] [ExSrc " << toString()
                   << "] pausing, queueSize=" << stats.queueSize
@@ -430,6 +447,14 @@ void UcxExchangeSource::process() {
         // Go dormant — do NOT re-enqueue into work queue.
         // UcxExchangeClient::next() will call resumeFromBackpressure().
         break;
+      }
+      if (queueBackpressureStart_.has_value()) {
+        metrics_.queueBackpressureNanos_.addValue(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() -
+                queueBackpressureStart_.value())
+                .count());
+        queueBackpressureStart_.reset();
       }
 
       // Count-only backpressure (Presto-style): post the next receive directly.
@@ -570,11 +595,40 @@ folly::F14FastMap<std::string, RuntimeMetric> UcxExchangeSource::metrics()
   map["ucxExchangeSource.numPackedColumns"] = metrics_.numPackedColumns_;
   map["ucxExchangeSource.totalBytes"] = metrics_.totalBytes_;
   map["ucxExchangeSource.hostStagedBytes"] = metrics_.hostStagedBytes_;
+  map["ucxExchangeSource.hostStagedForcedBytes"] =
+      metrics_.hostStagedForcedBytes_;
+  map["ucxExchangeSource.hostStagedNoCudaTransportBytes"] =
+      metrics_.hostStagedNoCudaTransportBytes_;
+  map["ucxExchangeSource.hostStagedSmallEagerBytes"] =
+      metrics_.hostStagedSmallEagerBytes_;
+  map["ucxExchangeSource.hostStagedOverDirectLimitBytes"] =
+      metrics_.hostStagedOverDirectLimitBytes_;
+  map["ucxExchangeSource.intraProcessHostBackedBytes"] =
+      metrics_.intraProcessHostBackedBytes_;
+  map["ucxExchangeSource.directDeviceBytes"] = metrics_.directDeviceBytes_;
+  map["ucxExchangeSource.directReceiveAllocationNanos"] =
+      metrics_.directReceiveAllocationNanos_;
+  map["ucxExchangeSource.directReceiveAllocationSyncNanos"] =
+      metrics_.directReceiveAllocationSyncNanos_;
   map["ucxExchangeSource.asyncHostCopyBytes"] = metrics_.asyncHostCopyBytes_;
   map["ucxExchangeSource.asyncHostCopyThrottledBytes"] =
       metrics_.asyncHostCopyThrottledBytes_;
   map["ucxExchangeSource.hostCopySyncNanos"] = metrics_.hostCopySyncNanos_;
   map["ucxExchangeSource.rttPerRequest"] = metrics_.rttPerRequest_;
+  map["ucxExchangeSource.sameHostDataReceiveBytes"] =
+      metrics_.sameHostDataReceiveBytes_;
+  map["ucxExchangeSource.sameHostDataReceiveNanos"] =
+      metrics_.sameHostDataReceiveNanos_;
+  map["ucxExchangeSource.remoteHostDataReceiveBytes"] =
+      metrics_.remoteHostDataReceiveBytes_;
+  map["ucxExchangeSource.remoteHostDataReceiveNanos"] =
+      metrics_.remoteHostDataReceiveNanos_;
+  map["ucxExchangeSource.metadataReceiveNanos"] =
+      metrics_.metadataReceiveNanos_;
+  map["ucxExchangeSource.receiveCreditWaitNanos"] =
+      metrics_.receiveCreditWaitNanos_;
+  map["ucxExchangeSource.queueBackpressureNanos"] =
+      metrics_.queueBackpressureNanos_;
   return map;
 }
 
@@ -801,6 +855,7 @@ void UcxExchangeSource::getMetadata() {
   // Use weak_ptr to prevent use-after-free if close() is called during callback
   std::weak_ptr<UcxExchangeSource> weak = weak_from_this();
   retireRequest(request_, completedRequests_);
+  metadataReceiveStart_ = std::chrono::steady_clock::now();
   request_ = endpointRef_->endpoint_->tagRecv(
       reinterpret_cast<void*>(metadataReq->data()),
       kMaxMetaBufSize,
@@ -842,6 +897,10 @@ void UcxExchangeSource::onMetadata(
     return;
   }
   VLOG(3) << toString() << " + onMetadata " << ucs_status_string(status);
+  metrics_.metadataReceiveNanos_.addValue(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - metadataReceiveStart_)
+          .count());
 
   if (status != UCS_OK) {
     std::string errorMsg = fmt::format(
@@ -913,6 +972,21 @@ bool UcxExchangeSource::tryStartDataReceive(
   if (!communicator) {
     return false;
   }
+  const auto markReceiveCreditWait = [&]() {
+    if (!receiveCreditWaitStart_.has_value()) {
+      receiveCreditWaitStart_ = std::chrono::steady_clock::now();
+    }
+  };
+  const auto recordReceiveCreditWait = [&]() {
+    if (receiveCreditWaitStart_.has_value()) {
+      metrics_.receiveCreditWaitNanos_.addValue(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() -
+              receiveCreditWaitStart_.value())
+              .count());
+      receiveCreditWaitStart_.reset();
+    }
+  };
 
   UcxExchangeQueue::BackpressureStats stats;
   if (!queue_->tryReserveReceive(
@@ -925,6 +999,7 @@ bool UcxExchangeSource::tryStartDataReceive(
     if (!setStateIf(expectedState, ReceiverState::WaitingForReceiveCredit)) {
       return false;
     }
+    markReceiveCreditWait();
     expectedState = ReceiverState::WaitingForReceiveCredit;
     if (!backpressureActive_.exchange(true, std::memory_order_acq_rel)) {
       VLOG(1) << "[BACKPRESSURE] [ExSrc " << toString()
@@ -947,9 +1022,12 @@ bool UcxExchangeSource::tryStartDataReceive(
   }
   reservedReceiveBytes_ = ptr->metadata.dataSizeBytes;
 
-  const bool useHostStaging = shouldHostStageDeviceTransfer(
+  ptr->transferPath = deviceTransferPath(
       communicator->hasCudaTransport(), ptr->metadata.dataSizeBytes);
+  const bool useHostStaging =
+      ptr->transferPath != DeviceTransferPath::kDirectDevice;
   if (useHostStaging && !tryReserveRecvHostBytes(ptr->metadata.dataSizeBytes)) {
+    markReceiveCreditWait();
     queue_->releaseReservedReceive(reservedReceiveBytes_);
     reservedReceiveBytes_ = 0;
     if (getState() == expectedState) {
@@ -967,6 +1045,7 @@ bool UcxExchangeSource::tryStartDataReceive(
   }
 
   if (!useHostStaging && !hasRecvDeviceCredit(ptr->metadata.dataSizeBytes)) {
+    markReceiveCreditWait();
     releaseReceiveReservation();
     if (getState() == expectedState) {
       setStateIf(expectedState, ReceiverState::WaitingForReceiveCredit);
@@ -982,14 +1061,22 @@ bool UcxExchangeSource::tryStartDataReceive(
   // CUDA pool. Reserve their not-yet-allocated bytes in the shared workspace
   // domain so four executors cannot all admit against the same physical
   // headroom snapshot. The reservation is released only after the allocation
-  // stream is synchronized; from then on cudaMemGetInfo/async-pool usage makes
-  // the live buffer visible to subsequent admission decisions. In addition to
-  // the steady-state watermark, preserve one minimum consumer workspace. If
-  // receives consume that last GiB, the Filter/TopN input which must dequeue
-  // them cannot run and both sides wait forever despite a valid byte cap.
+  // stream is synchronized. In addition to the steady-state watermark,
+  // preserve one minimum consumer workspace so the Filter/TopN input which
+  // dequeues receive pages can still make progress.
+  //
+  // A configured process-wide receive-device cap is an exact admission
+  // mechanism: all receive allocations are posted by this one communicator
+  // thread and the statistics resource continues tracking buffers after they
+  // move to consumers. Do not additionally call cudaMemGetInfo and query the
+  // async pool for every page. Those driver-wide queries serialize the sole
+  // UCX progress thread, pausing every endpoint, and the temporary workspace
+  // reservation below is released before the receive allocation in any case.
+  // Deployments without an explicit cap retain the conservative headroom
+  // admission path.
   std::optional<facebook::velox::cudf_velox::DeviceMemoryWorkspaceReservation>
       receiveWorkspace;
-  if (!useHostStaging) {
+  if (!useHostStaging && maxInFlightRecvDeviceBytes() <= 0) {
     const auto now = std::chrono::steady_clock::now();
     const bool useProgressHeadroom =
         receiveWorkspaceBlockedSince_.has_value() &&
@@ -1003,6 +1090,7 @@ bool UcxExchangeSource::tryStartDataReceive(
         ? tryAcquireRecvWorkspaceProgressLease(ptr->metadata.dataSizeBytes)
         : nullptr;
     if (useProgressHeadroom && receiveProgressLease == nullptr) {
+      markReceiveCreditWait();
       releaseReceiveReservation();
       if (getState() == expectedState) {
         setStateIf(expectedState, ReceiverState::WaitingForReceiveCredit);
@@ -1016,6 +1104,7 @@ bool UcxExchangeSource::tryStartDataReceive(
             receiveMinHeadroom,
             facebook::velox::cudf_velox::DeviceMemoryWorkspacePriority::kInput);
     if (!receiveWorkspace.has_value()) {
+      markReceiveCreditWait();
       if (!receiveWorkspaceBlockedSince_.has_value()) {
         receiveWorkspaceBlockedSince_ = now;
       }
@@ -1043,6 +1132,8 @@ bool UcxExchangeSource::tryStartDataReceive(
   auto stream =
       facebook::velox::cudf_velox::cudfGlobalStreamPool().get_stream();
   ptr->stream = stream;
+  const auto allocationStream =
+      useHostStaging ? stream : directReceiveAllocationStream();
 
   // UCX writes receive buffers from its progress thread, outside CUDA stream
   // ordering. Allocate from the shared async pool, then synchronize this
@@ -1051,12 +1142,23 @@ bool UcxExchangeSource::tryStartDataReceive(
   // downstream work and eventual deallocation remain stream ordered.
   auto& recvMemoryResource = receiveDeviceMemoryResource();
   const auto allocateReceiveBuffer = [&]() {
+    const auto allocationStart = std::chrono::steady_clock::now();
     ptr->dataBuf = std::make_unique<rmm::device_buffer>(
         ptr->metadata.dataSizeBytes,
-        stream,
+        allocationStream,
         cuda::mr::any_resource<cuda::mr::device_accessible>{
             recvMemoryResource});
-    CUDF_CUDA_TRY(cudaStreamSynchronize(stream.value()));
+    const auto allocationEnd = std::chrono::steady_clock::now();
+    CUDF_CUDA_TRY(cudaStreamSynchronize(allocationStream.value()));
+    const auto syncEnd = std::chrono::steady_clock::now();
+    metrics_.directReceiveAllocationNanos_.addValue(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            allocationEnd - allocationStart)
+            .count());
+    metrics_.directReceiveAllocationSyncNanos_.addValue(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            syncEnd - allocationEnd)
+            .count());
   };
   if (!useHostStaging) {
     try {
@@ -1140,9 +1242,12 @@ bool UcxExchangeSource::tryStartDataReceive(
                  << " deferring UCX receive after recoverable GPU allocation "
                     "pressure: "
                  << ptr->metadata.dataSizeBytes << " bytes";
+    markReceiveCreditWait();
     wakeCommunicator();
     return false;
   }
+
+  recordReceiveCreditWait();
 
   VLOG(3) << toString() << " Allocated " << ptr->metadata.dataSizeBytes
           << (useHostStaging ? " bytes of deferred host receive memory"
@@ -1181,6 +1286,7 @@ bool UcxExchangeSource::tryStartDataReceive(
 
   std::weak_ptr<UcxExchangeSource> weak = weak_from_this();
   retireRequest(request_, completedRequests_);
+  ptr->dataReceiveStart = std::chrono::steady_clock::now();
   request_ = endpointRef_->endpoint_->tagRecv(
       receiveBuffer,
       ptr->metadata.dataSizeBytes,
@@ -1224,6 +1330,22 @@ void UcxExchangeSource::onData(
   }
   VLOG(3) << toString() << " + onData " << ucs_status_string(status);
 
+  const auto dataReceiveNanos =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() -
+          std::static_pointer_cast<DataAndMetadata>(arg)->dataReceiveStart)
+          .count();
+  metrics_.rttPerRequest_.addValue(dataReceiveNanos);
+  if (samePhysicalHost_) {
+    metrics_.sameHostDataReceiveBytes_.addValue(
+        std::static_pointer_cast<DataAndMetadata>(arg)->metadata.dataSizeBytes);
+    metrics_.sameHostDataReceiveNanos_.addValue(dataReceiveNanos);
+  } else {
+    metrics_.remoteHostDataReceiveBytes_.addValue(
+        std::static_pointer_cast<DataAndMetadata>(arg)->metadata.dataSizeBytes);
+    metrics_.remoteHostDataReceiveNanos_.addValue(dataReceiveNanos);
+  }
+
   if (status != UCS_OK) {
     std::string errorMsg = fmt::format(
         "Failed to receive data from host {}:{}, task {}: {}",
@@ -1249,6 +1371,25 @@ void UcxExchangeSource::onData(
 
     if (ptr->hostData != nullptr) {
       metrics_.hostStagedBytes_.addValue(ptr->metadata.dataSizeBytes);
+      switch (ptr->transferPath) {
+        case DeviceTransferPath::kHostForced:
+          metrics_.hostStagedForcedBytes_.addValue(ptr->metadata.dataSizeBytes);
+          break;
+        case DeviceTransferPath::kHostNoCudaTransport:
+          metrics_.hostStagedNoCudaTransportBytes_.addValue(
+              ptr->metadata.dataSizeBytes);
+          break;
+        case DeviceTransferPath::kHostSmallEager:
+          metrics_.hostStagedSmallEagerBytes_.addValue(
+              ptr->metadata.dataSizeBytes);
+          break;
+        case DeviceTransferPath::kHostOverDirectLimit:
+          metrics_.hostStagedOverDirectLimitBytes_.addValue(
+              ptr->metadata.dataSizeBytes);
+          break;
+        case DeviceTransferPath::kDirectDevice:
+          VELOX_UNREACHABLE("Host data received on the direct-device path");
+      }
       if (exchangeVariableWidthValidationEnabled()) {
         LOG(WARNING) << "UCX receiver staged key=" << partitionKey_.toString()
                      << " sequence=" << expectedSequence
@@ -1285,6 +1426,12 @@ void UcxExchangeSource::onData(
     }
     metrics_.numPackedColumns_.addValue(1);
     metrics_.totalBytes_.addValue(ptr->metadata.dataSizeBytes);
+    metrics_.directDeviceBytes_.addValue(ptr->metadata.dataSizeBytes);
+
+    // The dedicated allocation stream is synchronized before tagRecv and UCX
+    // has now completed the DMA.  Rebind ownership to the stream exposed to
+    // the consumer so downstream kernels precede the eventual async free.
+    ptr->dataBuf->set_stream(ptr->stream);
 
     // Create packed_columns from the received metadata and data buffer
     cudf::packed_columns packedCols(
@@ -1494,6 +1641,7 @@ void UcxExchangeSource::onIntraNodeData(IntraNodeTransferResult result) {
   if (result.isHostBacked()) {
     VELOX_CHECK_NOT_NULL(result.hostMetadata);
     metrics_.hostStagedBytes_.addValue(dataBytes);
+    metrics_.intraProcessHostBackedBytes_.addValue(dataBytes);
     auto stream =
         facebook::velox::cudf_velox::cudfGlobalStreamPool().get_stream();
     auto tableWithStream = std::make_unique<PackedTableWithStream>(
@@ -1513,6 +1661,7 @@ void UcxExchangeSource::onIntraNodeData(IntraNodeTransferResult result) {
   }
 
   auto data = std::move(result.data);
+  metrics_.directDeviceBytes_.addValue(dataBytes);
   // Make the consumer page independently owned. Moving a uniquely referenced
   // producer allocation into the consumer looked safe, but under sustained
   // HASH exchange its stream-ordered allocation was recycled while the page

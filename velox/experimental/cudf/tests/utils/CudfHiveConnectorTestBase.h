@@ -188,7 +188,9 @@ class CudfHiveConnectorTestBase
       const std::optional<common::CompressionKind> compressionKind = {},
       const std::unordered_map<std::string, std::string>& serdeParameters = {},
       const std::shared_ptr<dwio::common::WriterOptions>& writerOptions =
-          nullptr);
+          nullptr,
+      dwio::common::FileFormat storageFormat =
+          dwio::common::FileFormat::PARQUET);
 };
 
 /// Same as connector::hive::CudfHiveConnectorBuilder, except that this

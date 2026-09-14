@@ -155,6 +155,58 @@ TEST_F(CudfFilterProjectTest, hashWithSeed) {
   facebook::velox::test::assertEqualVectors(expected, hashResults);
 }
 
+TEST_F(CudfFilterProjectTest, xxhash64WithSeed) {
+  auto input = makeNullableFlatVector<std::string>(
+      {"Spark", "", "abcdefghijklmnopqrstuvwxyz"});
+  auto data = makeRowVector({input});
+  assertExpressionMatchesCpu(
+      "xxhash64_with_seed(cast(42 as bigint), c0)", data, data->rowType());
+}
+
+TEST_F(CudfFilterProjectTest, positiveModulo) {
+  auto dividend = makeNullableFlatVector<int64_t>(
+      {1, -1, 3, -1, std::nullopt});
+  auto divisor = makeFlatVector<int64_t>({3, 3, -2, -3, 3});
+  auto data = makeRowVector({dividend, divisor});
+  assertExpressionMatchesCpu("pmod(c0, c1)", data, data->rowType());
+}
+
+TEST_F(CudfFilterProjectTest, bitwiseXor) {
+  auto left = makeNullableFlatVector<int64_t>(
+      {0, 1, -1, INT64_MAX, INT64_MIN, std::nullopt});
+  auto right = makeFlatVector<int64_t>(
+      {6364136223846793005LL, 1, 7, -1, INT64_MAX, 42});
+  auto data = makeRowVector({left, right});
+  assertExpressionMatchesCpu("bitwise_xor(c0, c1)", data, data->rowType());
+}
+
+TEST_F(CudfFilterProjectTest, sparkArraySize) {
+  auto arrays = makeNullableArrayVector<int64_t>(
+      {{{1, 2, 3}},
+       std::vector<std::optional<int64_t>>{},
+       std::nullopt,
+       {{4, 5}}});
+  auto data = makeRowVector({arrays});
+  assertExpressionMatchesCpu("size(c0, true)", data, data->rowType());
+  assertExpressionMatchesCpu(
+      "greaterthan(size(c0, true), 0)", data, data->rowType());
+  assertExpressionMatchesCpu("size(c0, false)", data, data->rowType());
+}
+
+TEST_F(CudfFilterProjectTest, constantArrayProjection) {
+  auto input = makeRowVector({makeFlatVector<int64_t>({10, 20, 30})});
+  auto plan = PlanBuilder()
+                  .setParseOptions(options_)
+                  .values({input})
+                  .project({"array_constructor(0, 1, 2, 3, 4) AS result"})
+                  .planNode();
+  auto expected = makeRowVector(
+      {makeArrayVector<int32_t>({{0, 1, 2, 3, 4},
+                                {0, 1, 2, 3, 4},
+                                {0, 1, 2, 3, 4}})});
+  AssertQueryBuilder(plan).assertResults({expected});
+}
+
 // TODO: Re-enable after https://github.com/rapidsai/cudf/issues/21720.
 // cuDF's murmurhash3_x86_32 combines columns via hash_combine(h(col0, seed),
 // h(col1, seed)), while Spark instead hashes columns iteratively:

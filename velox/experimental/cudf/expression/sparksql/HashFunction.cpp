@@ -23,6 +23,7 @@
 
 #include <cudf/hashing.hpp>
 #include <cudf/table/table.hpp>
+#include <cudf/unary.hpp>
 
 namespace facebook::velox::cudf_velox::sparksql {
 namespace {
@@ -76,6 +77,43 @@ ColumnOrView HashFunction::eval(
   auto inputTableView = convertToTableView(inputColumns);
   return cudf::hashing::murmurhash3_x86_32(
       inputTableView, seedValue_, stream, mr);
+}
+
+bool XxHash64Function::canEvaluate(const core::TypedExprPtr& expr) {
+  return expr->inputs().size() >= 2 && expr->inputs()[0]->isConstantKind() &&
+      expr->inputs()[0]->type()->kind() == TypeKind::BIGINT;
+}
+
+XxHash64Function::XxHash64Function(
+    const core::TypedExprPtr& expr,
+    memory::MemoryPool* pool) {
+  VELOX_CHECK_GE(expr->inputs().size(), 2, "xxhash64 expects at least 2 inputs");
+  VELOX_CHECK(
+      expr->inputs()[0]->isConstantKind(), "xxhash64 seed must be a constant");
+  const auto* seedExpr =
+      expr->inputs()[0]->asUnchecked<core::ConstantTypedExpr>();
+  const auto vec = seedExpr->hasValueVector()
+      ? seedExpr->valueVector()
+      : seedExpr->toConstantVector(pool);
+  seedValue_ = static_cast<uint64_t>(
+      vec->as<SimpleVector<int64_t>>()->valueAt(0));
+}
+
+ColumnOrView XxHash64Function::eval(
+    std::vector<ColumnOrView>& inputColumns,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) const {
+  VELOX_CHECK(!inputColumns.empty());
+  auto unsignedHash = cudf::hashing::xxhash_64(
+      convertToTableView(inputColumns), seedValue_, stream, mr);
+  // libcudf exposes the 64-bit hash bits as UINT64. Spark's xxhash64 result is
+  // BIGINT, so materialize the signed representation before Arrow/Velox
+  // conversion sees the otherwise unsupported unsigned type.
+  return cudf::cast(
+      unsignedHash->view(),
+      cudf::data_type{cudf::type_id::INT64},
+      stream,
+      mr);
 }
 
 } // namespace facebook::velox::cudf_velox::sparksql

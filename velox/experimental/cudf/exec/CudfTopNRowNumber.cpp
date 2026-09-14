@@ -243,7 +243,10 @@ uint64_t topNSequentialEarlyDenseProbeBatches() {
                  << value;
     return 0;
   }
-  return std::clamp<uint64_t>(parsed, 2, 1024);
+  // A final WindowGroupLimit partition can arrive as one large shuffle batch.
+  // Allow probing that first batch so dense inputs do not fall through to the
+  // full sequential uniqueness proof and a second partitioning pass.
+  return std::clamp<uint64_t>(parsed, 1, 1024);
 }
 
 uint32_t topNSequentialEarlyDenseMaxDistinctPct() {

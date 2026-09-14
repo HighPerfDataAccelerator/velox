@@ -64,6 +64,7 @@
 #include "velox/exec/PartitionedOutput.h"
 #include "velox/exec/StreamingAggregation.h"
 #include "velox/exec/TableScan.h"
+#include "velox/exec/TableWriter.h"
 #include "velox/exec/Task.h"
 #include "velox/exec/TopN.h"
 #include "velox/exec/TopNRowNumber.h"
@@ -256,6 +257,53 @@ class TableScanAdapter : public OperatorAdapter {
   }
 };
 
+/// TableWriterAdapter - keeps TableWriter and lets a cuDF data sink consume
+/// the preceding CudfVector without inserting CudfToVelox at the boundary.
+class TableWriterAdapter : public OperatorAdapter {
+ public:
+  TableWriterAdapter() : OperatorAdapter("TableWriter") {}
+
+  bool canHandle(const exec::Operator* op) const override {
+    return dynamic_cast<const exec::TableWriter*>(op) != nullptr;
+  }
+
+  bool canRunOnGPU(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* /*ctx*/) const override {
+    const auto tableWriteNode =
+        std::dynamic_pointer_cast<const core::TableWriteNode>(planNode);
+    if (!tableWriteNode) {
+      return false;
+    }
+    const auto& connector = velox::connector::ConnectorRegistry::tryGet(
+        tableWriteNode->insertTableHandle()->connectorId());
+    return std::dynamic_pointer_cast<
+               facebook::velox::cudf_velox::connector::hive::
+                   CudfHiveConnector>(connector) != nullptr;
+  }
+
+  bool acceptsGpuInput() const override {
+    return true;
+  }
+
+  bool producesGpuOutput() const override {
+    return false;
+  }
+
+  std::vector<std::unique_ptr<exec::Operator>> createReplacements(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& /*planNode*/,
+      exec::DriverCtx* /*ctx*/,
+      int32_t /*operatorId*/) const override {
+    return {};
+  }
+
+  bool keepOperator() const override {
+    return true;
+  }
+};
+
 /// FilterProjectAdapter - Replaces with CudfFilterProject
 class FilterProjectAdapter : public OperatorAdapter {
  public:
@@ -306,6 +354,19 @@ class FilterProjectAdapter : public OperatorAdapter {
     // Check projects separately
     if (projectPlanNode) {
       for (const auto& projection : projectPlanNode->projections()) {
+        // CudfFilterProject handles top-level field accesses as identity
+        // projections by moving/selecting the existing libcudf column. Do not
+        // send nested ARRAY/MAP/ROW identity fields through scalar-expression
+        // validation: no expression is evaluated, and rejecting their result
+        // types inserts an otherwise unnecessary GPU -> host boundary.
+        if (const auto field = core::TypedExprs::asFieldAccess(projection)) {
+          const auto& inputs = field->inputs();
+          if (inputs.empty() ||
+              (inputs.size() == 1 &&
+               dynamic_cast<const core::InputTypedExpr*>(inputs[0].get()))) {
+            continue;
+          }
+        }
         if (projection->isConstantKind()) {
           const auto* constant =
               projection->asUnchecked<core::ConstantTypedExpr>();
@@ -1469,6 +1530,7 @@ void registerAllOperatorAdapters() {
 
   // Register all adapters
   registry.registerAdapter(std::make_unique<TableScanAdapter>());
+  registry.registerAdapter(std::make_unique<TableWriterAdapter>());
   registry.registerAdapter(std::make_unique<FilterProjectAdapter>());
   registry.registerAdapter(std::make_unique<AggregationAdapter>());
   registry.registerAdapter(std::make_unique<UnnestAdapter>());

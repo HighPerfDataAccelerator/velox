@@ -56,7 +56,8 @@ std::shared_ptr<facebook::velox::exec::Task> createSourceTask(
     std::string_view taskId,
     std::shared_ptr<facebook::velox::memory::MemoryPool> pool,
     facebook::velox::RowTypePtr rowType,
-    uint64_t kMaxOutputBufferSize = FOUR_GBYTES);
+    uint64_t kMaxOutputBufferSize = FOUR_GBYTES,
+    const std::unordered_map<std::string, std::string>& extraConfig = {});
 
 /// @brief Helper function to create a sink task for testing.
 /// Creates a simple task associated with a plan fragment that consists fo a

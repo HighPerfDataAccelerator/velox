@@ -463,6 +463,100 @@ TEST_F(UcxOutputQueueManagerTest, basicPartitioned) {
   EXPECT_TRUE(task->isFinished());
 }
 
+TEST_F(UcxOutputQueueManagerTest, adaptiveBurstBorrowsAndReleasesGlobalCredit) {
+  const std::string taskId = "adaptive-burst-credit";
+  queueManager_->removeTask(taskId);
+
+  auto first = makePackedColumns(1024);
+  const auto pageBytes = first->gpu_data->size();
+  ASSERT_GT(pageBytes, 0);
+  const std::unordered_map<std::string, std::string> config{
+      {UcxOutputQueue::kAdaptiveBurstMaxBytesConfig,
+       std::to_string(pageBytes * 3)},
+      {UcxOutputQueue::kAdaptiveGlobalBurstBytesConfig,
+       std::to_string(pageBytes * 2)},
+      {UcxOutputQueue::kAdaptiveMinDeviceHeadroomBytesConfig, "0"}};
+  auto task = createSourceTask(
+      taskId, pool_, UcxTestData::kTestRowType, pageBytes, config);
+  queueManager_->initializeTask(
+      task,
+      core::PartitionedOutputNode::Kind::kPartitioned,
+      1,
+      1);
+
+  queueManager_->enqueue(taskId, 0, std::move(first), 1024);
+  ContinueFuture firstFuture;
+  EXPECT_FALSE(queueManager_->checkBlocked(taskId, &firstFuture));
+
+  queueManager_->enqueue(taskId, 0, makePackedColumns(1024), 1024);
+  ContinueFuture secondFuture;
+  EXPECT_FALSE(queueManager_->checkBlocked(taskId, &secondFuture));
+
+  queueManager_->enqueue(taskId, 0, makePackedColumns(1024), 1024);
+  ContinueFuture blockedFuture;
+  EXPECT_TRUE(queueManager_->checkBlocked(taskId, &blockedFuture));
+  EXPECT_FALSE(blockedFuture.isReady());
+
+  // One dequeue shrinks this queue's burst lease and wakes waiters across all
+  // fragment queues in the executor.
+  fetch(taskId, 0);
+  blockedFuture.wait();
+  EXPECT_TRUE(blockedFuture.isReady());
+
+  queueManager_->removeTask(taskId);
+}
+
+TEST_F(UcxOutputQueueManagerTest, adaptiveBurstCreditMovesBetweenTasks) {
+  const std::string firstTaskId = "adaptive-burst-first";
+  const std::string secondTaskId = "adaptive-burst-second";
+  queueManager_->removeTask(firstTaskId);
+  queueManager_->removeTask(secondTaskId);
+
+  auto sample = makePackedColumns(1024);
+  const auto pageBytes = sample->gpu_data->size();
+  ASSERT_GT(pageBytes, 0);
+  const std::unordered_map<std::string, std::string> config{
+      {UcxOutputQueue::kAdaptiveBurstMaxBytesConfig,
+       std::to_string(pageBytes * 3)},
+      {UcxOutputQueue::kAdaptiveGlobalBurstBytesConfig,
+       std::to_string(pageBytes)},
+      {UcxOutputQueue::kAdaptiveMinDeviceHeadroomBytesConfig, "0"}};
+  auto firstTask = createSourceTask(
+      firstTaskId, pool_, UcxTestData::kTestRowType, pageBytes, config);
+  auto secondTask = createSourceTask(
+      secondTaskId, pool_, UcxTestData::kTestRowType, pageBytes, config);
+  queueManager_->initializeTask(
+      firstTask,
+      core::PartitionedOutputNode::Kind::kPartitioned,
+      1,
+      1);
+  queueManager_->initializeTask(
+      secondTask,
+      core::PartitionedOutputNode::Kind::kPartitioned,
+      1,
+      1);
+
+  queueManager_->enqueue(firstTaskId, 0, std::move(sample), 1024);
+  queueManager_->enqueue(firstTaskId, 0, makePackedColumns(1024), 1024);
+  ContinueFuture firstFuture;
+  EXPECT_FALSE(queueManager_->checkBlocked(firstTaskId, &firstFuture));
+
+  queueManager_->enqueue(secondTaskId, 0, makePackedColumns(1024), 1024);
+  queueManager_->enqueue(secondTaskId, 0, makePackedColumns(1024), 1024);
+  ContinueFuture secondFuture;
+  EXPECT_TRUE(queueManager_->checkBlocked(secondTaskId, &secondFuture));
+  EXPECT_FALSE(secondFuture.isReady());
+
+  fetch(firstTaskId, 0);
+  secondFuture.wait();
+  EXPECT_TRUE(secondFuture.isReady());
+  ContinueFuture retryFuture;
+  EXPECT_FALSE(queueManager_->checkBlocked(secondTaskId, &retryFuture));
+
+  queueManager_->removeTask(firstTaskId);
+  queueManager_->removeTask(secondTaskId);
+}
+
 TEST_F(UcxOutputQueueManagerTest, v1RepeatedFetchAdvancesQueue) {
   const std::string taskId = "v1RepeatedFetch";
   const int destination = 0;

@@ -38,10 +38,12 @@
 #include <cudf/concatenate.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/detail/utilities/stream_pool.hpp>
+#include <cudf/filling.hpp>
 #include <cudf/lists/lists_column_view.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/replace.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
+#include <cudf/stream_compaction.hpp>
 #include <cudf/unary.hpp>
 
 #include <cstdlib>
@@ -1006,6 +1008,74 @@ struct GroupbyCollectListAggregator : GroupbyAggregator {
     return std::move(results[outputIdx_].results[0]);
   }
 
+  bool supportsPartialIdentity() const override {
+    return step == core::AggregationNode::Step::kPartial &&
+        constant == nullptr;
+  }
+
+  std::unique_ptr<cudf::column> makePartialIdentityColumn(
+      cudf::table_view const& tbl,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) override {
+    VELOX_CHECK(supportsPartialIdentity());
+    const auto input = tbl.column(inputIndex);
+    const auto numRows = input.size();
+    if (!input.has_nulls()) {
+      auto offsets = cudf::sequence(
+          numRows + 1,
+          cudf::numeric_scalar<cudf::size_type>(0, true, stream, mr),
+          cudf::numeric_scalar<cudf::size_type>(1, true, stream, mr),
+          stream,
+          mr);
+      return cudf::make_lists_column(
+          numRows,
+          std::move(offsets),
+          std::make_unique<cudf::column>(input, stream, mr),
+          0,
+          rmm::device_buffer{});
+    }
+
+    auto valid = cudf::is_valid(input, stream, mr);
+    auto filtered = cudf::apply_boolean_mask(
+        cudf::table_view{{input}}, valid->view(), stream, mr);
+    auto filteredColumns = filtered->release();
+    VELOX_CHECK_EQ(filteredColumns.size(), 1);
+    auto elements = std::move(filteredColumns.front());
+
+    // The offsets are the inclusive prefix sum of input validity, with a zero
+    // prepended. Therefore a non-null raw value is a singleton list and a null
+    // raw value is an empty list. This preserves collect_list's EXCLUDE-null
+    // semantics without attaching a nullable top-level list mask (libcudf
+    // replace_nulls does not support every nested child type, including the
+    // ARRAY<STRUCT> state used by PayPal).
+    auto validInt = cudf::cast(
+        valid->view(),
+        cudf::data_type{cudf::type_id::INT32},
+        stream,
+        mr);
+    auto cumulative = cudf::scan(
+        validInt->view(),
+        *cudf::make_sum_aggregation<cudf::scan_aggregation>(),
+        cudf::scan_type::INCLUSIVE,
+        cudf::null_policy::EXCLUDE,
+        stream,
+        mr);
+    auto zero = cudf::make_column_from_scalar(
+        cudf::numeric_scalar<cudf::size_type>(0, true, stream, mr),
+        1,
+        stream,
+        mr);
+    const std::vector<cudf::column_view> offsetPieces{
+        zero->view(), cumulative->view()};
+    auto offsets = cudf::concatenate(offsetPieces, stream, mr);
+    return cudf::make_lists_column(
+        numRows,
+        std::move(offsets),
+        std::move(elements),
+        0,
+        rmm::device_buffer{});
+  }
+
  private:
   uint32_t outputIdx_{0};
   std::unique_ptr<cudf::column> nonNullMergeInput_;
@@ -1321,7 +1391,7 @@ void CudfGroupby::initialize() {
                   return aggregator->supportsPartialIdentity();
                 }),
         "partial identity aggregation currently supports only non-constant "
-        "SUM, MIN, and MAX companion aggregates");
+        "SUM, MIN, MAX, and COLLECT_LIST companion aggregates");
     LOG(INFO) << "CUDF_GROUPBY_PARTIAL_IDENTITY node=" << diagnosticNodeId_
               << " state=enabled keys=" << groupingKeyOutputChannels_.size()
               << " aggregates=" << aggregators_.size();

@@ -701,9 +701,96 @@ class CastFunction : public CudfFunction {
         // computed temporary. Returning only its view lets FunctionExpression
         // destroy the owner as the recursive frame exits.
         return std::move(inputColumns[0]);
-      case Mode::kStringToInteger:
-        return cudf::strings::to_integers(
-            cudf::strings_column_view(inputCol), targetCudfType_, stream, mr);
+      case Mode::kStringToInteger: {
+        // Spark's non-ANSI string-to-integer cast returns null for malformed
+        // and out-of-range strings. libcudf::strings::to_integers does not
+        // validate input, so build the validity predicate explicitly.
+        //
+        // Runtime shuffle/cache readers may represent an empty STRING column
+        // without materialized offsets/chars children. Do not construct a
+        // strings_column_view (or iterate its children) for a zero-row batch.
+        if (inputCol.size() == 0) {
+          return cudf::make_empty_column(targetCudfType_);
+        }
+        // Expand the original validity mask separately, then always remove it
+        // from the STRING view passed to libcudf conversion. Runtime
+        // shuffle/cache columns can carry a readable device mask which cannot
+        // be copied with cudaMemcpyDefault; both strings::is_integer() and
+        // strings::to_integers() otherwise copy that mask internally.
+        std::vector<cudf::column_view> children(
+            inputCol.child_begin(), inputCol.child_end());
+        auto castInput = cudf::column_view(
+            inputCol.type(),
+            inputCol.size(),
+            inputCol.head<void>(),
+            nullptr,
+            0,
+            inputCol.offset(),
+            children);
+        const cudf::strings_column_view stringsInput(castInput);
+        const auto rethrowWithInput = [&](const char* phase,
+                                          const std::exception& error) {
+          VELOX_FAIL(
+              "String-to-integer cast failed during {}: rows={}, offset={}, "
+              "nullable={}, nullCount={}, mask={}: {}",
+              phase,
+              inputCol.size(),
+              inputCol.offset(),
+              inputCol.nullable(),
+              inputCol.null_count(),
+              static_cast<const void*>(inputCol.null_mask()),
+              error.what());
+        };
+        std::unique_ptr<cudf::column> inputValidity;
+        if (inputCol.nullable()) {
+          try {
+            inputValidity = cudf::is_valid(inputCol, stream, mr);
+          } catch (const std::exception& error) {
+            rethrowWithInput("is_valid", error);
+          }
+        }
+        std::unique_ptr<cudf::column> valid;
+        try {
+          valid = cudf::strings::is_integer(
+              stringsInput, targetCudfType_, stream, mr);
+        } catch (const std::exception& error) {
+          rethrowWithInput("is_integer", error);
+        }
+        if (inputValidity) {
+          try {
+            valid = cudf::binary_operation(
+                valid->view(),
+                inputValidity->view(),
+                cudf::binary_operator::LOGICAL_AND,
+                cudf::data_type{cudf::type_id::BOOL8},
+                stream,
+                mr);
+          } catch (const std::exception& error) {
+            rethrowWithInput("combine_validity", error);
+          }
+        }
+        std::unique_ptr<cudf::column> converted;
+        try {
+          converted = cudf::strings::to_integers(
+              stringsInput, targetCudfType_, stream, mr);
+        } catch (const std::exception& error) {
+          rethrowWithInput("to_integers", error);
+        }
+        std::unique_ptr<cudf::scalar> nullScalar;
+        try {
+          nullScalar = cudf::make_default_constructed_scalar(
+              targetCudfType_, stream, mr);
+          nullScalar->set_valid_async(false, stream);
+        } catch (const std::exception& error) {
+          rethrowWithInput("make_null_scalar", error);
+        }
+        try {
+          return cudf::copy_if_else(
+              converted->view(), *nullScalar, valid->view(), stream, mr);
+        } catch (const std::exception& error) {
+          rethrowWithInput("copy_if_else", error);
+        }
+      }
       case Mode::kStringToFloat:
         return cudf::strings::to_floats(
             cudf::strings_column_view(inputCol), targetCudfType_, stream, mr);
@@ -740,6 +827,42 @@ class CardinalityFunction : public CudfFunction {
     auto inputCol = asView(inputColumns[0]);
     return cudf::lists::count_elements(inputCol, stream, mr);
   }
+};
+
+class SparkSizeFunction : public CudfFunction {
+ public:
+  SparkSizeFunction(
+      const core::TypedExprPtr& expr,
+      memory::MemoryPool* pool) {
+    VELOX_CHECK_EQ(expr->inputs().size(), 2, "size expects exactly 2 inputs");
+    VELOX_CHECK(
+        expr->inputs()[1]->isConstantKind(),
+        "size legacySizeOfNull argument must be constant");
+    auto legacySizeOfNull =
+        toConstantVector(expr->inputs()[1], pool)->as<ConstantVector<bool>>();
+    VELOX_CHECK_NOT_NULL(legacySizeOfNull);
+    VELOX_CHECK(
+        !legacySizeOfNull->isNullAt(0),
+        "size legacySizeOfNull argument must not be null");
+    legacySizeOfNull_ = legacySizeOfNull->valueAt(0);
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    VELOX_CHECK_EQ(inputColumns.size(), 1, "size expects one array column");
+    auto result =
+        cudf::lists::count_elements(asView(inputColumns[0]), stream, mr);
+    if (legacySizeOfNull_ && result->has_nulls()) {
+      cudf::numeric_scalar<int32_t> minusOne(-1, true, stream, mr);
+      result = cudf::replace_nulls(result->view(), minusOne, stream, mr);
+    }
+    return result;
+  }
+
+ private:
+  bool legacySizeOfNull_{false};
 };
 
 class IsNullFunction : public CudfFunction {
@@ -2345,9 +2468,31 @@ class RowConstructorFunction : public CudfFunction {
     numInputs_ = expr->inputs().size();
     bool hasNonLiteralInput = false;
     literals_.reserve(numInputs_);
-    for (const auto& input : expr->inputs()) {
+    for (size_t inputIndex = 0; inputIndex < expr->inputs().size(); ++inputIndex) {
+      const auto& input = expr->inputs()[inputIndex];
       if (input->isConstantKind()) {
-        literals_.push_back(makeScalarFromConstantExpr(input, pool));
+        if (input->type()->kind() == TypeKind::UNKNOWN) {
+          // Velox uses UNKNOWN for an untyped NULL. libcudf has no EMPTY
+          // scalar, so use the same all-null physical placeholder as the
+          // Arrow/cuDF interop path. Prefer the resolved ROW child type when
+          // one exists; an unresolved UNKNOWN child is represented as INT8.
+          auto physicalType = expr->type()->childAt(inputIndex);
+          if (physicalType->kind() == TypeKind::UNKNOWN) {
+            physicalType = TINYINT();
+          }
+          auto stream =
+              cudf::get_default_stream(cudf::allow_default_stream);
+          auto scalar = cudf::make_default_constructed_scalar(
+              veloxToCudfDataType(physicalType), stream, get_temp_mr());
+          // Scalar construction may enqueue initialization of device-side
+          // validity storage. Keep the constructor-time literal contract used
+          // by makeScalarFromConstantExpr: all work is complete before the
+          // scalar is retained and later evaluated on arbitrary task streams.
+          stream.synchronize();
+          literals_.push_back(std::move(scalar));
+        } else {
+          literals_.push_back(makeScalarFromConstantExpr(input, pool));
+        }
       } else {
         hasNonLiteralInput = true;
         literals_.push_back(nullptr);
@@ -2569,6 +2714,19 @@ bool registerBuiltinFunctions(const std::string& prefix) {
            .argumentType("array(any)")
            .build()});
 
+  registerCudfFunction(
+      prefix + "size",
+      [](const std::string&,
+         const core::TypedExprPtr& expr,
+         memory::MemoryPool* pool) {
+        return std::make_shared<SparkSizeFunction>(expr, pool);
+      },
+      {FunctionSignatureBuilder()
+           .returnType("integer")
+           .argumentType("array(any)")
+           .constantArgumentType("boolean")
+           .build()});
+
   // Coalesce is special form and doesn't have a prefix in its name.
   registerCudfFunction(
       "coalesce",
@@ -2646,6 +2804,22 @@ bool registerBuiltinFunctions(const std::string& prefix) {
 
   registerCudfFunction(
       "is_null",
+      [](const std::string&,
+         const core::TypedExprPtr& expr,
+         memory::MemoryPool*) {
+        return std::make_shared<IsNullFunction>(expr);
+      },
+      {FunctionSignatureBuilder()
+           .typeVariable("T")
+           .returnType("boolean")
+           .argumentType("T")
+           .build()});
+
+  // Spark's Substrait conversion uses the unseparated spelling for IsNull.
+  // Keep the Presto spelling above as well because plans from both frontends
+  // reach this shared evaluator.
+  registerCudfFunction(
+      "isnull",
       [](const std::string&,
          const core::TypedExprPtr& expr,
          memory::MemoryPool*) {
@@ -2974,6 +3148,26 @@ bool registerBuiltinFunctions(const std::string& prefix) {
           return std::make_shared<BinaryFunction>(expr, op, pool);
         },
         {FunctionSignatureBuilder()
+             .returnType("tinyint")
+             .argumentType("tinyint")
+             .argumentType("tinyint")
+             .build(),
+         FunctionSignatureBuilder()
+             .returnType("smallint")
+             .argumentType("smallint")
+             .argumentType("smallint")
+             .build(),
+         FunctionSignatureBuilder()
+             .returnType("integer")
+             .argumentType("integer")
+             .argumentType("integer")
+             .build(),
+         FunctionSignatureBuilder()
+             .returnType("bigint")
+             .argumentType("bigint")
+             .argumentType("bigint")
+             .build(),
+         FunctionSignatureBuilder()
              .returnType("double")
              .argumentType("double")
              .argumentType("double")
@@ -2987,7 +3181,16 @@ bool registerBuiltinFunctions(const std::string& prefix) {
       {prefix + "minus", prefix + "subtract"}, cudf::binary_operator::SUB);
   registerBinaryOp({prefix + "multiply"}, cudf::binary_operator::MUL);
   registerBinaryOp({prefix + "divide"}, cudf::binary_operator::DIV);
-  registerBinaryOp({prefix + "mod"}, cudf::binary_operator::MOD);
+  registerBinaryOp(
+      {prefix + "mod", prefix + "remainder"},
+      cudf::binary_operator::MOD);
+  // Spark pmod is a distinct operator: unlike remainder, a positive divisor
+  // always produces a non-negative result. libcudf implements these semantics
+  // directly, so keep it as a recursive FunctionExpression boundary instead
+  // of lowering it to the cuDF AST MOD operator.
+  registerBinaryOp({prefix + "pmod"}, cudf::binary_operator::PMOD);
+  registerBinaryOp(
+      {prefix + "bitwise_xor"}, cudf::binary_operator::BITWISE_XOR);
 
   //
   // regular comparison operators
@@ -3635,6 +3838,12 @@ bool canExprRunOnGpu(
   const core::TypedExprPtr checked = (queryCtx != nullptr && pool != nullptr)
       ? expression::optimize(expr, queryCtx, pool)
       : expr;
+  // Root literals are materialized directly by CudfFilterProject. This also
+  // covers nested ARRAY/MAP/ROW constants, which cannot be represented by a
+  // cuDF AST scalar but are imported as a repeated Arrow column.
+  if (checked->isConstantKind()) {
+    return true;
+  }
   return !requiresCpuForTimezone(checked, queryCtx) &&
       canBeEvaluatedByCudf(checked);
 }

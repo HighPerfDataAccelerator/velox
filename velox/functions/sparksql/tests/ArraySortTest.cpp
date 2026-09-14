@@ -197,6 +197,16 @@ TEST_F(ArraySortTest, lambda) {
       true,
       data,
       sortedAsc);
+  // Spark 4 generates this nulls-last wrapper for array_sort(array) when it
+  // serializes the default comparator into the Substrait plan.
+  testArraySort(
+      "(x, y) -> if(and(isnull(x), isnull(y)), 0, if(isnull(x), 1, if(isnull(y), -1, if(lessthan(x, y), -1, if(greaterthan(x, y), 1, 0)))))",
+      true,
+      data,
+      makeNullableArrayVector<std::string>({
+          {"abc", "abc123", "abcd", std::nullopt},
+          {"x", "xyz", "xyz123", std::nullopt},
+      }));
 
   // Different ways to sort by length descending.
   testArraySort("x -> length(x)", false, data, sortedDesc);

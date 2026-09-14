@@ -37,7 +37,9 @@
 
 #include <gflags/gflags.h>
 #include <re2/re2.h>
+#include <cudf/io/orc.hpp>
 
+#include <atomic>
 #include <string>
 
 using namespace facebook::velox;
@@ -598,12 +600,27 @@ class TableWriteTest : public CudfHiveConnectorTestBase {
 class BasicTableWriteTest : public CudfHiveConnectorTestBase {};
 
 TEST_F(BasicTableWriteTest, roundTrip) {
+  TestValue::enable();
+  std::atomic<int32_t> deviceAppends{0};
+  ScopedTestValue deviceAppendHook(
+      "facebook::velox::cudf_velox::connector::hive::"
+      "CudfHiveDataSink::appendDeviceData",
+      std::function<void(
+          cudf_velox::connector::hive::CudfHiveDataSink*)>(
+          [&](cudf_velox::connector::hive::CudfHiveDataSink*) {
+            ++deviceAppends;
+          }));
   vector_size_t size = 1'000;
   auto data = makeRowVector({
       makeFlatVector<int32_t>(size, [](auto row) { return row; }),
       makeFlatVector<int32_t>(
           size, [](auto row) { return row * 2; }, nullEvery(7)),
+      makeArrayVector<int64_t>(
+          size,
+          [](auto row) { return row % 4; },
+          [](auto row) { return row; }),
   });
+  auto expectedData = data;
 
   auto sourceFilePath = TempFilePath::create();
   writeToFile(sourceFilePath->getPath(), data);
@@ -616,13 +633,28 @@ TEST_F(BasicTableWriteTest, roundTrip) {
                   .outputType(rowType)
                   .tableHandle(CudfHiveConnectorTestBase::makeTableHandle())
                   .endTableScan()
+                  // Limit is always GPU-capable and preserves the full input,
+                  // forcing a CudfVector into TableWriter without changing the
+                  // round-trip expectation.
+                  .limit(0, size, false)
+                  // Exercise the Job 38 boundary: Spark emits a final identity
+                  // Project containing nested columns immediately before the
+                  // table writer.
+                  .project({"c0", "c1", "c2"})
                   .addNode(cudfTableWrite(targetDirectoryPath->getPath()))
                   .planNode();
 
   auto results =
       AssertQueryBuilder(plan)
+          .config("cudf.enabled", true)
+          .config("cudf.debug_enabled", true)
+          .config("cudf.allow_cpu_fallback", false)
           .split(makeCudfHiveConnectorSplit(sourceFilePath->getPath()))
           .copyResults(pool());
+#ifndef NDEBUG
+  // TestValue callbacks are intentionally compiled out of release builds.
+  ASSERT_GT(deviceAppends.load(), 0);
+#endif
   ASSERT_EQ(2, results->size());
 
   // First column has number of rows written in the first row and nulls in other
@@ -638,12 +670,18 @@ TEST_F(BasicTableWriteTest, roundTrip) {
                      ->as<FlatVector<StringView>>();
   ASSERT_TRUE(details->isNullAt(0));
   ASSERT_FALSE(details->isNullAt(1));
-  folly::dynamic obj = folly::parseJson(details->valueAt(1));
+  folly::dynamic obj =
+      folly::parseJson(std::string_view(details->valueAt(1)));
 
   ASSERT_EQ(size, obj["rowCount"].asInt());
   auto fileWriteInfos = obj["fileWriteInfos"];
   ASSERT_EQ(1, fileWriteInfos.size());
   auto writeFileName = fileWriteInfos[0]["writeFileName"].asString();
+  const auto outputPath =
+      fmt::format("{}/{}", targetDirectoryPath->getPath(), writeFileName);
+  ASSERT_GT(fileWriteInfos[0]["fileSize"].asInt(), 0);
+  ASSERT_EQ(
+      fileWriteInfos[0]["fileSize"].asInt(), fs::file_size(outputPath));
 
   // Read from 'writeFileName' and verify the data matches the original.
   plan = PlanBuilder()
@@ -656,10 +694,9 @@ TEST_F(BasicTableWriteTest, roundTrip) {
   auto copy =
       AssertQueryBuilder(plan)
           .split(makeCudfHiveConnectorSplit(
-              fmt::format(
-                  "{}/{}", targetDirectoryPath->getPath(), writeFileName)))
+              outputPath))
           .copyResults(pool());
-  assertEqualResults({data}, {copy});
+  assertEqualResults({expectedData}, {copy});
 }
 
 TEST_F(BasicTableWriteTest, targetFileName) {
@@ -679,7 +716,7 @@ TEST_F(BasicTableWriteTest, targetFileName) {
   auto results = AssertQueryBuilder(plan).copyResults(pool());
   auto* details = results->childAt(TableWriteTraits::kFragmentChannel)
                       ->asUnchecked<SimpleVector<StringView>>();
-  auto detail = folly::parseJson(details->valueAt(1));
+  auto detail = folly::parseJson(std::string_view(details->valueAt(1)));
   auto fileWriteInfos = detail["fileWriteInfos"];
   ASSERT_EQ(1, fileWriteInfos.size());
   ASSERT_EQ(fileWriteInfos[0]["writeFileName"].asString(), kFileName);
@@ -693,6 +730,89 @@ TEST_F(BasicTableWriteTest, targetFileName) {
       .split(makeCudfHiveConnectorSplit(
           fmt::format("{}/{}", directory->getPath(), kFileName)))
       .assertResults(data);
+}
+
+TEST_F(BasicTableWriteTest, orcRoundTrip) {
+  constexpr vector_size_t kSize = 1'000;
+  auto data = makeRowVector({
+      makeFlatVector<int64_t>(kSize, folly::identity),
+      makeFlatVector<int64_t>(
+          kSize, [](auto row) { return row * 7; }, nullEvery(11)),
+  });
+  auto directory = TempDirectoryPath::create();
+  auto plan = PlanBuilder()
+                  .values({data})
+                  .addNode(cudfTableWrite(
+                      directory->getPath(),
+                      dwio::common::FileFormat::ORC,
+                      {},
+                      nullptr,
+                      "part-test.orc"))
+                  .planNode();
+
+  auto results = AssertQueryBuilder(plan).copyResults(pool());
+  auto* details = results->childAt(TableWriteTraits::kFragmentChannel)
+                      ->asUnchecked<SimpleVector<StringView>>();
+  auto detail = folly::parseJson(std::string_view(details->valueAt(1)));
+  auto fileWriteInfos = detail["fileWriteInfos"];
+  ASSERT_EQ(1, fileWriteInfos.size());
+  ASSERT_EQ("part-test.orc", fileWriteInfos[0]["writeFileName"].asString());
+
+  const auto outputPath =
+      fmt::format("{}/{}", directory->getPath(), "part-test.orc");
+  auto options = cudf::io::orc_reader_options::builder(
+                     cudf::io::source_info(outputPath))
+                     .build();
+  auto output = cudf::io::read_orc(options);
+  ASSERT_EQ(kSize, output.tbl->num_rows());
+  ASSERT_EQ(2, output.tbl->num_columns());
+}
+
+TEST_F(BasicTableWriteTest, createsMissingTargetDirectory) {
+  constexpr const char* kFileName = "nested-output.parquet";
+  auto data = makeRowVector({makeFlatVector<int64_t>(10, folly::identity)});
+  auto root = TempDirectoryPath::create();
+  const auto targetDirectory =
+      fmt::format("{}/missing/task/attempt", root->getPath());
+  ASSERT_FALSE(fs::exists(targetDirectory));
+
+  auto plan = PlanBuilder()
+                  .values({data})
+                  .addNode(cudfTableWrite(
+                      targetDirectory,
+                      dwio::common::FileFormat::PARQUET,
+                      {},
+                      nullptr,
+                      kFileName))
+                  .planNode();
+  AssertQueryBuilder(plan).copyResults(pool());
+
+  ASSERT_TRUE(fs::exists(targetDirectory));
+  ASSERT_TRUE(fs::exists(fmt::format("{}/{}", targetDirectory, kFileName)));
+}
+
+TEST_F(BasicTableWriteTest, writesFileUriIntoCommitterDirectory) {
+  constexpr const char* kFileName = "file-uri-output.parquet";
+  auto data = makeRowVector({makeFlatVector<int64_t>(10, folly::identity)});
+  auto root = TempDirectoryPath::create();
+  const auto localTargetDirectory =
+      fmt::format("{}/missing/task/attempt", root->getPath());
+  const auto fileUriTargetDirectory = fmt::format("file:{}", localTargetDirectory);
+
+  auto plan = PlanBuilder()
+                  .values({data})
+                  .addNode(cudfTableWrite(
+                      fileUriTargetDirectory,
+                      dwio::common::FileFormat::PARQUET,
+                      {},
+                      nullptr,
+                      kFileName))
+                  .planNode();
+  AssertQueryBuilder(plan).copyResults(pool());
+
+  const auto outputPath = fmt::format("{}/{}", localTargetDirectory, kFileName);
+  ASSERT_TRUE(fs::exists(outputPath));
+  ASSERT_GT(fs::file_size(outputPath), 0);
 }
 
 class UnpartitionedTableWriterTest

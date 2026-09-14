@@ -172,6 +172,36 @@ int64_t maxInFlightSendHostBytes() {
 
 std::atomic<int64_t> inFlightSendHostBytes{0};
 
+std::atomic<int64_t> activeRemoteDataSends{0};
+std::atomic<int64_t> maxActiveRemoteDataSends{0};
+std::atomic<int64_t> postedRemoteDataSends{0};
+std::atomic<int64_t> completedRemoteDataSends{0};
+std::atomic<int64_t> completedRemoteDataBytes{0};
+std::atomic<int64_t> remoteDataSendNanos{0};
+
+void recordRemoteDataSendPosted() {
+  postedRemoteDataSends.fetch_add(1, std::memory_order_relaxed);
+  const auto active =
+      activeRemoteDataSends.fetch_add(1, std::memory_order_acq_rel) + 1;
+  auto maximum = maxActiveRemoteDataSends.load(std::memory_order_relaxed);
+  while (active > maximum &&
+         !maxActiveRemoteDataSends.compare_exchange_weak(
+             maximum,
+             active,
+             std::memory_order_release,
+             std::memory_order_relaxed)) {
+  }
+}
+
+void recordRemoteDataSendCompleted(int64_t bytes, int64_t nanos) {
+  const auto previous =
+      activeRemoteDataSends.fetch_sub(1, std::memory_order_acq_rel);
+  VELOX_CHECK_GT(previous, 0);
+  completedRemoteDataSends.fetch_add(1, std::memory_order_relaxed);
+  completedRemoteDataBytes.fetch_add(bytes, std::memory_order_relaxed);
+  remoteDataSendNanos.fetch_add(nanos, std::memory_order_relaxed);
+}
+
 bool tryReserveSendHostBytes(int64_t bytes) {
   VELOX_CHECK_GE(bytes, 0);
   auto current = inFlightSendHostBytes.load(std::memory_order_relaxed);
@@ -203,6 +233,16 @@ void releaseSendHostBytes(int64_t bytes) {
 
 } // namespace
 
+UcxRemoteDataPathSnapshot remoteDataPathSnapshot() {
+  return {
+      activeRemoteDataSends.load(std::memory_order_relaxed),
+      maxActiveRemoteDataSends.load(std::memory_order_relaxed),
+      postedRemoteDataSends.load(std::memory_order_relaxed),
+      completedRemoteDataSends.load(std::memory_order_relaxed),
+      completedRemoteDataBytes.load(std::memory_order_relaxed),
+      remoteDataSendNanos.load(std::memory_order_relaxed)};
+}
+
 VELOX_DEFINE_EMBEDDED_ENUM_NAME(
     UcxExchangeServer,
     ServerState,
@@ -231,6 +271,7 @@ struct DataSendContext {
   uint64_t hostDataBytes{0};
   bool hostDataPinned{false};
   int64_t reservedHostBytes{0};
+  std::atomic<bool> completionRecorded{false};
 
   ~DataSendContext() {
     releaseHostReservation();
@@ -843,12 +884,19 @@ void UcxExchangeServer::sendData() {
                       : "direct-device")
               << " send for " << bytes_ << " bytes";
 
+      const auto remoteSendPostedAt = std::chrono::steady_clock::now();
+      const auto remoteSendBytes = static_cast<int64_t>(bytes_);
+      recordRemoteDataSendPosted();
       dataRequest_ = endpointRef_->endpoint_->tagSend(
           sendBuffer,
           static_cast<size_t>(bytes_),
           ucxx::Tag{dataTag},
           false,
-          [weakData, useHostStaging, dataSequence](
+          [weakData,
+           useHostStaging,
+           dataSequence,
+           remoteSendPostedAt,
+           remoteSendBytes](
               ucs_status_t status, std::shared_ptr<void> arg) {
             // Hold the producer device allocation through the UCX completion
             // callback. For direct CUDA transfer, successful UCP completion is
@@ -857,6 +905,14 @@ void UcxExchangeServer::sendData() {
             // retaining a direct device packet in every exchange server pins
             // enough GPU memory to block the shared device-state arbitrator.
             auto ctx = std::static_pointer_cast<DataSendContext>(arg);
+            if (!ctx->completionRecorded.exchange(
+                    true, std::memory_order_acq_rel)) {
+              recordRemoteDataSendCompleted(
+                  remoteSendBytes,
+                  std::chrono::duration_cast<std::chrono::nanoseconds>(
+                      std::chrono::steady_clock::now() - remoteSendPostedAt)
+                      .count());
+            }
             auto dataHolder = std::move(ctx->data);
             auto hostDataHolder = std::move(ctx->hostData);
             const auto hostDataBytes = ctx->hostDataBytes;

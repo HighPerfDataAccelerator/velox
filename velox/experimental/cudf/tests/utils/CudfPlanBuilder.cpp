@@ -77,11 +77,17 @@ std::function<PlanNodePtr(std::string, PlanNodePtr)> cudfTableWrite(
         outputDirectoryPath,
         cudf_velox::connector::hive::LocationHandle::TableType::kNew,
         outputFileName);
-    auto parquetHandle =
+    auto cudfHandle =
         CudfHiveConnectorTestBase::makeCudfHiveInsertTableHandle(
-            rowType->names(), rowType->children(), locationHandle, compression);
+            rowType->names(),
+            rowType->children(),
+            locationHandle,
+            compression,
+            serdeParameters,
+            options,
+            fileFormat);
     auto insertHandle = std::make_shared<core::InsertTableHandle>(
-        std::string(connectorId), parquetHandle);
+        std::string(connectorId), cudfHandle);
 
     return std::make_shared<core::TableWriteNode>(
         nodeId,

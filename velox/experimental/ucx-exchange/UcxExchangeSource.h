@@ -48,17 +48,47 @@ struct UcxExchangeMetrics {
       : numPackedColumns_(RuntimeMetric(RuntimeCounter::Unit::kNone)),
         totalBytes_(RuntimeCounter::Unit::kBytes),
         hostStagedBytes_(RuntimeCounter::Unit::kBytes),
+        hostStagedForcedBytes_(RuntimeCounter::Unit::kBytes),
+        hostStagedNoCudaTransportBytes_(RuntimeCounter::Unit::kBytes),
+        hostStagedSmallEagerBytes_(RuntimeCounter::Unit::kBytes),
+        hostStagedOverDirectLimitBytes_(RuntimeCounter::Unit::kBytes),
+        intraProcessHostBackedBytes_(RuntimeCounter::Unit::kBytes),
+        directDeviceBytes_(RuntimeCounter::Unit::kBytes),
+        directReceiveAllocationNanos_(RuntimeCounter::Unit::kNanos),
+        directReceiveAllocationSyncNanos_(RuntimeCounter::Unit::kNanos),
         asyncHostCopyBytes_(RuntimeCounter::Unit::kBytes),
         asyncHostCopyThrottledBytes_(RuntimeCounter::Unit::kBytes),
         hostCopySyncNanos_(RuntimeCounter::Unit::kNanos),
-        rttPerRequest_(RuntimeMetric(RuntimeCounter::Unit::kNanos)) {}
+        rttPerRequest_(RuntimeMetric(RuntimeCounter::Unit::kNanos)),
+        sameHostDataReceiveBytes_(RuntimeCounter::Unit::kBytes),
+        sameHostDataReceiveNanos_(RuntimeCounter::Unit::kNanos),
+        remoteHostDataReceiveBytes_(RuntimeCounter::Unit::kBytes),
+        remoteHostDataReceiveNanos_(RuntimeCounter::Unit::kNanos),
+        metadataReceiveNanos_(RuntimeCounter::Unit::kNanos),
+        receiveCreditWaitNanos_(RuntimeCounter::Unit::kNanos),
+        queueBackpressureNanos_(RuntimeCounter::Unit::kNanos) {}
   RuntimeMetric numPackedColumns_; // total number of packed columns received.
   RuntimeMetric totalBytes_; // total number of bytes received
   RuntimeMetric hostStagedBytes_; // bytes received through a host bounce.
+  RuntimeMetric hostStagedForcedBytes_;
+  RuntimeMetric hostStagedNoCudaTransportBytes_;
+  RuntimeMetric hostStagedSmallEagerBytes_;
+  RuntimeMetric hostStagedOverDirectLimitBytes_;
+  RuntimeMetric intraProcessHostBackedBytes_;
+  RuntimeMetric directDeviceBytes_;
+  RuntimeMetric directReceiveAllocationNanos_;
+  RuntimeMetric directReceiveAllocationSyncNanos_;
   RuntimeMetric asyncHostCopyBytes_; // host-bounce H2D bytes published async.
   RuntimeMetric asyncHostCopyThrottledBytes_; // bytes fenced by async limit.
   RuntimeMetric hostCopySyncNanos_; // fallback H2D synchronization wall.
   RuntimeMetric rttPerRequest_;
+  RuntimeMetric sameHostDataReceiveBytes_;
+  RuntimeMetric sameHostDataReceiveNanos_;
+  RuntimeMetric remoteHostDataReceiveBytes_;
+  RuntimeMetric remoteHostDataReceiveNanos_;
+  RuntimeMetric metadataReceiveNanos_;
+  RuntimeMetric receiveCreditWaitNanos_;
+  RuntimeMetric queueBackpressureNanos_;
 };
 
 /// The UcxExchangeSource is the client that communicates with the remote
@@ -157,6 +187,10 @@ class UcxExchangeSource
   /// min:  1.16GB'
   folly::F14FastMap<std::string, RuntimeMetric> metrics() const;
 
+  ReceiverState stateForDiagnostics() const {
+    return state_.load(std::memory_order_relaxed);
+  }
+
   std::string toString() const {
     std::stringstream out;
     out << "@" << taskId_ << " - @" << partitionKey_.toString();
@@ -177,8 +211,10 @@ class UcxExchangeSource
     std::unique_ptr<rmm::device_buffer> dataBuf;
     std::shared_ptr<uint8_t> hostData;
     bool hostDataPinned{false};
+    DeviceTransferPath transferPath{DeviceTransferPath::kDirectDevice};
     rmm::cuda_stream_view stream; // The stream used to allocate dataBuf
     std::shared_ptr<void> receiveWorkspaceProgressLease;
+    std::chrono::steady_clock::time_point dataReceiveStart;
   };
 
   /// @brief The constructor is private in order to ensure that exchange sources
@@ -299,6 +335,9 @@ class UcxExchangeSource
 
   // The connection parameters
   const std::string host_;
+  // True for a peer in another executor process on this physical host. A peer
+  // in this process bypasses UCXX entirely after the handshake.
+  const bool samePhysicalHost_;
   uint16_t port_;
   const std::string taskId_;
 
@@ -350,6 +389,9 @@ class UcxExchangeSource
   std::optional<std::chrono::steady_clock::time_point>
       receiveWorkspaceBlockedSince_;
   bool receiveWorkspaceProgressLogged_{false};
+  std::chrono::steady_clock::time_point metadataReceiveStart_;
+  std::optional<std::chrono::steady_clock::time_point> receiveCreditWaitStart_;
+  std::optional<std::chrono::steady_clock::time_point> queueBackpressureStart_;
 
   // Some metrics/counters:
   UcxExchangeMetrics metrics_;

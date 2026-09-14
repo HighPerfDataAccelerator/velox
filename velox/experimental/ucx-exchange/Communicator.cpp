@@ -333,15 +333,31 @@ void Communicator::run() {
   }
   const bool contextSupportsCuda = context_->hasCudaSupport();
   const bool cudaComponentLoaded = hasLoadedCudaUctComponent();
-  cudaTransportAvailable_.store(
-      contextSupportsCuda && cudaComponentLoaded, std::memory_order_release);
-  LOG(INFO) << "UCX CUDA transport support="
+  // UCXX derives hasCudaSupport() from the UCP context's supported memory
+  // types and the configured UCX_TLS.  That is the capability relevant to
+  // ucp_tag_send/recv.  Do not additionally gate it on a UCT component-name
+  // scan: component naming/loading is internal to UCX and produced false
+  // negatives even while endpoint protocol selection showed cuda and
+  // cuda_ipc lanes.
+  cudaTransportAvailable_.store(contextSupportsCuda, std::memory_order_release);
+  LOG(WARNING) << "UCX CUDA transport support="
             << (hasCudaTransport() ? "enabled" : "disabled")
             << " (contextMemoryType=" << (contextSupportsCuda ? "yes" : "no")
             << ", loadedCudaComponent=" << (cudaComponentLoaded ? "yes" : "no")
             << ")"
             << "; remote transfers will use "
             << (hasCudaTransport() ? "direct device buffers" : "host staging");
+  if (contextSupportsCuda != cudaComponentLoaded) {
+    LOG(WARNING) << "UCX CUDA capability diagnostics disagree; using the UCP "
+                    "context memory-type result for data-path selection";
+  }
+  if (const char* value = std::getenv("GLUTEN_UCX_REQUIRE_CUDA_TRANSPORT");
+      value != nullptr && value[0] != '\0' && value[0] != '0') {
+    VELOX_CHECK(
+        hasCudaTransport(),
+        "GLUTEN_UCX_REQUIRE_CUDA_TRANSPORT is set, but the UCP context does "
+        "not support CUDA memory");
+  }
 
   worker_ = context_->createWorker();
 
@@ -382,13 +398,55 @@ void Communicator::run() {
 
         // Count ExSrv vs ExSrc elements.
         int numServers = 0, numSources = 0;
+        int serversWaitingForQueue = 0;
+        int serversSendingRemote = 0;
+        int serversWaitingIntraNode = 0;
+        int serversDataReady = 0;
+        int sourcesWaitingMetadata = 0;
+        int sourcesWaitingData = 0;
+        int sourcesWaitingCredit = 0;
+        int sourcesWaitingIntraNode = 0;
         for (const auto& elem : elements_) {
-          if (dynamic_cast<UcxExchangeServer*>(elem.get())) {
+          if (auto* server = dynamic_cast<UcxExchangeServer*>(elem.get())) {
             ++numServers;
-          } else if (dynamic_cast<UcxExchangeSource*>(elem.get())) {
+            switch (server->stateForDiagnostics()) {
+              case UcxExchangeServer::ServerState::WaitingForDataFromQueue:
+                ++serversWaitingForQueue;
+                break;
+              case UcxExchangeServer::ServerState::WaitingForSendComplete:
+                ++serversSendingRemote;
+                break;
+              case UcxExchangeServer::ServerState::WaitingForIntraNodeRetrieve:
+                ++serversWaitingIntraNode;
+                break;
+              case UcxExchangeServer::ServerState::DataReady:
+                ++serversDataReady;
+                break;
+              default:
+                break;
+            }
+          } else if (
+              auto* source = dynamic_cast<UcxExchangeSource*>(elem.get())) {
             ++numSources;
+            switch (source->stateForDiagnostics()) {
+              case UcxExchangeSource::ReceiverState::WaitingForMetadata:
+                ++sourcesWaitingMetadata;
+                break;
+              case UcxExchangeSource::ReceiverState::WaitingForData:
+                ++sourcesWaitingData;
+                break;
+              case UcxExchangeSource::ReceiverState::WaitingForReceiveCredit:
+                ++sourcesWaitingCredit;
+                break;
+              case UcxExchangeSource::ReceiverState::WaitingForIntraNodeData:
+                ++sourcesWaitingIntraNode;
+                break;
+              default:
+                break;
+            }
           }
         }
+        const auto remoteData = remoteDataPathSnapshot();
 
         size_t numEndpoints;
         {
@@ -400,10 +458,24 @@ void Communicator::run() {
           std::lock_guard<std::mutex> lock(deferredRequestsMutex_);
           deferredRequestCount = deferredRequests_.size();
         }
-        VLOG(2) << "[COMM-HEARTBEAT] workQueue=" << workQueue_.size()
+        LOG(WARNING) << "[COMM-HEARTBEAT] workQueue=" << workQueue_.size()
                 << " elements=" << elements_.size()
                 << " (servers=" << numServers << " sources=" << numSources
                 << ")"
+                << " serverStates={queue=" << serversWaitingForQueue
+                << ",remoteSend=" << serversSendingRemote
+                << ",intraWait=" << serversWaitingIntraNode
+                << ",dataReady=" << serversDataReady << "}"
+                << " sourceStates={metadata=" << sourcesWaitingMetadata
+                << ",data=" << sourcesWaitingData
+                << ",credit=" << sourcesWaitingCredit
+                << ",intraWait=" << sourcesWaitingIntraNode << "}"
+                << " remoteData={active=" << remoteData.activeSends
+                << ",maxActive=" << remoteData.maxActiveSends
+                << ",posted=" << remoteData.postedSends
+                << ",completed=" << remoteData.completedSends
+                << ",bytes=" << remoteData.completedBytes
+                << ",sendNanos=" << remoteData.sendNanos << "}"
                 << " endpoints=" << numEndpoints
                 << " deferredCleanup=" << deferredEndpointCleanup_.size()
                 << " deferredRequests=" << deferredRequestCount

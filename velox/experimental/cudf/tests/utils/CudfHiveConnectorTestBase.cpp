@@ -303,7 +303,8 @@ CudfHiveConnectorTestBase::makeCudfHiveInsertTableHandle(
     std::shared_ptr<connector::hive::LocationHandle> locationHandle,
     const std::optional<common::CompressionKind> compressionKind,
     const std::unordered_map<std::string, std::string>& serdeParameters,
-    const std::shared_ptr<dwio::common::WriterOptions>& writerOptions) {
+    const std::shared_ptr<dwio::common::WriterOptions>& writerOptions,
+    dwio::common::FileFormat storageFormat) {
   std::vector<std::shared_ptr<const connector::hive::CudfHiveColumnHandle>>
       columnHandles;
 
@@ -320,7 +321,8 @@ CudfHiveConnectorTestBase::makeCudfHiveInsertTableHandle(
       locationHandle,
       compressionKind,
       serdeParameters,
-      writerOptions);
+      writerOptions,
+      storageFormat);
 }
 
 } // namespace facebook::velox::cudf_velox::exec::test

@@ -115,6 +115,85 @@ uint64_t retainedCudfBytes(const CudfVector& vector) {
   return viewBytes;
 }
 
+std::optional<int32_t> mppTaskFragmentId(std::string_view taskId) {
+  const auto replicaMarker = taskId.rfind("-p");
+  if (replicaMarker == std::string_view::npos || replicaMarker == 0) {
+    return std::nullopt;
+  }
+  const auto fragmentSeparator = taskId.rfind('-', replicaMarker - 1);
+  if (fragmentSeparator == std::string_view::npos ||
+      fragmentSeparator + 1 == replicaMarker) {
+    return std::nullopt;
+  }
+  const auto token = taskId.substr(
+      fragmentSeparator + 1, replicaMarker - fragmentSeparator - 1);
+  const std::string tokenString(token);
+  char* end = nullptr;
+  const auto parsed = std::strtol(tokenString.c_str(), &end, 10);
+  if (end == nullptr || *end != '\0' || parsed < 0 ||
+      parsed > std::numeric_limits<int32_t>::max()) {
+    return std::nullopt;
+  }
+  return static_cast<int32_t>(parsed);
+}
+
+bool prebuildProbeFragmentSelected(std::string_view taskId) {
+  const auto* value =
+      std::getenv("CUDF_HASH_JOIN_PREBUILD_PROBE_FRAGMENT_IDS");
+  if (value == nullptr || *value == '\0') {
+    return true;
+  }
+  const auto fragmentId = mppTaskFragmentId(taskId);
+  if (!fragmentId.has_value()) {
+    return false;
+  }
+  std::string_view requested(value);
+  size_t begin = 0;
+  while (begin <= requested.size()) {
+    const auto comma = requested.find(',', begin);
+    const auto token = requested.substr(
+        begin,
+        comma == std::string_view::npos ? requested.size() - begin
+                                        : comma - begin);
+    const std::string tokenString(token);
+    char* end = nullptr;
+    const auto parsed = std::strtol(tokenString.c_str(), &end, 10);
+    if (end != nullptr && *end == '\0' && parsed == *fragmentId) {
+      return true;
+    }
+    if (comma == std::string_view::npos) {
+      break;
+    }
+    begin = comma + 1;
+  }
+  return false;
+}
+
+bool prebuildProbePlanNodeSelected(std::string_view planNodeId) {
+  const auto* value =
+      std::getenv("CUDF_HASH_JOIN_PREBUILD_PROBE_PLAN_NODE_IDS");
+  if (value == nullptr || *value == '\0') {
+    return true;
+  }
+  std::string_view requested(value);
+  size_t begin = 0;
+  while (begin <= requested.size()) {
+    const auto comma = requested.find(',', begin);
+    const auto token = requested.substr(
+        begin,
+        comma == std::string_view::npos ? requested.size() - begin
+                                        : comma - begin);
+    if (token == planNodeId) {
+      return true;
+    }
+    if (comma == std::string_view::npos) {
+      break;
+    }
+    begin = comma + 1;
+  }
+  return false;
+}
+
 bool graceBulkBuildRestoreEnabled() {
   const auto* value = std::getenv("GLUTEN_CUDF_HASH_JOIN_BULK_BUILD_RESTORE");
   if (value == nullptr) {
@@ -438,6 +517,33 @@ GracePinnedHostStagingPool& graceBuildPinnedHostStagingPool() {
   static GracePinnedHostStagingPool pool(
       "CUDF_HASH_JOIN_GRACE_BUILD_PINNED_BUFFER_COUNT", 4);
   return pool;
+}
+
+HashJoinHostBatch packHashJoinTablePinned(
+    cudf::table_view table,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) {
+  auto packed = cudf::pack(table, stream, mr);
+  HashJoinHostBatch host;
+  host.dataBytes = packed.gpu_data->size();
+  host.rows = static_cast<vector_size_t>(table.num_rows());
+  host.data = gracePinnedHostStagingPool().acquireShared(host.dataBytes);
+  host.pinned = host.data != nullptr;
+  if (!host.data && host.dataBytes > 0) {
+    host.data = std::shared_ptr<uint8_t>(
+        new uint8_t[host.dataBytes], std::default_delete<uint8_t[]>());
+  }
+  if (host.dataBytes > 0) {
+    CUDF_CUDA_TRY(cudaMemcpyAsync(
+        host.data.get(),
+        packed.gpu_data->data(),
+        host.dataBytes,
+        cudaMemcpyDeviceToHost,
+        stream.value()));
+  }
+  stream.synchronize();
+  host.metadata = std::move(packed.metadata);
+  return host;
 }
 
 folly::CPUThreadPoolExecutor& graceSpillReadExecutor() {
@@ -771,6 +877,10 @@ class ProbeMatchTracker {
 } // namespace
 
 void CudfHashJoinProbe::doClose() {
+  prebuildProbeHostBatches_.clear();
+  prebuildProbeBufferedBytes_ = 0;
+  prebuildProbeBufferedRows_ = 0;
+  graceWorkspaceRequest_.reset();
   graceWorkspaceAdmission_.reset();
   Operator::close();
   filterEvaluator_.reset();
@@ -1826,6 +1936,29 @@ CudfHashJoinProbe::CudfHashJoinProbe(
       const auto requested = std::strtoull(value, &end, 10);
       if (end != value && *end == '\0' && requested > 0) {
         graceEagerProbeBufferLimitBytes_ = requested;
+      }
+    }
+  }
+  if (!graceEnabled_ && (joinNode_->isInnerJoin() || joinNode_->isLeftJoin() ||
+                         joinNode_->isRightJoin())) {
+    if (const auto* value =
+            std::getenv("CUDF_HASH_JOIN_PREBUILD_PROBE_HOST_BYTES")) {
+      char* end = nullptr;
+      const auto requested = std::strtoull(value, &end, 10);
+      if (end != value && *end == '\0' && requested > 0 &&
+          prebuildProbeFragmentSelected(operatorCtx_->task()->taskId()) &&
+          prebuildProbePlanNodeSelected(planNodeId())) {
+        prebuildProbeHostLimitBytes_ = requested;
+        graceProbeHostLimitBytes_ = config.hashJoinGraceHostBytes > 0
+            ? config.hashJoinGraceHostBytes
+            : requested;
+        prebuildProbeEnabled_ = true;
+        LOG(WARNING) << "CudfHashJoinProbe task="
+                     << operatorCtx_->task()->taskId()
+                     << " node=" << planNodeId()
+                     << " enabled pre-build DRAM probe buffering limitBytes="
+                     << prebuildProbeHostLimitBytes_
+                     << " sharedHostLimitBytes=" << graceProbeHostLimitBytes_;
       }
     }
   }
@@ -3151,7 +3284,51 @@ bool CudfHashJoinProbe::needsInput() const {
       graceProbeBufferedBytes_ >= graceEagerProbeBufferLimitBytes_) {
     return false;
   }
+  if (prebuildProbeEnabled_ && !hashObject_.has_value()) {
+    return !noMoreInput_ && input_ == nullptr && !prebuildProbeHostFull_ &&
+        prebuildProbeBufferedBytes_ < prebuildProbeHostLimitBytes_;
+  }
   return !noMoreInput_ && !finished_ && input_ == nullptr;
+}
+
+void CudfHashJoinProbe::bufferPrebuildProbeInput(CudfVectorPtr input) {
+  VELOX_CHECK_NOT_NULL(input);
+  const auto rows = input->size();
+  auto batch = packHashJoinTablePinned(
+      input->getTableView(), input->stream(), get_output_mr());
+  const bool usedPinnedD2H = batch.pinned;
+  auto reservation = tryReserveGraceHostMemory(
+      batch.dataBytes, graceProbeHostLimitBytes_);
+  if (!reservation) {
+    // Keep at most this single device input while waiting for the build.  The
+    // temporary host image is destroyed here; no unaccounted DRAM survives.
+    prebuildProbeHostFull_ = true;
+    input_ = std::move(input);
+    addRuntimeStat(
+        "cudfPrebuildProbeHostReservationFailures",
+        RuntimeCounter(1, RuntimeCounter::Unit::kNone));
+    return;
+  }
+  batch.hostReservation = std::move(reservation);
+  if (usedPinnedD2H) {
+    addRuntimeStat(
+        "cudfPrebuildProbePinnedD2HBytes",
+        RuntimeCounter(batch.dataBytes, RuntimeCounter::Unit::kBytes));
+    demotePinnedGraceBatchAsync(batch);
+  } else {
+    addRuntimeStat(
+        "cudfPrebuildProbePageableD2HBytes",
+        RuntimeCounter(batch.dataBytes, RuntimeCounter::Unit::kBytes));
+  }
+  prebuildProbeBufferedBytes_ += batch.dataBytes;
+  prebuildProbeBufferedRows_ += rows;
+  addRuntimeStat(
+      "cudfPrebuildProbeHostBufferedBytes",
+      RuntimeCounter(batch.dataBytes, RuntimeCounter::Unit::kBytes));
+  addRuntimeStat(
+      "cudfPrebuildProbeHostBufferedRows",
+      RuntimeCounter(rows, RuntimeCounter::Unit::kNone));
+  prebuildProbeHostBatches_.push_back(std::move(batch));
 }
 
 void CudfHashJoinProbe::doAddInput(RowVectorPtr input) {
@@ -3190,6 +3367,10 @@ void CudfHashJoinProbe::doAddInput(RowVectorPtr input) {
   }
 
   if (input->size() > 0) {
+    if (prebuildProbeEnabled_ && !hashObject_.has_value()) {
+      bufferPrebuildProbeInput(std::move(cudfInput));
+      return;
+    }
     if (graceBuildData_ || graceEagerActive_) {
       queueGraceProbeInput(std::move(cudfInput));
       return;
@@ -3209,6 +3390,15 @@ void CudfHashJoinProbe::doNoMoreInput() {
                  << " partitionBatches=" << graceProbePartitionBatches_;
   }
   Operator::noMoreInput();
+  if (prebuildProbeEnabled_ && joinNode_->isRightJoin() &&
+      (input_ != nullptr || !prebuildProbeHostBatches_.empty())) {
+    // RIGHT-join unmatched-build emission uses an end-of-probe peer barrier.
+    // Receiving end-of-input is not equivalent to completing probe work when
+    // pre-build batches are queued in DRAM. Defer that barrier until this
+    // driver has replayed its last queued batch.
+    prebuildProbeFinishPending_ = true;
+    return;
+  }
   if (!graceEnabled_ && !joinNode_->isRightJoin() &&
       !joinNode_->isRightSemiFilterJoin() &&
       !joinNode_->isRightSemiProjectJoin() && !joinNode_->isFullJoin()) {
@@ -5346,6 +5536,22 @@ RowVectorPtr CudfHashJoinProbe::doGetOutput() {
   if (graceBuildData_) {
     return getGraceOutput();
   }
+  if (hashObject_.has_value() && input_ == nullptr &&
+      !prebuildProbeHostBatches_.empty()) {
+    auto& batch = prebuildProbeHostBatches_.front();
+    const auto bytes = batch.dataBytes;
+    const auto rows = batch.rows;
+    input_ = restoreHostBatch(
+        batch, probeType_, cudfGlobalStreamPool().get_stream(), true);
+    prebuildProbeHostBatches_.pop_front();
+    VELOX_CHECK_GE(prebuildProbeBufferedBytes_, bytes);
+    VELOX_CHECK_GE(prebuildProbeBufferedRows_, rows);
+    prebuildProbeBufferedBytes_ -= bytes;
+    prebuildProbeBufferedRows_ -= rows;
+    addRuntimeStat(
+        "cudfPrebuildProbeHostRestoredBytes",
+        RuntimeCounter(bytes, RuntimeCounter::Unit::kBytes));
+  }
   if (finished_ or !hashObject_.has_value()) {
     return nullptr;
   }
@@ -5444,8 +5650,13 @@ RowVectorPtr CudfHashJoinProbe::doGetOutput() {
   // the refcount while cudfInput still holds a reference.
   cudfInput.reset();
   input_.reset();
-  finished_ = noMoreInput_ && !joinNode_->isRightJoin() &&
-      !joinNode_->isFullJoin() && !joinNode_->isRightSemiProjectJoin();
+  if (prebuildProbeFinishPending_ && prebuildProbeHostBatches_.empty()) {
+    prebuildProbeFinishPending_ = false;
+    doNoMoreInput();
+  }
+  finished_ = noMoreInput_ && prebuildProbeHostBatches_.empty() &&
+      !joinNode_->isRightJoin() && !joinNode_->isFullJoin() &&
+      !joinNode_->isRightSemiProjectJoin();
 
   if (joinNode_->isRightSemiProjectJoin()) {
     VELOX_CHECK(cudfOutputs.empty());
@@ -5510,7 +5721,23 @@ exec::BlockingReason CudfHashJoinProbe::isBlocked(ContinueFuture* future) {
       std::dynamic_pointer_cast<CudfHashJoinBridge>(joinBridge);
   VELOX_CHECK_NOT_NULL(cudfJoinBridge);
   VELOX_CHECK_NOT_NULL(future);
-  if (graceEnabled_) {
+  if (prebuildProbeEnabled_) {
+    auto result = cudfJoinBridge->tryFinalResult();
+    if (!result.has_value()) {
+      if (!noMoreInput_ && input_ == nullptr && !prebuildProbeHostFull_ &&
+          prebuildProbeBufferedBytes_ < prebuildProbeHostLimitBytes_) {
+        return exec::BlockingReason::kNotBlocked;
+      }
+      result = cudfJoinBridge->finalResultOrFuture(future);
+      if (!result.has_value()) {
+        return exec::BlockingReason::kWaitForJoinBuild;
+      }
+    }
+    VELOX_CHECK(
+        result->hash.has_value() && !result->grace,
+        "Pre-build happy-path probe buffer requires a regular hash build");
+    hashObject_ = std::move(result->hash);
+  } else if (graceEnabled_) {
     std::optional<CudfHashJoinBridge::BuildResult> result;
     if (graceEagerActive_) {
       result = cudfJoinBridge->tryFinalResult();
@@ -5664,7 +5891,10 @@ bool CudfHashJoinProbe::isFinished() {
   // last driver alive until all build tables are emitted; peer drivers have no
   // output after the end-of-probe barrier and can finish normally.
   const auto hasNoMoreWork = noMoreInput_ && input_ == nullptr &&
-      !(joinNode_->isRightSemiProjectJoin() && isLastDriver_ && !finished_);
+      prebuildProbeHostBatches_.empty() && !prebuildProbeFinishPending_ &&
+      !((joinNode_->isRightJoin() || joinNode_->isFullJoin() ||
+         joinNode_->isRightSemiProjectJoin()) &&
+        isLastDriver_ && !finished_);
   const auto isFinished = finished_ || hasNoMoreWork;
 
   // Release hashObject_ if finished

@@ -54,6 +54,34 @@ constexpr uint64_t HANDSHAKE_RESPONSE_TAG = 0x04000000;
 // same host-staging decision.
 constexpr int64_t kDeviceEagerHostStageBytes = 64 << 10;
 
+enum class DeviceTransferPath : uint8_t {
+  kDirectDevice,
+  kHostForced,
+  kHostNoCudaTransport,
+  kHostSmallEager,
+  kHostOverDirectLimit,
+};
+
+inline DeviceTransferPath selectDeviceTransferPath(
+    bool hasCudaTransport,
+    int64_t bytes,
+    bool forceHostStaging,
+    int64_t directDeviceLimitBytes) {
+  if (forceHostStaging) {
+    return DeviceTransferPath::kHostForced;
+  }
+  if (!hasCudaTransport) {
+    return DeviceTransferPath::kHostNoCudaTransport;
+  }
+  if (bytes <= kDeviceEagerHostStageBytes) {
+    return DeviceTransferPath::kHostSmallEager;
+  }
+  if (directDeviceLimitBytes > 0 && bytes > directDeviceLimitBytes) {
+    return DeviceTransferPath::kHostOverDirectLimit;
+  }
+  return DeviceTransferPath::kDirectDevice;
+}
+
 inline int64_t maxDirectDeviceTransferBytes() {
   if (const char* value = std::getenv("GLUTEN_UCX_DIRECT_DEVICE_MAX_BYTES")) {
     char* end = nullptr;
@@ -68,15 +96,34 @@ inline int64_t maxDirectDeviceTransferBytes() {
 inline bool shouldHostStageDeviceTransfer(
     bool hasCudaTransport,
     int64_t bytes) {
+  bool forceHostStaging = false;
   if (const char* value = std::getenv("GLUTEN_UCX_FORCE_HOST_STAGING");
       value != nullptr && value[0] != '\0') {
     if (value[0] != '0') {
-      return true;
+      forceHostStaging = true;
     }
   }
-  const auto directLimit = maxDirectDeviceTransferBytes();
-  return !hasCudaTransport || bytes <= kDeviceEagerHostStageBytes ||
-      (directLimit > 0 && bytes > directLimit);
+  return selectDeviceTransferPath(
+             hasCudaTransport,
+             bytes,
+             forceHostStaging,
+             maxDirectDeviceTransferBytes()) !=
+      DeviceTransferPath::kDirectDevice;
+}
+
+inline DeviceTransferPath deviceTransferPath(
+    bool hasCudaTransport,
+    int64_t bytes) {
+  bool forceHostStaging = false;
+  if (const char* value = std::getenv("GLUTEN_UCX_FORCE_HOST_STAGING");
+      value != nullptr && value[0] != '\0' && value[0] != '0') {
+    forceHostStaging = true;
+  }
+  return selectDeviceTransferPath(
+      hasCudaTransport,
+      bytes,
+      forceHostStaging,
+      maxDirectDeviceTransferBytes());
 }
 
 /// Acquires one reusable pinned host buffer dedicated to UCX bounce traffic.

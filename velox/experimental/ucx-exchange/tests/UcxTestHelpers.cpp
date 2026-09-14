@@ -30,7 +30,8 @@ std::shared_ptr<Task> createSourceTask(
     std::string_view taskId,
     std::shared_ptr<memory::MemoryPool> pool,
     RowTypePtr rowType,
-    uint64_t kMaxOutputBufferSize) {
+    uint64_t kMaxOutputBufferSize,
+    const std::unordered_map<std::string, std::string>& extraConfig) {
   VLOG(3) << "Testing SourceTask";
   const size_t vectorSize = 10;
 
@@ -59,6 +60,7 @@ std::shared_ptr<Task> createSourceTask(
   std::unordered_map<std::string, std::string> configSettings{
       {velox::core::QueryConfig::kMaxOutputBufferSize,
        std::to_string(kMaxOutputBufferSize)}};
+  configSettings.insert(extraConfig.begin(), extraConfig.end());
 
   auto queryCtx = core::QueryCtx::create(
       executor.get(), core::QueryConfig(std::move(configSettings)));

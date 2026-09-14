@@ -37,4 +37,21 @@ class HashFunction : public CudfFunction {
   uint32_t seedValue_;
 };
 
+/// Spark xxhash64_with_seed(seed, ...). Computes xxHash64 over the remaining
+/// arguments using the constant BIGINT seed emitted by Spark's Substrait plan.
+class XxHash64Function : public CudfFunction {
+ public:
+  static bool canEvaluate(const core::TypedExprPtr& expr);
+
+  XxHash64Function(const core::TypedExprPtr& expr, memory::MemoryPool* pool);
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override;
+
+ private:
+  uint64_t seedValue_;
+};
+
 } // namespace facebook::velox::cudf_velox::sparksql

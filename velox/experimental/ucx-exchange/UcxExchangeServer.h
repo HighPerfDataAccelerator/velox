@@ -34,6 +34,19 @@
 
 namespace facebook::velox::ucx_exchange {
 
+struct UcxRemoteDataPathSnapshot {
+  int64_t activeSends{0};
+  int64_t maxActiveSends{0};
+  int64_t postedSends{0};
+  int64_t completedSends{0};
+  int64_t completedBytes{0};
+  int64_t sendNanos{0};
+};
+
+/// Process-wide remote data-send counters used to distinguish transport
+/// stalls from gaps in the exchange state machine.
+UcxRemoteDataPathSnapshot remoteDataPathSnapshot();
+
 class UcxExchangeServer
     : public CommElement,
       public std::enable_shared_from_this<UcxExchangeServer> {
@@ -77,6 +90,10 @@ class UcxExchangeServer
   /// @brief Returns true if this server detected same-node with the source.
   bool isIntraNodeTransfer() const {
     return isIntraNodeTransfer_;
+  }
+
+  ServerState stateForDiagnostics() const {
+    return state_.load(std::memory_order_relaxed);
   }
 
  private:

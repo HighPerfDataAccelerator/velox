@@ -1997,10 +1997,10 @@ TEST_F(CudfFilterProjectTest, rowConstructorWithUntypedNullField) {
   auto plan = PlanBuilder()
                   .values(vectors)
                   .project({"row_constructor(c0, null) AS r"})
-                  .project({"r.c1"})
+                  .project({"r.c1", "r.c2"})
                   .planNode();
 
-  assertQuery(plan, "SELECT c0 FROM tmp");
+  assertQuery(plan, "SELECT c0, NULL FROM tmp");
 }
 
 TEST_F(CudfFilterProjectTest, cardinality) {
@@ -2012,6 +2012,13 @@ TEST_F(CudfFilterProjectTest, cardinality) {
                   .planNode();
   auto expected = makeRowVector({makeFlatVector<int64_t>({3, 2, 0})});
   AssertQueryBuilder(plan).assertResults({expected});
+}
+
+TEST_F(CudfFilterProjectTest, nestedIdentityProjection) {
+  auto data = makeRowVector(
+      {makeArrayVector<int64_t>({{1, 2, 3}, {4}, {}, {5, 6}})});
+  auto plan = PlanBuilder().values({data}).project({"c0"}).planNode();
+  AssertQueryBuilder(plan).assertResults({data});
 }
 
 TEST_F(CudfFilterProjectTest, split) {
@@ -2442,6 +2449,30 @@ TEST_F(CudfSimpleFilterProjectTest, castToSmallInt) {
   auto tryCast =
       evaluateOnce<int16_t, int32_t>("try_cast(c0 as smallint)", -214);
   EXPECT_EQ(tryCast, -214);
+}
+
+TEST_F(CudfSimpleFilterProjectTest, tryCastStringToInteger) {
+  auto input = makeRowVector({makeNullableFlatVector<std::string>({
+      "123",
+      "-7",
+      "+42",
+      "not-a-number",
+      "9223372036854775808",
+      "",
+      std::nullopt,
+  })});
+  auto emptyInput =
+      makeRowVector({makeFlatVector<std::string>(std::vector<std::string>{})});
+
+  for (const auto& expression : {
+           "try_cast(c0 as bigint)",
+           "try_cast(c0 as integer)",
+       }) {
+    SCOPED_TRACE(expression);
+    assertExpressionMatchesCpu(expression, input, input->rowType());
+    assertExpressionMatchesCpu(
+        expression, emptyInput, emptyInput->rowType());
+  }
 }
 
 TEST_F(CudfSimpleFilterProjectTest, castNumericToBoolean) {

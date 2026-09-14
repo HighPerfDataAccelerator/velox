@@ -139,6 +139,66 @@ bool SimpleComparisonChecker::isLessThen(
 std::optional<SimpleComparison> SimpleComparisonChecker::isSimpleComparison(
     const std::string& prefix,
     const core::LambdaTypedExpr& expr) {
+  // Spark 4 expands the default array_sort comparator into null guards around
+  // an otherwise simple comparison:
+  //   if (isnull(x) and isnull(y), 0,
+  //     if (isnull(x), 1, if (isnull(y), -1, compare(x, y))))
+  // Strip that exact nulls-last wrapper. The rewritten native array_sort has
+  // the same null ordering, while avoiding execution of a comparator lambda.
+  auto asCall = [](const core::TypedExprPtr& value,
+                   const std::string& name,
+                   size_t arity) -> const core::CallTypedExpr* {
+    const auto* call =
+        dynamic_cast<const core::CallTypedExpr*>(value.get());
+    return call != nullptr && call->name() == name &&
+            call->inputs().size() == arity
+        ? call
+        : nullptr;
+  };
+  auto isField = [](const core::TypedExprPtr& value,
+                    const std::string& name) {
+    const auto* field =
+        dynamic_cast<const core::FieldAccessTypedExpr*>(value.get());
+    return field != nullptr && field->isInputColumn() &&
+        field->name() == name;
+  };
+  auto isNullOf = [&](const core::TypedExprPtr& value,
+                      const std::string& name) {
+    const auto* call = asCall(value, prefix + "isnull", 1);
+    return call != nullptr && isField(call->inputs()[0], name);
+  };
+  auto isConstant = [](const core::TypedExprPtr& value, int64_t expected) {
+    int64_t actual = 0;
+    ComparisonConstantMatcher matcher(&actual);
+    return matcher.match(value) && actual == expected;
+  };
+
+  if (expr.signature()->size() == 2) {
+    const auto& left = expr.signature()->nameOf(0);
+    const auto& right = expr.signature()->nameOf(1);
+    const auto* outer = asCall(expr.body(), expression::kIf, 3);
+    if (outer != nullptr) {
+      const auto* bothNull =
+          asCall(outer->inputs()[0], expression::kAnd, 2);
+      const auto* leftNull =
+          asCall(outer->inputs()[2], expression::kIf, 3);
+      const auto* rightNull = leftNull == nullptr
+          ? nullptr
+          : asCall(leftNull->inputs()[2], expression::kIf, 3);
+      if (bothNull != nullptr && leftNull != nullptr && rightNull != nullptr &&
+          isNullOf(bothNull->inputs()[0], left) &&
+          isNullOf(bothNull->inputs()[1], right) &&
+          isConstant(outer->inputs()[1], 0) &&
+          isNullOf(leftNull->inputs()[0], left) &&
+          isConstant(leftNull->inputs()[1], 1) &&
+          isNullOf(rightNull->inputs()[0], right) &&
+          isConstant(rightNull->inputs()[1], -1)) {
+        core::LambdaTypedExpr unwrapped(expr.signature(), rightNull->inputs()[2]);
+        return isSimpleComparison(prefix, unwrapped);
+      }
+    }
+  }
+
   // First, check the shape of the expression.
   // if (x(a) < y(b), c1, if (u(c) > v(d), c2, c3))
   core::FieldAccessTypedExprPtr a, b, c, d;

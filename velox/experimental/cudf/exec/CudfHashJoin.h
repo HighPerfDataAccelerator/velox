@@ -329,6 +329,7 @@ class CudfHashJoinProbe : public CudfOperatorBase {
 
  private:
   void waitForBuildReady(rmm::cuda_stream_view stream);
+  void bufferPrebuildProbeInput(CudfVectorPtr input);
   void partitionAndPackProbe(CudfVectorPtr input);
   void queueGraceProbeInput(CudfVectorPtr input);
   void flushGraceProbeInputBatch();
@@ -409,6 +410,18 @@ class CudfHashJoinProbe : public CudfOperatorBase {
   /** @brief Output column positions for right table columns */
   std::vector<size_t> rightColumnOutputIndices_;
   bool finished_{false};
+
+  // Optional happy-path overlap for an MPP probe whose build is not ready.
+  // Inputs are packed into bounded shared DRAM and replayed against the
+  // ordinary device hash table after the bridge publishes it.  This is not a
+  // spill path and is disabled by default.
+  std::deque<HashJoinHostBatch> prebuildProbeHostBatches_;
+  uint64_t prebuildProbeHostLimitBytes_{0};
+  uint64_t prebuildProbeBufferedBytes_{0};
+  uint64_t prebuildProbeBufferedRows_{0};
+  bool prebuildProbeEnabled_{false};
+  bool prebuildProbeHostFull_{false};
+  bool prebuildProbeFinishPending_{false};
 
   std::shared_ptr<GraceHashJoinBuildData> graceBuildData_;
   // Coalesce small device inputs before hash partition + pack + D2H. This

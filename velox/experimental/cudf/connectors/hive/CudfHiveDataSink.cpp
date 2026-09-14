@@ -19,16 +19,19 @@
 #include "velox/experimental/cudf/connectors/hive/CudfHiveDataSink.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveTableHandle.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
+#include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
 #include "velox/common/base/Counters.h"
 #include "velox/common/base/Fs.h"
 #include "velox/common/base/StatsReporter.h"
+#include "velox/common/file/FileSystems.h"
 #include "velox/dwio/common/Options.h"
 #include "velox/exec/OperatorUtils.h"
 
 #include <cudf/copying.hpp>
+#include <cudf/io/orc.hpp>
 #include <cudf/io/parquet.hpp>
 #include <cudf/io/types.hpp>
 #include <cudf/table/table.hpp>
@@ -73,6 +76,18 @@ uint64_t getFinishTimeSliceLimitMsFromCudfHiveConfig(
 
 std::string makeUuid() {
   return boost::lexical_cast<std::string>(boost::uuids::random_generator()());
+}
+
+std::string cudfWritePath(std::string path) {
+  // Hadoop passes local task-attempt directories as file:/... URIs. libcudf's
+  // local sink expects an operating-system path; otherwise it creates a
+  // literal "file:" directory below the executor working directory, outside
+  // the FileOutputCommitter staging tree.
+  constexpr std::string_view kFilePrefix{"file:"};
+  if (path.compare(0, kFilePrefix.size(), kFilePrefix) == 0) {
+    path.erase(0, kFilePrefix.size());
+  }
+  return path;
 }
 
 cudf::io::compression_type getCompressionType(
@@ -156,6 +171,48 @@ CudfHiveDataSink::CudfHiveDataSink(
 void CudfHiveDataSink::appendData(RowVectorPtr input) {
   checkRunning();
 
+  // Preserve a device-resident pipeline into libcudf's file writer. The
+  // generic Arrow conversion below materializes a CudfVector on the host and
+  // copies the same columns back to the GPU. Wide TopN output made that round
+  // trip and its synchronization dominate table-write tasks.
+  if (auto deviceInput = std::dynamic_pointer_cast<CudfVector>(input)) {
+    const auto inputStream = deviceInput->stream();
+    const auto inputView = deviceInput->getTableView();
+    if (!writer_.has_value()) {
+      writer_ = createCudfWriter(inputView, inputStream);
+      writerStream_ = inputStream;
+    }
+    VELOX_CHECK(writerStream_.has_value());
+
+    if (writerStream_->value() == inputStream.value()) {
+      // The writer work and CudfVector's stream-ordered destruction use the
+      // same stream, so the input remains live until the writer consumes it.
+      writeCudf(inputView);
+    } else {
+      // Inputs from a different producer stream need ordering in both
+      // directions: writer waits for production, then producer waits before
+      // its stream-ordered input destruction. Neither wait blocks the host.
+      CudaEvent inputReady(cudaEventDisableTiming);
+      CudaEvent inputConsumed(cudaEventDisableTiming);
+      inputReady.recordFrom(inputStream).waitOn(*writerStream_);
+      writeCudf(inputView);
+      inputConsumed.recordFrom(*writerStream_).waitOn(inputStream);
+    }
+
+    if (!loggedDeviceInput_) {
+      LOG(WARNING) << "CudfHiveDataSink writing CudfVector without host "
+                      "Arrow round trip";
+      loggedDeviceInput_ = true;
+    }
+    TestValue::adjust(
+        "facebook::velox::cudf_velox::connector::hive::"
+        "CudfHiveDataSink::appendDeviceData",
+        this);
+    writerInfo_->inputSizeInBytes += input->estimateFlatSize();
+    writerInfo_->numWrittenRows += input->size();
+    return;
+  }
+
   // Convert the input RowVectorPtr to cudf::table
   auto stream = cudfGlobalStreamPool().get_stream();
   auto cudfInput =
@@ -165,18 +222,18 @@ void CudfHiveDataSink::appendData(RowVectorPtr input) {
       cudfInput, "Failed to convert input RowVectorPtr to cudf::table");
 
   // Check if the writer doesn't already exist
-  if (writer_ == nullptr) {
+  if (!writer_.has_value()) {
     writer_ = createCudfWriter(cudfInput->view(), stream);
+    writerStream_ = stream;
   }
 
   // Write the table to the sink
-  writer_->write(cudfInput->view());
+  writeCudf(cudfInput->view());
   writerInfo_->inputSizeInBytes += input->estimateFlatSize();
   writerInfo_->numWrittenRows += input->size();
 }
 
-std::unique_ptr<cudf::io::chunked_parquet_writer>
-CudfHiveDataSink::createCudfWriter(
+CudfHiveDataSink::CudfWriter CudfHiveDataSink::createCudfWriter(
     cudf::table_view cudfTable,
     rmm::cuda_stream_view stream) {
   // Create a table_input_metadata from the input
@@ -188,8 +245,11 @@ CudfHiveDataSink::createCudfWriter(
 
   // Create a sink and writer
   const auto& locationHandle = insertTableHandle_->locationHandle();
+  const auto fileFormat = insertTableHandle_->storageFormat();
+  const auto defaultExtension =
+      fileFormat == dwio::common::FileFormat::ORC ? ".orc" : ".parquet";
   const auto targetFileName = locationHandle->targetFileName().empty()
-      ? fmt::format("{}{}", makeUuid(), ".parquet")
+      ? fmt::format("{}{}", makeUuid(), defaultExtension)
       : locationHandle->targetFileName();
 
   auto writerParameters = CudfHiveWriterParameters(
@@ -197,14 +257,38 @@ CudfHiveDataSink::createCudfWriter(
       targetFileName,
       locationHandle->targetPath());
 
-  const auto writePath = fs::path(writerParameters.writeDirectory()) /
+  const auto localWriteDirectory =
+      cudfWritePath(writerParameters.writeDirectory());
+  const auto writePath = fs::path(localWriteDirectory) /
       writerParameters.writeFileName();
+
+  // Spark's FileCommitProtocol can hand each native writer a task-attempt
+  // directory below the final output root. libcudf/kvikio opens the target
+  // file directly and does not create missing parents, unlike Velox's generic
+  // WriteFile path. Create the complete directory here before constructing the
+  // file sink. mkdir is recursive and idempotent for concurrent writers.
+  filesystems::getFileSystem(
+      writerParameters.writeDirectory(), parquetConfig_->config())
+      ->mkdir(localWriteDirectory);
 
   makeWriterOptions(writerParameters);
 
   // Create writer options for the given sink
-  const auto sinkInfo = cudf::io::sink_info(
-      fmt::format("{}/{}", locationHandle->targetPath(), targetFileName));
+  const auto sinkInfo = cudf::io::sink_info(writePath.string());
+  if (fileFormat == dwio::common::FileFormat::ORC) {
+    VELOX_CHECK(
+        cudf::io::is_supported_write_orc(compressionKind),
+        "Unsupported libcudf ORC compression codec: {}",
+        static_cast<int>(compressionKind));
+    auto cudfWriterOptions =
+        cudf::io::chunked_orc_writer_options::builder(sinkInfo)
+            .metadata(std::move(tableInputMetadata))
+            .compression(compressionKind)
+            .build();
+    return std::make_unique<cudf::io::orc_chunked_writer>(
+        cudfWriterOptions, stream);
+  }
+
   auto cudfWriterOptions =
       cudf::io::chunked_parquet_writer_options::builder(sinkInfo)
           .metadata(tableInputMetadata)
@@ -256,13 +340,33 @@ CudfHiveDataSink::createCudfWriter(
           writerOptions->compressionStats);
     }
     // Write sorting columns if available
-    if (sortingColumns_.empty()) {
+    if (!sortingColumns_.empty()) {
       cudfWriterOptions.set_sorting_columns(sortingColumns_);
     }
   }
 
   return std::make_unique<cudf::io::chunked_parquet_writer>(
       cudfWriterOptions, stream);
+}
+
+void CudfHiveDataSink::writeCudf(cudf::table_view cudfTable) {
+  VELOX_CHECK(writer_.has_value());
+  std::visit(
+      [&](auto& writer) {
+        VELOX_CHECK_NOT_NULL(writer);
+        writer->write(cudfTable);
+      },
+      *writer_);
+}
+
+void CudfHiveDataSink::closeCudf() {
+  VELOX_CHECK(writer_.has_value());
+  std::visit(
+      [](auto& writer) {
+        VELOX_CHECK_NOT_NULL(writer);
+        writer->close();
+      },
+      *writer_);
 }
 
 cudf::io::table_input_metadata CudfHiveDataSink::createCudfTableInputMetadata(
@@ -335,8 +439,12 @@ DataSink::Stats CudfHiveDataSink::stats() const {
   int64_t numWrittenBytes{0};
   int64_t writeIOTimeUs{0};
 
-  numWrittenBytes += ioStatistics_->rawBytesWritten();
-  writeIOTimeUs += ioStatistics_->writeIOTimeUs();
+  if (state_ == State::kClosed) {
+    numWrittenBytes = writtenBytes_;
+  } else if (ioStatistics_ != nullptr) {
+    numWrittenBytes = ioStatistics_->rawBytesWritten();
+    writeIOTimeUs = ioStatistics_->writeIOTimeUs();
+  }
 
   stats.numWrittenBytes = numWrittenBytes;
   stats.writeIOTimeUs = writeIOTimeUs;
@@ -345,8 +453,10 @@ DataSink::Stats CudfHiveDataSink::stats() const {
     return stats;
   }
 
+  if (writerInfo_ == nullptr) {
+    return stats;
+  }
   stats.numWrittenFiles = 1;
-  VELOX_CHECK_NOT_NULL(writerInfo_);
   if (!writerInfo_->spillStats->empty()) {
     stats.spillStats += *writerInfo_->spillStats;
   }
@@ -384,8 +494,6 @@ void CudfHiveDataSink::checkStateTransition(State oldState, State newState) {
 }
 
 bool CudfHiveDataSink::finish() {
-  VELOX_CHECK_NOT_NULL(writer_, "CudfHiveDataSink has no writer");
-
   setState(State::kFinishing);
   return true;
 }
@@ -396,8 +504,12 @@ std::vector<std::string> CudfHiveDataSink::close() {
 
   std::vector<std::string> partitionUpdates{};
 
+  // An empty writer task does not create a data file or a commit fragment.
+  if (writerInfo_ == nullptr) {
+    return partitionUpdates;
+  }
+
   partitionUpdates.reserve(1);
-  VELOX_CHECK_NOT_NULL(writerInfo_);
   // clang-format off
     auto partitionUpdateJson = folly::toJson(
      folly::dynamic::object
@@ -407,10 +519,10 @@ std::vector<std::string> CudfHiveDataSink::close() {
           folly::dynamic::object
             ("writeFileName", writerInfo_->writerParameters.writeFileName())
             ("targetFileName", writerInfo_->writerParameters.targetFileName())
-            ("fileSize", ioStatistics_->rawBytesWritten())))
+            ("fileSize", writtenBytes_)))
         ("rowCount", writerInfo_->numWrittenRows)
         ("inMemoryDataSizeInBytes", writerInfo_->inputSizeInBytes)
-        ("onDiskDataSizeInBytes", ioStatistics_->rawBytesWritten())
+        ("onDiskDataSizeInBytes", writtenBytes_)
         ("containsNumberedFileNames", true));
   // clang-format on
   partitionUpdates.emplace_back(partitionUpdateJson);
@@ -426,14 +538,21 @@ void CudfHiveDataSink::abort() {
 void CudfHiveDataSink::closeInternal() {
   VELOX_CHECK_NE(state_, State::kRunning);
   VELOX_CHECK_NE(state_, State::kFinishing);
-  VELOX_CHECK_NOT_NULL(writer_, "CudfHiveDataSink has no writer");
+  if (!writer_.has_value()) {
+    return;
+  }
 
   TestValue::adjust(
       "facebook::velox::connector::hive::CudfHiveDataSink::closeInternal",
       this);
 
   // Close cudf writer
-  writer_->close();
+  closeCudf();
+
+  const auto& parameters = writerInfo_->writerParameters;
+  const auto writePath = fs::path(cudfWritePath(parameters.writeDirectory())) /
+      parameters.writeFileName();
+  writtenBytes_ = fs::file_size(writePath);
 
   // Reset the unique pointers to Cudf writer and options
   writer_.reset();
@@ -442,7 +561,7 @@ void CudfHiveDataSink::closeInternal() {
 std::shared_ptr<memory::MemoryPool> CudfHiveDataSink::createWriterPool() {
   auto* connectorPool = connectorQueryCtx_->connectorMemoryPool();
   return connectorPool->addAggregateChild(
-      fmt::format("{}.{}", connectorPool->name(), "parquet-writer"));
+      fmt::format("{}.{}", connectorPool->name(), "cudf-file-writer"));
 }
 
 void CudfHiveDataSink::makeWriterOptions(
@@ -504,6 +623,11 @@ folly::dynamic CudfHiveInsertTableHandle::serialize() const {
   if (compressionKind_.has_value()) {
     obj["compressionKind"] = common::compressionKindToString(*compressionKind_);
   }
+  folly::dynamic serde = folly::dynamic::object;
+  for (const auto& [key, value] : serdeParameters_) {
+    serde[key] = value;
+  }
+  obj["serdeParameters"] = std::move(serde);
 
   return obj;
 }
@@ -521,11 +645,21 @@ CudfHiveInsertTableHandlePtr CudfHiveInsertTableHandle::create(
         common::stringToCompressionKind(obj["compressionKind"].asString());
   }
   std::unordered_map<std::string, std::string> serdeParameters;
-  for (const auto& pair : obj["serdeParameters"].items()) {
-    serdeParameters.emplace(pair.first.asString(), pair.second.asString());
+  if (obj.count("serdeParameters") > 0) {
+    for (const auto& pair : obj["serdeParameters"].items()) {
+      serdeParameters.emplace(pair.first.asString(), pair.second.asString());
+    }
   }
+  const auto storageFormat = obj.count("tableStorageFormat") > 0
+      ? dwio::common::toFileFormat(obj["tableStorageFormat"].asString())
+      : dwio::common::FileFormat::PARQUET;
   return std::make_shared<CudfHiveInsertTableHandle>(
-      inputColumns, locationHandle, compressionKind, serdeParameters);
+      inputColumns,
+      locationHandle,
+      compressionKind,
+      serdeParameters,
+      nullptr,
+      storageFormat);
 }
 
 std::string CudfHiveInsertTableHandle::toString() const {

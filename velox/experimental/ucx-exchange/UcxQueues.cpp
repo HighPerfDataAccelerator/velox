@@ -20,6 +20,7 @@
 #include <atomic>
 #include <limits>
 #include <sstream>
+#include <unordered_map>
 
 namespace facebook::velox::ucx_exchange {
 
@@ -27,6 +28,137 @@ namespace {
 std::atomic<int64_t> diagnosticGlobalQueuedBytes{0};
 std::atomic<int64_t> diagnosticGlobalQueuedColumns{0};
 std::atomic<int64_t> diagnosticGlobalQueueGiB{0};
+
+// Lends only bytes above each task's ordinary max output-buffer size. This
+// lets hot producers use idle device capacity without multiplying a large
+// static allowance by every live fragment.
+class AdaptiveQueueBurstCoordinator {
+ public:
+  bool tryResize(
+      const void* owner,
+      uint64_t currentBytes,
+      uint64_t requestedBytes,
+      uint64_t globalLimitBytes) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto it = grants_.find(owner);
+    VELOX_DCHECK_EQ(
+        currentBytes, it == grants_.end() ? uint64_t{0} : it->second);
+    if (requestedBytes <= currentBytes) {
+      grantedBytes_ -= currentBytes - requestedBytes;
+      if (requestedBytes == 0) {
+        grants_.erase(owner);
+      } else {
+        grants_[owner] = requestedBytes;
+      }
+      return true;
+    }
+    const auto additional = requestedBytes - currentBytes;
+    if (additional > globalLimitBytes ||
+        grantedBytes_ > globalLimitBytes - additional) {
+      return false;
+    }
+    grantedBytes_ += additional;
+    grants_[owner] = requestedBytes;
+    return true;
+  }
+
+  void addWaiter(const void* owner, ContinuePromise promise) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    waiters_.push_back(Waiter{owner, std::move(promise)});
+  }
+
+  std::vector<ContinuePromise> releaseTo(
+      const void* owner,
+      uint64_t currentBytes,
+      uint64_t requestedBytes) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto it = grants_.find(owner);
+    VELOX_DCHECK_EQ(
+        currentBytes, it == grants_.end() ? uint64_t{0} : it->second);
+    VELOX_DCHECK_LE(requestedBytes, currentBytes);
+    if (requestedBytes == currentBytes) {
+      return {};
+    }
+    grantedBytes_ -= currentBytes - requestedBytes;
+    if (requestedBytes == 0) {
+      grants_.erase(owner);
+    } else {
+      grants_[owner] = requestedBytes;
+    }
+    return takeAllWaitersLocked();
+  }
+
+  std::vector<ContinuePromise> removeOwner(
+      const void* owner,
+      uint64_t currentBytes) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (const auto it = grants_.find(owner); it != grants_.end()) {
+      VELOX_DCHECK_EQ(currentBytes, it->second);
+      grantedBytes_ -= it->second;
+      grants_.erase(it);
+    } else {
+      VELOX_DCHECK_EQ(currentBytes, 0);
+    }
+
+    std::vector<ContinuePromise> promises;
+    for (auto it = waiters_.begin(); it != waiters_.end();) {
+      // Releasing credit may make every waiter runnable. With no released
+      // credit, wake only this owner so cancellation cannot strand a driver.
+      if (currentBytes > 0 || it->owner == owner) {
+        promises.push_back(std::move(it->promise));
+        it = waiters_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    return promises;
+  }
+
+  std::vector<ContinuePromise> cancelOwnerWaiters(const void* owner) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<ContinuePromise> promises;
+    for (auto it = waiters_.begin(); it != waiters_.end();) {
+      if (it->owner == owner) {
+        promises.push_back(std::move(it->promise));
+        it = waiters_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    return promises;
+  }
+
+  std::vector<ContinuePromise> notifyProgress() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return takeAllWaitersLocked();
+  }
+
+ private:
+  struct Waiter {
+    const void* owner;
+    ContinuePromise promise;
+  };
+
+  std::vector<ContinuePromise> takeAllWaitersLocked() {
+    std::vector<ContinuePromise> promises;
+    promises.reserve(waiters_.size());
+    for (auto& waiter : waiters_) {
+      promises.push_back(std::move(waiter.promise));
+    }
+    waiters_.clear();
+    return promises;
+  }
+
+  std::mutex mutex_;
+  uint64_t grantedBytes_{0};
+  std::unordered_map<const void*, uint64_t> grants_;
+  std::vector<Waiter> waiters_;
+};
+
+AdaptiveQueueBurstCoordinator& adaptiveQueueBurstCoordinator() {
+  static AdaptiveQueueBurstCoordinator coordinator;
+  return coordinator;
+}
 
 void updateDiagnosticGlobalQueue(
     int64_t bytes,
@@ -263,6 +395,7 @@ UcxOutputQueue::UcxOutputQueue(
   if (task_) {
     maxSize_ = task_->queryCtx()->queryConfig().maxOutputBufferSize();
     continueSize_ = (maxSize_ * kContinuePct) / 100;
+    configureAdaptiveBurst(task_->queryCtx()->queryConfig());
     initialized_.store(true, std::memory_order_release);
   } // else: maxSize_ and continueSize_ will be set once the task is created and
     // initialize called.
@@ -272,6 +405,39 @@ UcxOutputQueue::UcxOutputQueue(
     // create the destination queues inside the vector using emplace_back.
     queues_.emplace_back(std::make_unique<UcxDestinationQueue>());
   }
+}
+
+UcxOutputQueue::~UcxOutputQueue() {
+  auto promises = adaptiveQueueBurstCoordinator().removeOwner(
+      this, adaptiveBurstGrantedBytes_);
+  adaptiveBurstGrantedBytes_ = 0;
+  for (auto& promise : promises) {
+    promise.setValue();
+  }
+}
+
+void UcxOutputQueue::configureAdaptiveBurst(
+    const core::QueryConfig& queryConfig) {
+  adaptiveBurstMaxSize_ = queryConfig.get<uint64_t>(
+      kAdaptiveBurstMaxBytesConfig, 0);
+  adaptiveGlobalBurstBytes_ = queryConfig.get<uint64_t>(
+      kAdaptiveGlobalBurstBytesConfig, 0);
+  adaptiveMinDeviceHeadroomBytes_ = queryConfig.get<uint64_t>(
+      kAdaptiveMinDeviceHeadroomBytesConfig, 0);
+  if (adaptiveBurstMaxSize_ <= maxSize_ ||
+      adaptiveGlobalBurstBytes_ == 0) {
+    adaptiveBurstMaxSize_ = 0;
+    adaptiveGlobalBurstBytes_ = 0;
+    adaptiveMinDeviceHeadroomBytes_ = 0;
+    return;
+  }
+  LOG(INFO) << "Adaptive UCX output credit task="
+            << (task_ ? task_->taskId() : "n/a")
+            << " baseBytes=" << maxSize_
+            << " burstMaxBytes=" << adaptiveBurstMaxSize_
+            << " globalBurstBytes=" << adaptiveGlobalBurstBytes_
+            << " minDeviceHeadroomBytes="
+            << adaptiveMinDeviceHeadroomBytes_;
 }
 
 bool UcxOutputQueue::initialize(
@@ -289,6 +455,7 @@ bool UcxOutputQueue::initialize(
   task_ = task;
   maxSize_ = task_->queryCtx()->queryConfig().maxOutputBufferSize();
   continueSize_ = (maxSize_ * kContinuePct) / 100;
+  configureAdaptiveBurst(task_->queryCtx()->queryConfig());
   // Publish task metadata before destination queue expansion. Acceptor only
   // needs task/kind to choose the intra-node path; getData() takes mutex_ and
   // waits for any queue expansion in this function to finish.
@@ -350,6 +517,8 @@ void UcxOutputQueue::enqueue(
       totalBytesSent_ += numBytes;
       totalRowsSent_ += numRows;
       totalPackedColumnsSent_++;
+      updateDiagnosticGlobalQueue(
+          numBytes * numActive, numActive, "broadcast-enqueue", task_);
       success = true;
     } else {
       VELOX_CHECK_LT(destination, queues_.size());
@@ -368,16 +537,85 @@ void UcxOutputQueue::enqueue(
 
 bool UcxOutputQueue::checkBlocked(ContinueFuture* future) {
   std::lock_guard<std::mutex> l(mutex_);
-  if (queuedBytes_ >= maxSize_ && future) {
+  if (future && shouldBlockLocked()) {
     VLOG(2) << "[BACKPRESSURE] task=" << (task_ ? task_->taskId() : "n/a")
             << " BLOCKED queuedBytes=" << queuedBytes_
             << " maxSize=" << maxSize_
+            << " burstMaxSize=" << adaptiveBurstMaxSize_
+            << " burstGrantedBytes=" << adaptiveBurstGrantedBytes_
             << " waitingProducers=" << (promises_.size() + 1);
-    promises_.emplace_back("UcxOutputQueue::checkBlocked");
-    *future = promises_.back().getSemiFuture();
+    if (adaptiveBurstMaxSize_ > maxSize_) {
+      ++adaptiveBurstBlockedCount_;
+      ContinuePromise promise{"UcxOutputQueue::adaptiveCheckBlocked"};
+      *future = promise.getSemiFuture();
+      adaptiveQueueBurstCoordinator().addWaiter(this, std::move(promise));
+    } else {
+      promises_.emplace_back("UcxOutputQueue::checkBlocked");
+      *future = promises_.back().getSemiFuture();
+    }
     return true;
   }
   return false;
+}
+
+bool UcxOutputQueue::shouldBlockLocked() {
+  VELOX_DCHECK_GE(queuedBytes_, 0);
+  const auto queuedBytes = static_cast<uint64_t>(queuedBytes_);
+  if (queuedBytes < maxSize_) {
+    return false;
+  }
+  if (adaptiveBurstMaxSize_ <= maxSize_) {
+    return true;
+  }
+  const bool reachedBurstLimit = queuedBytes >= adaptiveBurstMaxSize_;
+  const auto accountedBytes = std::min(queuedBytes, adaptiveBurstMaxSize_);
+  const auto requestedBurst = accountedBytes - maxSize_;
+  if (adaptiveMinDeviceHeadroomBytes_ > 0) {
+    const auto headroom = cudf_velox::captureDeviceAllocationHeadroom();
+    if (!headroom.cudaValid ||
+        headroom.allocatableBytes() <= adaptiveMinDeviceHeadroomBytes_) {
+      return true;
+    }
+  }
+  if (!adaptiveQueueBurstCoordinator().tryResize(
+          this,
+          adaptiveBurstGrantedBytes_,
+          requestedBurst,
+          adaptiveGlobalBurstBytes_)) {
+    return true;
+  }
+  adaptiveBurstGrantedBytes_ = requestedBurst;
+  adaptivePeakBurstGrantedBytes_ =
+      std::max(adaptivePeakBurstGrantedBytes_, adaptiveBurstGrantedBytes_);
+  return reachedBurstLimit;
+}
+
+void UcxOutputQueue::shrinkAdaptiveBurstLocked(
+    std::vector<ContinuePromise>& promises) {
+  if (adaptiveBurstMaxSize_ <= maxSize_) {
+    return;
+  }
+  VELOX_DCHECK_GE(queuedBytes_, 0);
+  const auto queuedBytes = static_cast<uint64_t>(queuedBytes_);
+  const auto requestedBurst = queuedBytes > maxSize_
+      ? std::min(queuedBytes, adaptiveBurstMaxSize_) - maxSize_
+      : 0;
+  if (requestedBurst >= adaptiveBurstGrantedBytes_) {
+    auto adaptivePromises =
+        adaptiveQueueBurstCoordinator().notifyProgress();
+    promises.insert(
+        promises.end(),
+        std::make_move_iterator(adaptivePromises.begin()),
+        std::make_move_iterator(adaptivePromises.end()));
+    return;
+  }
+  auto adaptivePromises = adaptiveQueueBurstCoordinator().releaseTo(
+      this, adaptiveBurstGrantedBytes_, requestedBurst);
+  adaptiveBurstGrantedBytes_ = requestedBurst;
+  promises.insert(
+      promises.end(),
+      std::make_move_iterator(adaptivePromises.begin()),
+      std::make_move_iterator(adaptivePromises.end()));
 }
 
 void UcxOutputQueue::getData(int destination, UcxDataAvailableCallback notify) {
@@ -536,6 +774,13 @@ void UcxOutputQueue::checkIfDone(bool oneDriverFinished) {
               << " chunks=" << totalPackedColumnsSent_
               << " avgRowsPerChunk=" << avgRows
               << " totalBytes=" << totalBytesSent_;
+      if (adaptiveBurstMaxSize_ > maxSize_) {
+        LOG(INFO) << "Adaptive UCX output credit summary task="
+                  << (task_ ? task_->taskId() : "n/a")
+                  << " peakBurstGrantedBytes="
+                  << adaptivePeakBurstGrantedBytes_
+                  << " adaptiveBlockedCount=" << adaptiveBurstBlockedCount_;
+      }
     }
     for (auto& queue : queues_) {
       if (queue != nullptr) {
@@ -631,6 +876,8 @@ void UcxOutputQueue::updateOutputBuffers(int numBuffers, bool noMoreBuffers) {
           // decrements don't drive it negative.
           queuedBytes_ += data->gpu_data->size();
           queuedPackedColumns_++;
+          updateDiagnosticGlobalQueue(
+              data->gpu_data->size(), 1, "broadcast-backfill", task_);
         }
         if (atEnd_) {
           buffer->enqueueBack(nullptr);
@@ -716,6 +963,15 @@ void UcxOutputQueue::terminate() {
     }
     // Release any outstanding producer-side promises (blocked on queue-full).
     promises = std::move(promises_);
+    // Cancellation must wake this task's waiters, but its borrowed credit
+    // remains reserved while queued GPU pages are still reachable. The
+    // destructor releases the credit together with those pages.
+    auto adaptivePromises =
+        adaptiveQueueBurstCoordinator().cancelOwnerWaiters(this);
+    promises.insert(
+        promises.end(),
+        std::make_move_iterator(adaptivePromises.begin()),
+        std::make_move_iterator(adaptivePromises.end()));
   }
 
   // Fire callbacks outside of mutex to avoid potential deadlocks.
@@ -778,6 +1034,7 @@ void UcxOutputQueue::updateStatsWithFreedLocked(
   VELOX_CHECK_GE(queuedPackedColumns_, 0);
   updateDiagnosticGlobalQueue(-bytes, -numPackedCols, "dequeue", task_);
   logDeviceQueueResidencyLocked("dequeue");
+  shrinkAdaptiveBurstLocked(promises);
 
   // Check whether queue is below low-water mark and return outstanding
   // promises
@@ -786,7 +1043,11 @@ void UcxOutputQueue::updateStatsWithFreedLocked(
             << " UNBLOCKING " << promises_.size() << " producers"
             << " queuedBytes=" << queuedBytes_
             << " continueSize=" << continueSize_;
-    promises = std::move(promises_);
+    auto legacyPromises = std::move(promises_);
+    promises.insert(
+        promises.end(),
+        std::make_move_iterator(legacyPromises.begin()),
+        std::make_move_iterator(legacyPromises.end()));
   }
 }
 

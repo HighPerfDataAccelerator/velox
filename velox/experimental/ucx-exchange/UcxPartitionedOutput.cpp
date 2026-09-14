@@ -214,6 +214,39 @@ uint64_t packedHostBytesLimit() {
   return uint64_t{8} << 30;
 }
 
+bool shouldExternalizeSourceTailForDevicePressure() {
+  const char* value = std::getenv(
+      "GLUTEN_UCX_BACKPRESSURE_EXTERNALIZE_MIN_DEVICE_HEADROOM_BYTES");
+  if (value == nullptr || value[0] == '\0') {
+    // Preserve the original safety behavior unless the deployment explicitly
+    // selects a device-headroom policy.
+    return true;
+  }
+
+  uint64_t minimumHeadroomBytes;
+  try {
+    minimumHeadroomBytes = std::stoull(value);
+  } catch (...) {
+    LOG(WARNING) << "Ignoring invalid "
+                    "GLUTEN_UCX_BACKPRESSURE_EXTERNALIZE_MIN_DEVICE_"
+                    "HEADROOM_BYTES="
+                 << value;
+    return true;
+  }
+
+  // Zero explicitly disables host externalization. This is important for
+  // direct-device exchange deployments: ordinary output-queue backpressure is
+  // not evidence of device pressure and must not introduce a D2H/H2D bounce.
+  if (minimumHeadroomBytes == 0) {
+    return false;
+  }
+
+  const auto headroom = cudf_velox::captureDeviceAllocationHeadroom();
+  // If CUDA headroom cannot be sampled, retain the conservative safety path.
+  return !headroom.cudaValid ||
+      headroom.allocatableBytes() <= minimumHeadroomBytes;
+}
+
 uint64_t targetBytesPerUcxChunk(
     const core::QueryConfig& queryConfig,
     const core::PlanNodeId& planNodeId) {
@@ -620,7 +653,7 @@ bool UcxPartitionedOutput::externalizeActiveSourceTail() {
           "operator=UcxPartitionedOutput task={} phase=externalizeSourceTail",
           taskId()));
   if (!sourceCanExternalizeOnBackpressure_ || !hasActiveDeviceSource() ||
-      !activeStream_) {
+      !activeStream_ || !shouldExternalizeSourceTailForDevicePressure()) {
     return false;
   }
 

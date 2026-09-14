@@ -680,6 +680,10 @@ void CudfSplitReader::resetSplit() {
 }
 
 cudf::ast::expression const* CudfSplitReader::pushdownFilter() const {
+  if (!cudfHiveConfig_->parquetFilterPushdownEnabledSession(
+          connectorQueryCtx_->sessionProperties())) {
+    return nullptr;
+  }
   return subfieldFilter();
 }
 

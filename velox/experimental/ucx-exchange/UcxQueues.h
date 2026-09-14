@@ -148,6 +148,16 @@ class UcxDestinationQueue {
 /// more data will be added.
 class UcxOutputQueue : public std::enable_shared_from_this<UcxOutputQueue> {
  public:
+  // Optional query-scoped elastic credit for UCX device output queues. The
+  // ordinary max_output_buffer_size remains the guaranteed per-task budget.
+  // Zero keeps the historical fixed-cap behavior used by local profiles.
+  static constexpr const char* kAdaptiveBurstMaxBytesConfig =
+      "ucx.output_buffer_adaptive_burst_size";
+  static constexpr const char* kAdaptiveGlobalBurstBytesConfig =
+      "ucx.output_buffer_adaptive_global_burst_size";
+  static constexpr const char* kAdaptiveMinDeviceHeadroomBytesConfig =
+      "ucx.output_buffer_adaptive_min_device_headroom";
+
   /// @brief Creates a new output queue for a data-producing task.
   /// @param taskId The id of the source task that produces the data
   /// @param numDestinations The number of destinations, i.e. the partitions.
@@ -159,6 +169,8 @@ class UcxOutputQueue : public std::enable_shared_from_this<UcxOutputQueue> {
       uint32_t numDrivers,
       core::PartitionedOutputNode::Kind kind =
           core::PartitionedOutputNode::Kind::kPartitioned);
+
+  ~UcxOutputQueue();
 
   /// @brief initializes an unitialized queue. This is needed in order to
   /// support delayed construction, i.e. if a "getData" arrives before the queue
@@ -272,6 +284,12 @@ class UcxOutputQueue : public std::enable_shared_from_this<UcxOutputQueue> {
 
   void updateTotalQueuedBytesMsLocked();
 
+  void configureAdaptiveBurst(const core::QueryConfig& queryConfig);
+
+  bool shouldBlockLocked();
+
+  void shrinkAdaptiveBurstLocked(std::vector<ContinuePromise>& promises);
+
   /// Emits coarse queue-residency diagnostics without changing backpressure.
   /// Must be called with mutex_ held.
   void logDeviceQueueResidencyLocked(const char* event);
@@ -317,6 +335,15 @@ class UcxOutputQueue : public std::enable_shared_from_this<UcxOutputQueue> {
   // When 'queuedBytes_' goes below 'continueSize_', blocked producers are
   // resumed.
   uint64_t continueSize_{0};
+
+  // Executor-wide credit only accounts for bytes above maxSize_. It is
+  // disabled when adaptiveBurstMaxSize_ <= maxSize_.
+  uint64_t adaptiveBurstMaxSize_{0};
+  uint64_t adaptiveGlobalBurstBytes_{0};
+  uint64_t adaptiveMinDeviceHeadroomBytes_{0};
+  uint64_t adaptiveBurstGrantedBytes_{0};
+  uint64_t adaptivePeakBurstGrantedBytes_{0};
+  uint64_t adaptiveBurstBlockedCount_{0};
 
   // Total number of drivers expected to produce results. This number will
   // decrease in the end of grouped execution, when we understand the real

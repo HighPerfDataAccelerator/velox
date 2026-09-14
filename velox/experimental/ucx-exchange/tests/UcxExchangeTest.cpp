@@ -79,6 +79,28 @@ using namespace facebook::velox::core;
 
 namespace facebook::velox::ucx_exchange {
 
+TEST(UcxDeviceTransferPathTest, reportsEveryHostStagingReason) {
+  EXPECT_EQ(
+      selectDeviceTransferPath(true, 1 << 20, false, 128 << 20),
+      DeviceTransferPath::kDirectDevice);
+  EXPECT_EQ(
+      selectDeviceTransferPath(true, 1 << 20, true, 128 << 20),
+      DeviceTransferPath::kHostForced);
+  EXPECT_EQ(
+      selectDeviceTransferPath(false, 1 << 20, false, 128 << 20),
+      DeviceTransferPath::kHostNoCudaTransport);
+  EXPECT_EQ(
+      selectDeviceTransferPath(
+          true, kDeviceEagerHostStageBytes, false, 128 << 20),
+      DeviceTransferPath::kHostSmallEager);
+  EXPECT_EQ(
+      selectDeviceTransferPath(true, 129 << 20, false, 128 << 20),
+      DeviceTransferPath::kHostOverDirectLimit);
+  EXPECT_EQ(
+      selectDeviceTransferPath(true, 129 << 20, false, 0),
+      DeviceTransferPath::kDirectDevice);
+}
+
 TEST(UcxPinnedBufferPoolTest, h2dPoolHasIndependentSharedLease) {
   auto transport = acquireUcxPinnedBuffer(1);
   auto h2d = acquireUcxH2DPinnedBuffer(1);

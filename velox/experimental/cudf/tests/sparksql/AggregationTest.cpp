@@ -14,11 +14,13 @@
  * limitations under the License.
  */
 
+#include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/AggregationRegistry.h"
 #include "velox/experimental/cudf/exec/SparkAggregateFunctions.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 
 #include "velox/common/base/tests/GTestUtils.h"
+#include "velox/exec/tests/utils/AssertQueryBuilder.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
 #include "velox/functions/lib/aggregates/tests/utils/AggregationTestBase.h"
 #include "velox/functions/sparksql/aggregates/Register.h"
@@ -125,6 +127,16 @@ TEST_F(AggregationTest, groupedCollectListOfRow) {
           .finalAggregation()
           .planNode();
   assertQuery(partialFinal, expected);
+
+  // Identity PARTIAL bypasses the local hash groupby. Each non-null ROW is
+  // emitted as a singleton ARRAY state and FINAL performs the only grouping.
+  // Exercise null ROWs as well so the bypass preserves collect_list's
+  // EXCLUDE-null semantics rather than producing ARRAY[NULL].
+  AssertQueryBuilder(partialFinal)
+      .config(
+          cudf_velox::CudfConfig::kCudfPartialIdentityAggregation,
+          "true")
+      .assertResults({expected});
 }
 
 } // namespace facebook::velox::exec::sparksql::test
