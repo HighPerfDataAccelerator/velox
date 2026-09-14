@@ -1796,7 +1796,7 @@ TEST_P(UcxExchangeTest, hashWindowBackpressureIsResumable) {
     averageRowBytes = flatBytes / kRowsPerDriver +
         static_cast<uint64_t>(flatBytes % kRowsPerDriver != 0);
   }
-  cudf::get_default_stream().synchronize();
+  cudf::get_default_stream().sync();
   ASSERT_GT(averageRowBytes, 0);
   const auto maxOutputBufferBytes = averageRowBytes * kQueueCapacityRows;
 
