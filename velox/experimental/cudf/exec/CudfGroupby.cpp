@@ -1637,10 +1637,9 @@ bool CudfGroupby::initializeStreamingGroupby(
     return false;
   }
 
-  // libcudf's streaming_groupby does not accept an MR for persistent state and
-  // allocates it from the current device resource. Preserve the existing
-  // groupby contract when output allocations use a distinct resource by
-  // falling back until libcudf exposes a persistent-state MR parameter.
+  // Keep streaming_groupby's persistent state on the configured device
+  // resource. Preserve the existing groupby contract when output allocations
+  // use a distinct resource by falling back.
   if (!config.outputMemoryResource.empty() &&
       config.outputMemoryResource != config.memoryResource) {
     return false;
@@ -2249,7 +2248,8 @@ void CudfGroupby::computeFinalGroupbyStreaming(CudfVectorPtr tbl) {
         streamingRequests,
         finalStreamingMaxDistinctKeys_,
         ignoreNullKeys_ ? cudf::null_policy::EXCLUDE
-                        : cudf::null_policy::INCLUDE);
+                        : cudf::null_policy::INCLUDE,
+        get_temp_mr());
     finalAggregationMode_ = FinalAggregationMode::kStreaming;
     LOG(INFO) << "CUDF_GROUPBY_STREAMING node=" << diagnosticNodeId_
               << " state=selected maxDistinctKeys="

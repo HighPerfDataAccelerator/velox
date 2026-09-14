@@ -2181,9 +2181,17 @@ CudfHashJoinProbe::rightSemiProjectJoin(
         // mask to the build indices. Null filter results are excluded by
         // apply_boolean_mask, matching SQL join predicate semantics.
         auto leftResult = cudf::gather(
-            leftTableView, leftIndicesCol, oobPolicy, stream, get_temp_mr());
+            leftTableView,
+            leftIndicesCol,
+            oobPolicy,
+            stream,
+            cudf::memory_resources{get_temp_mr(), get_temp_mr()});
         auto rightResult = cudf::gather(
-            rightTableView, rightIndicesCol, oobPolicy, stream, get_temp_mr());
+            rightTableView,
+            rightIndicesCol,
+            oobPolicy,
+            stream,
+            cudf::memory_resources{get_temp_mr(), get_temp_mr()});
         auto joinedCols = leftResult->release();
         auto rightCols = rightResult->release();
         joinedCols.insert(
