@@ -243,7 +243,7 @@ CudfHiveDataSource::CudfHiveDataSource(
   // and doesn't depend on split-specific state.
   if (!readerSubfieldFilters.empty()) {
     auto const readerFilterType = getTableRowType();
-    subfieldFilterExpr_ = &createAstFromSubfieldFilters(
+    subfieldFilterAst_ = &createAstFromSubfieldFilters(
         readerSubfieldFilters,
         subfieldTree_,
         subfieldScalars_,
@@ -275,7 +275,7 @@ std::unique_ptr<CudfSplitReader> CudfHiveDataSource::createCudfSplitReader() {
       ioStatistics_,
       ioStats_,
       useExperimentalCudfReader_,
-      subfieldFilterExpr_);
+      subfieldFilterAst_);
 }
 
 void CudfHiveDataSource::convertSplit(std::shared_ptr<ConnectorSplit> split) {
@@ -369,7 +369,7 @@ void CudfHiveDataSource::setFromDataSource(
   // pointers remain valid after the preloaded DataSource is destroyed.
   subfieldTree_ = std::move(source->subfieldTree_);
   subfieldScalars_ = std::move(source->subfieldScalars_);
-  subfieldFilterExpr_ = source->subfieldFilterExpr_;
+  subfieldFilterAst_ = source->subfieldFilterAst_;
   totalRemainingFilterTime_.fetch_add(
       source->totalRemainingFilterTime_.load(std::memory_order_relaxed),
       std::memory_order_relaxed);
@@ -381,7 +381,7 @@ void CudfHiveDataSource::setFromDataSource(
 
   if (cudfSplitReader_) {
     cudfSplitReader_->setDataSourceContext(
-        connectorQueryCtx_, runtimeStats_, subfieldFilterExpr_);
+        connectorQueryCtx_, runtimeStats_, subfieldFilterAst_);
   }
 }
 
@@ -410,7 +410,7 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
         cudfRemainingFilterExpression_->eval(inputViews, stream, get_temp_mr());
     auto originalTable =
         std::make_unique<cudf::table>(std::move(cudfTableColumns));
-    cudfTable = cudf::apply_boolean_mask(
+    cudfTable = cudf::apply_retention_mask(
         *originalTable, asView(filterResult), stream, get_output_mr());
   }
   totalRemainingFilterTime_.fetch_add(
@@ -437,7 +437,7 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
             pool_, outputType_, nRows, std::move(cudfTable), stream)
       : with_arrow::toVeloxColumn(
             cudfTable->view(), pool_, outputType_, stream, get_temp_mr());
-  stream.synchronize();
+  stream.sync();
 
   VELOX_CHECK_NOT_NULL(output, "Cudf to Velox conversion yielded a nullptr");
 

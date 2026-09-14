@@ -25,7 +25,9 @@
 #include <cudf/io/parquet.hpp>
 #include <cudf/types.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
+#include <rmm/resource_ref.hpp>
+
+#include <cuda/stream>
 
 #include <cstdint>
 #include <string>
@@ -53,6 +55,13 @@ class CudfOrderBy : public CudfOperatorBase {
 
   static bool isSupported(
       const std::shared_ptr<const core::OrderByNode>& orderByNode);
+
+  /// Builds the GPU sort appended after a kept UcxExchange operator. Together,
+  /// the two operators implement MergeExchange on the GPU.
+  CudfOrderBy(
+      int32_t operatorId,
+      exec::DriverCtx* driverCtx,
+      const std::shared_ptr<const core::MergeExchangeNode>& mergeExchangeNode);
 
   bool needsInput() const override {
     return !noMoreInput_;
@@ -116,14 +125,14 @@ class CudfOrderBy : public CudfOperatorBase {
   void prepareSpilledOutput();
   uint64_t measureTableBytes(
       std::unique_ptr<cudf::table>& table,
-      rmm::cuda_stream_view stream);
+      cuda::stream_ref stream);
   bool loadPausedChunk(
       SortedRun& run,
-      rmm::cuda_stream_view stream,
+      cuda::stream_ref stream,
       MergeStats& stats);
   std::unique_ptr<cudf::table> mergeNextPausedBatch(
       std::vector<SortedRun*>& runs,
-      rmm::cuda_stream_view stream,
+      cuda::stream_ref stream,
       rmm::device_async_resource_ref mr,
       bool& finished,
       MergeStats& stats);
@@ -133,10 +142,14 @@ class CudfOrderBy : public CudfOperatorBase {
   void cleanupSpillFiles();
   void cleanupSpillStateAfterFailure(std::string_view context) noexcept;
 
-  std::shared_ptr<const core::OrderByNode> orderByNode_;
   // Inputs, readers, merge cursors and output slices all outlive one Operator
   // call. Keep their work and destruction ordered on one persistent stream.
-  const rmm::cuda_stream_view stateStream_;
+  const cuda::stream_ref stateStream_;
+
+  // Initializes cuDF sort keys from the plan node's ordering.
+  void initializeSortKeys(
+      const std::vector<core::FieldAccessTypedExprPtr>& sortingKeys,
+      const std::vector<core::SortOrder>& sortingOrders);
   std::vector<CudfVectorPtr> inputs_;
   std::vector<cudf::size_type> sortKeys_;
   std::vector<cudf::order> columnOrder_;

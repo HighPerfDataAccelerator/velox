@@ -49,7 +49,7 @@ namespace facebook::velox::cudf_velox::test {
 
 class CudfGroupbyTestHelper {
  public:
-  static rmm::cuda_stream_view stateStream(const CudfGroupby& groupby) {
+  static cuda::stream_ref stateStream(const CudfGroupby& groupby) {
     return groupby.stateStream_;
   }
 
@@ -1215,7 +1215,7 @@ TEST_F(AggregationTest, partialIdentityMaterializesPackedInputBeforeViews) {
             auto stream = (*input)->stream();
             auto packedColumns = cudf::pack(
                 (*input)->getTableView(), stream, cudf_velox::get_output_mr());
-            stream.synchronize();
+            stream.sync();
             auto packedView = cudf::unpack(packedColumns);
             *input = std::make_shared<cudf_velox::CudfVector>(
                 (*input)->pool(),
@@ -1309,7 +1309,7 @@ TEST_F(
       cudf_velox::test::CudfGroupbyTestHelper::stateStream(groupby);
 
   rmm::cuda_stream allocationStream{rmm::cuda_stream::flags::non_blocking};
-  ASSERT_NE(allocationStream.value(), stateStream.value());
+  ASSERT_NE(allocationStream.get(), stateStream.get());
   const auto inputType = finalNode->sources()[0]->outputType();
   auto intermediateInput = makeRowVector(
       inputType->names(),
@@ -1326,7 +1326,7 @@ TEST_F(
       table->view(),
       allocationStream.view(),
       rmm::to_device_async_resource_ref_checked(&recordingResource));
-  allocationStream.synchronize();
+  allocationStream.sync();
   auto packedView = cudf::unpack(packedColumns);
   auto packedTable = std::make_unique<cudf::packed_table>(
       cudf::packed_table{packedView, std::move(packedColumns)});
@@ -1341,9 +1341,9 @@ TEST_F(
   cudf_velox::test::CudfGroupbyTestHelper::prepareInputForStateStream(
       groupby, packedInput);
   packedInput.reset();
-  stateStream.synchronize();
+  stateStream.sync();
   EXPECT_GT(recordingResource.deallocationCount(), 0);
-  EXPECT_EQ(recordingResource.lastDeallocationStream(), stateStream.value());
+  EXPECT_EQ(recordingResource.lastDeallocationStream(), stateStream.get());
   recordingResource.releaseDeferred();
 }
 

@@ -83,7 +83,7 @@ class MonotonicallyIncreasingIdFunction : public CudfFunction {
 
   ColumnOrView eval(
       std::vector<ColumnOrView>& inputColumns,
-      rmm::cuda_stream_view stream,
+      cuda::stream_ref stream,
       rmm::device_async_resource_ref mr) const override {
     const auto inputRowCount = inputColumns.empty()
         ? cudf::size_type{0}
@@ -94,7 +94,7 @@ class MonotonicallyIncreasingIdFunction : public CudfFunction {
   ColumnOrView eval(
       std::vector<ColumnOrView>& inputColumns,
       cudf::size_type inputRowCount,
-      rmm::cuda_stream_view stream,
+      cuda::stream_ref stream,
       rmm::device_async_resource_ref mr) const override {
     VELOX_CHECK(inputColumns.empty());
     constexpr int64_t kRowsPerPartition = int64_t{1} << 33;
@@ -131,7 +131,7 @@ class TrimFunction : public CudfFunction {
 
   ColumnOrView eval(
       std::vector<ColumnOrView>& inputColumns,
-      rmm::cuda_stream_view stream,
+      cuda::stream_ref stream,
       rmm::device_async_resource_ref mr) const override {
     VELOX_CHECK_EQ(inputColumns.size(), 1, "trim expects one input column");
     cudf::string_scalar space(" ", true, stream, mr);

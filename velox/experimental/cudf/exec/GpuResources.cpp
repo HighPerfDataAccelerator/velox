@@ -33,6 +33,8 @@
 
 #include <cuda_runtime_api.h>
 
+#include <cuda_runtime.h>
+
 #include <common/base/Exceptions.h>
 #include <dlfcn.h>
 #include <glog/logging.h>
@@ -526,8 +528,53 @@ std::size_t deviceMemoryAdmissionReservedBytes(int device) {
 }
 
 cudf::detail::cuda_stream_pool& cudfGlobalStreamPool() {
-  return cudf::detail::global_cuda_stream_pool();
+  return cudf::detail::current_cuda_stream_pool();
 };
+
+namespace {
+
+// Device owning the registration-time primary context
+int cudfContextDevice = -1;
+
+} // namespace
+
+void setCudfContextDevice(int device) {
+  cudfContextDevice = device;
+}
+
+void ensureCudaContextForThread() {
+  // Create and push the device's primary context on this thread, at most once.
+  static thread_local bool initialized = false;
+  if (initialized) {
+    return;
+  }
+
+  // Device is recorded by setCudfContextDevice() from registerCudf().
+  VELOX_CHECK_GE(
+      cudfContextDevice,
+      0,
+      "cuDF is not yet registered. Please call registerCudf() first.");
+  VELOX_CHECK_EQ(
+      static_cast<int>(cudaSuccess),
+      static_cast<int>(cudaSetDevice(cudfContextDevice)),
+      "Failed to set CUDA device for cuDF worker thread",
+      cudfContextDevice);
+  VELOX_CHECK_EQ(
+      static_cast<int>(cudaSuccess),
+      static_cast<int>(cudaFree(nullptr)),
+      "Failed to initialize CUDA context on cuDF worker thread");
+  VELOX_CHECK_EQ(
+      static_cast<int>(cudaSuccess),
+      static_cast<int>(cudaGetDevice(&cudfContextDevice)),
+      "Failed to get current CUDA device ordinal");
+
+  initialized = true;
+}
+
+cuda::stream_ref getDefaultStreamForCurrentThread() {
+  ensureCudaContextForThread();
+  return cudf::get_default_stream(cudf::allow_default_stream);
+}
 
 std::optional<cuda::mr::any_resource<cuda::mr::device_accessible>> mr_;
 std::optional<cuda::mr::any_resource<cuda::mr::device_accessible>> output_mr_;
@@ -650,7 +697,7 @@ CudaAllocationTraceScope::~CudaAllocationTraceScope() {
 // __attribute__((error)). The overload below calls the real function.
 namespace cudf {
 
-rmm::cuda_stream_view const get_default_stream(allow_default_stream_t) {
+cuda::stream_ref const get_default_stream(allow_default_stream_t) {
   return cudf::get_default_stream();
 }
 

@@ -129,6 +129,7 @@ class CudfOperatorBase : public exec::Operator, public NvtxHelper {
         nvtxMethods_(nvtxMethods) {}
 
   void addInput(RowVectorPtr input) final {
+    ensureCudaContextForThread();
     VELOX_NVTX_OPERATOR_FUNC_RANGE_IF(
         nvtxMethods_ & NvtxMethodFlag::kAddInput, className_);
     CudaAllocationTraceScope allocationTrace(
@@ -155,6 +156,7 @@ class CudfOperatorBase : public exec::Operator, public NvtxHelper {
   }
 
   RowVectorPtr getOutput() final {
+    ensureCudaContextForThread();
     VELOX_NVTX_OPERATOR_FUNC_RANGE_IF(
         nvtxMethods_ & NvtxMethodFlag::kGetOutput, className_);
     CudaAllocationTraceScope allocationTrace(
@@ -182,6 +184,7 @@ class CudfOperatorBase : public exec::Operator, public NvtxHelper {
   }
 
   void noMoreInput() final {
+    ensureCudaContextForThread();
     VELOX_NVTX_OPERATOR_FUNC_RANGE_IF(
         nvtxMethods_ & NvtxMethodFlag::kNoMoreInput, className_);
     const auto sample = shouldSampleDeviceMemory(true);
@@ -201,6 +204,9 @@ class CudfOperatorBase : public exec::Operator, public NvtxHelper {
   }
 
   void close() final {
+    // close() may run on a different thread than construction so bind the
+    // context here too.
+    ensureCudaContextForThread();
     VELOX_NVTX_OPERATOR_FUNC_RANGE_IF(
         nvtxMethods_ & NvtxMethodFlag::kClose, className_);
     const auto sample = shouldSampleDeviceMemory(true);
@@ -305,6 +311,7 @@ class CudfSourceOperatorBase : public exec::SourceOperator, public NvtxHelper {
         nvtxMethods_(nvtxMethods) {}
 
   RowVectorPtr getOutput() final {
+    ensureCudaContextForThread();
     VELOX_NVTX_OPERATOR_FUNC_RANGE_IF(
         nvtxMethods_ & NvtxMethodFlag::kGetOutput, className_);
     auto result = doGetOutput();
@@ -313,6 +320,9 @@ class CudfSourceOperatorBase : public exec::SourceOperator, public NvtxHelper {
   }
 
   void close() final {
+    // close() may run on a different thread than construction so bind the
+    // context here too.
+    ensureCudaContextForThread();
     VELOX_NVTX_OPERATOR_FUNC_RANGE_IF(
         nvtxMethods_ & NvtxMethodFlag::kClose, className_);
     doClose();

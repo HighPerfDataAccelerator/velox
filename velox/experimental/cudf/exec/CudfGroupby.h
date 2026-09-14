@@ -61,7 +61,7 @@ struct StreamingGroupbyAggregator {
   // Consumes the result positions recorded by addStreamingRequest().
   virtual std::unique_ptr<cudf::column> makeOutputColumn(
       std::vector<cudf::groupby::aggregation_result>& results,
-      rmm::cuda_stream_view stream,
+      cuda::stream_ref stream,
       rmm::device_async_resource_ref mr) = 0;
 
   virtual ~StreamingGroupbyAggregator() = default;
@@ -86,7 +86,7 @@ struct GroupbyAggregator {
   virtual void addGroupbyRequest(
       cudf::table_view const& tbl,
       std::vector<cudf::groupby::aggregation_request>& requests,
-      rmm::cuda_stream_view stream,
+      cuda::stream_ref stream,
       rmm::device_async_resource_ref mr) = 0;
 
   // Releases columns materialized solely to back views in the most recently
@@ -101,7 +101,7 @@ struct GroupbyAggregator {
 
   virtual std::unique_ptr<cudf::column> makeOutputColumn(
       std::vector<cudf::groupby::aggregation_result>& results,
-      rmm::cuda_stream_view stream,
+      cuda::stream_ref stream,
       rmm::device_async_resource_ref mr) = 0;
 
   // A high-cardinality PARTIAL aggregation can legally emit one intermediate
@@ -114,7 +114,7 @@ struct GroupbyAggregator {
   virtual std::unique_ptr<cudf::column> makePartialIdentityColumn(
       cudf::table_view const& /* tbl */,
       std::unique_ptr<cudf::column> /* inputOwner */,
-      rmm::cuda_stream_view /* stream */,
+      cuda::stream_ref /* stream */,
       rmm::device_async_resource_ref /* mr */) {
     VELOX_UNSUPPORTED("Aggregate does not support PARTIAL identity output");
   }
@@ -143,7 +143,7 @@ struct GroupbyAggregator {
   cudf::column_view materializeMaskedInput(
       cudf::table_view const& tbl,
       uint32_t valueIdx,
-      rmm::cuda_stream_view stream,
+      cuda::stream_ref stream,
       rmm::device_async_resource_ref mr);
 
  private:
@@ -233,7 +233,7 @@ class CudfGroupby : public CudfOperatorBase {
       std::vector<column_index_t> const& groupByKeys,
       std::vector<std::unique_ptr<GroupbyAggregator>>& aggregators,
       TypePtr const& outputType,
-      rmm::cuda_stream_view stream,
+      cuda::stream_ref stream,
       rmm::device_async_resource_ref mr,
       bool keysAreSorted = false);
 
@@ -287,7 +287,7 @@ class CudfGroupby : public CudfOperatorBase {
   // Aggregation state outlives an individual addInput() call. Keep all state
   // production, compaction, and finalization on one stream so dependencies are
   // not lost when successive exchange pages arrive on different streams.
-  const rmm::cuda_stream_view stateStream_;
+  const cuda::stream_ref stateStream_;
   std::vector<std::unique_ptr<GroupbyAggregator>> aggregators_;
   std::vector<std::unique_ptr<GroupbyAggregator>> intermediateAggregators_;
   // Used for kSingle streaming: partial-step aggregators (raw -> intermediate)
@@ -357,7 +357,7 @@ class CudfGroupby : public CudfOperatorBase {
   std::vector<std::unique_ptr<StreamingGroupbyAggregator>>
       streamingGroupbyAggregators_;
   std::unique_ptr<cudf::groupby::streaming_groupby> streamingGroupby_;
-  std::optional<rmm::cuda_stream_view> streamingGroupbyStream_;
+  std::optional<cuda::stream_ref> streamingGroupbyStream_;
   std::unique_ptr<CudaEvent> streamingGroupbyEvent_;
   size_t streamingGroupbyCapacity_{0};
 };

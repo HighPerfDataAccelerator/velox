@@ -56,7 +56,7 @@ class InteropTest : public ::testing::Test, public VectorTestBase {
     // Convert cudf -> Velox using the existing Arrow path.
     auto result = cudf_velox::with_arrow::toVeloxColumn(
         cudfTable->view(), pool_.get(), input->type(), stream, mr);
-    stream.synchronize();
+    stream.sync();
 
     // Verify.
     test::assertEqualVectors(input, result);
@@ -261,7 +261,7 @@ TEST_F(InteropTest, restoresNestedUntypedNullAfterCudfRoundTrip) {
       physicalInput, pool_.get(), stream, mr);
   auto result = cudf_velox::with_arrow::toVeloxColumn(
       table->view(), pool_.get(), logicalType, stream, mr);
-  stream.synchronize();
+  stream.sync();
 
   ASSERT_TRUE(logicalType->equivalent(*result->type()));
   auto payload = result->childAt(0)->as<RowVector>();
@@ -308,7 +308,7 @@ TEST_F(InteropTest, transportsNestedUntypedNullThroughCudfGather) {
       mr);
   auto result = cudf_velox::with_arrow::toVeloxColumn(
       gathered->view(), pool_.get(), input->type(), stream, mr);
-  stream.synchronize();
+  stream.sync();
 
   test::assertEqualVectors(input, result);
 }
@@ -330,7 +330,7 @@ TEST_F(InteropTest, restoresTypedNullAfterUntypedTransport) {
       physicalInput, pool_.get(), stream, mr);
   auto result = cudf_velox::with_arrow::toVeloxColumn(
       table->view(), pool_.get(), logicalType, stream, mr);
-  stream.synchronize();
+  stream.sync();
 
   ASSERT_TRUE(logicalType->equivalent(*result->type()));
   const auto payload = result->childAt(0)->as<RowVector>();

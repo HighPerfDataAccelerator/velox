@@ -80,7 +80,7 @@ std::unique_ptr<cudf::table> copyTableSlice(
     cudf::table_view input,
     cudf::size_type begin,
     cudf::size_type end,
-    rmm::cuda_stream_view stream,
+    cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) {
   VELOX_CHECK_LE(begin, end);
   auto slices = cudf::slice(input, {begin, end}, stream);
@@ -90,7 +90,7 @@ std::unique_ptr<cudf::table> copyTableSlice(
 
 cudf::size_type firstSearchPosition(
     cudf::column_view positions,
-    rmm::cuda_stream_view stream) {
+    cuda::stream_ref stream) {
   VELOX_CHECK_EQ(positions.size(), 1);
   cudf::size_type result{0};
   CUDF_CUDA_TRY(cudaMemcpyAsync(
@@ -98,8 +98,8 @@ cudf::size_type firstSearchPosition(
       positions.data<cudf::size_type>(),
       sizeof(result),
       cudaMemcpyDeviceToHost,
-      stream.value()));
-  stream.synchronize();
+      stream.get()));
+  stream.sync();
   return result;
 }
 
@@ -116,7 +116,7 @@ std::vector<cudf::column_view> selectColumns(
 
 std::unique_ptr<cudf::column> makeSizeTypeColumn(
     const std::vector<cudf::size_type>& values,
-    rmm::cuda_stream_view stream,
+    cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) {
   auto column = cudf::make_fixed_width_column(
       cudf::data_type{cudf::type_id::INT32},
@@ -130,14 +130,14 @@ std::unique_ptr<cudf::column> makeSizeTypeColumn(
         values.data(),
         values.size() * sizeof(cudf::size_type),
         cudaMemcpyHostToDevice,
-        stream.value()));
+        stream.get()));
   }
   return column;
 }
 
 std::unique_ptr<cudf::column> makeInt64Column(
     const std::vector<int64_t>& values,
-    rmm::cuda_stream_view stream,
+    cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) {
   auto column = cudf::make_fixed_width_column(
       cudf::data_type{cudf::type_id::INT64},
@@ -151,14 +151,14 @@ std::unique_ptr<cudf::column> makeInt64Column(
         values.data(),
         values.size() * sizeof(int64_t),
         cudaMemcpyHostToDevice,
-        stream.value()));
+        stream.get()));
   }
   return column;
 }
 
 std::unique_ptr<cudf::scalar> copyScalar(
     const cudf::scalar& value,
-    rmm::cuda_stream_view stream,
+    cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) {
   auto column = cudf::make_column_from_scalar(value, 1, stream, mr);
   return cudf::get_element(column->view(), 0, stream, mr);
@@ -167,7 +167,7 @@ std::unique_ptr<cudf::scalar> copyScalar(
 std::unique_ptr<cudf::scalar> addValidScalars(
     const cudf::scalar& left,
     const cudf::scalar& right,
-    rmm::cuda_stream_view stream,
+    cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) {
   VELOX_CHECK(left.is_valid(stream));
   VELOX_CHECK(right.is_valid(stream));
@@ -425,7 +425,7 @@ bool isPartitionFirstWindow(const core::WindowNode& windowNode) {
 
 std::unique_ptr<cudf::column> makeConstantOnesColumn(
     cudf::size_type numRows,
-    rmm::cuda_stream_view stream,
+    cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) {
   auto oneScalar = cudf::numeric_scalar<int64_t>(1, true, stream, mr);
   return cudf::make_column_from_scalar(oneScalar, numRows, stream, mr);
@@ -435,7 +435,7 @@ cudf::column_view makeCountStarInputColumn(
     const cudf::table_view& sortedView,
     cudf::size_type logicalRowCount,
     ColumnOrView& owner,
-    rmm::cuda_stream_view stream,
+    cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) {
   if (sortedView.num_columns() > 0) {
     return sortedView.column(0);
@@ -458,7 +458,7 @@ std::unique_ptr<cudf::column> computeGlobalAggregate(
     bool isCountStar,
     cudf::data_type resultType,
     cudf::size_type numRows,
-    rmm::cuda_stream_view stream,
+    cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) {
   std::unique_ptr<cudf::scalar> resultScalar;
   if (baseName == "sum") {
@@ -1068,9 +1068,9 @@ void CudfWindow::doAddInput(RowVectorPtr input) {
         streamingReplay_,
         "CudfWindow received sorted input while replay was active");
     const auto inputStream = cudfInput->stream();
-    if (inputStream.value() != stateStream_.value()) {
+    if (inputStream.get() != stateStream_.get()) {
       cudf::detail::join_streams(
-          std::vector<rmm::cuda_stream_view>{inputStream}, stateStream_);
+          std::vector<cuda::stream_ref>{inputStream}, stateStream_);
     }
     VELOX_CHECK(
         cudfInput->rebindStream(stateStream_),
@@ -1088,9 +1088,9 @@ void CudfWindow::doAddInput(RowVectorPtr input) {
         pendingOutput_,
         "CudfWindow received sorted input before prior output was drained");
     const auto inputStream = cudfInput->stream();
-    if (inputStream.value() != stateStream_.value()) {
+    if (inputStream.get() != stateStream_.get()) {
       cudf::detail::join_streams(
-          std::vector<rmm::cuda_stream_view>{inputStream}, stateStream_);
+          std::vector<cuda::stream_ref>{inputStream}, stateStream_);
     }
     VELOX_CHECK(
         cudfInput->rebindStream(stateStream_),
@@ -1150,7 +1150,7 @@ cudf::size_type CudfWindow::trailingGroupStart(
     const std::vector<cudf::size_type>& indices,
     const std::vector<cudf::order>& orders,
     const std::vector<cudf::null_order>& nullOrders,
-    rmm::cuda_stream_view stream,
+    cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) const {
   VELOX_CHECK_GT(input.num_rows(), 0);
   auto keys = cudf::table_view(selectColumns(input, indices));
@@ -1199,7 +1199,7 @@ std::unique_ptr<cudf::table> CudfWindow::appendConstantResults(
 
 std::unique_ptr<cudf::table> CudfWindow::computeFullPartitionCountOutput(
     std::unique_ptr<cudf::table> input,
-    rmm::cuda_stream_view stream,
+    cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) const {
   VELOX_CHECK_NOT_NULL(input);
   auto partitionColumns = selectColumns(input->view(), partitionKeyIndices_);
@@ -1245,7 +1245,7 @@ std::unique_ptr<cudf::column> CudfWindow::computeRunningPartitionSumColumn(
     const cudf::table_view& sortedInput,
     const core::WindowNode::Function& function,
     const TypePtr& expectedType,
-    rmm::cuda_stream_view stream,
+    cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) const {
   VELOX_CHECK(!partitionKeyIndices_.empty());
   const auto valueChannel = resolveInputChannel(function, inputRowType_);
@@ -1279,7 +1279,7 @@ std::unique_ptr<cudf::column> CudfWindow::computeRunningPartitionSumColumn(
 
 std::unique_ptr<cudf::table> CudfWindow::computeRangeRunningSumOutput(
     std::unique_ptr<cudf::table> input,
-    rmm::cuda_stream_view stream,
+    cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) {
   VELOX_CHECK_NOT_NULL(input);
   VELOX_CHECK_GT(input->num_rows(), 0);
@@ -1949,7 +1949,7 @@ std::unique_ptr<cudf::table> CudfWindow::takeCompletePartitions(
 std::unique_ptr<cudf::column> CudfWindow::computeStreamingRowNumberColumn(
     const cudf::table_view& sortedInput,
     const TypePtr& expectedType,
-    rmm::cuda_stream_view stream,
+    cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) const {
   const auto valuesColumn = sortedInput.column(sortKeyIndices_[0]);
   const auto order = sortOrders_[0];
@@ -1988,7 +1988,7 @@ std::unique_ptr<cudf::column> CudfWindow::computeStreamingRowNumberColumn(
 std::unique_ptr<cudf::column> CudfWindow::computeStreamingRankColumn(
     const cudf::table_view& sortedInput,
     const TypePtr& expectedType,
-    rmm::cuda_stream_view stream,
+    cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) const {
   auto rowNumber =
       computeStreamingRowNumberColumn(sortedInput, expectedType, stream, mr);
@@ -2056,7 +2056,7 @@ cudf::size_type CudfWindow::continuingPrefixSize(
     const std::unique_ptr<cudf::table>& previousKey,
     const std::vector<cudf::order>& orders,
     const std::vector<cudf::null_order>& nullOrders,
-    rmm::cuda_stream_view stream,
+    cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) const {
   if (!previousKey || sortedInput.num_rows() == 0) {
     return 0;
@@ -2077,7 +2077,7 @@ std::unique_ptr<cudf::column> CudfWindow::fixRankLikeColumn(
     std::unique_ptr<cudf::column> localResult,
     std::string_view functionName,
     const cudf::table_view& sortedInput,
-    rmm::cuda_stream_view stream,
+    cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) const {
   if (!hasRankLikeState_ || sortedInput.num_rows() == 0) {
     return localResult;
@@ -2196,7 +2196,7 @@ std::unique_ptr<cudf::column> CudfWindow::fixRankLikeColumn(
 
 void CudfWindow::updateRankLikeState(
     const cudf::table_view& sortedInput,
-    rmm::cuda_stream_view stream,
+    cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) {
   VELOX_CHECK_GT(sortedInput.num_rows(), 0);
   const auto numRows = sortedInput.num_rows();
@@ -2273,7 +2273,7 @@ void CudfWindow::computeRankColumnsBatch(
     const std::vector<std::pair<size_t, std::string>>& pendingRanks,
     cudf::groupby::groupby* rankGrouper,
     std::vector<std::unique_ptr<cudf::column>>& windowResultCols,
-    rmm::cuda_stream_view stream,
+    cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) const {
   if (pendingRanks.empty()) {
     return;
@@ -2364,7 +2364,7 @@ std::unique_ptr<cudf::column> CudfWindow::computeLeadLagColumn(
     cudf::column_view inputCol,
     const core::WindowNode::Function& func,
     const std::string& baseName,
-    rmm::cuda_stream_view stream,
+    cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) const {
   VELOX_CHECK_LE(
       func.functionCall->inputs().size(),
@@ -2415,7 +2415,7 @@ std::unique_ptr<cudf::column> CudfWindow::invokeGroupedRollingWindow(
     const core::WindowNode::Function& func,
     std::unique_ptr<cudf::rolling_aggregation> agg,
     bool isFullPartition,
-    rmm::cuda_stream_view stream,
+    cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) const {
   // RANGE frames are handled by the batched grouped_range_rolling_window path
   // in doGetOutput (see toBatchRangeWindowTypes). canRunOnGPU only accepts
@@ -2450,7 +2450,7 @@ std::unique_ptr<cudf::column> CudfWindow::computeNthValueColumn(
     const core::WindowNode::Function& func,
     const std::string& baseName,
     bool isFullPartition,
-    rmm::cuda_stream_view stream,
+    cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) const {
   auto nullPolicy = func.ignoreNulls ? cudf::null_policy::EXCLUDE
                                      : cudf::null_policy::INCLUDE;
@@ -2471,7 +2471,7 @@ std::unique_ptr<cudf::column> CudfWindow::computeNthValueColumn(
 std::unique_ptr<cudf::column> CudfWindow::computePartitionFirstColumn(
     const cudf::table_view& sortedInput,
     const core::WindowNode::Function& func,
-    rmm::cuda_stream_view stream,
+    cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) const {
   VELOX_CHECK(!partitionKeyIndices_.empty());
   VELOX_CHECK(!sortKeyIndices_.empty());
@@ -2549,7 +2549,7 @@ std::unique_ptr<cudf::column> CudfWindow::computeAggregateColumn(
     const core::WindowNode::Function& func,
     const std::string& baseName,
     bool isCountStar,
-    rmm::cuda_stream_view stream,
+    cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) const {
   // The unpartitioned, sort-key-less full-partition case is already
   // dispatched to computeGlobalAggregate() directly from doGetOutput(), so
@@ -2658,7 +2658,7 @@ bool CudfWindow::isFinished() {
 
 std::unique_ptr<cudf::column> CudfWindow::makeRangePeerOrdinalColumn(
     const cudf::table_view& sortedInput,
-    rmm::cuda_stream_view stream,
+    cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) const {
   VELOX_CHECK_GT(sortedInput.num_rows(), 0);
   VELOX_CHECK_GT(sortKeyIndices_.size(), 1);
@@ -3025,7 +3025,7 @@ RowVectorPtr CudfWindow::doGetOutput() {
       return output;
     }
     finished_ = true;
-    stream_.synchronize();
+    stream_.sync();
     cleanupSpillFiles();
     return nullptr;
   }
@@ -3068,7 +3068,7 @@ void CudfWindow::doClose() {
   // Release GPU allocations only after pending work on stream_ completes.
   if (streamAcquired_) {
     try {
-      stream_.synchronize();
+      stream_.sync();
     } catch (const std::exception& error) {
       LOG(WARNING) << "CudfWindow cleanup synchronization failed: "
                    << error.what();
@@ -3092,7 +3092,7 @@ void CudfWindow::doClose() {
   cleanupSpillFiles();
   if (streamAcquired_) {
     try {
-      stream_.synchronize();
+      stream_.sync();
     } catch (const std::exception& error) {
       LOG(WARNING) << "CudfWindow post-cleanup synchronization failed: "
                    << error.what();
