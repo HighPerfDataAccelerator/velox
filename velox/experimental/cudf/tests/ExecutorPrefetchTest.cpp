@@ -123,6 +123,30 @@ class TrackingArrayInputStream final
   const std::shared_ptr<std::atomic<bool>> destroyed_;
 };
 
+class AsyncInMemoryReadFile final : public InMemoryReadFile {
+ public:
+  AsyncInMemoryReadFile(
+      std::string content,
+      std::shared_ptr<std::atomic<uint64_t>> asyncReads)
+      : InMemoryReadFile(std::move(content)),
+        asyncReads_(std::move(asyncReads)) {}
+
+  bool hasPreadvAsync() const override {
+    return true;
+  }
+
+  folly::SemiFuture<uint64_t> preadvAsync(
+      uint64_t offset,
+      const std::vector<folly::Range<char*>>& buffers,
+      const FileIoContext& context = {}) const override {
+    asyncReads_->fetch_add(1, std::memory_order_relaxed);
+    return folly::makeSemiFuture<uint64_t>(preadv(offset, buffers, context));
+  }
+
+ private:
+  const std::shared_ptr<std::atomic<uint64_t>> asyncReads_;
+};
+
 class FakeCachedBufferedInput final : public dwio::common::BufferedInput {
  public:
   FakeCachedBufferedInput(
@@ -131,16 +155,22 @@ class FakeCachedBufferedInput final : public dwio::common::BufferedInput {
       folly::Executor* executor,
       uint64_t blockSize,
       std::shared_ptr<std::atomic<uint64_t>> backedUpBytes,
-      std::shared_ptr<std::atomic<bool>> streamDestroyed)
-      : BufferedInput(std::make_shared<InMemoryReadFile>(content), pool),
+      std::shared_ptr<std::atomic<bool>> streamDestroyed,
+      bool hasCache = true,
+      std::shared_ptr<ReadFile> readFile = nullptr)
+      : BufferedInput(
+            readFile ? std::move(readFile)
+                     : std::make_shared<InMemoryReadFile>(content),
+            pool),
         content_(std::move(content)),
         executor_(executor),
         blockSize_(blockSize),
         backedUpBytes_(std::move(backedUpBytes)),
-        streamDestroyed_(std::move(streamDestroyed)) {}
+        streamDestroyed_(std::move(streamDestroyed)),
+        hasCache_(hasCache) {}
 
   bool hasCache() const override {
-    return true;
+    return hasCache_;
   }
 
   folly::Executor* executor() const override {
@@ -174,6 +204,7 @@ class FakeCachedBufferedInput final : public dwio::common::BufferedInput {
   const uint64_t blockSize_;
   const std::shared_ptr<std::atomic<uint64_t>> backedUpBytes_;
   const std::shared_ptr<std::atomic<bool>> streamDestroyed_;
+  const bool hasCache_;
 };
 
 TEST_F(CacheHintRangeStatsTest, countsPhysicalChunkRelativeKeys) {
@@ -256,6 +287,103 @@ TEST_F(CacheHintRangeStatsTest, bufferedMetadataTailUsesOneReadAhead) {
       std::string_view(reinterpret_cast<char*>(footer.data()), footer.size()),
       std::string_view(content).substr(
           kFileSize - kTailSize + 1024, footer.size()));
+}
+
+TEST_F(CacheHintRangeStatsTest, bufferedHostReadsRemainLazy) {
+  folly::CPUThreadPoolExecutor executor(2);
+  const std::string content = "0123456789abcdef";
+  auto input = std::make_shared<FakeCachedBufferedInput>(
+      content,
+      *pool_,
+      &executor,
+      content.size(),
+      std::make_shared<std::atomic<uint64_t>>(0),
+      std::make_shared<std::atomic<bool>>(false));
+  BufferedInputDataSource source(input);
+
+  auto allocatedRead = source.host_read_async(3, 5);
+  EXPECT_EQ(allocatedRead.wait_for(0s), std::future_status::deferred);
+  auto buffer = allocatedRead.get();
+  EXPECT_EQ(buffer->size(), 5);
+  EXPECT_EQ(
+      std::string_view(
+          reinterpret_cast<const char*>(buffer->data()), buffer->size()),
+      "34567");
+
+  std::array<uint8_t, 4> destination{};
+  auto destinationRead =
+      source.host_read_async(8, destination.size(), destination.data());
+  EXPECT_EQ(destinationRead.wait_for(0s), std::future_status::deferred);
+  EXPECT_EQ(destinationRead.get(), destination.size());
+  EXPECT_EQ(
+      std::string_view(
+          reinterpret_cast<const char*>(destination.data()),
+          destination.size()),
+      "89ab");
+}
+
+TEST_F(
+    CacheHintRangeStatsTest,
+    nonCacheDeviceReadUsesConfiguredPinnedPoolAndRetainsHostBuffer) {
+  ASSERT_EQ(setenv("GLUTEN_CPP_S3_PINNED_POOL", "1", 1), 0);
+  SCOPE_EXIT {
+    unsetenv("GLUTEN_CPP_S3_PINNED_POOL");
+  };
+  folly::CPUThreadPoolExecutor executor(1);
+  const std::string content = "0123456789abcdef";
+  auto asyncReads = std::make_shared<std::atomic<uint64_t>>(0);
+  auto input = std::make_shared<FakeCachedBufferedInput>(
+      content,
+      *pool_,
+      &executor,
+      content.size(),
+      std::make_shared<std::atomic<uint64_t>>(0),
+      std::make_shared<std::atomic<bool>>(false),
+      /*hasCache=*/false,
+      std::make_shared<AsyncInMemoryReadFile>(content, asyncReads));
+
+  std::vector<std::shared_ptr<void>> retained;
+  std::weak_ptr<void> retainedWeak;
+  bool copiedFromPinnedHostMemory = false;
+  BufferedInputDeviceCopyHooks hooks{
+      .copy = [&copiedFromPinnedHostMemory](
+                  uint8_t* destination,
+                  const void* source,
+                  size_t bytes,
+                  rmm::cuda_stream_view) {
+        cudaPointerAttributes attributes{};
+        const auto status = cudaPointerGetAttributes(&attributes, source);
+        copiedFromPinnedHostMemory = status == cudaSuccess &&
+            attributes.type == cudaMemoryTypeHost;
+        if (status != cudaSuccess) {
+          cudaGetLastError();
+        }
+        std::memcpy(destination, source, bytes);
+      },
+      .retainUntilComplete =
+          [&retained, &retainedWeak](
+              std::shared_ptr<void> lifetime, rmm::cuda_stream_view) {
+            retainedWeak = lifetime;
+            retained.push_back(std::move(lifetime));
+          }};
+  BufferedInputDataSource source(input, std::move(hooks));
+  std::array<uint8_t, 6> destination{};
+
+  auto read = source.device_read_async(
+      4, destination.size(), destination.data(), rmm::cuda_stream_view{});
+  EXPECT_EQ(asyncReads->load(std::memory_order_relaxed), 1);
+  EXPECT_EQ(read.get(), destination.size());
+  EXPECT_EQ(
+      std::string_view(
+          reinterpret_cast<const char*>(destination.data()),
+          destination.size()),
+      "456789");
+  EXPECT_TRUE(copiedFromPinnedHostMemory);
+  ASSERT_EQ(retained.size(), 1);
+  EXPECT_FALSE(retainedWeak.expired());
+
+  retained.clear();
+  EXPECT_TRUE(retainedWeak.expired());
 }
 
 TEST_F(CacheHintRangeStatsTest, directCachePageH2dAvoidsHostStaging) {
