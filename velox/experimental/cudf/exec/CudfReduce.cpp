@@ -130,7 +130,7 @@ std::unique_ptr<cudf::column> reduceMinMaxWithInputType(
         cudf::table_view const& input,                                 \
         TypePtr const& outputType,                                     \
         vector_size_t /* inputRowCount */,                             \
-        cuda::stream_ref stream,                                  \
+        cuda::stream_ref stream,                                       \
         rmm::device_async_resource_ref mr) override {                  \
       auto const aggRequest =                                          \
           cudf::make_##name##_aggregation<cudf::reduce_aggregation>(); \

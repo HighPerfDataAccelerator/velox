@@ -295,8 +295,7 @@ TEST_F(CacheHintRangeStatsTest, directCachePageH2dAvoidsHostStaging) {
           },
       .retainUntilComplete =
           [&retained, &retainedWeak](
-              std::shared_ptr<void> stream,
-              cuda::stream_ref /*cudaStream*/) {
+              std::shared_ptr<void> stream, cuda::stream_ref /*cudaStream*/) {
             retainedWeak = stream;
             retained.push_back(std::move(stream));
           }};
@@ -372,16 +371,14 @@ TEST_F(
                 gate.cv.wait(lock, [&] { return gate.releaseFirst; });
               }
             },
-        .retainUntilComplete = [](std::shared_ptr<void>,
-                                  cuda::stream_ref) {}};
+        .retainUntilComplete = [](std::shared_ptr<void>, cuda::stream_ref) {}};
   };
 
   BufferedInputDataSource firstSource(makeInput(), makeHooks(true));
   BufferedInputDataSource secondSource(makeInput(), makeHooks(false));
   rmm::cuda_stream firstStream;
   rmm::cuda_stream secondStream;
-  auto fetch = [](BufferedInputDataSource& source,
-                  cuda::stream_ref stream) {
+  auto fetch = [](BufferedInputDataSource& source, cuda::stream_ref stream) {
     std::array<cudf::io::text::byte_range_info, 1> ranges{{{0, 1}}};
     auto [buffers, spans, completion] =
         cudf::io::parquet::fetch_byte_ranges_to_device_async(

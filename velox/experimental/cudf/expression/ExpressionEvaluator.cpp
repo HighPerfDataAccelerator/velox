@@ -109,9 +109,7 @@ class ScopedCudfFunctionQueryContext {
   const core::QueryCtx* previousCtx_;
 };
 
-bool decimalScalarIsZero(
-    const cudf::scalar& scalar,
-    cuda::stream_ref stream) {
+bool decimalScalarIsZero(const cudf::scalar& scalar, cuda::stream_ref stream) {
   if (!scalar.is_valid(stream)) {
     return false;
   }

@@ -178,18 +178,16 @@ void Acceptor::cStyleAMCallback(
         ->tagSendBuilder(
             response.get(), sizeof(*response), ucxx::Tag{responseTag})
         .pythonFuture(false)
-        .callbackFunction(
-            [response, keyStr = key.toString(), peerAddress](
-                ucs_status_t status, std::shared_ptr<void> arg) {
-              if (status == UCS_OK) {
-                VLOG(3) << "HandshakeResponse sent successfully to " << keyStr
-                        << " peer=" << peerAddress;
-              } else {
-                VLOG(0) << "Failed to send HandshakeResponse to " << keyStr
-                        << ": " << ucs_status_string(status)
-                        << " peer=" << peerAddress;
-              }
-            })
+        .callbackFunction([response, keyStr = key.toString(), peerAddress](
+                              ucs_status_t status, std::shared_ptr<void> arg) {
+          if (status == UCS_OK) {
+            VLOG(3) << "HandshakeResponse sent successfully to " << keyStr
+                    << " peer=" << peerAddress;
+          } else {
+            VLOG(0) << "Failed to send HandshakeResponse to " << keyStr << ": "
+                    << ucs_status_string(status) << " peer=" << peerAddress;
+          }
+        })
         .callbackData(response)
         .build();
   } catch (const std::exception& e) {

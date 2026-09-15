@@ -126,10 +126,8 @@ class CudfOrderBy : public CudfOperatorBase {
   uint64_t measureTableBytes(
       std::unique_ptr<cudf::table>& table,
       cuda::stream_ref stream);
-  bool loadPausedChunk(
-      SortedRun& run,
-      cuda::stream_ref stream,
-      MergeStats& stats);
+  bool
+  loadPausedChunk(SortedRun& run, cuda::stream_ref stream, MergeStats& stats);
   std::unique_ptr<cudf::table> mergeNextPausedBatch(
       std::vector<SortedRun*>& runs,
       cuda::stream_ref stream,

@@ -186,7 +186,7 @@ uint64_t addRepresentedRows(uint64_t left, uint64_t right) {
     void addGroupbyRequest(                                                   \
         cudf::table_view const& tbl,                                          \
         std::vector<cudf::groupby::aggregation_request>& requests,            \
-        cuda::stream_ref stream,                                         \
+        cuda::stream_ref stream,                                              \
         rmm::device_async_resource_ref mr) override {                         \
       auto& request = requests.emplace_back();                                \
       output_idx = requests.size() - 1;                                       \
@@ -216,7 +216,7 @@ uint64_t addRepresentedRows(uint64_t left, uint64_t right) {
                                                                               \
     std::unique_ptr<cudf::column> makeOutputColumn(                           \
         std::vector<cudf::groupby::aggregation_result>& results,              \
-        cuda::stream_ref stream,                                         \
+        cuda::stream_ref stream,                                              \
         rmm::device_async_resource_ref mr) override {                         \
       auto col = std::move(results[output_idx].results[0]);                   \
       const auto cudfType = cudf_velox::veloxToCudfDataType(resultType);      \
@@ -234,7 +234,7 @@ uint64_t addRepresentedRows(uint64_t left, uint64_t right) {
     std::unique_ptr<cudf::column> makePartialIdentityColumn(                  \
         cudf::table_view const& tbl,                                          \
         std::unique_ptr<cudf::column> inputOwner,                             \
-        cuda::stream_ref stream,                                         \
+        cuda::stream_ref stream,                                              \
         rmm::device_async_resource_ref mr) override {                         \
       VELOX_CHECK(supportsPartialIdentity());                                 \
       auto col = inputOwner ? std::move(inputOwner)                           \

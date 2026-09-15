@@ -15,14 +15,14 @@
  */
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/CudfConversion.h"
-#include "velox/experimental/cudf/exec/OperatorAdapters.h"
 #include "velox/experimental/cudf/exec/CudfValues.h"
 #include "velox/experimental/cudf/exec/CudfWindow.h"
+#include "velox/experimental/cudf/exec/OperatorAdapters.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/tests/CudfFunctionBaseTest.h"
 
-#include "velox/common/file/FileSystems.h"
 #include "velox/common/base/tests/GTestUtils.h"
+#include "velox/common/file/FileSystems.h"
 #include "velox/common/testutil/TempDirectoryPath.h"
 #include "velox/exec/FilterProject.h"
 #include "velox/exec/PlanNodeStats.h"
@@ -196,16 +196,18 @@ class AppendingAdapter : public cudf_velox::OperatorAdapter {
       exec::DriverCtx* ctx,
       int32_t operatorId) const override {
     std::vector<std::unique_ptr<exec::Operator>> appended;
-    appended.push_back(std::make_unique<cudf_velox::CudfFromVelox>(
-        operatorId,
-        planNode->outputType(),
-        ctx,
-        planNode->id() + "-from-velox"));
-    appended.push_back(std::make_unique<cudf_velox::CudfToVelox>(
-        operatorId,
-        planNode->outputType(),
-        ctx,
-        planNode->id() + "-to-velox"));
+    appended.push_back(
+        std::make_unique<cudf_velox::CudfFromVelox>(
+            operatorId,
+            planNode->outputType(),
+            ctx,
+            planNode->id() + "-from-velox"));
+    appended.push_back(
+        std::make_unique<cudf_velox::CudfToVelox>(
+            operatorId,
+            planNode->outputType(),
+            ctx,
+            planNode->id() + "-to-velox"));
     return appended;
   }
 };
@@ -1001,8 +1003,9 @@ TEST_F(AdapterOperatorTest, keptOperatorNeedsNoAppendedOperators) {
 TEST_F(
     AdapterOperatorTest,
     emptyReplacementIsRejectedDespiteConversionOperator) {
-  registerAdapterFirst(std::make_unique<EmptyReplacementAdapter>(
-      /*keepOperator=*/false, /*producesGpuOutput=*/true));
+  registerAdapterFirst(
+      std::make_unique<EmptyReplacementAdapter>(
+          /*keepOperator=*/false, /*producesGpuOutput=*/true));
 
   auto data = makeRowVector({"c0"}, {makeFlatVector<int32_t>({1, 2, 3, 4, 5})});
   auto plan = PlanBuilder().values({data}).project({"c0 * 2 as x"}).planNode();
@@ -1016,8 +1019,9 @@ TEST_F(
 // Adapter errors are rejected even when CPU fallback is enabled.
 TEST_F(AdapterOperatorTest, emptyReplacementIsRejectedWithCpuFallbackEnabled) {
   enableCpuFallback();
-  registerAdapterFirst(std::make_unique<EmptyReplacementAdapter>(
-      /*keepOperator=*/false, /*producesGpuOutput=*/true));
+  registerAdapterFirst(
+      std::make_unique<EmptyReplacementAdapter>(
+          /*keepOperator=*/false, /*producesGpuOutput=*/true));
 
   auto data = makeRowVector({"c0"}, {makeFlatVector<int32_t>({1, 2, 3, 4, 5})});
   auto plan = PlanBuilder().values({data}).project({"c0 * 2 as x"}).planNode();

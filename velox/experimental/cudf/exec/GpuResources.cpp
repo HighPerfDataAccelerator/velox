@@ -31,9 +31,8 @@
 #include <rmm/mr/prefetch_resource_adaptor.hpp>
 #include <rmm/mr/statistics_resource_adaptor.hpp>
 
-#include <cuda_runtime_api.h>
-
 #include <cuda_runtime.h>
+#include <cuda_runtime_api.h>
 
 #include <common/base/Exceptions.h>
 #include <dlfcn.h>

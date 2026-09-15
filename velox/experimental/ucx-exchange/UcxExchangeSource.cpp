@@ -573,21 +573,20 @@ void UcxExchangeSource::sendHandshake() {
   // Pass handshakeReq as the callback arg to keep the send buffer alive until
   // the async amSend completes. UCXX stores it as shared_ptr<void> but the
   // type-erased deleter still calls ~HandshakeMsg correctly.
-  request_ = endpointRef_->endpoint_
-                 ->amSendBuilder(
-                     handshakeReq.get(),
-                     sizeof(*handshakeReq),
-                     UCS_MEMORY_TYPE_HOST)
-                 .receiverCallbackInfo(info)
-                 .pythonFuture(false)
-                 .callbackFunction(
-                     [weak](ucs_status_t status, std::shared_ptr<void> arg) {
-                       if (auto self = weak.lock()) {
-                         self->onHandshake(status, arg);
-                       }
-                     })
-                 .callbackData(handshakeReq)
-                 .build();
+  request_ =
+      endpointRef_->endpoint_
+          ->amSendBuilder(
+              handshakeReq.get(), sizeof(*handshakeReq), UCS_MEMORY_TYPE_HOST)
+          .receiverCallbackInfo(info)
+          .pythonFuture(false)
+          .callbackFunction(
+              [weak](ucs_status_t status, std::shared_ptr<void> arg) {
+                if (auto self = weak.lock()) {
+                  self->onHandshake(status, arg);
+                }
+              })
+          .callbackData(handshakeReq)
+          .build();
 }
 
 void UcxExchangeSource::onHandshake(

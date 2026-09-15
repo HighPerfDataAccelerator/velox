@@ -118,8 +118,7 @@ BoundedCachePageRegistration makeBoundedCachePageRegistration(
     std::optional<CachePageHostRegistrationHooks> hooks = std::nullopt);
 
 struct BufferedInputDeviceCopyHooks {
-  std::function<void(uint8_t*, const void*, size_t, cuda::stream_ref)>
-      copy;
+  std::function<void(uint8_t*, const void*, size_t, cuda::stream_ref)> copy;
   std::function<void(std::shared_ptr<void>, cuda::stream_ref)>
       retainUntilComplete;
 };
@@ -257,10 +256,8 @@ class KvikioS3DataSource final : public cudf::io::datasource {
       uint8_t* dst,
       cuda::stream_ref stream) override;
 
-  std::unique_ptr<datasource::buffer> device_read(
-      size_t offset,
-      size_t size,
-      cuda::stream_ref stream) override;
+  std::unique_ptr<datasource::buffer>
+  device_read(size_t offset, size_t size, cuda::stream_ref stream) override;
 
   size_t readRanges(
       const std::vector<size_t>& offsets,
