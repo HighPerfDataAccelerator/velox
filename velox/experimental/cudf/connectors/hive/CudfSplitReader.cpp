@@ -1240,8 +1240,11 @@ std::shared_ptr<cudf::io::datasource> CudfSplitReader::createCudfDataSource(
   const FileHandle* bufferedFileHandle = fileHandleCachePtr.get();
 #ifdef VELOX_ENABLE_S3
   std::optional<FileHandle> scheduledFileHandle;
-  if (connectorQueryCtx_->cache() != nullptr && filePath.starts_with("s3://") &&
-      nativeS3ScheduledReadEnabled()) {
+  // The native scheduler is useful for both CachedBufferedInput and
+  // DirectBufferedInput. Restricting it to cache-backed queries silently
+  // bypasses the configured CRT/SDK request window for the non-cache
+  // BufferedInput path, which is the common cuDF scan configuration.
+  if (filePath.starts_with("s3://") && nativeS3ScheduledReadEnabled()) {
     scheduledFileHandle.emplace(
         FileHandle{
             makeNativeScheduledS3ReadFile(bufferedFileHandle->file, filePath),

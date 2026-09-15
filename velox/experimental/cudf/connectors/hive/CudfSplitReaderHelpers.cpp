@@ -1501,6 +1501,33 @@ class NativeS3SdkScheduler {
     return prioritized;
   }
 
+  void shutdown() {
+    {
+      std::unique_lock<std::mutex> lock(mutex_);
+      if (stopping_) {
+        return;
+      }
+      condition_.wait(lock, [this] {
+        return priorityQueue_.empty() && queue_.empty() &&
+            inflightRequests_.load(std::memory_order_acquire) == 0 &&
+            activeCrtCallbacks_.load(std::memory_order_acquire) == 0;
+      });
+      stopping_ = true;
+    }
+    condition_.notify_all();
+    for (auto& worker : workers_) {
+      if (worker.joinable()) {
+        worker.join();
+      }
+    }
+    workers_.clear();
+
+    auto highThroughputClient =
+        highThroughputCrtClient_.exchange(nullptr, std::memory_order_acq_rel);
+    highThroughputClient.reset();
+    crtClient_.reset();
+  }
+
  private:
   struct Request {
     std::shared_ptr<facebook::velox::ReadFile> readFile;
@@ -1651,16 +1678,7 @@ class NativeS3SdkScheduler {
   }
 
   ~NativeS3SdkScheduler() {
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      stopping_ = true;
-    }
-    condition_.notify_all();
-    for (auto& worker : workers_) {
-      if (worker.joinable()) {
-        worker.join();
-      }
-    }
+    shutdown();
   }
 
   void enqueueCrt(std::shared_ptr<Request> request) {
@@ -1827,6 +1845,7 @@ class NativeS3SdkScheduler {
               const Aws::S3Crt::Model::GetObjectRequest&,
               Aws::S3Crt::Model::GetObjectOutcome outcome,
               const std::shared_ptr<const Aws::Client::AsyncCallerContext>&) {
+            activeCrtCallbacks_.fetch_add(1, std::memory_order_acq_rel);
             bool succeeded = false;
             try {
               if (outcome.IsSuccess()) {
@@ -1899,6 +1918,8 @@ class NativeS3SdkScheduler {
                 completedRequests_.fetch_add(1, std::memory_order_relaxed) + 1;
             logProgress(completed);
             dispatchCrt();
+            activeCrtCallbacks_.fetch_sub(1, std::memory_order_acq_rel);
+            condition_.notify_all();
           });
     }
   }
@@ -2062,6 +2083,7 @@ class NativeS3SdkScheduler {
   std::atomic<uint64_t> completedRequests_{0};
   std::atomic<uint64_t> completedBytes_{0};
   std::atomic<uint64_t> inflightRequests_{0};
+  std::atomic<uint64_t> activeCrtCallbacks_{0};
   std::atomic<uint64_t> peakInflightRequests_{0};
   std::atomic<uint64_t> totalTimeUs_{0};
   std::atomic<uint64_t> retryAttempts_{0};
@@ -3124,6 +3146,14 @@ void initializeNativeS3Scheduler() {
 #endif
 }
 
+void shutdownNativeS3Scheduler() {
+#ifdef VELOX_ENABLE_S3
+  if (nativeS3ScheduledReadEnabled()) {
+    NativeS3SdkScheduler::instance().shutdown();
+  }
+#endif
+}
+
 bool prioritizeNativeS3File(const std::string& filePath) {
 #ifdef VELOX_ENABLE_S3
   if (!nativeS3ScheduledReadEnabled() || !filePath.starts_with("s3://")) {
@@ -3478,16 +3508,74 @@ std::future<size_t> BufferedInputDataSource::device_read_async(
         });
     return toStdFuture(std::move(future));
   }
+  auto hooks = deviceCopyHooks_;
+  const auto usePinnedStaging = detail::usePinnedHostBufferPool();
+  auto inputStream = input_->getInputStream();
+  if (usePinnedStaging && inputStream->hasReadAsync()) {
+    auto hostBuffer = std::make_shared<PinnedHostBuffer>(readSize);
+    std::vector<folly::Range<char*>> buffers{
+        folly::Range<char*>(
+            reinterpret_cast<char*>(hostBuffer->data()), readSize)};
+    // Native S3 implementations submit before returning their SemiFuture.
+    // Do not first enqueue this work on the bounded Velox IO pool: doing so
+    // caps the executor-global CRT request window at IOThreads and leaves
+    // small-range scans latency-bound.
+    auto future = inputStream->readAsync(
+        buffers, offset, facebook::velox::dwio::common::LogType::FILE);
+    auto copyFuture =
+        std::move(future)
+            .via(input_->executor())
+            .thenValue([inputStream = std::move(inputStream),
+                        hostBuffer = std::move(hostBuffer),
+                        readSize,
+                        dst,
+                        stream,
+                        hooks = std::move(hooks)](uint64_t copied) mutable {
+              VELOX_CHECK_EQ(
+                  copied, readSize, "Short asynchronous BufferedInput read");
+              hooks.copy(dst, hostBuffer->data(), copied, stream);
+              hooks.retainUntilComplete(std::move(hostBuffer), stream);
+              return static_cast<size_t>(copied);
+            });
+    return toStdFuture(std::move(copyFuture));
+  }
   auto future = folly::via(input_->executor())
-                    .thenValue([this, offset, readSize, dst, stream](auto&&) {
-                      auto hostBuffer = this->host_read(offset, readSize);
-                      CUDF_CUDA_TRY(cudaMemcpyAsync(
+                    .thenValue([this,
+                                offset,
+                                readSize,
+                                dst,
+                                stream,
+                                usePinnedStaging,
+                                hooks = std::move(hooks)](auto&&) mutable {
+                      if (usePinnedStaging) {
+                        auto hostBuffer =
+                            std::make_shared<PinnedHostBuffer>(readSize);
+                        const auto copied = this->readBuffered(
+                            offset, readSize, hostBuffer->data());
+                        hooks.copy(
+                            dst, hostBuffer->data(), copied, stream);
+                        // Keep the pinned staging allocation unavailable to
+                        // the pool until its H2D copy reaches the stream
+                        // callback. This also prevents another S3 range from
+                        // overwriting a buffer still consumed by CUDA.
+                        hooks.retainUntilComplete(
+                            std::move(hostBuffer), stream);
+                        return copied;
+                      }
+                      auto hostBuffer =
+                          std::shared_ptr<cudf::io::datasource::buffer>(
+                              this->host_read(offset, readSize));
+                      hooks.copy(
                           dst,
                           hostBuffer->data(),
                           hostBuffer->size(),
-                          cudaMemcpyHostToDevice,
-                          stream.value()));
-                      return hostBuffer->size();
+                          stream);
+                      const auto copied = hostBuffer->size();
+                      // The H2D copy is asynchronous with respect to this IO
+                      // worker. Keep its pageable source alive until the CUDA
+                      // stream reaches the callback behind the copy.
+                      hooks.retainUntilComplete(std::move(hostBuffer), stream);
+                      return copied;
                     });
   return toStdFuture(std::move(future));
 }

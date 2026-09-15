@@ -461,6 +461,10 @@ void logNativeS3SchedulerStats(
 /// S3 support or the native scheduler is disabled.
 void initializeNativeS3Scheduler();
 
+/// Drains the executor-global native S3 scheduler and destroys its AWS CRT
+/// clients before the process-global AWS SDK teardown.
+void shutdownNativeS3Scheduler();
+
 /// Raises queued native S3 ranges for 'filePath' ahead of speculative data
 /// ranges without shrinking the executor-global request window. Returns true
 /// when at least one queued range was marked. This is a no-op when demand
