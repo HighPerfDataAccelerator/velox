@@ -111,6 +111,10 @@ struct GroupbyAggregator {
     return false;
   }
 
+  std::optional<uint32_t> partialIdentityMaskIndex() const {
+    return maskIndex;
+  }
+
   virtual std::unique_ptr<cudf::column> makePartialIdentityColumn(
       cudf::table_view const& /* tbl */,
       std::unique_ptr<cudf::column> /* inputOwner */,
@@ -189,6 +193,8 @@ class CudfGroupby : public CudfOperatorBase {
       int32_t operatorId,
       exec::DriverCtx* driverCtx,
       std::shared_ptr<const core::AggregationNode> const& aggregationNode);
+
+  ~CudfGroupby() override;
 
   void initialize() override;
 

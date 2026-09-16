@@ -2206,7 +2206,7 @@ CudfHashJoinProbe::rightSemiProjectJoin(
         VELOX_CHECK_NOT_NULL(filterEvaluator_);
         auto filterColumn =
             filterEvaluator_->eval(joinedViews, stream, get_temp_mr());
-        auto filteredTable = cudf::apply_boolean_mask(
+        auto filteredTable = cudf::apply_retention_mask(
             cudf::table_view{{rightIndicesCol}},
             asView(filterColumn),
             stream,

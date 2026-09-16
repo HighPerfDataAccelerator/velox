@@ -72,7 +72,10 @@ if(UCX_LIBRARY AND UCX_INCLUDE_DIR)
 else()
   set(UCX_FOUND FALSE)
 endif()
-if(UCX_FOUND)
+# Configuring cuDF can overwrite UCX_FOUND before ucxx is declared below.
+# Preserve this outer probe so a detected UCX installation always fetches ucxx.
+set(VELOX_cudf_UCX_FOUND ${UCX_FOUND})
+if(VELOX_cudf_UCX_FOUND)
   message(STATUS "Found UCX: ${UCX_LIBRARY} (headers: ${UCX_INCLUDE_DIR}) -- ucxx will be fetched")
   # ucxx commit 22d9c90 from 2026-09-09 (release/0.52 branch)
   set(VELOX_ucxx_VERSION 0.52)
@@ -132,7 +135,7 @@ block(SCOPE_FOR VARIABLES)
     UPDATE_DISCONNECTED 1
   )
 
-  if(UCX_FOUND)
+  if(VELOX_cudf_UCX_FOUND)
     FetchContent_Declare(
       ucxx
       URL ${VELOX_ucxx_SOURCE_URL}
@@ -145,7 +148,7 @@ block(SCOPE_FOR VARIABLES)
 
   FetchContent_MakeAvailable(cudf)
 
-  if(UCX_FOUND)
+  if(VELOX_cudf_UCX_FOUND)
     FetchContent_MakeAvailable(ucxx)
   endif()
 

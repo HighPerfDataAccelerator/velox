@@ -1207,6 +1207,46 @@ TEST_F(AggregationTest, partialIdentityDoesNotRequireStreamingCapacity) {
       .assertResults("SELECT c0, sum(c1), min(c1) FROM tmp GROUP BY c0");
 }
 
+TEST_F(AggregationTest, partialIdentitySupportsMaskedSimpleAggregates) {
+  auto vectors = {
+      makeRowVector(
+          {"k", "v", "m"},
+          {makeFlatVector<int64_t>({1, 1, 2}),
+           makeFlatVector<int64_t>({10, 20, 30}),
+           makeNullableFlatVector<bool>({true, false, std::nullopt})}),
+      makeRowVector(
+          {"k", "v", "m"},
+          {makeFlatVector<int64_t>({1, 2, 2}),
+           makeFlatVector<int64_t>({40, 50, 60}),
+           makeFlatVector<bool>({true, true, false})}),
+  };
+  createDuckDbTable(vectors);
+
+  auto plan = PlanBuilder()
+                  .values(vectors)
+                  .partialAggregation(
+                      {"k"}, {"sum(v)", "min(v)", "max(v)"}, {"m", "m", "m"})
+                  .finalAggregation()
+                  .planNode();
+  AssertQueryBuilder(duckDbQueryRunner_)
+      .config(cudf_velox::CudfConfig::kCudfPartialIdentityAggregation, "true")
+      .plan(plan)
+      .assertResults(
+          "SELECT k, sum(v) FILTER (WHERE m), min(v) FILTER (WHERE m), "
+          "max(v) FILTER (WHERE m) FROM tmp GROUP BY k");
+
+  auto sharedMaskPlan = PlanBuilder()
+                            .values(vectors)
+                            .partialAggregation({"k", "m"}, {"sum(v)"}, {"m"})
+                            .finalAggregation()
+                            .planNode();
+  AssertQueryBuilder(duckDbQueryRunner_)
+      .config(cudf_velox::CudfConfig::kCudfPartialIdentityAggregation, "true")
+      .plan(sharedMaskPlan)
+      .assertResults(
+          "SELECT k, m, sum(v) FILTER (WHERE m) FROM tmp GROUP BY k, m");
+}
+
 TEST_F(AggregationTest, partialIdentityMaterializesPackedInputBeforeViews) {
   SCOPED_TESTVALUE_SET(
       "facebook::velox::cudf_velox::CudfGroupby::doAddInput::input",
@@ -1309,7 +1349,7 @@ TEST_F(
       cudf_velox::test::CudfGroupbyTestHelper::stateStream(groupby);
 
   rmm::cuda_stream allocationStream{rmm::cuda_stream::flags::non_blocking};
-  ASSERT_NE(allocationStream.get(), stateStream.get());
+  ASSERT_NE(allocationStream.view().get(), stateStream.get());
   const auto inputType = finalNode->sources()[0]->outputType();
   auto intermediateInput = makeRowVector(
       inputType->names(),
@@ -1326,7 +1366,7 @@ TEST_F(
       table->view(),
       allocationStream.view(),
       rmm::to_device_async_resource_ref_checked(&recordingResource));
-  allocationStream.sync();
+  allocationStream.view().sync();
   auto packedView = cudf::unpack(packedColumns);
   auto packedTable = std::make_unique<cudf::packed_table>(
       cudf::packed_table{packedView, std::move(packedColumns)});

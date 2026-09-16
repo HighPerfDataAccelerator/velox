@@ -438,6 +438,33 @@ struct SimpleGroupbyAggregator final : GroupbyAggregator {
     return column;
   }
 
+  bool supportsPartialIdentity() const override {
+    return step == core::AggregationNode::Step::kPartial && constant == nullptr;
+  }
+
+  std::unique_ptr<cudf::column> makePartialIdentityColumn(
+      cudf::table_view const& table,
+      std::unique_ptr<cudf::column> inputOwner,
+      cuda::stream_ref stream,
+      rmm::device_async_resource_ref mr) override {
+    VELOX_CHECK(supportsPartialIdentity());
+    std::unique_ptr<cudf::column> column;
+    if (maskIndex.has_value()) {
+      column = cudf_velox::applyMask(
+          table.column(inputIndex), table.column(*maskIndex), stream, mr);
+    } else if (inputOwner) {
+      column = std::move(inputOwner);
+    } else {
+      column =
+          std::make_unique<cudf::column>(table.column(inputIndex), stream, mr);
+    }
+    const auto cudfType = cudf_velox::veloxToCudfDataType(resultType);
+    if (column->type() != cudfType) {
+      column = cudf::cast(*column, cudfType, stream, mr);
+    }
+    return column;
+  }
+
  private:
   uint32_t outputIndex_{0};
 };
@@ -1625,6 +1652,8 @@ CudfGroupby::CudfGroupby(
       maxPartialAggregationMemoryUsage_(
           driverCtx->queryConfig().maxPartialAggregationMemoryUsage()) {}
 
+CudfGroupby::~CudfGroupby() = default;
+
 bool CudfGroupby::initializeStreamingGroupby(
     const RowTypePtr& inputRowSchema,
     const std::vector<VectorPtr>& constants,
@@ -1937,15 +1966,16 @@ void CudfGroupby::initialize() {
 
   if (partialIdentityAggregationEnabled_) {
     VELOX_USER_CHECK(
-        streamingEnabled_ &&
-            std::all_of(
-                aggregators_.begin(),
-                aggregators_.end(),
-                [](const auto& aggregator) {
-                  return aggregator->supportsPartialIdentity();
-                }),
-        "partial identity aggregation currently supports only non-constant "
-        "SUM, MIN, and MAX companion aggregates");
+        streamingEnabled_,
+        "partial identity aggregation requires non-empty grouping keys and "
+        "companion aggregates whose steps match the plan node");
+    for (size_t i = 0; i < aggregators_.size(); ++i) {
+      VELOX_USER_CHECK(
+          aggregators_[i]->supportsPartialIdentity(),
+          "partial identity aggregation does not support aggregate {} ({})",
+          i,
+          aggregationNode_->aggregates()[i].call->name());
+    }
     LOG(INFO) << "CUDF_GROUPBY_PARTIAL_IDENTITY node=" << diagnosticNodeId_
               << " state=enabled keys=" << groupingKeyOutputChannels_.size()
               << " aggregates=" << aggregators_.size();
@@ -2071,6 +2101,9 @@ void CudfGroupby::computePartialIdentity(CudfVectorPtr tbl) {
   }
   for (const auto& aggregator : aggregators_) {
     ++remainingUses[aggregationInputChannels_.at(aggregator->inputIndex)];
+    if (const auto maskIndex = aggregator->partialIdentityMaskIndex()) {
+      ++remainingUses[aggregationInputChannels_.at(*maskIndex)];
+    }
   }
 
   const auto takeOwner = [&](column_index_t sourceChannel) {
@@ -2107,11 +2140,16 @@ void CudfGroupby::computePartialIdentity(CudfVectorPtr tbl) {
   for (auto& aggregator : aggregators_) {
     auto owner =
         takeOwner(aggregationInputChannels_.at(aggregator->inputIndex));
-    resultColumns.push_back(aggregator->makePartialIdentityColumn(
-        permutedInputView,
-        std::move(owner),
-        inputTableStream,
-        get_output_mr()));
+    std::unique_ptr<cudf::column> maskOwner;
+    if (const auto maskIndex = aggregator->partialIdentityMaskIndex()) {
+      maskOwner = takeOwner(aggregationInputChannels_.at(*maskIndex));
+    }
+    auto identityColumn = aggregator->makePartialIdentityColumn(
+        permutedInputView, std::move(owner), inputTableStream, get_output_mr());
+    // A mask can also be a grouping key or aggregate input. Keep its original
+    // owner alive until applyMask has consumed the corresponding table view.
+    maskOwner.reset();
+    resultColumns.push_back(std::move(identityColumn));
   }
   auto resultTable = std::make_unique<cudf::table>(std::move(resultColumns));
   const auto outputRows = resultTable->num_rows();
