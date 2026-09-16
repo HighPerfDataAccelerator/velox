@@ -26,6 +26,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <utility>
+// cuDF 26.10's AST header uses std::variant without including this header.
+#include <variant>
 
 namespace facebook::velox::cudf_velox::detail {
 
