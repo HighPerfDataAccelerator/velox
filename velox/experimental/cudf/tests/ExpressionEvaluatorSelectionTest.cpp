@@ -190,7 +190,7 @@ TEST_F(
         "",
         stream,
         mr);
-    stream.synchronize();
+    stream.sync();
 
     ASSERT_EQ(output->size(), rows);
     auto ids = output->childAt(0)->as<SimpleVector<int64_t>>();

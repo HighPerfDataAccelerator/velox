@@ -37,6 +37,9 @@
 #include <cudf/io/parquet_schema.hpp>
 #include <cudf/io/types.hpp>
 
+#include <functional>
+#include <utility>
+
 namespace facebook::velox::cudf_velox::connector::hive {
 
 using namespace facebook::velox::connector;
@@ -63,38 +66,51 @@ class CudfSplitReader : public NvtxHelper {
       const std::shared_ptr<io::IoStatistics>& ioStatistics,
       const std::shared_ptr<IoStats>& ioStats,
       bool useExperimentalCudfReader,
-      cudf::ast::expression const* subfieldFilterExpr);
+      const cudf::ast::expression* subfieldFilterAst);
 
   virtual ~CudfSplitReader();
 
+  using PushdownFilterBuilder = std::function<cudf::ast::expression const*(
+      const cudf::io::parquet::FileMetaData&)>;
+
+  /// Sets a builder for a split-specific pushdown filter. The builder is
+  /// invoked after the Parquet footer is read and before reader options are
+  /// configured. The returned expression must remain alive while the split is
+  /// being read.
+  void setPushdownFilterBuilder(PushdownFilterBuilder builder) {
+    pushdownFilterBuilder_ = std::move(builder);
+  }
+
   /// Prepare the split: open cudf reader, set up data source and options.
   /// @param runtimeStats Reference to the DataSource's runtime statistics
-  void prepareSplit(dwio::common::RuntimeStatistics& runtimeStats);
+  void prepareSplit(dwio::common::RuntimeStats& runtimeStats);
 
   /// Rebind state owned by the DataSource after an asynchronously prepared
   /// reader is moved to the driver thread.
   virtual void setDataSourceContext(
       const ConnectorQueryCtx* connectorQueryCtx,
-      dwio::common::RuntimeStatistics& runtimeStats,
+      dwio::common::RuntimeStats& runtimeStats,
       cudf::ast::expression const* subfieldFilterExpr);
 
   /// Read the next raw cudf table chunk. Returns nullopt when done.
   virtual std::optional<std::unique_ptr<cudf::table>> next(uint64_t size);
 
   /// Get the stream.
-  rmm::cuda_stream_view stream() const {
+  cuda::stream_ref stream() const {
     return stream_;
   }
 
  protected:
   // Performs split-specific setup after base reader state is reset.
-  virtual void prepareSplitInternal(
-      dwio::common::RuntimeStatistics& runtimeStats);
+  virtual void prepareSplitInternal(dwio::common::RuntimeStats& runtimeStats);
+
+  // Returns whether the split is skipped.
+  virtual bool isSplitSkipped() const;
 
   // Setup the cuDF reader.
   virtual void setupReader();
 
-  // Return the filter to push down to the cuDF reader.
+  // Return the split-specific filter to push down to the cuDF reader.
   virtual cudf::ast::expression const* pushdownFilter() const;
 
   // Determine the output memory resource for the cuDF reader.
@@ -155,8 +171,11 @@ class CudfSplitReader : public NvtxHelper {
   // Whether to use the experimental cuDF reader.
   bool useExperimentalCudfReader() const;
 
-  // Returns the original subfield filter.
-  cudf::ast::expression const* subfieldFilter() const;
+  // Return the logical subfield filter AST used after reading.
+  const cudf::ast::expression* subfieldFilterAst() const;
+
+  // Return whether the pushdown filter was built for the current split.
+  bool hasSplitSpecificPushdownFilter() const;
 
   // Clear split readers and data sources after a physical split has been
   // fully processed.
@@ -175,7 +194,7 @@ class CudfSplitReader : public NvtxHelper {
   std::shared_ptr<io::IoStatistics> ioStatistics_;
   std::shared_ptr<IoStats> ioStats_;
 
-  rmm::cuda_stream_view stream_;
+  cuda::stream_ref stream_{cudaStream_t{cudaStreamDefault}};
 
   // Parquet metadata(s) for the current split(s).
   std::vector<cudf::io::parquet::FileMetaData> fileMetaData_;
@@ -209,7 +228,10 @@ class CudfSplitReader : public NvtxHelper {
   bool cachePrefetchFirstLoadReady_{false};
 
   dwio::common::ReaderOptions baseReaderOpts_;
-  cudf::ast::expression const* subfieldFilterExpr_;
+  const cudf::ast::expression* subfieldFilterAst_;
+  cudf::ast::expression const* pushdownFilterExpr_;
+  PushdownFilterBuilder pushdownFilterBuilder_;
+  bool hasSplitSpecificPushdownFilter_{false};
 
   struct TotalScanTimeCallbackData {
     uint64_t startTimeUs;

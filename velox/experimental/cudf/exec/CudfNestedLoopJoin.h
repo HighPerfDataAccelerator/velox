@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "velox/experimental/cudf/exec/CudfJoin.h"
 #include "velox/experimental/cudf/exec/CudfOperator.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
 #include "velox/experimental/cudf/expression/PrecomputeInstruction.h"
@@ -29,7 +30,7 @@
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/table/table.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
+#include <cuda/stream>
 
 #include <memory>
 
@@ -49,7 +50,12 @@ class CudfNestedLoopJoinBridge : public exec::JoinBridge {
   // table because the cross-join output is probe_rows × build_rows — batching
   // the build side does not prevent output overflow, so we enforce a single
   // table and fail early if the build side exceeds cudf::size_type limits.
-  using build_data_type = std::shared_ptr<cudf::table>;
+  struct BuildData {
+    std::shared_ptr<cudf::table> table;
+    // cudf::table cannot represent the row count of a zero-column table.
+    cudf::size_type rowCount;
+  };
+  using build_data_type = BuildData;
 
   void setData(std::optional<build_data_type> data);
 
@@ -76,9 +82,9 @@ class CudfNestedLoopJoinBridge : public exec::JoinBridge {
   // stream-ordered free (enqueued on this same stream, since that's where
   // it was allocated) can't race a still-in-flight probe read. See
   // CudfNestedLoopJoinProbe::recordReadCompletion().
-  void setBuildStream(rmm::cuda_stream_view buildStream);
+  void setBuildStream(cuda::stream_ref buildStream);
 
-  std::optional<rmm::cuda_stream_view> getBuildStream();
+  std::optional<cuda::stream_ref> getBuildStream();
 
   void reserveBuildBytes(uint64_t bytes, uint64_t maxBuildBytes);
 
@@ -87,7 +93,7 @@ class CudfNestedLoopJoinBridge : public exec::JoinBridge {
  private:
   std::optional<build_data_type> data_;
   std::shared_ptr<CudaEvent> buildReadyEvent_;
-  std::optional<rmm::cuda_stream_view> buildStream_;
+  std::optional<cuda::stream_ref> buildStream_;
   uint64_t retainedBuildBytes_{0};
 };
 
@@ -220,29 +226,38 @@ class CudfNestedLoopJoinProbe : public CudfOperatorBase {
   void doClose() override;
 
  private:
-  /// Joins a single probe batch against the build table. Uses cross_join for
-  /// unfiltered joins and conditional_inner_join for filtered joins. Updates
-  /// probeMatchedFlags_ for left/full joins and buildMatchedFlags_ for
-  /// right/full joins.
+  /// Joins a single probe batch against the build table. Uses cuDF cross_join
+  /// for regular unfiltered joins and a repeat path for zero-column builds.
+  /// Uses conditional_inner_join for filtered joins. Updates probeMatchedFlags_
+  /// for left/full joins and buildMatchedFlags_ for right/full joins.
   std::unique_ptr<cudf::table> joinWithBuildBatch(
       cudf::table_view probeTableView,
       cudf::table_view buildView,
-      rmm::cuda_stream_view stream);
+      cudf::size_type buildRows,
+      cuda::stream_ref stream);
+
+  /// Produces the cross-join output when the build side has zero columns.
+  /// cudf::cross_join cannot be used because a zero-column build table reports
+  /// num_rows() == 0, so each probe row is repeated buildRows times.
+  std::unique_ptr<cudf::table> crossJoinZeroColumnBuild(
+      cudf::table_view probeView,
+      cudf::size_type buildRows,
+      cuda::stream_ref stream);
 
   /// Emits probe rows that had no match across all build batches, with null
   /// build columns. Used for left/full joins after all build batches exhausted.
   std::unique_ptr<cudf::table> emitProbeMismatchRows(
       cudf::table_view probeTableView,
-      rmm::cuda_stream_view stream);
+      cuda::stream_ref stream);
 
   /// Emits build rows that had no match across all probe inputs, with null
   /// probe columns. Used for right/full joins after all probes finish. Only
   /// called by the last driver after merging flags from all peers.
-  RowVectorPtr emitBuildMismatchRows(rmm::cuda_stream_view stream);
+  RowVectorPtr emitBuildMismatchRows(cuda::stream_ref stream);
 
   // Makes the given probe stream wait on the build-ready event before it
   // reads build-side data. See buildReadyEvent_.
-  void waitForBuildReady(rmm::cuda_stream_view probeStream);
+  void waitForBuildReady(cuda::stream_ref probeStream);
 
   // Records completion of a read of build-side state on probeStream, and
   // makes buildStream_ wait on it. Must be called after every read of
@@ -251,7 +266,20 @@ class CudfNestedLoopJoinProbe : public CudfOperatorBase {
   // before buildData_'s eventual stream-ordered free (enqueued on
   // buildStream_) can run - matching CudfHashJoinProbe's pattern. A no-op
   // if buildStream_ was never fetched (e.g. build side never ran).
-  void recordReadCompletion(rmm::cuda_stream_view probeStream);
+  void recordReadCompletion(cuda::stream_ref probeStream);
+
+  /// Evaluates a join condition that isn't AST-representable (e.g. `probe.col
+  /// LIKE build.pattern`) by materializing the probe x build cross product
+  /// and running filterEvaluator_ over it. Returns (probeIndex, buildIndex)
+  /// pairs where the condition holds, matching cudf::conditional_inner_join's
+  /// output shape. `needBuildIndices=false` skips building the build-index
+  /// column for callers that don't need it (e.g. left semi project).
+  std::pair<std::unique_ptr<cudf::column>, std::unique_ptr<cudf::column>>
+  crossJoinConditionalIndices(
+      cudf::table_view probeTableView,
+      cudf::table_view buildView,
+      cuda::stream_ref stream,
+      bool needBuildIndices = true);
 
   bool isLeftOrFullJoin() const {
     return joinType_ == core::JoinType::kLeft ||
@@ -277,12 +305,15 @@ class CudfNestedLoopJoinProbe : public CudfOperatorBase {
   std::vector<PrecomputeInstruction> leftPrecomputeInstructions_;
   std::vector<PrecomputeInstruction> rightPrecomputeInstructions_;
 
-  // Output column mapping resolved by name from the output type.
-  // Handles arbitrary column ordering (e.g., {"b0", "p0"}).
-  std::vector<cudf::size_type> probeColumnIndicesToGather_;
-  std::vector<cudf::size_type> buildColumnIndicesToGather_;
-  std::vector<size_t> probeColumnOutputIndices_;
-  std::vector<size_t> buildColumnOutputIndices_;
+  CudfJoinOutputLayout outputLayout_;
+
+  // False when the join condition has a non-AST-representable
+  // sub-expression spanning both sides (see crossJoinConditionalIndices).
+  // In that case tree_/scalars_/*PrecomputeInstructions_ above are unused
+  // (left empty) and filterEvaluator_ below evaluates the whole condition
+  // instead.
+  bool useAstFilter_{true};
+  std::shared_ptr<CudfExpression> filterEvaluator_;
 
   // Probe and build types (cached for null column creation in left joins).
   RowTypePtr probeType_;
@@ -324,7 +355,7 @@ class CudfNestedLoopJoinProbe : public CudfOperatorBase {
   // Last CUDA stream used for probing, needed for join_streams in
   // noMoreInput() to ensure GPU-side ordering before the cross-peer
   // buildMatchedFlags_ merge (right/full join only).
-  std::optional<rmm::cuda_stream_view> lastProbeStream_;
+  std::optional<cuda::stream_ref> lastProbeStream_;
 
   // Build-ready event, fetched once from the bridge in isBlocked() -
   // already created and recorded by the build side, so waitForBuildReady()
@@ -337,7 +368,7 @@ class CudfNestedLoopJoinProbe : public CudfOperatorBase {
   // probe batch's completion, so buildData_'s eventual stream-ordered free
   // (enqueued on this same stream) is correctly ordered after all reads -
   // see CudfNestedLoopJoinBridge::setBuildStream().
-  std::optional<rmm::cuda_stream_view> buildStream_;
+  std::optional<cuda::stream_ref> buildStream_;
   // Reused event for recordReadCompletion()'s record-then-wait pattern.
   // Safe to reuse across calls since each call finishes using the current
   // recording (via waitOn()) before the next call re-records it.

@@ -17,6 +17,7 @@
 #include <glog/logging.h>
 #include <malloc.h>
 #include <rmm/cuda_stream_view.hpp>
+#include <ucxx/request_tag_builder.h>
 #include <algorithm>
 #include <cstdlib>
 #include <limits>
@@ -285,6 +286,7 @@ void UcxExchangeServer::process() {
             static_cast<int64_t>(sequenceNumber_),
             [weakQueue](
                 std::shared_ptr<cudf::packed_columns> data,
+                vector_size_t numRows,
                 int64_t sequence,
                 std::vector<int64_t> remainingBytes) {
               auto self = weakQueue.lock();
@@ -328,6 +330,7 @@ void UcxExchangeServer::process() {
                   self->dataPtr_ == nullptr,
                   "Data pointer exists: Illegal state!");
               self->dataPtr_ = std::move(data);
+              self->dataNumRows_ = numRows;
               self->setState(ServerState::DataReady);
               self->wakeCommunicator();
             });
@@ -490,9 +493,11 @@ void UcxExchangeServer::sendData() {
               key,
               dataPtr_,
               stream,
+              dataNumRows_,
               /*atEnd=*/false,
               makeIntraNodeRetrieveWakeup());
       dataPtr_.reset();
+      dataNumRows_ = 0;
       intraNodeAtEndPublished_ = false;
 
       // Go dormant until the source retrieves the entry and the registry wakeup
@@ -515,6 +520,7 @@ void UcxExchangeServer::sendData() {
               key,
               nullptr,
               rmm::cuda_stream_default,
+              /*numRows=*/0,
               /*atEnd=*/true,
               makeIntraNodeRetrieveWakeup());
       intraNodeAtEndPublished_ = true;
@@ -552,6 +558,7 @@ void UcxExchangeServer::sendData() {
       metadataMsg->cudfMetadata =
           std::make_unique<std::vector<uint8_t>>(*dataPtr_->metadata);
       metadataMsg->dataSizeBytes = dataPtr_->gpu_data->size();
+      metadataMsg->numRows = dataNumRows_;
       metadataMsg->remainingBytes = {};
       metadataMsg->atEnd = false;
     } else {
@@ -559,6 +566,7 @@ void UcxExchangeServer::sendData() {
               << partitionKey_.toString();
       metadataMsg->cudfMetadata = nullptr;
       metadataMsg->dataSizeBytes = 0;
+      metadataMsg->numRows = 0;
       metadataMsg->remainingBytes = {};
       metadataMsg->atEnd = true;
     }
@@ -579,43 +587,48 @@ void UcxExchangeServer::sendData() {
     auto metaCtx = std::make_shared<MetaSendContext>();
     metaCtx->metadata = serializedMetadata;
 
-    metaRequest_ = endpointRef_->endpoint_->tagSend(
-        metaCtx->metadata.get(),
-        serMetaSize,
-        ucxx::Tag{metadataTag},
-        false,
-        [tid = partitionKey_.toString(), metadataTag, weakMeta](
-            ucs_status_t status, std::shared_ptr<void> arg) {
-          // Release the metadata buffer from the context. The context
-          // shell stays alive with the Request; only the payload is freed.
-          auto ctx = std::static_pointer_cast<MetaSendContext>(arg);
-          auto metaHolder = std::move(ctx->metadata); // release CPU buffer
+    metaRequest_ =
+        endpointRef_->endpoint_
+            ->tagSendBuilder(
+                metaCtx->metadata.get(), serMetaSize, ucxx::Tag{metadataTag})
+            .pythonFuture(false)
+            .callbackFunction([tid = partitionKey_.toString(),
+                               metadataTag,
+                               weakMeta](
+                                  ucs_status_t status,
+                                  std::shared_ptr<void> arg) {
+              // Release the metadata buffer from the context. The context
+              // shell stays alive with the Request; only the payload is freed.
+              auto ctx = std::static_pointer_cast<MetaSendContext>(arg);
+              auto metaHolder = std::move(ctx->metadata); // release CPU buffer
 
-          auto self = weakMeta.lock();
-          if (!self) {
-            return; // Object was destroyed, safe to ignore
-          }
-          // Check if close() was called
-          if (self->closed_.load(std::memory_order_acquire)) {
-            VLOG(3) << "@" << self->partitionKey_.taskId
+              auto self = weakMeta.lock();
+              if (!self) {
+                return; // Object was destroyed, safe to ignore
+              }
+              // Check if close() was called
+              if (self->closed_.load(std::memory_order_acquire)) {
+                VLOG(3)
+                    << "@" << self->partitionKey_.taskId
                     << " metadata send callback called after close, ignoring";
-            return;
-          }
-          if (status == UCS_OK) {
-            VLOG(3) << "@" << self->partitionKey_.taskId
-                    << " metadata successfully sent to " << tid
-                    << " with tag: " << std::hex << metadataTag;
-          } else {
-            VLOG(0) << "[UCX-SERVER-METADATA-SEND-ERROR] task="
-                    << self->partitionKey_.taskId << " key=" << tid
-                    << " seq=" << self->sequenceNumber_ << " tag=" << std::hex
-                    << metadataTag << std::dec
-                    << " status=" << ucs_status_string(status);
-            self->setState(ServerState::Done);
-            self->wakeCommunicator();
-          }
-        },
-        metaCtx);
+                return;
+              }
+              if (status == UCS_OK) {
+                VLOG(3) << "@" << self->partitionKey_.taskId
+                        << " metadata successfully sent to " << tid
+                        << " with tag: " << std::hex << metadataTag;
+              } else {
+                VLOG(0) << "[UCX-SERVER-METADATA-SEND-ERROR] task="
+                        << self->partitionKey_.taskId << " key=" << tid
+                        << " seq=" << self->sequenceNumber_
+                        << " tag=" << std::hex << metadataTag << std::dec
+                        << " status=" << ucs_status_string(status);
+                self->setState(ServerState::Done);
+                self->wakeCommunicator();
+              }
+            })
+            .callbackData(metaCtx)
+            .build();
 
     // send the data chunk (if any)
     if (dataPtr_) {
@@ -658,40 +671,46 @@ void UcxExchangeServer::sendData() {
               << (useHostStaging ? "host-staged" : "direct-device")
               << " send for " << bytes_ << " bytes";
 
-      dataRequest_ = endpointRef_->endpoint_->tagSend(
-          sendBuffer,
-          static_cast<size_t>(bytes_),
-          ucxx::Tag{dataTag},
-          false,
-          [weakData](ucs_status_t status, std::shared_ptr<void> arg) {
-            // Release both payload buffers from the context. completedRequests_
-            // deliberately retains the UCXX Request (and therefore
-            // callbackData) for wireup replay safety, so leaving hostData in
-            // this context leaks one complete host-staging copy per batch until
-            // the exchange server is destroyed.  Large MPP exchanges otherwise
-            // consume hundreds of GiB even though every send has completed. The
-            // callback means UCX has finished with both payloads; only the
-            // empty context shell must remain alive with the Request.
-            auto ctx = std::static_pointer_cast<DataSendContext>(arg);
-            auto dataHolder = std::move(ctx->data);
-            auto hostDataHolder = std::move(ctx->hostData);
-            const auto releasedHostBytes = ctx->reservedHostBytes;
-            ctx->releaseHostReservation();
-            hostDataHolder.reset();
-            // The default allocator retains these very large vector arenas in
-            // the executor even after free().  A long exchange therefore has
-            // bounded live staging but unbounded RSS. Return completed large
-            // transfers to the OS instead of waiting for process teardown.
-            accountFreedHostBytesAndTrim(releasedHostBytes);
+      dataRequest_ =
+          endpointRef_->endpoint_
+              ->tagSendBuilder(
+                  sendBuffer, static_cast<size_t>(bytes_), ucxx::Tag{dataTag})
+              .pythonFuture(false)
+              .callbackFunction(
+                  [weakData](ucs_status_t status, std::shared_ptr<void> arg) {
+                    // Release both payload buffers from the context.
+                    // completedRequests_ deliberately retains the UCXX Request
+                    // (and therefore callbackData) for wireup replay safety, so
+                    // leaving hostData in this context leaks one complete
+                    // host-staging copy per batch until the exchange server is
+                    // destroyed.  Large MPP exchanges otherwise consume
+                    // hundreds of GiB even though every send has completed. The
+                    // callback means UCX has finished with both payloads; only
+                    // the empty context shell must remain alive with the
+                    // Request.
+                    auto ctx = std::static_pointer_cast<DataSendContext>(arg);
+                    auto dataHolder = std::move(ctx->data);
+                    auto hostDataHolder = std::move(ctx->hostData);
+                    const auto releasedHostBytes = ctx->reservedHostBytes;
+                    ctx->releaseHostReservation();
+                    hostDataHolder.reset();
+                    // The default allocator retains these very large vector
+                    // arenas in the executor even after free().  A long
+                    // exchange therefore has bounded live staging but unbounded
+                    // RSS. Return completed large transfers to the OS instead
+                    // of waiting for process teardown.
+                    accountFreedHostBytesAndTrim(releasedHostBytes);
 
-            if (auto self = weakData.lock()) {
-              self->sendComplete(status, arg);
-            }
-            // The holders are destroyed here, releasing the GPU buffer if
-            // sendComplete() already reset the server's dataPtr_, and always
-            // releasing the completed transfer's host staging allocation.
-          },
-          dataCtx);
+                    if (auto self = weakData.lock()) {
+                      self->sendComplete(status, arg);
+                    }
+                    // The holders are destroyed here, releasing the GPU buffer
+                    // if sendComplete() already reset the server's dataPtr_,
+                    // and always releasing the completed transfer's host
+                    // staging allocation.
+                  })
+              .callbackData(dataCtx)
+              .build();
     } else {
       // Data pointer is null, so no more data will be coming.
       VLOG(3) << "@" << partitionKey_.taskId
@@ -723,7 +742,7 @@ void UcxExchangeServer::sendComplete(
     auto duration = end - sendStart_;
     auto micros =
         std::chrono::duration_cast<std::chrono::microseconds>(duration).count();
-    auto throughput = bytes_ / micros;
+    auto throughput = (micros > 0) ? (bytes_ / micros) : 0;
 
     VLOG(3) << "@" << partitionKey_.taskId << " duration: "
             << std::chrono::duration_cast<std::chrono::milliseconds>(duration)
@@ -734,6 +753,7 @@ void UcxExchangeServer::sendComplete(
 
     this->sequenceNumber_++;
     dataPtr_.reset(); // release memory.
+    dataNumRows_ = 0;
     VLOG(3) << "@" << partitionKey_.taskId
             << " Releasing dataPtr_ in sendComplete.";
     setState(ServerState::ReadyToTransfer);

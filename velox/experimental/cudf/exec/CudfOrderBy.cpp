@@ -21,6 +21,8 @@
 #include "velox/experimental/cudf/exec/NvtxHelper.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 
+#include "velox/core/PlanNode.h"
+
 #include <cudf/concatenate.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/io/parquet.hpp>
@@ -147,7 +149,7 @@ std::unique_ptr<cudf::table> copyTableSlice(
     cudf::table_view input,
     cudf::size_type begin,
     cudf::size_type end,
-    rmm::cuda_stream_view stream,
+    cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) {
   VELOX_CHECK_LE(begin, end);
   auto slices = cudf::slice(input, {begin, end}, stream);
@@ -157,7 +159,7 @@ std::unique_ptr<cudf::table> copyTableSlice(
 
 cudf::size_type firstSearchPosition(
     cudf::column_view positions,
-    rmm::cuda_stream_view stream) {
+    cuda::stream_ref stream) {
   VELOX_CHECK_EQ(positions.size(), 1);
   cudf::size_type result{0};
   CUDF_CUDA_TRY(cudaMemcpyAsync(
@@ -165,8 +167,8 @@ cudf::size_type firstSearchPosition(
       positions.data<cudf::size_type>(),
       sizeof(result),
       cudaMemcpyDeviceToHost,
-      stream.value()));
-  stream.synchronize();
+      stream.get()));
+  stream.sync();
   return result;
 }
 
@@ -254,7 +256,6 @@ CudfOrderBy::CudfOrderBy(
           NvtxMethodFlag::kAll,
           std::nullopt,
           orderByNode),
-      orderByNode_(orderByNode),
       stateStream_(cudfGlobalStreamPool().get_stream()),
       sortedRunBytes_(
           testingSortedRunBytes.load() > 0
@@ -278,17 +279,64 @@ CudfOrderBy::CudfOrderBy(
       isSupported(orderByNode),
       "CudfOrderBy received an unsupported external-spill schema or sorting "
       "key type");
-  sortKeys_.reserve(orderByNode->sortingKeys().size());
-  columnOrder_.reserve(orderByNode->sortingKeys().size());
-  nullOrder_.reserve(orderByNode->sortingKeys().size());
-  for (int i = 0; i < orderByNode->sortingKeys().size(); ++i) {
-    const auto channel =
-        exec::exprToChannel(orderByNode->sortingKeys()[i].get(), outputType_);
+  initializeSortKeys(orderByNode->sortingKeys(), orderByNode->sortingOrders());
+}
+
+CudfOrderBy::CudfOrderBy(
+    int32_t operatorId,
+    exec::DriverCtx* driverCtx,
+    const std::shared_ptr<const core::MergeExchangeNode>& mergeExchangeNode)
+    : CudfOperatorBase(
+          operatorId,
+          driverCtx,
+          mergeExchangeNode->outputType(),
+          mergeExchangeNode->id(),
+          "CudfOrderBy",
+          nvtx3::rgb{64, 224, 208}, // Turquoise
+          NvtxMethodFlag::kAll,
+          std::nullopt,
+          mergeExchangeNode),
+      stateStream_(cudfGlobalStreamPool().get_stream()),
+      sortedRunBytes_(
+          testingSortedRunBytes.load() > 0
+              ? testingSortedRunBytes.load()
+              : CudfConfig::getInstance().orderBySortedRunBytes),
+      mergeFanIn_(
+          testingMergeFanIn.load() > 0
+              ? testingMergeFanIn.load()
+              : static_cast<size_t>(
+                    CudfConfig::getInstance().orderByMergeFanIn)),
+      outputChunkBytes_(
+          testingOutputChunkBytes.load() > 0
+              ? testingOutputChunkBytes.load()
+              : CudfConfig::getInstance().orderByOutputChunkBytes),
+      maxOutputRows_(
+          testingMaxOutputRows.load() > 0
+              ? testingMaxOutputRows.load()
+              : static_cast<cudf::size_type>(
+                    CudfConfig::getInstance().orderByMaxOutputRows)) {
+  VELOX_CHECK(
+      isSupported(
+          mergeExchangeNode->outputType(), mergeExchangeNode->sortingKeys()),
+      "CudfOrderBy received an unsupported external-spill schema or sorting "
+      "key type");
+  initializeSortKeys(
+      mergeExchangeNode->sortingKeys(), mergeExchangeNode->sortingOrders());
+}
+
+void CudfOrderBy::initializeSortKeys(
+    const std::vector<core::FieldAccessTypedExprPtr>& sortingKeys,
+    const std::vector<core::SortOrder>& sortingOrders) {
+  sortKeys_.reserve(sortingKeys.size());
+  columnOrder_.reserve(sortingKeys.size());
+  nullOrder_.reserve(sortingKeys.size());
+  for (size_t i = 0; i < sortingKeys.size(); ++i) {
+    const auto channel = exec::exprToChannel(sortingKeys[i].get(), outputType_);
     VELOX_CHECK(
         channel != kConstantChannel,
         "OrderBy doesn't allow constant sorting keys");
     sortKeys_.push_back(channel);
-    auto const& sortingOrder = orderByNode->sortingOrders()[i];
+    const auto& sortingOrder = sortingOrders[i];
     columnOrder_.push_back(
         sortingOrder.isAscending() ? cudf::order::ASCENDING
                                    : cudf::order::DESCENDING);
@@ -309,8 +357,8 @@ void CudfOrderBy::doAddInput(RowVectorPtr input) {
     VELOX_CHECK_NOT_NULL(cudfInput, "Expected CudfVector input");
 
     const auto inputStream = cudfInput->stream();
-    if (inputStream.value() != stateStream_.value()) {
-      std::vector<rmm::cuda_stream_view> inputStreams{inputStream};
+    if (inputStream.get() != stateStream_.get()) {
+      std::vector<cuda::stream_ref> inputStreams{inputStream};
       cudf::detail::join_streams(inputStreams, stateStream_);
     }
     // A packed-table backing buffer can retain a different deallocation stream
@@ -420,7 +468,7 @@ void CudfOrderBy::spillSortedRun() {
           "operator=CudfOrderBy node={} state=sortRun.concatenate.begin "
           "bufferedBytes={} bufferedInputs={} existingRuns={} "
           "sortedRunBytes={} mergeFanIn={}",
-          orderByNode_->id(),
+          planNodeId(),
           bufferedBytes_,
           inputs_.size(),
           sortedRuns_.size(),
@@ -432,12 +480,12 @@ void CudfOrderBy::spillSortedRun() {
   logDeviceMemorySnapshot(
       fmt::format(
           "operator=CudfOrderBy node={} state=sortRun.concatenate.end rows={}",
-          orderByNode_->id(),
+          planNodeId(),
           input->num_rows()));
   logDeviceMemorySnapshot(
       fmt::format(
           "operator=CudfOrderBy node={} state=sortRun.sort.begin rows={}",
-          orderByNode_->id(),
+          planNodeId(),
           input->num_rows()));
   auto sorted = cudf::sort_by_key(
       input->view(),
@@ -449,7 +497,7 @@ void CudfOrderBy::spillSortedRun() {
   logDeviceMemorySnapshot(
       fmt::format(
           "operator=CudfOrderBy node={} state=sortRun.sort.end rows={}",
-          orderByNode_->id(),
+          planNodeId(),
           sorted->num_rows()));
 
   auto path = fmt::format(
@@ -462,7 +510,7 @@ void CudfOrderBy::spillSortedRun() {
       fmt::format(
           "operator=CudfOrderBy node={} state=sortRun.write.begin rows={} "
           "existingRuns={} path={}",
-          orderByNode_->id(),
+          planNodeId(),
           sorted->num_rows(),
           sortedRuns_.size(),
           path));
@@ -475,7 +523,7 @@ void CudfOrderBy::spillSortedRun() {
       fmt::format(
           "operator=CudfOrderBy node={} state=sortRun.write.end rows={} runs={} "
           "path={}",
-          orderByNode_->id(),
+          planNodeId(),
           sorted->num_rows(),
           sortedRuns_.size(),
           sortedRuns_.back().path));
@@ -484,7 +532,7 @@ void CudfOrderBy::spillSortedRun() {
 
 uint64_t CudfOrderBy::measureTableBytes(
     std::unique_ptr<cudf::table>& table,
-    rmm::cuda_stream_view stream) {
+    cuda::stream_ref stream) {
   VELOX_CHECK_NOT_NULL(table);
   auto vector = std::make_shared<CudfVector>(
       pool(), outputType_, table->num_rows(), std::move(table), stream);
@@ -495,9 +543,9 @@ uint64_t CudfOrderBy::measureTableBytes(
 
 bool CudfOrderBy::loadPausedChunk(
     SortedRun& run,
-    rmm::cuda_stream_view stream,
+    cuda::stream_ref stream,
     MergeStats& stats) {
-  VELOX_CHECK(stream.value() == stateStream_.value());
+  VELOX_CHECK(stream.get() == stateStream_.get());
   VELOX_CHECK_NOT_NULL(run.reader);
 
   if (run.chunk && run.chunkOffset < run.chunk->num_rows()) {
@@ -525,11 +573,11 @@ bool CudfOrderBy::loadPausedChunk(
 
 std::unique_ptr<cudf::table> CudfOrderBy::mergeNextPausedBatch(
     std::vector<SortedRun*>& runs,
-    rmm::cuda_stream_view stream,
+    cuda::stream_ref stream,
     rmm::device_async_resource_ref mr,
     bool& finished,
     MergeStats& stats) {
-  VELOX_CHECK(stream.value() == stateStream_.value());
+  VELOX_CHECK(stream.get() == stateStream_.get());
   if (finished) {
     return nullptr;
   }
@@ -707,7 +755,7 @@ void CudfOrderBy::compactSortedRunsForMerge() {
     }
 
     // Complete I/O and stream-ordered frees before deleting the previous level.
-    stateStream_.synchronize();
+    stateStream_.sync();
     for (const auto& path : obsoletePaths) {
       std::error_code error;
       std::filesystem::remove(path, error);
@@ -738,7 +786,7 @@ void CudfOrderBy::compactSortedRunsForMerge() {
             "operator=CudfOrderBy node={} state=compaction.level.end "
             "inputRuns={} outputRuns={} sourceChunks={} outputBatches={} "
             "maxResidentBytes={} maxOutputBytes={} maxActiveRuns={}",
-            orderByNode_->id(),
+            planNodeId(),
             inputRunCount,
             sortedRuns_.size(),
             levelStats.sourceChunks,
@@ -748,13 +796,13 @@ void CudfOrderBy::compactSortedRunsForMerge() {
             levelStats.maxActiveRuns));
   }
 
-  stateStream_.synchronize();
+  stateStream_.sync();
   logDeviceMemorySnapshot(
       fmt::format(
           "operator=CudfOrderBy node={} state=compaction.end runs={} "
           "sourceChunks={} outputBatches={} maxResidentBytes={} "
           "maxOutputBytes={} maxActiveRuns={}",
-          orderByNode_->id(),
+          planNodeId(),
           sortedRuns_.size(),
           compactionStats.sourceChunks,
           compactionStats.outputBatches,
@@ -787,7 +835,7 @@ void CudfOrderBy::initializeSortedRunReaders() {
       fmt::format(
           "operator=CudfOrderBy node={} state=output.merge.begin runs={} "
           "chunkReadLimit={} passReadLimit={}",
-          orderByNode_->id(),
+          planNodeId(),
           sortedRuns_.size(),
           mergeChunkBytes.load(),
           kMergePassBytes));
@@ -819,7 +867,7 @@ std::unique_ptr<cudf::table> CudfOrderBy::mergeNextSortedBatch() {
             "sourceChunks={} sourceRows={} sourceBytes={} outputBatches={} "
             "outputRows={} outputBytes={} maxResidentRows={} "
             "maxResidentBytes={} maxOutputBytes={} maxActiveRuns={}",
-            orderByNode_->id(),
+            planNodeId(),
             sortedRuns_.size(),
             outputMergeStats_.sourceChunks,
             outputMergeStats_.sourceRows,
@@ -893,7 +941,7 @@ CudfVectorPtr CudfOrderBy::takePendingOutput() {
     const auto actualBytes = output->estimateFlatSize();
     if (actualBytes <= byteLimit || targetRows == 1) {
       if (actualBytes > byteLimit) {
-        LOG(WARNING) << "CudfOrderBy node=" << orderByNode_->id()
+        LOG(WARNING) << "CudfOrderBy node=" << planNodeId()
                      << " emitted one oversized row bytes=" << actualBytes
                      << " byteLimit=" << byteLimit;
       }
@@ -917,12 +965,12 @@ CudfVectorPtr CudfOrderBy::takePendingOutput() {
 void CudfOrderBy::cleanupSpillFiles() {
   // Finish reader/writer work before destroying owners, then wait for their
   // stream-ordered frees before removing spill files.
-  stateStream_.synchronize();
+  stateStream_.sync();
   sortedRuns_.clear();
   pendingOutput_.reset();
   pendingOutputOffset_ = 0;
   pendingOutputBytes_ = 0;
-  stateStream_.synchronize();
+  stateStream_.sync();
 
   if (!spillDirectory_.empty()) {
     std::error_code error;
@@ -941,7 +989,7 @@ void CudfOrderBy::cleanupSpillFiles() {
 void CudfOrderBy::cleanupSpillStateAfterFailure(
     std::string_view context) noexcept {
   try {
-    stateStream_.synchronize();
+    stateStream_.sync();
   } catch (const std::exception& error) {
     LOG(WARNING) << "CudfOrderBy " << context
                  << " pre-destruction cleanup failed: " << error.what();
@@ -954,7 +1002,7 @@ void CudfOrderBy::cleanupSpillStateAfterFailure(
   pendingOutputBytes_ = 0;
 
   try {
-    stateStream_.synchronize();
+    stateStream_.sync();
   } catch (const std::exception& error) {
     LOG(WARNING) << "CudfOrderBy " << context
                  << " post-destruction cleanup failed: " << error.what();

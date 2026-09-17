@@ -129,6 +129,7 @@ class CudfOperatorBase : public exec::Operator, public NvtxHelper {
         nvtxMethods_(nvtxMethods) {}
 
   void addInput(RowVectorPtr input) final {
+    ensureCudaContextForThread();
     VELOX_NVTX_OPERATOR_FUNC_RANGE_IF(
         nvtxMethods_ & NvtxMethodFlag::kAddInput, className_);
     CudaAllocationTraceScope allocationTrace(
@@ -155,6 +156,7 @@ class CudfOperatorBase : public exec::Operator, public NvtxHelper {
   }
 
   RowVectorPtr getOutput() final {
+    ensureCudaContextForThread();
     VELOX_NVTX_OPERATOR_FUNC_RANGE_IF(
         nvtxMethods_ & NvtxMethodFlag::kGetOutput, className_);
     CudaAllocationTraceScope allocationTrace(
@@ -182,6 +184,7 @@ class CudfOperatorBase : public exec::Operator, public NvtxHelper {
   }
 
   void noMoreInput() final {
+    ensureCudaContextForThread();
     VELOX_NVTX_OPERATOR_FUNC_RANGE_IF(
         nvtxMethods_ & NvtxMethodFlag::kNoMoreInput, className_);
     const auto sample = shouldSampleDeviceMemory(true);
@@ -201,6 +204,9 @@ class CudfOperatorBase : public exec::Operator, public NvtxHelper {
   }
 
   void close() final {
+    // close() may run on a different thread than construction so bind the
+    // context here too.
+    ensureCudaContextForThread();
     VELOX_NVTX_OPERATOR_FUNC_RANGE_IF(
         nvtxMethods_ & NvtxMethodFlag::kClose, className_);
     const auto sample = shouldSampleDeviceMemory(true);
@@ -270,6 +276,69 @@ class CudfOperatorBase : public exec::Operator, public NvtxHelper {
   const int32_t operatorId_;
   const NvtxMethodFlag nvtxMethods_;
   uint64_t deviceMemoryCallCount_{0};
+};
+
+/// Base class for cuDF source operators (first operator in a Driver pipeline).
+///
+/// This mirrors CudfOperatorBase but inherits from exec::SourceOperator instead
+/// of exec::Operator. Source operators never accept input (addInput/noMoreInput
+/// are disabled by SourceOperator), so this class only wraps getOutput and
+/// close with NVTX profiling and checkCudaErrorInDebug.
+///
+/// Derived classes override:
+///   - doGetOutput()   -- produces output rows; called by getOutput()
+///   - doClose()       -- releases resources; called by close()
+///                        (defaults to SourceOperator::close())
+class CudfSourceOperatorBase : public exec::SourceOperator, public NvtxHelper {
+ public:
+  CudfSourceOperatorBase(
+      int32_t operatorId,
+      exec::DriverCtx* driverCtx,
+      RowTypePtr outputType,
+      const core::PlanNodeId& planNodeId,
+      const std::string& operatorName,
+      std::optional<nvtx3::color> color = std::nullopt,
+      NvtxMethodFlag nvtxMethods = NvtxMethodFlag::kGetOutput |
+          NvtxMethodFlag::kClose)
+      : SourceOperator(
+            driverCtx,
+            outputType,
+            operatorId,
+            planNodeId,
+            operatorName),
+        NvtxHelper(color, operatorId, fmt::format("[{}]", planNodeId)),
+        className_(operatorName),
+        nvtxMethods_(nvtxMethods) {}
+
+  RowVectorPtr getOutput() final {
+    ensureCudaContextForThread();
+    VELOX_NVTX_OPERATOR_FUNC_RANGE_IF(
+        nvtxMethods_ & NvtxMethodFlag::kGetOutput, className_);
+    auto result = doGetOutput();
+    checkCudaErrorInDebug();
+    return result;
+  }
+
+  void close() final {
+    // close() may run on a different thread than construction so bind the
+    // context here too.
+    ensureCudaContextForThread();
+    VELOX_NVTX_OPERATOR_FUNC_RANGE_IF(
+        nvtxMethods_ & NvtxMethodFlag::kClose, className_);
+    doClose();
+    checkCudaErrorInDebug();
+  }
+
+ protected:
+  virtual RowVectorPtr doGetOutput() = 0;
+
+  virtual void doClose() {
+    SourceOperator::close();
+  }
+
+ private:
+  const std::string className_;
+  const NvtxMethodFlag nvtxMethods_;
 };
 
 } // namespace facebook::velox::cudf_velox

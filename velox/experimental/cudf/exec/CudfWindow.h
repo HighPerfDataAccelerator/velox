@@ -29,7 +29,7 @@
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
+#include <cuda/stream>
 
 #include <memory>
 #include <optional>
@@ -140,24 +140,24 @@ class CudfWindow : public CudfOperatorBase {
 
   std::unique_ptr<cudf::table> computeFullPartitionCountOutput(
       std::unique_ptr<cudf::table> input,
-      rmm::cuda_stream_view stream,
+      cuda::stream_ref stream,
       rmm::device_async_resource_ref mr) const;
 
   std::unique_ptr<cudf::table> computeRangeRunningSumOutput(
       std::unique_ptr<cudf::table> input,
-      rmm::cuda_stream_view stream,
+      cuda::stream_ref stream,
       rmm::device_async_resource_ref mr);
 
   std::unique_ptr<cudf::column> computeRunningPartitionSumColumn(
       const cudf::table_view& sortedInput,
       const core::WindowNode::Function& function,
       const TypePtr& expectedType,
-      rmm::cuda_stream_view stream,
+      cuda::stream_ref stream,
       rmm::device_async_resource_ref mr) const;
 
   std::unique_ptr<cudf::column> makeRangePeerOrdinalColumn(
       const cudf::table_view& sortedInput,
-      rmm::cuda_stream_view stream,
+      cuda::stream_ref stream,
       rmm::device_async_resource_ref mr) const;
 
   std::vector<cudf::size_type> streamingGroupIndices() const;
@@ -168,7 +168,7 @@ class CudfWindow : public CudfOperatorBase {
       const std::vector<cudf::size_type>& indices,
       const std::vector<cudf::order>& orders,
       const std::vector<cudf::null_order>& nullOrders,
-      rmm::cuda_stream_view stream,
+      cuda::stream_ref stream,
       rmm::device_async_resource_ref mr) const;
   void advanceBoundedStreaming();
   void processDeferredStreamingInput();
@@ -187,25 +187,25 @@ class CudfWindow : public CudfOperatorBase {
   std::unique_ptr<cudf::column> computeStreamingRowNumberColumn(
       const cudf::table_view& sortedInput,
       const TypePtr& expectedType,
-      rmm::cuda_stream_view stream,
+      cuda::stream_ref stream,
       rmm::device_async_resource_ref mr) const;
 
   std::unique_ptr<cudf::column> computeStreamingRankColumn(
       const cudf::table_view& sortedInput,
       const TypePtr& expectedType,
-      rmm::cuda_stream_view stream,
+      cuda::stream_ref stream,
       rmm::device_async_resource_ref mr) const;
 
   std::unique_ptr<cudf::column> fixRankLikeColumn(
       std::unique_ptr<cudf::column> localResult,
       std::string_view functionName,
       const cudf::table_view& sortedInput,
-      rmm::cuda_stream_view stream,
+      cuda::stream_ref stream,
       rmm::device_async_resource_ref mr) const;
 
   void updateRankLikeState(
       const cudf::table_view& sortedInput,
-      rmm::cuda_stream_view stream,
+      cuda::stream_ref stream,
       rmm::device_async_resource_ref mr);
 
   cudf::size_type continuingPrefixSize(
@@ -214,7 +214,7 @@ class CudfWindow : public CudfOperatorBase {
       const std::unique_ptr<cudf::table>& previousKey,
       const std::vector<cudf::order>& orders,
       const std::vector<cudf::null_order>& nullOrders,
-      rmm::cuda_stream_view stream,
+      cuda::stream_ref stream,
       rmm::device_async_resource_ref mr) const;
 
   // Compute row_number/rank/dense_rank via cudf::groupby::scan or cudf::scan.
@@ -223,7 +223,7 @@ class CudfWindow : public CudfOperatorBase {
       const std::vector<std::pair<size_t, std::string>>& pendingRanks,
       cudf::groupby::groupby* rankGrouper,
       std::vector<std::unique_ptr<cudf::column>>& windowResultCols,
-      rmm::cuda_stream_view stream,
+      cuda::stream_ref stream,
       rmm::device_async_resource_ref mr) const;
 
   std::unique_ptr<cudf::column> computeLeadLagColumn(
@@ -231,7 +231,7 @@ class CudfWindow : public CudfOperatorBase {
       cudf::column_view inputCol,
       const core::WindowNode::Function& func,
       const std::string& baseName,
-      rmm::cuda_stream_view stream,
+      cuda::stream_ref stream,
       rmm::device_async_resource_ref mr) const;
 
   // Compute a RESPECT NULLS first/first_value whose frame starts at the first
@@ -239,7 +239,7 @@ class CudfWindow : public CudfOperatorBase {
   std::unique_ptr<cudf::column> computePartitionFirstColumn(
       const cudf::table_view& sortedInput,
       const core::WindowNode::Function& func,
-      rmm::cuda_stream_view stream,
+      cuda::stream_ref stream,
       rmm::device_async_resource_ref mr) const;
 
   // Compute first_value or last_value via cudf rolling window APIs.
@@ -249,7 +249,7 @@ class CudfWindow : public CudfOperatorBase {
       const core::WindowNode::Function& func,
       const std::string& baseName,
       bool isFullPartition,
-      rmm::cuda_stream_view stream,
+      cuda::stream_ref stream,
       rmm::device_async_resource_ref mr) const;
 
   // Compute aggregate window functions (sum, min, max, count, avg)
@@ -260,7 +260,7 @@ class CudfWindow : public CudfOperatorBase {
       const core::WindowNode::Function& func,
       const std::string& baseName,
       bool isCountStar,
-      rmm::cuda_stream_view stream,
+      cuda::stream_ref stream,
       rmm::device_async_resource_ref mr) const;
 
   // Dispatch ROWS window frames to grouped_rolling_window. RANGE frames are
@@ -271,7 +271,7 @@ class CudfWindow : public CudfOperatorBase {
       const core::WindowNode::Function& func,
       std::unique_ptr<cudf::rolling_aggregation> agg,
       bool isFullPartition,
-      rmm::cuda_stream_view stream,
+      cuda::stream_ref stream,
       rmm::device_async_resource_ref mr) const;
 
   std::shared_ptr<const core::WindowNode> windowNode_;
@@ -280,7 +280,7 @@ class CudfWindow : public CudfOperatorBase {
   const bool fullPartitionCountStreaming_;
   const bool rangeSumStreaming_;
   const bool boundedStreaming_;
-  const rmm::cuda_stream_view stateStream_;
+  const cuda::stream_ref stateStream_;
 
   std::vector<cudf::size_type> partitionKeyIndices_;
   std::vector<cudf::size_type> sortKeyIndices_;
@@ -306,7 +306,7 @@ class CudfWindow : public CudfOperatorBase {
   // Sorted and concatenated input data, prepared in doNoMoreInput().
   std::unique_ptr<cudf::table> sortedData_;
   cudf::size_type logicalRowCount_{0};
-  rmm::cuda_stream_view stream_{};
+  cuda::stream_ref stream_{cudaStream_t{cudaStreamDefault}};
   bool streamAcquired_{false};
 
   std::unique_ptr<cudf::table> deferredInput_;

@@ -34,9 +34,10 @@
 #include <cudf/io/text/byte_range_info.hpp>
 #include <cudf/io/types.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
 #include <rmm/resource_ref.hpp>
+
+#include <cuda/stream>
 
 #ifdef VELOX_ENABLE_S3
 #include <kvikio/remote_handle.hpp>
@@ -117,9 +118,8 @@ BoundedCachePageRegistration makeBoundedCachePageRegistration(
     std::optional<CachePageHostRegistrationHooks> hooks = std::nullopt);
 
 struct BufferedInputDeviceCopyHooks {
-  std::function<void(uint8_t*, const void*, size_t, rmm::cuda_stream_view)>
-      copy;
-  std::function<void(std::shared_ptr<void>, rmm::cuda_stream_view)>
+  std::function<void(uint8_t*, const void*, size_t, cuda::stream_ref)> copy;
+  std::function<void(std::shared_ptr<void>, cuda::stream_ref)>
       retainUntilComplete;
 };
 
@@ -164,14 +164,14 @@ class BufferedInputDataSource : public cudf::io::datasource {
       size_t offset,
       size_t size,
       uint8_t* dst,
-      rmm::cuda_stream_view stream) override;
+      cuda::stream_ref stream) override;
 
   // Use the enqueue API from dwio::common::BufferedInput.
   // Pass a device buffer to copy to after load.
   void enqueueForDevice(uint64_t offset, uint64_t size, uint8_t* dst);
 
   // loads and copies to device.
-  void load(rmm::cuda_stream_view stream);
+  void load(cuda::stream_ref stream);
 
   /// Populates AsyncDataCache for projected ranges without allocating device
   /// memory. Returns false when this data source is not cache-backed.
@@ -208,8 +208,7 @@ class BufferedInputDataSource : public cudf::io::datasource {
   std::once_flag tailCacheOnce_;
   size_t tailCacheOffset_{0};
   std::vector<uint8_t> tailCache_;
-  std::vector<std::function<void(rmm::cuda_stream_view stream)>>
-      pendingDeviceLoads_;
+  std::vector<std::function<void(cuda::stream_ref stream)>> pendingDeviceLoads_;
 };
 
 /// KvikIO remote S3 source with credentials resolved by Velox's AWS provider
@@ -249,18 +248,16 @@ class KvikioS3DataSource final : public cudf::io::datasource {
       size_t offset,
       size_t size,
       uint8_t* dst,
-      rmm::cuda_stream_view stream) override;
+      cuda::stream_ref stream) override;
 
   size_t device_read(
       size_t offset,
       size_t size,
       uint8_t* dst,
-      rmm::cuda_stream_view stream) override;
+      cuda::stream_ref stream) override;
 
-  std::unique_ptr<datasource::buffer> device_read(
-      size_t offset,
-      size_t size,
-      rmm::cuda_stream_view stream) override;
+  std::unique_ptr<datasource::buffer>
+  device_read(size_t offset, size_t size, cuda::stream_ref stream) override;
 
   size_t readRanges(
       const std::vector<size_t>& offsets,
@@ -328,10 +325,6 @@ class CrtS3DataSource final : public cudf::io::datasource {
 };
 
 bool crtS3RangeReaderAvailable();
-
-/// Returns true when the executor-global native AWS SDK scheduler is selected
-/// for S3 reads.
-bool nativeS3ScheduledReadEnabled();
 
 struct NativeS3ReadGroup {
   uint64_t offset{0};
@@ -429,6 +422,10 @@ std::shared_ptr<facebook::velox::ReadFile> makeNativeScheduledS3ReadFile(
     const std::string& filePath);
 #endif
 
+/// Returns true when the executor-global native AWS SDK scheduler is selected
+/// for S3 reads.
+bool nativeS3ScheduledReadEnabled();
+
 /// Starts construction of the optional high-throughput CRT client. This is
 /// intended to run asynchronously once query-level request pressure is known,
 /// before cache-load producers begin issuing their bounded range requests.
@@ -511,7 +508,7 @@ std::shared_ptr<PreparedHostByteRanges> prepareByteRangesToHost(
 FetchedDeviceByteRanges copyPreparedByteRangesToDevice(
     std::shared_ptr<PreparedHostByteRanges> prepared,
     cudf::host_span<const cudf::io::text::byte_range_info> byteRanges,
-    rmm::cuda_stream_view stream,
+    cuda::stream_ref stream,
     rmm::device_async_resource_ref mr);
 
 /**
@@ -528,7 +525,7 @@ FetchedDeviceByteRanges copyPreparedByteRangesToDevice(
 FetchedDeviceByteRanges fetchByteRangesAsync(
     std::shared_ptr<cudf::io::datasource> dataSource,
     cudf::host_span<const cudf::io::text::byte_range_info> byteRanges,
-    rmm::cuda_stream_view stream,
+    cuda::stream_ref stream,
     rmm::device_async_resource_ref mr);
 
 } // namespace facebook::velox::cudf_velox::connector::hive

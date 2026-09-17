@@ -51,10 +51,13 @@ target_include_directories(velox_ucx_exchange PRIVATE ${CMAKE_CURRENT_BINARY_DIR
 
 find_package(ucxx CONFIG REQUIRED)
 find_package(ucx REQUIRED)
+if(NOT TARGET nvtx3::nvtx3-cpp)
+  find_package(nvtx3 REQUIRED)
+endif()
 
 target_link_libraries(
   velox_ucx_exchange
-  PUBLIC ucxx::ucxx ucx::ucp
+  PUBLIC ucxx::ucxx ucx::ucp nvtx3::nvtx3-cpp
   PRIVATE cudf::cudf CUDA::cudart CUDA::cuda_driver Folly::folly velox_core ucx::ucs
 )
 

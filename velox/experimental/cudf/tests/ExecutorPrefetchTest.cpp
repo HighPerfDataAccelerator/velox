@@ -287,7 +287,7 @@ TEST_F(CacheHintRangeStatsTest, directCachePageH2dAvoidsHostStaging) {
           [&](uint8_t* destination,
               const void* source,
               size_t bytes,
-              rmm::cuda_stream_view /*stream*/) {
+              cuda::stream_ref /*stream*/) {
             copyThread = std::this_thread::get_id();
             copySources.push_back(source);
             copySizes.push_back(bytes);
@@ -295,8 +295,7 @@ TEST_F(CacheHintRangeStatsTest, directCachePageH2dAvoidsHostStaging) {
           },
       .retainUntilComplete =
           [&retained, &retainedWeak](
-              std::shared_ptr<void> stream,
-              rmm::cuda_stream_view /*cudaStream*/) {
+              std::shared_ptr<void> stream, cuda::stream_ref /*cudaStream*/) {
             retainedWeak = stream;
             retained.push_back(std::move(stream));
           }};
@@ -304,7 +303,7 @@ TEST_F(CacheHintRangeStatsTest, directCachePageH2dAvoidsHostStaging) {
   std::vector<uint8_t> fakeDevice(kReadSize);
   const auto statsBefore = directCachePageH2dStats();
   auto read = source.device_read_async(
-      kOffset, kReadSize, fakeDevice.data(), rmm::cuda_stream_view{});
+      kOffset, kReadSize, fakeDevice.data(), cuda::stream_ref{});
   EXPECT_TRUE(copySizes.empty());
   EXPECT_EQ(
       read.wait_for(std::chrono::seconds{0}), std::future_status::deferred);
@@ -364,7 +363,7 @@ TEST_F(
   auto makeHooks = [&](bool first) {
     return BufferedInputDeviceCopyHooks{
         .copy =
-            [&, first](uint8_t*, const void*, size_t, rmm::cuda_stream_view) {
+            [&, first](uint8_t*, const void*, size_t, cuda::stream_ref) {
               std::unique_lock lock(gate.mutex);
               (first ? gate.firstEntered : gate.secondEntered) = true;
               gate.cv.notify_all();
@@ -372,16 +371,14 @@ TEST_F(
                 gate.cv.wait(lock, [&] { return gate.releaseFirst; });
               }
             },
-        .retainUntilComplete = [](std::shared_ptr<void>,
-                                  rmm::cuda_stream_view) {}};
+        .retainUntilComplete = [](std::shared_ptr<void>, cuda::stream_ref) {}};
   };
 
   BufferedInputDataSource firstSource(makeInput(), makeHooks(true));
   BufferedInputDataSource secondSource(makeInput(), makeHooks(false));
   rmm::cuda_stream firstStream;
   rmm::cuda_stream secondStream;
-  auto fetch = [](BufferedInputDataSource& source,
-                  rmm::cuda_stream_view stream) {
+  auto fetch = [](BufferedInputDataSource& source, cuda::stream_ref stream) {
     std::array<cudf::io::text::byte_range_info, 1> ranges{{{0, 1}}};
     auto [buffers, spans, completion] =
         cudf::io::parquet::fetch_byte_ranges_to_device_async(

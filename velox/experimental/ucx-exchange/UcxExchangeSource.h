@@ -15,7 +15,8 @@
  */
 #pragma once
 
-#include "velox/common/Enums.h"
+#include "velox/common/EnumDeclare.h"
+#include "velox/common/EnumDefine.h"
 #include "velox/common/base/RuntimeMetrics.h"
 #include "velox/exec/Exchange.h"
 #include "velox/experimental/ucx-exchange/CommElement.h"
@@ -253,10 +254,12 @@ class UcxExchangeSource
 
   /// @brief For intra-node transfer: handles data retrieved from registry.
   /// @param data The packed_columns from registry (nullptr if atEnd or error)
+  /// @param numRows Logical rows in 'data'
   /// @param atEnd True if this is end-of-stream
   void onIntraNodeData(
       std::shared_ptr<cudf::packed_columns> data,
       rmm::cuda_stream_view producerStream,
+      vector_size_t numRows,
       bool atEnd);
 
   /// @brief Sets the new state of this exchange source using

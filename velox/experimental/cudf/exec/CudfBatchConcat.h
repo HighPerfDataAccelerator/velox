@@ -66,6 +66,7 @@ class CudfBatchConcat : public CudfOperatorBase {
  protected:
   void doAddInput(RowVectorPtr input) override;
   RowVectorPtr doGetOutput() override;
+  void doClose() override;
 
  private:
   exec::DriverCtx* const driverCtx_;

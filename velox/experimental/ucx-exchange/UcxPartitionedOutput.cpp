@@ -332,7 +332,7 @@ void UcxPartitionedOutput::preparePendingFlush() {
   auto stream = activeInputs_.back()->stream();
   if (activeInputs_.size() > 1) {
     std::vector<cudf::table_view> views;
-    std::vector<rmm::cuda_stream_view> inputStreams;
+    std::vector<cuda::stream_ref> inputStreams;
     views.reserve(activeInputs_.size());
     inputStreams.reserve(activeInputs_.size());
     for (auto& input : activeInputs_) {

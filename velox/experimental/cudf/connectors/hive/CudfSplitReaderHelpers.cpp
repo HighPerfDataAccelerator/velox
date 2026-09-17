@@ -550,20 +550,20 @@ BufferedInputDeviceCopyHooks defaultBufferedInputDeviceCopyHooks() {
           [](uint8_t* destination,
              const void* source,
              size_t bytes,
-             rmm::cuda_stream_view stream) {
+             cuda::stream_ref stream) {
             CUDF_CUDA_TRY(cudaMemcpyAsync(
                 destination,
                 source,
                 bytes,
                 cudaMemcpyHostToDevice,
-                stream.value()));
+                stream.get()));
           },
       .retainUntilComplete =
-          [](std::shared_ptr<void> lifetime, rmm::cuda_stream_view stream) {
+          [](std::shared_ptr<void> lifetime, cuda::stream_ref stream) {
             using Completion = std::shared_ptr<void>;
             auto completion = std::make_unique<Completion>(std::move(lifetime));
             const auto status = cudaLaunchHostFunc(
-                stream.value(),
+                stream.get(),
                 [](void* opaque) { delete static_cast<Completion*>(opaque); },
                 completion.get());
             if (status != cudaSuccess) {
@@ -571,7 +571,7 @@ BufferedInputDeviceCopyHooks defaultBufferedInputDeviceCopyHooks() {
               // pinned until the stream is quiescent before propagating the
               // callback submission failure. The callback itself intentionally
               // invokes no CUDA API.
-              CUDF_CUDA_TRY(cudaStreamSynchronize(stream.value()));
+              CUDF_CUDA_TRY(cudaStreamSynchronize(stream.get()));
               CUDF_CUDA_TRY(status);
             }
             completion.release();
@@ -2967,7 +2967,7 @@ std::future<size_t> KvikioS3DataSource::device_read_async(
     size_t offset,
     size_t requestedSize,
     uint8_t* dst,
-    rmm::cuda_stream_view stream) {
+    cuda::stream_ref stream) {
   const auto readSize = clampedReadSize(offset, requestedSize);
   if (readSize == 0) {
     return std::async(std::launch::deferred, [] { return size_t{0}; });
@@ -3046,9 +3046,9 @@ std::future<size_t> KvikioS3DataSource::device_read_async(
                 completion->first->data(),
                 readSize,
                 cudaMemcpyHostToDevice,
-                stream.value()));
+                stream.get()));
             CUDF_CUDA_TRY(cudaLaunchHostFunc(
-                stream.value(),
+                stream.get(),
                 [](void* opaque) { delete static_cast<Completion*>(opaque); },
                 completion.get()));
             completion.release();
@@ -3060,8 +3060,8 @@ std::future<size_t> KvikioS3DataSource::device_read_async(
               hostBuffer->data(),
               readSize,
               cudaMemcpyHostToDevice,
-              stream.value()));
-          stream.synchronize();
+              stream.get()));
+          stream.sync();
           h2dPermit.release();
           return actual;
         });
@@ -3080,19 +3080,25 @@ size_t KvikioS3DataSource::device_read(
     size_t offset,
     size_t requestedSize,
     uint8_t* dst,
-    rmm::cuda_stream_view stream) {
+    cuda::stream_ref stream) {
   return device_read_async(offset, requestedSize, dst, stream).get();
 }
 
 std::unique_ptr<cudf::io::datasource::buffer> KvikioS3DataSource::device_read(
     size_t offset,
     size_t requestedSize,
-    rmm::cuda_stream_view stream) {
+    cuda::stream_ref stream) {
   rmm::device_buffer data(clampedReadSize(offset, requestedSize), stream);
   const auto readSize = device_read(
       offset, requestedSize, static_cast<uint8_t*>(data.data()), stream);
   data.resize(readSize, stream);
   return cudf::io::datasource::buffer::create(std::move(data));
+}
+#endif
+
+#ifndef VELOX_ENABLE_S3
+bool nativeS3ScheduledReadEnabled() {
+  return false;
 }
 #endif
 
@@ -3164,30 +3170,30 @@ void BufferedInputDataSource::enqueueForDevice(
     uint8_t* dst) {
   auto inputStream = input_->enqueue({offset, size});
   std::shared_ptr sharedStream(std::move(inputStream));
-  pendingDeviceLoads_.push_back([dst, size, sharedStream](
-                                    rmm::cuda_stream_view stream) {
-    uint64_t copied = 0;
-    while (copied < size) {
-      const void* buffer = nullptr;
-      int32_t available = 0;
-      VELOX_CHECK(
-          sharedStream->Next(&buffer, &available),
-          "BufferedInput stream ended after {} of {} bytes",
-          copied,
-          size);
-      VELOX_CHECK_GT(available, 0);
-      const auto bytes = std::min<uint64_t>(available, size - copied);
-      CUDF_CUDA_TRY(cudaMemcpyAsync(
-          dst + copied, buffer, bytes, cudaMemcpyHostToDevice, stream.value()));
-      copied += bytes;
-      if (bytes < static_cast<uint64_t>(available)) {
-        sharedStream->BackUp(available - bytes);
-      }
-    }
-  });
+  pendingDeviceLoads_.push_back(
+      [dst, size, sharedStream](cuda::stream_ref stream) {
+        uint64_t copied = 0;
+        while (copied < size) {
+          const void* buffer = nullptr;
+          int32_t available = 0;
+          VELOX_CHECK(
+              sharedStream->Next(&buffer, &available),
+              "BufferedInput stream ended after {} of {} bytes",
+              copied,
+              size);
+          VELOX_CHECK_GT(available, 0);
+          const auto bytes = std::min<uint64_t>(available, size - copied);
+          CUDF_CUDA_TRY(cudaMemcpyAsync(
+              dst + copied, buffer, bytes, cudaMemcpyDefault, stream.get()));
+          copied += bytes;
+          if (bytes < static_cast<uint64_t>(available)) {
+            sharedStream->BackUp(available - bytes);
+          }
+        }
+      });
 }
 
-void BufferedInputDataSource::load(rmm::cuda_stream_view stream) {
+void BufferedInputDataSource::load(cuda::stream_ref stream) {
   input_->load(velox::dwio::common::LogType::FILE);
   // The cache load above is already complete and pendingDeviceLoads_ belongs
   // exclusively to this data source. Avoid serializing cache-to-device copies
@@ -3387,7 +3393,7 @@ std::future<size_t> BufferedInputDataSource::device_read_async(
     size_t offset,
     size_t size,
     uint8_t* dst,
-    rmm::cuda_stream_view stream) {
+    cuda::stream_ref stream) {
   VELOX_CHECK(input_->executor() != nullptr, "IO executor is not initialized");
   const auto readSize =
       offset >= fileSize_ ? 0 : std::min(size, fileSize_ - offset);
@@ -3485,8 +3491,8 @@ std::future<size_t> BufferedInputDataSource::device_read_async(
                           dst,
                           hostBuffer->data(),
                           hostBuffer->size(),
-                          cudaMemcpyHostToDevice,
-                          stream.value()));
+                          cudaMemcpyDefault,
+                          stream.get()));
                       return hostBuffer->size();
                     });
   return toStdFuture(std::move(future));
@@ -3623,7 +3629,7 @@ std::shared_ptr<PreparedHostByteRanges> prepareByteRangesToHost(
 FetchedDeviceByteRanges copyPreparedByteRangesToDevice(
     std::shared_ptr<PreparedHostByteRanges> prepared,
     cudf::host_span<const cudf::io::text::byte_range_info> byteRanges,
-    rmm::cuda_stream_view stream,
+    cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) {
   const auto totalStart = std::chrono::steady_clock::now();
   constexpr auto kBufferPaddingMultiple = 8;
@@ -3658,8 +3664,8 @@ FetchedDeviceByteRanges copyPreparedByteRangesToDevice(
       prepared->hostBuffer->data(),
       prepared->totalSize,
       cudaMemcpyHostToDevice,
-      stream.value()));
-  stream.synchronize();
+      stream.get()));
+  stream.sync();
   const auto copyDone = std::chrono::steady_clock::now();
   // Return pooled pinned memory before publishing the device spans. Timing
   // this separately catches CUDA-wide synchronization in host unregister.
@@ -3715,7 +3721,7 @@ FetchedDeviceByteRanges copyPreparedByteRangesToDevice(
 FetchedDeviceByteRanges fetchByteRangesAsync(
     std::shared_ptr<cudf::io::datasource> dataSource,
     cudf::host_span<const cudf::io::text::byte_range_info> byteRanges,
-    rmm::cuda_stream_view stream,
+    cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) {
   // Pad buffer sizes to be a multiple of 8 bytes. Required by
   // `decode_page_data_kernel` in cuDF Parquet reader.
@@ -3871,8 +3877,8 @@ FetchedDeviceByteRanges fetchByteRangesAsync(
         hostBuffer->data(),
         totalSize,
         cudaMemcpyHostToDevice,
-        stream.value()));
-    stream.synchronize();
+        stream.get()));
+    stream.sync();
     h2dPermit.release();
     return {
         std::move(columnChunkBuffers),
@@ -3918,7 +3924,7 @@ FetchedDeviceByteRanges fetchByteRangesAsync(
 
     // load buffered input data source
     auto syncFunction = [](std::shared_ptr<cudf::io::datasource> dataSource,
-                           rmm::cuda_stream_view stream) {
+                           cuda::stream_ref stream) {
       auto buffer =
           checkedPointerCast<BufferedInputDataSource>(dataSource.get());
       buffer->load(stream);
@@ -3976,7 +3982,7 @@ FetchedDeviceByteRanges fetchByteRangesAsync(
   // KvikIO's remote read uses internal worker streams. Synchronize preceding
   // consumer work before scheduling the batch; completion of each pread()
   // includes its H2D copy.
-  stream.synchronize();
+  stream.sync();
 
   {
     std::lock_guard<std::mutex> lock(ioBatchMutex());
@@ -4004,8 +4010,8 @@ FetchedDeviceByteRanges fetchByteRangesAsync(
                       dest,
                       hostBuffer->data(),
                       hostBuffer->size(),
-                      cudaMemcpyHostToDevice,
-                      stream.value()));
+                      cudaMemcpyDefault,
+                      stream.get()));
                   return ioSize;
                 }));
       }

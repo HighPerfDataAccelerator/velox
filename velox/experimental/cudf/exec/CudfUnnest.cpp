@@ -44,7 +44,7 @@ column_index_t fieldChannel(
 
 std::unique_ptr<cudf::column> makeVeloxOrdinality(
     const cudf::column_view& zeroBasedPosition,
-    rmm::cuda_stream_view stream,
+    cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) {
   auto ordinalityType = cudf::data_type{cudf::type_id::INT64};
   auto castPosition = cudf::cast(zeroBasedPosition, ordinalityType, stream, mr);

@@ -41,7 +41,11 @@ TEST(IntraNodeTransferRegistryTest, registerWaiterWokenByPublish) {
   EXPECT_EQ(woken.load(), 0);
 
   auto future = registry->publish(
-      key, /*data=*/nullptr, rmm::cuda_stream_default, /*atEnd=*/false);
+      key,
+      /*data=*/nullptr,
+      rmm::cuda_stream_default,
+      /*numRows=*/0,
+      /*atEnd=*/false);
   EXPECT_EQ(woken.load(), 1);
 
   // The woken consumer would now poll and retrieve the data.
@@ -57,7 +61,11 @@ TEST(IntraNodeTransferRegistryTest, registerWaiterReadyReturnsTrue) {
   const auto key = makeKey("registerWaiterReadyReturnsTrue");
 
   auto future = registry->publish(
-      key, /*data=*/nullptr, rmm::cuda_stream_default, /*atEnd=*/true);
+      key,
+      /*data=*/nullptr,
+      rmm::cuda_stream_default,
+      /*numRows=*/0,
+      /*atEnd=*/true);
 
   std::atomic<int> woken{0};
   const bool readyNow = registry->registerWaiter(key, [&woken]() { ++woken; });

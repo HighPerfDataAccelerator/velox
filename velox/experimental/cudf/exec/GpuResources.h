@@ -22,6 +22,7 @@
 #include <rmm/resource_ref.hpp>
 
 #include <cuda/memory_resource>
+#include <cuda/stream>
 
 #include <cstddef>
 #include <cstdint>
@@ -208,5 +209,21 @@ class CudaAllocationTraceScope {
   bool active_{false};
   std::string previousContext_;
 };
+
+/// Records the CUDA device owning the primary context, so worker threads can
+/// bind it via `ensureCudaContextForThread()`.
+///
+/// @param device The CUDA device ordinal that was current during registration.
+void setCudfContextDevice(int device);
+
+/// Binds the primary CUDA context on the calling thread, once (thread-local).
+/// Needed as `cuda::stream_ref` uses the driver API, which does not lazily
+/// create a context like the runtime API does.
+void ensureCudaContextForThread();
+
+/// Ensures that the calling thread has a CUDA context and returns the
+/// `cudf::get_default_stream()`. Use it for host-thread stream work outside
+/// cuDF operators.
+[[nodiscard]] cuda::stream_ref getDefaultStreamForCurrentThread();
 
 } // namespace facebook::velox::cudf_velox

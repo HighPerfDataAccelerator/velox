@@ -35,8 +35,10 @@ int main(int argc, char** argv) {
   facebook::velox::process::addDefaultFatalSignalHandler();
   folly::Init init(&argc, &argv, false);
   facebook::velox::Type::registerSerDe();
-  facebook::velox::cudf_velox::CudfConfig::getInstance().exchangeLogLevel =
-      FLAGS_exchange_log_level;
-  facebook::velox::cudf_velox::CudfConfig::getInstance().exchange = true;
+  auto& cudfConfig = facebook::velox::cudf_velox::CudfConfig::getInstance();
+  // Enable the UCX exchange so the Communicator initializes under test;
+  // production code enables it via the "cudf.exchange" session config.
+  cudfConfig.exchange = true;
+  cudfConfig.exchangeLogLevel = FLAGS_exchange_log_level;
   return RUN_ALL_TESTS();
 }
