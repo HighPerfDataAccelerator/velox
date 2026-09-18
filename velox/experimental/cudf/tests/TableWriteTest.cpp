@@ -23,6 +23,7 @@
 #include "velox/experimental/cudf/tests/utils/CudfHiveConnectorTestBase.h"
 #include "velox/experimental/cudf/tests/utils/CudfPlanBuilder.h"
 
+#include "folly/ScopeGuard.h"
 #include "folly/dynamic.h"
 #include "velox/common/base/Fs.h"
 #include "velox/common/testutil/TempDirectoryPath.h"
@@ -35,11 +36,13 @@
 #include "velox/exec/tests/utils/AssertQueryBuilder.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
 
-#include <gflags/gflags.h>
-#include <re2/re2.h>
 #include <cudf/io/orc.hpp>
 
+#include <gflags/gflags.h>
+#include <re2/re2.h>
+
 #include <atomic>
+#include <cstdlib>
 #include <string>
 
 using namespace facebook::velox;
@@ -597,28 +600,67 @@ class TableWriteTest : public CudfHiveConnectorTestBase {
   core::PlanNodeId tableWriteNodeId_;
 };
 
-class BasicTableWriteTest : public CudfHiveConnectorTestBase {};
+class BasicTableWriteTest : public CudfHiveConnectorTestBase {
+ protected:
+  void runRoundTrip(int batches = 1);
+};
 
 TEST_F(BasicTableWriteTest, roundTrip) {
+  runRoundTrip();
+}
+
+TEST_F(BasicTableWriteTest, asyncRoundTripAndByteCapFallback) {
+  const auto saved = [](const char* key) -> std::optional<std::string> {
+    const auto* value = std::getenv(key);
+    return value == nullptr ? std::nullopt : std::optional<std::string>{value};
+  };
+  const auto enabled = saved("GLUTEN_CUDF_ASYNC_TABLE_WRITE");
+  const auto limit = saved("GLUTEN_CUDF_ASYNC_TABLE_WRITE_MAX_INPUT_BYTES");
+  SCOPE_EXIT {
+    for (const auto& [key, value] :
+         std::vector<std::pair<const char*, std::optional<std::string>>>{
+             {"GLUTEN_CUDF_ASYNC_TABLE_WRITE", enabled},
+             {"GLUTEN_CUDF_ASYNC_TABLE_WRITE_MAX_INPUT_BYTES", limit}}) {
+      if (value) {
+        setenv(key, value->c_str(), 1);
+      } else {
+        unsetenv(key);
+      }
+    }
+  };
+  ASSERT_EQ(setenv("GLUTEN_CUDF_ASYNC_TABLE_WRITE", "1", 1), 0);
+  // Includes nullable and nested data, completion before commit metadata,
+  // and the original synchronous path when the byte cap cannot admit input.
+  for (const auto* cap : {"1073741824", "1"}) {
+    ASSERT_EQ(
+        setenv("GLUTEN_CUDF_ASYNC_TABLE_WRITE_MAX_INPUT_BYTES", cap, 1), 0);
+    runRoundTrip();
+  }
+}
+
+TEST_F(BasicTableWriteTest, multipleInputRoundTrip) {
+  // All batches contain nested and nullable columns. The same test is run
+  // with batching OFF/ON, including a byte-cap synchronous fallback.
+  runRoundTrip(32);
+}
+
+void BasicTableWriteTest::runRoundTrip(int batches) {
   TestValue::enable();
   std::atomic<int32_t> deviceAppends{0};
   ScopedTestValue deviceAppendHook(
       "facebook::velox::cudf_velox::connector::hive::"
       "CudfHiveDataSink::appendDeviceData",
-      std::function<void(
-          cudf_velox::connector::hive::CudfHiveDataSink*)>(
+      std::function<void(cudf_velox::connector::hive::CudfHiveDataSink*)>(
           [&](cudf_velox::connector::hive::CudfHiveDataSink*) {
             ++deviceAppends;
           }));
-  vector_size_t size = 1'000;
+  vector_size_t size = batches > 1 ? 32'768 : 1'000;
   auto data = makeRowVector({
       makeFlatVector<int32_t>(size, [](auto row) { return row; }),
       makeFlatVector<int32_t>(
           size, [](auto row) { return row * 2; }, nullEvery(7)),
       makeArrayVector<int64_t>(
-          size,
-          [](auto row) { return row % 4; },
-          [](auto row) { return row; }),
+          size, [](auto row) { return row % 4; }, [](auto row) { return row; }),
   });
   auto expectedData = data;
 
@@ -636,21 +678,34 @@ TEST_F(BasicTableWriteTest, roundTrip) {
                   // Limit is always GPU-capable and preserves the full input,
                   // forcing a CudfVector into TableWriter without changing the
                   // round-trip expectation.
-                  .limit(0, size, false)
+                  .limit(0, size * batches, false)
                   // Exercise the Job 38 boundary: Spark emits a final identity
                   // Project containing nested columns immediately before the
                   // table writer.
                   .project({"c0", "c1", "c2"})
-                  .addNode(cudfTableWrite(targetDirectoryPath->getPath()))
+                  .addNode(cudfTableWrite(
+                      targetDirectoryPath->getPath(),
+                      FileFormat::PARQUET,
+                      std::nullopt,
+                      kCudfHiveConnectorId,
+                      {},
+                      nullptr,
+                      "",
+                      CompressionKind::CompressionKind_SNAPPY))
                   .planNode();
 
-  auto results =
-      AssertQueryBuilder(plan)
-          .config("cudf.enabled", true)
-          .config("cudf.debug_enabled", true)
-          .config("cudf.allow_cpu_fallback", false)
-          .split(makeCudfHiveConnectorSplit(sourceFilePath->getPath()))
-          .copyResults(pool());
+  std::vector<Split> inputSplits;
+  for (int i = 0; i < batches; ++i) {
+    inputSplits.emplace_back(
+        makeCudfHiveConnectorSplit(sourceFilePath->getPath()));
+  }
+  auto results = AssertQueryBuilder(plan)
+                     .maxDrivers(1)
+                     .config("cudf.enabled", true)
+                     .config("cudf.debug_enabled", true)
+                     .config("cudf.allow_cpu_fallback", false)
+                     .splits(inputSplits)
+                     .copyResults(pool());
 #ifndef NDEBUG
   // TestValue callbacks are intentionally compiled out of release builds.
   ASSERT_GT(deviceAppends.load(), 0);
@@ -662,7 +717,7 @@ TEST_F(BasicTableWriteTest, roundTrip) {
   auto rowCount = results->childAt(TableWriteTraits::kRowCountChannel)
                       ->as<FlatVector<int64_t>>();
   ASSERT_FALSE(rowCount->isNullAt(0));
-  ASSERT_EQ(size, rowCount->valueAt(0));
+  ASSERT_EQ(size * batches, rowCount->valueAt(0));
   ASSERT_TRUE(rowCount->isNullAt(1));
 
   // Second column contains details about written files.
@@ -670,18 +725,16 @@ TEST_F(BasicTableWriteTest, roundTrip) {
                      ->as<FlatVector<StringView>>();
   ASSERT_TRUE(details->isNullAt(0));
   ASSERT_FALSE(details->isNullAt(1));
-  folly::dynamic obj =
-      folly::parseJson(std::string_view(details->valueAt(1)));
+  folly::dynamic obj = folly::parseJson(std::string_view(details->valueAt(1)));
 
-  ASSERT_EQ(size, obj["rowCount"].asInt());
+  ASSERT_EQ(size * batches, obj["rowCount"].asInt());
   auto fileWriteInfos = obj["fileWriteInfos"];
   ASSERT_EQ(1, fileWriteInfos.size());
   auto writeFileName = fileWriteInfos[0]["writeFileName"].asString();
   const auto outputPath =
       fmt::format("{}/{}", targetDirectoryPath->getPath(), writeFileName);
   ASSERT_GT(fileWriteInfos[0]["fileSize"].asInt(), 0);
-  ASSERT_EQ(
-      fileWriteInfos[0]["fileSize"].asInt(), fs::file_size(outputPath));
+  ASSERT_EQ(fileWriteInfos[0]["fileSize"].asInt(), fs::file_size(outputPath));
 
   // Read from 'writeFileName' and verify the data matches the original.
   plan = PlanBuilder()
@@ -691,12 +744,10 @@ TEST_F(BasicTableWriteTest, roundTrip) {
              .endTableScan()
              .planNode();
 
-  auto copy =
-      AssertQueryBuilder(plan)
-          .split(makeCudfHiveConnectorSplit(
-              outputPath))
-          .copyResults(pool());
-  assertEqualResults({expectedData}, {copy});
+  auto copy = AssertQueryBuilder(plan)
+                  .split(makeCudfHiveConnectorSplit(outputPath))
+                  .copyResults(pool());
+  assertEqualResults(std::vector<RowVectorPtr>(batches, expectedData), {copy});
 }
 
 TEST_F(BasicTableWriteTest, targetFileName) {
@@ -760,9 +811,9 @@ TEST_F(BasicTableWriteTest, orcRoundTrip) {
 
   const auto outputPath =
       fmt::format("{}/{}", directory->getPath(), "part-test.orc");
-  auto options = cudf::io::orc_reader_options::builder(
-                     cudf::io::source_info(outputPath))
-                     .build();
+  auto options =
+      cudf::io::orc_reader_options::builder(cudf::io::source_info(outputPath))
+          .build();
   auto output = cudf::io::read_orc(options);
   ASSERT_EQ(kSize, output.tbl->num_rows());
   ASSERT_EQ(2, output.tbl->num_columns());
@@ -797,7 +848,8 @@ TEST_F(BasicTableWriteTest, writesFileUriIntoCommitterDirectory) {
   auto root = TempDirectoryPath::create();
   const auto localTargetDirectory =
       fmt::format("{}/missing/task/attempt", root->getPath());
-  const auto fileUriTargetDirectory = fmt::format("file:{}", localTargetDirectory);
+  const auto fileUriTargetDirectory =
+      fmt::format("file:{}", localTargetDirectory);
 
   auto plan = PlanBuilder()
                   .values({data})

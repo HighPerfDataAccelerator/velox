@@ -31,7 +31,9 @@
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
+#include "velox/experimental/ucx-exchange/IntraNodeDeviceLease.h"
 #include "velox/experimental/ucx-exchange/IntraNodeTransferRegistry.h"
+#include "velox/experimental/ucx-exchange/MetadataReceiveBuffer.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeSource.h"
 
 using namespace facebook::velox::exec;
@@ -844,7 +846,11 @@ void UcxExchangeSource::getMetadata() {
   // Each retained UCXX request needs a distinct receive address. An old
   // request can be replayed during endpoint wireup; sharing this allocation
   // with the current request would let the transport overwrite new metadata.
-  auto metadataReq = std::make_shared<std::vector<uint8_t>>(kMaxMetaBufSize);
+  static const bool lazyInitialize = [] {
+    const auto* value = std::getenv("GLUTEN_UCX_METADATA_LAZY_INIT");
+    return value != nullptr && std::string_view(value) == "1";
+  }();
+  auto metadataReq = std::make_shared<MetadataReceiveBuffer>(!lazyInitialize);
   const auto expectedSequence = sequenceNumber_;
   uint64_t metadataTag = getMetadataTag(partitionKeyHash_, expectedSequence);
 
@@ -863,7 +869,7 @@ void UcxExchangeSource::getMetadata() {
       ucxx::TagMaskFull,
       false,
       [weak, expectedSequence](ucs_status_t status, std::shared_ptr<void> arg) {
-        auto metadata = std::static_pointer_cast<std::vector<uint8_t>>(arg);
+        auto metadata = std::static_pointer_cast<MetadataReceiveBuffer>(arg);
         if (auto self = weak.lock()) {
           self->onMetadata(status, metadata, expectedSequence);
         }
@@ -918,16 +924,17 @@ void UcxExchangeSource::onMetadata(
     VELOX_CHECK_NOT_NULL(arg, "Didn't get metadata");
 
     // arg contains the actual serialized metadata, deserialize the metadata
-    std::shared_ptr<std::vector<uint8_t>> metadataMsg =
-        std::static_pointer_cast<std::vector<uint8_t>>(arg);
+    auto metadataMsg = std::static_pointer_cast<MetadataReceiveBuffer>(arg);
+
+    uint32_t serializedBytes = 0;
+    std::memcpy(
+        &serializedBytes,
+        metadataMsg->data() + sizeof(kMagicNumber),
+        sizeof(serializedBytes));
+    VELOX_CHECK_GE(serializedBytes, MetadataReceiveBuffer::kHeaderBytes);
+    VELOX_CHECK_LE(serializedBytes, metadataMsg->size());
 
     if (exchangeVariableWidthValidationEnabled()) {
-      uint32_t serializedBytes = 0;
-      std::memcpy(
-          &serializedBytes,
-          metadataMsg->data() + sizeof(kMagicNumber),
-          sizeof(serializedBytes));
-      VELOX_CHECK_LE(serializedBytes, metadataMsg->size());
       LOG(WARNING) << "UCX receiver metadata key=" << partitionKey_.toString()
                    << " sequence=" << expectedSequence
                    << " bytes=" << serializedBytes << " fingerprint=0x"
@@ -1688,6 +1695,16 @@ void UcxExchangeSource::onIntraNodeData(IntraNodeTransferResult result) {
 
   auto tableWithStream =
       std::make_unique<PackedTableWithStream>(std::move(packedTable), stream);
+  if (const auto* adaptive =
+          std::getenv("GLUTEN_UCX_INTRANODE_ADAPTIVE_DEVICE");
+      adaptive != nullptr && std::string_view(adaptive) == "1") {
+    // The independent clone and metadata are complete. In the opt-in split
+    // reservation path, retire an exclusively owned producer now, retaining
+    // the clone's credit until the consumer vector releases it. Shared pages
+    // and the control path conservatively retain both halves as before.
+    tableWithStream->lifetimeOwner =
+        finishIntraNodeDeviceClone(std::move(data));
+  }
 
   enqueue(std::move(tableWithStream));
 

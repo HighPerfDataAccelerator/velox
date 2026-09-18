@@ -19,6 +19,7 @@
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConnectorSplit.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveDataSource.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveTableHandle.h"
+#include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/expression/SubfieldFiltersToAst.h"
 #include "velox/experimental/cudf/tests/utils/CudfHiveConnectorTestBase.h"
 
@@ -46,6 +47,7 @@
 #include "velox/type/Type.h"
 #include "velox/type/tests/SubfieldFiltersBuilder.h"
 
+#include <cudf/io/orc.hpp>
 #include <cudf/io/parquet.hpp>
 
 #include <fmt/ranges.h>
@@ -95,6 +97,36 @@ StatsFilterMetrics readParquetWithStatsFilter(
 
 class TableScanTest : public virtual CudfHiveConnectorTestBase {
  protected:
+  void writeOrc(const std::string& path, const RowVectorPtr& data) {
+    auto stream = cudfGlobalStreamPool().get_stream();
+    auto table =
+        with_arrow::toCudfTable(data, pool_.get(), stream, get_output_mr());
+    cudf::io::table_input_metadata metadata(table->view());
+    for (int i = 0; i < data->type()->size(); ++i) {
+      metadata.column_metadata[i].set_name(data->type()->asRow().nameOf(i));
+    }
+    auto options = cudf::io::orc_writer_options::builder(
+                       cudf::io::sink_info(path), table->view())
+                       .metadata(metadata)
+                       .compression(cudf::io::compression_type::SNAPPY)
+                       .stripe_size_rows(512)
+                       .build();
+    cudf::io::write_orc(options, stream);
+    stream.synchronize();
+  }
+
+  auto orcSplit(
+      const std::string& path,
+      uint64_t start = 0,
+      uint64_t length = std::numeric_limits<uint64_t>::max()) {
+    return std::make_shared<
+        facebook::velox::connector::hive::HiveConnectorSplit>(
+        kCudfHiveConnectorId,
+        path,
+        dwio::common::FileFormat::ORC,
+        start,
+        length);
+  }
   void SetUp() override {
     CudfHiveConnectorTestBase::SetUp();
     ExchangeSource::factories().clear();
@@ -875,6 +907,98 @@ TEST_F(TableScanTest, remainingFilterExtraction) {
   ASSERT_NE(it, scanStats.customStats.end());
   EXPECT_EQ(it->second.sum, 0)
       << "Expected no remaining filter time when filter is fully extracted";
+}
+
+TEST_F(TableScanTest, orcProjectionAndExtractedFilter) {
+  auto data = makeRowVector({
+      makeFlatVector<int64_t>(4096, folly::identity),
+      makeFlatVector<int64_t>(
+          4096, [](auto i) { return i * 7; }, nullEvery(11)),
+      makeFlatVector<int64_t>(4096, [](auto i) { return -i; }),
+  });
+  auto file = TempFilePath::create();
+  writeOrc(file->getPath(), data);
+  createDuckDbTable({data});
+  auto type = asRowType(data->type());
+  for (const auto& output : {type, ROW({"c2", "c1"}, {BIGINT(), BIGINT()})}) {
+    auto plan =
+        PlanBuilder(pool_.get())
+            .startTableScan()
+            .connectorId(kCudfHiveConnectorId)
+            .outputType(output)
+            .dataColumns(type)
+            .assignments(HiveConnectorTestBase::allRegularColumns(output))
+            .remainingFilter("c0 >= 100 AND c0 < 3000 AND c1 IS NOT NULL")
+            .endTableScan()
+            .planNode();
+    assertQuery(
+        plan,
+        orcSplit(file->getPath()),
+        output == type
+            ? "SELECT * FROM tmp WHERE c0 >= 100 AND c0 < 3000 AND c1 IS NOT NULL"
+            : "SELECT c2, c1 FROM tmp WHERE c0 >= 100 AND c0 < 3000 AND c1 IS NOT NULL");
+  }
+}
+
+TEST_F(TableScanTest, orcRejectsPartialByteRanges) {
+  auto data = makeRowVector({makeFlatVector<int64_t>(4096, folly::identity)});
+  auto file = TempFilePath::create();
+  writeOrc(file->getPath(), data);
+  createDuckDbTable({data});
+  auto plan = tableScanNode(asRowType(data->type()));
+  VELOX_ASSERT_THROW(
+      assertQuery(plan, orcSplit(file->getPath(), 1), "SELECT * FROM tmp"),
+      "whole-file split");
+  VELOX_ASSERT_THROW(
+      assertQuery(plan, orcSplit(file->getPath(), 0, 1), "SELECT * FROM tmp"),
+      "whole-file split");
+}
+
+TEST_F(TableScanTest, orcSplitSerialization) {
+  using GpuSplit = cudf_velox::connector::hive::CudfHiveConnectorSplit;
+  GpuSplit split(
+      "cudf-hive",
+      "/test.orc",
+      0,
+      123,
+      0,
+      {},
+      {},
+      dwio::common::FileFormat::ORC);
+  auto restored = GpuSplit::create(split.serialize());
+  EXPECT_EQ(restored->fileFormat, dwio::common::FileFormat::ORC);
+  EXPECT_EQ(restored->length, 123);
+  auto legacy = split.serialize();
+  legacy.erase("fileFormat");
+  EXPECT_EQ(
+      GpuSplit::create(legacy)->fileFormat, dwio::common::FileFormat::PARQUET);
+}
+
+TEST_F(TableScanTest, orcChunkedAndEmptyFilter) {
+  auto data = makeRowVector({makeFlatVector<int64_t>(32000, folly::identity)});
+  auto file = TempFilePath::create();
+  writeOrc(file->getPath(), data);
+  createDuckDbTable({data});
+  auto type = asRowType(data->type());
+  for (const auto& filter : {"c0 >= 0", "c0 < 0"}) {
+    auto plan = PlanBuilder(pool_.get())
+                    .startTableScan()
+                    .connectorId(kCudfHiveConnectorId)
+                    .outputType(type)
+                    .dataColumns(type)
+                    .assignments(HiveConnectorTestBase::allRegularColumns(type))
+                    .remainingFilter(filter)
+                    .endTableScan()
+                    .planNode();
+    AssertQueryBuilder(plan, duckDbQueryRunner_)
+        .connectorSessionProperty(
+            kCudfHiveConnectorId,
+            cudf_velox::connector::hive::CudfHiveConfig::
+                kMaxChunkReadLimitSession,
+            "1024")
+        .splits({Split(orcSplit(file->getPath()))})
+        .assertResults(std::string("SELECT * FROM tmp WHERE ") + filter);
+  }
 }
 
 TEST_F(TableScanTest, decimalSubfieldFilter) {

@@ -62,6 +62,16 @@ struct CudfHiveConnectorSplit
       const std::unordered_map<std::string, std::string>& _infoColumns = {},
       std::vector<CudfCoalescedFile> _coalescedFiles = {});
 
+  CudfHiveConnectorSplit(
+      const std::string& connectorId,
+      const std::string& filePath,
+      uint64_t start,
+      uint64_t length,
+      int64_t splitWeight,
+      const std::unordered_map<std::string, std::string>& infoColumns,
+      std::vector<CudfCoalescedFile> coalescedFiles,
+      dwio::common::FileFormat format);
+
   std::string toString() const override;
   std::string getFileName() const;
 
@@ -92,6 +102,11 @@ class CudfHiveConnectorSplitBuilder {
     return *this;
   }
 
+  CudfHiveConnectorSplitBuilder& fileFormat(dwio::common::FileFormat format) {
+    fileFormat_ = format;
+    return *this;
+  }
+
   CudfHiveConnectorSplitBuilder& infoColumn(
       const std::string& name,
       const std::string& value) {
@@ -111,7 +126,14 @@ class CudfHiveConnectorSplitBuilder {
 
   std::shared_ptr<CudfHiveConnectorSplit> build() const {
     return std::make_shared<CudfHiveConnectorSplit>(
-        connectorId_, filePath_, start_, length_, splitWeight_, infoColumns_);
+        connectorId_,
+        filePath_,
+        start_,
+        length_,
+        splitWeight_,
+        infoColumns_,
+        std::vector<CudfCoalescedFile>{},
+        fileFormat_);
   }
 
  private:
@@ -120,6 +142,7 @@ class CudfHiveConnectorSplitBuilder {
   uint64_t length_{std::numeric_limits<uint64_t>::max()};
   std::string connectorId_;
   int64_t splitWeight_{0};
+  dwio::common::FileFormat fileFormat_{dwio::common::FileFormat::PARQUET};
   std::unordered_map<std::string, std::string> infoColumns_ = {};
 };
 

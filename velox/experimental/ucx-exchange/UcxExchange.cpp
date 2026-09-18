@@ -22,7 +22,9 @@
 #include <cudf/utilities/error.hpp>
 #include <rmm/device_buffer.hpp>
 
+#include <charconv>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 
 using facebook::velox::exec::Operator;
@@ -32,6 +34,25 @@ using facebook::velox::exec::RemoteConnectorSplit;
 using namespace facebook::velox::cudf_velox; // NOLINT
 
 namespace facebook::velox::ucx_exchange {
+
+namespace {
+std::chrono::milliseconds exchangeStatsInterval() {
+  // Opt-in while qualifying: zero preserves the per-page control. Bound the
+  // interval and reject malformed values, rather than silently hiding stats.
+  const auto* value = std::getenv("GLUTEN_UCX_STATS_INTERVAL_MS");
+  if (!value) {
+    return std::chrono::milliseconds{0};
+  }
+  int64_t interval = 0;
+  const auto* end = value + std::strlen(value);
+  const auto parsed = std::from_chars(value, end, interval);
+  VELOX_USER_CHECK(
+      parsed.ec == std::errc{} && parsed.ptr == end && interval >= 0 &&
+          interval <= 60000,
+      "GLUTEN_UCX_STATS_INTERVAL_MS must be an integer in [0, 60000]");
+  return std::chrono::milliseconds{interval};
+}
+} // namespace
 
 // --- Implementation of the UcxExchange operator.
 
@@ -56,7 +77,8 @@ UcxExchange::UcxExchange(
       closeExchangeClientOnClose_{ucxExchangeClient == nullptr},
       processSplits_{driverCtx->driverId == 0},
       pipelineId_{driverCtx->pipelineId},
-      driverId_{driverCtx->driverId} {
+      driverId_{driverCtx->driverId},
+      statsRefresh_{exchangeStatsInterval()} {
   if (ucxExchangeClient) {
     // UcxExchangeClient is provided externally when this is a "plain"
     // UcxExchange.
@@ -207,7 +229,7 @@ BlockingReason UcxExchange::isBlocked(ContinueFuture* future) {
       const auto numSplits = stats_.rlock()->numSplits;
       operatorCtx_->task()->multipleSplitsFinished(false, numSplits, 0);
     }
-    recordExchangeClientStats();
+    recordExchangeClientStats(atEnd_);
     return BlockingReason::kNotBlocked;
   }
 
@@ -357,13 +379,18 @@ void UcxExchange::close() {
   exchangeClient_ = nullptr;
 }
 
-void UcxExchange::recordExchangeClientStats() {
+void UcxExchange::recordExchangeClientStats(bool force) {
   if (!processSplits_) {
     return;
   }
+  if (!statsRefresh_.shouldRefresh(ExchangeStatsRefresh::Clock::now(), force)) {
+    return;
+  }
+  VELOX_NVTX_OPERATOR_FUNC_RANGE();
 
   auto lockedStats = stats_.wlock();
   const auto exchangeClientStats = exchangeClient_->stats();
+  lockedStats->runtimeStats["ucxExchange.statsSnapshots"].addValue(1);
   for (const auto& [name, value] : exchangeClientStats) {
     lockedStats->runtimeStats.erase(name);
     lockedStats->runtimeStats.insert({name, value});

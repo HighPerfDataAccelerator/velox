@@ -190,9 +190,9 @@ void CudfHiveDataSource::convertSplit(std::shared_ptr<ConnectorSplit> split) {
   // Convert `HiveConnectorSplit` to `CudfHiveConnectorSplit`
   auto hiveSplit = checkedPointerCast<hive::HiveConnectorSplit>(split);
 
-  VELOX_CHECK_EQ(
-      hiveSplit->fileFormat,
-      dwio::common::FileFormat::PARQUET,
+  VELOX_CHECK(
+      hiveSplit->fileFormat == dwio::common::FileFormat::PARQUET ||
+          hiveSplit->fileFormat == dwio::common::FileFormat::ORC,
       "Unsupported file format for conversion from HiveConnectorSplit to CudfHiveConnectorSplit");
 
   // Remove "file:" prefix from the file path if present
@@ -207,6 +207,7 @@ void CudfHiveDataSource::convertSplit(std::shared_ptr<ConnectorSplit> split) {
   }
 
   auto cudfHiveSplitBuilder = CudfHiveConnectorSplitBuilder(cleanedPath)
+                                  .fileFormat(hiveSplit->fileFormat)
                                   .start(hiveSplit->start)
                                   .length(hiveSplit->length)
                                   .connectorId(hiveSplit->connectorId)

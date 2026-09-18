@@ -21,6 +21,9 @@
 #include "velox/experimental/cudf/exec/CudfPackedRestore.h"
 #include "velox/experimental/cudf/exec/CudfPackedSpill.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
+#include "velox/experimental/cudf/exec/GracePinnedTransfer.h"
+#include "velox/experimental/cudf/exec/GraceStagingPolicy.h"
+#include "velox/experimental/cudf/exec/HostStagingCopy.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/expression/AstExpression.h"
@@ -71,6 +74,7 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -138,8 +142,7 @@ std::optional<int32_t> mppTaskFragmentId(std::string_view taskId) {
 }
 
 bool prebuildProbeFragmentSelected(std::string_view taskId) {
-  const auto* value =
-      std::getenv("CUDF_HASH_JOIN_PREBUILD_PROBE_FRAGMENT_IDS");
+  const auto* value = std::getenv("CUDF_HASH_JOIN_PREBUILD_PROBE_FRAGMENT_IDS");
   if (value == nullptr || *value == '\0') {
     return true;
   }
@@ -212,6 +215,19 @@ bool graceBulkProbeRestoreEnabled() {
       std::string_view(value) == "TRUE";
 }
 
+bool graceAsyncProbeRestoreEnabled() {
+  const auto* value = std::getenv("GLUTEN_CUDF_HASH_JOIN_ASYNC_PROBE_RESTORE");
+  return value != nullptr && std::string_view(value) == "1";
+}
+
+folly::CPUThreadPoolExecutor& graceProbeRestoreExecutor() {
+  // Each driver owns at most one future, bounded by its admitted output
+  // group. Do not create a new OS thread per packed chunk or wait on the
+  // demotion/read executors from a worker in that same executor.
+  static folly::CPUThreadPoolExecutor executor(4);
+  return executor;
+}
+
 bool graceAsyncBuildDemoteEnabled() {
   const auto* value = std::getenv("GLUTEN_CUDF_HASH_JOIN_ASYNC_BUILD_DEMOTE");
   if (value == nullptr) {
@@ -219,6 +235,13 @@ bool graceAsyncBuildDemoteEnabled() {
   }
   return std::string_view(value) == "1" || std::string_view(value) == "true" ||
       std::string_view(value) == "TRUE";
+}
+
+bool graceAsyncProbeDemoteEnabled() {
+  const auto* value = std::getenv("GLUTEN_CUDF_HASH_JOIN_ASYNC_PROBE_DEMOTE");
+  return value != nullptr &&
+      (std::string_view(value) == "1" || std::string_view(value) == "true" ||
+       std::string_view(value) == "TRUE");
 }
 
 bool gracePageableRestoreBounceEnabled() {
@@ -229,6 +252,18 @@ bool gracePageableRestoreBounceEnabled() {
   }
   return std::string_view(value) == "1" || std::string_view(value) == "true" ||
       std::string_view(value) == "TRUE";
+}
+
+bool graceStrictPinnedTransfersEnabled() {
+  const auto* value =
+      std::getenv("GLUTEN_CUDF_HASH_JOIN_STRICT_PINNED_TRANSFERS");
+  return value != nullptr && std::string_view(value) == "1";
+}
+
+bool graceAsyncBuildHostRestoreEnabled() {
+  const auto* value =
+      std::getenv("GLUTEN_CUDF_HASH_JOIN_ASYNC_BUILD_HOST_RESTORE");
+  return value != nullptr && std::string_view(value) == "1";
 }
 
 bool replayableResidentBuildFinalizeEnabled() {
@@ -251,7 +286,7 @@ size_t graceBuildDemoteThreads() {
     if (end == value || *end != '\0') {
       return size_t{2};
     }
-    return static_cast<size_t>(std::clamp<uint64_t>(requested, 1, 8));
+    return static_cast<size_t>(std::clamp<uint64_t>(requested, 1, 16));
   }();
   return threads;
 }
@@ -267,6 +302,37 @@ folly::CPUThreadPoolExecutor& graceBuildDemoteExecutor() {
 // that vector (not copies), so each slice can be partitioned and packed to
 // host before the next slice is submitted.
 constexpr uint64_t kGracePartitionBatchBytes = 256ULL << 20;
+
+bool boundedGracePinnedStagingEnabled() {
+  static const bool enabled = [] {
+    const auto* value =
+        std::getenv("GLUTEN_CUDF_HASH_JOIN_BOUNDED_PINNED_STAGING");
+    return value != nullptr && std::string_view(value) == "1";
+  }();
+  return enabled;
+}
+
+uint64_t gracePackedBufferCount(cudf::column_view column) {
+  // Conservatively include both data and validity buffers even when empty.
+  uint64_t count = 2;
+  for (auto child = column.child_begin(); child != column.child_end();
+       ++child) {
+    count += gracePackedBufferCount(*child);
+  }
+  return count;
+}
+
+uint64_t gracePartitionDataBudget(cudf::table_view table, uint64_t partitions) {
+  if (!boundedGracePinnedStagingEnabled()) {
+    return kGracePartitionBatchBytes;
+  }
+  uint64_t buffers = 0;
+  for (auto column : table) {
+    buffers += gracePackedBufferCount(column);
+  }
+  return facebook::velox::cudf_velox::detail::gracePartitionDataBudget(
+      kGracePartitionBatchBytes, buffers, partitions);
+}
 
 // Build and probe have already crossed an MPP hash exchange using libcudf's
 // default seed. Reusing it for Grace fanout leaves the exchange-selected low
@@ -339,13 +405,12 @@ struct HashJoinPackTiming {
   uint64_t storageConsumerMicros{0};
   uint64_t pinnedStagingAcquireMicros{0};
   bool usedPinnedStaging{false};
+  uint64_t shortPinnedBytes{0};
 };
 
 struct CudaPinnedHostDeleter {
   void operator()(uint8_t* data) const {
     if (data != nullptr) {
-      // A deleter cannot report an error.  All submitted copies are
-      // synchronized before this object is destroyed.
       cudaFreeHost(data);
     }
   }
@@ -403,40 +468,76 @@ class GracePinnedHostStagingPool {
     }
   }
 
-  GracePinnedHostStagingLease acquire(uint64_t requiredBytes) {
+  GracePinnedHostStagingLease acquire(
+      uint64_t requiredBytes,
+      bool waitForShortLease = false) {
+    nvtx3::scoped_range acquireRange("GraceHost::acquireSlot");
     if (requiredBytes == 0) {
       return {};
     }
-    std::lock_guard<std::mutex> lock(mutex_);
-    size_t available = slots_.size();
-    for (size_t i = 0; i < slots_.size(); ++i) {
-      if (!slots_[i]->busy && slots_[i]->capacity >= requiredBytes) {
-        slots_[i]->busy = true;
-        return {this, i, slots_[i]->data.get()};
-      }
-      if (!slots_[i]->busy && available == slots_.size()) {
-        available = i;
-      }
-    }
-    if (available == slots_.size() && slots_.size() < maxSlots_) {
-      slots_.push_back(std::make_unique<Slot>());
-      available = slots_.size() - 1;
-    }
-    if (available == slots_.size()) {
-      // Acquisition never waits. Probe prefetch can retain a lease until a
-      // later operator turn, and build demotion is independently asynchronous;
-      // pageable staging remains the bounded correctness fallback.
+    const bool bounded = boundedGracePinnedStagingEnabled();
+    if (bounded && requiredBytes > kGracePartitionBatchBytes) {
+      nvtx3::scoped_range reason("GraceHost::slotOversize");
+      // Never grow a registered slot beyond its budget, including for skewed
+      // variable-width data. The caller retains its pageable-copy fallback.
       return {};
+    }
+    std::unique_lock<std::mutex> lock(mutex_);
+    size_t available;
+    for (;;) {
+      available = slots_.size();
+      for (size_t i = 0; i < slots_.size(); ++i) {
+        if (!slots_[i]->busy && slots_[i]->capacity >= requiredBytes) {
+          slots_[i]->busy = true;
+          return {this, i, slots_[i]->data.get()};
+        }
+        if (!slots_[i]->busy && available == slots_.size()) {
+          available = i;
+        }
+      }
+      if (available == slots_.size() && slots_.size() < maxSlots_) {
+        slots_.push_back(std::make_unique<Slot>());
+        available = slots_.size() - 1;
+      }
+      if (available != slots_.size()) {
+        break;
+      }
+      if (!waitForShortLease) {
+        nvtx3::scoped_range reason("GraceHost::slotsBusy");
+        // Long-lived demotion/prefetch leases must never be waited on here:
+        // their completion may require a later turn of this same driver.
+        return {};
+      }
+      // Only the dedicated synchronous-copy pool uses this option. Its
+      // holders do not queue futures or await another driver while leased.
+      nvtx3::scoped_range waitRange("GraceHost::waitShortSlot");
+      slotAvailable_.wait(lock);
     }
     auto& slot = *slots_[available];
     uint8_t* allocated = nullptr;
     const auto allocationBytes =
         std::max<uint64_t>(kGracePartitionBatchBytes, requiredBytes);
-    const auto status = cudaHostAlloc(
-        reinterpret_cast<void**>(&allocated),
-        allocationBytes,
-        cudaHostAllocDefault);
+    if (bounded) {
+      // This slot has never been allocated: successful fixed-size slots are
+      // always reusable above. Reserve it before dropping the lock, so other
+      // drivers can release/use existing slots while CUDA registers memory.
+      VELOX_CHECK_EQ(slot.capacity, 0);
+      slot.busy = true;
+      lock.unlock();
+    }
+    const auto status = [&] {
+      nvtx3::scoped_range registerRange("GraceHost::registerSlot");
+      return cudaHostAlloc(
+          reinterpret_cast<void**>(&allocated),
+          allocationBytes,
+          cudaHostAllocDefault);
+    }();
+    if (bounded) {
+      lock.lock();
+      slot.busy = false;
+    }
     if (status != cudaSuccess) {
+      slotAvailable_.notify_one();
       // Preserve an existing smaller allocation. Pinned staging is an
       // optimization; pageable memory remains the correctness fallback.
       LOG(WARNING) << "Grace hash join could not allocate " << allocationBytes
@@ -445,9 +546,14 @@ class GracePinnedHostStagingPool {
                    << "; falling back to pageable copies";
       return {};
     }
-    slot.data.reset(allocated);
+    slot.data = std::unique_ptr<uint8_t, CudaPinnedHostDeleter>(
+        allocated, CudaPinnedHostDeleter{});
     slot.capacity = allocationBytes;
     slot.busy = true;
+    LOG(WARNING) << "CUDF_GRACE_PINNED_STAGING bounded=" << bounded
+                 << " slot=" << available << " slots=" << slots_.size()
+                 << " maxSlots=" << maxSlots_ << " capacity=" << allocationBytes
+                 << " required=" << requiredBytes;
     return {this, available, slot.data.get()};
   }
 
@@ -461,11 +567,37 @@ class GracePinnedHostStagingPool {
     return std::shared_ptr<uint8_t>(owner, owner->data());
   }
 
+  // Restore is latency-sensitive: reuse an idle fixed-capacity D2H slot but
+  // never register or resize pinned memory on the H2D critical path.
+  std::shared_ptr<uint8_t> acquireSharedIfReady(uint64_t requiredBytes) {
+    if (requiredBytes == 0 || requiredBytes > kGracePartitionBatchBytes) {
+      return nullptr;
+    }
+    GracePinnedHostStagingLease lease;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      for (size_t i = 0; i < slots_.size(); ++i) {
+        if (!slots_[i]->busy && slots_[i]->capacity >= requiredBytes) {
+          slots_[i]->busy = true;
+          lease = GracePinnedHostStagingLease(this, i, slots_[i]->data.get());
+          break;
+        }
+      }
+    }
+    if (!lease) {
+      return nullptr;
+    }
+    auto owner =
+        std::make_shared<GracePinnedHostStagingLease>(std::move(lease));
+    return std::shared_ptr<uint8_t>(owner, owner->data());
+  }
+
   void release(size_t slot) {
     std::lock_guard<std::mutex> lock(mutex_);
     VELOX_CHECK_LT(slot, slots_.size());
     VELOX_CHECK(slots_[slot]->busy);
     slots_[slot]->busy = false;
+    slotAvailable_.notify_one();
   }
 
  private:
@@ -476,6 +608,7 @@ class GracePinnedHostStagingPool {
   };
 
   std::mutex mutex_;
+  std::condition_variable slotAvailable_;
   std::vector<std::unique_ptr<Slot>> slots_;
   size_t maxSlots_;
 };
@@ -506,6 +639,14 @@ GracePinnedHostStagingLease::~GracePinnedHostStagingLease() {
 GracePinnedHostStagingPool& gracePinnedHostStagingPool() {
   static GracePinnedHostStagingPool pool(
       "CUDF_HASH_JOIN_GRACE_PINNED_BUFFER_COUNT", 4);
+  return pool;
+}
+
+GracePinnedHostStagingPool& graceShortPinnedCopyPool() {
+  // Independent of leases retained by demotion, prefetch or storage writes.
+  // Two fixed 256-MiB scratch slots by default; no packet-sized growth.
+  static GracePinnedHostStagingPool pool(
+      "CUDF_HASH_JOIN_GRACE_SHORT_COPY_SLOTS", 2);
   return pool;
 }
 
@@ -556,6 +697,8 @@ folly::CPUThreadPoolExecutor& graceSpillReadExecutor() {
 
 using HashJoinPartitionConsumer =
     std::function<void(size_t, HashJoinHostBatch)>;
+using HashJoinDevicePartitionConsumer =
+    std::function<bool(size_t, cudf::table_view, uint64_t)>;
 
 void packHashJoinPartitions(
     cudf::table_view table,
@@ -564,7 +707,8 @@ void packHashJoinPartitions(
     rmm::device_async_resource_ref mr,
     const HashJoinPartitionConsumer& consumer,
     HashJoinPackTiming* timing = nullptr,
-    bool useDedicatedBuildStaging = false) {
+    bool useDedicatedBuildStaging = false,
+    const HashJoinDevicePartitionConsumer& deviceConsumer = {}) {
   const auto splitStart = std::chrono::steady_clock::now();
   // contiguous_split packs every partition in one libcudf operation.  Keep
   // all device buffers alive while the D2H copies are submitted, then wait
@@ -574,8 +718,14 @@ void packHashJoinPartitions(
   auto packedPartitions = cudf::contiguous_split(table, splits, stream, mr);
   const auto splitEnd = std::chrono::steady_clock::now();
   uint64_t totalDataBytes = 0;
-  for (const auto& packed : packedPartitions) {
-    totalDataBytes += packed.data.gpu_data->size();
+  std::vector<bool> consumedOnDevice(packedPartitions.size(), false);
+  for (size_t i = 0; i < packedPartitions.size(); ++i) {
+    const auto& packed = packedPartitions[i];
+    consumedOnDevice[i] = deviceConsumer &&
+        deviceConsumer(i, packed.table, packed.data.gpu_data->size());
+    if (!consumedOnDevice[i]) {
+      totalDataBytes += packed.data.gpu_data->size();
+    }
   }
   // Reuse one of a small process-wide pool of staging buffers. The storage
   // consumer runs while this lease is held, so a disk-bound partition can
@@ -596,6 +746,9 @@ void packHashJoinPartitions(
   std::vector<std::shared_ptr<uint8_t>> pageableFallbacks(
       packedPartitions.size());
   for (size_t i = 0; i < packedPartitions.size(); ++i) {
+    if (consumedOnDevice[i]) {
+      continue;
+    }
     auto& packed = packedPartitions[i];
     const auto dataBytes = packed.data.gpu_data->size();
     if (dataBytes > 0) {
@@ -603,13 +756,26 @@ void packHashJoinPartitions(
         pageableFallbacks[i] = std::shared_ptr<uint8_t>(
             new uint8_t[dataBytes], std::default_delete<uint8_t[]>());
       }
-      CUDF_CUDA_TRY(cudaMemcpyAsync(
-          usePinnedStaging ? pinnedData + pinnedOffset
-                           : pageableFallbacks[i].get(),
-          packed.data.gpu_data->data(),
-          dataBytes,
-          cudaMemcpyDeviceToHost,
-          stream.value()));
+      if (!usePinnedStaging && graceStrictPinnedTransfersEnabled()) {
+        const auto copy = grace_transfer::copyGraceViaPinned(
+            packed.data.gpu_data->data(),
+            pageableFallbacks[i].get(),
+            dataBytes,
+            false,
+            stream);
+        if (timing != nullptr) {
+          timing->shortPinnedBytes += copy.bytes;
+          timing->pinnedToPageableCopyMicros += copy.hostCopyMicros;
+        }
+      } else {
+        CUDF_CUDA_TRY(cudaMemcpyAsync(
+            usePinnedStaging ? pinnedData + pinnedOffset
+                             : pageableFallbacks[i].get(),
+            packed.data.gpu_data->data(),
+            dataBytes,
+            cudaMemcpyDeviceToHost,
+            stream.value()));
+      }
     }
     pinnedOffset += dataBytes;
   }
@@ -619,6 +785,9 @@ void packHashJoinPartitions(
   uint64_t sourceOffset = 0;
   const auto consumerStart = std::chrono::steady_clock::now();
   for (size_t i = 0; i < packedPartitions.size(); ++i) {
+    if (consumedOnDevice[i]) {
+      continue;
+    }
     auto& packed = packedPartitions[i];
     HashJoinHostBatch host;
     host.dataBytes = packed.data.gpu_data->size();
@@ -654,7 +823,6 @@ void packHashJoinPartitions(
         std::chrono::duration_cast<std::chrono::microseconds>(
             synchronizeEnd - copySubmitEnd)
             .count();
-    timing->pinnedToPageableCopyMicros = 0;
     timing->storageConsumerMicros =
         std::chrono::duration_cast<std::chrono::microseconds>(
             consumerEnd - consumerStart)
@@ -687,26 +855,56 @@ bool demotePinnedGraceBatchAsync(HashJoinHostBatch& batch) {
     return false;
   }
   auto source = batch.data;
-  auto pageable = std::shared_ptr<uint8_t>(
-      new uint8_t[batch.dataBytes], std::default_delete<uint8_t[]>());
+  std::shared_ptr<uint8_t> pageable;
+  const auto* diagnostics =
+      std::getenv("GLUTEN_CUDF_GRACE_PAGEABLE_LIFETIME_DIAGNOSTICS");
+  if (diagnostics && std::string_view(diagnostics) == "1") {
+    auto data = std::unique_ptr<uint8_t[]>(new uint8_t[batch.dataBytes]);
+    auto lifetime = std::make_shared<nvtx3::unique_range>(
+        fmt::format("GraceHost::pageableLive bytes={}", batch.dataBytes)
+            .c_str());
+    pageable = std::shared_ptr<uint8_t>(
+        data.release(),
+        [lifetime = std::move(lifetime)](uint8_t* pointer) mutable {
+          delete[] pointer;
+          lifetime.reset();
+        });
+  } else {
+    pageable = std::shared_ptr<uint8_t>(
+        new uint8_t[batch.dataBytes], std::default_delete<uint8_t[]>());
+  }
   const auto dataBytes = batch.dataBytes;
   auto completion = std::make_shared<std::promise<void>>();
   batch.spillWriteFuture = completion->get_future().share();
-  auto copy =
-      [source = std::move(source), pageable, dataBytes, completion]() mutable {
-        try {
-          std::memcpy(pageable.get(), source.get(), dataBytes);
-          // Release the pinned lease before publishing completion. A
-          // packaged_task stores its callable in the future's shared state,
-          // which kept source alive until final build publication and starved
-          // every reusable staging slot even after memcpy had finished.
-          source.reset();
-          completion->set_value();
-        } catch (...) {
-          source.reset();
-          completion->set_exception(std::current_exception());
-        }
-      };
+  // A process range crosses the submitting/worker threads. The shared holder
+  // lets the worker end queue time on entry even while add() is returning.
+  auto queued = std::make_shared<std::unique_ptr<nvtx3::unique_range>>(
+      std::make_unique<nvtx3::unique_range>("GraceHost::demoteQueue"));
+  auto copy = [source = std::move(source),
+               pageable,
+               reservation = batch.hostReservation,
+               dataBytes,
+               queued,
+               completion]() mutable {
+    queued->reset();
+    try {
+      {
+        nvtx3::scoped_range copyRange("GraceHost::asyncDemoteMemcpy");
+        std::memcpy(pageable.get(), source.get(), dataBytes);
+      }
+      // Release the pinned lease before publishing completion. A
+      // packaged_task stores its callable in the future's shared state,
+      // which kept source alive until final build publication and starved
+      // every reusable staging slot even after memcpy had finished.
+      source.reset();
+      reservation.reset();
+      completion->set_value();
+    } catch (...) {
+      source.reset();
+      reservation.reset();
+      completion->set_exception(std::current_exception());
+    }
+  };
   batch.data = std::move(pageable);
   batch.pinned = false;
   try {
@@ -722,11 +920,13 @@ bool demotePinnedGraceBatchAsync(HashJoinHostBatch& batch) {
 }
 
 uint64_t waitForGraceResidentDemotions(GraceHashJoinBuildData& buildData) {
+  nvtx3::scoped_range range("GraceHost::waitBuildDemotions");
   const auto start = std::chrono::steady_clock::now();
   bool waited = false;
   const auto waitBatches = [&](std::vector<HashJoinHostBatch>& batches) {
     for (auto& batch : batches) {
       if (!batch.spillFile && batch.spillWriteFuture.valid()) {
+        nvtx3::scoped_range waitRange("GraceHost::waitBatchDemotion");
         batch.spillWriteFuture.get();
         batch.spillWriteFuture = {};
         waited = true;
@@ -876,11 +1076,141 @@ class ProbeMatchTracker {
 
 } // namespace
 
+grace_transfer::GracePinnedTransferStats grace_transfer::copyGraceViaPinned(
+    void* device,
+    void* host,
+    uint64_t bytes,
+    bool hostToDevice,
+    rmm::cuda_stream_view stream) {
+  nvtx3::scoped_range transferRange(
+      hostToDevice ? "GraceHost::shortH2D" : "GraceHost::shortD2H");
+  GracePinnedTransferStats stats;
+  if (bytes == 0) {
+    return stats;
+  }
+  const auto micros = [](auto start) {
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+               std::chrono::steady_clock::now() - start)
+        .count();
+  };
+  const auto acquireStart = std::chrono::steady_clock::now();
+  auto scratch =
+      graceShortPinnedCopyPool().acquire(kGracePartitionBatchBytes, true);
+  VELOX_CHECK(scratch, "Cannot allocate bounded pinned Grace copy scratch");
+  stats.slotAcquireMicros = micros(acquireStart);
+  auto* deviceBytes = static_cast<uint8_t*>(device);
+  auto* hostBytes = static_cast<uint8_t*>(host);
+  for (uint64_t offset = 0; offset < bytes;) {
+    const auto size = std::min(kGracePartitionBatchBytes, bytes - offset);
+    if (hostToDevice) {
+      nvtx3::scoped_range copyRange("GraceHost::shortMemcpyToPinned");
+      const auto start = std::chrono::steady_clock::now();
+      std::memcpy(scratch.data(), hostBytes + offset, size);
+      stats.hostCopyMicros += micros(start);
+    }
+    const auto start = std::chrono::steady_clock::now();
+    {
+      nvtx3::scoped_range dmaRange("GraceHost::shortDmaAndWait");
+      CUDF_CUDA_TRY(cudaMemcpyAsync(
+          hostToDevice ? deviceBytes + offset : scratch.data(),
+          hostToDevice ? scratch.data() : deviceBytes + offset,
+          size,
+          hostToDevice ? cudaMemcpyHostToDevice : cudaMemcpyDeviceToHost,
+          stream.value()));
+      stream.synchronize();
+    }
+    stats.deviceCopyMicros += micros(start);
+    if (!hostToDevice) {
+      nvtx3::scoped_range copyRange("GraceHost::shortMemcpyToPageable");
+      const auto copyStart = std::chrono::steady_clock::now();
+      static const bool parallelCopy = [] {
+        const auto* value =
+            std::getenv("GLUTEN_CUDF_GRACE_PARALLEL_PAGEABLE_COPY");
+        return value && std::string_view(value) == "1";
+      }();
+      host_staging::copyPageableHost(
+          hostBytes + offset,
+          scratch.data(),
+          size,
+          parallelCopy,
+          "GraceHost::parallelPageableCopyChunk");
+      stats.hostCopyMicros += micros(copyStart);
+    }
+    offset += size;
+  }
+  stats.bytes = bytes;
+  return stats;
+}
+
+struct CudfHashJoinProbe::GraceAsyncProbeGroup {
+  struct RestoredWave {
+    CudfBulkPackedRestore data;
+    uint64_t stagedBytes{0};
+    uint64_t stagingMicros{0};
+  };
+  GraceAsyncProbeGroup(size_t end, uint64_t bytes, rmm::cuda_stream_view stream)
+      : end(end), bytes(bytes), stream(stream) {
+    const auto* value = std::getenv("GLUTEN_CUDF_GRACE_DRIVER_RESTORE_WAIT");
+    schedulerVisible = value && std::string_view(value) == "1";
+    value = std::getenv("GLUTEN_CUDF_GRACE_STREAM_PROBE_OUTPUT");
+    streamOutput = value && std::string_view(value) == "1";
+    schedulerVisible = schedulerVisible || streamOutput;
+  }
+  ~GraceAsyncProbeGroup() {
+    // A packaged_task's std::future does not join on destruction. In-flight
+    // restore owns source payloads and uses the enclosing workspace budget.
+    if (pending.valid()) {
+      pending.wait();
+    }
+    finishOutputWait();
+  }
+  bool ready() const {
+    return !pending.valid() ||
+        pending.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+  }
+  void noteOutputReady() {
+    if (!firstOutputReady) {
+      firstOutputReady = std::chrono::steady_clock::now();
+      outputWaitRange = nvtxRangeStartA("GraceProbe::firstWaveToOutput");
+    }
+  }
+  uint64_t finishOutputWait() {
+    if (!firstOutputReady) {
+      return 0;
+    }
+    const auto nanos = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           std::chrono::steady_clock::now() - *firstOutputReady)
+                           .count();
+    nvtxRangeEnd(outputWaitRange);
+    firstOutputReady.reset();
+    return nanos;
+  }
+  size_t end;
+  uint64_t bytes;
+  rmm::cuda_stream_view stream;
+  bool schedulerVisible{false};
+  bool streamOutput{false};
+  vector_size_t zeroColumnRows{0};
+  uint64_t outputBytes{0};
+  std::vector<std::unique_ptr<cudf::table>> tables;
+  uint64_t restoreMicros{0};
+  uint64_t joinMicros{0};
+  std::future<RestoredWave> pending;
+  std::optional<RestoredWave> readyWave;
+  ContinueFuture wake{ContinueFuture::makeEmpty()};
+  std::optional<std::chrono::steady_clock::time_point> suspendedAt;
+  std::optional<std::chrono::steady_clock::time_point> firstOutputReady;
+  nvtxRangeId_t outputWaitRange{0};
+};
+
 void CudfHashJoinProbe::doClose() {
+  graceAsyncProbeGroup_.reset();
+  graceResidentOutputs_.clear();
+  graceResidentOutputBytes_ = 0;
+  graceResidentOutputRows_ = 0;
   prebuildProbeHostBatches_.clear();
   prebuildProbeBufferedBytes_ = 0;
   prebuildProbeBufferedRows_ = 0;
-  graceWorkspaceRequest_.reset();
   graceWorkspaceAdmission_.reset();
   Operator::close();
   filterEvaluator_.reset();
@@ -1097,14 +1427,15 @@ void CudfHashJoinBuild::partitionAndPack(CudfVectorPtr input) {
   auto stream = input->stream();
   const auto inputRows = input->size();
   const auto inputBytes = retainedCudfBytes(*input);
-  const uint64_t rowsPerSlice =
-      inputRows == 0 || inputBytes <= kGracePartitionBatchBytes
+  const auto sliceBudget =
+      gracePartitionDataBudget(input->getTableView(), gracePartitions_);
+  const uint64_t rowsPerSlice = inputRows == 0 || inputBytes <= sliceBudget
       ? std::max<uint64_t>(inputRows, 1)
       : std::max<uint64_t>(
             1,
             static_cast<uint64_t>(
-                static_cast<long double>(inputRows) *
-                kGracePartitionBatchBytes / inputBytes));
+                static_cast<long double>(inputRows) * sliceBudget /
+                inputBytes));
   for (uint64_t begin = 0; begin < inputRows; begin += rowsPerSlice) {
     const auto end = std::min<uint64_t>(inputRows, begin + rowsPerSlice);
     auto slices = cudf::slice(
@@ -1246,6 +1577,7 @@ void CudfHashJoinBuild::partitionAndPack(CudfVectorPtr input) {
                  << " pinnedStagingAcquireUs="
                  << packTiming.pinnedStagingAcquireMicros
                  << " usedPinnedStaging=" << packTiming.usedPinnedStaging
+                 << " shortPinnedBytes=" << packTiming.shortPinnedBytes
                  << " residentHostBytes=" << graceBuildData_->residentHostBytes
                  << " diskBytes=" << graceBuildData_->diskBytes
                  << " executorReservedHostBytes="
@@ -1874,6 +2206,14 @@ CudfHashJoinProbe::CudfHashJoinProbe(
       probeType_(joinNode_->sources()[0]->outputType()),
       buildType_(joinNode_->sources()[1]->outputType()),
       cudaEvent_(std::make_unique<CudaEvent>(cudaEventDisableTiming)) {
+  if (const auto* value =
+          std::getenv("GLUTEN_CUDF_HASH_JOIN_RESIDENT_OUTPUT_BYTES")) {
+    char* end = nullptr;
+    const auto bytes = std::strtoull(value, &end, 10);
+    if (end != value && *end == '\0' && bytes <= (256ULL << 20)) {
+      graceResidentOutputTargetBytes_ = bytes;
+    }
+  }
   auto const& leftKeys = joinNode_->leftKeys(); // probe keys
   auto const& rightKeys = joinNode_->rightKeys(); // build keys
 
@@ -1939,8 +2279,9 @@ CudfHashJoinProbe::CudfHashJoinProbe(
       }
     }
   }
-  if (!graceEnabled_ && (joinNode_->isInnerJoin() || joinNode_->isLeftJoin() ||
-                         joinNode_->isRightJoin())) {
+  if (!graceEnabled_ &&
+      (joinNode_->isInnerJoin() || joinNode_->isLeftJoin() ||
+       joinNode_->isRightJoin())) {
     if (const auto* value =
             std::getenv("CUDF_HASH_JOIN_PREBUILD_PROBE_HOST_BYTES")) {
       char* end = nullptr;
@@ -2021,7 +2362,14 @@ void CudfHashJoinProbe::spillGraceProbeBatch(
       tryReserveGraceHostMemory(batch.dataBytes, graceProbeHostLimitBytes_);
   if (graceProbeHostLimitBytes_ == 0 || reservation != nullptr) {
     batch.hostReservation = std::move(reservation);
-    graceHostDemoteMicros_ += demotePinnedGraceBatch(batch);
+    // Only pinned batches are queued: outstanding copies retain bounded
+    // staging leases. If the pool is exhausted, pack falls back to pageable
+    // D2H instead of growing an unbounded demotion queue. The batch future
+    // orders both scalar and bulk restoration after its producer completes.
+    if (!graceAsyncProbeDemoteEnabled() ||
+        !demotePinnedGraceBatchAsync(batch)) {
+      graceHostDemoteMicros_ += demotePinnedGraceBatch(batch);
+    }
     graceProbeResidentHostBytes_ += batch.dataBytes;
     return;
   }
@@ -2138,14 +2486,15 @@ void CudfHashJoinProbe::partitionAndPackProbe(CudfVectorPtr input) {
   const auto numPartitions = graceProbePartitions_.size();
   const auto inputRows = input->size();
   const auto inputBytes = retainedCudfBytes(*input);
-  const uint64_t rowsPerSlice =
-      inputRows == 0 || inputBytes <= kGracePartitionBatchBytes
+  const auto sliceBudget =
+      gracePartitionDataBudget(input->getTableView(), numPartitions);
+  const uint64_t rowsPerSlice = inputRows == 0 || inputBytes <= sliceBudget
       ? std::max<uint64_t>(inputRows, 1)
       : std::max<uint64_t>(
             1,
             static_cast<uint64_t>(
-                static_cast<long double>(inputRows) *
-                kGracePartitionBatchBytes / inputBytes));
+                static_cast<long double>(inputRows) * sliceBudget /
+                inputBytes));
   for (uint64_t begin = 0; begin < inputRows; begin += rowsPerSlice) {
     const auto end = std::min<uint64_t>(inputRows, begin + rowsPerSlice);
     auto slices = cudf::slice(
@@ -2197,6 +2546,12 @@ void CudfHashJoinProbe::partitionAndPackProbe(CudfVectorPtr input) {
           }
           spillGraceProbeBatch(host, partition);
           graceProbePartitions_[partition].push_back(std::move(host));
+        },
+        nullptr,
+        false,
+        [&](size_t partition, cudf::table_view table, uint64_t bytes) {
+          return graceResidentInputEligible_ &&
+              tryProbeGraceResidentPartition(partition, table, bytes, stream);
         });
   }
 }
@@ -2224,6 +2579,17 @@ void CudfHashJoinProbe::queueGraceProbeInput(CudfVectorPtr input) {
   VELOX_CHECK_NOT_NULL(input);
   ++graceProbeSourceBatches_;
   const auto inputBytes = retainedCudfBytes(*input);
+  if (graceBuildData_ && graceBuildData_->resident) {
+    // Coalesce only early output, not input owners. Large inputs and failed
+    // admissions use the original host path with the preserved build image.
+    VELOX_CHECK(!graceResidentOutputReady());
+    graceResidentInputEligible_ = inputBytes <= (1ULL << 30);
+    SCOPE_EXIT {
+      graceResidentInputEligible_ = false;
+    };
+    partitionAndPackProbe(std::move(input));
+    return;
+  }
   // Split only when the empty/non-empty chars pattern changes. Uniform
   // all-empty groups remain safe to concatenate and avoid fragmented
   // partition/pack launches.
@@ -2253,7 +2619,16 @@ CudfVectorPtr CudfHashJoinProbe::restoreHostBatch(
     HashJoinHostBatch& batch,
     const RowTypePtr& type,
     rmm::cuda_stream_view stream,
-    bool consume) {
+    bool consume,
+    std::shared_ptr<uint8_t> stagedData) {
+  VELOX_CHECK(!stagedData || !batch.spillFile);
+  bool stagedTransferComplete = false;
+  SCOPE_EXIT {
+    // A staged lease must outlive any partially submitted DMA on error.
+    if (stagedData && !stagedTransferComplete) {
+      cudaStreamSynchronize(stream.value());
+    }
+  };
   if (batch.spillWriteFuture.valid()) {
     batch.spillWriteFuture.get();
   }
@@ -2271,7 +2646,7 @@ CudfVectorPtr CudfHashJoinProbe::restoreHostBatch(
       : GracePinnedHostStagingLease{};
   auto* pinnedData = batch.pinned ? batch.data.get() : pinnedStaging.data();
   std::unique_ptr<uint8_t[]> diskData;
-  const uint8_t* sourceData = batch.data.get();
+  const uint8_t* sourceData = stagedData ? stagedData.get() : batch.data.get();
   const auto hostStageStart = std::chrono::steady_clock::now();
   if (batch.spillFile) {
     // A probe read-ahead stores the raw range directly in a pooled pinned
@@ -2292,13 +2667,15 @@ CudfVectorPtr CudfHashJoinProbe::restoreHostBatch(
       batch.dataBytes == 0 || sourceData != nullptr,
       "Grace hash join batch has neither host data nor a spill file");
   const auto usedPinnedSource = batch.dataBytes > 0 &&
-      ((batch.pinned && batch.data != nullptr) || pinnedStaging);
+      (stagedData || (batch.pinned && batch.data != nullptr) || pinnedStaging);
+  const bool shortPinnedCopy =
+      !usedPinnedSource && graceStrictPinnedTransfersEnabled();
   if (batch.spillFile) {
     graceRestoreDiskBytes_ += batch.dataBytes;
   } else {
     graceRestoreResidentBytes_ += batch.dataBytes;
   }
-  if (usedPinnedSource) {
+  if (usedPinnedSource || shortPinnedCopy) {
     graceRestorePinnedSourceBytes_ += batch.dataBytes;
   } else {
     graceRestorePageableDirectBytes_ += batch.dataBytes;
@@ -2307,14 +2684,33 @@ CudfVectorPtr CudfHashJoinProbe::restoreHostBatch(
       std::chrono::duration_cast<std::chrono::microseconds>(
           hostStageEnd - hostStageStart)
           .count();
-  CUDF_CUDA_TRY(cudaMemcpyAsync(
-      gpuData->data(),
-      sourceData,
-      batch.dataBytes,
-      cudaMemcpyHostToDevice,
-      stream.value()));
+  if (shortPinnedCopy) {
+    const auto copy = grace_transfer::copyGraceViaPinned(
+        gpuData->data(),
+        const_cast<uint8_t*>(sourceData),
+        batch.dataBytes,
+        true,
+        stream);
+    graceRestoreHostStageMicros_ += copy.hostCopyMicros;
+    graceRestoreCopySynchronizeMicros_ += copy.deviceCopyMicros;
+    addRuntimeStat(
+        "cudfGraceShortPinnedRestoreBytes",
+        RuntimeCounter(copy.bytes, RuntimeCounter::Unit::kBytes));
+    addRuntimeStat(
+        "cudfGraceShortPinnedAcquireNanos",
+        RuntimeCounter(
+            copy.slotAcquireMicros * 1000, RuntimeCounter::Unit::kNanos));
+  } else {
+    CUDF_CUDA_TRY(cudaMemcpyAsync(
+        gpuData->data(),
+        sourceData,
+        batch.dataBytes,
+        cudaMemcpyHostToDevice,
+        stream.value()));
+  }
   const auto copySynchronizeStart = std::chrono::steady_clock::now();
   stream.synchronize();
+  stagedTransferComplete = true;
   graceRestoreCopySynchronizeMicros_ +=
       std::chrono::duration_cast<std::chrono::microseconds>(
           std::chrono::steady_clock::now() - copySynchronizeStart)
@@ -2548,7 +2944,8 @@ GraceHashJoinPartitionSet CudfHashJoinProbe::repartitionGracePartition(
 
 void CudfHashJoinProbe::loadGraceBuildPartition(
     GraceHashJoinPartition& partition,
-    rmm::cuda_stream_view stream) {
+    rmm::cuda_stream_view stream,
+    bool preserveHost) {
   VELOX_CHECK_NOT_NULL(graceBuildData_);
   auto& hostBatches = partition.build;
   uint64_t buildBytes = 0;
@@ -2557,7 +2954,7 @@ void CudfHashJoinProbe::loadGraceBuildPartition(
     buildBytes += host.dataBytes;
     buildRows += host.rows;
   }
-  const auto useBulkRestore = graceBulkBuildRestoreEnabled();
+  const auto useBulkRestore = graceBulkBuildRestoreEnabled() && !preserveHost;
   CudfBulkPackedRestore bulkRestored;
   CudfBulkPackedRestoreStats bulkRestoreStats;
   std::vector<CudfVectorPtr> restored;
@@ -2625,11 +3022,87 @@ void CudfHashJoinProbe::loadGraceBuildPartition(
         bulkRestoreStats.copyStreamSynchronizeMicros;
   } else {
     restored.reserve(hostBatches.size());
-    // Compatibility path for same-binary A/B. A partition is single-owner,
-    // but retain the historical per-batch metadata copy and H2D sync here so
-    // the switch isolates only the bulk restore implementation.
-    for (auto& host : hostBatches) {
-      restored.push_back(restoreHostBatch(host, buildType_, stream, false));
+    struct HostStage {
+      std::shared_ptr<uint8_t> data;
+      std::future<uint64_t> ready;
+    };
+    std::vector<HostStage> stages(hostBatches.size());
+    SCOPE_EXIT {
+      // packaged_task futures do not join on destruction. Retain owners on
+      // cancellation or failure until all submitted CPU copies finish.
+      for (auto& stage : stages) {
+        if (stage.ready.valid()) {
+          stage.ready.wait();
+        }
+      }
+    };
+    const bool stageHost = graceAsyncBuildHostRestoreEnabled();
+    constexpr size_t kHostStageDepth = 4;
+    const auto schedule = [&](size_t index) {
+      if (!stageHost || index >= hostBatches.size()) {
+        return;
+      }
+      auto& host = hostBatches[index];
+      // Disk/pinned/oversized images retain the established restore path.
+      // Never register or grow a pinned slot on the restore critical path.
+      if (host.spillFile || host.pinned || !host.data || host.dataBytes == 0) {
+        return;
+      }
+      if (host.spillWriteFuture.valid()) {
+        host.spillWriteFuture.get();
+      }
+      auto pinned = graceBuildPinnedHostStagingPool().acquireSharedIfReady(
+          host.dataBytes);
+      if (!pinned) {
+        return;
+      }
+      auto copy = std::make_shared<std::packaged_task<uint64_t()>>(
+          [source = host.data,
+           reservation = host.hostReservation,
+           destination = pinned,
+           bytes = host.dataBytes] {
+            nvtx3::scoped_range range("GraceBuild::stageHostBatch");
+            const auto start = std::chrono::steady_clock::now();
+            std::memcpy(destination.get(), source.get(), bytes);
+            return std::chrono::duration_cast<std::chrono::microseconds>(
+                       std::chrono::steady_clock::now() - start)
+                .count();
+          });
+      stages[index].data = std::move(pinned);
+      stages[index].ready = copy->get_future();
+      try {
+        graceBuildDemoteExecutor().add([copy] { (*copy)(); });
+      } catch (...) {
+        (*copy)();
+      }
+      addRuntimeStat(
+          "cudfGraceAsyncBuildHostStageBytes",
+          RuntimeCounter(host.dataBytes, RuntimeCounter::Unit::kBytes));
+    };
+    for (size_t i = 0; i < std::min(kHostStageDepth, hostBatches.size()); ++i) {
+      schedule(i);
+    }
+    for (size_t i = 0; i < hostBatches.size(); ++i) {
+      auto& stage = stages[i];
+      if (stage.ready.valid()) {
+        nvtx3::scoped_range range("GraceBuild::waitHostBatch");
+        const auto start = std::chrono::steady_clock::now();
+        const auto copyMicros = stage.ready.get();
+        graceRestoreHostStageMicros_ += copyMicros;
+        const auto waitNanos =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - start)
+                .count();
+        addRuntimeStat(
+            "cudfGraceAsyncBuildHostStageWaitNanos",
+            RuntimeCounter(waitNanos, RuntimeCounter::Unit::kNanos));
+      }
+      // CPU preparation of N+1 overlaps H2D of N. GPU allocation/order are
+      // unchanged. Keep original host images/metadata for resident replay.
+      restored.push_back(restoreHostBatch(
+          hostBatches[i], buildType_, stream, false, std::move(stage.data)));
+      // H2D has completed and released the pinned lease before refill.
+      schedule(i + kHostStageDepth);
     }
   }
   const auto restoreEnd = std::chrono::steady_clock::now();
@@ -2694,6 +3167,187 @@ void CudfHashJoinProbe::loadGraceBuildPartition(
                << std::chrono::duration_cast<std::chrono::microseconds>(
                       hashEnd - concatenateEnd)
                       .count();
+}
+
+void CudfHashJoinProbe::initializeGraceResidentPartition() {
+  const auto* enabled = std::getenv("GLUTEN_CUDF_HASH_JOIN_RESIDENT_PROBE");
+  if (!enabled || std::string_view(enabled) != "1" ||
+      !joinNode_->isInnerJoin() || joinNode_->filter() ||
+      graceEagerProbeBufferLimitBytes_ > 0) {
+    // Eager pre-build buffering has a separate peer/publication lifecycle.
+    // Keep its existing path until that combination is explicitly qualified.
+    return;
+  }
+  std::call_once(graceBuildData_->residentInit, [&]() {
+    // This first hybrid step only promotes root partition zero, once. Do not
+    // chase favourable partitions or retry an admission under pressure.
+    constexpr uint64_t kMaxBuildBytes = 2ULL << 30;
+    uint64_t limit = kMaxBuildBytes;
+    if (const auto* value =
+            std::getenv("GLUTEN_CUDF_HASH_JOIN_RESIDENT_BUILD_MAX_BYTES")) {
+      char* end = nullptr;
+      const auto parsed = std::strtoull(value, &end, 10);
+      if (end != value && *end == '\0' && parsed <= kMaxBuildBytes) {
+        limit = parsed;
+      }
+    }
+    if (graceBuildData_->partitions.empty()) {
+      return;
+    }
+    uint64_t bytes = 0;
+    uint64_t rows = 0;
+    for (const auto& batch : graceBuildData_->partitions[0]) {
+      bytes += batch.dataBytes;
+      rows += batch.rows;
+    }
+    if (rows == 0 || rows > std::numeric_limits<cudf::size_type>::max() ||
+        bytes > std::min(limit, graceRestoreBuildBytes_)) {
+      addRuntimeStat("cudfGraceResidentBuildRejected", RuntimeCounter(1));
+      return;
+    }
+    // Restore + concatenate + hash construction can briefly coexist. Keep
+    // an additional 8 GiB physical headroom for input/output and other joins.
+    auto workspace = tryAcquireBackgroundDeviceMemoryWorkspace(
+        bytes * 3 + (512ULL << 20),
+        8ULL << 30,
+        DeviceMemoryWorkspacePriority::kInput);
+    if (!workspace) {
+      addRuntimeStat("cudfGraceResidentBuildRejected", RuntimeCounter(1));
+      return;
+    }
+    GraceHashJoinPartition partition(exec::SpillPartitionId(0));
+    partition.build = std::move(graceBuildData_->partitions[0]);
+    SCOPE_EXIT {
+      graceBuildData_->partitions[0] = std::move(partition.build);
+      hashObject_.reset();
+    };
+    auto stream = cudfGlobalStreamPool().get_stream();
+    loadGraceBuildPartition(partition, stream, /*preserveHost=*/true);
+    auto resident =
+        std::make_shared<GraceHashJoinBuildData::ResidentPartition>();
+    resident->partition = 0;
+    resident->table = hashObject_->first.at(0);
+    resident->hash = hashObject_->second.at(0);
+    // loadGraceBuildPartition synchronizes construction before publication.
+    // Physical allocations now account for the persistent hash/table; the
+    // transient construction lease must not survive downstream backpressure.
+    graceBuildData_->resident = std::move(resident);
+    addRuntimeStat(
+        "cudfGraceResidentBuildBytes",
+        RuntimeCounter(bytes, RuntimeCounter::Unit::kBytes));
+    LOG(WARNING) << "CudfHashJoinProbe node=" << planNodeId()
+                 << " resident Grace partition=0 buildBytes=" << bytes
+                 << " rows=" << rows << " hostBuildPreserved=1";
+  });
+}
+
+bool CudfHashJoinProbe::tryProbeGraceResidentPartition(
+    size_t partition,
+    cudf::table_view table,
+    uint64_t bytes,
+    rmm::cuda_stream_view stream) {
+  if (!graceBuildData_ || !graceBuildData_->resident ||
+      partition != graceBuildData_->resident->partition) {
+    return false;
+  }
+  if (table.num_rows() == 0) {
+    return true;
+  }
+  auto workspace = tryAcquireBackgroundDeviceMemoryWorkspace(
+      estimateGraceProbeWorkspaceBytes(bytes),
+      8ULL << 30,
+      DeviceMemoryWorkspacePriority::kDrain);
+  if (!workspace) {
+    graceResidentFlushRequested_ = !graceResidentOutputs_.empty();
+    addRuntimeStat(
+        "cudfGraceResidentProbeFallbackBytes",
+        RuntimeCounter(bytes, RuntimeCounter::Unit::kBytes));
+    return false;
+  }
+  VELOX_CHECK(!hashObject_.has_value());
+  const auto& resident = *graceBuildData_->resident;
+  hashObject_ = std::make_pair(
+      std::vector<std::shared_ptr<cudf::table>>{resident.table},
+      std::vector<std::shared_ptr<cudf::hash_join>>{resident.hash});
+  SCOPE_EXIT {
+    hashObject_.reset();
+  };
+  std::vector<JoinOutput> outputs;
+  {
+    std::lock_guard<std::mutex> lock(cudfCucoMutex());
+    outputs = innerJoin(table, stream);
+    stream.synchronize();
+  }
+  for (auto& output : outputs) {
+    if (output.numRows > 0) {
+      auto batch = std::make_shared<CudfVector>(
+          pool(), outputType_, output.numRows, std::move(output.table), stream);
+      graceResidentOutputBytes_ += retainedCudfBytes(*batch);
+      graceResidentOutputRows_ += output.numRows;
+      graceResidentOutputs_.push_back(std::move(batch));
+    }
+  }
+  addRuntimeStat(
+      "cudfGraceResidentProbeBypassBytes",
+      RuntimeCounter(bytes, RuntimeCounter::Unit::kBytes));
+  addRuntimeStat(
+      "cudfGraceResidentProbeBypassRows",
+      RuntimeCounter(table.num_rows(), RuntimeCounter::Unit::kNone));
+  return true;
+}
+
+bool CudfHashJoinProbe::graceResidentOutputReady() const {
+  return !graceResidentOutputs_.empty() &&
+      (graceResidentFlushRequested_ ||
+       graceResidentOutputBytes_ >= graceResidentOutputTargetBytes_ ||
+       graceResidentOutputRows_ >= 2000000 ||
+       graceResidentOutputs_.size() >= 64);
+}
+
+RowVectorPtr CudfHashJoinProbe::takeGraceResidentOutput() {
+  VELOX_CHECK(!graceResidentOutputs_.empty());
+  auto workspace =
+      graceResidentOutputTargetBytes_ > 0 && graceResidentOutputs_.size() > 1
+      ? tryAcquireBackgroundDeviceMemoryWorkspace(
+            graceResidentOutputBytes_ + (256ULL << 20),
+            8ULL << 30,
+            DeviceMemoryWorkspacePriority::kOutput)
+      : std::nullopt;
+  if (!workspace) {
+    // Flush without another allocation when concat cannot be admitted. Keep
+    // draining instead of accepting inputs and waiting for memory to appear.
+    auto output = std::move(graceResidentOutputs_.front());
+    graceResidentOutputs_.pop_front();
+    graceResidentOutputBytes_ -=
+        retainedCudfBytes(*std::dynamic_pointer_cast<CudfVector>(output));
+    graceResidentOutputRows_ -= output->size();
+    graceResidentFlushRequested_ = !graceResidentOutputs_.empty();
+    return output;
+  }
+  auto stream =
+      std::dynamic_pointer_cast<CudfVector>(graceResidentOutputs_.front())
+          ->stream();
+  const auto rows = graceResidentOutputRows_;
+  const auto batches = graceResidentOutputs_.size();
+  std::vector<CudfVectorPtr> inputs;
+  inputs.reserve(batches);
+  while (!graceResidentOutputs_.empty()) {
+    inputs.push_back(
+        std::dynamic_pointer_cast<CudfVector>(
+            std::move(graceResidentOutputs_.front())));
+    graceResidentOutputs_.pop_front();
+  }
+  auto table = getConcatenatedTable(
+      std::move(inputs), outputType_, stream, get_output_mr());
+  stream.synchronize();
+  graceResidentOutputBytes_ = 0;
+  graceResidentOutputRows_ = 0;
+  graceResidentFlushRequested_ = false;
+  addRuntimeStat(
+      "cudfGraceResidentCoalescedInputBatches", RuntimeCounter(batches));
+  addRuntimeStat("cudfGraceResidentCoalescedOutputs", RuntimeCounter(1));
+  return std::make_shared<CudfVector>(
+      pool(), outputType_, rows, std::move(table), stream);
 }
 
 uint64_t CudfHashJoinProbe::estimateGraceBuildWorkspaceBytes(
@@ -2781,7 +3435,8 @@ RowVectorPtr CudfHashJoinProbe::getGraceOutput() {
   auto cudfHashJoinBridge =
       std::dynamic_pointer_cast<CudfHashJoinBridge>(joinBridge);
   VELOX_CHECK_NOT_NULL(cudfHashJoinBridge);
-  auto stream = cudfGlobalStreamPool().get_stream();
+  auto stream = graceAsyncProbeGroup_ ? graceAsyncProbeGroup_->stream
+                                      : cudfGlobalStreamPool().get_stream();
   while (true) {
     if (!gracePartition_.has_value()) {
       gracePartition_ = cudfHashJoinBridge->nextGracePartition();
@@ -2862,7 +3517,7 @@ RowVectorPtr CudfHashJoinProbe::getGraceOutput() {
       // driver waits on downstream output or probe prefetch.
       graceWorkspaceAdmission_.reset();
     }
-    if (graceProbeChunk_ >= probeBatches.size()) {
+    if (!graceAsyncProbeGroup_ && graceProbeChunk_ >= probeBatches.size()) {
       if (joinNode_->isRightJoin() && !gracePartitionUnmatchedEmitted_) {
         if (!acquireGraceWorkspace(
                 estimateGraceProbeWorkspaceBytes(buildBytes),
@@ -2925,9 +3580,11 @@ RowVectorPtr CudfHashJoinProbe::getGraceOutput() {
     // The global device arbitrator admits the complete group at kDrain
     // priority, so two drivers cannot independently overcommit the GPU.
     const auto groupBegin = graceProbeChunk_;
-    auto groupEnd = groupBegin;
-    uint64_t groupBytes = 0;
-    while (groupEnd < probeBatches.size()) {
+    auto groupEnd =
+        graceAsyncProbeGroup_ ? graceAsyncProbeGroup_->end : groupBegin;
+    uint64_t groupBytes =
+        graceAsyncProbeGroup_ ? graceAsyncProbeGroup_->bytes : 0;
+    while (!graceAsyncProbeGroup_ && groupEnd < probeBatches.size()) {
       const auto batchBytes = probeBatches[groupEnd].dataBytes;
       if (groupEnd > groupBegin &&
           batchBytes > graceRestoreProbeBytes_ -
@@ -2940,16 +3597,36 @@ RowVectorPtr CudfHashJoinProbe::getGraceOutput() {
         break;
       }
     }
-    VELOX_CHECK_GT(groupEnd, groupBegin);
+    VELOX_CHECK(graceAsyncProbeGroup_ || groupEnd > groupBegin);
     if (!acquireGraceWorkspace(
             estimateGraceProbeWorkspaceBytes(groupBytes),
             DeviceMemoryWorkspacePriority::kDrain)) {
       return nullptr;
     }
-    vector_size_t zeroColumnRows = 0;
-    std::vector<std::unique_ptr<cudf::table>> tables;
-    uint64_t groupRestoreMicros = 0;
-    uint64_t groupJoinMicros = 0;
+    const auto asyncResidentRestore = graceAsyncProbeRestoreEnabled() &&
+        groupBytes <= (1ULL << 30) &&
+        std::all_of(probeBatches.begin() + groupBegin,
+                    probeBatches.begin() + groupEnd,
+                    [](const auto& batch) { return !batch.spillFile; });
+    if (asyncResidentRestore && !graceAsyncProbeGroup_) {
+      graceAsyncProbeGroup_ =
+          std::make_shared<GraceAsyncProbeGroup>(groupEnd, groupBytes, stream);
+    }
+    vector_size_t localZeroColumnRows = 0;
+    std::vector<std::unique_ptr<cudf::table>> localTables;
+    uint64_t localRestoreMicros = 0;
+    uint64_t localJoinMicros = 0;
+    auto& zeroColumnRows = graceAsyncProbeGroup_
+        ? graceAsyncProbeGroup_->zeroColumnRows
+        : localZeroColumnRows;
+    auto& tables =
+        graceAsyncProbeGroup_ ? graceAsyncProbeGroup_->tables : localTables;
+    auto& groupRestoreMicros = graceAsyncProbeGroup_
+        ? graceAsyncProbeGroup_->restoreMicros
+        : localRestoreMicros;
+    auto& groupJoinMicros = graceAsyncProbeGroup_
+        ? graceAsyncProbeGroup_->joinMicros
+        : localJoinMicros;
     const auto joinProbe = [&](cudf::table_view probeView) {
       const auto joinStart = std::chrono::steady_clock::now();
       std::vector<JoinOutput> outputs;
@@ -2970,10 +3647,301 @@ RowVectorPtr CudfHashJoinProbe::getGraceOutput() {
                              .count();
       for (auto& output : outputs) {
         zeroColumnRows += output.numRows;
+        if (graceAsyncProbeGroup_ && graceAsyncProbeGroup_->streamOutput &&
+            output.table) {
+          for (const auto& column : output.table->view()) {
+            graceAsyncProbeGroup_->outputBytes +=
+                estimateColumnViewBytes(column);
+          }
+        }
         tables.push_back(std::move(output.table));
       }
     };
-    if (!graceBulkProbeRestoreEnabled()) {
+    if (asyncResidentRestore) {
+      // Restore N+1 on a separate host worker/CUDA stream while this driver
+      // joins N. Both waves are subsets of the ALREADY admitted group, not
+      // speculative input beyond its memory budget. Disk prefetch retains
+      // the established fallback below; it has a separate lease lifecycle.
+      int device = 0;
+      CUDF_CUDA_TRY(cudaGetDevice(&device));
+      auto copyStream = cudfGlobalStreamPool().get_stream();
+      if (copyStream.value() == stream.value()) {
+        copyStream = cudfGlobalStreamPool().get_stream();
+      }
+      const auto mr = get_output_mr();
+      using RestoredWave = GraceAsyncProbeGroup::RestoredWave;
+      auto& group = *graceAsyncProbeGroup_;
+      auto& pending = group.pending;
+      const auto scheduleWave = [&]() {
+        const bool stagePageable = gracePageableRestoreBounceEnabled();
+        const auto waveEnd = stagePageable
+            ? facebook::velox::cudf_velox::detail::graceRestoreWaveEnd(
+                  graceProbeChunk_,
+                  groupEnd,
+                  graceProbePrefetchDepth_,
+                  kGracePartitionBatchBytes,
+                  [&](size_t index) {
+                    return probeBatches[index].pinned
+                        ? uint64_t{0}
+                        : probeBatches[index].dataBytes;
+                  })
+            : std::min<size_t>(
+                  groupEnd, graceProbeChunk_ + graceProbePrefetchDepth_);
+        std::vector<CudfPackedHostRestoreChunk> chunks;
+        std::vector<size_t> pageableChunks;
+        chunks.reserve(waveEnd - graceProbeChunk_);
+        uint64_t bytes = 0;
+        for (; graceProbeChunk_ < waveEnd; ++graceProbeChunk_) {
+          auto& host = probeBatches[graceProbeChunk_];
+          if (host.spillWriteFuture.valid()) {
+            host.spillWriteFuture.get();
+            host.spillWriteFuture = {};
+          }
+          accountConsumedGraceProbeBatch(host);
+          CudfPackedHostRestoreChunk chunk;
+          chunk.metadata = std::move(host.metadata);
+          chunk.data = std::move(host.data);
+          chunk.dataBytes = host.dataBytes;
+          chunk.keepAlive = std::move(host.hostReservation);
+          bytes += host.dataBytes;
+          graceRestoreResidentBytes_ += host.dataBytes;
+          if (host.pinned) {
+            graceRestorePinnedSourceBytes_ += host.dataBytes;
+          } else {
+            graceRestorePageableDirectBytes_ += host.dataBytes;
+            pageableChunks.push_back(chunks.size());
+          }
+          host.dataBytes = 0;
+          host.rows = 0;
+          host.pinned = false;
+          ++gracePartitionProbeChunks_;
+          chunks.push_back(std::move(chunk));
+        }
+        gracePartitionProbeBytes_ += bytes;
+        addRuntimeStat(
+            "cudfGraceAsyncProbeRestoreBytes",
+            RuntimeCounter(bytes, RuntimeCounter::Unit::kBytes));
+        addRuntimeStat("cudfGraceAsyncProbeRestoreWaves", RuntimeCounter(1));
+        auto task = std::make_shared<std::packaged_task<RestoredWave()>>(
+            [chunks = std::move(chunks),
+             pageableChunks = std::move(pageableChunks),
+             stagePageable,
+             device,
+             copyStream,
+             mr]() mutable {
+              CUDF_CUDA_TRY(cudaSetDevice(device));
+              nvtx3::scoped_range range("GraceProbe::restoreAsyncWave");
+              // Keep host payload/accounting alive even if bulk restore
+              // throws after enqueueing only part of its H2D work.
+              std::vector<std::shared_ptr<void>> owners;
+              owners.reserve(chunks.size() * 2);
+              for (const auto& chunk : chunks) {
+                owners.push_back(chunk.data);
+                owners.push_back(chunk.keepAlive);
+              }
+              RestoredWave result;
+              std::shared_ptr<uint8_t> staging;
+              if (stagePageable) {
+                nvtx3::scoped_range stageRange("GraceProbe::stageResidentWave");
+                const auto start = std::chrono::steady_clock::now();
+                uint64_t pageableBytes = 0;
+                for (const auto i : pageableChunks) {
+                  pageableBytes += chunks[i].dataBytes;
+                }
+                staging = gracePinnedHostStagingPool().acquireSharedIfReady(
+                    pageableBytes);
+                if (staging) {
+                  uint64_t offset = 0;
+                  std::vector<std::future<void>> copies;
+                  copies.reserve(pageableChunks.size());
+                  SCOPE_EXIT {
+                    // Submission/get can throw. Do not return this slot or
+                    // its source owners while any CPU copy still uses it.
+                    for (auto& copy : copies) {
+                      if (copy.valid()) {
+                        copy.wait();
+                      }
+                    }
+                  };
+                  for (const auto i : pageableChunks) {
+                    auto& chunk = chunks[i];
+                    if (chunk.dataBytes == 0) {
+                      continue;
+                    }
+                    VELOX_CHECK_NOT_NULL(chunk.data);
+                    auto destination = std::shared_ptr<uint8_t>(
+                        staging, staging.get() + offset);
+                    auto copy = std::make_shared<std::packaged_task<void()>>(
+                        [source = chunk.data,
+                         destination,
+                         bytes = chunk.dataBytes] {
+                          nvtx3::scoped_range range(
+                              "GraceProbe::copyResidentChunk");
+                          std::memcpy(destination.get(), source.get(), bytes);
+                        });
+                    copies.push_back(copy->get_future());
+                    try {
+                      // The existing bounded demotion pool only performs
+                      // host copies; it never waits on this restore executor.
+                      graceBuildDemoteExecutor().add([copy] { (*copy)(); });
+                    } catch (...) {
+                      (*copy)();
+                    }
+                    chunk.data = std::move(destination);
+                    offset += chunk.dataBytes;
+                  }
+                  for (auto& copy : copies) {
+                    copy.get();
+                  }
+                  result.stagedBytes = pageableBytes;
+                }
+                result.stagingMicros =
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - start)
+                        .count();
+              }
+              try {
+                result.data = bulkRestoreCudfPackedHostChunks(
+                    std::move(chunks), copyStream, mr);
+                return result;
+              } catch (...) {
+                // Keep the pinned lease as well as the original pageable
+                // owners until any partially submitted DMA has completed.
+                cudaStreamSynchronize(copyStream.value());
+                throw;
+              }
+            });
+        pending = task->get_future();
+        std::shared_ptr<ContinuePromise> wake;
+        if (group.schedulerVisible) {
+          auto contract = makeVeloxContinuePromiseContract("GraceProbeRestore");
+          wake = std::make_shared<ContinuePromise>(std::move(contract.first));
+          group.wake = std::move(contract.second);
+        }
+        auto run = [task, wake]() {
+          // packaged_task retains errors in its future. Publish readiness
+          // after both successful and failed execution so Driver resumes and
+          // observes the original error. No operator/GPU work in callbacks.
+          (*task)();
+          if (wake) {
+            wake->setValue();
+          }
+        };
+        try {
+          graceProbeRestoreExecutor().add(run);
+        } catch (...) {
+          // Allocation/queue failure must not strand a future. The packaged
+          // task retains any restore error for the driver's get().
+          run();
+        }
+      };
+      if (!pending.valid() && !group.readyWave) {
+        scheduleWave();
+      }
+      while (pending.valid() || group.readyWave) {
+        if (group.schedulerVisible && !group.ready()) {
+          if (!group.suspendedAt) {
+            group.suspendedAt = std::chrono::steady_clock::now();
+            addRuntimeStat("cudfGraceDriverRestoreSuspends", RuntimeCounter(1));
+          }
+          // Cursor, partial output, source ownership and the already-admitted
+          // complete group survive this return. isBlocked transfers wake.
+          return nullptr;
+        }
+        if (group.suspendedAt) {
+          const auto waited =
+              std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  std::chrono::steady_clock::now() - *group.suspendedAt)
+                  .count();
+          addRuntimeStat(
+              "cudfGraceDriverRestoreWaitNanos",
+              RuntimeCounter(waited, RuntimeCounter::Unit::kNanos));
+          groupRestoreMicros += waited / 1000;
+          group.suspendedAt.reset();
+        }
+        if (!group.readyWave) {
+          group.wake = ContinueFuture::makeEmpty();
+          const auto waitStart = std::chrono::steady_clock::now();
+          {
+            nvtx3::scoped_range waitRange("GraceProbe::waitRestoredWave");
+            group.readyWave.emplace(pending.get());
+          }
+          auto& wave = *group.readyWave;
+          // This counter measures exposed wait, not summed worker time.
+          groupRestoreMicros +=
+              std::chrono::duration_cast<std::chrono::microseconds>(
+                  std::chrono::steady_clock::now() - waitStart)
+                  .count();
+          graceRestorePageableDirectBytes_ -= wave.stagedBytes;
+          graceRestorePinnedSourceBytes_ += wave.stagedBytes;
+          graceRestoreResidentBounceBytes_ += wave.stagedBytes;
+          graceRestoreHostStageMicros_ += wave.stagingMicros;
+          addRuntimeStat(
+              "cudfGraceAsyncProbePinnedStagingBytes",
+              RuntimeCounter(wave.stagedBytes, RuntimeCounter::Unit::kBytes));
+          graceRestoreCopySynchronizeMicros_ +=
+              wave.data.stats().copyStreamSynchronizeMicros;
+        }
+        if (group.streamOutput && zeroColumnRows > 0 &&
+            (group.outputBytes >= graceResidentOutputTargetBytes_ ||
+             zeroColumnRows >= 2000000 || tables.size() >= 64)) {
+          nvtx3::scoped_range handoffRange("GraceProbe::partialGroupOutput");
+          // get() above both propagates errors and proves the worker has
+          // completed H2D. Its ready wave owns actual device buffers. No
+          // future allocation is in flight when we release the temporary
+          // group credit before downstream writer admission.
+          VELOX_CHECK(!pending.valid());
+          const auto outputStart = std::chrono::steady_clock::now();
+          auto output =
+              concatenateTables(std::move(tables), stream, get_output_mr());
+          stream.synchronize();
+          const auto rows =
+              outputType_->size() == 0 ? zeroColumnRows : output->num_rows();
+          tables.clear();
+          zeroColumnRows = 0;
+          group.outputBytes = 0;
+          gracePartitionOutputMicros_ +=
+              std::chrono::duration_cast<std::chrono::microseconds>(
+                  std::chrono::steady_clock::now() - outputStart)
+                  .count();
+          addRuntimeStat(
+              "cudfGraceFirstWaveToOutputNanos",
+              RuntimeCounter(
+                  group.finishOutputWait(), RuntimeCounter::Unit::kNanos));
+          addRuntimeStat("cudfGracePartialGroupOutputs", RuntimeCounter(1));
+          graceWorkspaceAdmission_.reset();
+          // The next getOutput must acquire a new credit before consuming
+          // readyWave or scheduling another restore. Cursor and row owners
+          // survive this handoff; no chunk is consumed twice.
+          graceOutputHandoffStart_ = std::chrono::steady_clock::now();
+          graceOutputHandoffPending_ = true;
+          return std::make_shared<CudfVector>(
+              pool(), outputType_, rows, std::move(output), stream);
+        }
+        auto wave = std::move(*group.readyWave);
+        group.readyWave.reset();
+        auto& restored = wave.data;
+        if (graceProbeChunk_ < groupEnd) {
+          scheduleWave();
+        }
+        nvtx3::scoped_range range("GraceProbe::joinRestoredWave");
+        try {
+          for (const auto& probeView : restored.tables()) {
+            joinProbe(probeView);
+          }
+        } catch (...) {
+          // Even a failed join may have submitted compute-stream kernels.
+          // Keep this copy-stream-owned input alive through that tail.
+          cudaStreamSynchronize(stream.value());
+          throw;
+        }
+        if (zeroColumnRows > 0) {
+          group.noteOutputReady();
+        }
+        // joinProbe synchronizes the compute stream before the copy-stream
+        // allocation owner is destroyed: no cross-stream use-after-free.
+      }
+    } else if (!graceBulkProbeRestoreEnabled()) {
       for (; graceProbeChunk_ < groupEnd; ++graceProbeChunk_) {
         waitForGraceProbePrefetch(graceProbeChunk_);
         auto& hostProbe = probeBatches[graceProbeChunk_];
@@ -3045,6 +4013,9 @@ RowVectorPtr CudfHashJoinProbe::getGraceOutput() {
         uint64_t pinnedDirectBytes = 0;
         for (auto chunkIndex = waveBegin; chunkIndex < waveEnd; ++chunkIndex) {
           auto& hostProbe = probeBatches[chunkIndex];
+          if (hostProbe.spillWriteFuture.valid()) {
+            hostProbe.spillWriteFuture.get();
+          }
           const auto restoredBytes = hostProbe.dataBytes;
           accountConsumedGraceProbeBatch(hostProbe);
           CudfPackedHostRestoreChunk chunk;
@@ -3122,6 +4093,14 @@ RowVectorPtr CudfHashJoinProbe::getGraceOutput() {
             .count();
     const auto rows =
         outputType_->size() == 0 ? zeroColumnRows : output->num_rows();
+    if (graceAsyncProbeGroup_ && rows > 0) {
+      addRuntimeStat(
+          "cudfGraceFirstWaveToOutputNanos",
+          RuntimeCounter(
+              graceAsyncProbeGroup_->finishOutputWait(),
+              RuntimeCounter::Unit::kNanos));
+    }
+    graceAsyncProbeGroup_.reset();
     // Kernel allocations have been made and are now represented by physical
     // device usage. Release the virtual transient lease before handing output
     // to a possibly blocked downstream operator. The returned CudfVector owns
@@ -3167,6 +4146,7 @@ RowVectorPtr CudfHashJoinProbe::getGraceOutput() {
                << " hostDemoteUs=" << graceHostDemoteMicros_
                << " rawSpillWriteUs=" << graceRawSpillWriteMicros_
                << " restoreResidentBytes=" << graceRestoreResidentBytes_
+               << " asyncProbeDemote=" << graceAsyncProbeDemoteEnabled()
                << " restoreDiskBytes=" << graceRestoreDiskBytes_
                << " restorePinnedSourceBytes=" << graceRestorePinnedSourceBytes_
                << " restoreResidentBounceBytes="
@@ -3277,6 +4257,10 @@ void CudfHashJoinProbe::initialize() {
 }
 
 bool CudfHashJoinProbe::needsInput() const {
+  if (graceAsyncProbeGroup_ || graceResidentOutputReady() ||
+      graceResidentFinishPending_) {
+    return false;
+  }
   if (joinNode_->isRightSemiFilterJoin()) {
     return !noMoreInput_;
   }
@@ -3297,8 +4281,8 @@ void CudfHashJoinProbe::bufferPrebuildProbeInput(CudfVectorPtr input) {
   auto batch = packHashJoinTablePinned(
       input->getTableView(), input->stream(), get_output_mr());
   const bool usedPinnedD2H = batch.pinned;
-  auto reservation = tryReserveGraceHostMemory(
-      batch.dataBytes, graceProbeHostLimitBytes_);
+  auto reservation =
+      tryReserveGraceHostMemory(batch.dataBytes, graceProbeHostLimitBytes_);
   if (!reservation) {
     // Keep at most this single device input while waiting for the build.  The
     // temporary host image is destroyed here; no unaccounted DRAM survives.
@@ -3383,6 +4367,13 @@ void CudfHashJoinProbe::doNoMoreInput() {
   if (!graceProbeInputs_.empty()) {
     flushGraceProbeInputBatch();
   }
+  if (!graceResidentOutputs_.empty()) {
+    // EOF may arrive while the last input's output is pending. Do not let
+    // the peer barrier release the resident hash or discard peer outputs.
+    Operator::noMoreInput();
+    graceResidentFinishPending_ = true;
+    return;
+  }
   if (graceProbeSourceBatches_ > 0) {
     LOG(WARNING) << "CudfHashJoinProbe node=" << planNodeId()
                  << " Grace partition input coalescing sourceBatches="
@@ -3466,6 +4457,7 @@ void CudfHashJoinProbe::doNoMoreInput() {
       probe->finished_ = true;
     }
     if (graceBuildData_) {
+      graceBuildData_->resident.reset();
       graceProbeDraining_ = true;
       LOG(WARNING) << "CudfHashJoinProbe task="
                    << operatorCtx_->task()->taskId() << " node=" << planNodeId()
@@ -3593,10 +4585,25 @@ CudfHashJoinProbe::JoinOutput CudfHashJoinProbe::unfilteredOutput(
       std::max(leftIndicesCol.size(), rightIndicesCol.size()));
   auto leftInput = leftTableView.select(leftColumnIndicesToGather_);
   auto rightInput = rightTableView.select(rightColumnIndicesToGather_);
+  // INNER joins only produce matching, in-range row pairs, including after
+  // residual-index filtering. NULLIFY unnecessarily forces validity-mask
+  // construction for every output column, even for non-nullable input.
+  // Keep NULLIFY for all other join kinds: their maps may contain no-match
+  // sentinels. DONT_CHECK still gathers existing source nulls normally.
+  const auto* validGather =
+      std::getenv("GLUTEN_CUDF_INNER_GATHER_VALID_INDICES");
+  const bool useValidIndices = joinNode_->isInnerJoin() && validGather &&
+      std::string_view(validGather) == "1";
+  const auto boundsPolicy =
+      useValidIndices ? cudf::out_of_bounds_policy::DONT_CHECK : oobPolicy;
+  if (useValidIndices) {
+    LOG_EVERY_N(WARNING, 128)
+        << "CUDF_INNER_GATHER_VALID_INDICES node=" << planNodeId();
+  }
   auto leftResult = cudf::gather(
-      leftInput, leftIndicesCol, oobPolicy, stream, get_output_mr());
+      leftInput, leftIndicesCol, boundsPolicy, stream, get_output_mr());
   auto rightResult = cudf::gather(
-      rightInput, rightIndicesCol, oobPolicy, stream, get_output_mr());
+      rightInput, rightIndicesCol, boundsPolicy, stream, get_output_mr());
 
   if (CudfConfig::getInstance().debugEnabled) {
     VLOG(1) << "Left result number of columns: " << leftResult->num_columns();
@@ -5533,6 +6540,18 @@ RowVectorPtr CudfHashJoinProbe::graceRightNullUnmatchedOutput(
 }
 
 RowVectorPtr CudfHashJoinProbe::doGetOutput() {
+  if (graceResidentOutputReady() ||
+      (!graceResidentOutputs_.empty() && noMoreInput_)) {
+    return takeGraceResidentOutput();
+  }
+  if (graceResidentFinishPending_) {
+    graceResidentFinishPending_ = false;
+    doNoMoreInput();
+    // Non-last peers must observe their barrier future before any drain.
+    if (future_.valid()) {
+      return nullptr;
+    }
+  }
   if (graceBuildData_) {
     return getGraceOutput();
   }
@@ -5694,6 +6713,12 @@ bool CudfHashJoinProbe::skipProbeOnEmptyBuild() const {
 }
 
 exec::BlockingReason CudfHashJoinProbe::isBlocked(ContinueFuture* future) {
+  if (graceAsyncProbeGroup_ && graceAsyncProbeGroup_->schedulerVisible &&
+      !graceAsyncProbeGroup_->ready()) {
+    VELOX_CHECK(graceAsyncProbeGroup_->wake.valid());
+    *future = std::move(graceAsyncProbeGroup_->wake);
+    return exec::BlockingReason::kWaitForProducer;
+  }
   if (replayableDeviceWorkspace().takeFuture(future)) {
     return exec::BlockingReason::kWaitForArbitration;
   }
@@ -5771,6 +6796,7 @@ exec::BlockingReason CudfHashJoinProbe::isBlocked(ContinueFuture* future) {
     }
     if (result->grace) {
       graceBuildData_ = std::move(result->grace);
+      initializeGraceResidentPartition();
       if (noMoreInput_ && isLastDriver_) {
         graceProbeDraining_ = true;
         LOG(WARNING) << "CudfHashJoinProbe task="
@@ -5884,6 +6910,9 @@ exec::BlockingReason CudfHashJoinProbe::isBlocked(ContinueFuture* future) {
 }
 
 bool CudfHashJoinProbe::isFinished() {
+  if (graceAsyncProbeGroup_) {
+    return false;
+  }
   if (graceBuildData_ || (graceEnabled_ && !graceFinished_)) {
     return graceFinished_;
   }

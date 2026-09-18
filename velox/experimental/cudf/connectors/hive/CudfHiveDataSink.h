@@ -27,11 +27,13 @@
 #include "velox/exec/MemoryReclaimer.h"
 #include "velox/type/Type.h"
 
-#include <cudf/io/parquet.hpp>
+#include <cudf/io/data_sink.hpp>
 #include <cudf/io/orc.hpp>
+#include <cudf/io/parquet.hpp>
 #include <cudf/io/types.hpp>
 #include <cudf/types.hpp>
 
+#include <future>
 #include <optional>
 #include <variant>
 
@@ -40,6 +42,7 @@ namespace facebook::velox::cudf_velox::connector::hive {
 using namespace facebook::velox::connector;
 
 class LocationHandle;
+struct CudfWriterBatchState;
 using LocationHandlePtr = std::shared_ptr<const LocationHandle>;
 
 /// Location related properties of the CudfHive table to be written.
@@ -301,6 +304,8 @@ class CudfHiveDataSink : public DataSink {
       CommitStrategy commitStrategy,
       const std::shared_ptr<const CudfHiveConfig>& parquetConfig);
 
+  ~CudfHiveDataSink() override;
+
   void appendData(RowVectorPtr input) override;
 
   bool finish() override;
@@ -325,6 +330,7 @@ class CudfHiveDataSink : public DataSink {
       cudf::table_view cudfTable,
       rmm::cuda_stream_view stream);
   void writeCudf(cudf::table_view cudfTable);
+  void awaitPendingWrite();
   void closeCudf();
   cudf::io::table_input_metadata createCudfTableInputMetadata(
       cudf::table_view cudfTable);
@@ -362,9 +368,20 @@ class CudfHiveDataSink : public DataSink {
 
   // Below are structures for partitions from all inputs. writerInfo_ and
   // writers_ are both indexed by partitionId.
+  // A custom user sink must outlive its libcudf writer wrapper.
+  std::unique_ptr<cudf::io::data_sink> boundedFileSink_;
   std::optional<CudfWriter> writer_;
   std::optional<rmm::cuda_stream_view> writerStream_;
   bool loggedDeviceInput_{false};
+  // At most one byte-limited input is retained by a background write. Only
+  // that worker touches the writer until the future is consumed. This lets
+  // the driver produce the next input without queueing arbitrary GPU state.
+  std::future<void> pendingWrite_;
+  // Optional independent consumer. Includes active and queued input bytes in
+  // one fixed bound; drained before accessing the libcudf writer elsewhere.
+  std::unique_ptr<CudfWriterBatchState> batchWriter_;
+  uint64_t asyncWriteBatches_{0};
+  uint64_t asyncWriteWaitMicros_{0};
   int64_t writtenBytes_{0};
 
   std::vector<cudf::io::sorting_column> sortingColumns_;

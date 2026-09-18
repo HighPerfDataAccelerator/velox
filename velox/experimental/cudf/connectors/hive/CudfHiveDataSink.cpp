@@ -15,6 +15,9 @@
  */
 
 #include "velox/experimental/cudf/CudfNoDefaults.h"
+#include "velox/experimental/cudf/connectors/hive/BoundedBatchWriter.h"
+#include "velox/experimental/cudf/connectors/hive/CudfBoundedFileSink.h"
+#include "velox/experimental/cudf/connectors/hive/CudfEagerFileSink.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConfig.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveDataSink.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveTableHandle.h"
@@ -30,6 +33,7 @@
 #include "velox/dwio/common/Options.h"
 #include "velox/exec/OperatorUtils.h"
 
+#include <cudf/concatenate.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/io/orc.hpp>
 #include <cudf/io/parquet.hpp>
@@ -37,15 +41,45 @@
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 
+#include <nvtx3/nvtx3.hpp>
+
 #include <boost/lexical_cast.hpp>
 #include <boost/uuid/uuid_generators.hpp>
 #include <boost/uuid/uuid_io.hpp>
+
+#include <chrono>
+#include <cstdlib>
 
 using facebook::velox::common::testutil::TestValue;
 
 namespace facebook::velox::cudf_velox::connector::hive {
 
 namespace {
+
+bool asyncWriterEnabled() {
+  const auto* value = std::getenv("GLUTEN_CUDF_ASYNC_TABLE_WRITE");
+  return value != nullptr && std::string_view(value) == "1";
+}
+
+bool batchWriterEnabled() {
+  const auto* value = std::getenv("GLUTEN_CUDF_ASYNC_TABLE_WRITE_COALESCE");
+  return asyncWriterEnabled() && value != nullptr &&
+      std::string_view(value) == "1";
+}
+
+uint64_t asyncWriterMaxInputBytes() {
+  constexpr uint64_t kDefault = 1ULL << 30;
+  const auto* value =
+      std::getenv("GLUTEN_CUDF_ASYNC_TABLE_WRITE_MAX_INPUT_BYTES");
+  if (value == nullptr) {
+    return kDefault;
+  }
+  char* end = nullptr;
+  const auto bytes = std::strtoull(value, &end, 10);
+  return end != value && *end == '\0' && bytes > 0 && bytes <= kDefault
+      ? bytes
+      : kDefault;
+}
 
 std::unordered_map<LocationHandle::TableType, std::string> tableTypeNames() {
   return {
@@ -126,6 +160,23 @@ std::shared_ptr<memory::MemoryPool> createSortPool(
 
 } // namespace
 
+struct CudfWriterBatchState {
+  struct Input {
+    DeviceMemoryWorkspaceReservation reservation;
+    std::shared_ptr<CudfVector> owner;
+    CudaEvent ready;
+    uint64_t bytes;
+  };
+
+  explicit CudfWriterBatchState(BoundedBatchWriter<Input>::Consumer consume)
+      : queue(asyncWriterMaxInputBytes(), 64, std::move(consume)) {}
+
+  BoundedBatchWriter<Input> queue;
+  uint64_t coalescedBatches{0};
+  uint64_t coalescedInputs{0};
+  uint64_t admissionFallbackBatches{0};
+};
+
 const std::string LocationHandle::tableTypeName(
     LocationHandle::TableType type) {
   static const auto kTableTypes = tableTypeNames();
@@ -169,34 +220,170 @@ CudfHiveDataSink::CudfHiveDataSink(
 }
 
 void CudfHiveDataSink::appendData(RowVectorPtr input) {
+  nvtx3::scoped_range appendRange("CudfWriter::appendData");
   checkRunning();
+  auto deviceInput = std::dynamic_pointer_cast<CudfVector>(input);
+  // The experimental consumer serializes the writer independently. Legacy
+  // futures and host-converted inputs must still drain before writer access.
+  if (!batchWriterEnabled() || !deviceInput || pendingWrite_.valid()) {
+    awaitPendingWrite();
+  }
 
   // Preserve a device-resident pipeline into libcudf's file writer. The
   // generic Arrow conversion below materializes a CudfVector on the host and
   // copies the same columns back to the GPU. Wide TopN output made that round
   // trip and its synchronization dominate table-write tasks.
-  if (auto deviceInput = std::dynamic_pointer_cast<CudfVector>(input)) {
+  if (deviceInput) {
     const auto inputStream = deviceInput->stream();
     const auto inputView = deviceInput->getTableView();
     if (!writer_.has_value()) {
-      writer_ = createCudfWriter(inputView, inputStream);
-      writerStream_ = inputStream;
+      writerStream_ = asyncWriterEnabled() ? cudfGlobalStreamPool().get_stream()
+                                           : inputStream;
+      writer_ = createCudfWriter(inputView, *writerStream_);
     }
     VELOX_CHECK(writerStream_.has_value());
 
-    if (writerStream_->value() == inputStream.value()) {
-      // The writer work and CudfVector's stream-ordered destruction use the
-      // same stream, so the input remains live until the writer consumes it.
-      writeCudf(inputView);
+    const auto inputBytes = deviceInput->estimateFlatSize();
+    auto workspace = asyncWriterEnabled() && inputBytes > 0 &&
+            inputBytes <= asyncWriterMaxInputBytes()
+        ? tryAcquireBackgroundDeviceMemoryWorkspace(
+              2 * inputBytes,
+              512ULL << 20,
+              DeviceMemoryWorkspacePriority::kOutput)
+        : std::optional<DeviceMemoryWorkspaceReservation>{};
+    if (workspace.has_value() && batchWriterEnabled()) {
+      if (!batchWriter_) {
+        int device = 0;
+        CUDF_CUDA_TRY(cudaGetDevice(&device));
+        batchWriter_ = std::make_unique<CudfWriterBatchState>(
+            [this, device](std::vector<CudfWriterBatchState::Input>& inputs) {
+              CUDF_CUDA_TRY(cudaSetDevice(device));
+              nvtx3::scoped_range workerRange("CudfWriter::asyncBatch");
+              // Keep temporaries alive until the exception handler has also
+              // stopped any already-submitted CUDA work.
+              std::unique_ptr<cudf::table> combined;
+              std::optional<DeviceMemoryWorkspaceReservation> concatWorkspace;
+              try {
+                std::vector<cudf::table_view> views;
+                uint64_t bytes = 0;
+                for (const auto& input : inputs) {
+                  input.ready.waitOn(*writerStream_);
+                  views.push_back(input.owner->getTableView());
+                  bytes += input.bytes;
+                }
+                if (inputs.size() > 1) {
+                  // Each accepted input already owns its original 2x writer
+                  // workspace credit. Concatenation needs EXTRA credit; if
+                  // unavailable, drain individually, never wait for upstream.
+                  concatWorkspace = tryAcquireBackgroundDeviceMemoryWorkspace(
+                      bytes,
+                      512ULL << 20,
+                      DeviceMemoryWorkspacePriority::kOutput);
+                  if (concatWorkspace) {
+                    nvtx3::scoped_range range(
+                        "CudfWriter::coalesceReadyInputs");
+                    combined =
+                        cudf::concatenate(views, *writerStream_, get_temp_mr());
+                    ++batchWriter_->coalescedBatches;
+                    batchWriter_->coalescedInputs += inputs.size();
+                  } else {
+                    ++batchWriter_->admissionFallbackBatches;
+                  }
+                }
+                if (combined) {
+                  writeCudf(combined->view());
+                  ++asyncWriteBatches_;
+                } else {
+                  for (const auto& view : views) {
+                    writeCudf(view);
+                    ++asyncWriteBatches_;
+                  }
+                }
+                {
+                  nvtx3::scoped_range finishRange("CudfWriter::finishStream");
+                  writerStream_->synchronize();
+                }
+                combined.reset();
+                // Input owners are destroyed by the queue before it returns
+                // byte/item credit. Their workspace tokens remain live too.
+              } catch (...) {
+                cudaStreamSynchronize(writerStream_->value());
+                throw;
+              }
+            });
+      }
+      CudaEvent ready(cudaEventDisableTiming);
+      ready.recordFrom(inputStream);
+      const auto start = std::chrono::steady_clock::now();
+      {
+        nvtx3::scoped_range waitRange("CudfWriter::awaitBatchCapacity");
+        batchWriter_->queue.submit(
+            {std::move(*workspace), deviceInput, std::move(ready), inputBytes},
+            inputBytes);
+      }
+      asyncWriteWaitMicros_ +=
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              std::chrono::steady_clock::now() - start)
+              .count();
+    } else if (workspace.has_value()) {
+      int device = 0;
+      CUDF_CUDA_TRY(cudaGetDevice(&device));
+      CudaEvent ready(cudaEventDisableTiming);
+      ready.recordFrom(inputStream).waitOn(*writerStream_);
+      // The strong vector owner survives the complete write and CUDA tail.
+      // The cooperative workspace lease protects concurrent join restore
+      // admission; unavailable admission takes the original synchronous path.
+      pendingWrite_ = std::async(
+          std::launch::async,
+          [this,
+           device,
+           owner = deviceInput,
+           reservation = std::move(*workspace)]() mutable {
+            CUDF_CUDA_TRY(cudaSetDevice(device));
+            nvtx3::scoped_range workerRange("CudfWriter::asyncBatch");
+            try {
+              writeCudf(owner->getTableView());
+              {
+                nvtx3::scoped_range finishRange("CudfWriter::finishStream");
+                writerStream_->synchronize();
+              }
+              {
+                nvtx3::scoped_range releaseRange("CudfWriter::releaseInput");
+                owner.reset();
+              }
+              {
+                nvtx3::scoped_range releaseRange(
+                    "CudfWriter::releaseWorkspace");
+                reservation.release();
+              }
+            } catch (...) {
+              // Keep the source alive until already-submitted work stops,
+              // including on exception. Preserve the original write error.
+              cudaStreamSynchronize(writerStream_->value());
+              owner.reset();
+              reservation.release();
+              throw;
+            }
+          });
+      ++asyncWriteBatches_;
     } else {
-      // Inputs from a different producer stream need ordering in both
-      // directions: writer waits for production, then producer waits before
-      // its stream-ordered input destruction. Neither wait blocks the host.
-      CudaEvent inputReady(cudaEventDisableTiming);
-      CudaEvent inputConsumed(cudaEventDisableTiming);
-      inputReady.recordFrom(inputStream).waitOn(*writerStream_);
-      writeCudf(inputView);
-      inputConsumed.recordFrom(*writerStream_).waitOn(inputStream);
+      // Oversize or admission failure: the synchronous fallback cannot touch
+      // a writer that still has accepted background batches.
+      awaitPendingWrite();
+      if (writerStream_->value() == inputStream.value()) {
+        // The writer work and CudfVector's stream-ordered destruction use the
+        // same stream, so the input remains live until the writer consumes it.
+        writeCudf(inputView);
+      } else {
+        // Inputs from a different producer stream need ordering in both
+        // directions: writer waits for production, then producer waits before
+        // its stream-ordered input destruction. Neither wait blocks the host.
+        CudaEvent inputReady(cudaEventDisableTiming);
+        CudaEvent inputConsumed(cudaEventDisableTiming);
+        inputReady.recordFrom(inputStream).waitOn(*writerStream_);
+        writeCudf(inputView);
+        inputConsumed.recordFrom(*writerStream_).waitOn(inputStream);
+      }
     }
 
     if (!loggedDeviceInput_) {
@@ -233,6 +420,50 @@ void CudfHiveDataSink::appendData(RowVectorPtr input) {
   writerInfo_->numWrittenRows += input->size();
 }
 
+CudfHiveDataSink::~CudfHiveDataSink() {
+  // A cancelled task may destroy the sink without calling close(). Do not
+  // let a worker outlive this object or its writer. Normal finish/close/abort
+  // consumes errors; destructors must not throw during exception unwinding.
+  if (pendingWrite_.valid()) {
+    pendingWrite_.wait();
+  }
+  if (batchWriter_) {
+    try {
+      batchWriter_->queue.drain();
+    } catch (...) {
+      // drain propagates only after all accepted owners have been released.
+    }
+    batchWriter_.reset();
+  }
+}
+
+void CudfHiveDataSink::awaitPendingWrite() {
+  if (batchWriter_) {
+    const auto start = std::chrono::steady_clock::now();
+    {
+      nvtx3::scoped_range range("CudfWriter::drainBatchedWrites");
+      batchWriter_->queue.drain();
+    }
+    asyncWriteWaitMicros_ +=
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - start)
+            .count();
+  }
+  if (!pendingWrite_.valid()) {
+    return;
+  }
+  const auto start = std::chrono::steady_clock::now();
+  {
+    // This is the producer's exposed wait, not the worker's full write time.
+    nvtx3::scoped_range waitRange("CudfWriter::awaitPreviousWrite");
+    pendingWrite_.get();
+  }
+  asyncWriteWaitMicros_ +=
+      std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now() - start)
+          .count();
+}
+
 CudfHiveDataSink::CudfWriter CudfHiveDataSink::createCudfWriter(
     cudf::table_view cudfTable,
     rmm::cuda_stream_view stream) {
@@ -259,22 +490,50 @@ CudfHiveDataSink::CudfWriter CudfHiveDataSink::createCudfWriter(
 
   const auto localWriteDirectory =
       cudfWritePath(writerParameters.writeDirectory());
-  const auto writePath = fs::path(localWriteDirectory) /
-      writerParameters.writeFileName();
+  const bool isS3 = localWriteDirectory.rfind("s3://", 0) == 0 ||
+      localWriteDirectory.rfind("s3a://", 0) == 0 ||
+      localWriteDirectory.rfind("s3n://", 0) == 0;
+  const auto* directS3 = std::getenv("GLUTEN_CUDF_DIRECT_S3_SINK");
+  VELOX_CHECK(
+      !isS3 || (directS3 && std::string_view(directS3) == "1"),
+      "Native S3 writes require GLUTEN_CUDF_DIRECT_S3_SINK=1");
+  // filesystem::path can normalize away a slash in the URI scheme.
+  const auto writePath = isS3
+      ? fmt::format(
+            "{}/{}", localWriteDirectory, writerParameters.writeFileName())
+      : (fs::path(localWriteDirectory) / writerParameters.writeFileName())
+            .string();
 
   // Spark's FileCommitProtocol can hand each native writer a task-attempt
   // directory below the final output root. libcudf/kvikio opens the target
   // file directly and does not create missing parents, unlike Velox's generic
   // WriteFile path. Create the complete directory here before constructing the
   // file sink. mkdir is recursive and idempotent for concurrent writers.
-  filesystems::getFileSystem(
-      writerParameters.writeDirectory(), parquetConfig_->config())
-      ->mkdir(localWriteDirectory);
+  if (!isS3) {
+    filesystems::getFileSystem(
+        writerParameters.writeDirectory(), parquetConfig_->config())
+        ->mkdir(localWriteDirectory);
+  }
 
   makeWriterOptions(writerParameters);
 
   // Create writer options for the given sink
-  const auto sinkInfo = cudf::io::sink_info(writePath.string());
+  const auto* eagerSink = std::getenv("GLUTEN_CUDF_BOUNDED_EAGER_FILE_SINK");
+  if (isS3) {
+    auto fileSystem =
+        filesystems::getFileSystem(writePath, parquetConfig_->config());
+    filesystems::FileOptions options;
+    options.pool = writerInfo_->sinkPool.get();
+    boundedFileSink_ = std::make_unique<CudfEagerFileSink>(
+        writePath, fileSystem->openFileForWrite(writePath, options));
+    LOG(WARNING) << "CudfHiveDataSink: direct S3 sink for " << writePath;
+  } else if (eagerSink && std::string_view(eagerSink) == "1") {
+    boundedFileSink_ = std::make_unique<CudfBoundedFileSink>(writePath);
+    LOG(WARNING) << "CUDF_BOUNDED_EAGER_FILE_SINK depth=4";
+  }
+  const auto sinkInfo = boundedFileSink_
+      ? cudf::io::sink_info(boundedFileSink_.get())
+      : cudf::io::sink_info(writePath);
   if (fileFormat == dwio::common::FileFormat::ORC) {
     VELOX_CHECK(
         cudf::io::is_supported_write_orc(compressionKind),
@@ -350,6 +609,7 @@ CudfHiveDataSink::CudfWriter CudfHiveDataSink::createCudfWriter(
 }
 
 void CudfHiveDataSink::writeCudf(cudf::table_view cudfTable) {
+  nvtx3::scoped_range writeRange("CudfWriter::writeBatch");
   VELOX_CHECK(writer_.has_value());
   std::visit(
       [&](auto& writer) {
@@ -360,6 +620,7 @@ void CudfHiveDataSink::writeCudf(cudf::table_view cudfTable) {
 }
 
 void CudfHiveDataSink::closeCudf() {
+  nvtx3::scoped_range closeRange("CudfWriter::close");
   VELOX_CHECK(writer_.has_value());
   std::visit(
       [](auto& writer) {
@@ -495,6 +756,7 @@ void CudfHiveDataSink::checkStateTransition(State oldState, State newState) {
 
 bool CudfHiveDataSink::finish() {
   setState(State::kFinishing);
+  awaitPendingWrite();
   return true;
 }
 
@@ -538,6 +800,7 @@ void CudfHiveDataSink::abort() {
 void CudfHiveDataSink::closeInternal() {
   VELOX_CHECK_NE(state_, State::kRunning);
   VELOX_CHECK_NE(state_, State::kFinishing);
+  awaitPendingWrite();
   if (!writer_.has_value()) {
     return;
   }
@@ -548,11 +811,38 @@ void CudfHiveDataSink::closeInternal() {
 
   // Close cudf writer
   closeCudf();
+  if (asyncWriteBatches_ > 0) {
+    LOG(WARNING) << "CUDF_ASYNC_TABLE_WRITE batches=" << asyncWriteBatches_
+                 << " waitUs=" << asyncWriteWaitMicros_
+                 << " maxInFlightInputs=" << (batchWriter_ ? 64 : 1)
+                 << " maxInputBytes=" << asyncWriterMaxInputBytes();
+  }
+  if (batchWriter_) {
+    const auto stats = batchWriter_->queue.stats();
+    LOG(WARNING) << "CUDF_WRITER_READY_BATCHES inputs=" << stats.inputs
+                 << " batches=" << stats.batches
+                 << " maxBatchItems=" << stats.maxBatchItems
+                 << " peakBytes=" << stats.peakBytes
+                 << " peakItems=" << stats.peakItems
+                 << " maxOutstandingBytes=" << asyncWriterMaxInputBytes()
+                 << " coalescedBatches=" << batchWriter_->coalescedBatches
+                 << " coalescedInputs=" << batchWriter_->coalescedInputs
+                 << " admissionFallbackBatches="
+                 << batchWriter_->admissionFallbackBatches;
+  }
 
-  const auto& parameters = writerInfo_->writerParameters;
-  const auto writePath = fs::path(cudfWritePath(parameters.writeDirectory())) /
-      parameters.writeFileName();
-  writtenBytes_ = fs::file_size(writePath);
+  if (auto* remoteSink =
+          dynamic_cast<CudfEagerFileSink*>(boundedFileSink_.get())) {
+    // Complete the S3 upload while failures can still fail the Spark task.
+    remoteSink->closeRemote();
+    writtenBytes_ = remoteSink->bytes_written();
+  } else {
+    const auto& parameters = writerInfo_->writerParameters;
+    const auto writePath =
+        fs::path(cudfWritePath(parameters.writeDirectory())) /
+        parameters.writeFileName();
+    writtenBytes_ = fs::file_size(writePath);
+  }
 
   // Reset the unique pointers to Cudf writer and options
   writer_.reset();

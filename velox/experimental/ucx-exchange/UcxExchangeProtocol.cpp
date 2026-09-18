@@ -17,15 +17,61 @@
 #include "velox/experimental/ucx-exchange/UcxExchangeProtocol.h"
 
 #include <cuda_runtime.h>
+#include <cudf/utilities/error.hpp>
 #include <glog/logging.h>
+#include <nvtx3/nvtx3.hpp>
+#include <sys/resource.h>
+#include <array>
+#include <chrono>
 #include <cstring>
 #include <mutex>
 #include <stdexcept>
 #include "velox/common/base/Exceptions.h"
+#include "velox/experimental/cudf/exec/HostStagingCopy.h"
 
 namespace facebook::velox::ucx_exchange {
 
 namespace {
+// Dedicated CPU-only workers: submitting staging threads may wait here, but
+// never submit back into their own executor. No additional data buffers or
+// pinned leases are allocated. Existing staging admission bounds callers.
+bool copyPageableHost(void* destination, const void* source, uint64_t bytes) {
+  static const bool enabled = [] {
+    const auto* value = std::getenv("GLUTEN_UCX_PARALLEL_PAGEABLE_COPY");
+    return value && std::string_view(value) == "1";
+  }();
+  return cudf_velox::host_staging::copyPageableHost(
+      destination,
+      source,
+      bytes,
+      enabled,
+      "UcxHost::parallelPageableCopyChunk");
+}
+
+bool pinnedLeaseDiagnostics() {
+  static const bool enabled = [] {
+    const auto* value = std::getenv("GLUTEN_UCX_PINNED_LEASE_DIAGNOSTICS");
+    return value && std::string_view(value) == "1";
+  }();
+  return enabled;
+}
+
+size_t localPinnedQueueLimit() {
+  static const size_t limit = [] {
+    const auto* value = std::getenv("GLUTEN_UCX_LOCAL_PINNED_QUEUE_LIMIT");
+    if (!value) {
+      return size_t{0};
+    }
+    char* end = nullptr;
+    const auto parsed = std::strtoull(value, &end, 10);
+    VELOX_USER_CHECK(
+        end != value && *end == '\0' && parsed <= 16,
+        "GLUTEN_UCX_LOCAL_PINNED_QUEUE_LIMIT must be in [0, 16]");
+    return static_cast<size_t>(parsed);
+  }();
+  return limit;
+}
+
 class UcxPinnedBufferPool {
  public:
   UcxPinnedBufferPool(const char* countEnv, const char* label) : label_{label} {
@@ -38,16 +84,42 @@ class UcxPinnedBufferPool {
     }
   }
 
-  std::shared_ptr<uint8_t> acquire(uint64_t requiredBytes) {
+  std::shared_ptr<uint8_t> acquire(
+      uint64_t requiredBytes,
+      const char* owner = "unspecified",
+      std::string_view localQueue = {}) {
     if (requiredBytes == 0) {
       return {};
     }
     std::lock_guard<std::mutex> lock(mutex_);
+    // Local pages can retain their transport lease behind a join-build
+    // barrier. Bound one queue's ownership, rather than waiting for a slot
+    // while the queue needed to unblock that consumer cannot make progress.
+    // The caller keeps its existing pageable fallback and host accounting.
+    const auto queueLimit = localPinnedQueueLimit();
+    if (queueLimit && !localQueue.empty()) {
+      size_t queueLeases = 0;
+      for (const auto& slot : slots_) {
+        if (slot->busy && slot->localQueue == localQueue &&
+            ++queueLeases >= queueLimit) {
+          if (pinnedLeaseDiagnostics()) {
+            auto label = std::string("UcxPinnedQueueLimit pool=") + label_ +
+                " owner=" + owner + " bytes=" + std::to_string(requiredBytes) +
+                " holders=";
+            for (const auto& held : slots_) {
+              label += std::string(held->busy ? held->owner : "none") + ",";
+            }
+            nvtx3::scoped_range limited(label.c_str());
+          }
+          return {};
+        }
+      }
+    }
     size_t available = slots_.size();
     for (size_t i = 0; i < slots_.size(); ++i) {
       if (!slots_[i]->busy && slots_[i]->capacity >= requiredBytes) {
         slots_[i]->busy = true;
-        return makeOwner(i);
+        return makeOwner(i, requiredBytes, owner, localQueue);
       }
       if (!slots_[i]->busy && available == slots_.size()) {
         available = i;
@@ -58,6 +130,15 @@ class UcxPinnedBufferPool {
       available = slots_.size() - 1;
     }
     if (available == slots_.size()) {
+      if (pinnedLeaseDiagnostics()) {
+        std::string label = std::string("UcxPinnedMiss pool=") + label_ +
+            " owner=" + owner + " bytes=" + std::to_string(requiredBytes) +
+            " holders=";
+        for (const auto& slot : slots_) {
+          label += std::string(slot->owner) + ",";
+        }
+        nvtx3::scoped_range miss(label.c_str());
+      }
       return {};
     }
 
@@ -82,7 +163,7 @@ class UcxPinnedBufferPool {
     slot.data = allocation;
     slot.capacity = allocationBytes;
     slot.busy = true;
-    return makeOwner(available);
+    return makeOwner(available, requiredBytes, owner, localQueue);
   }
 
   ~UcxPinnedBufferPool() {
@@ -98,22 +179,55 @@ class UcxPinnedBufferPool {
     uint8_t* data{nullptr};
     uint64_t capacity{0};
     bool busy{false};
+    const char* owner{"none"};
+    std::string localQueue;
   };
 
   struct Lease {
-    Lease(UcxPinnedBufferPool* pool, size_t slot) : pool(pool), slot(slot) {}
+    Lease(
+        UcxPinnedBufferPool* pool,
+        size_t slot,
+        uint64_t bytes,
+        const char* owner)
+        : pool(pool), slot(slot) {
+      if (pinnedLeaseDiagnostics()) {
+        const auto label = std::string("UcxPinnedLease pool=") + pool->label_ +
+            " owner=" + owner + " slot=" + std::to_string(slot) +
+            " bytes=" + std::to_string(bytes) +
+            " capacity=" + std::to_string(pool->slots_[slot]->capacity);
+        range = std::make_unique<nvtx3::unique_range>(label.c_str());
+      }
+    }
     ~Lease() {
       std::lock_guard<std::mutex> lock(pool->mutex_);
       VELOX_CHECK(pool->slots_[slot]->busy);
+      range.reset();
+      pool->slots_[slot]->owner = "none";
+      pool->slots_[slot]->localQueue.clear();
       pool->slots_[slot]->busy = false;
     }
     UcxPinnedBufferPool* pool;
     size_t slot;
+    std::unique_ptr<nvtx3::unique_range> range;
   };
 
-  std::shared_ptr<uint8_t> makeOwner(size_t slot) {
-    auto lease = std::make_shared<Lease>(this, slot);
-    return std::shared_ptr<uint8_t>(lease, slots_[slot]->data);
+  std::shared_ptr<uint8_t> makeOwner(
+      size_t slot,
+      uint64_t bytes,
+      const char* owner,
+      std::string_view localQueue) {
+    try {
+      // Copy before constructing Lease: an allocation failure must not destroy
+      // an already-created Lease while this mutex is held.
+      slots_[slot]->localQueue = localQueue;
+      auto lease = std::make_shared<Lease>(this, slot, bytes, owner);
+      slots_[slot]->owner = owner;
+      return std::shared_ptr<uint8_t>(lease, slots_[slot]->data);
+    } catch (...) {
+      slots_[slot]->busy = false;
+      slots_[slot]->localQueue.clear();
+      throw;
+    }
   }
 
   std::mutex mutex_;
@@ -132,14 +246,110 @@ UcxPinnedBufferPool& ucxH2DPinnedBufferPool() {
   static UcxPinnedBufferPool pool("GLUTEN_UCX_H2D_PINNED_BUFFER_COUNT", "H2D");
   return pool;
 }
+
+UcxPinnedBufferPool& ucxD2HPinnedBufferPool() {
+  static UcxPinnedBufferPool pool("GLUTEN_UCX_D2H_PINNED_BUFFER_COUNT", "D2H");
+  return pool;
+}
 } // namespace
 
 std::shared_ptr<uint8_t> acquireUcxPinnedBuffer(uint64_t requiredBytes) {
   return ucxPinnedBufferPool().acquire(requiredBytes);
 }
 
+std::shared_ptr<uint8_t> acquireUcxPinnedBufferForStage(
+    uint64_t requiredBytes,
+    bool intraNode,
+    std::string_view localQueue) {
+  return ucxPinnedBufferPool().acquire(
+      requiredBytes,
+      intraNode ? "intra" : "remote",
+      intraNode ? localQueue : std::string_view{});
+}
+
 std::shared_ptr<uint8_t> acquireUcxH2DPinnedBuffer(uint64_t requiredBytes) {
   return ucxH2DPinnedBufferPool().acquire(requiredBytes);
+}
+
+std::shared_ptr<uint8_t> acquireUcxD2HPinnedBuffer() {
+  return ucxD2HPinnedBufferPool().acquire(kUcxD2HStagingBytes);
+}
+
+void initializeUcxStagingPools() {
+  (void)ucxPinnedBufferPool();
+  (void)ucxH2DPinnedBufferPool();
+  (void)ucxD2HPinnedBufferPool();
+}
+
+void copyUcxDeviceToPageableHost(
+    void* destination,
+    const void* source,
+    uint64_t bytes,
+    rmm::cuda_stream_view stream) {
+  if (bytes == 0) {
+    return;
+  }
+  nvtx3::scoped_range transferRange("UcxHost::shortD2H");
+  static const bool diagnostics = [] {
+    const auto* value = std::getenv("GLUTEN_UCX_HOST_COPY_DIAGNOSTICS");
+    return value && value[0] != '\0' && value[0] != '0';
+  }();
+  std::shared_ptr<uint8_t> scratch;
+  {
+    nvtx3::scoped_range acquireRange("UcxHost::acquireD2HSlot");
+    scratch = acquireUcxD2HPinnedBuffer();
+  }
+  VELOX_CHECK_NOT_NULL(
+      scratch,
+      "Bounded UCX D2H scratch unavailable; refusing pageable CUDA fallback");
+  auto* dst = static_cast<uint8_t*>(destination);
+  auto* src = static_cast<const uint8_t*>(source);
+  for (uint64_t offset = 0; offset < bytes;) {
+    const auto size = std::min(kUcxD2HStagingBytes, bytes - offset);
+    {
+      nvtx3::scoped_range dmaRange("UcxHost::shortDmaAndWait");
+      CUDF_CUDA_TRY(cudaMemcpyAsync(
+          scratch.get(),
+          src + offset,
+          size,
+          cudaMemcpyDeviceToHost,
+          stream.value()));
+      stream.synchronize();
+    }
+    {
+      nvtx3::scoped_range copyRange("UcxHost::shortMemcpyToPageable");
+      rusage before{}, after{};
+      const bool beforeValid =
+          diagnostics && getrusage(RUSAGE_THREAD, &before) == 0;
+      const auto start = diagnostics ? std::chrono::steady_clock::now()
+                                     : std::chrono::steady_clock::time_point{};
+      const bool parallel = copyPageableHost(dst + offset, scratch.get(), size);
+      if (diagnostics) {
+        const auto wallNs =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - start)
+                .count();
+        // Parent-thread rusage does not account for the parallel copy workers.
+        const bool valid =
+            !parallel && getrusage(RUSAGE_THREAD, &after) == 0 && beforeValid;
+        const auto micros = [](const timeval& value) {
+          return int64_t{value.tv_sec} * 1000000 + value.tv_usec;
+        };
+        LOG(WARNING)
+            << "UCX_HOST_COPY bytes=" << size << " wallNs=" << wallNs
+            << " parallel=" << parallel << " rusageValid=" << valid
+            << " userUs="
+            << (valid ? micros(after.ru_utime) - micros(before.ru_utime) : -1)
+            << " systemUs="
+            << (valid ? micros(after.ru_stime) - micros(before.ru_stime) : -1)
+            << " minorFaults="
+            << (valid ? after.ru_minflt - before.ru_minflt : -1)
+            << " majorFaults="
+            << (valid ? after.ru_majflt - before.ru_majflt : -1);
+      }
+    }
+    offset += size;
+  }
 }
 
 uint32_t fnv1a_32(std::string_view s) {

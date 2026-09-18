@@ -41,6 +41,7 @@
 #include <future>
 #include <limits>
 #include <memory>
+#include <mutex>
 
 namespace facebook::velox::cudf_velox {
 
@@ -74,6 +75,16 @@ struct HashJoinHostBatch {
 /// use HASH_MURMUR3 with seed zero, so a matching key is restored into exactly
 /// one GPU-resident bucket.
 struct GraceHashJoinBuildData {
+  // An optional immutable hash, shared by all probe drivers. Initialization
+  // happens once after final build publication; release happens only after
+  // the probe peer barrier. Host build batches remain available for fallback.
+  struct ResidentPartition {
+    size_t partition;
+    std::shared_ptr<cudf::table> table;
+    std::shared_ptr<cudf::hash_join> hash;
+  };
+  std::once_flag residentInit;
+  std::shared_ptr<ResidentPartition> resident;
   std::vector<std::vector<HashJoinHostBatch>> partitions;
   // RIGHT join build rows with any null join key can never match under SQL
   // null semantics. Keep them outside the hash partitions and emit them
@@ -348,14 +359,24 @@ class CudfHashJoinProbe : public CudfOperatorBase {
       HashJoinHostBatch& batch,
       const RowTypePtr& type,
       rmm::cuda_stream_view stream,
-      bool consume);
+      bool consume,
+      std::shared_ptr<uint8_t> stagedData = nullptr);
   void initializeGracePartitionQueue();
   GraceHashJoinPartitionSet repartitionGracePartition(
       GraceHashJoinPartition& partition,
       rmm::cuda_stream_view stream);
   void loadGraceBuildPartition(
       GraceHashJoinPartition& partition,
+      rmm::cuda_stream_view stream,
+      bool preserveHost = false);
+  void initializeGraceResidentPartition();
+  bool tryProbeGraceResidentPartition(
+      size_t partition,
+      cudf::table_view table,
+      uint64_t bytes,
       rmm::cuda_stream_view stream);
+  bool graceResidentOutputReady() const;
+  RowVectorPtr takeGraceResidentOutput();
   uint64_t estimateGraceBuildWorkspaceBytes(
       const GraceHashJoinPartition& partition,
       bool recursiveRepartition) const;
@@ -424,6 +445,16 @@ class CudfHashJoinProbe : public CudfOperatorBase {
   bool prebuildProbeFinishPending_{false};
 
   std::shared_ptr<GraceHashJoinBuildData> graceBuildData_;
+  // Stop accepting input at the coalescing target (plus at most the final
+  // admitted input's expansion). A row/batch cap also bounds zero-column
+  // outputs. This is not a bound on arbitrary join fanout within one input.
+  std::deque<RowVectorPtr> graceResidentOutputs_;
+  uint64_t graceResidentOutputBytes_{0};
+  uint64_t graceResidentOutputRows_{0};
+  uint64_t graceResidentOutputTargetBytes_{256ULL << 20};
+  bool graceResidentFlushRequested_{false};
+  bool graceResidentFinishPending_{false};
+  bool graceResidentInputEligible_{false};
   // Coalesce small device inputs before hash partition + pack + D2H. This
   // amortizes partition/pack kernels without changing the bounded host tier.
   std::vector<CudfVectorPtr> graceProbeInputs_;
@@ -489,6 +520,10 @@ class CudfHashJoinProbe : public CudfOperatorBase {
   // batch is blocked downstream double-counts that memory and can starve the
   // next drain for tens of seconds.
   std::optional<DeviceMemoryWorkspaceReservation> graceWorkspaceAdmission_;
+  // Declared after the admission: reverse destruction waits for in-flight
+  // restore work before returning its workspace credit.
+  struct GraceAsyncProbeGroup;
+  std::shared_ptr<GraceAsyncProbeGroup> graceAsyncProbeGroup_;
   size_t graceProbePrefetchDepth_{4};
   std::deque<std::pair<size_t, std::future<void>>> graceProbePrefetchFutures_;
 
