@@ -30,7 +30,7 @@ TEST(ConfigTest, cudfConfig) {
   EXPECT_EQ(defaults.exchangeBatchSizeMinThreshold, 32000000);
   EXPECT_EQ(defaults.exchangeBatchSizeMinThresholdBytes, 0);
   EXPECT_DOUBLE_EQ(defaults.hashJoinLoadFactor, 0.5);
-  EXPECT_FALSE(defaults.hashJoinDistinctEnabled);
+  EXPECT_TRUE(defaults.hashJoinDistinctEnabled);
 
   std::unordered_map<std::string, std::string> options = {
       {CudfConfig::kCudfEnabled, "false"},
@@ -46,7 +46,7 @@ TEST(ConfigTest, cudfConfig) {
       {CudfConfig::kCudfExchangeConcatOptimizationEnabled, "false"},
       {CudfConfig::kCudfExchangeBatchSizeMinThresholdBytes, "8388608"},
       {CudfConfig::kCudfHashJoinLoadFactor, "0.7"},
-      {CudfConfig::kCudfHashJoinDistinctEnabled, "true"},
+      {CudfConfig::kCudfHashJoinDistinctEnabled, "false"},
       {CudfConfig::kCudfOrderByMergeFanIn, "7"},
       {CudfConfig::kCudfWindowSortedRunBytes, "134217728"},
       {CudfConfig::kCudfStreamingGroupbyEnabled, "true"},
@@ -64,7 +64,7 @@ TEST(ConfigTest, cudfConfig) {
   ASSERT_EQ(config.exchangeConcatOptimizationEnabled, false);
   ASSERT_EQ(config.exchangeBatchSizeMinThresholdBytes, 8388608);
   ASSERT_DOUBLE_EQ(config.hashJoinLoadFactor, 0.7);
-  ASSERT_TRUE(config.hashJoinDistinctEnabled);
+  ASSERT_FALSE(config.hashJoinDistinctEnabled);
   ASSERT_EQ(config.streamingGroupbyEnabled, true);
   ASSERT_EQ(config.streamingGroupbyCapacityMultiplier, 3.5);
   ASSERT_EQ(config.allowCpuFallback, false);

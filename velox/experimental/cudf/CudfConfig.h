@@ -265,7 +265,7 @@ struct CudfConfig {
   /// Hash-table occupancy used by cuDF hash joins. Higher values reduce
   /// retained build memory at the cost of additional probe collisions.
   double hashJoinLoadFactor{0.5};
-  bool hashJoinDistinctEnabled{false};
+  bool hashJoinDistinctEnabled{true};
   // Query config key for the TopN batch size in the cuDF TopN operator.
   int32_t topNBatchSize{5};
 
