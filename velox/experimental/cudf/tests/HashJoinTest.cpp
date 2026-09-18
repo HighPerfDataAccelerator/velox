@@ -101,6 +101,116 @@ core::PlanNodePtr countStarOverZeroColumnHashJoinPlan(
       .planNode();
 }
 
+TEST_F(HashJoinTest, distinctBuildChunks) {
+  auto probe = makeRowVector(
+      {"k", "p"},
+      {makeNullableFlatVector<int64_t>({1, 2, 2, 3, std::nullopt}),
+       makeFlatVector<int32_t>({1, 2, 3, 4, 5})});
+  auto build = makeRowVector(
+      {"u_k", "u_p"},
+      {makeFlatVector<int64_t>({1, 2, 2, 3}),
+       makeFlatVector<int32_t>({1, 2, 3, 4})});
+  createDuckDbTable("t", {probe});
+  createDuckDbTable("u", {build});
+  for (bool enabled : {false, true}) {
+    for (int maxRows : {2, 32}) {
+      for (auto const& filter : {std::string{}, std::string{"p < u_p"}}) {
+        auto idGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+        auto plan = PlanBuilder(idGenerator)
+                        .values({probe})
+                        .hashJoin(
+                            {"k"},
+                            {"u_k"},
+                            PlanBuilder(idGenerator).values({build}).planNode(),
+                            filter,
+                            {"k", "p", "u_k", "u_p"},
+                            core::JoinType::kInner)
+                        .planNode();
+        auto sql = "SELECT t.k, t.p, u.u_k, u.u_p FROM t JOIN u ON k = u_k" +
+            (filter.empty() ? std::string{} : " WHERE " + filter);
+        auto task =
+            AssertQueryBuilder(plan, duckDbQueryRunner_)
+                .maxDrivers(1)
+                .config(
+                    cudf_velox::CudfConfig::kCudfHashJoinDistinctEnabled,
+                    enabled ? "true" : "false")
+                .config(
+                    cudf_velox::CudfConfig::kCudfBatchSizeMaxThreshold,
+                    std::to_string(maxRows))
+                .assertResults(sql);
+        int64_t distinctChunks = 0;
+        int64_t generalChunks = 0;
+        for (auto const& pipeline : task->taskStats().pipelineStats) {
+          for (auto const& op : pipeline.operatorStats) {
+            for (auto const& [name, metric] : op.runtimeStats) {
+              if (name == "cudfHashJoinDistinctChunks") {
+                distinctChunks += metric.sum;
+              } else if (name == "cudfHashJoinGeneralChunks") {
+                generalChunks += metric.sum;
+              }
+            }
+          }
+        }
+        EXPECT_EQ(distinctChunks, enabled && maxRows == 2 ? 2 : 0);
+        EXPECT_EQ(
+            generalChunks,
+            enabled && maxRows == 2 ? 0 : (maxRows == 2 ? 2 : 1));
+      }
+    }
+  }
+}
+
+TEST_F(HashJoinTest, distinctCompositeBuildAndOuterFallback) {
+  auto probe = makeRowVector(
+      {"k", "p"},
+      {makeFlatVector<int64_t>({1, 1, 2, 3}),
+       makeFlatVector<int32_t>({1, 2, 1, 1})});
+  auto build = makeRowVector(
+      {"u_k", "u_p"},
+      {makeFlatVector<int64_t>({1, 1, 2}), makeFlatVector<int32_t>({1, 2, 1})});
+  createDuckDbTable("t", {probe});
+  createDuckDbTable("u", {build});
+  for (auto joinType :
+       {core::JoinType::kInner,
+        core::JoinType::kLeft,
+        core::JoinType::kRight,
+        core::JoinType::kFull}) {
+    auto idGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+    auto plan = PlanBuilder(idGenerator)
+                    .values({probe})
+                    .hashJoin(
+                        {"k", "p"},
+                        {"u_k", "u_p"},
+                        PlanBuilder(idGenerator).values({build}).planNode(),
+                        "",
+                        {"k", "p", "u_k", "u_p"},
+                        joinType)
+                    .planNode();
+    std::string join = joinType == core::JoinType::kInner ? "INNER"
+        : joinType == core::JoinType::kLeft               ? "LEFT"
+        : joinType == core::JoinType::kRight              ? "RIGHT"
+                                                          : "FULL";
+    auto task =
+        AssertQueryBuilder(plan, duckDbQueryRunner_)
+            .maxDrivers(1)
+            .config(
+                cudf_velox::CudfConfig::kCudfHashJoinDistinctEnabled, "true")
+            .assertResults(
+                "SELECT k, p, u_k, u_p FROM t " + join +
+                " JOIN u ON k = u_k AND p = u_p");
+    int64_t distinctChunks = 0;
+    for (auto const& pipeline : task->taskStats().pipelineStats) {
+      for (auto const& op : pipeline.operatorStats) {
+        auto it = op.runtimeStats.find("cudfHashJoinDistinctChunks");
+        if (it != op.runtimeStats.end()) {
+          distinctChunks += it->second.sum;
+        }
+      }
+    }
+    EXPECT_EQ(distinctChunks, joinType == core::JoinType::kInner ? 1 : 0);
+  }
+}
+
 TEST_F(HashJoinTest, countStarOverInnerJoinWithZeroColumnOutput) {
   auto probe = makeRowVector({"k"}, {makeFlatVector<int32_t>({1, 2, 2, 3})});
   auto build = makeRowVector({"u_k"}, {makeFlatVector<int32_t>({2, 2, 4})});

@@ -319,3 +319,9 @@ add_subdirectory(utils)
 if(${VELOX_ENABLE_SPARK_FUNCTIONS})
   add_subdirectory(sparksql)
 endif()
+
+velox_add_cudf_test(
+  NAME velox_cudf_hash_join_table_test
+  SOURCES HashJoinTableTest.cpp
+  LIBS velox_cudf_exec
+)
