@@ -16,6 +16,9 @@
 
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/CudfConversion.h"
+#include "velox/experimental/cudf/exec/GracePinnedTransfer.h"
+#include "velox/experimental/cudf/exec/GraceStagingPolicy.h"
+#include "velox/experimental/cudf/exec/HostStagingCopy.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/expression/PrestoFunctions.h"
 
@@ -38,10 +41,14 @@
 #include "velox/vector/VectorPrinter.h"
 #include "velox/vector/fuzzer/VectorFuzzer.h"
 
+#include <rmm/cuda_stream.hpp>
+#include <rmm/device_buffer.hpp>
+
 #include <fmt/format.h>
 #include <re2/re2.h>
 
 #include <atomic>
+#include <future>
 
 using namespace facebook::velox;
 using namespace facebook::velox::exec;
@@ -51,6 +58,96 @@ using namespace facebook::velox::common::testutil;
 using facebook::velox::test::BatchMaker;
 
 namespace {
+
+TEST(HostStagingCopyTest, thresholdTailAndUnalignedPointers) {
+  constexpr uint64_t threshold = 8ULL << 20;
+  for (const uint64_t bytes :
+       {uint64_t{0}, threshold - 1, threshold, threshold + 257}) {
+    std::vector<uint8_t> source(bytes + 2), destination(bytes + 4, 0xa5);
+    for (uint64_t i = 0; i < source.size(); ++i) {
+      source[i] = (i * 17 + i / 4096) % 251;
+    }
+    for (const bool enabled : {false, true}) {
+      EXPECT_EQ(
+          cudf_velox::host_staging::copyPageableHost(
+              destination.data() + 1,
+              source.data() + 1,
+              bytes,
+              enabled,
+              "HostStagingCopyTest::chunk"),
+          enabled && bytes >= threshold);
+      EXPECT_EQ(destination.front(), 0xa5);
+      EXPECT_EQ(destination[bytes + 1], 0xa5);
+      EXPECT_TRUE(
+          std::equal(
+              source.begin() + 1,
+              source.begin() + 1 + bytes,
+              destination.begin() + 1));
+    }
+  }
+  EXPECT_FALSE(
+      cudf_velox::host_staging::copyPageableHost(
+          nullptr, nullptr, 0, true, "HostStagingCopyTest::empty"));
+}
+
+TEST(GracePinnedTransferTest, emptyCopyDoesNotNeedPointers) {
+  const auto stats = cudf_velox::grace_transfer::copyGraceViaPinned(
+      nullptr, nullptr, 0, true, rmm::cuda_stream_default);
+  EXPECT_EQ(stats.bytes, 0);
+}
+
+TEST(GracePinnedTransferTest, oversizedRoundTripPreservesIndependentHostImage) {
+  const uint64_t bytes = (256ULL << 20) + 257;
+  std::vector<uint8_t> input(bytes);
+  for (uint64_t i = 0; i < bytes; ++i) {
+    input[i] = (i * 17 + i / 4096) % 251;
+  }
+  std::vector<uint8_t> output(bytes, 0);
+  rmm::cuda_stream stream;
+  rmm::device_buffer device(bytes, stream.view());
+  auto up = cudf_velox::grace_transfer::copyGraceViaPinned(
+      device.data(), input.data(), bytes, true, stream.view());
+  auto down = cudf_velox::grace_transfer::copyGraceViaPinned(
+      device.data(), output.data(), bytes, false, stream.view());
+  EXPECT_EQ(up.bytes, bytes);
+  EXPECT_EQ(down.bytes, bytes);
+  EXPECT_EQ(output, input);
+  // A later transfer may reuse the scratch, not the retained output image.
+  std::vector<uint8_t> next(257, 0x33);
+  cudf_velox::grace_transfer::copyGraceViaPinned(
+      device.data(), next.data(), next.size(), true, stream.view());
+  EXPECT_EQ(output, input);
+}
+
+TEST(GracePinnedTransferTest, concurrentCopiesDoNotAlias) {
+  int deviceId = 0;
+  ASSERT_EQ(cudaGetDevice(&deviceId), cudaSuccess);
+  std::vector<std::future<bool>> futures;
+  for (int i = 0; i < 4; ++i) {
+    futures.push_back(std::async(std::launch::async, [deviceId, i] {
+      if (cudaSetDevice(deviceId) != cudaSuccess) {
+        return false;
+      }
+      rmm::cuda_stream stream;
+      const uint64_t bytes = (16ULL << 20) + i;
+      rmm::device_buffer device(bytes, stream.view());
+      std::vector<uint8_t> input(bytes, 0x40 + i), output(bytes, 0);
+      for (int iteration = 0; iteration < 3; ++iteration) {
+        cudf_velox::grace_transfer::copyGraceViaPinned(
+            device.data(), input.data(), bytes, true, stream.view());
+        cudf_velox::grace_transfer::copyGraceViaPinned(
+            device.data(), output.data(), bytes, false, stream.view());
+        if (input != output) {
+          return false;
+        }
+      }
+      return true;
+    }));
+  }
+  for (auto& future : futures) {
+    EXPECT_TRUE(future.get());
+  }
+}
 
 class HashJoinTest : public HashJoinTestBase {
  public:
@@ -68,7 +165,496 @@ class HashJoinTest : public HashJoinTestBase {
     cudf_velox::unregisterCudf();
     HashJoinTestBase::TearDown();
   }
+
+  void runResidentGraceProbeTest(
+      uint64_t limit,
+      int drivers,
+      bool zeroColumns,
+      uint64_t outputTarget = 256ULL << 20,
+      bool asyncRestore = false,
+      bool pageableBounce = false,
+      bool strictPinned = false,
+      bool asyncBuildHostRestore = false) {
+    auto& config = cudf_velox::CudfConfig::getInstance();
+    const auto oldBuild = config.hashJoinGraceBuildBytes;
+    const auto oldHost = config.hashJoinGraceHostBytes;
+    const auto oldParts = config.hashJoinGracePartitions;
+    const auto oldEnabled = std::getenv("GLUTEN_CUDF_HASH_JOIN_RESIDENT_PROBE");
+    const auto oldLimit =
+        std::getenv("GLUTEN_CUDF_HASH_JOIN_RESIDENT_BUILD_MAX_BYTES");
+    const auto oldOutput =
+        std::getenv("GLUTEN_CUDF_HASH_JOIN_RESIDENT_OUTPUT_BYTES");
+    const auto oldAsync =
+        std::getenv("GLUTEN_CUDF_HASH_JOIN_ASYNC_PROBE_RESTORE");
+    const auto oldBounce =
+        std::getenv("GLUTEN_CUDF_HASH_JOIN_PAGEABLE_RESTORE_BOUNCE");
+    const auto oldStrict =
+        std::getenv("GLUTEN_CUDF_HASH_JOIN_STRICT_PINNED_TRANSFERS");
+    const auto oldBuildStage =
+        std::getenv("GLUTEN_CUDF_HASH_JOIN_ASYNC_BUILD_HOST_RESTORE");
+    const std::optional<std::string> savedBuildStage = oldBuildStage
+        ? std::optional<std::string>(oldBuildStage)
+        : std::nullopt;
+    const std::optional<std::string> savedStrict =
+        oldStrict ? std::optional<std::string>(oldStrict) : std::nullopt;
+    const std::optional<std::string> savedBounce =
+        oldBounce ? std::optional<std::string>(oldBounce) : std::nullopt;
+    const std::optional<std::string> savedAsync =
+        oldAsync ? std::optional<std::string>(oldAsync) : std::nullopt;
+    const std::optional<std::string> savedEnabled =
+        oldEnabled ? std::optional<std::string>(oldEnabled) : std::nullopt;
+    const std::optional<std::string> savedLimit =
+        oldLimit ? std::optional<std::string>(oldLimit) : std::nullopt;
+    const std::optional<std::string> savedOutput =
+        oldOutput ? std::optional<std::string>(oldOutput) : std::nullopt;
+    SCOPE_EXIT {
+      if (savedBuildStage) {
+        setenv(
+            "GLUTEN_CUDF_HASH_JOIN_ASYNC_BUILD_HOST_RESTORE",
+            savedBuildStage->c_str(),
+            1);
+      } else {
+        unsetenv("GLUTEN_CUDF_HASH_JOIN_ASYNC_BUILD_HOST_RESTORE");
+      }
+      if (savedStrict) {
+        setenv(
+            "GLUTEN_CUDF_HASH_JOIN_STRICT_PINNED_TRANSFERS",
+            savedStrict->c_str(),
+            1);
+      } else {
+        unsetenv("GLUTEN_CUDF_HASH_JOIN_STRICT_PINNED_TRANSFERS");
+      }
+      config.hashJoinGraceBuildBytes = oldBuild;
+      config.hashJoinGraceHostBytes = oldHost;
+      config.hashJoinGracePartitions = oldParts;
+      if (savedBounce) {
+        setenv(
+            "GLUTEN_CUDF_HASH_JOIN_PAGEABLE_RESTORE_BOUNCE",
+            savedBounce->c_str(),
+            1);
+      } else {
+        unsetenv("GLUTEN_CUDF_HASH_JOIN_PAGEABLE_RESTORE_BOUNCE");
+      }
+      if (savedAsync) {
+        setenv(
+            "GLUTEN_CUDF_HASH_JOIN_ASYNC_PROBE_RESTORE",
+            savedAsync->c_str(),
+            1);
+      } else {
+        unsetenv("GLUTEN_CUDF_HASH_JOIN_ASYNC_PROBE_RESTORE");
+      }
+      if (savedEnabled) {
+        setenv(
+            "GLUTEN_CUDF_HASH_JOIN_RESIDENT_PROBE", savedEnabled->c_str(), 1);
+      } else {
+        unsetenv("GLUTEN_CUDF_HASH_JOIN_RESIDENT_PROBE");
+      }
+      if (savedLimit) {
+        setenv(
+            "GLUTEN_CUDF_HASH_JOIN_RESIDENT_BUILD_MAX_BYTES",
+            savedLimit->c_str(),
+            1);
+      } else {
+        unsetenv("GLUTEN_CUDF_HASH_JOIN_RESIDENT_BUILD_MAX_BYTES");
+      }
+      if (savedOutput) {
+        setenv(
+            "GLUTEN_CUDF_HASH_JOIN_RESIDENT_OUTPUT_BYTES",
+            savedOutput->c_str(),
+            1);
+      } else {
+        unsetenv("GLUTEN_CUDF_HASH_JOIN_RESIDENT_OUTPUT_BYTES");
+      }
+    };
+    config.hashJoinGraceBuildBytes = 1;
+    setenv(
+        "GLUTEN_CUDF_HASH_JOIN_ASYNC_BUILD_HOST_RESTORE",
+        asyncBuildHostRestore ? "1" : "0",
+        1);
+    setenv(
+        "GLUTEN_CUDF_HASH_JOIN_STRICT_PINNED_TRANSFERS",
+        strictPinned ? "1" : "0",
+        1);
+    config.hashJoinGraceHostBytes = 1ULL << 30;
+    config.hashJoinGracePartitions = 8;
+    setenv(
+        "GLUTEN_CUDF_HASH_JOIN_ASYNC_PROBE_RESTORE",
+        asyncRestore ? "1" : "0",
+        1);
+    setenv(
+        "GLUTEN_CUDF_HASH_JOIN_PAGEABLE_RESTORE_BOUNCE",
+        pageableBounce ? "1" : "0",
+        1);
+    setenv("GLUTEN_CUDF_HASH_JOIN_RESIDENT_PROBE", "1", 1);
+    setenv(
+        "GLUTEN_CUDF_HASH_JOIN_RESIDENT_BUILD_MAX_BYTES",
+        std::to_string(limit).c_str(),
+        1);
+    setenv(
+        "GLUTEN_CUDF_HASH_JOIN_RESIDENT_OUTPUT_BYTES",
+        std::to_string(outputTarget).c_str(),
+        1);
+    auto probe = makeRowVector(
+        {"k", "v"},
+        {makeNullableFlatVector<int64_t>(
+             {0,
+              1,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15,
+              std::nullopt}),
+         makeFlatVector<int64_t>(18, [](auto row) { return row; })});
+    auto build = makeRowVector(
+        {"u_k", "u_v"},
+        {makeNullableFlatVector<int64_t>(
+             {0,
+              1,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15,
+              std::nullopt}),
+         makeFlatVector<int64_t>(18, [](auto row) { return 100 + row; })});
+    // More independent chunks than one restore wave in the async cases.
+    std::vector<RowVectorPtr> probeInputs(asyncRestore ? 64 : 2, probe);
+    createDuckDbTable("t", probeInputs);
+    createDuckDbTable("u", {build, build});
+    auto ids = std::make_shared<core::PlanNodeIdGenerator>();
+    auto plan =
+        PlanBuilder(ids)
+            .values(probeInputs)
+            .localPartition({"k"})
+            .hashJoin(
+                {"k"},
+                {"u_k"},
+                PlanBuilder(ids)
+                    .values({build, build})
+                    .localPartition({"u_k"})
+                    .planNode(),
+                "",
+                zeroColumns ? std::vector<std::string>{}
+                            : std::vector<std::string>{"k", "v", "u_k", "u_v"});
+    if (zeroColumns) {
+      plan.localPartition({}).singleAggregation({}, {"count(*)"});
+    }
+    auto task =
+        AssertQueryBuilder(plan.planNode(), duckDbQueryRunner_)
+            .maxDrivers(drivers)
+            .config(cudf_velox::CudfFromVelox::kGpuBatchSizeRows, "4")
+            .assertResults(
+                zeroColumns ? "SELECT count(*) FROM t JOIN u ON k = u_k"
+                            : "SELECT k, v, u_k, u_v FROM t JOIN u ON k = u_k");
+    int64_t bypassRows = 0;
+    int64_t restoreWaves = 0;
+    int64_t stagedBytes = 0;
+    int64_t shortPinnedBytes = 0;
+    int64_t buildStagedBytes = 0;
+    int64_t driverRestoreSuspends = 0;
+    int64_t driverRestoreWaitNanos = 0;
+    int64_t partialGroupOutputs = 0;
+    for (const auto& pipeline : task->taskStats().pipelineStats) {
+      for (const auto& op : pipeline.operatorStats) {
+        const auto partialOutputs =
+            op.runtimeStats.find("cudfGracePartialGroupOutputs");
+        if (partialOutputs != op.runtimeStats.end()) {
+          partialGroupOutputs += partialOutputs->second.sum;
+        }
+        const auto suspends =
+            op.runtimeStats.find("cudfGraceDriverRestoreSuspends");
+        if (suspends != op.runtimeStats.end()) {
+          driverRestoreSuspends += suspends->second.sum;
+        }
+        const auto waited =
+            op.runtimeStats.find("cudfGraceDriverRestoreWaitNanos");
+        if (waited != op.runtimeStats.end()) {
+          driverRestoreWaitNanos += waited->second.sum;
+        }
+        const auto buildStaged =
+            op.runtimeStats.find("cudfGraceAsyncBuildHostStageBytes");
+        if (buildStaged != op.runtimeStats.end()) {
+          buildStagedBytes += buildStaged->second.sum;
+        }
+        const auto shortCopy =
+            op.runtimeStats.find("cudfGraceShortPinnedRestoreBytes");
+        if (shortCopy != op.runtimeStats.end()) {
+          shortPinnedBytes += shortCopy->second.sum;
+        }
+        const auto staged =
+            op.runtimeStats.find("cudfGraceAsyncProbePinnedStagingBytes");
+        if (staged != op.runtimeStats.end()) {
+          stagedBytes += staged->second.sum;
+        }
+        const auto waves =
+            op.runtimeStats.find("cudfGraceAsyncProbeRestoreWaves");
+        if (waves != op.runtimeStats.end()) {
+          restoreWaves += waves->second.sum;
+        }
+        const auto it =
+            op.runtimeStats.find("cudfGraceResidentProbeBypassRows");
+        if (it != op.runtimeStats.end()) {
+          bypassRows += it->second.sum;
+        }
+      }
+    }
+    if (asyncRestore) {
+      EXPECT_GT(restoreWaves, 0);
+      if (limit > 0) {
+        // Resident mode packs each producer batch independently, ensuring
+        // more than one four-chunk wave per partition in this test.
+        EXPECT_GT(restoreWaves, 8);
+      }
+    } else {
+      EXPECT_EQ(restoreWaves, 0);
+    }
+    const auto* driverWait =
+        std::getenv("GLUTEN_CUDF_GRACE_DRIVER_RESTORE_WAIT");
+    const auto* streaming =
+        std::getenv("GLUTEN_CUDF_GRACE_STREAM_PROBE_OUTPUT");
+    const bool streamOutput = streaming && std::string_view(streaming) == "1";
+    if (asyncRestore &&
+        (streamOutput || (driverWait && std::string_view(driverWait) == "1"))) {
+      // These queries contain multiple independently restored waves. Require
+      // evidence of suspension and successful resume, not just correct rows
+      // produced by accidentally retaining the synchronous implementation.
+      EXPECT_GT(driverRestoreSuspends, 0);
+      EXPECT_GT(driverRestoreWaitNanos, 0);
+    } else {
+      EXPECT_EQ(driverRestoreSuspends, 0);
+      EXPECT_EQ(driverRestoreWaitNanos, 0);
+    }
+    if (streamOutput && asyncRestore && outputTarget <= 1) {
+      EXPECT_GT(partialGroupOutputs, 0);
+    } else if (!streamOutput) {
+      EXPECT_EQ(partialGroupOutputs, 0);
+    }
+    if (strictPinned) {
+      if (!asyncBuildHostRestore) {
+        EXPECT_GT(shortPinnedBytes, 0);
+      }
+    } else {
+      EXPECT_EQ(shortPinnedBytes, 0);
+    }
+    if (pageableBounce) {
+      EXPECT_GT(stagedBytes, 0);
+    } else {
+      EXPECT_EQ(stagedBytes, 0);
+    }
+    if (asyncBuildHostRestore) {
+      EXPECT_GT(buildStagedBytes, 0);
+    } else {
+      EXPECT_EQ(buildStagedBytes, 0);
+    }
+    if (limit == 0) {
+      EXPECT_EQ(bypassRows, 0);
+    } else {
+      EXPECT_GT(bypassRows, 0);
+    }
+  }
 };
+
+TEST(HostStagingCopyTest, concurrentCallersPreserveIndependentBuffers) {
+  std::vector<std::future<bool>> callers;
+  for (size_t caller = 0; caller < 4; ++caller) {
+    callers.push_back(std::async(std::launch::async, [caller] {
+      const size_t bytes = (8ULL << 20) + 4099 + caller;
+      std::vector<uint8_t> source(bytes, static_cast<uint8_t>(31 + caller));
+      std::vector<uint8_t> destination(bytes + 2, 0);
+      const bool parallel = cudf_velox::host_staging::copyPageableHost(
+          destination.data() + 1,
+          source.data(),
+          bytes,
+          true,
+          "HostStagingCopyTest::concurrentChunk");
+      return parallel && destination.front() == 0 && destination.back() == 0 &&
+          std::equal(source.begin(), source.end(), destination.begin() + 1);
+    }));
+  }
+  for (auto& caller : callers) {
+    EXPECT_TRUE(caller.get());
+  }
+}
+
+TEST_F(HashJoinTest, residentGraceProbeDuplicatesAndNulls) {
+  runResidentGraceProbeTest(2ULL << 30, 1, false);
+}
+
+TEST_F(HashJoinTest, validIndexGatherPreservesPayloadAndOuterNulls) {
+  auto probe = makeRowVector(
+      {"k", "v"},
+      {makeNullableFlatVector<int64_t>({0, 1, 1, 2, std::nullopt}),
+       makeNullableFlatVector<int64_t>(
+           {std::nullopt, 11, std::nullopt, 22, 99})});
+  auto build = makeRowVector(
+      {"u_k", "u_v"},
+      {makeNullableFlatVector<int64_t>({1, 1, 3, std::nullopt}),
+       makeNullableFlatVector<int64_t>({100, std::nullopt, 300, 999})});
+  createDuckDbTable("t", {probe});
+  createDuckDbTable("u", {build});
+  for (const auto& [type, sql] :
+       std::vector<std::pair<core::JoinType, std::string>>{
+           {core::JoinType::kInner, "JOIN"},
+           {core::JoinType::kLeft, "LEFT JOIN"},
+           {core::JoinType::kFull, "FULL OUTER JOIN"}}) {
+    auto ids = std::make_shared<core::PlanNodeIdGenerator>();
+    auto plan = PlanBuilder(ids)
+                    .values({probe})
+                    .hashJoin(
+                        {"k"},
+                        {"u_k"},
+                        PlanBuilder(ids).values({build}).planNode(),
+                        "",
+                        {"k", "v", "u_k", "u_v"},
+                        type)
+                    .planNode();
+    AssertQueryBuilder(plan, duckDbQueryRunner_)
+        .assertResults("SELECT k, v, u_k, u_v FROM t " + sql + " u ON k = u_k");
+  }
+}
+
+TEST(GraceStagingPolicyTest, packedAlignmentFitsFixedCapacity) {
+  constexpr uint64_t capacity = 256ULL << 20;
+  // 25 fixed-width columns, conservatively two buffers each, eight partitions.
+  const auto budget =
+      cudf_velox::detail::gracePartitionDataBudget(capacity, 50, 8);
+  EXPECT_EQ(budget, capacity - 25600);
+  EXPECT_LE(budget + 50 * 8 * 63, capacity);
+  EXPECT_EQ(
+      cudf_velox::detail::gracePartitionDataBudget(capacity, 0, 8), capacity);
+}
+
+TEST(GraceStagingPolicyTest, oversizedMetadataCannotOverflow) {
+  using cudf_velox::detail::gracePartitionDataBudget;
+  EXPECT_EQ(gracePartitionDataBudget(0, 1, 1), 0);
+  EXPECT_EQ(gracePartitionDataBudget(64, 1, 1), 1);
+  EXPECT_EQ(gracePartitionDataBudget(1024, UINT64_MAX, UINT64_MAX), 1);
+  EXPECT_EQ(gracePartitionDataBudget(1024, 1, 0), 1024);
+}
+
+TEST(GraceStagingPolicyTest, restoreWaveCountAndByteLimits) {
+  using cudf_velox::detail::graceRestoreWaveEnd;
+  const std::vector<uint64_t> bytes(12, 33ULL << 20);
+  const auto at = [&](size_t i) { return bytes.at(i); };
+  EXPECT_EQ(graceRestoreWaveEnd(0, 12, 4, 256ULL << 20, at), 4);
+  EXPECT_EQ(graceRestoreWaveEnd(0, 12, 8, 256ULL << 20, at), 7);
+  EXPECT_EQ(graceRestoreWaveEnd(7, 12, 8, 256ULL << 20, at), 12);
+  EXPECT_EQ(graceRestoreWaveEnd(0, 12, 8, 264ULL << 20, at), 8);
+}
+
+TEST(GraceStagingPolicyTest, restoreWaveOversizeProgressAndOverflow) {
+  using cudf_velox::detail::graceRestoreWaveEnd;
+  const std::vector<uint64_t> bytes{UINT64_MAX, 1, 0, UINT64_MAX};
+  const auto at = [&](size_t i) { return bytes.at(i); };
+  EXPECT_EQ(graceRestoreWaveEnd(0, 4, 8, 256, at), 1);
+  EXPECT_EQ(graceRestoreWaveEnd(1, 4, 8, UINT64_MAX, at), 3);
+  EXPECT_EQ(graceRestoreWaveEnd(3, 4, 8, UINT64_MAX, at), 4);
+  EXPECT_EQ(graceRestoreWaveEnd(0, 4, 0, 0, at), 1);
+  EXPECT_EQ(graceRestoreWaveEnd(4, 4, 8, 256, at), 4);
+}
+
+TEST(GraceStagingPolicyTest, restoreWavePinnedChunksDoNotConsumeBounce) {
+  using cudf_velox::detail::graceRestoreWaveEnd;
+  const std::vector<uint64_t> bytes{0, 128, 0, 128, 0, 1};
+  EXPECT_EQ(
+      graceRestoreWaveEnd(
+          0, bytes.size(), 8, 256, [&](size_t i) { return bytes.at(i); }),
+      5);
+}
+
+TEST_F(HashJoinTest, residentGraceProbeMultipleDrivers) {
+  runResidentGraceProbeTest(2ULL << 30, 3, false);
+}
+
+TEST_F(HashJoinTest, residentGraceProbeZeroColumnOutput) {
+  runResidentGraceProbeTest(2ULL << 30, 1, true);
+}
+
+TEST_F(HashJoinTest, residentGraceProbeZeroLimitFallback) {
+  runResidentGraceProbeTest(0, 3, false);
+}
+
+TEST_F(HashJoinTest, residentGraceProbeNoCoalescing) {
+  runResidentGraceProbeTest(2ULL << 30, 3, false, 0);
+}
+
+TEST_F(HashJoinTest, residentGraceProbeTinyOutputTarget) {
+  runResidentGraceProbeTest(2ULL << 30, 3, false, 1);
+}
+
+TEST_F(HashJoinTest, asyncGraceRestoreDuplicatesAndNulls) {
+  runResidentGraceProbeTest(0, 1, false, 256ULL << 20, true);
+}
+
+TEST_F(HashJoinTest, asyncGraceRestoreMultipleDrivers) {
+  runResidentGraceProbeTest(2ULL << 30, 3, false, 256ULL << 20, true);
+}
+
+TEST_F(HashJoinTest, asyncGraceRestoreZeroColumnOutput) {
+  runResidentGraceProbeTest(0, 3, true, 256ULL << 20, true);
+}
+
+TEST_F(HashJoinTest, asyncGraceRestorePinnedStagingMultipleDrivers) {
+  runResidentGraceProbeTest(2ULL << 30, 3, false, 256ULL << 20, true, true);
+}
+
+TEST_F(HashJoinTest, asyncGraceRestorePinnedStagingZeroColumnOutput) {
+  runResidentGraceProbeTest(0, 3, true, 256ULL << 20, true, true);
+}
+
+TEST_F(HashJoinTest, strictPinnedGraceMultipleDrivers) {
+  runResidentGraceProbeTest(0, 3, false, 256ULL << 20, true, true, true);
+}
+
+TEST_F(HashJoinTest, strictPinnedGraceZeroColumnOutput) {
+  runResidentGraceProbeTest(0, 3, true, 256ULL << 20, true, true, true);
+}
+
+TEST_F(HashJoinTest, asyncBuildHostGraceMultipleDrivers) {
+  runResidentGraceProbeTest(0, 3, false, 256ULL << 20, true, true, true, true);
+}
+
+TEST_F(HashJoinTest, asyncBuildHostGraceZeroColumnOutput) {
+  runResidentGraceProbeTest(0, 3, true, 256ULL << 20, true, true, true, true);
+}
+
+TEST_F(HashJoinTest, asyncBuildHostGraceResidentReplay) {
+  runResidentGraceProbeTest(
+      2ULL << 30, 3, false, 256ULL << 20, true, true, true, true);
+}
+
+TEST_F(HashJoinTest, streamGraceOutputSingleDriver) {
+  runResidentGraceProbeTest(2ULL << 30, 1, false, 1, true, true, true, true);
+}
+
+TEST_F(HashJoinTest, streamGraceOutputMultipleDrivers) {
+  runResidentGraceProbeTest(2ULL << 30, 3, false, 1, true, true, true, true);
+}
+
+TEST_F(HashJoinTest, streamGraceOutputZeroColumn) {
+  runResidentGraceProbeTest(2ULL << 30, 3, true, 0, true, true, true, true);
+}
 
 class MultiThreadedHashJoinTest
     : public HashJoinTest,
