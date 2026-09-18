@@ -15,6 +15,7 @@
  */
 
 #include "velox/experimental/cudf/CudfNoDefaults.h"
+#include "velox/experimental/cudf/connectors/hive/BufferedInputPinnedPool.h"
 #include "velox/experimental/cudf/connectors/hive/CudfSplitReaderHelpers.h"
 
 #include "velox/common/Casts.h"
@@ -31,6 +32,7 @@
 #include <cuda/std/tuple>
 
 #include <curl/curl.h>
+#include <folly/ScopeGuard.h>
 #include <folly/futures/Future.h>
 
 #ifdef VELOX_ENABLE_S3
@@ -2728,6 +2730,42 @@ std::future<size_t> BufferedInputDataSource::device_read_async(
         [copyFromCache = std::move(copyFromCache)](auto&&) mutable {
           return copyFromCache();
         });
+    return toStdFuture(std::move(future));
+  }
+  if (envFlagEnabled("GLUTEN_CUDF_BUFFERED_INPUT_PINNED")) {
+    int device;
+    CUDF_CUDA_TRY(cudaGetDevice(&device));
+    auto future =
+        folly::via(input_->executor())
+            .thenValue([input = input_, offset, readSize, dst, stream, device](
+                           auto&&) {
+              int previousDevice;
+              CUDF_CUDA_TRY(cudaGetDevice(&previousDevice));
+              CUDF_CUDA_TRY(cudaSetDevice(device));
+              SCOPE_EXIT {
+                cudaSetDevice(previousDevice);
+              };
+              BufferedInputPinnedPool::instance().copyToDevice(
+                  dst,
+                  readSize,
+                  stream.value(),
+                  [&](size_t position, size_t bytes, uint8_t* pinned) {
+                    using facebook::velox::dwio::common::LogType;
+                    // Preserve already-buffered ranges. Otherwise
+                    // ReadFileInputStream fills pinned storage directly and
+                    // retains IO accounting; no
+                    // SeekableFileInputStream/pageable temporary is needed.
+                    if (input->isBuffered(offset + position, bytes)) {
+                      auto source =
+                          input->read(offset + position, bytes, LogType::FILE);
+                      source->readFully(reinterpret_cast<char*>(pinned), bytes);
+                    } else {
+                      input->getInputStream()->read(
+                          pinned, bytes, offset + position, LogType::FILE);
+                    }
+                  });
+              return readSize;
+            });
     return toStdFuture(std::move(future));
   }
   auto future = folly::via(input_->executor())

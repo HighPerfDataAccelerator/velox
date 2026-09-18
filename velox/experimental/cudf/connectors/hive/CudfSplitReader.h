@@ -33,6 +33,7 @@
 
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/experimental/hybrid_scan.hpp>
+#include <cudf/io/orc.hpp>
 #include <cudf/io/parquet.hpp>
 #include <cudf/io/parquet_schema.hpp>
 #include <cudf/io/types.hpp>
@@ -130,6 +131,9 @@ class CudfSplitReader : public NvtxHelper {
   // Create the chunked parquet reader.
   void createCudfReader();
 
+  // Whole-file ORC only: partial byte ranges must not decode the whole file.
+  void createOrcReader();
+
   // Create the experimental hybrid scan reader.
   // Requires exactly one footer.
   void createExperimentalReader();
@@ -193,6 +197,7 @@ class CudfSplitReader : public NvtxHelper {
   std::shared_ptr<SplitPrefetchResult> selectivePreloadResult_;
   cudf::io::parquet_reader_options readerOptions_;
   CudfParquetReaderPtr splitReader_;
+  std::unique_ptr<cudf::io::chunked_orc_reader> orcReader_;
   CudfHybridScanReaderPtr exptSplitReader_;
   std::unique_ptr<HybridScanState> hybridScanState_;
   bool useExperimentalCudfReader_;

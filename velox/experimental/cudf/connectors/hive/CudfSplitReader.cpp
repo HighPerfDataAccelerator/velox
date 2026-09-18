@@ -47,8 +47,10 @@
 #include <cudf/io/text/byte_range_info.hpp>
 #include <cudf/io/types.hpp>
 #include <cudf/lists/lists_column_view.hpp>
+#include <cudf/stream_compaction.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
+#include <cudf/transform.hpp>
 #include <cudf/unary.hpp>
 
 #include <cuda_runtime.h>
@@ -345,7 +347,9 @@ CudfSplitReader::CudfSplitReader(
       ioStats_(ioStats),
       cudfHiveConfig_(cudfHiveConfig),
       pool_(connectorQueryCtx->memoryPool()),
-      useExperimentalCudfReader_(useExperimentalCudfReader),
+      useExperimentalCudfReader_(
+          useExperimentalCudfReader &&
+          split_->fileFormat == dwio::common::FileFormat::PARQUET),
       baseReaderOpts_(pool_),
       subfieldFilterExpr_(subfieldFilterExpr) {
   baseReaderOpts_.setDataIoStats(ioStatistics_);
@@ -366,7 +370,9 @@ void CudfSplitReader::setDataSourceContext(
 }
 
 void CudfSplitReader::setupReader() {
-  if (useExperimentalCudfReader_) {
+  if (split_->fileFormat == dwio::common::FileFormat::ORC) {
+    createOrcReader();
+  } else if (useExperimentalCudfReader_) {
     createExperimentalReader();
   } else {
     createCudfReader();
@@ -424,6 +430,24 @@ std::optional<std::unique_ptr<cudf::table>> CudfSplitReader::next(
 
 std::optional<std::unique_ptr<cudf::table>> CudfSplitReader::readNextChunk() {
   auto output_mr = determineCudfMemoryResource();
+
+  if (orcReader_) {
+    if (!orcReader_->has_next()) {
+      return std::nullopt;
+    }
+    auto table = std::move(orcReader_->read_chunk().tbl);
+    // Unlike Parquet, libcudf ORC does not accept a filter AST. Filters
+    // extracted from remainingFilter must still be applied, including when
+    // their columns are not in the final projection.
+    if (subfieldFilter() != nullptr) {
+      auto mask = cudf::compute_column(
+          table->view(), *subfieldFilter(), stream_, get_temp_mr());
+      table = cudf::apply_boolean_mask(
+          table->view(), mask->view(), stream_, output_mr);
+    }
+    return castDecimalColumnsToVeloxTypes(
+        std::move(table), outputType_, stream_, output_mr);
+  }
 
   if (!useExperimentalCudfReader_) {
     waitForCachePrefetchHint();
@@ -669,6 +693,7 @@ void CudfSplitReader::setupExperimentalScan() {
 }
 
 void CudfSplitReader::resetSplit() {
+  orcReader_.reset();
   splitReader_.reset();
   exptSplitReader_.reset();
   hybridScanState_.reset();
@@ -1257,6 +1282,33 @@ void CudfSplitReader::createCudfReader() {
 
   // Metadata ingested
   fileMetaData_.clear();
+}
+
+void CudfSplitReader::createOrcReader() {
+  VELOX_CHECK_EQ(split_->start, 0, "cuDF ORC requires a whole-file split");
+  VELOX_CHECK(
+      split_->coalescedFiles.empty(), "ORC split coalescing is not supported");
+  VELOX_CHECK(!prependRowIndex_, "ORC row-index generation is not supported");
+  setupCudfDataSource();
+  VELOX_CHECK_GE(
+      split_->length,
+      primaryDataSourceSize(),
+      "cuDF ORC requires a whole-file split; partial ranges would duplicate rows");
+  auto options = cudf::io::orc_reader_options::builder(
+                     cudf::io::source_info{dataSource_.get()})
+                     .timestamp_type(cudfHiveConfig_->timestampType())
+                     .build();
+  if (!readColumnNames_.empty()) {
+    options.set_columns(readColumnNames_);
+  }
+  orcReader_ = std::make_unique<cudf::io::chunked_orc_reader>(
+      cudfHiveConfig_->maxChunkReadLimitSession(
+          connectorQueryCtx_->sessionProperties()),
+      cudfHiveConfig_->maxPassReadLimitSession(
+          connectorQueryCtx_->sessionProperties()),
+      options,
+      stream_,
+      determineCudfMemoryResource());
 }
 
 void CudfSplitReader::createExperimentalReader() {
