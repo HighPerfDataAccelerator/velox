@@ -635,6 +635,10 @@ void CudfConfig::initialize(
     batchSizeMaxThreshold =
         folly::to<int32_t>(config[kCudfBatchSizeMaxThreshold]);
   }
+  if (config.find(kCudfHashJoinDistinctEnabled) != config.end()) {
+    hashJoinDistinctEnabled =
+        folly::to<bool>(config[kCudfHashJoinDistinctEnabled]);
+  }
   if (config.find(kCudfHashJoinLoadFactor) != config.end()) {
     hashJoinLoadFactor = folly::to<double>(config[kCudfHashJoinLoadFactor]);
     VELOX_USER_CHECK_GT(

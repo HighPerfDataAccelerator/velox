@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "velox/experimental/cudf/exec/CudfHashJoinTable.h"
 #include "velox/experimental/cudf/exec/CudfJoin.h"
 #include "velox/experimental/cudf/exec/CudfOperator.h"
 #include "velox/experimental/cudf/expression/AstExpression.h"
@@ -62,7 +63,7 @@ class CudfHashJoinBridge : public exec::JoinBridge {
    * batched processing */
   using hash_type = std::pair<
       std::vector<std::shared_ptr<cudf::table>>,
-      std::vector<std::shared_ptr<cudf::hash_join>>>;
+      std::vector<std::shared_ptr<CudfHashJoinTable>>>;
 
   void setHashTable(std::optional<hash_type> hashObject);
 
