@@ -20,6 +20,7 @@
 #include "velox/exec/Task.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/NvtxHelper.h"
+#include "velox/experimental/ucx-exchange/ExchangeStatsRefresh.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeClient.h"
 #include "velox/experimental/ucx-exchange/UcxQueues.h"
 
@@ -73,7 +74,7 @@ class UcxExchange : public SourceOperator, public cudf_velox::NvtxHelper {
 
   // Fetches runtime stats from ExchangeClient and replaces these in this
   // operator's stats.
-  void recordExchangeClientStats();
+  void recordExchangeClientStats(bool force = true);
 
   void recordInputStats(uint64_t rawInputBytes, const RowVectorPtr& result);
 
@@ -90,6 +91,7 @@ class UcxExchange : public SourceOperator, public cudf_velox::NvtxHelper {
   const bool processSplits_;
   const int pipelineId_;
   const int driverId_;
+  ExchangeStatsRefresh statsRefresh_;
   bool noMoreSplits_ = false;
 
   // A future received from Task::getSplitOrFuture(). It will be complete when

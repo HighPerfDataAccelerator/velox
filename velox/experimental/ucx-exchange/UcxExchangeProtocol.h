@@ -15,6 +15,7 @@
  */
 #pragma once
 
+#include <rmm/cuda_stream_view.hpp>
 #include <algorithm>
 #include <cinttypes>
 #include <cstdlib>
@@ -133,6 +134,11 @@ inline DeviceTransferPath deviceTransferPath(
 /// bounded slot is busy so callers can preserve correctness with pageable
 /// staging.
 std::shared_ptr<uint8_t> acquireUcxPinnedBuffer(uint64_t requiredBytes);
+// Same pool/capacity, with a diagnostic ownership label for transport staging.
+std::shared_ptr<uint8_t> acquireUcxPinnedBufferForStage(
+    uint64_t requiredBytes,
+    bool intraNode,
+    std::string_view localQueue = {});
 
 /// Acquires a pinned scratch buffer used only for deferred host-to-device
 /// copies. Remote UCX receive buffers deliberately remain pageable and owned
@@ -140,6 +146,28 @@ std::shared_ptr<uint8_t> acquireUcxPinnedBuffer(uint64_t requiredBytes);
 /// pool slot. Keeping this pool separate also prevents long D2H sends from
 /// starving the short-lived H2D copy engine bounce.
 std::shared_ptr<uint8_t> acquireUcxH2DPinnedBuffer(uint64_t requiredBytes);
+
+// Short-lived D2H scratch is independent of the transport pool: transport
+// leases may remain in a network request or a not-yet-consumed probe queue.
+// Fixed-size slots cannot grow with packet size; larger packets are chunked.
+inline constexpr uint64_t kUcxD2HStagingBytes = 128ULL << 20;
+std::shared_ptr<uint8_t> acquireUcxD2HPinnedBuffer();
+
+// Construct pool control objects without allocating/registering any buffers.
+// An async executor must be constructed afterward, so its workers join before
+// static pool destruction can free their pinned storage.
+void initializeUcxStagingPools();
+
+// Completes D2H through reusable pinned scratch, then CPU-copies into the
+// caller-owned pageable queue image. No pageable pointer is passed to CUDA.
+// Throws on scratch exhaustion/allocation failure rather than silently
+// submitting a blocking pageable CUDA copy. Caller establishes producer-stream
+// ordering before this call. Scratch is returned before this function returns.
+void copyUcxDeviceToPageableHost(
+    void* destination,
+    const void* source,
+    uint64_t bytes,
+    rmm::cuda_stream_view stream);
 
 inline bool exchangeVariableWidthValidationEnabled() {
   const char* value =

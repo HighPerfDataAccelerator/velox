@@ -41,8 +41,11 @@
 #include "velox/experimental/cudf/exec/CudfPackedSpill.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/ucx-exchange/Communicator.h"
+#include "velox/experimental/ucx-exchange/IntraNodeDeviceLease.h"
+#include "velox/experimental/ucx-exchange/MetadataReceiveBuffer.h"
 #include "velox/experimental/ucx-exchange/RangePartitionFunction.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeProtocol.h"
+#include "velox/experimental/ucx-exchange/UcxExchangeServer.h"
 #include "velox/experimental/ucx-exchange/UcxOutputQueueManager.h"
 #include "velox/experimental/ucx-exchange/tests/SinkDriverMock.h"
 #include "velox/experimental/ucx-exchange/tests/SourceDriverMock.h"
@@ -79,6 +82,172 @@ using namespace facebook::velox::core;
 
 namespace facebook::velox::ucx_exchange {
 
+namespace {
+std::shared_ptr<cudf::packed_columns> makeLeaseTestPage(
+    std::atomic<uint64_t>& counter,
+    bool split,
+    std::weak_ptr<cudf::packed_columns>& producer) {
+  auto lease = std::make_shared<IntraNodeDeviceLease>(counter);
+  lease->producer = std::make_shared<cudf::packed_columns>(
+      std::make_unique<std::vector<uint8_t>>(), nullptr);
+  producer = lease->producer;
+  lease->bytes = 200;
+  lease->splitReservation = split;
+  counter.fetch_add(lease->bytes);
+  auto* ptr = lease->producer.get();
+  return {ptr, IntraNodeDeviceLeaseOwner{std::move(lease)}};
+}
+} // namespace
+
+TEST(IntraNodeDeviceLeaseTest, completedCloneRetiresOnlyProducerHalf) {
+  std::atomic<uint64_t> counter{0};
+  std::weak_ptr<cudf::packed_columns> producer;
+  auto page = makeLeaseTestPage(counter, true, producer);
+  auto consumer = finishIntraNodeDeviceClone(std::move(page));
+  EXPECT_TRUE(producer.expired());
+  EXPECT_EQ(counter.load(), 100);
+  auto downstreamVector = consumer;
+  consumer.reset();
+  EXPECT_EQ(counter.load(), 100);
+  downstreamVector.reset();
+  EXPECT_EQ(counter.load(), 0);
+}
+
+TEST(IntraNodeDeviceLeaseTest, cancellationBeforeCloneReleasesBothHalves) {
+  std::atomic<uint64_t> counter{0};
+  std::weak_ptr<cudf::packed_columns> producer;
+  auto page = makeLeaseTestPage(counter, true, producer);
+  EXPECT_EQ(counter.load(), 200);
+  page.reset();
+  EXPECT_TRUE(producer.expired());
+  EXPECT_EQ(counter.load(), 0);
+}
+
+TEST(IntraNodeDeviceLeaseTest, sharedRegistryAliasRetainsBothHalves) {
+  std::atomic<uint64_t> counter{0};
+  std::weak_ptr<cudf::packed_columns> producer;
+  auto page = makeLeaseTestPage(counter, true, producer);
+  auto alias = page;
+  auto consumer = finishIntraNodeDeviceClone(std::move(page));
+  EXPECT_FALSE(producer.expired());
+  EXPECT_EQ(counter.load(), 200);
+  consumer.reset();
+  EXPECT_EQ(counter.load(), 200);
+  alias.reset();
+  EXPECT_TRUE(producer.expired());
+  EXPECT_EQ(counter.load(), 0);
+}
+
+TEST(IntraNodeDeviceLeaseTest, sharedOriginalProducerRetainsBothHalves) {
+  std::atomic<uint64_t> counter{0};
+  std::weak_ptr<cudf::packed_columns> producer;
+  auto page = makeLeaseTestPage(counter, true, producer);
+  auto externalProducer = producer.lock();
+  auto consumer = finishIntraNodeDeviceClone(std::move(page));
+  EXPECT_EQ(counter.load(), 200);
+  externalProducer.reset();
+  EXPECT_FALSE(producer.expired());
+  consumer.reset();
+  EXPECT_TRUE(producer.expired());
+  EXPECT_EQ(counter.load(), 0);
+}
+
+TEST(IntraNodeDeviceLeaseTest, controlRetainsProducerUntilConsumerRelease) {
+  std::atomic<uint64_t> counter{0};
+  std::weak_ptr<cudf::packed_columns> producer;
+  auto page = makeLeaseTestPage(counter, false, producer);
+  auto consumer = finishIntraNodeDeviceClone(std::move(page));
+  EXPECT_FALSE(producer.expired());
+  EXPECT_EQ(counter.load(), 200);
+  consumer.reset();
+  EXPECT_TRUE(producer.expired());
+  EXPECT_EQ(counter.load(), 0);
+}
+
+TEST(MetadataReceiveBufferTest, retainedRequestsOwnDistinctStorage) {
+  auto first = std::make_shared<MetadataReceiveBuffer>(false);
+  std::shared_ptr<void> retained = first;
+  const auto* address = first->data();
+  first.reset();
+  auto second = std::make_shared<MetadataReceiveBuffer>(false);
+  EXPECT_NE(address, second->data());
+  auto restored = std::static_pointer_cast<MetadataReceiveBuffer>(retained);
+  EXPECT_EQ(restored->data(), address);
+  for (size_t i = 0; i < MetadataReceiveBuffer::kHeaderBytes; ++i) {
+    EXPECT_EQ(restored->data()[i], 0);
+    EXPECT_EQ(second->data()[i], 0);
+  }
+}
+
+TEST(MetadataReceiveBufferTest, decodesOnlySerializedPrefix) {
+  for (const bool initializePayload : {false, true}) {
+    for (const bool atEnd : {false, true}) {
+      MetadataMsg message;
+      message.atEnd = atEnd;
+      message.dataSizeBytes = atEnd ? 0 : 123456;
+      message.remainingBytes = {17, 23};
+      message.cudfMetadata = std::make_unique<std::vector<uint8_t>>(257, 0x5a);
+      auto [wire, bytes] = message.serialize();
+      MetadataReceiveBuffer receive(initializePayload);
+      ASSERT_LT(bytes, receive.size());
+      std::memcpy(receive.data(), wire.get(), bytes);
+      // The unused tail must not affect decoding, regardless of its contents.
+      std::memset(receive.data() + bytes, 0xa5, receive.size() - bytes);
+      auto decoded = MetadataMsg::deserializeMetadataMsg(receive.data());
+      EXPECT_EQ(decoded.atEnd, message.atEnd);
+      EXPECT_EQ(decoded.dataSizeBytes, message.dataSizeBytes);
+      EXPECT_EQ(decoded.remainingBytes, message.remainingBytes);
+      EXPECT_EQ(*decoded.cudfMetadata, *message.cudfMetadata);
+    }
+  }
+}
+
+TEST(MetadataReceiveBufferTest, emptyReceiveHasInvalidMagic) {
+  MetadataReceiveBuffer receive(false);
+  EXPECT_THROW(
+      MetadataMsg::deserializeMetadataMsg(receive.data()), VeloxException);
+}
+
+TEST(MetadataReceiveBufferTest, untouchedTailRemainsZero) {
+  for (const bool initializePayload : {false, true}) {
+    MetadataReceiveBuffer receive(initializePayload);
+    for (size_t i = 0; i < receive.size(); ++i) {
+      ASSERT_EQ(receive.data()[i], 0) << "offset=" << i;
+    }
+    receive.data()[receive.size() - 1] = 0x5a;
+    auto next = std::make_shared<MetadataReceiveBuffer>(initializePayload);
+    EXPECT_EQ(next->data()[next->size() - 1], 0);
+    EXPECT_EQ(receive.data()[receive.size() - 1], 0x5a);
+  }
+}
+
+TEST(ExchangeStatsRefreshTest, zeroIntervalPreservesPerPageSnapshots) {
+  ExchangeStatsRefresh refresh(std::chrono::milliseconds{0});
+  const auto now = ExchangeStatsRefresh::Clock::time_point{};
+  for (int i = 0; i < 100; ++i) {
+    EXPECT_TRUE(refresh.shouldRefresh(now, false));
+  }
+}
+
+TEST(ExchangeStatsRefreshTest, boundedCadenceAndForcedFinalSnapshots) {
+  ExchangeStatsRefresh refresh(std::chrono::milliseconds{100});
+  const auto start = ExchangeStatsRefresh::Clock::time_point{};
+  EXPECT_TRUE(refresh.shouldRefresh(start, false));
+  for (int i = 0; i < 100; ++i) {
+    EXPECT_FALSE(
+        refresh.shouldRefresh(start + std::chrono::milliseconds{i}, false));
+  }
+  EXPECT_TRUE(
+      refresh.shouldRefresh(start + std::chrono::milliseconds{100}, false));
+  EXPECT_FALSE(
+      refresh.shouldRefresh(start + std::chrono::milliseconds{101}, false));
+  // Both EOF and close must work even inside the throttled interval.
+  EXPECT_TRUE(
+      refresh.shouldRefresh(start + std::chrono::milliseconds{101}, true));
+  EXPECT_TRUE(
+      refresh.shouldRefresh(start + std::chrono::milliseconds{101}, true));
+}
+
 TEST(UcxDeviceTransferPathTest, reportsEveryHostStagingReason) {
   EXPECT_EQ(
       selectDeviceTransferPath(true, 1 << 20, false, 128 << 20),
@@ -112,6 +281,134 @@ TEST(UcxPinnedBufferPoolTest, h2dPoolHasIndependentSharedLease) {
   const auto* transportAddress = transport.get();
   transport.reset();
   EXPECT_EQ(retainedTransportOwner.get(), transportAddress);
+}
+
+TEST(UcxPinnedBufferPoolTest, localAndRemoteStageLabelsShareBoundedCapacity) {
+  std::vector<std::shared_ptr<uint8_t>> local;
+  while (auto slot = acquireUcxPinnedBufferForStage(1, true)) {
+    local.push_back(std::move(slot));
+    ASSERT_LE(local.size(), 16);
+  }
+  ASSERT_FALSE(local.empty());
+  EXPECT_EQ(acquireUcxPinnedBufferForStage(1, false), nullptr);
+  const auto* released = local.front().get();
+  local.front().reset();
+  auto remote = acquireUcxPinnedBufferForStage(1, false);
+  ASSERT_NE(remote, nullptr);
+  EXPECT_EQ(remote.get(), released);
+  auto retained = remote;
+  remote.reset();
+  EXPECT_EQ(acquireUcxPinnedBufferForStage(1, false), nullptr);
+  retained.reset();
+  EXPECT_NE(acquireUcxPinnedBufferForStage(1, false), nullptr);
+}
+
+TEST(
+    UcxPinnedBufferPoolTest,
+    localQueueLimitPreservesOtherQueueAndSharedOwner) {
+  std::vector<std::shared_ptr<uint8_t>> capacityProbe;
+  while (auto slot = acquireUcxPinnedBuffer(1)) {
+    capacityProbe.push_back(std::move(slot));
+    ASSERT_LE(capacityProbe.size(), 16);
+  }
+  const auto capacity = capacityProbe.size();
+  ASSERT_GT(capacity, 0);
+  capacityProbe.clear();
+  const auto* flag = std::getenv("GLUTEN_UCX_LOCAL_PINNED_QUEUE_LIMIT");
+  const auto limit = flag ? std::strtoull(flag, nullptr, 10) : 0;
+  const auto expected =
+      limit == 0 ? capacity : std::min<size_t>(limit, capacity);
+  std::vector<std::shared_ptr<uint8_t>> queue;
+  while (auto slot = acquireUcxPinnedBufferForStage(1, true, "queue-A")) {
+    queue.push_back(std::move(slot));
+    ASSERT_LE(queue.size(), capacity);
+  }
+  ASSERT_EQ(queue.size(), expected);
+  auto retained = queue.front();
+  const auto* address = retained.get();
+  if (limit > 0 && capacity > expected) {
+    std::vector<std::shared_ptr<uint8_t>> other;
+    while (auto slot = acquireUcxPinnedBufferForStage(1, true, "queue-B")) {
+      other.push_back(std::move(slot));
+      ASSERT_LE(other.size(), capacity - expected);
+    }
+    ASSERT_EQ(other.size(), std::min<size_t>(limit, capacity - expected));
+    EXPECT_EQ(acquireUcxPinnedBufferForStage(1, true, "queue-A"), nullptr);
+    other.clear();
+    // Remote completion does not inherit the local queue cap.
+    EXPECT_NE(acquireUcxPinnedBufferForStage(1, false, "queue-A"), nullptr);
+  }
+  // Keep the other leases live: removing one reference must not return its
+  // slot or its quota while a shared owner still retains it.
+  queue.erase(queue.begin());
+  EXPECT_EQ(acquireUcxPinnedBufferForStage(1, true, "queue-A"), nullptr);
+  retained.reset();
+  auto reused = acquireUcxPinnedBufferForStage(1, true, "queue-A");
+  ASSERT_NE(reused, nullptr);
+  EXPECT_EQ(reused.get(), address);
+}
+
+TEST(UcxPinnedBufferPoolTest, shortD2HLeaseIsPinnedIndependentAndBounded) {
+  auto transport = acquireUcxPinnedBuffer(1);
+  auto h2d = acquireUcxH2DPinnedBuffer(1);
+  auto scratch = acquireUcxD2HPinnedBuffer();
+  ASSERT_NE(scratch, nullptr);
+  EXPECT_NE(scratch.get(), transport.get());
+  EXPECT_NE(scratch.get(), h2d.get());
+  cudaPointerAttributes attributes{};
+  ASSERT_EQ(cudaPointerGetAttributes(&attributes, scratch.get()), cudaSuccess);
+  EXPECT_EQ(attributes.type, cudaMemoryTypeHost);
+  auto* address = scratch.get();
+  scratch.reset();
+  auto reused = acquireUcxD2HPinnedBuffer();
+  EXPECT_EQ(reused.get(), address);
+  std::vector<std::shared_ptr<uint8_t>> busy{std::move(reused)};
+  while (auto slot = acquireUcxD2HPinnedBuffer()) {
+    busy.push_back(std::move(slot));
+    ASSERT_LE(busy.size(), 16);
+  }
+  // No CUDA copy can be submitted on pool exhaustion, even for a small page.
+  EXPECT_THROW(
+      copyUcxDeviceToPageableHost(
+          nullptr, nullptr, 1, rmm::cuda_stream_default),
+      VeloxException);
+  busy.clear();
+  EXPECT_NE(acquireUcxD2HPinnedBuffer(), nullptr);
+}
+
+TEST(UcxPinnedBufferPoolTest, shortD2HChunksPreservePageableQueueImage) {
+  rmm::cuda_stream stream;
+  const auto size = kUcxD2HStagingBytes + 257;
+  rmm::device_buffer device(size, stream.view());
+  std::vector<uint8_t> expected(size);
+  for (size_t i = 0; i < expected.size(); ++i) {
+    expected[i] = static_cast<uint8_t>((i * 17 + i / 4096) % 251);
+  }
+  ASSERT_EQ(
+      cudaMemcpyAsync(
+          device.data(),
+          expected.data(),
+          size,
+          cudaMemcpyHostToDevice,
+          stream.value()),
+      cudaSuccess);
+  std::vector<uint8_t> output(size, 0);
+  copyUcxDeviceToPageableHost(
+      output.data(), device.data(), size, stream.view());
+  EXPECT_EQ(output, expected);
+  // A following copy can reuse scratch without corrupting the retained queue
+  // image. The queue owns storage, not the pinned scratch lease.
+  ASSERT_EQ(
+      cudaMemsetAsync(device.data(), 0xa5, size, stream.value()), cudaSuccess);
+  std::vector<uint8_t> next(257, 0);
+  copyUcxDeviceToPageableHost(
+      next.data(), device.data(), next.size(), stream.view());
+  EXPECT_TRUE(std::all_of(next.begin(), next.end(), [](uint8_t value) {
+    return value == 0xa5;
+  }));
+  EXPECT_EQ(output, expected);
+  EXPECT_NO_THROW(
+      copyUcxDeviceToPageableHost(nullptr, nullptr, 0, stream.view()));
 }
 
 struct ExchangeTestParams {
@@ -150,6 +447,9 @@ static std::vector<ExchangeTestParams> generateTestParams() {
       {"SourceSinkDrivers", 10, 10, 1, 10, 1000, TableType::NARROW},
       // Test with multiple partitions (hash partitioning)
       {"MultiPartition", 1, 1, 4, 100, 1000, TableType::NARROW},
+      // Larger than eager packets: exercise pooled/pageable staging rather
+      // than passing a cache qualification using only tiny bypass buffers.
+      {"PageableCache", 1, 1, 4, 32, 16384, TableType::NARROW},
       // Test with multiple partitions and multiple drivers
       {"MultiPartitionDrivers", 4, 4, 4, 25, 1000, TableType::NARROW},
       // Wide table tests with numeric types shared by Velox and cuDF.
@@ -193,6 +493,7 @@ struct ExchangeTestParamsPrinter {
 
 class UcxExchangeTest : public testing::TestWithParam<ExchangeTestParams> {
  protected:
+  void runDataIntegrity();
   static constexpr uint16_t kCommunicatorPort = 21346;
   static constexpr auto kUnusedCoordinatorUrl =
       std::string_view("http://localhost:12345/bla");
@@ -383,6 +684,92 @@ TEST_P(UcxExchangeTest, basicTest) {
 }
 
 TEST_P(UcxExchangeTest, dataIntegrityTest) {
+  runDataIntegrity();
+}
+
+TEST_P(UcxExchangeTest, asyncHostStageDataIntegrity) {
+  const auto p = GetParam();
+  if (p.numSrcDrivers != 1 || p.numDstDrivers != 1 || p.numPartitions != 4 ||
+      !((p.numChunks == 100 && p.numRowsPerChunk == 1000) ||
+        (p.numChunks == 32 && p.numRowsPerChunk == 16384)) ||
+      p.numUpstreamTasks != 1 || p.tableType != TableType::NARROW) {
+    GTEST_SKIP() << "Focused four-destination async staging test";
+  }
+  auto& config = cudf_velox::CudfConfig::getInstance();
+  const bool original = config.intraNodeExchange;
+  std::vector<std::pair<const char*, std::optional<std::string>>> saved;
+  for (const auto* name :
+       {"GLUTEN_UCX_ASYNC_HOST_SEND_STAGE",
+        "GLUTEN_UCX_SHORT_PINNED_D2H",
+        "GLUTEN_UCX_FORCE_HOST_STAGING",
+        "GLUTEN_UCX_INTRANODE_HOST_BOUNCE",
+        "GLUTEN_UCX_INTRANODE_ADAPTIVE_DEVICE"}) {
+    const auto* value = std::getenv(name);
+    saved.emplace_back(
+        name, value ? std::optional<std::string>{value} : std::nullopt);
+  }
+  SCOPE_EXIT {
+    config.intraNodeExchange = original;
+    for (const auto& [name, value] : saved) {
+      if (value) {
+        setenv(name, value->c_str(), 1);
+      } else {
+        unsetenv(name);
+      }
+    }
+  };
+  setenv("GLUTEN_UCX_ASYNC_HOST_SEND_STAGE", "1", 1);
+  setenv("GLUTEN_UCX_SHORT_PINNED_D2H", "1", 1);
+  setenv("GLUTEN_UCX_FORCE_HOST_STAGING", "1", 1);
+  setenv("GLUTEN_UCX_INTRANODE_HOST_BOUNCE", "1", 1);
+  setenv("GLUTEN_UCX_INTRANODE_ADAPTIVE_DEVICE", "0", 1);
+  for (const bool intra : {false, true}) {
+    SCOPED_TRACE(intra);
+    config.intraNodeExchange = intra;
+    const auto before = completedAsyncHostStageCount();
+    runDataIntegrity();
+    EXPECT_GT(completedAsyncHostStageCount(), before);
+  }
+}
+
+TEST_P(UcxExchangeTest, adaptiveIntraNodeDataIntegrity) {
+  if (GetParam().tableType != TableType::NARROW ||
+      GetParam().numRowsPerChunk > 1000) {
+    GTEST_SKIP() << "Bounded multi-driver/partition regression only";
+  }
+  auto& config = cudf_velox::CudfConfig::getInstance();
+  const bool oldIntraNode = config.intraNodeExchange;
+  const auto save = [](const char* name) -> std::optional<std::string> {
+    const auto* value = std::getenv(name);
+    return value ? std::optional<std::string>{value} : std::nullopt;
+  };
+  const auto oldEnabled = save("GLUTEN_UCX_INTRANODE_ADAPTIVE_DEVICE");
+  const auto oldLimit = save("GLUTEN_UCX_INTRANODE_DEVICE_MAX_BYTES");
+  SCOPE_EXIT {
+    config.intraNodeExchange = oldIntraNode;
+    for (const auto& [name, value] :
+         std::vector<std::pair<const char*, std::optional<std::string>>>{
+             {"GLUTEN_UCX_INTRANODE_ADAPTIVE_DEVICE", oldEnabled},
+             {"GLUTEN_UCX_INTRANODE_DEVICE_MAX_BYTES", oldLimit}}) {
+      if (value) {
+        setenv(name, value->c_str(), 1);
+      } else {
+        unsetenv(name);
+      }
+    }
+  };
+  config.intraNodeExchange = true;
+  ASSERT_EQ(setenv("GLUTEN_UCX_INTRANODE_ADAPTIVE_DEVICE", "1", 1), 0);
+  // Zero forces the safe host path; a small cap exercises bounded fallback;
+  // the normal cap permits independent device clones with retained credit.
+  for (const auto* cap : {"0", "1048576", "536870912"}) {
+    SCOPED_TRACE(cap);
+    ASSERT_EQ(setenv("GLUTEN_UCX_INTRANODE_DEVICE_MAX_BYTES", cap, 1), 0);
+    runDataIntegrity();
+  }
+}
+
+void UcxExchangeTest::runDataIntegrity() {
   VLOG(3) << "+ UcxExchangeTest::dataIntegrityTest";
   ExchangeTestParams p = GetParam();
 
@@ -1012,6 +1399,86 @@ TEST_P(UcxExchangeTest, sharedClientSurvivesOneExchangeClose) {
 // Test that verifies intra-node exchange does not livelock when a producing
 // task is removed while the consumer is polling IntraNodeTransferRegistry.
 // Before the fix: test times out (livelock). After the fix: test passes.
+TEST_P(UcxExchangeTest, throttledExchangeRetainsFinalStats) {
+  if (GetParam() != generateTestParams().front()) {
+    GTEST_SKIP() << "runs only once";
+  }
+  const auto* envName = "GLUTEN_UCX_STATS_INTERVAL_MS";
+  const auto* previous = std::getenv(envName);
+  const auto oldInterval =
+      previous ? std::optional<std::string>{previous} : std::nullopt;
+  auto& config = cudf_velox::CudfConfig::getInstance();
+  const auto oldIntraNode = config.intraNodeExchange;
+  SCOPE_EXIT {
+    config.intraNodeExchange = oldIntraNode;
+    if (oldInterval) {
+      setenv(envName, oldInterval->c_str(), 1);
+    } else {
+      unsetenv(envName);
+    }
+  };
+  config.intraNodeExchange = true;
+  ASSERT_EQ(setenv(envName, "60000", 1), 0);
+
+  for (const bool earlyClose : {false, true}) {
+    SCOPED_TRACE(earlyClose);
+    const auto prefix = getUniqueTaskPrefix();
+    const auto srcId = prefix + "statsSrc";
+    const auto rowType = UcxTestData::kTestRowType;
+    auto srcTask = createSourceTask(srcId, pool_, rowType);
+    queueManager_->initializeTask(
+        srcTask, core::PartitionedOutputNode::Kind::kPartitioned, 1, 1);
+    SCOPE_EXIT {
+      queueManager_->removeTask(srcId);
+    };
+    auto source =
+        std::make_shared<UcxPartitionedOutputMock>(srcId, 1, 1, 100, 1000);
+    source->run();
+    source->joinThreads();
+
+    core::PlanNodeId nodeId;
+    auto task = createExchangeTask(prefix + "statsSink", rowType, 0, nodeId);
+    task->addSplit(nodeId, remoteSplit(srcId, 0));
+    task->noMoreSplits(nodeId);
+    auto client = std::make_shared<UcxExchangeClient>(task->taskId(), 0, 1);
+    auto ctx = std::make_shared<DriverCtx>(task, 0, 0, kUngroupedGroupId, 0);
+    UcxExchange exchange(0, ctx.get(), task->planFragment().planNode, client);
+    uint64_t rows = 0;
+    while (true) {
+      ContinueFuture future;
+      if (exchange.isBlocked(&future) != BlockingReason::kNotBlocked) {
+        future.wait();
+        continue;
+      }
+      if (auto output = exchange.getOutput()) {
+        rows += output->size();
+      }
+      if ((earlyClose && rows >= 5000) || exchange.isFinished()) {
+        break;
+      }
+    }
+    if (!earlyClose) {
+      EXPECT_EQ(rows, 100000);
+      // EOF is sufficient even before close (task stats can be read here).
+      auto stats = exchange.stats().rlock();
+      EXPECT_EQ(
+          stats->runtimeStats.at("ucxExchangeSource.numPackedColumns").sum,
+          100);
+      EXPECT_LE(stats->runtimeStats.at("ucxExchange.statsSnapshots").sum, 2);
+    }
+    exchange.close();
+    const auto expected = client->stats();
+    auto stats = exchange.stats().rlock();
+    for (const auto* key :
+         {"ucxExchangeSource.numPackedColumns",
+          "ucxExchangeSource.totalBytes"}) {
+      EXPECT_EQ(stats->runtimeStats.at(key).sum, expected.at(key).sum);
+      EXPECT_EQ(stats->runtimeStats.at(key).count, expected.at(key).count);
+    }
+    EXPECT_LE(stats->runtimeStats.at("ucxExchange.statsSnapshots").sum, 3);
+  }
+}
+
 TEST_P(UcxExchangeTest, intraNodeTaskRemovalLivelock) {
   // This test doesn't use parameters — run only for the first param set.
   {

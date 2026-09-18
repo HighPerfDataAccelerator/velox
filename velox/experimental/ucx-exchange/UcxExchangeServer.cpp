@@ -14,24 +14,45 @@
  * limitations under the License.
  */
 #include "velox/experimental/ucx-exchange/UcxExchangeServer.h"
+#include <folly/ScopeGuard.h>
+#include <folly/executors/CPUThreadPoolExecutor.h>
 #include <glog/logging.h>
 #include <malloc.h>
+#include <nvtx3/nvtx3.hpp>
 #include <rmm/cuda_stream.hpp>
 #include <rmm/cuda_stream_view.hpp>
 #include <algorithm>
 #include <cstdlib>
 #include <limits>
+#include <optional>
 #include <string>
 #include "cuda_runtime.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
+#include "velox/experimental/ucx-exchange/BudgetedPageableCache.h"
 #include "velox/experimental/ucx-exchange/Communicator.h"
+#include "velox/experimental/ucx-exchange/IntraNodeDeviceLease.h"
 #include "velox/experimental/ucx-exchange/IntraNodeTransferRegistry.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeProtocol.h"
 
 namespace facebook::velox::ucx_exchange {
 
 namespace {
+bool pageableCacheEnabled() {
+  static const bool enabled = [] {
+    const auto* value = std::getenv("GLUTEN_UCX_PAGEABLE_CACHE");
+    return value && std::string_view(value) == "1";
+  }();
+  return enabled;
+}
+
+std::shared_ptr<BudgetedPageableCache> pageableCache() {
+  // Idle cap only. Active AND idle backing retain the existing sender credit;
+  // this is not an additional host-memory allowance.
+  static auto cache = std::make_shared<BudgetedPageableCache>(512ULL << 20, 64);
+  return cache;
+}
+
 void accountFreedHostBytesAndTrim(uint64_t bytes) {
   constexpr uint64_t kTrimInterval = 64ULL * 1024 * 1024;
   static std::atomic<uint64_t> freedSinceTrim{0};
@@ -59,21 +80,97 @@ rmm::cuda_stream_view hostStagingCopyStream() {
   return stream.view();
 }
 
+std::string hostStagingRequestLabel(
+    const PartitionKey& key,
+    uint32_t sequence) {
+  static const bool enabled = [] {
+    const auto* value = std::getenv("GLUTEN_UCX_PINNED_LEASE_DIAGNOSTICS");
+    return value && std::string_view(value) == "1";
+  }();
+  if (!enabled) {
+    return {};
+  }
+  return "UcxPinnedRequest task=" + key.taskId +
+      " destination=" + std::to_string(key.destination) +
+      " sequence=" + std::to_string(sequence);
+}
+
+std::string localPinnedQueueKey(const PartitionKey& key, bool intraNode) {
+  static const bool enabled = [] {
+    const auto* value = std::getenv("GLUTEN_UCX_LOCAL_PINNED_QUEUE_LIMIT");
+    return value && std::strtoull(value, nullptr, 10) > 0;
+  }();
+  return enabled && intraNode ? key.toString() : std::string{};
+}
+
 std::shared_ptr<uint8_t> allocateHostStagingBuffer(
     uint64_t bytes,
-    bool& pinned) {
+    bool& pinned,
+    bool intraNode,
+    const std::string& requestLabel,
+    const std::string& localQueue,
+    std::shared_ptr<void>& reservation) {
+  // Same-thread request range identifies the queue for any nested acquisition
+  // or miss. It is not an ownership range and does not extend buffer lifetime.
+  std::optional<nvtx3::scoped_range> requestRange;
+  if (!requestLabel.empty()) {
+    requestRange.emplace(requestLabel.c_str());
+  }
   // Do not occupy a 256-MiB pooled slot for UCX eager packets. Large
   // rendezvous packets use the same bounded, reusable pinned pool as packed
   // spill/restore so their D2H copy can run on a CUDA copy engine. Falling
   // back to pageable memory preserves correctness when all slots are busy.
   if (bytes > static_cast<uint64_t>(kDeviceEagerHostStageBytes)) {
-    auto buffer = acquireUcxPinnedBuffer(bytes);
+    auto buffer = acquireUcxPinnedBufferForStage(bytes, intraNode, localQueue);
     if (buffer != nullptr) {
       pinned = true;
+      if (pageableCacheEnabled()) {
+        // Pinned buffers share the same budget. Keep credit until the actual
+        // final owner, including deferred local H2D and remote replay, retires.
+        struct Owner {
+          std::shared_ptr<void> credit;
+          std::shared_ptr<uint8_t> buffer;
+        };
+        auto owner = std::make_shared<Owner>();
+        owner->credit = reservation;
+        owner->buffer = std::move(buffer);
+        auto result = std::shared_ptr<uint8_t>(owner, owner->buffer.get());
+        reservation.reset();
+        return result;
+      }
       return buffer;
     }
   }
   pinned = false;
+  if (pageableCacheEnabled() &&
+      bytes > static_cast<uint64_t>(kDeviceEagerHostStageBytes)) {
+    nvtx3::scoped_range range{"UcxHost::pageableCacheAcquire"};
+    // Cached logical leases are NOT fresh pageableLive allocation ranges.
+    return pageableCache()->acquire(bytes, reservation);
+  }
+  const auto* lifetimeDiagnostics =
+      std::getenv("GLUTEN_UCX_PAGEABLE_LIFETIME_DIAGNOSTICS");
+  if (pageableCacheEnabled() ||
+      (lifetimeDiagnostics && std::string_view(lifetimeDiagnostics) == "1")) {
+    // Ownership only, not a CPU execution interval. Do not prefault/zero the
+    // destination or retain an extra payload owner merely for diagnostics.
+    auto data = std::unique_ptr<uint8_t[]>(new uint8_t[bytes]);
+    std::shared_ptr<nvtx3::unique_range> lifetime;
+    if (lifetimeDiagnostics && std::string_view(lifetimeDiagnostics) == "1") {
+      lifetime = std::make_shared<nvtx3::unique_range>(
+          ("UcxHost::pageableLive bytes=" + std::to_string(bytes)).c_str());
+    }
+    auto result = std::shared_ptr<uint8_t>(
+        data.release(),
+        [lifetime = std::move(lifetime),
+         credit = reservation](uint8_t* pointer) mutable {
+          delete[] pointer;
+          lifetime.reset();
+          credit.reset();
+        });
+    reservation.reset();
+    return result;
+  }
   return std::shared_ptr<uint8_t>(
       new uint8_t[bytes], std::default_delete<uint8_t[]>());
 }
@@ -109,6 +206,8 @@ serverStateNames() {
               {UcxExchangeServer::ServerState::WaitingForDataFromQueue,
                "WaitingForDataFromQueue"},
               {UcxExchangeServer::ServerState::DataReady, "DataReady"},
+              {UcxExchangeServer::ServerState::WaitingForHostStage,
+               "WaitingForHostStage"},
               {UcxExchangeServer::ServerState::WaitingForSendComplete,
                "WaitingForSendComplete"},
               {UcxExchangeServer::ServerState::WaitingForIntraNodeRetrieve,
@@ -153,6 +252,75 @@ bool intraNodeHostBounceEnabled() {
   return enabled;
 }
 
+bool adaptiveIntraNodeDeviceEnabled() {
+  const auto* value = std::getenv("GLUTEN_UCX_INTRANODE_ADAPTIVE_DEVICE");
+  return value != nullptr && std::string_view(value) == "1";
+}
+
+bool shortPinnedD2HEnabled() {
+  const auto* value = std::getenv("GLUTEN_UCX_SHORT_PINNED_D2H");
+  return value != nullptr && std::string_view(value) == "1";
+}
+
+// Includes BOTH the retained producer page and its independent consumer clone.
+// Credit survives registry retrieval and stays attached to the consumer vector.
+// A process-wide cap is conservative even when a process uses multiple GPUs.
+std::atomic<uint64_t> intraNodeDeviceBytes{0};
+
+std::shared_ptr<cudf::packed_columns> tryAdmitIntraNodeDevice(
+    const std::shared_ptr<cudf::packed_columns>& data) {
+  constexpr uint64_t kDefaultLimit = 512ULL << 20;
+  uint64_t limit = kDefaultLimit;
+  if (const auto* value =
+          std::getenv("GLUTEN_UCX_INTRANODE_DEVICE_MAX_BYTES")) {
+    char* end = nullptr;
+    const auto parsed = std::strtoull(value, &end, 10);
+    if (end != value && *end == '\0' && parsed <= kDefaultLimit) {
+      limit = parsed;
+    }
+  }
+  const auto bytes = data->gpu_data->size();
+  if (bytes == 0 || bytes > limit / 2) {
+    return nullptr;
+  }
+  const auto retainedBytes = 2 * bytes;
+  auto lease = std::make_shared<IntraNodeDeviceLease>(intraNodeDeviceBytes);
+  auto current = intraNodeDeviceBytes.load(std::memory_order_acquire);
+  do {
+    if (current > limit - retainedBytes) {
+      return nullptr;
+    }
+  } while (!intraNodeDeviceBytes.compare_exchange_weak(
+      current, current + retainedBytes, std::memory_order_acq_rel));
+  lease->bytes = retainedBytes;
+  const auto* retireProducer =
+      std::getenv("GLUTEN_UCX_INTRANODE_RETIRE_PRODUCER");
+  lease->splitReservation =
+      retireProducer != nullptr && std::string_view(retireProducer) == "1";
+  auto workspace = cudf_velox::tryAcquireBackgroundDeviceMemoryWorkspace(
+      lease->splitReservation ? bytes : retainedBytes,
+      6ULL << 30,
+      cudf_velox::DeviceMemoryWorkspacePriority::kInput);
+  if (!workspace.has_value()) {
+    return nullptr;
+  }
+  lease->workspace.emplace(std::move(*workspace));
+  if (lease->splitReservation) {
+    auto producerWorkspace =
+        cudf_velox::tryAcquireBackgroundDeviceMemoryWorkspace(
+            bytes,
+            6ULL << 30,
+            cudf_velox::DeviceMemoryWorkspacePriority::kInput);
+    if (!producerWorkspace.has_value()) {
+      return nullptr;
+    }
+    lease->producerWorkspace.emplace(std::move(*producerWorkspace));
+  }
+  lease->producer = data;
+  return std::shared_ptr<cudf::packed_columns>(
+      data.get(), IntraNodeDeviceLeaseOwner{std::move(lease)});
+}
+
 int64_t maxInFlightSendHostBytes() {
   static const int64_t limit = [] {
     if (const char* value =
@@ -171,6 +339,7 @@ int64_t maxInFlightSendHostBytes() {
 }
 
 std::atomic<int64_t> inFlightSendHostBytes{0};
+std::atomic<int64_t> peakSendHostBytes{0};
 
 std::atomic<int64_t> activeRemoteDataSends{0};
 std::atomic<int64_t> maxActiveRemoteDataSends{0};
@@ -210,6 +379,12 @@ bool tryReserveSendHostBytes(int64_t bytes) {
     // single packed table cannot be split by the current wire protocol, and
     // rejecting it forever would deadlock the exchange.
     if (current > 0 && current + bytes > maxInFlightSendHostBytes()) {
+      if (pageableCacheEnabled() &&
+          pageableCache()->evictAtLeast(
+              current + bytes - maxInFlightSendHostBytes()) > 0) {
+        current = inFlightSendHostBytes.load(std::memory_order_relaxed);
+        continue;
+      }
       return false;
     }
     if (inFlightSendHostBytes.compare_exchange_weak(
@@ -217,6 +392,13 @@ bool tryReserveSendHostBytes(int64_t bytes) {
             current + bytes,
             std::memory_order_acq_rel,
             std::memory_order_relaxed)) {
+      if (pageableCacheEnabled()) {
+        auto peak = peakSendHostBytes.load(std::memory_order_relaxed);
+        while (peak < current + bytes &&
+               !peakSendHostBytes.compare_exchange_weak(
+                   peak, current + bytes, std::memory_order_relaxed)) {
+        }
+      }
       return true;
     }
   }
@@ -230,6 +412,13 @@ void releaseSendHostBytes(int64_t bytes) {
       inFlightSendHostBytes.fetch_sub(bytes, std::memory_order_acq_rel);
   VELOX_CHECK_GE(previous, bytes);
 }
+
+struct SendHostReservation {
+  int64_t bytes{0};
+  ~SendHostReservation() {
+    releaseSendHostBytes(bytes);
+  }
+};
 
 } // namespace
 
@@ -271,6 +460,7 @@ struct DataSendContext {
   uint64_t hostDataBytes{0};
   bool hostDataPinned{false};
   int64_t reservedHostBytes{0};
+  std::shared_ptr<void> hostReservation;
   std::atomic<bool> completionRecorded{false};
 
   ~DataSendContext() {
@@ -279,6 +469,16 @@ struct DataSendContext {
 
   bool reserveHostBytes(int64_t bytes) {
     VELOX_CHECK_EQ(reservedHostBytes, 0);
+    VELOX_CHECK(!hostReservation);
+    if (pageableCacheEnabled()) {
+      auto reservation = std::make_shared<SendHostReservation>();
+      if (!tryReserveSendHostBytes(bytes)) {
+        return false;
+      }
+      reservation->bytes = bytes;
+      hostReservation = std::move(reservation);
+      return true;
+    }
     if (!tryReserveSendHostBytes(bytes)) {
       return false;
     }
@@ -287,12 +487,74 @@ struct DataSendContext {
   }
 
   void releaseHostReservation() {
+    hostReservation.reset();
     if (reservedHostBytes > 0) {
       releaseSendHostBytes(reservedHostBytes);
       reservedHostBytes = 0;
     }
   }
 };
+
+struct AsyncHostStage {
+  std::shared_ptr<DataSendContext> context;
+  std::exception_ptr error;
+  std::atomic<bool> ready{false};
+};
+
+namespace {
+bool asyncHostStageEnabled() {
+  const auto* value = std::getenv("GLUTEN_UCX_ASYNC_HOST_SEND_STAGE");
+  return value && value[0] == '1';
+}
+
+// Admission bounds submitted work as well as active work. Respect one-slot
+// pressure configurations without allowing concurrent users to exhaust scratch.
+uint32_t hostStageConcurrency() {
+  static const uint32_t count = [] {
+    const auto* value = std::getenv("GLUTEN_UCX_D2H_PINNED_BUFFER_COUNT");
+    char* end = nullptr;
+    const auto parsed = value ? std::strtoull(value, &end, 10) : 4;
+    return value && (end == value || *end != '\0')
+        ? 4U
+        : static_cast<uint32_t>(std::clamp<uint64_t>(parsed, 1, 4));
+  }();
+  return count;
+}
+
+std::atomic<uint32_t> activeHostStages{0};
+std::atomic<uint64_t> completedHostStages{0};
+struct HostStageAdmission {
+  ~HostStageAdmission() {
+    activeHostStages.fetch_sub(1, std::memory_order_release);
+  }
+};
+
+std::shared_ptr<HostStageAdmission> tryAdmitHostStage() {
+  auto current = activeHostStages.load(std::memory_order_relaxed);
+  while (current < hostStageConcurrency()) {
+    if (activeHostStages.compare_exchange_weak(
+            current, current + 1, std::memory_order_acq_rel)) {
+      try {
+        return std::make_shared<HostStageAdmission>();
+      } catch (...) {
+        activeHostStages.fetch_sub(1, std::memory_order_release);
+        throw;
+      }
+    }
+  }
+  return nullptr;
+}
+
+folly::CPUThreadPoolExecutor& hostStageExecutor() {
+  initializeUcxStagingPools();
+  static folly::CPUThreadPoolExecutor executor(hostStageConcurrency());
+  return executor;
+}
+} // namespace
+
+uint64_t completedAsyncHostStageCount() {
+  return completedHostStages.load(std::memory_order_acquire);
+}
 
 void UcxExchangeServer::setState(ServerState newState) {
   auto oldState = state_.exchange(newState, std::memory_order_seq_cst);
@@ -423,6 +685,7 @@ void UcxExchangeServer::process() {
       // to do
       break;
     case ServerState::DataReady:
+    case ServerState::WaitingForHostStage:
       sendData();
       break;
     case ServerState::WaitingForSendComplete:
@@ -474,6 +737,26 @@ void UcxExchangeServer::close() {
   if (!closed_.compare_exchange_strong(
           expected, desired, std::memory_order_acq_rel)) {
     return; // already closed.
+  }
+  if (pageableCacheEnabled()) {
+    const auto stats = pageableCache()->stats();
+    LOG(WARNING) << "UCX_PAGEABLE_CACHE_SNAPSHOT requests=" << stats.requests
+                 << " hits=" << stats.hits
+                 << " hitPayloadBytes=" << stats.hitPayloadBytes
+                 << " allocatedBytes=" << stats.allocatedBytes
+                 << " idleBytes=" << stats.idleBytes
+                 << " peakIdleBytes=" << stats.peakIdleBytes
+                 << " idleBlocks=" << stats.idleBlocks
+                 << " evictedBytes=" << stats.evictedBytes
+                 << " senderCreditBytes=" << inFlightSendHostBytes.load()
+                 << " peakSenderCreditBytes=" << peakSendHostBytes.load()
+                 << " senderLimitBytes=" << maxInFlightSendHostBytes();
+  }
+  {
+    std::lock_guard<std::recursive_mutex> lock(dataMutex_);
+    // Never join a staging worker on the progress thread. Its closure keeps
+    // source, destination, credit and scratch alive until completed DMA/copy.
+    hostStage_.reset();
   }
   VLOG(2) << "[UCX-SERVER-CLOSE] task=" << partitionKey_.taskId
           << " key=" << partitionKey_.toString() << " peer="
@@ -543,6 +826,115 @@ void UcxExchangeServer::sendData() {
     return;
   }
   std::lock_guard<std::recursive_mutex> lock(dataMutex_);
+  if (closed_.load(std::memory_order_acquire)) {
+    return;
+  }
+
+  std::shared_ptr<DataSendContext> stagedContext;
+  std::shared_ptr<cudf::packed_columns> preAdmittedDevice;
+  const bool asyncStage = asyncHostStageEnabled();
+  if (asyncStage && dataPtr_) {
+    if (hostStage_) {
+      if (!hostStage_->ready.load(std::memory_order_acquire)) {
+        return; // Only completion re-enqueues this pending transfer.
+      }
+      auto completed = std::exchange(hostStage_, nullptr);
+      if (completed->error) {
+        std::rethrow_exception(completed->error);
+      }
+      stagedContext = std::move(completed->context);
+    } else {
+      if (isIntraNodeTransfer_ && adaptiveIntraNodeDeviceEnabled()) {
+        preAdmittedDevice = tryAdmitIntraNodeDevice(dataPtr_);
+      }
+      const auto size = dataPtr_->gpu_data->size();
+      const bool needsHost = isIntraNodeTransfer_
+          ? ((intraNodeHostBounceEnabled() ||
+              adaptiveIntraNodeDeviceEnabled()) &&
+             !preAdmittedDevice)
+          : shouldHostStageDeviceTransfer(
+                communicator->hasCudaTransport(), size);
+      if (needsHost) {
+        auto admission = tryAdmitHostStage();
+        auto context = std::make_shared<DataSendContext>();
+        if (!admission || !context->reserveHostBytes(size)) {
+          wakeCommunicator();
+          return; // Retry credit without blocking UCXX progress.
+        }
+        int device = 0;
+        CUDF_CUDA_TRY(cudaGetDevice(&device));
+        auto pending = std::make_shared<AsyncHostStage>();
+        pending->context = std::move(context);
+        hostStage_ = pending;
+        setState(ServerState::WaitingForHostStage);
+        std::weak_ptr<UcxExchangeServer> weak = weak_from_this();
+        hostStageExecutor().add([pending,
+                                 source = dataPtr_,
+                                 device,
+                                 size,
+                                 admission,
+                                 weak,
+                                 intraNode = isIntraNodeTransfer_,
+                                 requestLabel = hostStagingRequestLabel(
+                                     partitionKey_, sequenceNumber_),
+                                 localQueue = localPinnedQueueKey(
+                                     partitionKey_,
+                                     isIntraNodeTransfer_)]() mutable {
+          try {
+            CUDF_CUDA_TRY(cudaSetDevice(device));
+            nvtx3::scoped_range range("UcxHost::asyncSendStage");
+            auto& ctx = *pending->context;
+            ctx.hostDataBytes = size;
+            ctx.hostData = allocateHostStagingBuffer(
+                size,
+                ctx.hostDataPinned,
+                intraNode,
+                requestLabel,
+                localQueue,
+                ctx.hostReservation);
+            // A per-operation stream avoids reusing a thread-local stream
+            // created for another CUDA device in multi-device test processes.
+            rmm::cuda_stream stream{rmm::cuda_stream::flags::non_blocking};
+            SCOPE_EXIT {
+              // Also fence partially submitted work on exceptional exits.
+              cudaStreamSynchronize(stream.value());
+            };
+            cudf_velox::CudaEvent ready{cudaEventDisableTiming};
+            ready.recordFrom(source->gpu_data->stream()).waitOn(stream.view());
+            if (!ctx.hostDataPinned && shortPinnedD2HEnabled()) {
+              copyUcxDeviceToPageableHost(
+                  ctx.hostData.get(),
+                  source->gpu_data->data(),
+                  size,
+                  stream.view());
+            } else {
+              CUDF_CUDA_TRY(cudaMemcpyAsync(
+                  ctx.hostData.get(),
+                  source->gpu_data->data(),
+                  size,
+                  cudaMemcpyDeviceToHost,
+                  stream.value()));
+              stream.synchronize();
+            }
+            LOG_EVERY_N(WARNING, 128) << "UCX_ASYNC_HOST_STAGE bytes=" << size
+                                      << " pinned=" << ctx.hostDataPinned;
+            completedHostStages.fetch_add(1, std::memory_order_release);
+          } catch (...) {
+            pending->error = std::current_exception();
+          }
+          source.reset();
+          admission
+              .reset(); // Scratch has returned; no downstream future holds it.
+          pending->ready.store(true, std::memory_order_release);
+          if (auto self = weak.lock();
+              self && !self->closed_.load(std::memory_order_acquire)) {
+            self->wakeCommunicator();
+          }
+        });
+        return;
+      }
+    }
+  }
 
   VLOG(2) << (isIntraNodeTransfer_ ? "[INTRA]" : "[REMOTE]") << " [ExSrv "
           << partitionKey_.toString() << " seq=" << sequenceNumber_
@@ -566,7 +958,11 @@ void UcxExchangeServer::sendData() {
       IntraNodeTransferKey key{
           partitionKey_.taskId, partitionKey_.destination, sequenceNumber_};
       const auto stream = dataPtr_->gpu_data->stream();
-      if (intraNodeHostBounceEnabled()) {
+      const auto adaptiveDevice = adaptiveIntraNodeDeviceEnabled();
+      auto admittedDevice = asyncStage ? std::move(preAdmittedDevice)
+          : adaptiveDevice             ? tryAdmitIntraNodeDevice(dataPtr_)
+                           : std::shared_ptr<cudf::packed_columns>{};
+      if ((intraNodeHostBounceEnabled() || adaptiveDevice) && !admittedDevice) {
         // A direct same-node publication keeps the producer device allocation
         // alive until the downstream source polls and then clones it. Under
         // multi-driver HASH fan-out, several fragments can each wait for a
@@ -574,41 +970,59 @@ void UcxExchangeServer::sendData() {
         // ownership boundary to bounded host storage: D2H completes here, the
         // producer allocation is released, and the consumer defers H2D until
         // its Velox Driver has acquired device admission.
-        auto bounce = std::make_shared<DataSendContext>();
-        if (!bounce->reserveHostBytes(static_cast<int64_t>(bytes_))) {
+        auto bounce =
+            stagedContext ? stagedContext : std::make_shared<DataSendContext>();
+        if (!stagedContext &&
+            !bounce->reserveHostBytes(static_cast<int64_t>(bytes_))) {
           wakeCommunicator();
           return;
         }
-        bounce->hostDataBytes = bytes_;
-        bounce->hostData =
-            allocateHostStagingBuffer(bytes_, bounce->hostDataPinned);
+        if (!stagedContext) {
+          bounce->hostDataBytes = bytes_;
+          bounce->hostData = allocateHostStagingBuffer(
+              bytes_,
+              bounce->hostDataPinned,
+              true,
+              hostStagingRequestLabel(partitionKey_, sequenceNumber_),
+              localPinnedQueueKey(partitionKey_, true),
+              bounce->hostReservation);
+          const auto copyStream = hostStagingCopyStream();
+          cudf_velox::CudaEvent producerReady{cudaEventDisableTiming};
+          producerReady.recordFrom(stream).waitOn(copyStream);
+          cudaError_t copyStatus = cudaSuccess;
+          if (!bounce->hostDataPinned && shortPinnedD2HEnabled()) {
+            copyUcxDeviceToPageableHost(
+                bounce->hostData.get(),
+                dataPtr_->gpu_data->data(),
+                bytes_,
+                copyStream);
+          } else {
+            copyStatus = cudaMemcpyAsync(
+                bounce->hostData.get(),
+                dataPtr_->gpu_data->data(),
+                bytes_,
+                cudaMemcpyDeviceToHost,
+                copyStream.value());
+          }
+          if (copyStatus != cudaSuccess) {
+            cudf_velox::logDeviceMemorySnapshot(
+                "UcxExchangeServer intra-node bounce D2H error");
+          }
+          CUDF_CUDA_TRY(copyStatus);
+          const auto synchronizeStatus =
+              cudaStreamSynchronize(copyStream.value());
+          if (synchronizeStatus != cudaSuccess) {
+            LOG(ERROR) << "UCX intra-node bounce D2H stream failed task="
+                       << partitionKey_.toString()
+                       << " sequence=" << sequenceNumber_ << " bytes=" << bytes_
+                       << " status=" << cudaGetErrorString(synchronizeStatus);
+            cudf_velox::logDeviceMemorySnapshot(
+                "UcxExchangeServer intra-node bounce D2H stream error");
+          }
+          CUDF_CUDA_TRY(synchronizeStatus);
+        }
         auto metadata =
             std::make_unique<std::vector<uint8_t>>(*dataPtr_->metadata);
-        const auto copyStream = hostStagingCopyStream();
-        cudf_velox::CudaEvent producerReady{cudaEventDisableTiming};
-        producerReady.recordFrom(stream).waitOn(copyStream);
-        const auto copyStatus = cudaMemcpyAsync(
-            bounce->hostData.get(),
-            dataPtr_->gpu_data->data(),
-            bytes_,
-            cudaMemcpyDeviceToHost,
-            copyStream.value());
-        if (copyStatus != cudaSuccess) {
-          cudf_velox::logDeviceMemorySnapshot(
-              "UcxExchangeServer intra-node bounce D2H error");
-        }
-        CUDF_CUDA_TRY(copyStatus);
-        const auto synchronizeStatus =
-            cudaStreamSynchronize(copyStream.value());
-        if (synchronizeStatus != cudaSuccess) {
-          LOG(ERROR) << "UCX intra-node bounce D2H stream failed task="
-                     << partitionKey_.toString()
-                     << " sequence=" << sequenceNumber_ << " bytes=" << bytes_
-                     << " status=" << cudaGetErrorString(synchronizeStatus);
-          cudf_velox::logDeviceMemorySnapshot(
-              "UcxExchangeServer intra-node bounce D2H stream error");
-        }
-        CUDF_CUDA_TRY(synchronizeStatus);
 
         // Alias the data pointer to the context so host credit and the pinned
         // pool lease remain owned by the consumer queue through deferred H2D.
@@ -635,10 +1049,17 @@ void UcxExchangeServer::sendData() {
         intraNodeRetrieveFuture_ =
             IntraNodeTransferRegistry::getInstance()->publish(
                 key,
-                dataPtr_,
+                admittedDevice ? admittedDevice : dataPtr_,
                 stream,
                 /*atEnd=*/false,
                 makeIntraNodeRetrieveWakeup());
+        if (admittedDevice) {
+          LOG_EVERY_N(WARNING, 128)
+              << "CUDF_UCX_INTRANODE_ADAPTIVE_DEVICE task="
+              << partitionKey_.taskId << " bytes=" << bytes_
+              << " retainedDeviceBytes="
+              << intraNodeDeviceBytes.load(std::memory_order_acquire);
+        }
       }
       dataPtr_.reset();
       intraNodeAtEndPublished_ = false;
@@ -687,8 +1108,10 @@ void UcxExchangeServer::sendData() {
     std::shared_ptr<DataSendContext> dataCtx;
     if (dataPtr_) {
       const auto hostBytes = static_cast<int64_t>(dataPtr_->gpu_data->size());
-      dataCtx = std::make_shared<DataSendContext>();
-      if (useHostStaging && !dataCtx->reserveHostBytes(hostBytes)) {
+      dataCtx =
+          stagedContext ? stagedContext : std::make_shared<DataSendContext>();
+      if (useHostStaging && !stagedContext &&
+          !dataCtx->reserveHostBytes(hostBytes)) {
         // Keep dataPtr_ and state=DataReady.  Completed UCX callbacks release
         // process-wide credit; requeueing lets this server retry without
         // dequeuing or staging another packed table.
@@ -819,61 +1242,78 @@ void UcxExchangeServer::sendData() {
       dataCtx->data = dataPtr_;
       void* sendBuffer = dataCtx->data->gpu_data->data();
       if (useHostStaging) {
-        dataCtx->hostDataBytes = bytes_;
-        dataCtx->hostData =
-            allocateHostStagingBuffer(bytes_, dataCtx->hostDataPinned);
-        const auto producerStream = dataCtx->data->gpu_data->stream();
-        if (exchangeVariableWidthValidationEnabled()) {
-          LOG(WARNING) << "UCX sender validating key="
+        if (!stagedContext) {
+          dataCtx->hostDataBytes = bytes_;
+          dataCtx->hostData = allocateHostStagingBuffer(
+              bytes_,
+              dataCtx->hostDataPinned,
+              false,
+              hostStagingRequestLabel(partitionKey_, sequenceNumber_),
+              {},
+              dataCtx->hostReservation);
+          const auto producerStream = dataCtx->data->gpu_data->stream();
+          if (exchangeVariableWidthValidationEnabled()) {
+            LOG(WARNING) << "UCX sender validating key="
+                         << partitionKey_.toString()
+                         << " sequence=" << sequenceNumber_
+                         << " bytes=" << bytes_;
+            const auto senderView = cudf::unpack(*dataCtx->data);
+            LOG(WARNING) << "UCX sender device page key="
+                         << partitionKey_.toString()
+                         << " sequence=" << sequenceNumber_
+                         << " rows=" << senderView.num_rows() << " layout="
+                         << cudf_velox::validateVariableWidthTableLayout(
+                                senderView, producerStream);
+          }
+          const auto copyStream = hostStagingCopyStream();
+          // The packed device allocation carries the stream on which its last
+          // producer was submitted. Queue publication normally synchronizes
+          // that stream, but relying on every producer path to have done so
+          // makes the communicator's independent non-blocking copy stream race
+          // any missed or future asynchronous publication path. Record the
+          // dependency at the ownership handoff and keep the event alive until
+          // D2H completes.
+          cudf_velox::CudaEvent producerReady{cudaEventDisableTiming};
+          producerReady.recordFrom(producerStream).waitOn(copyStream);
+          cudaError_t copyStatus = cudaSuccess;
+          if (!dataCtx->hostDataPinned && shortPinnedD2HEnabled()) {
+            copyUcxDeviceToPageableHost(
+                dataCtx->hostData.get(),
+                dataCtx->data->gpu_data->data(),
+                bytes_,
+                copyStream);
+          } else {
+            copyStatus = cudaMemcpyAsync(
+                dataCtx->hostData.get(),
+                dataCtx->data->gpu_data->data(),
+                bytes_,
+                cudaMemcpyDeviceToHost,
+                copyStream.value());
+          }
+          if (copyStatus != cudaSuccess) {
+            cudf_velox::logDeviceMemorySnapshot(
+                "UcxExchangeServer host staging D2H error");
+          }
+          CUDF_CUDA_TRY(copyStatus);
+          const auto synchronizeStatus =
+              cudaStreamSynchronize(copyStream.value());
+          if (synchronizeStatus != cudaSuccess) {
+            LOG(ERROR) << "UCX host staging D2H stream failed task="
                        << partitionKey_.toString()
-                       << " sequence=" << sequenceNumber_
-                       << " bytes=" << bytes_;
-          const auto senderView = cudf::unpack(*dataCtx->data);
-          LOG(WARNING) << "UCX sender device page key="
-                       << partitionKey_.toString()
-                       << " sequence=" << sequenceNumber_
-                       << " rows=" << senderView.num_rows() << " layout="
-                       << cudf_velox::validateVariableWidthTableLayout(
-                              senderView, producerStream);
-        }
-        const auto copyStream = hostStagingCopyStream();
-        // The packed device allocation carries the stream on which its last
-        // producer was submitted. Queue publication normally synchronizes that
-        // stream, but relying on every producer path to have done so makes the
-        // communicator's independent non-blocking copy stream race any missed
-        // or future asynchronous publication path. Record the dependency at
-        // the ownership handoff and keep the event alive until D2H completes.
-        cudf_velox::CudaEvent producerReady{cudaEventDisableTiming};
-        producerReady.recordFrom(producerStream).waitOn(copyStream);
-        const auto copyStatus = cudaMemcpyAsync(
-            dataCtx->hostData.get(),
-            dataCtx->data->gpu_data->data(),
-            bytes_,
-            cudaMemcpyDeviceToHost,
-            copyStream.value());
-        if (copyStatus != cudaSuccess) {
-          cudf_velox::logDeviceMemorySnapshot(
-              "UcxExchangeServer host staging D2H error");
-        }
-        CUDF_CUDA_TRY(copyStatus);
-        const auto synchronizeStatus =
-            cudaStreamSynchronize(copyStream.value());
-        if (synchronizeStatus != cudaSuccess) {
-          LOG(ERROR) << "UCX host staging D2H stream failed task="
-                     << partitionKey_.toString()
-                     << " sequence=" << sequenceNumber_ << " bytes=" << bytes_
-                     << " status=" << cudaGetErrorString(synchronizeStatus);
-          cudf_velox::logDeviceMemorySnapshot(
-              "UcxExchangeServer host staging D2H stream error");
-        }
-        CUDF_CUDA_TRY(synchronizeStatus);
-        if (exchangeVariableWidthValidationEnabled()) {
-          LOG(WARNING) << "UCX sender staged key=" << partitionKey_.toString()
                        << " sequence=" << sequenceNumber_ << " bytes=" << bytes_
-                       << " fingerprint=0x" << std::hex
-                       << diagnosticBufferFingerprint(
-                              dataCtx->hostData.get(), bytes_)
-                       << std::dec;
+                       << " status=" << cudaGetErrorString(synchronizeStatus);
+            cudf_velox::logDeviceMemorySnapshot(
+                "UcxExchangeServer host staging D2H stream error");
+          }
+          CUDF_CUDA_TRY(synchronizeStatus);
+          if (exchangeVariableWidthValidationEnabled()) {
+            LOG(WARNING) << "UCX sender staged key=" << partitionKey_.toString()
+                         << " sequence=" << sequenceNumber_
+                         << " bytes=" << bytes_ << " fingerprint=0x" << std::hex
+                         << diagnosticBufferFingerprint(
+                                dataCtx->hostData.get(), bytes_)
+                         << std::dec;
+          }
         }
         sendBuffer = dataCtx->hostData.get();
       }
@@ -896,8 +1336,7 @@ void UcxExchangeServer::sendData() {
            useHostStaging,
            dataSequence,
            remoteSendPostedAt,
-           remoteSendBytes](
-              ucs_status_t status, std::shared_ptr<void> arg) {
+           remoteSendBytes](ucs_status_t status, std::shared_ptr<void> arg) {
             // Hold the producer device allocation through the UCX completion
             // callback. For direct CUDA transfer, successful UCP completion is
             // the ownership boundary at which the send buffer becomes reusable.

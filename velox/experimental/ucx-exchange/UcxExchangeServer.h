@@ -34,6 +34,8 @@
 
 namespace facebook::velox::ucx_exchange {
 
+struct AsyncHostStage;
+
 struct UcxRemoteDataPathSnapshot {
   int64_t activeSends{0};
   int64_t maxActiveSends{0};
@@ -46,6 +48,7 @@ struct UcxRemoteDataPathSnapshot {
 /// Process-wide remote data-send counters used to distinguish transport
 /// stalls from gaps in the exchange state machine.
 UcxRemoteDataPathSnapshot remoteDataPathSnapshot();
+uint64_t completedAsyncHostStageCount();
 
 class UcxExchangeServer
     : public CommElement,
@@ -61,6 +64,7 @@ class UcxExchangeServer
     WaitingForSendComplete,
     WaitingForIntraNodeRetrieve,
     Done,
+    WaitingForHostStage,
   };
 
   VELOX_DECLARE_EMBEDDED_ENUM_NAME(ServerState);
@@ -145,6 +149,9 @@ class UcxExchangeServer
 
   std::atomic<ServerState> state_;
   std::shared_ptr<cudf::packed_columns> dataPtr_{nullptr};
+  // Worker completion publishes ready with release ordering. The worker owns
+  // the source/credit independently, including when close() drops this handle.
+  std::shared_ptr<AsyncHostStage> hostStage_;
   /// Protects dataPtr_. Must be recursive because sendData() holds the lock
   /// when calling tagSend(), and for small messages UCX completes inline via
   /// its fast-completion path, firing the sendComplete() callback on the same
