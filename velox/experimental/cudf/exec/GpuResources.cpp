@@ -22,6 +22,7 @@
 #include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/prefetch.hpp>
 
+#include <rmm/cuda_stream_pool.hpp>
 #include <rmm/mr/arena_memory_resource.hpp>
 #include <rmm/mr/cuda_async_managed_memory_resource.hpp>
 #include <rmm/mr/cuda_async_memory_resource.hpp>
@@ -526,9 +527,53 @@ std::size_t deviceMemoryAdmissionReservedBytes(int device) {
   return it == deviceMemoryAdmissionBytes.end() ? 0 : it->second;
 }
 
-cudf::detail::cuda_stream_pool& cudfGlobalStreamPool() {
-  return cudf::detail::current_cuda_stream_pool();
+namespace {
+
+class SharedStreamPool final : public cudf::detail::cuda_stream_pool {
+ public:
+  cuda::stream_ref get_stream() override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return streams_.get_stream();
+  }
+
+  std::vector<cuda::stream_ref> get_streams(std::size_t count) override {
+    std::vector<cuda::stream_ref> result;
+    result.reserve(count);
+    // Keep a batch contiguous so concurrent callers cannot introduce duplicates
+    // before all 32 streams have been visited.
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (std::size_t i = 0; i < count; ++i) {
+      result.emplace_back(streams_.get_stream());
+    }
+    return result;
+  }
+
+ private:
+  rmm::cuda_stream_pool streams_{32, rmm::cuda_stream::flags::non_blocking};
+  std::mutex mutex_;
 };
+
+} // namespace
+
+cudf::detail::cuda_stream_pool& cudfGlobalStreamPool() {
+  int device;
+  VELOX_CHECK_EQ(
+      static_cast<int>(cudaGetDevice(&device)),
+      static_cast<int>(cudaSuccess),
+      "Failed to get current CUDA device for the shared stream pool");
+  static std::mutex mutex;
+  // Readers retain streams across worker threads and query lifetimes. Keep the
+  // pools alive through process exit, without CUDA calls during static
+  // teardown.
+  static auto* pools =
+      new std::unordered_map<int, std::unique_ptr<SharedStreamPool>>;
+  std::lock_guard<std::mutex> lock(mutex);
+  auto& pool = (*pools)[device];
+  if (!pool) {
+    pool = std::make_unique<SharedStreamPool>();
+  }
+  return *pool;
+}
 
 namespace {
 
