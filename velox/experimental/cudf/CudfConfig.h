@@ -53,6 +53,8 @@ struct CudfConfig {
       "cudf.batch_size_min_threshold_bytes"};
   static constexpr const char* kCudfBatchSizeMaxThreshold{
       "cudf.batch_size_max_threshold"};
+  static constexpr const char* kCudfHashJoinDistinctEnabled{
+      "cudf.hash_join_distinct_enabled"};
   static constexpr const char* kCudfHashJoinLoadFactor{
       "cudf.hash_join_load_factor"};
   static constexpr const char* kCudfConcatOptimizationEnabled{
@@ -263,6 +265,7 @@ struct CudfConfig {
   /// Hash-table occupancy used by cuDF hash joins. Higher values reduce
   /// retained build memory at the cost of additional probe collisions.
   double hashJoinLoadFactor{0.5};
+  bool hashJoinDistinctEnabled{true};
   // Query config key for the TopN batch size in the cuDF TopN operator.
   int32_t topNBatchSize{5};
 

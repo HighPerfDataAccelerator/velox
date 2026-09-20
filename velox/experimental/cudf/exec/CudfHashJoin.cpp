@@ -39,11 +39,13 @@
 #include <cudf/detail/utilities/stream_pool.hpp>
 #include <cudf/filling.hpp>
 #include <cudf/groupby.hpp>
+#include <cudf/join/distinct_hash_join.hpp>
 #include <cudf/join/filtered_join.hpp>
 #include <cudf/join/join.hpp>
 #include <cudf/join/mixed_join.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/reduction.hpp>
+#include <cudf/reduction/distinct_count.hpp>
 #include <cudf/reshape.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
 #include <cudf/search.hpp>
@@ -63,6 +65,90 @@
 #include <optional>
 
 namespace facebook::velox::cudf_velox {
+
+// Owns one build chunk's index. The caller retains the underlying key columns.
+class CudfHashJoinTable {
+ public:
+  CudfHashJoinTable(
+      cudf::table_view keys,
+      bool tryDistinct,
+      double loadFactor,
+      cuda::stream_ref stream,
+      rmm::device_async_resource_ref mr);
+
+  using JoinIndices = std::pair<
+      std::unique_ptr<rmm::device_uvector<cudf::size_type>>,
+      std::unique_ptr<rmm::device_uvector<cudf::size_type>>>;
+
+  JoinIndices innerJoin(
+      cudf::table_view probe,
+      cuda::stream_ref stream,
+      rmm::device_async_resource_ref mr) const;
+
+  bool isDistinct() const {
+    return distinct_ != nullptr;
+  }
+
+ private:
+  std::unique_ptr<cudf::hash_join> general_;
+  std::unique_ptr<cudf::distinct_hash_join> distinct_;
+};
+
+CudfHashJoinTable::CudfHashJoinTable(
+    cudf::table_view keys,
+    bool tryDistinct,
+    double loadFactor,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) {
+#if CUDF_VERSION_MAJOR > 26 || \
+    (CUDF_VERSION_MAJOR == 26 && CUDF_VERSION_MINOR >= 8)
+  const bool eligible = tryDistinct && keys.num_columns() > 0 &&
+      keys.num_rows() > 0 &&
+      std::all_of(keys.begin(), keys.end(), [](auto const& key) {
+                          if (key.has_nulls()) {
+                            return false;
+                          }
+                          switch (key.type().id()) {
+                            case cudf::type_id::INT8:
+                            case cudf::type_id::INT16:
+                            case cudf::type_id::INT32:
+                            case cudf::type_id::INT64:
+                              return true;
+                            default:
+                              return false;
+                          }
+                        });
+  // Count whole key rows, not individual columns. The temporary index is
+  // released before constructing the retained index.
+  if (eligible &&
+      cudf::distinct_count(keys, cudf::null_equality::UNEQUAL, stream) ==
+          keys.num_rows()) {
+    distinct_ = std::make_unique<cudf::distinct_hash_join>(
+        keys, cudf::null_equality::UNEQUAL, loadFactor, stream, mr);
+    return;
+  }
+  general_ = std::make_unique<cudf::hash_join>(
+      keys,
+      cudf::nullable_join::YES,
+      cudf::null_equality::UNEQUAL,
+      loadFactor,
+      stream,
+      mr);
+#else
+  general_ = std::make_unique<cudf::hash_join>(
+      keys, cudf::null_equality::UNEQUAL, stream, mr);
+#endif
+}
+
+CudfHashJoinTable::JoinIndices CudfHashJoinTable::innerJoin(
+    cudf::table_view probe,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) const {
+  if (distinct_) {
+    return distinct_->inner_join(probe, stream, mr);
+  }
+  return general_->inner_join(probe, std::nullopt, stream, mr);
+}
 
 namespace {
 
@@ -378,8 +464,8 @@ void CudfHashJoinBuild::doNoMoreInput() {
         buildType->getChildIdx(rightKeys[i]->name()));
   }
 
-  // Construct hash_join object for join types that use hb->inner_join() or
-  // hb->left_join(). Semi filter and anti joins use standalone cudf functions
+  // Construct an index for join types that use hb->innerJoin().
+  // Semi filter and anti joins use standalone cudf functions
   // (e.g., mixed_left_semi_join, filtered_join) that build hash tables
   // internally, so they don't need this.
   bool buildHashJoin =
@@ -388,28 +474,26 @@ void CudfHashJoinBuild::doNoMoreInput() {
        joinNode_->isLeftSemiProjectJoin() ||
        joinNode_->isRightSemiProjectJoin());
 
-  std::vector<std::shared_ptr<cudf::hash_join>> hashObjects;
+  const bool tryDistinct = joinNode_->isInnerJoin() &&
+      operatorCtx_->driverCtx()->queryConfig().get<bool>(
+          CudfConfig::kCudfHashJoinDistinctEnabled,
+          cudfConfig.hashJoinDistinctEnabled);
+  std::vector<std::shared_ptr<CudfHashJoinTable>> hashObjects;
   for (auto i = 0; i < tbls.size(); i++) {
     hashObjects.push_back(
-#if CUDF_VERSION_MAJOR > 26 || \
-    (CUDF_VERSION_MAJOR == 26 && CUDF_VERSION_MINOR >= 8)
-        (buildHashJoin) ? std::make_shared<cudf::hash_join>(
-                              tbls[i]->view().select(buildKeyIndices),
-                              cudf::nullable_join::YES,
-                              cudf::null_equality::UNEQUAL,
-                              hashJoinLoadFactor,
-                              stream,
-                              get_temp_mr())
-                        : nullptr);
-#else
-        (buildHashJoin) ? std::make_shared<cudf::hash_join>(
-                              tbls[i]->view().select(buildKeyIndices),
-                              cudf::null_equality::UNEQUAL,
-                              stream)
-                        : nullptr);
-#endif
+        buildHashJoin ? std::make_shared<CudfHashJoinTable>(
+                            tbls[i]->view().select(buildKeyIndices),
+                            tryDistinct,
+                            hashJoinLoadFactor,
+                            stream,
+                            get_temp_mr())
+                      : nullptr);
     if (buildHashJoin) {
       VELOX_CHECK_NOT_NULL(hashObjects.back());
+      stats_.wlock()->addRuntimeStat(
+          hashObjects.back()->isDistinct() ? "cudfHashJoinDistinctChunks"
+                                           : "cudfHashJoinGeneralChunks",
+          RuntimeCounter(1));
     }
     if (CudfConfig::getInstance().debugEnabled) {
       if (hashObjects.back() != nullptr) {
@@ -970,11 +1054,8 @@ std::vector<CudfHashJoinProbe::JoinOutput> CudfHashJoinProbe::innerJoin(
 
     // left = probe, right = build
     VELOX_CHECK_NOT_NULL(hb);
-    auto [leftJoinIndices, rightJoinIndices] = hb->inner_join(
-        leftTableView.select(leftKeyIndices_),
-        std::nullopt,
-        stream,
-        get_temp_mr());
+    auto [leftJoinIndices, rightJoinIndices] = hb->innerJoin(
+        leftTableView.select(leftKeyIndices_), stream, get_temp_mr());
 
     auto leftIndicesSpan =
         cudf::device_span<cudf::size_type const>{*leftJoinIndices};
@@ -1154,11 +1235,8 @@ std::vector<CudfHashJoinProbe::JoinOutput> CudfHashJoinProbe::leftJoin(
     // Use inner_join to get only real matched pairs. Unmatched probe rows are
     // emitted separately after the loop.
     VELOX_CHECK_NOT_NULL(hb);
-    auto [leftJoinIndices, rightJoinIndices] = hb->inner_join(
-        leftTableView.select(leftKeyIndices_),
-        std::nullopt,
-        stream,
-        get_temp_mr());
+    auto [leftJoinIndices, rightJoinIndices] = hb->innerJoin(
+        leftTableView.select(leftKeyIndices_), stream, get_temp_mr());
 
     if (leftJoinIndices->size() == 0) {
       continue;
@@ -1221,11 +1299,8 @@ std::vector<CudfHashJoinProbe::JoinOutput> CudfHashJoinProbe::rightJoin(
     auto& hb = hbs[i];
 
     VELOX_CHECK_NOT_NULL(hb);
-    auto [leftJoinIndices, rightJoinIndices] = hb->inner_join(
-        leftTableView.select(leftKeyIndices_),
-        std::nullopt,
-        stream,
-        get_temp_mr());
+    auto [leftJoinIndices, rightJoinIndices] = hb->innerJoin(
+        leftTableView.select(leftKeyIndices_), stream, get_temp_mr());
     if (!joinNode_->filter()) {
       // Mark matched build rows by checking which row indices appear in
       // rightJoinIndices. Use contains to avoid scatter with duplicate indices.
@@ -1393,11 +1468,8 @@ std::vector<CudfHashJoinProbe::JoinOutput> CudfHashJoinProbe::fullJoin(
     // emitted separately after the loop. Unmatched build rows are emitted in
     // doGetOutput via rightMatchedFlags_.
     VELOX_CHECK_NOT_NULL(hb);
-    auto [leftJoinIndices, rightJoinIndices] = hb->inner_join(
-        leftTableView.select(leftKeyIndices_),
-        std::nullopt,
-        stream,
-        get_temp_mr());
+    auto [leftJoinIndices, rightJoinIndices] = hb->innerJoin(
+        leftTableView.select(leftKeyIndices_), stream, get_temp_mr());
 
     if (leftJoinIndices->size() == 0) {
       continue;
@@ -1714,11 +1786,8 @@ CudfHashJoinProbe::leftSemiProjectJoin(
     // Step 1: Inner join to get (probe_idx, build_idx) pairs where keys match.
     // Unlike left_join, inner_join only returns valid pairs (no JoinNoMatch).
     VELOX_CHECK_NOT_NULL(hb);
-    auto [leftJoinIndices, rightJoinIndices] = hb->inner_join(
-        leftTableView.select(leftKeyIndices_),
-        std::nullopt,
-        stream,
-        get_temp_mr());
+    auto [leftJoinIndices, rightJoinIndices] = hb->innerJoin(
+        leftTableView.select(leftKeyIndices_), stream, get_temp_mr());
 
     if (leftJoinIndices->size() == 0) {
       continue; // No matches from this build table
@@ -2141,11 +2210,8 @@ CudfHashJoinProbe::rightSemiProjectJoin(
     auto& hb = hbs[i];
     VELOX_CHECK_NOT_NULL(hb);
 
-    auto [leftJoinIndices, rightJoinIndices] = hb->inner_join(
-        leftTableView.select(leftKeyIndices_),
-        std::nullopt,
-        stream,
-        get_temp_mr());
+    auto [leftJoinIndices, rightJoinIndices] = hb->innerJoin(
+        leftTableView.select(leftKeyIndices_), stream, get_temp_mr());
 
     auto leftIndicesCol = cudf::column_view{
         cudf::device_span<cudf::size_type const>{*leftJoinIndices}};

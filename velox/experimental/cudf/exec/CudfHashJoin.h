@@ -40,6 +40,7 @@ namespace facebook::velox::cudf_velox {
 
 class CudaEvent;
 class CudfExpression;
+class CudfHashJoinTable;
 
 /**
  * @brief Bridge for transferring build-side hash tables between build and probe
@@ -62,7 +63,7 @@ class CudfHashJoinBridge : public exec::JoinBridge {
    * batched processing */
   using hash_type = std::pair<
       std::vector<std::shared_ptr<cudf::table>>,
-      std::vector<std::shared_ptr<cudf::hash_join>>>;
+      std::vector<std::shared_ptr<CudfHashJoinTable>>>;
 
   void setHashTable(std::optional<hash_type> hashObject);
 
