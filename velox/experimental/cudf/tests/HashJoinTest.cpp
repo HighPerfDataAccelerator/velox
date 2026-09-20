@@ -211,6 +211,56 @@ TEST_F(HashJoinTest, distinctCompositeBuildAndOuterFallback) {
   }
 }
 
+TEST_F(HashJoinTest, distinctIneligibleBuildFallback) {
+  std::vector<RowVectorPtr> builds = {
+      makeRowVector(
+          {"k", "p"},
+          {makeNullableFlatVector<int64_t>({1, std::nullopt, 2}),
+           makeFlatVector<int32_t>({1, 2, 3})}),
+      makeRowVector(
+          {"k", "p"},
+          {makeFlatVector<double>({1., 2., 3.}),
+           makeFlatVector<int32_t>({1, 2, 3})}),
+      makeRowVector(
+          {"k", "p"},
+          {makeFlatVector<int64_t>({1, 1, 2}),
+           makeFlatVector<int32_t>({1, 1, 2})})};
+  for (size_t i = 0; i < builds.size(); ++i) {
+    auto table = "fallback" + std::to_string(i);
+    createDuckDbTable(table, {builds[i]});
+    auto ids = std::make_shared<core::PlanNodeIdGenerator>();
+    auto plan = PlanBuilder(ids)
+                    .values({builds[i]})
+                    .hashJoin(
+                        {"k", "p"},
+                        {"u_k", "u_p"},
+                        PlanBuilder(ids)
+                            .values({builds[i]})
+                            .project({"k AS u_k", "p AS u_p"})
+                            .planNode(),
+                        "",
+                        {"k", "p", "u_k", "u_p"},
+                        core::JoinType::kInner)
+                    .planNode();
+    auto task = AssertQueryBuilder(plan, duckDbQueryRunner_)
+                    .maxDrivers(1)
+                    .assertResults(
+                        "SELECT t.k, t.p, u.k, u.p FROM " + table + " t JOIN " +
+                        table + " u ON t.k = u.k AND t.p = u.p");
+    int64_t generalChunks = 0;
+    for (auto const& pipeline : task->taskStats().pipelineStats) {
+      for (auto const& op : pipeline.operatorStats) {
+        EXPECT_EQ(op.runtimeStats.count("cudfHashJoinDistinctChunks"), 0);
+        auto it = op.runtimeStats.find("cudfHashJoinGeneralChunks");
+        if (it != op.runtimeStats.end()) {
+          generalChunks += it->second.sum;
+        }
+      }
+    }
+    EXPECT_EQ(generalChunks, 1);
+  }
+}
+
 TEST_F(HashJoinTest, countStarOverInnerJoinWithZeroColumnOutput) {
   auto probe = makeRowVector({"k"}, {makeFlatVector<int32_t>({1, 2, 2, 3})});
   auto build = makeRowVector({"u_k"}, {makeFlatVector<int32_t>({2, 2, 4})});

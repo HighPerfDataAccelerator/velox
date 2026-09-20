@@ -39,11 +39,13 @@
 #include <cudf/detail/utilities/stream_pool.hpp>
 #include <cudf/filling.hpp>
 #include <cudf/groupby.hpp>
+#include <cudf/join/distinct_hash_join.hpp>
 #include <cudf/join/filtered_join.hpp>
 #include <cudf/join/join.hpp>
 #include <cudf/join/mixed_join.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/reduction.hpp>
+#include <cudf/reduction/distinct_count.hpp>
 #include <cudf/reshape.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
 #include <cudf/search.hpp>
@@ -63,6 +65,90 @@
 #include <optional>
 
 namespace facebook::velox::cudf_velox {
+
+// Owns one build chunk's index. The caller retains the underlying key columns.
+class CudfHashJoinTable {
+ public:
+  CudfHashJoinTable(
+      cudf::table_view keys,
+      bool tryDistinct,
+      double loadFactor,
+      cuda::stream_ref stream,
+      rmm::device_async_resource_ref mr);
+
+  using JoinIndices = std::pair<
+      std::unique_ptr<rmm::device_uvector<cudf::size_type>>,
+      std::unique_ptr<rmm::device_uvector<cudf::size_type>>>;
+
+  JoinIndices innerJoin(
+      cudf::table_view probe,
+      cuda::stream_ref stream,
+      rmm::device_async_resource_ref mr) const;
+
+  bool isDistinct() const {
+    return distinct_ != nullptr;
+  }
+
+ private:
+  std::unique_ptr<cudf::hash_join> general_;
+  std::unique_ptr<cudf::distinct_hash_join> distinct_;
+};
+
+CudfHashJoinTable::CudfHashJoinTable(
+    cudf::table_view keys,
+    bool tryDistinct,
+    double loadFactor,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) {
+#if CUDF_VERSION_MAJOR > 26 || \
+    (CUDF_VERSION_MAJOR == 26 && CUDF_VERSION_MINOR >= 8)
+  const bool eligible = tryDistinct && keys.num_columns() > 0 &&
+      keys.num_rows() > 0 &&
+      std::all_of(keys.begin(), keys.end(), [](auto const& key) {
+                          if (key.has_nulls()) {
+                            return false;
+                          }
+                          switch (key.type().id()) {
+                            case cudf::type_id::INT8:
+                            case cudf::type_id::INT16:
+                            case cudf::type_id::INT32:
+                            case cudf::type_id::INT64:
+                              return true;
+                            default:
+                              return false;
+                          }
+                        });
+  // Count whole key rows, not individual columns. The temporary index is
+  // released before constructing the retained index.
+  if (eligible &&
+      cudf::distinct_count(keys, cudf::null_equality::UNEQUAL, stream) ==
+          keys.num_rows()) {
+    distinct_ = std::make_unique<cudf::distinct_hash_join>(
+        keys, cudf::null_equality::UNEQUAL, loadFactor, stream, mr);
+    return;
+  }
+  general_ = std::make_unique<cudf::hash_join>(
+      keys,
+      cudf::nullable_join::YES,
+      cudf::null_equality::UNEQUAL,
+      loadFactor,
+      stream,
+      mr);
+#else
+  general_ = std::make_unique<cudf::hash_join>(
+      keys, cudf::null_equality::UNEQUAL, stream, mr);
+#endif
+}
+
+CudfHashJoinTable::JoinIndices CudfHashJoinTable::innerJoin(
+    cudf::table_view probe,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) const {
+  if (distinct_) {
+    return distinct_->inner_join(probe, stream, mr);
+  }
+  return general_->inner_join(probe, std::nullopt, stream, mr);
+}
 
 namespace {
 

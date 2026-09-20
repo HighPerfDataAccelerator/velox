@@ -16,7 +16,6 @@
 
 #pragma once
 
-#include "velox/experimental/cudf/exec/CudfHashJoinTable.h"
 #include "velox/experimental/cudf/exec/CudfJoin.h"
 #include "velox/experimental/cudf/exec/CudfOperator.h"
 #include "velox/experimental/cudf/expression/AstExpression.h"
@@ -41,6 +40,7 @@ namespace facebook::velox::cudf_velox {
 
 class CudaEvent;
 class CudfExpression;
+class CudfHashJoinTable;
 
 /**
  * @brief Bridge for transferring build-side hash tables between build and probe
