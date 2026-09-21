@@ -557,11 +557,14 @@ void registerCudf() {
           [](int32_t operatorId,
              exec::DriverCtx* ctx,
              const std::shared_ptr<const core::PartitionedOutputNode>& node,
-             bool eagerFlush,
+             bool /*eagerFlush*/,
              const std::shared_ptr<UcxOutputBufferManager>& /*manager*/)
               -> std::unique_ptr<exec::Operator> {
             return std::make_unique<ucx_exchange::UcxPartitionedOutput>(
-                operatorId, ctx, node, eagerFlush);
+                operatorId,
+                ctx,
+                node,
+                ucx_exchange::UcxOutputQueueManager::getInstanceRef());
           });
   exec::OutputTransportRegistry::global().insert(
       std::string{core::TransportKind::kUcx},

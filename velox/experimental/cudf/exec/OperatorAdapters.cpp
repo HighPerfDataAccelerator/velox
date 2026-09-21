@@ -1432,7 +1432,10 @@ class PartitionedOutputAdapter : public OperatorAdapter {
     std::vector<std::unique_ptr<exec::Operator>> result;
     result.push_back(
         std::make_unique<ucx_exchange::UcxPartitionedOutput>(
-            operatorId, ctx, outputNode, partitionOp->getEagerFlush()));
+            operatorId,
+            ctx,
+            outputNode,
+            ucx_exchange::UcxOutputQueueManager::getInstanceRef()));
     return result;
   }
 
