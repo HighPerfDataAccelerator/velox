@@ -408,7 +408,7 @@ void WideTestTable::addNumericColumns(
       boolData_.data(),
       boolData_.size() * sizeof(int8_t),
       cudaMemcpyHostToDevice,
-      stream.value());
+      stream.get());
   columns.push_back(std::move(boolColumn));
 }
 
