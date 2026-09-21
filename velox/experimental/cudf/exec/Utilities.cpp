@@ -222,10 +222,11 @@ std::vector<std::unique_ptr<cudf::table>> getConcatenatedTableBatched(
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr,
     std::optional<size_t> maxRowsOverride) {
+  std::vector<std::unique_ptr<cudf::table>> outputTables;
   // Check for empty vector
   if (tables.size() == 0) {
-    concatTables.push_back(makeEmptyTable(tableType, stream, mr));
-    return concatTables;
+    outputTables.push_back(makeEmptyTable(tableType, stream, mr));
+    return outputTables;
   }
 
   struct BoundedView {
@@ -260,7 +261,6 @@ std::vector<std::unique_ptr<cudf::table>> getConcatenatedTableBatched(
     lastViewForSource[source] = boundedViews.size() - 1;
   }
 
-  std::vector<std::unique_ptr<cudf::table>> outputTables;
   try {
     size_t start = 0;
     while (start < boundedViews.size()) {
