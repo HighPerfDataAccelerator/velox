@@ -30,9 +30,9 @@
 #include <cuda_runtime.h>
 #include <ucxx/api.h>
 #include <ucxx/utils/ucx.h>
+#include <cuda/stream>
 
 #include <rmm/cuda_stream_pool.hpp>
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
 #include <rmm/mr/cuda_memory_resource.hpp>
 #include <rmm/mr/pool_memory_resource.hpp>
@@ -164,7 +164,8 @@ class UcxExchangeSource
     MetadataMsg metadata;
     std::unique_ptr<rmm::device_buffer> dataBuf;
     std::shared_ptr<std::vector<uint8_t>> hostData;
-    rmm::cuda_stream_view stream; // The stream used to allocate dataBuf
+    cuda::stream_ref stream{
+        cudaStream_t{cudaStreamDefault}}; // The stream used to allocate dataBuf
   };
 
   // Metadata receives are strictly serial for a source. Reuse one fixed-size

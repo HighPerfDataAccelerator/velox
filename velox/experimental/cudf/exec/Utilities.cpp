@@ -19,6 +19,8 @@
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 
+#include "velox/common/testutil/TestValue.h"
+
 #include <cudf/column/column_factories.hpp>
 #include <cudf/concatenate.hpp>
 #include <cudf/copying.hpp>
@@ -220,39 +222,29 @@ std::vector<std::unique_ptr<cudf::table>> getConcatenatedTableBatched(
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr,
     std::optional<size_t> maxRowsOverride) {
-  std::vector<std::unique_ptr<cudf::table>> concatTables;
   // Check for empty vector
   if (tables.size() == 0) {
     concatTables.push_back(makeEmptyTable(tableType, stream, mr));
     return concatTables;
   }
 
-  auto inputStreams = std::vector<cuda::stream_ref>();
-  auto tableViews = std::vector<cudf::table_view>();
+  struct BoundedView {
+    cudf::table_view view;
+    size_t sourceIndex;
+  };
 
-  inputStreams.reserve(tables.size());
-  tableViews.reserve(tables.size());
+  const auto maxRows = maxRowsOverride.value_or(maxBatchRows());
+  VELOX_CHECK_GT(maxRows, 0, "cuDF max batch size must be positive");
 
-  for (const auto& table : tables) {
-    VELOX_CHECK_NOT_NULL(table);
-    tableViews.push_back(table->getTableView());
-    inputStreams.push_back(table->stream());
-  }
-
-  cudf::detail::join_streams(inputStreams, stream);
-
-  try {
-    std::vector<std::unique_ptr<cudf::table>> outputTables;
-    const auto maxRows = maxRowsOverride.value_or(maxBatchRows());
-    VELOX_CHECK_GT(maxRows, 0, "cuDF max batch size must be positive");
-    std::vector<cudf::table_view> boundedViews;
-    boundedViews.reserve(tableViews.size());
-    for (const auto& tableView : tableViews) {
-      const auto numRows = static_cast<size_t>(tableView.num_rows());
-      if (numRows <= maxRows) {
-        boundedViews.push_back(tableView);
-        continue;
-      }
+  std::vector<BoundedView> boundedViews;
+  std::vector<size_t> lastViewForSource(tables.size());
+  for (size_t source = 0; source < tables.size(); ++source) {
+    VELOX_CHECK_NOT_NULL(tables[source]);
+    const auto tableView = tables[source]->getTableView();
+    const auto numRows = static_cast<size_t>(tableView.num_rows());
+    if (numRows <= maxRows) {
+      boundedViews.push_back({tableView, source});
+    } else {
       for (size_t start = 0; start < numRows;) {
         const auto end = start + std::min(maxRows, numRows - start);
         auto slices = cudf::slice(
@@ -261,41 +253,66 @@ std::vector<std::unique_ptr<cudf::table>> getConcatenatedTableBatched(
              static_cast<cudf::size_type>(end)},
             stream);
         VELOX_CHECK_EQ(slices.size(), 1);
-        boundedViews.push_back(slices.front());
+        boundedViews.push_back({slices.front(), source});
         start = end;
       }
     }
+    lastViewForSource[source] = boundedViews.size() - 1;
+  }
 
-    size_t startpos = 0;
-    size_t runningRows = 0;
-    for (size_t i = 0; i < boundedViews.size(); ++i) {
-      auto const numRows = static_cast<size_t>(boundedViews[i].num_rows());
-      // If adding this table would exceed the limit, flush current batch
-      // [startpos, i).
-      if (runningRows > 0 && runningRows + numRows > maxRows) {
-        outputTables.push_back(
-            cudf::concatenate(
-                std::vector<cudf::table_view>(
-                    boundedViews.begin() + startpos, boundedViews.begin() + i),
-                stream,
-                mr));
-        startpos = i;
-        runningRows = 0;
+  std::vector<std::unique_ptr<cudf::table>> outputTables;
+  try {
+    size_t start = 0;
+    while (start < boundedViews.size()) {
+      size_t end = start;
+      size_t runningRows = 0;
+      std::vector<cudf::table_view> tableViews;
+      while (end < boundedViews.size()) {
+        const auto numRows =
+            static_cast<size_t>(boundedViews[end].view.num_rows());
+        if (runningRows > 0 && runningRows + numRows > maxRows) {
+          break;
+        }
+        runningRows += numRows;
+        tableViews.push_back(boundedViews[end].view);
+        ++end;
       }
-      runningRows += numRows;
-    }
-    // Flush the final batch [startpos, end).
-    if (startpos < boundedViews.size()) {
-      outputTables.push_back(
-          cudf::concatenate(
-              std::vector<cudf::table_view>(
-                  boundedViews.begin() + startpos, boundedViews.end()),
-              stream,
-              mr));
-    }
-    orderCudfVectorDeallocationsAfterStream(tables, inputStreams, stream);
 
-    // Input tables are deallocated here when 'tables' goes out of scope.
+      std::vector<cuda::stream_ref> batchStreams;
+      std::vector<bool> streamAdded(tables.size(), false);
+      for (size_t i = start; i < end; ++i) {
+        const auto source = boundedViews[i].sourceIndex;
+        if (!streamAdded[source]) {
+          batchStreams.push_back(tables[source]->stream());
+          streamAdded[source] = true;
+        }
+      }
+      cudf::detail::join_streams(batchStreams, stream);
+      outputTables.push_back(cudf::concatenate(tableViews, stream, mr));
+
+      std::vector<CudfVectorPtr> releasedInputs;
+      std::vector<cuda::stream_ref> releasedStreams;
+      for (size_t source = 0; source < tables.size(); ++source) {
+        if (tables[source] && lastViewForSource[source] < end) {
+          releasedStreams.push_back(tables[source]->stream());
+          releasedInputs.push_back(std::move(tables[source]));
+        }
+      }
+      if (!releasedInputs.empty()) {
+        orderCudfVectorDeallocationsAfterStream(
+            releasedInputs, releasedStreams, stream);
+        releasedInputs.clear();
+      }
+
+      size_t retainedInputBatches =
+          std::count_if(tables.begin(), tables.end(), [](const auto& table) {
+            return table != nullptr;
+          });
+      common::testutil::TestValue::adjust(
+          "facebook::velox::cudf_velox::getConcatenatedTableBatched::retainedInputBatchesAfterBatchRelease",
+          &retainedInputBatches);
+      start = end;
+    }
     return outputTables;
   } catch (...) {
     // A failed later batch may leave earlier concatenate kernels in flight.

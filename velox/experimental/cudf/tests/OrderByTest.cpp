@@ -86,6 +86,7 @@ class OrderByTest : public OperatorTestBase {
   void SetUp() override {
     OperatorTestBase::SetUp();
     filesystems::registerLocalFileSystem();
+    cudf_velox::CudfConfig::getInstance().allowCpuFallback = false;
     cudf_velox::registerCudf();
     rng_.seed(123);
     timestampUnit_ = cudf_velox::CudfConfig::getInstance().timestampUnit;

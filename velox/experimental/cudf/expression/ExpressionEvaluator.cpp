@@ -749,6 +749,32 @@ __device__ void velox_round_double(
   std::unique_ptr<cudf::numeric_scalar<double>> factorScalar_;
 };
 
+// A short-decimal result can still have a long-decimal operand. The divide
+// kernels require matching column widths and cannot write a DECIMAL64 result
+// from DECIMAL128 input.
+cudf::data_type decimalDivisionWorkingType(
+    cudf::data_type lhsType,
+    cudf::data_type rhsType,
+    cudf::data_type resultType) {
+  const auto typeId = lhsType.id() == cudf::type_id::DECIMAL128 ||
+          rhsType.id() == cudf::type_id::DECIMAL128 ||
+          resultType.id() == cudf::type_id::DECIMAL128
+      ? cudf::type_id::DECIMAL128
+      : cudf::type_id::DECIMAL64;
+  return cudf::data_type{typeId, resultType.scale()};
+}
+
+std::unique_ptr<cudf::column> finalizeDecimalDivision(
+    std::unique_ptr<cudf::column> result,
+    cudf::data_type resultType,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) {
+  if (result->type() == resultType) {
+    return result;
+  }
+  return cudf::cast(result->view(), resultType, stream, mr);
+}
+
 class BinaryFunction : public CudfFunction {
  public:
   BinaryFunction(
@@ -792,7 +818,9 @@ class BinaryFunction : public CudfFunction {
         auto rhsView = asView(inputColumns[1]);
         std::unique_ptr<cudf::column> lhsCast;
         std::unique_ptr<cudf::column> rhsCast;
-        if (type_.id() == cudf::type_id::DECIMAL128) {
+        const auto workingType =
+            decimalDivisionWorkingType(lhsView.type(), rhsView.type(), type_);
+        if (workingType.id() == cudf::type_id::DECIMAL128) {
           if (lhsView.type().id() == cudf::type_id::DECIMAL64) {
             auto castType = cudf::data_type{
                 cudf::type_id::DECIMAL128, lhsView.type().scale()};
@@ -810,7 +838,9 @@ class BinaryFunction : public CudfFunction {
         auto rhsScale = -rhsView.type().scale();
         auto outScale = -type_.scale();
         auto aRescale = outScale - lhsScale + rhsScale;
-        return decimalDivide(lhsView, rhsView, type_, aRescale, stream, mr);
+        auto result =
+            decimalDivide(lhsView, rhsView, workingType, aRescale, stream, mr);
+        return finalizeDecimalDivision(std::move(result), type_, stream, mr);
       }
       auto lhsView = asView(inputColumns[0]);
       auto rhsView = asView(inputColumns[1]);
@@ -886,11 +916,24 @@ class BinaryFunction : public CudfFunction {
           VELOX_USER_FAIL("Division by zero");
         }
         auto lhsView = asView(inputColumns[0]);
+        const auto workingType =
+            decimalDivisionWorkingType(lhsView.type(), right_->type(), type_);
+        std::unique_ptr<cudf::column> lhsCast;
+        if (lhsView.type().id() != workingType.id()) {
+          lhsCast = cudf::cast(
+              lhsView,
+              cudf::data_type{workingType.id(), lhsView.type().scale()},
+              stream,
+              mr);
+          lhsView = lhsCast->view();
+        }
         auto lhsScale = -lhsView.type().scale();
         auto rhsScale = -right_->type().scale();
         auto outScale = -type_.scale();
         auto aRescale = outScale - lhsScale + rhsScale;
-        return decimalDivide(lhsView, *right_, type_, aRescale, stream, mr);
+        auto result =
+            decimalDivide(lhsView, *right_, workingType, aRescale, stream, mr);
+        return finalizeDecimalDivision(std::move(result), type_, stream, mr);
       }
       auto lhsView = asView(inputColumns[0]);
       if (isComparisonOp(op_) && cudf::is_fixed_point(lhsView.type()) &&
@@ -963,11 +1006,24 @@ class BinaryFunction : public CudfFunction {
     }
     if (op_ == cudf::binary_operator::DIV && cudf::is_fixed_point(type_)) {
       auto rhsView = asView(inputColumns[0]);
+      const auto workingType =
+          decimalDivisionWorkingType(left_->type(), rhsView.type(), type_);
+      std::unique_ptr<cudf::column> rhsCast;
+      if (rhsView.type().id() != workingType.id()) {
+        rhsCast = cudf::cast(
+            rhsView,
+            cudf::data_type{workingType.id(), rhsView.type().scale()},
+            stream,
+            mr);
+        rhsView = rhsCast->view();
+      }
       auto lhsScale = -left_->type().scale();
       auto rhsScale = -rhsView.type().scale();
       auto outScale = -type_.scale();
       auto aRescale = outScale - lhsScale + rhsScale;
-      return decimalDivide(*left_, rhsView, type_, aRescale, stream, mr);
+      auto result =
+          decimalDivide(*left_, rhsView, workingType, aRescale, stream, mr);
+      return finalizeDecimalDivision(std::move(result), type_, stream, mr);
     }
     auto rhsView = asView(inputColumns[0]);
     if (isComparisonOp(op_) && cudf::is_fixed_point(left_->type()) &&
@@ -1254,7 +1310,7 @@ class BetweenFunction : public CudfFunction {
     } else {
       leResultColumn = cudf::binary_operation(
           asView(inputColumns[0]),
-          asView(inputColumns[2]),
+          asView(inputColumns[minLiteral_ ? 1 : 2]),
           cudf::binary_operator::LESS_EQUAL,
           kBoolType,
           stream,
@@ -1364,9 +1420,10 @@ class GreatestLeastFunction : public CudfFunction {
 
 class SwitchFunction : public CudfFunction {
  public:
-  SwitchFunction(const core::TypedExprPtr& expr, memory::MemoryPool* pool) {
-    VELOX_CHECK_GE(expr->inputs().size(), 3);
-    VELOX_CHECK_EQ(expr->inputs().size() % 2, 1);
+  SwitchFunction(const core::TypedExprPtr& expr, memory::MemoryPool* pool)
+      : resultType_(veloxToCudfDataType(expr->type())),
+        hasElseClause_(expr->inputs().size() % 2 == 1) {
+    VELOX_CHECK_GE(expr->inputs().size(), 2);
 
     size_t nextColumn = 0;
     operands_.reserve(expr->inputs().size());
@@ -1407,13 +1464,20 @@ class SwitchFunction : public CudfFunction {
       return cudf::copy_if_else(view(left), view(right), condition, stream, mr);
     };
 
+    Operand implicitElse;
+    if (!hasElseClause_) {
+      implicitElse.scalar =
+          cudf::make_default_constructed_scalar(resultType_, stream, mr);
+    }
+    const auto& fallback = hasElseClause_ ? operands_.back() : implicitElse;
+
     std::unique_ptr<cudf::column> result;
-    const auto branchCount = (operands_.size() - 1) / 2;
+    const auto branchCount = operands_.size() / 2;
     for (size_t branch = branchCount; branch-- > 0;) {
       const auto condition = view(operands_[2 * branch]);
       const auto& value = operands_[2 * branch + 1];
       if (!result) {
-        result = select(value, operands_.back(), condition);
+        result = select(value, fallback, condition);
       } else if (value.scalar) {
         result = cudf::copy_if_else(
             *value.scalar, result->view(), condition, stream, mr);
@@ -1431,6 +1495,8 @@ class SwitchFunction : public CudfFunction {
     std::unique_ptr<cudf::scalar> scalar;
   };
 
+  const cudf::data_type resultType_;
+  const bool hasElseClause_;
   std::vector<Operand> operands_;
 };
 
@@ -1660,6 +1726,80 @@ class UpperFunction : public CudfFunction {
     auto inputCol = asView(inputColumns[0]);
     return cudf::strings::to_upper(inputCol, stream, mr);
   }
+};
+
+// replace(target_str, search_str[, replacement_str]): replaces every
+// occurrence of search_str in target_str with replacement_str. With only
+// search_str it removes search_str (i.e. an empty replacement). Backed by
+// cudf::strings::replace with a maxrepl of -1 so all occurrences are replaced.
+// Only a constant, non-empty search_str and constant replacement_str are
+// allowed.
+class ReplaceFunction : public CudfFunction {
+ public:
+  ReplaceFunction(const core::TypedExprPtr& expr, memory::MemoryPool* pool) {
+    VELOX_CHECK(
+        expr->inputs().size() == 2 || expr->inputs().size() == 3,
+        "replace expects 2 or 3 inputs");
+
+    // Search is a constant per the registered signatures; read it once here.
+    // canEvaluate declines an empty search, so enforce that invariant here too
+    // rather than let it surface as a raw cudf error deeper in eval.
+    auto searchValue = toConstantVector(expr->inputs()[1], pool);
+    searchIsNull_ = searchValue->isNullAt(0);
+    if (!searchIsNull_) {
+      search_ = searchValue->toString(0);
+      VELOX_CHECK(!search_.empty(), "replace search must not be empty");
+    }
+
+    // The 3-argument form carries a constant replacement; the 2-argument form
+    // removes the search, which is an empty, non-null replacement.
+    if (expr->inputs().size() == 3) {
+      auto replacementValue = toConstantVector(expr->inputs()[2], pool);
+      replacementIsNull_ = replacementValue->isNullAt(0);
+      if (!replacementIsNull_) {
+        replacement_ = replacementValue->toString(0);
+      }
+    }
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      cuda::stream_ref stream,
+      rmm::device_async_resource_ref mr) const override {
+    VELOX_CHECK(
+        !inputColumns.empty(),
+        "replace requires at least one non-literal input column");
+    // inputColumns holds only non-literal children, so the string column is the
+    // first (and only) entry and determines the output row count.
+    auto inputCol = asView(inputColumns[0]);
+
+    // replace(x, NULL, y) and replace(x, s, NULL) are NULL for every row.
+    // Match Velox null propagation by producing an all-null varchar column.
+    if (searchIsNull_ || replacementIsNull_) {
+      cudf::string_scalar nullString("", false, stream, mr);
+      return cudf::make_column_from_scalar(
+          nullString, inputCol.size(), stream, mr);
+    }
+
+    const cudf::strings_column_view stringsView(inputCol);
+    cudf::string_scalar searchScalar(search_, true, stream, mr);
+    cudf::string_scalar replacementScalar(replacement_, true, stream, mr);
+    // maxrepl == -1 replaces all occurrences. Nulls in the input column
+    // propagate to a null result.
+    return cudf::strings::replace(
+        stringsView, searchScalar, replacementScalar, -1, stream, mr);
+  }
+
+ private:
+  // Constant search value, valid only when searchIsNull_ is false.
+  std::string search_;
+  // Constant replacement value; empty for the 2-argument form, valid only when
+  // replacementIsNull_ is false.
+  std::string replacement_;
+  // Set when the constant search argument is null.
+  bool searchIsNull_{false};
+  // Set when the constant replacement argument is null.
+  bool replacementIsNull_{false};
 };
 
 class LikeFunction : public CudfFunction {
@@ -2769,6 +2909,34 @@ bool registerBuiltinFunctions(const std::string& prefix) {
            .build()});
 
   registerCudfFunction(
+      prefix + "replace",
+      [](const std::string&,
+         const core::TypedExprPtr& expr,
+         memory::MemoryPool* pool) {
+        return std::make_shared<ReplaceFunction>(expr, pool);
+      },
+      {FunctionSignatureBuilder()
+           .returnType("varchar")
+           .argumentType("varchar")
+           .constantArgumentType("varchar")
+           .constantArgumentType("varchar")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("varchar")
+           .argumentType("varchar")
+           .constantArgumentType("varchar")
+           .build()},
+      /*overwrite=*/true,
+      /*canEvaluate=*/
+      [](const core::TypedExprPtr& expr) {
+        // Decline an empty constant search_str: the expected semantics insert
+        // the replacement_str around every character, i.e. replace('abc', '',
+        // 'X') → 'XaXbXcX', which cudf::strings::replace does not implement.
+        auto search = constantVarcharValue(expr->inputs()[1]);
+        return !(search.has_value() && search->empty());
+      });
+
+  registerCudfFunction(
       prefix + "like",
       [](const std::string&,
          const core::TypedExprPtr& expr,
@@ -2839,29 +3007,36 @@ bool registerBuiltinFunctions(const std::string& prefix) {
            .variableArity("varchar")
            .build()});
 
-  // No prefix because switch and if are special form
+  // No prefix because switch and if are special forms. Forms without an
+  // explicit ELSE need a scalar for the implicit null fallback.
+  auto switchFactory = [](const std::string&,
+                          const core::TypedExprPtr& expr,
+                          memory::MemoryPool* pool) {
+    return std::make_shared<SwitchFunction>(expr, pool);
+  };
   registerCudfFunctions(
       {"switch", "if"},
-      [](const std::string&,
-         const core::TypedExprPtr& expr,
-         memory::MemoryPool* pool) {
-        return std::make_shared<SwitchFunction>(expr, pool);
-      },
+      switchFactory,
       {},
-      true,
+      /*overwrite=*/true,
       [](const core::TypedExprPtr& expr) {
         const auto& inputs = expr->inputs();
-        if (inputs.size() < 3 || inputs.size() % 2 == 0) {
+        if (inputs.size() < 2) {
           return false;
         }
-        for (size_t i = 0; i + 1 < inputs.size(); i += 2) {
+        const bool hasElseClause = inputs.size() % 2 == 1;
+        const auto branchInputCount = hasElseClause ? inputs.size() - 1
+                                                    : inputs.size();
+        for (size_t i = 0; i < branchInputCount; i += 2) {
           if (inputs[i]->type()->kind() != TypeKind::BOOLEAN ||
               inputs[i]->isConstantKind() ||
               !inputs[i + 1]->type()->equivalent(*expr->type())) {
             return false;
           }
         }
-        return inputs.back()->type()->equivalent(*expr->type());
+        return (hasElseClause &&
+                inputs.back()->type()->equivalent(*expr->type())) ||
+            (!hasElseClause && canMakeCudfDefaultScalar(expr->type()));
       });
 
   registerCudfFunctions(
