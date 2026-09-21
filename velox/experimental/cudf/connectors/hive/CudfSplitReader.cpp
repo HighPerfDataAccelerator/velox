@@ -352,6 +352,12 @@ std::unique_ptr<cudf::table> castDecimalColumnsToVeloxTypes(
     size_t numPrependedColumns,
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) {
+  // cuDF interprets an empty column projection as "read all columns". Keep
+  // those columns unchanged so the data source can preserve the row count and
+  // prune the physical columns before producing the zero-column output.
+  if (columnTypes.empty()) {
+    return std::move(table);
+  }
   VELOX_CHECK_EQ(
       numPrependedColumns + columnTypes.size(),
       table->view().num_columns(),

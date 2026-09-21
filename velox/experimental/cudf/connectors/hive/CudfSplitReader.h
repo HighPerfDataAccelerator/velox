@@ -53,8 +53,10 @@ using CudfHybridScanReader =
 using CudfHybridScanReaderPtr = std::unique_ptr<CudfHybridScanReader>;
 
 /// Normalizes decimal columns, recursively, to their logical Velox types.
-/// columnTypes must describe every column after numPrependedColumns, which
-/// are left unchanged. Casts and buffer releases use the supplied stream.
+/// When columnTypes is non-empty, it must describe every column after
+/// numPrependedColumns, which are left unchanged. An empty columnTypes span
+/// leaves cuDF's all-columns result unchanged for a zero-column projection.
+/// Casts and buffer releases use the supplied stream.
 std::unique_ptr<cudf::table> castDecimalColumnsToVeloxTypes(
     std::unique_ptr<cudf::table>&& table,
     std::span<const TypePtr> columnTypes,
