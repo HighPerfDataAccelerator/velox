@@ -2253,7 +2253,8 @@ RowVectorPtr CudfHashJoinProbe::rightSemiProjectOutput(
     }
 
     std::vector<std::unique_ptr<cudf::column>> outputCols(outputType_->size());
-    auto rightInput = rightTableView.select(outputLayout_.buildColumnIndices);
+    auto rightInput =
+        rightTableView.select(outputLayout_.buildColumnIndices());
     std::vector<std::unique_ptr<cudf::column>> rightCols;
     rightCols.reserve(rightInput.num_columns());
     for (cudf::size_type j = 0; j < rightInput.num_columns(); ++j) {
@@ -2261,7 +2262,7 @@ RowVectorPtr CudfHashJoinProbe::rightSemiProjectOutput(
           std::make_unique<cudf::column>(
               rightInput.column(j), stream, get_output_mr()));
     }
-    outputLayout_.scatterBuildColumns(outputCols, rightCols);
+    outputLayout_.scatterGatheredBuildColumns(outputCols, rightCols);
 
     std::unique_ptr<cudf::column> matchColumn;
     if (joinNode_->isNullAware() && probeSideHasRows_) {
