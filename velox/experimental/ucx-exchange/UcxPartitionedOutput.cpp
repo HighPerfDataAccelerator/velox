@@ -370,8 +370,7 @@ void UcxPartitionedOutput::preparePendingFlush() {
     }
 
     cudf::detail::join_streams(inputStreams, stream);
-    activeMergedTable_ = cudf::concatenate(
-        views, stream, cudf::get_current_device_resource_ref());
+    activeMergedTable_ = cudf::concatenate(views, stream, get_temp_mr());
     orderCudfVectorDeallocationsAfterStream(
         activeInputs_, inputStreams, stream);
     // The concatenated table is now the source owner. Releasing the input
@@ -642,7 +641,7 @@ void UcxPartitionedOutput::advanceActiveFlush() {
     // libcudf partition requires STRUCT children to align with their sliced
     // parent. Materialize this bounded window to normalize nested offsets.
     materializedPartitionInput = std::make_unique<cudf::table>(
-        partitionInput, stream, cudf::get_current_device_resource_ref());
+        partitionInput, stream, get_temp_mr());
     partitionInput = materializedPartitionInput->view();
   }
 
@@ -1052,7 +1051,8 @@ void UcxPartitionedOutput::hashPartition(
             numPartitions_,
             cudf::hash_id::HASH_MURMUR3,
             cudf::DEFAULT_HASH_SEED,
-            stream);
+            stream,
+            get_temp_mr());
         VELOX_CHECK_EQ(partitionOffsets.size(), numPartitions_ + 1);
         VELOX_CHECK_EQ(partitionOffsets.front(), 0);
         partitionOffsets.erase(partitionOffsets.begin());
@@ -1087,7 +1087,8 @@ void UcxPartitionedOutput::hashPartition(
             numPartitions_,
             cudf::hash_id::HASH_MURMUR3,
             cudf::DEFAULT_HASH_SEED,
-            stream);
+            stream,
+            get_temp_mr());
         VELOX_CHECK_EQ(partitionOffsets.size(), numPartitions_ + 1);
         VELOX_CHECK_EQ(partitionOffsets.front(), 0);
         chunks.push_back(
@@ -1118,9 +1119,7 @@ void UcxPartitionedOutput::hashPartition(
           destinationView = destinationViews.front();
         } else {
           combinedOwner = cudf::concatenate(
-              destinationViews,
-              stream,
-              cudf::get_current_device_resource_ref());
+              destinationViews, stream, get_temp_mr());
           destinationView = combinedOwner->view();
         }
 
@@ -1138,8 +1137,7 @@ void UcxPartitionedOutput::hashPartition(
               destinationView.num_rows(), begin + rowsPerMessage);
           auto slices = cudf::slice(destinationView, {begin, end}, stream);
           VELOX_CHECK_EQ(slices.size(), 1);
-          auto packed = cudf::pack(
-              slices[0], stream, cudf::get_current_device_resource_ref());
+          auto packed = cudf::pack(slices[0], stream, get_output_mr());
           packedPartitions.push_back(
               {slices[0].num_rows(),
                std::make_unique<cudf::packed_columns>(
@@ -1204,7 +1202,7 @@ void UcxPartitionedOutput::rangePartition(
         boundaryVector,
         pool(),
         stream,
-        cudf::get_current_device_resource_ref());
+        get_output_mr());
     VELOX_CHECK_LT(
         rangeBoundaries_->num_rows(),
         numPartitions_,
@@ -1223,7 +1221,7 @@ void UcxPartitionedOutput::rangePartition(
       rangeOrders_,
       rangeNullOrders_,
       stream,
-      cudf::get_current_device_resource_ref());
+      get_temp_mr());
   VELOX_CHECK(
       partitionIds->size() == tableView.num_rows(),
       "RANGE_PID must produce exactly one id per input row");
@@ -1238,7 +1236,7 @@ void UcxPartitionedOutput::rangePartition(
       partitionIds->view(),
       numPartitions_,
       stream,
-      cudf::get_current_device_resource_ref());
+      get_temp_mr());
   normalizePartitionOffsets(partitionOffsets, numPartitions_);
   splitAndEnqueue(partitionedTable->view(), partitionOffsets, stream);
 }
@@ -1306,7 +1304,8 @@ void UcxPartitionedOutput::splitAndEnqueue(
              static_cast<cudf::size_type>(end)},
             stream);
         VELOX_CHECK_EQ(slicedTables.size(), 1);
-        auto packedCols = cudf::pack(slicedTables[0], stream);
+        auto packedCols =
+            cudf::pack(slicedTables[0], stream, get_output_mr());
         stream.sync();
         auto packedColsPtr = std::make_unique<cudf::packed_columns>(
             std::move(packedCols.metadata), std::move(packedCols.gpu_data));
