@@ -55,6 +55,7 @@ velox_resolve_dependency_url(kvikio)
 
 # cudf commit 456580f from 2026-09-11 (release/26.10 branch)
 set(VELOX_cudf_VERSION 26.10 CACHE STRING "cudf version")
+# Native CI selects the prebuilt dependency image using this full cuDF commit.
 set(VELOX_cudf_COMMIT 456580fcdd726380dcb3de6b9686e7d47d6dd0a2)
 set(
   VELOX_cudf_BUILD_SHA256_CHECKSUM
