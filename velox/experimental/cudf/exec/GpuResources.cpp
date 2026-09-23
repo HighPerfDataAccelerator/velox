@@ -37,6 +37,7 @@
 
 #include <common/base/Exceptions.h>
 #include <dlfcn.h>
+#include <folly/Indestructible.h>
 #include <glog/logging.h>
 #include <unistd.h>
 
@@ -553,6 +554,11 @@ class SharedStreamPool final : public cudf::detail::cuda_stream_pool {
   std::mutex mutex_;
 };
 
+struct SharedStreamPoolRegistry {
+  std::mutex mutex;
+  std::unordered_map<int, std::unique_ptr<SharedStreamPool>> pools;
+};
+
 } // namespace
 
 cudf::detail::cuda_stream_pool& cudfGlobalStreamPool() {
@@ -561,14 +567,12 @@ cudf::detail::cuda_stream_pool& cudfGlobalStreamPool() {
       static_cast<int>(cudaGetDevice(&device)),
       static_cast<int>(cudaSuccess),
       "Failed to get current CUDA device for the shared stream pool");
-  static std::mutex mutex;
   // Readers retain streams across worker threads and query lifetimes. Keep the
   // pools alive through process exit, without CUDA calls during static
   // teardown.
-  static auto* pools =
-      new std::unordered_map<int, std::unique_ptr<SharedStreamPool>>;
-  std::lock_guard<std::mutex> lock(mutex);
-  auto& pool = (*pools)[device];
+  static folly::Indestructible<SharedStreamPoolRegistry> registry;
+  std::lock_guard<std::mutex> lock(registry->mutex);
+  auto& pool = registry->pools[device];
   if (!pool) {
     pool = std::make_unique<SharedStreamPool>();
   }

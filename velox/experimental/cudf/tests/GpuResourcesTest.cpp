@@ -20,6 +20,7 @@
 
 #include <cuda_runtime_api.h>
 
+#include <folly/ScopeGuard.h>
 #include <gtest/gtest.h>
 
 #include <future>
@@ -51,6 +52,15 @@ TEST(GpuResourcesTest, boundedNonBlockingPool) {
   for (size_t i = 32; i < streams.size(); ++i) {
     EXPECT_EQ(streams[i].get(), streams[i - 32].get());
   }
+  std::vector<cuda::stream_ref> directStreams;
+  directStreams.reserve(65);
+  for (size_t i = 0; i < 65; ++i) {
+    directStreams.emplace_back(pool.get_stream());
+  }
+  EXPECT_EQ(handles(directStreams), unique);
+  for (size_t i = 32; i < directStreams.size(); ++i) {
+    EXPECT_EQ(directStreams[i].get(), directStreams[i - 32].get());
+  }
 }
 
 TEST(GpuResourcesTest, concurrentBatchesAndThreadExit) {
@@ -61,20 +71,27 @@ TEST(GpuResourcesTest, concurrentBatchesAndThreadExit) {
   std::promise<void> start;
   auto ready = start.get_future().share();
   std::vector<std::future<cudaStream_t>> workers;
-  for (int i = 0; i < 16; ++i) {
-    workers.push_back(std::async(std::launch::async, [&, ready] {
-      EXPECT_EQ(cudaSetDevice(device), cudaSuccess);
-      ready.wait();
-      auto& shared = cudfGlobalStreamPool();
-      EXPECT_EQ(&shared, pool);
-      for (int j = 0; j < 100; ++j) {
-        EXPECT_EQ(handles(shared.get_streams(32)), expected);
-        EXPECT_EQ(expected.count(shared.get_stream().get()), 1);
-      }
-      return shared.get_stream().get();
-    }));
+  constexpr int kNumWorkers = 16;
+  workers.reserve(kNumWorkers);
+  {
+    // Release waiting workers before destroying their futures if launch throws.
+    SCOPE_EXIT {
+      start.set_value();
+    };
+    for (int i = 0; i < kNumWorkers; ++i) {
+      workers.push_back(std::async(std::launch::async, [&, ready] {
+        EXPECT_EQ(cudaSetDevice(device), cudaSuccess);
+        ready.wait();
+        auto& shared = cudfGlobalStreamPool();
+        EXPECT_EQ(&shared, pool);
+        for (int j = 0; j < 100; ++j) {
+          EXPECT_EQ(handles(shared.get_streams(32)), expected);
+          EXPECT_EQ(expected.count(shared.get_stream().get()), 1);
+        }
+        return shared.get_stream().get();
+      }));
+    }
   }
-  start.set_value();
   for (auto& worker : workers) {
     const auto retained = worker.get();
     // The worker has exited, but its stream must still support GPU work.
@@ -102,16 +119,20 @@ TEST(GpuResourcesTest, deviceIsolation) {
   ASSERT_EQ(cudaGetDevice(&original), cudaSuccess);
   auto* first = &cudfGlobalStreamPool();
   const auto firstStreams = handles(first->get_streams(32));
-  ASSERT_EQ(cudaSetDevice((original + 1) % count), cudaSuccess);
-  auto* second = &cudfGlobalStreamPool();
-  EXPECT_NE(first, second);
-  for (auto stream : second->get_streams(32)) {
-    EXPECT_EQ(firstStreams.count(stream.get()), 0);
-    int device;
-    EXPECT_EQ(cudaStreamGetDevice(stream.get(), &device), cudaSuccess);
-    EXPECT_EQ(device, (original + 1) % count);
+  const int secondDevice = (original + 1) % count;
+  {
+    SCOPE_EXIT {
+      EXPECT_EQ(cudaSetDevice(original), cudaSuccess);
+    };
+    ASSERT_EQ(cudaSetDevice(secondDevice), cudaSuccess);
+    auto* second = &cudfGlobalStreamPool();
+    EXPECT_NE(first, second);
+    for (auto stream : second->get_streams(32)) {
+      int device;
+      ASSERT_EQ(cudaStreamGetDevice(stream.get(), &device), cudaSuccess);
+      EXPECT_EQ(device, secondDevice);
+    }
   }
-  ASSERT_EQ(cudaSetDevice(original), cudaSuccess);
   EXPECT_EQ(&cudfGlobalStreamPool(), first);
   EXPECT_EQ(handles(first->get_streams(32)), firstStreams);
 }
