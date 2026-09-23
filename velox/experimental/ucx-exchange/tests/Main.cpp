@@ -15,9 +15,9 @@
  */
 #include "velox/common/process/ThreadDebugInfo.h"
 #include "velox/experimental/cudf/CudfConfig.h"
+#include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/ucx-exchange/Communicator.h"
 #include "velox/type/Type.h"
-#include "velox/experimental/cudf/exec/GpuResources.h"
 
 #include <cudf/utilities/error.hpp>
 #include <folly/Unit.h>

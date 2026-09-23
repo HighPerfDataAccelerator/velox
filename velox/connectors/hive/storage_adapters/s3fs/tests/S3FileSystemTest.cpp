@@ -268,8 +268,7 @@ TEST_F(S3FileSystemTest, writeFileAndRead) {
   const auto filename = localPath(bucketName) + "/" + file;
   const auto s3File = s3URI(bucketName, file);
 
-  auto s3Config =
-      siloServer_->s3Config({{"s3.multipart-upload-threads", "4"}});
+  auto s3Config = siloServer_->s3Config({{"s3.multipart-upload-threads", "4"}});
   filesystems::S3FileSystem s3fs(bucketName, s3Config);
   auto pool = memory::memoryManager()->addLeafPool("S3FileSystemTest");
   auto writeFile =

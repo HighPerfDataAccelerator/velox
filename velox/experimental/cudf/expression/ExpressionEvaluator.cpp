@@ -3025,8 +3025,8 @@ bool registerBuiltinFunctions(const std::string& prefix) {
           return false;
         }
         const bool hasElseClause = inputs.size() % 2 == 1;
-        const auto branchInputCount = hasElseClause ? inputs.size() - 1
-                                                    : inputs.size();
+        const auto branchInputCount =
+            hasElseClause ? inputs.size() - 1 : inputs.size();
         for (size_t i = 0; i < branchInputCount; i += 2) {
           if (inputs[i]->type()->kind() != TypeKind::BOOLEAN ||
               inputs[i]->isConstantKind() ||

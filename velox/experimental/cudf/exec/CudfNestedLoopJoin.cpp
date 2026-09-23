@@ -204,8 +204,7 @@ void CudfNestedLoopJoinBuild::recordInputStats(const CudfVector& input) {
   bufferedBuildBytes_ += inputBytes;
 }
 
-void CudfNestedLoopJoinBuild::transferInputAccountingTo(
-    CudfJoinBuild& target) {
+void CudfNestedLoopJoinBuild::transferInputAccountingTo(CudfJoinBuild& target) {
   auto* nestedTarget = dynamic_cast<CudfNestedLoopJoinBuild*>(&target);
   VELOX_CHECK_NOT_NULL(nestedTarget);
   if (!nestedTarget->buildBridge_) {

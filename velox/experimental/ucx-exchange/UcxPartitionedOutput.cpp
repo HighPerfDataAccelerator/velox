@@ -37,8 +37,8 @@
 #include <cudf/detail/utilities/stream_pool.hpp>
 #include <cudf/filling.hpp>
 #include <cudf/partitioning.hpp>
-#include <cudf/search.hpp>
 #include <cudf/scalar/scalar.hpp>
+#include <cudf/search.hpp>
 #include <cudf/stream_compaction.hpp>
 #include <cudf/unary.hpp>
 #include <cudf/utilities/memory_resource.hpp>
@@ -640,8 +640,8 @@ void UcxPartitionedOutput::advanceActiveFlush() {
   if (numPartitions_ > 1 && containsStructColumn(partitionInput)) {
     // libcudf partition requires STRUCT children to align with their sliced
     // parent. Materialize this bounded window to normalize nested offsets.
-    materializedPartitionInput = std::make_unique<cudf::table>(
-        partitionInput, stream, get_temp_mr());
+    materializedPartitionInput =
+        std::make_unique<cudf::table>(partitionInput, stream, get_temp_mr());
     partitionInput = materializedPartitionInput->view();
   }
 
@@ -650,8 +650,7 @@ void UcxPartitionedOutput::advanceActiveFlush() {
       VELOX_CHECK(
           hasColumns && !partitionKeyIndices_.empty(),
           "Replicate-nulls-and-any requires a column-bearing partition key");
-      replicateNullsAndAnyThenPartition(
-          partitionInput, rowsThisWindow, stream);
+      replicateNullsAndAnyThenPartition(partitionInput, rowsThisWindow, stream);
     } else if (!rangeBoundsJson_.empty()) {
       rangePartition(partitionInput, stream);
     } else {
@@ -1118,8 +1117,8 @@ void UcxPartitionedOutput::hashPartition(
         if (destinationViews.size() == 1) {
           destinationView = destinationViews.front();
         } else {
-          combinedOwner = cudf::concatenate(
-              destinationViews, stream, get_temp_mr());
+          combinedOwner =
+              cudf::concatenate(destinationViews, stream, get_temp_mr());
           destinationView = combinedOwner->view();
         }
 
@@ -1199,10 +1198,7 @@ void UcxPartitionedOutput::rangePartition(
         rangeOrders_,
         rangeNullOrders_);
     rangeBoundaries_ = cudf_velox::with_arrow::toCudfTable(
-        boundaryVector,
-        pool(),
-        stream,
-        get_output_mr());
+        boundaryVector, pool(), stream, get_output_mr());
     VELOX_CHECK_LT(
         rangeBoundaries_->num_rows(),
         numPartitions_,
@@ -1232,11 +1228,7 @@ void UcxPartitionedOutput::rangePartition(
   // libcudf::partition groups by the explicit INT32 map. No hash function is
   // involved; the returned table is routed directly to destination queues.
   auto [partitionedTable, partitionOffsets] = cudf::partition(
-      tableView,
-      partitionIds->view(),
-      numPartitions_,
-      stream,
-      get_temp_mr());
+      tableView, partitionIds->view(), numPartitions_, stream, get_temp_mr());
   normalizePartitionOffsets(partitionOffsets, numPartitions_);
   splitAndEnqueue(partitionedTable->view(), partitionOffsets, stream);
 }
@@ -1304,8 +1296,7 @@ void UcxPartitionedOutput::splitAndEnqueue(
              static_cast<cudf::size_type>(end)},
             stream);
         VELOX_CHECK_EQ(slicedTables.size(), 1);
-        auto packedCols =
-            cudf::pack(slicedTables[0], stream, get_output_mr());
+        auto packedCols = cudf::pack(slicedTables[0], stream, get_output_mr());
         stream.sync();
         auto packedColsPtr = std::make_unique<cudf::packed_columns>(
             std::move(packedCols.metadata), std::move(packedCols.gpu_data));
