@@ -44,6 +44,7 @@ velox_add_library(
   ExchangeQueue.cpp
   ExchangeSink.cpp
   ExchangeSource.cpp
+  ExchangeTransportRegistry.cpp
   FileExchangeFormat.cpp
   FileExchangeSink.cpp
   FileExchangeSource.cpp
@@ -153,9 +154,11 @@ velox_add_library(
   Exchange.h
   ExchangeClient.h
   InMemoryExchangeClient.h
+  ExchangeFactory.h
   ExchangeQueue.h
   ExchangeSink.h
   ExchangeSource.h
+  ExchangeTransportRegistry.h
   Expand.h
   FileExchangeFormat.h
   FileExchangeSink.h

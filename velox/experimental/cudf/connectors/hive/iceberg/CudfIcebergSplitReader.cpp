@@ -29,6 +29,7 @@
 #include "velox/connectors/hive/FileSplitReader.h"
 #include "velox/connectors/hive/iceberg/IcebergMetadataColumns.h"
 #include "velox/dwio/common/BufferUtil.h"
+#include "velox/functions/lib/string/StringImpl.h"
 #include "velox/type/Type.h"
 
 #include <cudf/column/column_factories.hpp>
@@ -96,7 +97,6 @@ CudfIcebergSplitReader::CudfIcebergSplitReader(
     const std::shared_ptr<const velox_hive::HiveConfig>& hiveConfig,
     const std::shared_ptr<io::IoStatistics>& ioStatistics,
     const std::shared_ptr<IoStats>& ioStats,
-    bool useExperimentalCudfReader,
     const cudf::ast::expression* subfieldFilterAst,
     const common::SubfieldFilters* subfieldFilters)
     : CudfSplitReader(
@@ -110,7 +110,6 @@ CudfIcebergSplitReader::CudfIcebergSplitReader(
           cudfHiveConfig,
           ioStatistics,
           ioStats,
-          useExperimentalCudfReader,
           subfieldFilterAst),
       icebergSplit_(std::move(icebergSplit)),
       hiveConfig_(hiveConfig),
@@ -139,16 +138,12 @@ void CudfIcebergSplitReader::resetSplit() {
   deleteBitmap_ = nullptr;
   deviceBitmap_.reset();
   deleteMask_.reset();
+  // Call base `resetSplit()` function
+  CudfSplitReader::resetSplit();
 }
 
 bool CudfIcebergSplitReader::isSplitSkipped() const {
   return skipSplit_;
-}
-
-void CudfIcebergSplitReader::setupReader() {
-  if (not noColumnsToRead_) {
-    CudfSplitReader::setupReader();
-  }
 }
 
 cudf::ast::expression const* CudfIcebergSplitReader::pushdownFilter() const {
@@ -195,6 +190,9 @@ void CudfIcebergSplitReader::prepareSplitInternal(
     dwio::common::RuntimeStats& runtimeStats) {
   fallbackSplits_.clear();
   runtimeStats_ = &runtimeStats;
+  // Base `prepareSplit` already called `resetSplit()` through virtual
+  // dispatch, which for this class clears both the iceberg-specific state
+  // and the base reader state.
 
   // Reset delete readers and column injection.
   resetSplit();
@@ -325,7 +323,9 @@ void CudfIcebergSplitReader::prepareCurrentSplit(
            "columns or unavailable split-specific decimal types.";
   }
 
-  setupReader();
+  if (not noColumnsToRead_) {
+    createCudfReader();
+  }
 }
 
 bool CudfIcebergSplitReader::prepareNextFallbackSplit() {
@@ -954,7 +954,12 @@ void CudfIcebergSplitReader::cacheSchemaFromMetadata() {
           childIdx,
           fileMeta.schema.size(),
           "Parquet schema child index out of range");
-      fileColumnNames_.insert(fileMeta.schema[childIdx].name);
+      const auto& name = fileMeta.schema[childIdx].name;
+      fileColumnNames_.insert(
+          caseInsensitiveColumnNames_
+              ? ::facebook::velox::functions::stringImpl::utf8StrToLowerCopy(
+                    name)
+              : name);
     }
   }
 }

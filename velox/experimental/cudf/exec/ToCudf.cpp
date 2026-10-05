@@ -19,6 +19,7 @@
 #include "velox/experimental/cudf/exec/CudfHashJoin.h"
 #include "velox/experimental/cudf/exec/CudfNestedLoopJoin.h"
 #include "velox/experimental/cudf/exec/CudfOperator.h"
+#include "velox/experimental/cudf/exec/GpuCapabilities.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/OperatorAdapters.h"
 #include "velox/experimental/cudf/exec/PrestoAggregateFunctions.h"
@@ -33,6 +34,7 @@
 #include "velox/experimental/ucx-exchange/UcxPartitionedOutput.h"
 
 #include "folly/Conv.h"
+#include "velox/common/base/Exceptions.h"
 #include "velox/core/PlanNode.h"
 #include "velox/exec/Driver.h"
 #include "velox/exec/HashBuild.h"
@@ -509,26 +511,38 @@ void registerCudf() {
   VELOX_CHECK_GE(contextDevice, 0, "Failed to get current CUDA device ordinal");
   setCudfContextDevice(contextDevice);
 
+  // Read the device before anything derives a default from it. The context
+  // exists by this point, and every memory-related default below is a size that
+  // only means something relative to the device it will live on.
+  initializeGpuCapabilities(contextDevice);
+
   const std::string mrMode = CudfConfig::getInstance().memoryResource;
-  auto mr = cudf_velox::createMemoryResource(
+  auto base = cudf_velox::createMemoryResource(
       mrMode, CudfConfig::getInstance().memoryPercent);
+  // Keep an always-on counter underneath the optional detailed diagnostics so
+  // cudfAllocatedBytes() remains available in both modes.
+  statsMr_.emplace(std::move(base));
+  auto tracked = cuda::mr::any_resource<cuda::mr::device_accessible>{
+      statsMr_.value()};
   if (deviceMemoryDiagnosticsEnabled()) {
-    mr_ = wrapDeviceMemoryResourceForDiagnostics(std::move(mr), false);
+    mr_ = wrapDeviceMemoryResourceForDiagnostics(std::move(tracked), false);
     LOG(INFO) << "Enabled cuDF RMM statistics for device-memory diagnostics";
   } else {
-    mr_ = std::move(mr);
+    mr_ = std::move(tracked);
   }
   cudf::set_current_device_resource(mr_.value());
 
   const auto& outputMrMode = CudfConfig::getInstance().outputMemoryResource;
   if (!outputMrMode.empty() && outputMrMode != mrMode) {
-    auto outputMr = cudf_velox::createMemoryResource(
-        outputMrMode, CudfConfig::getInstance().memoryPercent);
+    outputStatsMr_.emplace(cudf_velox::createMemoryResource(
+        outputMrMode, CudfConfig::getInstance().memoryPercent));
+    auto outputTracked = cuda::mr::any_resource<cuda::mr::device_accessible>{
+        outputStatsMr_.value()};
     if (deviceMemoryDiagnosticsEnabled()) {
-      output_mr_ =
-          wrapDeviceMemoryResourceForDiagnostics(std::move(outputMr), true);
+      output_mr_ = wrapDeviceMemoryResourceForDiagnostics(
+          std::move(outputTracked), true);
     } else {
-      output_mr_ = std::move(outputMr);
+      output_mr_ = std::move(outputTracked);
     }
   } else {
     output_mr_ = mr_;
@@ -577,10 +591,13 @@ void registerCudf() {
 void unregisterCudf() {
   exec::OutputTransportRegistry::global().erase(
       std::string{core::TransportKind::kUcx});
+  // Release outer resource wrappers before the adaptors they reference.
   output_mr_.reset();
   mr_.reset();
   output_statistics_mr_.reset();
   statistics_mr_.reset();
+  outputStatsMr_.reset();
+  statsMr_.reset();
   clearAsyncMemoryPoolHandles();
   // Undo registerCudf()'s operator adapter registration.
   OperatorAdapterRegistry::getInstance().clear();
@@ -619,8 +636,22 @@ void CudfConfig::initialize(
     outputMemoryResource = config[kCudfOutputMr];
   }
   if (config.find(kCudfBatchSizeMinThreshold) != config.end()) {
-    batchSizeMinThreshold =
+    const auto targetRows =
         folly::to<int32_t>(config[kCudfBatchSizeMinThreshold]);
+    VELOX_USER_CHECK_GT(
+        targetRows, 0, "cuDF BatchConcat minimum row target must be positive");
+    batchSizeMinThreshold = targetRows;
+  }
+  if (config.find(kCudfBatchSizeMinBytes) != config.end()) {
+    // tryTo so that a negative or malformed value is a user error, not a
+    // folly::ConversionError.
+    const auto& value = config[kCudfBatchSizeMinBytes];
+    const auto targetBytes = folly::tryTo<uint64_t>(value);
+    VELOX_USER_CHECK(
+        targetBytes.hasValue() && targetBytes.value() > 0,
+        "cuDF BatchConcat minimum byte target must be a positive integer: {}",
+        value);
+    batchSizeMinBytes = targetBytes.value();
   }
   if (config.find(kCudfBatchSizeMinThresholdBytes) != config.end()) {
     batchSizeMinThresholdBytes =

@@ -141,12 +141,64 @@ TEST_F(TableScanTest, allColumns) {
   ASSERT_TRUE(it->second.dynamicFilterStats.empty());
 }
 
+// Test scalar filter pushdown with data chosen to exercise SIMD bulk paths.
+TEST_F(TableScanTest, filterScalarTypes) {
+  constexpr vector_size_t kSize = 60'000;
+
+  // Use distinct BIGINT, INTEGER and SMALLINT values to select direct encoding
+  // and exercise their SIMD bulk paths when SIMD is enabled. REAL and DOUBLE
+  // also support SIMD bulk filtering. Repeated VARCHAR values target the
+  // dictionary path, which uses SIMD on indices and cached filter results.
+  auto rowVector = makeRowVector(
+      {makeFlatVector<int64_t>(kSize, [](vector_size_t row) { return row; }),
+       makeFlatVector<int32_t>(kSize, [](vector_size_t row) { return row; }),
+       makeFlatVector<int16_t>(
+           kSize, [](vector_size_t row) { return row - 30'000; }),
+       makeFlatVector<float>(
+           kSize, [](vector_size_t row) { return row + 0.5; }),
+       makeFlatVector<double>(
+           kSize, [](vector_size_t row) { return row + 0.25; }),
+       makeFlatVector<StringView>(
+           kSize,
+           [](vector_size_t row) {
+             return row % 2 == 0 ? "even"_sv : "odd"_sv;
+           }),
+       // TINYINT covers the scalar byte-RLE path.
+       makeFlatVector<int8_t>(
+           kSize, [](vector_size_t row) { return row % 127; })});
+  ASSERT_TRUE(rowType_->equivalent(*rowVector->type()));
+
+  auto filePath = TempFilePath::create();
+  writeToFile(filePath->getPath(), {rowVector});
+  createDuckDbTable({rowVector});
+
+  // Match numeric literal types to their columns to keep filters pushed down.
+  const std::vector<std::string> filters = {
+      "c0 >= 10000::BIGINT",
+      "c1 >= 10000::INTEGER",
+      "c2 >= (-20000)::SMALLINT",
+      "c3 >= cast(10000.5 as REAL)",
+      "c4 >= 10000.25",
+      "c5 = 'even'",
+      "c6 >= 63::TINYINT"};
+
+  // Filter each column in turn and compare all output columns with DuckDB
+  // to check filtering and row alignment.
+  for (const auto& filter : filters) {
+    SCOPED_TRACE(filter);
+    assertQuery(
+        PlanBuilder(pool_.get()).tableScan(rowType_, {filter}).planNode(),
+        {filePath},
+        fmt::format("SELECT * FROM tmp WHERE {}", filter));
+  }
+}
+
 TEST_F(TableScanTest, directBufferInputRawInputBytes) {
   constexpr int kSize = 10;
   auto vector = makeRowVector({
-      makeFlatVector<int64_t>(kSize, folly::identity),
-      makeFlatVector<int64_t>(kSize, folly::identity),
-      makeFlatVector<int64_t>(kSize, folly::identity),
+      makeFlatIdentityVector<int64_t>(kSize),
+      makeFlatIdentityVector<int64_t>(kSize),
+      makeFlatIdentityVector<int64_t>(kSize),
   });
   auto filePath = TempFilePath::create();
   createDuckDbTable({vector});
@@ -921,7 +973,7 @@ TEST_F(TableScanTest, subfieldPruningRemainingFilterMap) {
       [](auto i) { return i % 3; });
   auto mapType = mapVector->type();
   auto vector = makeRowVector(
-      {"a", "b"}, {makeFlatVector<int64_t>(10, folly::identity), mapVector});
+      {"a", "b"}, {makeFlatIdentityVector<int64_t>(10), mapVector});
   auto rowType = asRowType(vector->type());
   auto filePath = TempFilePath::create();
   writeToFile(filePath->getPath(), {vector});
@@ -1318,9 +1370,8 @@ TEST_F(TableScanTest, missingColumns) {
 
 TEST_F(TableScanTest, missingColumnsInRepeatedColumns) {
   constexpr int kSize = 10;
-  auto bigints = makeFlatVector<int64_t>(kSize, folly::identity);
-  auto structs =
-      makeRowVector({makeFlatVector<int64_t>(kSize, folly::identity)});
+  auto bigints = makeFlatIdentityVector<int64_t>(kSize);
+  auto structs = makeRowVector({makeFlatIdentityVector<int64_t>(kSize)});
   std::vector<vector_size_t> offsets(kSize);
   std::iota(offsets.begin(), offsets.end(), 0);
   auto vector = makeRowVector({
@@ -1341,7 +1392,7 @@ TEST_F(TableScanTest, missingColumnsInRepeatedColumns) {
                       ROW({"c0", "c1", "c2"}, {BIGINT(), c1Type, c2Type}))
                   .planNode();
   auto structs2 = makeRowVector({
-      makeFlatVector<int64_t>(kSize, folly::identity),
+      makeFlatIdentityVector<int64_t>(kSize),
       makeNullConstant(TypeKind::BIGINT, kSize),
   });
   auto indices = makeIndices(kSize, [](auto i) {
@@ -3590,7 +3641,7 @@ TEST_F(TableScanTest, bucketConversion) {
   constexpr int kSize = 100;
   auto vector = makeRowVector({
       makeFlatVector<int32_t>(kSize, [](auto i) { return 2 * i + 1; }),
-      makeFlatVector<int64_t>(kSize, folly::identity),
+      makeFlatIdentityVector<int64_t>(kSize),
   });
   auto schema = asRowType(vector->type());
   auto file = TempFilePath::create();
@@ -3694,7 +3745,7 @@ TEST_F(TableScanTest, bucketConversion) {
 TEST_F(TableScanTest, bucketConversionWithSubfieldPruning) {
   constexpr int kSize = 100;
   auto key = makeRowVector({
-      makeFlatVector<int64_t>(kSize, folly::identity),
+      makeFlatIdentityVector<int64_t>(kSize),
       makeFlatVector<int64_t>(kSize, [](auto i) { return 2 * i; }),
   });
   auto vector = makeRowVector({key});
@@ -4002,7 +4053,7 @@ TEST_F(TableScanTest, stringIsNullFilter) {
 
 TEST_F(TableScanTest, compactComplexNulls) {
   constexpr int kSize = 10;
-  auto iota = makeFlatVector<int64_t>(kSize, folly::identity);
+  auto iota = makeFlatIdentityVector<int64_t>(kSize);
   std::vector<vector_size_t> offsets(kSize);
   for (int i = 0; i < kSize; ++i) {
     offsets[i] = (i + 1) / 2 * 2;
@@ -4116,9 +4167,9 @@ TEST_F(TableScanTest, remainingFilter) {
 TEST_F(TableScanTest, remainingFilterLazyWithMultiReferences) {
   constexpr int kSize = 10;
   auto vector = makeRowVector({
-      makeFlatVector<int64_t>(kSize, folly::identity),
-      makeFlatVector<int64_t>(kSize, folly::identity),
-      makeFlatVector<int64_t>(kSize, folly::identity),
+      makeFlatIdentityVector<int64_t>(kSize),
+      makeFlatIdentityVector<int64_t>(kSize),
+      makeFlatIdentityVector<int64_t>(kSize),
   });
   auto schema = asRowType(vector->type());
   auto file = TempFilePath::create();
@@ -4199,8 +4250,8 @@ TEST_F(
     remainingFilterLazyWithMultiReferencesDirectlyInAndClause) {
   constexpr int kSize = 10;
   auto vector = makeRowVector({
-      makeFlatVector<int64_t>(kSize, folly::identity),
-      makeFlatVector<int64_t>(kSize, folly::identity),
+      makeFlatIdentityVector<int64_t>(kSize),
+      makeFlatIdentityVector<int64_t>(kSize),
   });
   auto schema = asRowType(vector->type());
   auto file = TempFilePath::create();
@@ -4269,7 +4320,7 @@ TEST_F(TableScanTest, remainingFilterSkippedStrides) {
 }
 
 TEST_F(TableScanTest, skipStridesForParentNulls) {
-  auto b = makeFlatVector<int64_t>(10'000, folly::identity);
+  auto b = makeFlatIdentityVector<int64_t>(10'000);
   auto a = makeRowVector({"b"}, {b}, [](auto i) { return i % 2 == 0; });
   auto vector = makeRowVector({"a"}, {a});
   auto file = TempFilePath::create();
@@ -4656,8 +4707,8 @@ TEST_F(TableScanTest, structLazy) {
 TEST_F(TableScanTest, interleaveLazyEager) {
   constexpr int kSize = 1000;
   auto column = makeRowVector(
-      {makeFlatVector<int64_t>(kSize, folly::identity),
-       makeRowVector({makeFlatVector<int64_t>(kSize, folly::identity)})});
+      {makeFlatIdentityVector<int64_t>(kSize),
+       makeRowVector({makeFlatIdentityVector<int64_t>(kSize)})});
   auto rows = makeRowVector({column});
   auto rowType = asRowType(rows->type());
   auto Lazyfile = TempFilePath::create();
@@ -4950,7 +5001,7 @@ TEST_F(TableScanTest, dictionaryMemo) {
 }
 
 TEST_F(TableScanTest, reuseRowVector) {
-  auto iota = makeFlatVector<int32_t>(10, folly::identity);
+  auto iota = makeFlatIdentityVector<int32_t>(10);
   auto data = makeRowVector({iota, makeRowVector({iota})});
   auto rowType = asRowType(data->type());
   auto file = TempFilePath::create();
@@ -4973,7 +5024,7 @@ TEST_F(TableScanTest, reuseRowVector) {
 // Tests queries that read more row fields than exist in the data.
 TEST_F(TableScanTest, readMissingFields) {
   vector_size_t size = 10;
-  auto iota = makeFlatVector<int64_t>(size, folly::identity);
+  auto iota = makeFlatIdentityVector<int64_t>(size);
   auto rowVector = makeRowVector({makeRowVector({iota, iota}), iota});
   auto filePath = TempFilePath::create();
   writeToFile(filePath->getPath(), {rowVector});
@@ -4990,7 +5041,7 @@ TEST_F(TableScanTest, readMissingFields) {
 
 TEST_F(TableScanTest, readExtraFields) {
   vector_size_t size = 10;
-  auto iota = makeFlatVector<int64_t>(size, folly::identity);
+  auto iota = makeFlatIdentityVector<int64_t>(size);
   auto rowVector = makeRowVector({makeRowVector({iota, iota}), iota});
   auto filePath = TempFilePath::create();
   writeToFile(filePath->getPath(), {rowVector});
@@ -5288,7 +5339,7 @@ TEST_F(TableScanTest, readMissingFieldsInMap) {
 
 TEST_F(TableScanTest, filterMissingFields) {
   constexpr int kSize = 10;
-  auto iota = makeFlatVector<int64_t>(kSize, folly::identity);
+  auto iota = makeFlatIdentityVector<int64_t>(kSize);
   auto data = makeRowVector({makeRowVector({iota})});
   auto file = TempFilePath::create();
   writeToFile(file->getPath(), {data});
@@ -5711,7 +5762,7 @@ TEST_F(TableScanTest, readFlatMapAsStruct) {
   auto c0 = makeRowVector(
       keys,
       {
-          makeFlatVector<int64_t>(kSize, folly::identity),
+          makeFlatIdentityVector<int64_t>(kSize),
           makeFlatVector<int64_t>(kSize, folly::identity, nullEvery(5)),
           makeFlatVector<int64_t>(kSize, folly::identity, nullEvery(7)),
       });
@@ -5751,9 +5802,9 @@ TEST_F(TableScanTest, readFlatMapAsStructNoMatchingKeys) {
   auto c0 = makeRowVector(
       keys,
       {
-          makeFlatVector<int64_t>(kSize, folly::identity),
-          makeFlatVector<int64_t>(kSize, folly::identity),
-          makeFlatVector<int64_t>(kSize, folly::identity),
+          makeFlatIdentityVector<int64_t>(kSize),
+          makeFlatIdentityVector<int64_t>(kSize),
+          makeFlatIdentityVector<int64_t>(kSize),
       });
   auto vector = makeRowVector({c0});
   auto config = std::make_shared<dwrf::Config>();
@@ -5885,9 +5936,9 @@ TEST_F(TableScanTest, dynamicFilters) {
   // Make sure filters on same column from multiple downstream operators are
   // merged properly without overwriting each other.
   auto aVector =
-      makeRowVector({"a"}, {makeFlatVector<int64_t>(20'000, folly::identity)});
+      makeRowVector({"a"}, {makeFlatIdentityVector<int64_t>(20'000)});
   auto bVector =
-      makeRowVector({"b"}, {makeFlatVector<int64_t>(10'000, folly::identity)});
+      makeRowVector({"b"}, {makeFlatIdentityVector<int64_t>(10'000)});
   auto cVector = makeRowVector(
       {"c"},
       {makeFlatVector<int64_t>(10'000, [](auto i) { return i + 10'000; })});
@@ -5934,8 +5985,7 @@ TEST_F(TableScanTest, dynamicFilters) {
 TEST_F(TableScanTest, dynamicFilterWithRowIndexColumn) {
   // This test ensures dynamic filters can be mapped to correct field when there
   // is row_index column.
-  auto aVector =
-      makeRowVector({"a"}, {makeFlatVector<int64_t>(10, folly::identity)});
+  auto aVector = makeRowVector({"a"}, {makeFlatIdentityVector<int64_t>(10)});
   auto bVector = makeRowVector({"b"}, {makeFlatVector<int64_t>(10, [](auto i) {
                                  if (i < 5) {
                                    return i;
@@ -5945,8 +5995,7 @@ TEST_F(TableScanTest, dynamicFilterWithRowIndexColumn) {
                                })});
   auto resVector = makeRowVector(
       {"row_index", "a"},
-      {makeFlatVector<int64_t>(5, folly::identity),
-       makeFlatVector<int64_t>(5, folly::identity)});
+      {makeFlatIdentityVector<int64_t>(5), makeFlatIdentityVector<int64_t>(5)});
   connector::ColumnHandleMap assignments;
   assignments["a"] = std::make_shared<connector::hive::HiveColumnHandle>(
       "a",
@@ -6281,7 +6330,7 @@ DEBUG_ONLY_TEST_F(TableScanTest, cancellationToken) {
 TEST_F(TableScanTest, rowNumberInRemainingFilter) {
   constexpr int kSize = 100;
   auto vector = makeRowVector({
-      makeFlatVector<int64_t>(kSize, folly::identity),
+      makeFlatIdentityVector<int64_t>(kSize),
   });
   auto file = TempFilePath::create();
   writeToFile(file->getPath(), {vector});
@@ -6506,7 +6555,7 @@ TEST_F(TableScanTest, rowId) {
       auto newExpected = makeRowVector({
           data,
           makeRowVector({
-              makeFlatVector<int64_t>(10, folly::identity),
+              makeFlatIdentityVector<int64_t>(10),
               makeConstant(StringView(rowGroupId), 10),
               makeConstant(split->rowIdProperties->metadataVersion, 10),
               makeConstant(split->rowIdProperties->partitionId, 10),
@@ -6560,7 +6609,7 @@ TEST_F(TableScanTest, rowId) {
     auto rowGroupId = split->getFileName();
     auto expected = makeRowVector({
         makeRowVector({
-            makeFlatVector<int64_t>(10, folly::identity),
+            makeFlatIdentityVector<int64_t>(10),
             makeConstant(StringView(rowGroupId), 10),
             makeConstant(split->rowIdProperties->metadataVersion, 10),
             makeConstant(split->rowIdProperties->partitionId, 10),
@@ -6574,7 +6623,7 @@ TEST_F(TableScanTest, rowId) {
 TEST_F(TableScanTest, footerIOCount) {
   // We should issue only 1 IO for a split range that does not contain any
   // stripe.
-  auto vector = makeRowVector({makeFlatVector<int64_t>(10, folly::identity)});
+  auto vector = makeRowVector({makeFlatIdentityVector<int64_t>(10)});
   auto file = TempFilePath::create();
   writeToFile(file->getPath(), {vector});
   auto plan = PlanBuilder().tableScan(asRowType(vector->type())).planNode();
@@ -7045,7 +7094,7 @@ TEST_F(TableScanTest, filterColumnHandles) {
 }
 
 TEST_F(TableScanTest, columnPostProcessorWithSubfieldFilters) {
-  auto data = makeFlatVector<int64_t>(10, folly::identity);
+  auto data = makeFlatIdentityVector<int64_t>(10);
   auto vector = makeRowVector({data, data, data});
   auto file = TempFilePath::create();
   writeToFile(file->getPath(), {vector});
@@ -8080,7 +8129,7 @@ TEST_F(TableScanTest, extractionSizeLargeDataMultipleBatches) {
   }
   auto keys = makeFlatVector<StringView>(
       totalEntries, [&](auto i) { return StringView(keyStrs[i]); });
-  auto values = makeFlatVector<int64_t>(totalEntries, folly::identity);
+  auto values = makeFlatIdentityVector<int64_t>(totalEntries);
   std::vector<vector_size_t> offsets(kNumRows);
   vector_size_t offset = 0;
   for (int i = 0; i < kNumRows; ++i) {

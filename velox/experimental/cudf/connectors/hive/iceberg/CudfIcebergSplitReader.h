@@ -64,7 +64,6 @@ class CudfIcebergSplitReader : public CudfSplitReader {
       const std::shared_ptr<const velox_hive::HiveConfig>& hiveConfig,
       const std::shared_ptr<io::IoStatistics>& ioStatistics,
       const std::shared_ptr<IoStats>& ioStats,
-      bool useExperimentalCudfReader,
       const cudf::ast::expression* subfieldFilterAst,
       const common::SubfieldFilters* subfieldFilters);
 
@@ -75,9 +74,6 @@ class CudfIcebergSplitReader : public CudfSplitReader {
   // Override to report a split the filter rejects as skipped.
   bool isSplitSkipped() const override;
 
-  // Override to only setup cuDF reader if we have columns to read.
-  void setupReader() override;
-
   // Skip Parquet pushdown when the subfield filter must run after reading.
   cudf::ast::expression const* pushdownFilter() const override;
 
@@ -87,10 +83,10 @@ class CudfIcebergSplitReader : public CudfSplitReader {
   // Override to apply Iceberg deletes after reading a cudf table chunk.
   std::optional<std::unique_ptr<cudf::table>> readNextChunk() override;
 
- private:
-  // Clear delete readers and column injection
-  void resetSplit();
+  // Clear delete readers, column injection, and the base reader state.
+  void resetSplit() override;
 
+ private:
   // Prepare the current physical file after its base reader state is reset.
   void prepareCurrentSplit(dwio::common::RuntimeStats& runtimeStats);
 
@@ -100,7 +96,6 @@ class CudfIcebergSplitReader : public CudfSplitReader {
   // Load each footer independently and compare schemas before cuDF aggregates
   // metadata across multiple sources.
   bool loadCoalescedFileMetadataAndCheckSchemas();
-
   // Selects applicable positional delete, equality delete, and deletion vector
   // files that apply to the split without opening any files.
   void classifyDeleteFiles();
@@ -293,7 +288,7 @@ class CudfIcebergSplitReader : public CudfSplitReader {
   // has transformed it differently from the pushed filter.
   std::optional<TransformedFilter> transformedLogicalFilter_;
 
-  // Top-level column names and total row count from the file metadata
+  // Top-level column names and total row count from the file metadata.
   std::unordered_set<std::string> fileColumnNames_;
 
   // Tracks the absolute row range covered by the split.

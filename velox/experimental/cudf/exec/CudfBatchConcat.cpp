@@ -85,6 +85,23 @@ int32_t queryConcatTargetRows(exec::DriverCtx* driverCtx) {
   return static_cast<int32_t>(targetRows);
 }
 
+uint64_t queryConcatTargetBytes(
+    exec::DriverCtx* driverCtx,
+    const RowTypePtr& outputType) {
+  if (outputType->size() == 0) {
+    return 0;
+  }
+  const auto configured = concatThreshold(
+      driverCtx,
+      CudfConfig::kCudfBatchSizeMinThresholdBytes,
+      "GLUTEN_CUDF_BATCH_SIZE_MIN_THRESHOLD_BYTES",
+      CudfConfig::getInstance().batchSizeMinThresholdBytes);
+  if (configured != 0) {
+    return configured;
+  }
+  return CudfConfig::getInstance().batchSizeMinBytes.value_or(0);
+}
+
 std::string getAggregationStep(
     const std::shared_ptr<const core::PlanNode>& planNode) {
   const auto aggregation =
@@ -131,14 +148,10 @@ CudfBatchConcat::CudfBatchConcat(
     : CudfBatchConcat(
           operatorId,
           driverCtx,
-          std::move(planNode),
-          std::move(outputType),
+          planNode,
+          outputType,
           targetRows,
-          concatThreshold(
-              driverCtx,
-              CudfConfig::kCudfBatchSizeMinThresholdBytes,
-              "GLUTEN_CUDF_BATCH_SIZE_MIN_THRESHOLD_BYTES",
-              CudfConfig::getInstance().batchSizeMinThresholdBytes)) {}
+          queryConcatTargetBytes(driverCtx, outputType)) {}
 
 CudfBatchConcat::CudfBatchConcat(
     int32_t operatorId,
@@ -259,13 +272,16 @@ RowVectorPtr CudfBatchConcat::doGetOutput() {
       outputQueue_.push(std::move(*it));
     }
 
-    // If last table is a smaller batch and we still expect more input and keep
-    // it in buffer.
+    // Keep the below-target tail of a split buffered while more input can
+    // arrive. A lone output is emitted even if it now measures below the
+    // target: concatenation merges null masks and string offsets, so byte
+    // estimates shrink, and re-buffering would concatenate the rows twice.
     auto& last = outputVectors.back();
-    auto rowCount = last->size();
+    const auto rowCount = static_cast<size_t>(last->size());
 
     const auto lastBytes = last->estimateFlatSize();
-    if (!noMoreInput_ && rowCount < targetRows_ &&
+    if (!noMoreInput_ && outputVectors.size() > 1 &&
+        rowCount < targetRows_ &&
         (targetBytes_ == 0 || lastBytes < targetBytes_)) {
       currentNumRows_ = rowCount;
       currentNumBytes_ = lastBytes;
@@ -292,6 +308,7 @@ void CudfBatchConcat::doClose() {
     outputQueue_.pop();
   }
   currentNumRows_ = 0;
+  currentNumBytes_ = 0;
   Operator::close();
 }
 

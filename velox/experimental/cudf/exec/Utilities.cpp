@@ -25,6 +25,7 @@
 #include <cudf/concatenate.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/detail/utilities/stream_pool.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 
 #include <cuda_runtime_api.h>
@@ -161,7 +162,6 @@ std::unique_ptr<cudf::column> makeEmptyColumnForType(
       return cudf::make_empty_column(cudf_velox::veloxToCudfDataType(type));
   }
 }
-
 std::unique_ptr<cudf::table> makeEmptyTable(
     TypePtr const& inputType,
     cuda::stream_ref stream,

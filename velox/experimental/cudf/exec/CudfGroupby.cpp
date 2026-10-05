@@ -40,6 +40,7 @@
 #include <cudf/copying.hpp>
 #include <cudf/detail/utilities/stream_pool.hpp>
 #include <cudf/lists/lists_column_view.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/replace.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
@@ -941,7 +942,8 @@ struct GroupbyMeanAggregator : GroupbyAggregator {
             cudf::data_type(cudf::type_id::STRUCT),
             size,
             rmm::device_buffer{},
-            rmm::device_buffer{},
+            cudf::create_null_mask(
+                0, cudf::mask_state::UNALLOCATED, stream, mr),
             0,
             std::move(children));
       }
@@ -976,7 +978,8 @@ struct GroupbyMeanAggregator : GroupbyAggregator {
             cudf::data_type(cudf::type_id::STRUCT),
             size,
             rmm::device_buffer{},
-            rmm::device_buffer{},
+            cudf::create_null_mask(
+                0, cudf::mask_state::UNALLOCATED, stream, mr),
             0,
             std::move(children));
       }
@@ -1185,7 +1188,7 @@ struct GroupbyStddevSampAggregator : GroupbyAggregator {
         cudf::data_type(cudf::type_id::STRUCT),
         size,
         rmm::device_buffer{},
-        rmm::device_buffer{},
+        cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr),
         0,
         std::move(children));
   }
@@ -2407,10 +2410,16 @@ CudfGroupby::FinalAggregationRun CudfGroupby::mergeFinalAggregationRuns(
 
   std::vector<CudfVectorPtr> inputs;
   inputs.reserve(2);
+  common::testutil::TestValue::adjust(
+      "CudfGroupby::computeFinalGroupbyIncrementally::beforeConcatenate",
+      &left.data);
   inputs.push_back(std::move(left.data));
   inputs.push_back(std::move(right.data));
   auto concatenated = getConcatenatedTable(
       std::move(inputs), bufferedResultType_, stateStream_, get_temp_mr());
+  common::testutil::TestValue::adjust(
+      "CudfGroupby::computeFinalGroupbyIncrementally::beforeAggregate",
+      &left.data);
   auto output = doGroupByAggregation(
       concatenated->view(),
       groupingKeyOutputChannels_,

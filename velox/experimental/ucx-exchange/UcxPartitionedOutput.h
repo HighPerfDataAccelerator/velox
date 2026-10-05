@@ -34,8 +34,9 @@ class UcxPartitionedOutput : public exec::Operator,
                              public cudf_velox::NvtxHelper {
  public:
   // Default minimum rows to accumulate before flushing. Matches HTTP
-  // PartitionedOutput's ~10,000 row target. Overridable via
-  // QueryConfig::kUcxPartitionedOutputBatchRows.
+  // PartitionedOutput's ~10,000 row target. The process-wide default comes from
+  // CudfConfig::partitionedOutputBatchRows and may be overridden per query
+  // using CudfConfig::kUcxPartitionedOutputBatchRows as the QueryConfig key.
   static constexpr int64_t kDefaultTargetRowsPerChunk = 10'000;
 
   /// @param queueManager Output queue manager the partitions are enqueued to.
@@ -61,7 +62,8 @@ class UcxPartitionedOutput : public exec::Operator,
     return !noMoreInput_ && !hasActiveFlush();
   }
 
-  /// Moves the shared output queue's backpressure future to the Driver.
+  /// Moves the shared output queue's backpressure future to the Driver and
+  /// returns kWaitForConsumer while the output queues are full.
   exec::BlockingReason isBlocked(ContinueFuture* future) override;
 
   /// Finished after all input windows have been enqueued and EOS published.
