@@ -291,8 +291,8 @@ TEST_F(LocalPartitionTest, hashAfterRemoteHashUsesAllLocalDrivers) {
       }
       EXPECT_TRUE(sawLocalPartition);
       EXPECT_TRUE(sawAggregation);
-     }
-   }
+    }
+  }
 }
 
 // The hive partition function spec is not one that

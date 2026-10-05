@@ -522,8 +522,8 @@ void registerCudf() {
   // Keep an always-on counter underneath the optional detailed diagnostics so
   // cudfAllocatedBytes() remains available in both modes.
   statsMr_.emplace(std::move(base));
-  auto tracked = cuda::mr::any_resource<cuda::mr::device_accessible>{
-      statsMr_.value()};
+  auto tracked =
+      cuda::mr::any_resource<cuda::mr::device_accessible>{statsMr_.value()};
   if (deviceMemoryDiagnosticsEnabled()) {
     mr_ = wrapDeviceMemoryResourceForDiagnostics(std::move(tracked), false);
     LOG(INFO) << "Enabled cuDF RMM statistics for device-memory diagnostics";
@@ -534,8 +534,9 @@ void registerCudf() {
 
   const auto& outputMrMode = CudfConfig::getInstance().outputMemoryResource;
   if (!outputMrMode.empty() && outputMrMode != mrMode) {
-    outputStatsMr_.emplace(cudf_velox::createMemoryResource(
-        outputMrMode, CudfConfig::getInstance().memoryPercent));
+    outputStatsMr_.emplace(
+        cudf_velox::createMemoryResource(
+            outputMrMode, CudfConfig::getInstance().memoryPercent));
     auto outputTracked = cuda::mr::any_resource<cuda::mr::device_accessible>{
         outputStatsMr_.value()};
     if (deviceMemoryDiagnosticsEnabled()) {

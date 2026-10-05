@@ -18,10 +18,10 @@
 
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConfig.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConnectorSplit.h"
+#include "velox/experimental/cudf/connectors/hive/CudfSplitReaderByteFetch.h"
 #include "velox/experimental/cudf/connectors/hive/CudfSplitReaderHelpers.h"
 #include "velox/experimental/cudf/connectors/hive/ExecutorSplitPrefetch.h"
 #include "velox/experimental/cudf/connectors/hive/PinnedHostBuffer.h"
-#include "velox/experimental/cudf/connectors/hive/CudfSplitReaderByteFetch.h"
 #include "velox/experimental/cudf/exec/NvtxHelper.h"
 
 #include "velox/common/io/IoStatistics.h"
@@ -51,8 +51,7 @@ using CudfParquetReader =
     cudf::io::parquet::experimental::hybrid_scan_multifile;
 using CudfParquetReaderPtr = std::unique_ptr<CudfParquetReader>;
 using CudfChunkedParquetReader = cudf::io::chunked_parquet_reader;
-using CudfChunkedParquetReaderPtr =
-    std::unique_ptr<CudfChunkedParquetReader>;
+using CudfChunkedParquetReaderPtr = std::unique_ptr<CudfChunkedParquetReader>;
 using CudfHybridScanReader =
     cudf::io::parquet::experimental::hybrid_scan_reader;
 using CudfHybridScanReaderPtr = std::unique_ptr<CudfHybridScanReader>;

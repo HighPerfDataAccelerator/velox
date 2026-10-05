@@ -44,10 +44,10 @@
 #include <future>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <streambuf>
 #include <string_view>
-#include <memory>
 #include <vector>
 
 namespace facebook::velox::cudf_velox::connector::hive {
@@ -192,6 +192,7 @@ class BufferedInputDataSource : public cudf::io::datasource {
       const std::vector<cudf::io::text::byte_range_info>& byteRanges) const;
 
   std::optional<uint64_t> cacheFileNum() const;
+
  private:
   size_t readBuffered(size_t offset, size_t size, uint8_t* dst);
 

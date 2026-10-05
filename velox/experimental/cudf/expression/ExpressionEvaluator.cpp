@@ -3532,8 +3532,8 @@ ColumnOrView FunctionExpression::eval(
       // conditional discards. Hand each branch inputs whose null mask excludes
       // the rows it does not supply; the kernels already skip null rows. Velox
       // CPU narrows a SelectivityVector per branch instead.
-      auto condition = subexpressions_[0]->eval(
-          inputColumnViews, inputRowCount, stream, mr);
+      auto condition =
+          subexpressions_[0]->eval(inputColumnViews, inputRowCount, stream, mr);
       const auto conditionView = asView(condition);
       subexprResults.push_back(std::move(condition));
 

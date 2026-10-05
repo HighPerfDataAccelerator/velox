@@ -280,8 +280,7 @@ RowVectorPtr CudfBatchConcat::doGetOutput() {
     const auto rowCount = static_cast<size_t>(last->size());
 
     const auto lastBytes = last->estimateFlatSize();
-    if (!noMoreInput_ && outputVectors.size() > 1 &&
-        rowCount < targetRows_ &&
+    if (!noMoreInput_ && outputVectors.size() > 1 && rowCount < targetRows_ &&
         (targetBytes_ == 0 || lastBytes < targetBytes_)) {
       currentNumRows_ = rowCount;
       currentNumBytes_ = lastBytes;

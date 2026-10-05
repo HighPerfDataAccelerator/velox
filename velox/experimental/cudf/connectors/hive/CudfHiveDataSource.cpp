@@ -385,8 +385,7 @@ void CudfHiveDataSource::setFromDataSource(std::unique_ptr<DataSource> source) {
   cudfSplitReader_ = std::move(preparedSource->cudfSplitReader_);
   VELOX_CHECK_NOT_NULL(cudfSplitReader_);
   totalRemainingFilterTime_.fetch_add(
-      preparedSource->totalRemainingFilterTime_.load(
-          std::memory_order_relaxed),
+      preparedSource->totalRemainingFilterTime_.load(std::memory_order_relaxed),
       std::memory_order_relaxed);
 
   preparedSource->ioStatistics_->merge(*ioStatistics_);
