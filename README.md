@@ -273,3 +273,5 @@ you can override the `NUM_THREADS` environment variable by doing:
 ```shell
 $ docker-compose run -e NUM_THREADS=<NUM_THREADS_TO_USE> --rm ubuntu-cpp
 ```
+
+<!-- Test-only PR for validating Velox premerge artifact uploads. Do not merge. -->
