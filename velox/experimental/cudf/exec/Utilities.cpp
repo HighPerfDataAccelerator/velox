@@ -116,7 +116,7 @@ std::unique_ptr<cudf::column> makeEmptyColumnForType(
         cudf::data_type{cudf::type_id::INT32},
         1,
         std::move(offsets),
-        rmm::device_buffer{},
+        cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr),
         0);
   };
   switch (type->kind()) {
@@ -131,22 +131,35 @@ std::unique_ptr<cudf::column> makeEmptyColumnForType(
     case TypeKind::VARCHAR:
     case TypeKind::VARBINARY:
       return cudf::make_strings_column(
-          0, zeroOffsets(), rmm::device_buffer{}, 0, rmm::device_buffer{});
+          0,
+          zeroOffsets(),
+          rmm::device_buffer{},
+          0,
+          cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr));
     case TypeKind::ARRAY:
       return cudf::make_lists_column(
           0,
           zeroOffsets(),
           makeEmptyColumnForType(type->childAt(0), stream, mr),
           0,
-          rmm::device_buffer{});
+          cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr));
     case TypeKind::MAP: {
       std::vector<std::unique_ptr<cudf::column>> entries;
       entries.push_back(makeEmptyColumnForType(type->childAt(0), stream, mr));
       entries.push_back(makeEmptyColumnForType(type->childAt(1), stream, mr));
       auto entryStruct = cudf::make_structs_column(
-          0, std::move(entries), 0, rmm::device_buffer{}, stream, mr);
+          0,
+          std::move(entries),
+          0,
+          cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr),
+          stream,
+          mr);
       return cudf::make_lists_column(
-          0, zeroOffsets(), std::move(entryStruct), 0, rmm::device_buffer{});
+          0,
+          zeroOffsets(),
+          std::move(entryStruct),
+          0,
+          cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr));
     }
     case TypeKind::ROW: {
       std::vector<std::unique_ptr<cudf::column>> children;
@@ -156,7 +169,12 @@ std::unique_ptr<cudf::column> makeEmptyColumnForType(
             makeEmptyColumnForType(type->childAt(i), stream, mr));
       }
       return cudf::make_structs_column(
-          0, std::move(children), 0, rmm::device_buffer{}, stream, mr);
+          0,
+          std::move(children),
+          0,
+          cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr),
+          stream,
+          mr);
     }
     default:
       return cudf::make_empty_column(cudf_velox::veloxToCudfDataType(type));

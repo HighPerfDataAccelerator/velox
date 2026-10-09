@@ -659,7 +659,7 @@ void UcxExchangeServer::sendData() {
       if (useHostStaging) {
         dataCtx->hostData = std::make_shared<std::vector<uint8_t>>(bytes_);
         const auto producerStream = dataCtx->data->gpu_data->stream();
-        CUDF_CUDA_TRY(cudaStreamSynchronize(producerStream.value()));
+        CUDF_CUDA_TRY(cudaStreamSynchronize(producerStream.get()));
         CUDF_CUDA_TRY(cudaMemcpy(
             dataCtx->hostData->data(),
             dataCtx->data->gpu_data->data(),

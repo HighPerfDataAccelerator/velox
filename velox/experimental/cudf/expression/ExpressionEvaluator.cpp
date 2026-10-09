@@ -2311,7 +2311,7 @@ class ArrayConstructorFunction : public CudfFunction {
         std::move(offsets),
         std::move(elements),
         0,
-        rmm::device_buffer{});
+        cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr));
   }
 
  private:
@@ -2378,7 +2378,12 @@ class RowConstructorFunction : public CudfFunction {
     VELOX_CHECK_EQ(nextInputColumnIndex, inputColumns.size());
     if (parentNullPolicy_ == RowParentNullPolicy::kNever) {
       return cudf::make_structs_column(
-          outputSize, std::move(children), 0, rmm::device_buffer{}, stream, mr);
+          outputSize,
+          std::move(children),
+          0,
+          cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr),
+          stream,
+          mr);
     }
 
     std::vector<cudf::column_view> childViews;
