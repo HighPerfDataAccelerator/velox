@@ -42,6 +42,7 @@ TEST(GpuResourcesTest, boundedNonBlockingPool) {
   auto& pool = cudfGlobalStreamPool();
   EXPECT_TRUE(pool.get_streams(0).empty());
   const auto streams = pool.get_streams(65);
+  EXPECT_EQ(streams.size(), 65);
   const auto unique = handles(streams);
   EXPECT_EQ(unique.size(), 32);
   for (auto stream : unique) {
