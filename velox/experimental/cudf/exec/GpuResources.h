@@ -169,7 +169,9 @@ tryAcquireDeviceMemoryAdmission(
 [[nodiscard]] std::size_t deviceMemoryAdmissionReservedBytes(int device);
 
 /**
- * @brief Returns the global CUDA stream pool used by cudf.
+ * @brief Returns Velox's shared pool of 32 non-blocking streams for the current
+ * CUDA device. Thread safe; streams remain valid for the process lifetime.
+ * cuDF internal operations retain their own stream pool policy.
  */
 [[nodiscard]] cudf::detail::cuda_stream_pool& cudfGlobalStreamPool();
 
