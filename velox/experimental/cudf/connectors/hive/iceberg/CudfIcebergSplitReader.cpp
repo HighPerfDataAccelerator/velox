@@ -29,6 +29,7 @@
 #include "velox/connectors/hive/FileSplitReader.h"
 #include "velox/connectors/hive/iceberg/IcebergMetadataColumns.h"
 #include "velox/dwio/common/BufferUtil.h"
+#include "velox/functions/lib/string/StringImpl.h"
 #include "velox/type/Type.h"
 
 #include <cudf/column/column_factories.hpp>
