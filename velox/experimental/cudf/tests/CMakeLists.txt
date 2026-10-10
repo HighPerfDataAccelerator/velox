@@ -338,3 +338,9 @@ add_subdirectory(utils)
 if(${VELOX_ENABLE_SPARK_FUNCTIONS})
   add_subdirectory(sparksql)
 endif()
+
+velox_add_cudf_test(
+  NAME velox_cudf_gpu_resources_test
+  SOURCES Main.cpp GpuResourcesTest.cpp
+  LIBS velox_cudf_exec Folly::folly
+)
