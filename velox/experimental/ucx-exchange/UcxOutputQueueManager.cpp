@@ -18,7 +18,6 @@
 #include <cudf/io/types.hpp>
 #include <cudf/table/table.hpp>
 #include <fmt/format.h>
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/exec_policy.hpp>
 #include <limits>
 #include "velox/experimental/ucx-exchange/IntraNodeTransferRegistry.h"

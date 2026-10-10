@@ -259,7 +259,7 @@ class UcxExchangeSource
   /// @param atEnd True if this is end-of-stream
   void onIntraNodeData(
       std::shared_ptr<cudf::packed_columns> data,
-      rmm::cuda_stream_view producerStream,
+      cuda::stream_ref producerStream,
       vector_size_t numRows,
       bool atEnd);
 

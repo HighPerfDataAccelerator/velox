@@ -32,7 +32,7 @@ IntraNodeTransferRegistry::getInstance() {
 std::future<void> IntraNodeTransferRegistry::publish(
     const IntraNodeTransferKey& key,
     std::shared_ptr<cudf::packed_columns> data,
-    rmm::cuda_stream_view stream,
+    cuda::stream_ref stream,
     vector_size_t numRows,
     bool atEnd,
     std::function<void()> onRetrieved) {
@@ -126,7 +126,7 @@ std::optional<IntraNodeTransferResult> IntraNodeTransferRegistry::poll(
               << " dest=" << key.destination << " seq=" << key.sequenceNumber;
       return IntraNodeTransferResult{
           .data = nullptr,
-          .stream = rmm::cuda_stream_default,
+          .stream = cuda::stream_ref{cudaStream_t{cudaStreamDefault}},
           .numRows = 0,
           .atEnd = true};
     }
@@ -250,7 +250,11 @@ IntraNodeTransferResult IntraNodeTransferRegistry::waitFor(
         // Timeout - return empty result
         VLOG(0) << "Timeout waiting for intra-node transfer: " << key.taskId
                 << " dest=" << key.destination << " seq=" << key.sequenceNumber;
-        return {nullptr, rmm::cuda_stream_default, 0, false};
+        return {
+            nullptr,
+            cuda::stream_ref{cudaStream_t{cudaStreamDefault}},
+            0,
+            false};
       }
     }
 

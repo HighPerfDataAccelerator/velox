@@ -16,7 +16,6 @@
 #include "velox/experimental/ucx-exchange/UcxExchangeServer.h"
 #include <glog/logging.h>
 #include <malloc.h>
-#include <rmm/cuda_stream_view.hpp>
 #include <ucxx/request_tag_builder.h>
 #include <algorithm>
 #include <cstdlib>
@@ -519,7 +518,7 @@ void UcxExchangeServer::sendData() {
           IntraNodeTransferRegistry::getInstance()->publish(
               key,
               nullptr,
-              rmm::cuda_stream_default,
+              cuda::stream_ref{cudaStream_t{cudaStreamDefault}},
               /*numRows=*/0,
               /*atEnd=*/true,
               makeIntraNodeRetrieveWakeup());
