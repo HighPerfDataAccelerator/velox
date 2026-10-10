@@ -21,6 +21,7 @@
 #include "velox/common/base/RandomUtil.h"
 #include "velox/common/file/FileSystems.h"
 #include "velox/common/io/IoStatistics.h"
+#include "velox/common/io/IoStatisticsRuntimeStats.h"
 #include "velox/connectors/Connector.h"
 #include "velox/connectors/hive/FileConnectorSplit.h"
 #include "velox/connectors/hive/FileHandle.h"
@@ -32,13 +33,6 @@
 #include "velox/expression/Expr.h"
 
 namespace facebook::velox::connector::hive {
-
-/// Adds the standard file IO counters and latencies to connector runtime
-/// stats. Shared by CPU and cuDF file data sources.
-void addIoStatsToRuntimeStats(
-    io::IoStatistics& ioStats,
-    std::string_view prefix,
-    std::unordered_map<std::string, RuntimeMetric>& runtimeStats);
 
 /// File-specific scan batch event with split metadata. Non-owning fields are
 /// valid only for the duration of the scan batch callback.
@@ -76,16 +70,16 @@ class FileDataSource : public DataSource {
   /// keys directly (e.g., "storageReadBytes"). Metadata IO stats use the
   /// kMetadataPrefix (e.g., "metadata.storageReadBytes").
   static constexpr std::string_view kMetadataPrefix{"metadata"};
-  static constexpr std::string_view kNumPrefetch{"numPrefetch"};
-  static constexpr std::string_view kPrefetchBytes{"prefetchBytes"};
-  static constexpr std::string_view kTotalScanTime{"totalScanTime"};
-  static constexpr std::string_view kOverreadBytes{"overreadBytes"};
-  static constexpr std::string_view kStorageReadBytes{"storageReadBytes"};
-  static constexpr std::string_view kNumLocalRead{"numLocalRead"};
-  static constexpr std::string_view kLocalReadBytes{"localReadBytes"};
-  static constexpr std::string_view kNumRamRead{"numRamRead"};
-  static constexpr std::string_view kRamReadBytes{"ramReadBytes"};
-  static constexpr std::string_view kReadGapBytes{"readGapBytes"};
+  static constexpr std::string_view kNumPrefetch{io::kNumPrefetch};
+  static constexpr std::string_view kPrefetchBytes{io::kPrefetchBytes};
+  static constexpr std::string_view kTotalScanTime{io::kTotalScanTime};
+  static constexpr std::string_view kOverreadBytes{io::kOverreadBytes};
+  static constexpr std::string_view kStorageReadBytes{io::kStorageReadBytes};
+  static constexpr std::string_view kNumLocalRead{io::kNumLocalRead};
+  static constexpr std::string_view kLocalReadBytes{io::kLocalReadBytes};
+  static constexpr std::string_view kNumRamRead{io::kNumRamRead};
+  static constexpr std::string_view kRamReadBytes{io::kRamReadBytes};
+  static constexpr std::string_view kReadGapBytes{io::kReadGapBytes};
 
   FileDataSource(
       const RowTypePtr& outputType,
@@ -180,6 +174,13 @@ class FileDataSource : public DataSource {
 
   const std::shared_ptr<common::MetadataFilter>& metadataFilter() const {
     return metadataFilter_;
+  }
+
+  /// The row type for the data source output, not including filter-only
+  /// columns. Subclasses may call this from createSplitReader() to obtain
+  /// the output schema when constructing a split reader.
+  const RowTypePtr& outputType() const {
+    return outputType_;
   }
 
   // Actual type produced by the reader after extraction pushdown.  Differs

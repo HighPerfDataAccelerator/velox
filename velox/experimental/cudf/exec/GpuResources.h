@@ -117,6 +117,14 @@ extern std::optional<rmm::mr::statistics_resource_adaptor> statistics_mr_;
 extern std::optional<rmm::mr::statistics_resource_adaptor>
     output_statistics_mr_;
 
+/// Statistics adaptors wrapping the main (and, if distinct, output) memory
+/// resources so that live-allocated GPU bytes can be reported.
+/// statistics_resource_adaptor is a cuda::mr::shared_resource: it is copyable
+/// and copies share the same counter state, so the copies placed in
+/// mr_/output_mr_ increment the same counters that these read.
+extern std::optional<rmm::mr::statistics_resource_adaptor> statsMr_;
+extern std::optional<rmm::mr::statistics_resource_adaptor> outputStatsMr_;
+
 /// Returns the memory resource designated for output vector allocations.
 rmm::device_async_resource_ref get_output_mr();
 
@@ -127,6 +135,12 @@ rmm::device_async_resource_ref get_output_mr();
  * @param percent The initial percent of GPU memory to allocate for pool or
  * arena resources, or the retained-memory release threshold for async.
  */
+
+/// Live bytes currently allocated through the cuDF/RMM memory resource(s), or
+/// -1 if cuDF is not registered. Counts the bytes callers hold rather than the
+/// device memory a pool resource retains for reuse, so the value drops as
+/// queries free their allocations.
+int64_t cudfAllocatedBytes();
 [[nodiscard]] cuda::mr::any_resource<cuda::mr::device_accessible>
 createMemoryResource(std::string_view mode, int percent);
 

@@ -19,10 +19,14 @@
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 
+#include "velox/common/testutil/TestValue.h"
+
 #include <cudf/column/column_factories.hpp>
 #include <cudf/concatenate.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/detail/utilities/stream_pool.hpp>
+#include <cudf/null_mask.hpp>
+#include <cudf/scalar/scalar_factories.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 
 #include <cuda_runtime_api.h>
@@ -102,6 +106,8 @@ std::unique_ptr<cudf::table> concatenateTables(
   return cudf::concatenate(tableViews, stream, mr);
 }
 
+namespace {
+
 std::unique_ptr<cudf::column> makeEmptyColumnForType(
     const TypePtr& type,
     cuda::stream_ref stream,
@@ -113,7 +119,7 @@ std::unique_ptr<cudf::column> makeEmptyColumnForType(
         cudf::data_type{cudf::type_id::INT32},
         1,
         std::move(offsets),
-        rmm::device_buffer{},
+        cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr),
         0);
   };
   switch (type->kind()) {
@@ -128,22 +134,35 @@ std::unique_ptr<cudf::column> makeEmptyColumnForType(
     case TypeKind::VARCHAR:
     case TypeKind::VARBINARY:
       return cudf::make_strings_column(
-          0, zeroOffsets(), rmm::device_buffer{}, 0, rmm::device_buffer{});
+          0,
+          zeroOffsets(),
+          rmm::device_buffer{},
+          0,
+          cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr));
     case TypeKind::ARRAY:
       return cudf::make_lists_column(
           0,
           zeroOffsets(),
           makeEmptyColumnForType(type->childAt(0), stream, mr),
           0,
-          rmm::device_buffer{});
+          cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr));
     case TypeKind::MAP: {
       std::vector<std::unique_ptr<cudf::column>> entries;
       entries.push_back(makeEmptyColumnForType(type->childAt(0), stream, mr));
       entries.push_back(makeEmptyColumnForType(type->childAt(1), stream, mr));
       auto entryStruct = cudf::make_structs_column(
-          0, std::move(entries), 0, rmm::device_buffer{}, stream, mr);
+          0,
+          std::move(entries),
+          0,
+          cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr),
+          stream,
+          mr);
       return cudf::make_lists_column(
-          0, zeroOffsets(), std::move(entryStruct), 0, rmm::device_buffer{});
+          0,
+          zeroOffsets(),
+          std::move(entryStruct),
+          0,
+          cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr));
     }
     case TypeKind::ROW: {
       std::vector<std::unique_ptr<cudf::column>> children;
@@ -153,7 +172,12 @@ std::unique_ptr<cudf::column> makeEmptyColumnForType(
             makeEmptyColumnForType(type->childAt(i), stream, mr));
       }
       return cudf::make_structs_column(
-          0, std::move(children), 0, rmm::device_buffer{}, stream, mr);
+          0,
+          std::move(children),
+          0,
+          cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr),
+          stream,
+          mr);
     }
     default:
       return cudf::make_empty_column(cudf_velox::veloxToCudfDataType(type));
@@ -161,16 +185,19 @@ std::unique_ptr<cudf::column> makeEmptyColumnForType(
 }
 
 std::unique_ptr<cudf::table> makeEmptyTable(
-    TypePtr const& inputType,
+    const TypePtr& type,
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) {
   std::vector<std::unique_ptr<cudf::column>> emptyColumns;
-  for (size_t i = 0; i < inputType->size(); ++i) {
+  emptyColumns.reserve(type->size());
+  for (size_t i = 0; i < type->size(); ++i) {
     emptyColumns.push_back(
-        makeEmptyColumnForType(inputType->childAt(i), stream, mr));
+        makeEmptyColumnForType(type->childAt(i), stream, mr));
   }
   return std::make_unique<cudf::table>(std::move(emptyColumns));
 }
+
+} // namespace
 
 std::unique_ptr<cudf::table> getConcatenatedTable(
     std::vector<CudfVectorPtr>&& tables,
@@ -220,39 +247,30 @@ std::vector<std::unique_ptr<cudf::table>> getConcatenatedTableBatched(
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr,
     std::optional<size_t> maxRowsOverride) {
-  std::vector<std::unique_ptr<cudf::table>> concatTables;
+  std::vector<std::unique_ptr<cudf::table>> outputTables;
   // Check for empty vector
   if (tables.size() == 0) {
-    concatTables.push_back(makeEmptyTable(tableType, stream, mr));
-    return concatTables;
+    outputTables.push_back(makeEmptyTable(tableType, stream, mr));
+    return outputTables;
   }
 
-  auto inputStreams = std::vector<cuda::stream_ref>();
-  auto tableViews = std::vector<cudf::table_view>();
+  struct BoundedView {
+    cudf::table_view view;
+    size_t sourceIndex;
+  };
 
-  inputStreams.reserve(tables.size());
-  tableViews.reserve(tables.size());
+  const auto maxRows = maxRowsOverride.value_or(maxBatchRows());
+  VELOX_CHECK_GT(maxRows, 0, "cuDF max batch size must be positive");
 
-  for (const auto& table : tables) {
-    VELOX_CHECK_NOT_NULL(table);
-    tableViews.push_back(table->getTableView());
-    inputStreams.push_back(table->stream());
-  }
-
-  cudf::detail::join_streams(inputStreams, stream);
-
-  try {
-    std::vector<std::unique_ptr<cudf::table>> outputTables;
-    const auto maxRows = maxRowsOverride.value_or(maxBatchRows());
-    VELOX_CHECK_GT(maxRows, 0, "cuDF max batch size must be positive");
-    std::vector<cudf::table_view> boundedViews;
-    boundedViews.reserve(tableViews.size());
-    for (const auto& tableView : tableViews) {
-      const auto numRows = static_cast<size_t>(tableView.num_rows());
-      if (numRows <= maxRows) {
-        boundedViews.push_back(tableView);
-        continue;
-      }
+  std::vector<BoundedView> boundedViews;
+  std::vector<size_t> lastViewForSource(tables.size());
+  for (size_t source = 0; source < tables.size(); ++source) {
+    VELOX_CHECK_NOT_NULL(tables[source]);
+    const auto tableView = tables[source]->getTableView();
+    const auto numRows = static_cast<size_t>(tableView.num_rows());
+    if (numRows <= maxRows) {
+      boundedViews.push_back({tableView, source});
+    } else {
       for (size_t start = 0; start < numRows;) {
         const auto end = start + std::min(maxRows, numRows - start);
         auto slices = cudf::slice(
@@ -261,41 +279,65 @@ std::vector<std::unique_ptr<cudf::table>> getConcatenatedTableBatched(
              static_cast<cudf::size_type>(end)},
             stream);
         VELOX_CHECK_EQ(slices.size(), 1);
-        boundedViews.push_back(slices.front());
+        boundedViews.push_back({slices.front(), source});
         start = end;
       }
     }
+    lastViewForSource[source] = boundedViews.size() - 1;
+  }
 
-    size_t startpos = 0;
-    size_t runningRows = 0;
-    for (size_t i = 0; i < boundedViews.size(); ++i) {
-      auto const numRows = static_cast<size_t>(boundedViews[i].num_rows());
-      // If adding this table would exceed the limit, flush current batch
-      // [startpos, i).
-      if (runningRows > 0 && runningRows + numRows > maxRows) {
-        outputTables.push_back(
-            cudf::concatenate(
-                std::vector<cudf::table_view>(
-                    boundedViews.begin() + startpos, boundedViews.begin() + i),
-                stream,
-                mr));
-        startpos = i;
-        runningRows = 0;
+  try {
+    size_t start = 0;
+    while (start < boundedViews.size()) {
+      size_t end = start;
+      size_t runningRows = 0;
+      std::vector<cudf::table_view> tableViews;
+      while (end < boundedViews.size()) {
+        const auto numRows =
+            static_cast<size_t>(boundedViews[end].view.num_rows());
+        if (runningRows > 0 && runningRows + numRows > maxRows) {
+          break;
+        }
+        runningRows += numRows;
+        tableViews.push_back(boundedViews[end].view);
+        ++end;
       }
-      runningRows += numRows;
-    }
-    // Flush the final batch [startpos, end).
-    if (startpos < boundedViews.size()) {
-      outputTables.push_back(
-          cudf::concatenate(
-              std::vector<cudf::table_view>(
-                  boundedViews.begin() + startpos, boundedViews.end()),
-              stream,
-              mr));
-    }
-    orderCudfVectorDeallocationsAfterStream(tables, inputStreams, stream);
 
-    // Input tables are deallocated here when 'tables' goes out of scope.
+      std::vector<cuda::stream_ref> batchStreams;
+      std::vector<bool> streamAdded(tables.size(), false);
+      for (size_t i = start; i < end; ++i) {
+        const auto source = boundedViews[i].sourceIndex;
+        if (!streamAdded[source]) {
+          batchStreams.push_back(tables[source]->stream());
+          streamAdded[source] = true;
+        }
+      }
+      cudf::detail::join_streams(batchStreams, stream);
+      outputTables.push_back(cudf::concatenate(tableViews, stream, mr));
+
+      std::vector<CudfVectorPtr> releasedInputs;
+      std::vector<cuda::stream_ref> releasedStreams;
+      for (size_t source = 0; source < tables.size(); ++source) {
+        if (tables[source] && lastViewForSource[source] < end) {
+          releasedStreams.push_back(tables[source]->stream());
+          releasedInputs.push_back(std::move(tables[source]));
+        }
+      }
+      if (!releasedInputs.empty()) {
+        orderCudfVectorDeallocationsAfterStream(
+            releasedInputs, releasedStreams, stream);
+        releasedInputs.clear();
+      }
+
+      size_t retainedInputBatches =
+          std::count_if(tables.begin(), tables.end(), [](const auto& table) {
+            return table != nullptr;
+          });
+      common::testutil::TestValue::adjust(
+          "facebook::velox::cudf_velox::getConcatenatedTableBatched::retainedInputBatchesAfterBatchRelease",
+          &retainedInputBatches);
+      start = end;
+    }
     return outputTables;
   } catch (...) {
     // A failed later batch may leave earlier concatenate kernels in flight.
@@ -420,6 +462,60 @@ void orderCudfVectorDeallocationsAfterStream(
 
   if (!allRebound) {
     streamsWaitForStream(eventForThread(), inputStreams, stream);
+  }
+}
+
+std::unique_ptr<cudf::column> makeAllNullColumn(
+    const TypePtr& type,
+    cudf::size_type numRows,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) {
+  switch (type->kind()) {
+    case TypeKind::ARRAY: {
+      // LIST: zeroed offsets (numRows + 1 zeros) + empty child + ALL_NULL mask.
+      cudf::numeric_scalar<int32_t> zeroScalar{0, true, stream, get_temp_mr()};
+      auto offsets =
+          cudf::make_column_from_scalar(zeroScalar, numRows + 1, stream, mr);
+      auto child = makeAllNullColumn(type->childAt(0), 0, stream, mr);
+      auto nullMask = cudf::create_null_mask(
+          numRows, cudf::mask_state::ALL_NULL, stream, mr);
+      return cudf::make_lists_column(
+          numRows,
+          std::move(offsets),
+          std::move(child),
+          numRows,
+          std::move(nullMask));
+    }
+    case TypeKind::ROW: {
+      // STRUCT: recursively create all-null children + ALL_NULL mask.
+      std::vector<std::unique_ptr<cudf::column>> children;
+      children.reserve(type->size());
+      for (size_t i = 0; i < type->size(); ++i) {
+        children.push_back(
+            makeAllNullColumn(type->childAt(i), numRows, stream, mr));
+      }
+      auto nullMask = cudf::create_null_mask(
+          numRows, cudf::mask_state::ALL_NULL, stream, mr);
+      return cudf::make_structs_column(
+          numRows,
+          std::move(children),
+          numRows,
+          std::move(nullMask),
+          stream,
+          mr);
+    }
+    default: {
+      // Flat types (including STRING): use the scalar approach.
+      auto cudfType = tryVeloxToCudfDataType(type);
+      if (!cudfType) {
+        VELOX_NYI(
+            "All-null column creation is not implemented for type {}",
+            type->toString());
+      }
+      auto nullScalar = cudf::make_default_constructed_scalar(
+          *cudfType, stream, get_temp_mr());
+      return cudf::make_column_from_scalar(*nullScalar, numRows, stream, mr);
+    }
   }
 }
 

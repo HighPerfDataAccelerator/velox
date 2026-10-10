@@ -16,8 +16,8 @@
 #pragma once
 
 #include <cudf/contiguous_split.hpp>
-#include <rmm/cuda_stream_view.hpp>
 #include <condition_variable>
+#include <cuda/stream>
 #include <functional>
 #include <future>
 #include <map>
@@ -54,7 +54,7 @@ struct IntraNodeTransferKey {
 /// @brief Result from intra-node transfer containing data and end marker.
 struct IntraNodeTransferResult {
   std::shared_ptr<cudf::packed_columns> data;
-  rmm::cuda_stream_view stream{rmm::cuda_stream_default};
+  cuda::stream_ref stream{cudaStream_t{cudaStreamDefault}};
   /// Logical rows in 'data'. Carried explicitly for the same reason the remote
   /// path puts a row count on the wire: a packed table with no columns cannot
   /// report its own row count.
@@ -68,7 +68,7 @@ struct IntraNodeTransferResult {
 /// promise on retrieval.
 struct IntraNodeTransferEntry {
   std::shared_ptr<cudf::packed_columns> data;
-  rmm::cuda_stream_view stream{rmm::cuda_stream_default};
+  cuda::stream_ref stream{cudaStream_t{cudaStreamDefault}};
   vector_size_t numRows{
       0}; // Logical rows in 'data'; see IntraNodeTransferResult.
   bool atEnd{false}; // True if this is the end-of-stream marker
@@ -117,7 +117,7 @@ class IntraNodeTransferRegistry {
   [[nodiscard]] std::future<void> publish(
       const IntraNodeTransferKey& key,
       std::shared_ptr<cudf::packed_columns> data,
-      rmm::cuda_stream_view stream,
+      cuda::stream_ref stream,
       vector_size_t numRows,
       bool atEnd,
       std::function<void()> onRetrieved = {});

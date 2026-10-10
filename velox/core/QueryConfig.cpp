@@ -35,6 +35,7 @@ const std::vector<config::ConfigProperty>& QueryConfig::registeredProperties() {
     VELOX_REGISTER_QUERY_CONFIG(kSessionTimezone);
     VELOX_REGISTER_QUERY_CONFIG(kSessionStartTime);
     VELOX_REGISTER_QUERY_CONFIG(kAdjustTimestampToTimezone);
+    VELOX_REGISTER_QUERY_CONFIG(kUseSessionTimezoneForTimestampWithTimezone);
 
     // Expression evaluation.
     VELOX_REGISTER_QUERY_CONFIG(kExprEvalSimplified);
@@ -103,6 +104,7 @@ const std::vector<config::ConfigProperty>& QueryConfig::registeredProperties() {
     VELOX_REGISTER_QUERY_CONFIG(kPreferredOutputBatchRows);
     VELOX_REGISTER_QUERY_CONFIG(kMaxOutputBatchRows);
     VELOX_REGISTER_QUERY_CONFIG(kMergeJoinOutputBatchStartSize);
+    VELOX_REGISTER_QUERY_CONFIG(kMergeJoinStreamLeftSide);
 
     // Table scan.
     VELOX_REGISTER_QUERY_CONFIG(kTableScanGetOutputTimeLimitMs);
@@ -274,6 +276,7 @@ const std::vector<config::ConfigProperty>& QueryConfig::registeredProperties() {
     VELOX_REGISTER_QUERY_CONFIG(kRpcRateLimiterMinLimit);
     VELOX_REGISTER_QUERY_CONFIG(kRpcRateLimiterDecreaseFactor);
     VELOX_REGISTER_QUERY_CONFIG(kRpcRateLimiterMaxLimit);
+    VELOX_REGISTER_QUERY_CONFIG(kRpcRateLimiterHardLimit);
 
 #undef VELOX_REGISTER_QUERY_CONFIG
 
