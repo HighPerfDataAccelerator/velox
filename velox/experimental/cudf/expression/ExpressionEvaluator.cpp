@@ -1357,6 +1357,35 @@ class GreatestLeastFunction : public CudfFunction {
   std::vector<size_t> order_;
 };
 
+namespace {
+
+bool supportsImplicitNullElse(const TypePtr& type) {
+  // Interval constant scalars differ from the cuDF storage type used for the
+  // implicit null ELSE.
+  if (type->isIntervalYearMonth() || type->isIntervalDayTime()) {
+    return false;
+  }
+  switch (type->kind()) {
+    case TypeKind::BOOLEAN:
+    case TypeKind::TINYINT:
+    case TypeKind::SMALLINT:
+    case TypeKind::INTEGER:
+    case TypeKind::BIGINT:
+    case TypeKind::REAL:
+    case TypeKind::DOUBLE:
+    case TypeKind::VARCHAR:
+    case TypeKind::VARBINARY:
+    case TypeKind::TIMESTAMP:
+      return true;
+    case TypeKind::HUGEINT:
+      return type->isDecimal();
+    default:
+      return false;
+  }
+}
+
+} // namespace
+
 class SwitchFunction : public CudfFunction {
  public:
   SwitchFunction(const core::TypedExprPtr& expr, memory::MemoryPool* pool)
@@ -2980,7 +3009,7 @@ bool registerBuiltinFunctions(const std::string& prefix) {
         }
         return (hasElseClause &&
                 inputs.back()->type()->equivalent(*expr->type())) ||
-            (!hasElseClause && canMakeCudfDefaultScalar(expr->type()));
+            (!hasElseClause && supportsImplicitNullElse(expr->type()));
       });
 
   registerCudfFunctions(
@@ -3614,9 +3643,9 @@ bool FunctionExpression::canEvaluate(const core::TypedExprPtr& expr) {
     if (isNumericToVarcharCast(srcType, dstType)) {
       return true;
     }
-    auto src = cudf_velox::veloxToCudfDataType(srcType);
-    auto dst = cudf_velox::veloxToCudfDataType(dstType);
-    return cudf::is_supported_cast(src, dst);
+    auto src = cudf_velox::tryVeloxToCudfDataType(srcType);
+    auto dst = cudf_velox::tryVeloxToCudfDataType(dstType);
+    return src && dst && cudf::is_supported_cast(*src, *dst);
   }
 
   auto& registry = getCudfFunctionRegistry();

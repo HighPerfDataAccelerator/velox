@@ -21,6 +21,7 @@
 
 #include "velox/common/Casts.h"
 #include "velox/connectors/hive/HiveConnectorSplit.h"
+#include "velox/connectors/hive/iceberg/IcebergColumnHandle.h"
 #include "velox/connectors/hive/iceberg/IcebergSplit.h"
 
 #include <string_view>
@@ -62,7 +63,26 @@ CudfIcebergDataSource::CudfIcebergDataSource(
           executor,
           connectorQueryCtx,
           cudfHiveConfig),
-      hiveConfig_(hiveConfig) {}
+      hiveConfig_(hiveConfig) {
+  const auto recordColumn = [this](const velox_hive::FileColumnHandle& handle) {
+    if (handle.columnType() ==
+        velox_hive::FileColumnHandle::ColumnType::kPartitionKey) {
+      partitionColumnNames_.insert(handle.name());
+    }
+    if (const auto* icebergHandle =
+            dynamic_cast<const velox_iceberg::IcebergColumnHandle*>(&handle)) {
+      sourceFieldIds_.emplace(
+          icebergHandle->name(), icebergHandle->field().fieldId);
+    }
+  };
+  for (const auto& [_, handle] : columnHandles) {
+    recordColumn(
+        *checkedPointerCast<const velox_hive::FileColumnHandle>(handle));
+  }
+  for (const auto& handle : tableHandle_->filterColumnHandles()) {
+    recordColumn(*handle);
+  }
+}
 
 void CudfIcebergDataSource::convertSplit(
     std::shared_ptr<velox_connector::ConnectorSplit> split) {
@@ -94,6 +114,8 @@ CudfIcebergDataSource::createCudfSplitReader() {
   return std::make_unique<CudfIcebergSplitReader>(
       split_,
       icebergSplit_,
+      partitionColumnNames_,
+      sourceFieldIds_,
       tableHandle_,
       outputType_,
       readColumnNames_,
