@@ -67,8 +67,8 @@
 #include <span>
 #include <sstream>
 #include <string_view>
-#include <unordered_map>
 #include <tuple>
+#include <unordered_map>
 #include <utility>
 
 namespace facebook::velox::cudf_velox::connector::hive {

@@ -316,10 +316,7 @@ bool CompileState::compile(bool allowCpuFallback) {
       if (isTypeSupportedByCudf(inputType)) {
         replaceOp.push_back(
             std::make_unique<CudfFromVelox>(
-                id,
-                inputType,
-                ctx,
-                planNode->id() + "-from-velox"));
+                id, inputType, ctx, planNode->id() + "-from-velox"));
       } else {
         skipGpuReplacement = true;
       }

@@ -23,10 +23,10 @@
 #include <cudf/detail/utilities/stream_pool.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 
-#include <cuda_runtime_api.h>
-
 #include <rmm/device_buffer.hpp>
 #include <rmm/resource_ref.hpp>
+
+#include <cuda_runtime_api.h>
 
 #include <folly/ScopeGuard.h>
 #include <gtest/gtest.h>
