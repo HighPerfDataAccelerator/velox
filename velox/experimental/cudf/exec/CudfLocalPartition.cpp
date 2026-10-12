@@ -35,6 +35,12 @@
 namespace facebook::velox::cudf_velox {
 
 namespace {
+// Remote UCX output uses DEFAULT_HASH_SEED. Reusing that hash locally makes
+// divisible partition counts correlate (e.g. four remote partitions -> two
+// local drivers), leaving local drivers empty. Keep one distinct local seed
+// across operators so equal keys and paired local join inputs remain colocated.
+constexpr auto kLocalExchangeHashSeed = cudf::DEFAULT_HASH_SEED ^ 0x9e3779b9U;
+
 template <class... Deriveds, class Base>
 bool isAnyOf(const Base* p) {
   return ((dynamic_cast<const Deriveds*>(p) != nullptr) || ...);
@@ -87,10 +93,7 @@ CudfLocalPartition::CudfLocalPartition(
       queues_{
           ctx->task->getLocalExchangeQueues(ctx->splitGroupId, planNode->id())},
       numPartitions_{queues_.size()},
-      hashSeed_{
-          planNode->id().find("_keyed_final_local_hash") != std::string::npos
-              ? cudf::DEFAULT_HASH_SEED ^ 0x9e3779b9U
-              : cudf::DEFAULT_HASH_SEED} {
+      hashSeed_{kLocalExchangeHashSeed} {
   // Following is IMO a hacky way to get the partition key indices. It is to
   // workaround the fact that the partition spec constructs the hash function
   // directly and has no public methods to get the partition key indices.

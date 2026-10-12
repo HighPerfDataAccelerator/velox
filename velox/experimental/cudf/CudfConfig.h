@@ -18,6 +18,7 @@
 
 #include <cudf/types.hpp>
 
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -51,6 +52,8 @@ struct CudfConfig {
       "cudf.exchange_batch_size_min_threshold_bytes"};
   static constexpr const char* kCudfBatchSizeMinThresholdBytes{
       "cudf.batch_size_min_threshold_bytes"};
+  static constexpr const char* kCudfBatchSizeMinBytes{
+      "cudf.batch_size_min_bytes"};
   static constexpr const char* kCudfBatchSizeMaxThreshold{
       "cudf.batch_size_max_threshold"};
   static constexpr const char* kCudfHashJoinDistinctEnabled{
@@ -205,10 +208,9 @@ struct CudfConfig {
 
   /// Whether to insert CudfBatchConcat before supported Cudf operators.
   /// This can improve performance by reducing the number of cuda kernel
-  /// launches on addInput of certain operators by collecting a minimum number
-  /// of rows before concatenating and passing on to the next operator.
-  /// This batch size is determined by batchSizeMinThreshold and
-  /// batchSizeMaxThreshold
+  /// launches on addInput of certain operators. Inputs are collected until
+  /// batchSizeMinBytes is reached, or batchSizeMinThreshold otherwise.
+  /// batchSizeMaxThreshold limits the rows in a concatenated batch.
   bool concatOptimizationEnabled{false};
 
   /// Maximum distinct keys retained by FINAL streaming groupby. Zero keeps
@@ -240,8 +242,9 @@ struct CudfConfig {
   /// from the first batch and to grow capacity when it is exhausted.
   double streamingGroupbyCapacityMultiplier{2.0};
 
-  /// Minimum rows to accumulate before GPU-side concatenation in
-  /// `CudfBatchConcat` (default 100k).
+  /// Minimum rows to accumulate before GPU-side concatenation (default 100k).
+  /// Applies when batchSizeMinBytes is unset, and always to zero-column
+  /// vectors, which have no GPU buffers to measure.
   int32_t batchSizeMinThreshold{100000};
 
   /// Target rows for CudfBatchConcat immediately after a UCX Exchange. Keep
@@ -257,6 +260,19 @@ struct CudfConfig {
   /// the byte threshold. When both row and byte thresholds are configured,
   /// reaching either one flushes the batch.
   uint64_t batchSizeMinThresholdBytes{0};
+
+  /// Estimated GPU bytes (CudfVector::estimateFlatSize()) to accumulate before
+  /// concatenation. Overrides batchSizeMinThreshold when set.
+  ///
+  /// This is a flush threshold, not a bound: inputs are buffered whole, so the
+  /// buffer can exceed it by up to one input. Peak GPU usage is about twice the
+  /// buffered bytes while cudf::concatenate builds the output, plus any
+  /// batchSizeMaxThreshold splits not yet drained downstream.
+  ///
+  /// With string columns, keep this well under 2 GiB unless
+  /// LIBCUDF_LARGE_STRINGS_ENABLED is set; cuDF rejects strings columns whose
+  /// character data overflows 32-bit offsets.
+  std::optional<uint64_t> batchSizeMinBytes;
 
   /// Maximum rows allowed in a concatenated batch (user configurable).
   /// When not set, cuDF's own `size_type::max()` is used.

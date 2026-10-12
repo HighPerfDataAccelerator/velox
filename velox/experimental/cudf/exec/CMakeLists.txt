@@ -26,6 +26,7 @@ add_library(
   CudfGroupby.cpp
   CudfHashJoin.cpp
   CudfJoin.cpp
+  CudfJoinBuild.cpp
   CudfLimit.cpp
   CudfLocalMerge.cpp
   CudfLocalPartition.cpp
@@ -42,6 +43,7 @@ add_library(
   DecimalAggregationDevice.cu
   DecimalAggregationHostOps.cpp
   DecimalAggregationState.cpp
+  GpuCapabilities.cpp
   GpuResources.cpp
   OperatorAdapters.cpp
   PrestoAggregateFunctions.cpp

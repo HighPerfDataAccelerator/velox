@@ -76,6 +76,10 @@ namespace facebook::velox::cudf_velox {
  * are also properly synchronized. The input tables are consumed and deallocated
  * after synchronization.
  *
+ * Input ownership is released one output batch at a time after stream-safe
+ * deallocation ordering has been established. This avoids retaining the full
+ * input set while all output batches are materialized.
+ *
  * @param tables Input vector of CUDF tables to concatenate (consumed during
  * operation)
  * @param tableType Velox type representation for creating empty tables when
@@ -83,7 +87,6 @@ namespace facebook::velox::cudf_velox {
  * @param stream CUDA stream for asynchronous operations and memory management
  * @return Vector of concatenated tables (multiple if input exceeded size
  * limits)
- *
  */
 [[nodiscard]] std::vector<std::unique_ptr<cudf::table>>
 getConcatenatedTableBatched(
@@ -210,6 +213,15 @@ void orderCudfVectorDeallocationsAfterStream(
     std::span<const CudfVectorPtr> vectors,
     std::span<const cuda::stream_ref> inputStreams,
     cuda::stream_ref stream);
+
+/// Creates an all-null cuDF column of \p numRows for the given Velox \p type.
+/// Supports cuDF-compatible scalar types and nested Velox ARRAY and ROW types.
+/// Throws for unsupported types.
+std::unique_ptr<cudf::column> makeAllNullColumn(
+    const TypePtr& type,
+    cudf::size_type numRows,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr);
 
 /// Extract the base function name from a possibly-prefixed name.
 /// Handles both Presto-style "presto.default.lag" and simple "lag".

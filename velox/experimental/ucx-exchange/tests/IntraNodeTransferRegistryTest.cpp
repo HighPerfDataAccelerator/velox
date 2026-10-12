@@ -15,8 +15,8 @@
  */
 #include "velox/experimental/ucx-exchange/IntraNodeTransferRegistry.h"
 #include <gtest/gtest.h>
-#include <rmm/cuda_stream_view.hpp>
 #include <atomic>
+#include <cuda/stream>
 
 using namespace facebook::velox::ucx_exchange;
 
@@ -43,7 +43,7 @@ TEST(IntraNodeTransferRegistryTest, registerWaiterWokenByPublish) {
   auto future = registry->publish(
       key,
       /*data=*/nullptr,
-      rmm::cuda_stream_default,
+      cuda::stream_ref{cudaStream_t{cudaStreamDefault}},
       /*numRows=*/0,
       /*atEnd=*/false);
   EXPECT_EQ(woken.load(), 1);
@@ -63,7 +63,7 @@ TEST(IntraNodeTransferRegistryTest, registerWaiterReadyReturnsTrue) {
   auto future = registry->publish(
       key,
       /*data=*/nullptr,
-      rmm::cuda_stream_default,
+      cuda::stream_ref{cudaStream_t{cudaStreamDefault}},
       /*numRows=*/0,
       /*atEnd=*/true);
 

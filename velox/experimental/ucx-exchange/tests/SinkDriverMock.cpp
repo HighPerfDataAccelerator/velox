@@ -62,7 +62,7 @@ void SinkDriverMock::updateDataValidity(
     return; // No reference data to check against
   }
 
-  auto stream = rmm::cuda_stream_default;
+  auto stream = cuda::stream_ref{cudaStream_t{cudaStreamDefault}};
 
   // Output chunks may be bounded slices of a larger input table. Validate each
   // slice at its logical position in the received stream.

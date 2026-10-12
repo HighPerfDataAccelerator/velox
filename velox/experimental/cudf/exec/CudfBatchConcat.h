@@ -22,6 +22,8 @@
 
 #include "velox/exec/Operator.h"
 
+#include <cstdint>
+#include <optional>
 #include <queue>
 #include <string>
 
@@ -71,7 +73,10 @@ class CudfBatchConcat : public CudfOperatorBase {
  private:
   exec::DriverCtx* const driverCtx_;
   const std::string aggregationStep_;
+  // Input vectors awaiting concatenation.
   std::vector<CudfVectorPtr> buffer_;
+
+  // Concatenated vectors ready for downstream consumption.
   std::queue<CudfVectorPtr> outputQueue_;
   uint64_t totalInputRows_{0};
   uint64_t totalInputBytes_{0};

@@ -37,7 +37,8 @@ HiveIcebergSplit::HiveIcebergSplit(
     int64_t dataSequenceNumber,
     const std::unordered_map<int32_t, std::optional<std::string>>&
         identityPartitionKeys,
-    std::optional<dwio::common::ColumnMappingMode> columnMappingMode)
+    std::optional<dwio::common::ColumnMappingMode> columnMappingMode,
+    std::optional<ChangelogSplitInfo> changelogSplitInfo)
     : HiveConnectorSplit(
           connectorId,
           filePath,
@@ -57,7 +58,8 @@ HiveIcebergSplit::HiveIcebergSplit(
           std::nullopt,
           columnMappingMode),
       dataSequenceNumber(dataSequenceNumber),
-      identityPartitionKeys(identityPartitionKeys) {
+      identityPartitionKeys(identityPartitionKeys),
+      changelogSplitInfo(std::move(changelogSplitInfo)) {
   // TODO: Deserialize _extraFileInfo to get deleteFiles;
 }
 
@@ -81,6 +83,7 @@ HiveIcebergSplit::HiveIcebergSplit(
     const std::unordered_map<int32_t, std::optional<std::string>>&
         identityPartitionKeys,
     std::optional<dwio::common::ColumnMappingMode> columnMappingMode,
+    std::optional<ChangelogSplitInfo> changelogSplitInfo,
     std::vector<IcebergCoalescedFile> coalescedFiles)
     : HiveConnectorSplit(
           connectorId,
@@ -103,7 +106,8 @@ HiveIcebergSplit::HiveIcebergSplit(
       deleteFiles(std::move(deletes)),
       coalescedFiles(std::move(coalescedFiles)),
       dataSequenceNumber(dataSequenceNumber),
-      identityPartitionKeys(identityPartitionKeys) {}
+      identityPartitionKeys(identityPartitionKeys),
+      changelogSplitInfo(std::move(changelogSplitInfo)) {}
 
 HiveIcebergSplit::HiveIcebergSplit(
     const std::string& connectorId,
@@ -141,6 +145,7 @@ HiveIcebergSplit::HiveIcebergSplit(
           dataSequenceNumber,
           identityPartitionKeys,
           std::nullopt,
+          std::nullopt,
           std::move(coalescedFiles)) {}
 
 HiveIcebergSplit::HiveIcebergSplit(
@@ -177,6 +182,7 @@ HiveIcebergSplit::HiveIcebergSplit(
           dataSequenceNumber,
           std::unordered_map<int32_t, std::optional<std::string>>{},
           std::nullopt,
+          std::nullopt,
           std::move(coalescedFiles)) {}
 
 std::shared_ptr<HiveIcebergSplit> IcebergSplitBuilder::build() const {
@@ -196,7 +202,8 @@ std::shared_ptr<HiveIcebergSplit> IcebergSplitBuilder::build() const {
       std::nullopt,
       dataSequenceNumber_,
       identityPartitionKeys_,
-      columnMappingMode_);
+      columnMappingMode_,
+      changelogSplitInfo_);
   split->physicalFilePath = physicalFilePath_;
   return split;
 }

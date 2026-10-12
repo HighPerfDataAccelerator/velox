@@ -314,6 +314,7 @@ RowVectorPtr TableScan::getOutput() {
             core::ScanBatchEvent event;
             event.numRows = completedRowsDelta;
             event.wallTimeMicros = ioTimeUs;
+            event.planNodeId = planNodeId();
             dataSource_->fireScanBatchCallback(event);
           }
           maxFilteringRatio_ = std::max(

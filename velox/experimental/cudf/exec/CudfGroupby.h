@@ -123,6 +123,11 @@ struct GroupbyAggregator {
     VELOX_UNSUPPORTED("Aggregate does not support PARTIAL identity output");
   }
 
+  // Release request temporaries after aggregate() has enqueued their last use.
+  virtual void releaseInput() {
+    maskedValues_.reset();
+  }
+
   virtual ~GroupbyAggregator() = default;
 
  protected:

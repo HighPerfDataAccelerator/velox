@@ -1150,7 +1150,7 @@ void UcxExchangeSource::waitForIntraNodeData() {
 
 void UcxExchangeSource::onIntraNodeData(
     std::shared_ptr<cudf::packed_columns> data,
-    rmm::cuda_stream_view producerStream,
+    cuda::stream_ref producerStream,
     vector_size_t numRows,
     bool atEnd) {
   // Check if close() was called
@@ -1207,7 +1207,7 @@ void UcxExchangeSource::onIntraNodeData(
   // shared owner and the producer host-synchronizes before publishing).
   auto stream = sharedPage
       ? facebook::velox::cudf_velox::cudfGlobalStreamPool().get_stream()
-      : cuda::stream_ref{producerStream.value()};
+      : producerStream;
   cudf::packed_columns packedCols(
       sharedPage ? std::make_unique<std::vector<uint8_t>>(*data->metadata)
                  : std::move(data->metadata),

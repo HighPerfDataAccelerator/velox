@@ -31,6 +31,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -54,6 +55,8 @@ class CudfIcebergSplitReader : public CudfSplitReader {
   CudfIcebergSplitReader(
       std::shared_ptr<CudfHiveConnectorSplit> split,
       std::shared_ptr<const velox_iceberg::HiveIcebergSplit> icebergSplit,
+      std::unordered_set<std::string> partitionColumnNames,
+      std::unordered_map<std::string, int32_t> sourceFieldIds,
       std::shared_ptr<const velox_hive::HiveTableHandle> tableHandle,
       const RowTypePtr& outputType,
       const std::vector<std::string>& readColumnNames,
@@ -64,7 +67,6 @@ class CudfIcebergSplitReader : public CudfSplitReader {
       const std::shared_ptr<const velox_hive::HiveConfig>& hiveConfig,
       const std::shared_ptr<io::IoStatistics>& ioStatistics,
       const std::shared_ptr<IoStats>& ioStats,
-      bool useExperimentalCudfReader,
       const cudf::ast::expression* subfieldFilterAst,
       const common::SubfieldFilters* subfieldFilters);
 
@@ -75,9 +77,6 @@ class CudfIcebergSplitReader : public CudfSplitReader {
   // Override to report a split the filter rejects as skipped.
   bool isSplitSkipped() const override;
 
-  // Override to only setup cuDF reader if we have columns to read.
-  void setupReader() override;
-
   // Skip Parquet pushdown when the subfield filter must run after reading.
   cudf::ast::expression const* pushdownFilter() const override;
 
@@ -85,12 +84,12 @@ class CudfIcebergSplitReader : public CudfSplitReader {
   rmm::device_async_resource_ref determineCudfMemoryResource() const override;
 
   // Override to apply Iceberg deletes after reading a cudf table chunk.
-  std::optional<std::unique_ptr<cudf::table>> readNextChunk() override;
+  std::optional<TableChunk> readNextChunk() override;
+
+  // Clear delete readers, column injection, and the base reader state.
+  void resetSplit() override;
 
  private:
-  // Clear delete readers and column injection
-  void resetSplit();
-
   // Prepare the current physical file after its base reader state is reset.
   void prepareCurrentSplit(dwio::common::RuntimeStats& runtimeStats);
 
@@ -100,7 +99,6 @@ class CudfIcebergSplitReader : public CudfSplitReader {
   // Load each footer independently and compare schemas before cuDF aggregates
   // metadata across multiple sources.
   bool loadCoalescedFileMetadataAndCheckSchemas();
-
   // Selects applicable positional delete, equality delete, and deletion vector
   // files that apply to the split without opening any files.
   void classifyDeleteFiles();
@@ -163,10 +161,11 @@ class CudfIcebergSplitReader : public CudfSplitReader {
   // that are not already in the output projection.
   void setupEqualityColumnKeys();
 
-  // Read metadata and cache `splitRowCount_` and `fileColumnNames_`
+  // Read metadata and cache `splitRowCount_` and `fileColumnNames_` across all
+  // physical files in an Iceberg coalesced split.
   void cacheSchemaFromMetadata();
 
-  // Returns the row range covered by the split.
+  // Returns the row range covered by the primary physical split.
   std::pair<std::size_t, std::size_t> computeSplitRowRange() const;
 
   // Adapts the data file schema to match the table schema expected by the
@@ -177,15 +176,23 @@ class CudfIcebergSplitReader : public CudfSplitReader {
   //    post-read injection as a constant.
   //
   // 2. Partition columns (Hive-migrated tables):
-  //    Value comes from the split's `partitionKeys`, not the data file.
-  //    Recorded for post-read injection as a constant.
+  //    Value comes from the split's metadata, not the data file. Recorded
+  //    for post-read injection as a constant.
+  //    a. `identityPartitionKeys`, keyed by the column's source field ID.
+  //       Checked first and applies to regular columns too, since the file's
+  //       own partition spec may differ from the current one.
+  //    b. `partitionKeys`, keyed by name, for `kPartitionKey` columns only.
   //
   // 3. Columns missing from the file (schema evolution):
-  //    Newly added columns absent from `fileColumnNames_`. Recorded for
-  //    post-read injection as a typed NULL.
+  //    Other columns absent from `fileColumnNames_`. Recorded for post-read
+  //    injection as a typed NULL.
   //
   // 4. Columns present in the file:
   //    Left in `readColumnNames_` for the parquet reader.
+  //
+  // A regular column sharing a transformed partition field's name falls into
+  // (3-4), unless its source field ID has an identity value (2a). Only (2)
+  // reads partition values: (2a) by field ID and (2b) by name.
   //
   // Injected names (1-3) are removed from `readColumnNames_`. `outputIndex` is
   // the column's position in the pre-strip `readColumnNames_` layout (output,
@@ -242,6 +249,13 @@ class CudfIcebergSplitReader : public CudfSplitReader {
   bool deferEverything() const;
 
   std::shared_ptr<const velox_iceberg::HiveIcebergSplit> icebergSplit_;
+
+  // Output and filter-only columns whose handles are `kPartitionKey`.
+  const std::unordered_set<std::string> partitionColumnNames_;
+
+  // Iceberg source field IDs of output and filter-only columns, by name.
+  const std::unordered_map<std::string, int32_t> sourceFieldIds_;
+
   std::shared_ptr<const velox_hive::HiveConfig> hiveConfig_;
   const std::vector<std::string> initialReadColumnNames_;
 
@@ -277,10 +291,6 @@ class CudfIcebergSplitReader : public CudfSplitReader {
   // Columns to inject after reading.
   std::vector<InjectedColumn> injectedColumns_;
 
-  // Whether every projected column is injected
-  bool noColumnsToRead_{false};
-  bool syntheticTableProduced_{false};
-
   // Whether the filter rejects this split entirely.
   bool skipSplit_{false};
 
@@ -292,13 +302,6 @@ class CudfIcebergSplitReader : public CudfSplitReader {
   // Transform of the logical filter, held only when a `PushdownFilterBuilder`
   // has transformed it differently from the pushed filter.
   std::optional<TransformedFilter> transformedLogicalFilter_;
-
-  // Top-level column names and total row count from the file metadata
-  std::unordered_set<std::string> fileColumnNames_;
-
-  // Tracks the absolute row range covered by the split.
-  std::size_t baseReadOffset_{0};
-  std::size_t splitRowCount_{0};
 
   // Bitmaps for positional deletes
   BufferPtr deleteBitmap_{nullptr};

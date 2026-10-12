@@ -18,7 +18,6 @@
 #include <cudf/io/types.hpp>
 #include <cudf/table/table.hpp>
 #include <fmt/format.h>
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/exec_policy.hpp>
 #include <limits>
 #include "velox/experimental/ucx-exchange/IntraNodeTransferRegistry.h"
@@ -26,10 +25,11 @@
 namespace facebook::velox::ucx_exchange {
 
 /* static */
-std::shared_ptr<UcxOutputQueueManager> UcxOutputQueueManager::getInstanceRef() {
+const std::shared_ptr<UcxOutputQueueManager>&
+UcxOutputQueueManager::getInstanceRef() {
   // In C++11, the static local variable is guaranteed to only be initialized
   // once even in a multi-threaded context.
-  static std::shared_ptr<UcxOutputQueueManager> instance =
+  static const std::shared_ptr<UcxOutputQueueManager> instance =
       std::make_shared<UcxOutputQueueManager>();
   return instance;
 }

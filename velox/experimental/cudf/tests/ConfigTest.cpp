@@ -16,11 +16,20 @@
 
 #include "velox/experimental/cudf/CudfConfig.h"
 
+#include "velox/common/base/Exceptions.h"
+#include "velox/common/base/tests/GTestUtils.h"
+
 #include <gtest/gtest.h>
 
 #include <limits>
 
 namespace facebook::velox::cudf_velox::test {
+
+TEST(ConfigTest, batchConcatThresholdDefaults) {
+  CudfConfig config;
+  EXPECT_EQ(config.batchSizeMinThreshold, 100'000);
+  EXPECT_FALSE(config.batchSizeMinBytes);
+}
 
 TEST(ConfigTest, cudfConfig) {
   CudfConfig defaults;
@@ -50,7 +59,9 @@ TEST(ConfigTest, cudfConfig) {
       {CudfConfig::kCudfOrderByMergeFanIn, "7"},
       {CudfConfig::kCudfWindowSortedRunBytes, "134217728"},
       {CudfConfig::kCudfStreamingGroupbyEnabled, "true"},
-      {CudfConfig::kCudfStreamingGroupbyCapacityMultiplier, "3.5"}};
+      {CudfConfig::kCudfStreamingGroupbyCapacityMultiplier, "3.5"},
+      {CudfConfig::kCudfBatchSizeMinThreshold, "123456"},
+      {CudfConfig::kCudfBatchSizeMinBytes, "2147483648"}};
 
   CudfConfig config;
   ASSERT_FALSE(config.streamingGroupbyEnabled);
@@ -74,6 +85,8 @@ TEST(ConfigTest, cudfConfig) {
   ASSERT_EQ(config.windowSortedRunBytes, 134217728);
   ASSERT_EQ(config.orderByOutputChunkBytes, 134217728);
   ASSERT_EQ(config.orderByMaxOutputRows, 1048576);
+  ASSERT_EQ(config.batchSizeMinThreshold, 123'456);
+  ASSERT_EQ(config.batchSizeMinBytes.value(), 2'147'483'648);
 }
 
 TEST(ConfigTest, HashJoinLoadFactorBounds) {
@@ -146,6 +159,26 @@ TEST(ConfigTest, GroupbyStreamingMaxDistinctKeysRange) {
   CudfConfig overflowConfig;
   EXPECT_ANY_THROW(overflowConfig.initialize(
       {{CudfConfig::kCudfGroupbyStreamingMaxDistinctKeys, "2147483648"}}));
+}
+
+TEST(ConfigTest, rejectsNonPositiveBatchConcatTargets) {
+  auto initialize = [](const char* key, const char* value) {
+    CudfConfig config;
+    config.initialize({{key, value}});
+  };
+
+  VELOX_ASSERT_USER_THROW(
+      initialize(CudfConfig::kCudfBatchSizeMinThreshold, "0"),
+      "cuDF BatchConcat minimum row target must be positive");
+  VELOX_ASSERT_USER_THROW(
+      initialize(CudfConfig::kCudfBatchSizeMinThreshold, "-5"),
+      "cuDF BatchConcat minimum row target must be positive");
+  VELOX_ASSERT_USER_THROW(
+      initialize(CudfConfig::kCudfBatchSizeMinBytes, "0"),
+      "cuDF BatchConcat minimum byte target must be a positive integer: 0");
+  VELOX_ASSERT_USER_THROW(
+      initialize(CudfConfig::kCudfBatchSizeMinBytes, "-1"),
+      "cuDF BatchConcat minimum byte target must be a positive integer: -1");
 }
 
 } // namespace facebook::velox::cudf_velox::test
