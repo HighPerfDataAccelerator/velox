@@ -666,11 +666,11 @@ class RowContainer {
            reinterpret_cast<uintptr_t>(range.data()));
       auto row = iter->rowOffset;
       while (row + rowSize <= limit) {
-        // Tuned and validated on x86 only; unmeasured on other architectures.
-#if defined(__x86_64__)
+#if defined(__x86_64__) || defined(__aarch64__)
         // Use integer arithmetic to avoid out-of-bounds pointer arithmetic when
         // the target lies past the current range; the hint itself is
-        // non-faulting for an invalid target on x86.
+        // non-faulting for an invalid target on x86 (PREFETCH) and aarch64
+        // (PRFM).
         if constexpr (prefetchDistanceBytes > 0) {
           __builtin_prefetch(reinterpret_cast<const char*>(
               reinterpret_cast<uintptr_t>(data) + row + prefetchDistanceBytes));
