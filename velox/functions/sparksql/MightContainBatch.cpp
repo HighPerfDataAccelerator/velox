@@ -151,8 +151,8 @@ class MightContainBatchFunction : public exec::VectorFunction {
           [&](vector_size_t row) { bits::setBit(rawResult, row, false); });
       return;
     }
-    exec::DecodedArgs decodedArgs(rows, {args[1]}, context);
-    const auto* values = decodedArgs.at(0);
+    exec::LocalDecodedVector decodedValues(context, *args[1], rows);
+    const auto* values = decodedValues.get();
     const uint64_t* bloom = view_->bitsData();
     const auto bloomSize = static_cast<uint32_t>(view_->size());
     auto probe = [&](const int64_t* input, int32_t size, uint8_t* out) {
