@@ -88,6 +88,26 @@ function github_checkout {
 # CXX_FLAGS=$(get_cxx_flags "avx")
 
 # shellcheck disable=SC2120
+# Flags that turn off the hardening some distributions enable by default in their compilers
+# (Ubuntu/Debian GCC: -fstack-protector-strong, -D_FORTIFY_SOURCE=3, -fstack-clash-protection, and
+# -fzero-init-padding-bits=all with GCC 15). With them, a build matches one made with a compiler that
+# has no such defaults (e.g. the RHEL gcc-toolset used for the Gluten release builds) and does not pay
+# their run-time cost in hot inlined code. Set VELOX_KEEP_DISTRO_HARDENING=ON to keep the compiler's
+# defaults. Each flag is emitted only if ${CXX:-c++} accepts it.
+function get_distro_hardening_off_flags {
+  if [ "${VELOX_KEEP_DISTRO_HARDENING:-OFF}" = "ON" ]; then
+    return
+  fi
+  local FLAG
+  for FLAG in -fno-stack-protector -fno-stack-clash-protection -U_FORTIFY_SOURCE \
+    -fzero-init-padding-bits=standard; do
+    if echo 'int main() { return 0; }' |
+      ${CXX:-c++} -x c++ -Werror "${FLAG}" -fsyntax-only - >/dev/null 2>&1; then
+      echo -n "${FLAG} "
+    fi
+  done
+}
+
 function get_cxx_flags {
   local CPU_ARCH=${1:-""}
   local OS
@@ -198,7 +218,7 @@ function get_cxx_flags {
     echo -n "Architecture not supported!"
     ;;
   esac
-
+  get_distro_hardening_off_flags
 }
 
 detect_sve_flags() {

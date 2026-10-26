@@ -440,9 +440,10 @@ if(
   )
 endif()
 
+# CXX lets the script probe the hardening-off flags with the compiler CMake uses.
 execute_process(
   COMMAND
-    bash -c
+    ${CMAKE_COMMAND} -E env CXX=${CMAKE_CXX_COMPILER} bash -c
     "( source ${CMAKE_CURRENT_SOURCE_DIR}/scripts/setup-helper-functions.sh && echo -n $(get_cxx_flags $ENV{CPU_TARGET}))"
   OUTPUT_VARIABLE SCRIPT_CXX_FLAGS
   RESULT_VARIABLE COMMAND_STATUS
@@ -452,6 +453,17 @@ if(COMMAND_STATUS EQUAL "1")
   message(FATAL_ERROR "Unable to determine compiler flags!")
 endif()
 message("Setting CMAKE_CXX_FLAGS=${SCRIPT_CXX_FLAGS}")
+
+# Also passed to dependencies built as external projects (bundled Arrow and its compression
+# libraries), which do not inherit CMAKE_CXX_FLAGS.
+execute_process(
+  COMMAND
+    ${CMAKE_COMMAND} -E env CXX=${CMAKE_CXX_COMPILER} bash -c
+    "( source ${CMAKE_CURRENT_SOURCE_DIR}/scripts/setup-helper-functions.sh && echo -n $(get_distro_hardening_off_flags))"
+  OUTPUT_VARIABLE VELOX_DISTRO_HARDENING_OFF_FLAGS
+)
+message("Distribution compiler hardening turned off with: ${VELOX_DISTRO_HARDENING_OFF_FLAGS}")
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${VELOX_DISTRO_HARDENING_OFF_FLAGS}")
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${SCRIPT_CXX_FLAGS}")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DUSE_VELOX_COMMON_BASE")
