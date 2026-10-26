@@ -53,8 +53,8 @@ if(VELOX_ENABLE_ARROW)
     -DBOOST_ROOT=${BOOST_ROOT}
     -DBoost_NO_BOOST_CMAKE=TRUE
     -DCMAKE_POLICY_VERSION_MINIMUM=3.5
-    -DCMAKE_C_FLAGS=${VELOX_DISTRO_HARDENING_OFF_FLAGS}
-    -DCMAKE_CXX_FLAGS=${VELOX_DISTRO_HARDENING_OFF_FLAGS}
+    -DCMAKE_C_FLAGS=${SCRIPT_CXX_FLAGS}
+    -DCMAKE_CXX_FLAGS=${SCRIPT_CXX_FLAGS}
     # Remove with Arrow upgrade to Arrow 20.
     -DARROW_CXXFLAGS=-Wno-documentation
     # Arrow inherits the CMake build type from Velox. So a Debug build turns

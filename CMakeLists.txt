@@ -454,16 +454,11 @@ if(COMMAND_STATUS EQUAL "1")
 endif()
 message("Setting CMAKE_CXX_FLAGS=${SCRIPT_CXX_FLAGS}")
 
-# Also passed to dependencies built as external projects (bundled Arrow and its compression
-# libraries), which do not inherit CMAKE_CXX_FLAGS.
-execute_process(
-  COMMAND
-    ${CMAKE_COMMAND} -E env CXX=${CMAKE_CXX_COMPILER} bash -c
-    "( source ${CMAKE_CURRENT_SOURCE_DIR}/scripts/setup-helper-functions.sh && echo -n $(get_distro_hardening_off_flags))"
-  OUTPUT_VARIABLE VELOX_DISTRO_HARDENING_OFF_FLAGS
-)
-message("Distribution compiler hardening turned off with: ${VELOX_DISTRO_HARDENING_OFF_FLAGS}")
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${VELOX_DISTRO_HARDENING_OFF_FLAGS}")
+# C sources and dependencies built as external projects (bundled Arrow with its LZ4/Zstd/Snappy),
+# which do not inherit CMAKE_CXX_FLAGS, get the same CPU target and hardening flags. Without the
+# CPU target, bundled Arrow on aarch64 is ARMv8.0 code whose atomics call outline helpers
+# (__aarch64_ldadd4_acq_rel was 1.1% of executor CPU in Gluten TPC-DS on Olympus).
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${SCRIPT_CXX_FLAGS}")
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${SCRIPT_CXX_FLAGS}")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DUSE_VELOX_COMMON_BASE")
