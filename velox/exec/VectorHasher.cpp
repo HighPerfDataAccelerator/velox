@@ -37,25 +37,42 @@ namespace {
 constexpr uint32_t kVectorHasherStateMagic = 0x56485331; // VHS1
 constexpr uint32_t kVectorHasherStateVersion = 3;
 
-// Runs 'func' on each selected row. For dense selections with a positive
-// 'distance', first calls 'prefetch' on the row 'distance' ahead so that
-// independent cache misses overlap. Sparse selections run unchanged.
+// Runs 'func' on each selected row. With a positive 'distance', first calls
+// 'prefetch' on the selected row 'distance' positions ahead so that
+// independent cache misses overlap.
 template <typename Prefetch, typename Func>
 void applyWithPrefetch(
     const SelectivityVector& rows,
     int32_t distance,
     Prefetch&& prefetch,
     Func&& func) {
-  if (distance <= 0 || !rows.isAllSelected()) {
+  if (distance <= 0) {
     rows.applyToSelected(func);
     return;
   }
-  const auto end = rows.end();
-  for (auto row = rows.begin(); row < end; ++row) {
-    if (row + distance < end) {
-      prefetch(row + distance);
+  if (rows.isAllSelected()) {
+    const auto end = rows.end();
+    for (auto row = rows.begin(); row < end; ++row) {
+      if (row + distance < end) {
+        prefetch(row + distance);
+      }
+      func(row);
     }
-    func(row);
+    return;
+  }
+  // Join probes arrive with rows already removed by null keys or a Bloom
+  // filter; look ahead along the selected rows instead. 'func' may deselect
+  // rows, so walk a copy of the selection.
+  thread_local std::vector<vector_size_t> selected;
+  selected.clear();
+  rows.applyToSelected(
+      [&](vector_size_t row) INLINE_LAMBDA { selected.push_back(row); });
+  const auto numSelected = static_cast<int32_t>(selected.size());
+  for (int32_t i = 0; i < numSelected; ++i) {
+    if (i + distance < numSelected) {
+      prefetch(selected[i + distance]);
+    }
+    func(selected[i]);
   }
 }
 
@@ -1024,21 +1041,34 @@ void VectorHasher::lookupValueIdsTyped(
 
   if (decoded.isIdentityMapping() ||
       rows.countSelected() <= decoded.base()->size()) {
-    rows.applyToSelected([&](vector_size_t row) INLINE_LAMBDA {
-      if (decoded.isNullAt(row)) {
-        if (multiplier_ == 1) {
-          result[row] = 0;
-        }
-        return;
-      }
-      T value = decoded.valueAt<T>(row);
-      uint64_t id = lookupValueId(value);
-      if (id == kUnmappable) {
-        rows.setValid(row, false);
-        return;
-      }
-      result[row] = multiplier_ == 1 ? id : result[row] + multiplier_ * id;
-    });
+    // Probe rows look up the distinct-value table one at a time, like the
+    // build side; prefetch the chunk of the row 'distance' ahead so that the
+    // misses of consecutive probes overlap. Rows that a previous key cleared
+    // from 'rows' are still valid to read.
+    applyWithPrefetch(
+        rows,
+        valueIdPrefetchDistance(),
+        [&](vector_size_t row) {
+          if (!decoded.isNullAt(row)) {
+            prefetchValueId(decoded.valueAt<T>(row));
+          }
+        },
+        [&](vector_size_t row) INLINE_LAMBDA {
+          if (decoded.isNullAt(row)) {
+            if (multiplier_ == 1) {
+              result[row] = 0;
+            }
+            return;
+          }
+          T value = decoded.valueAt<T>(row);
+          uint64_t id = lookupValueId(value);
+          if (id == kUnmappable) {
+            rows.setValid(row, false);
+            return;
+          }
+          result[row] =
+              multiplier_ == 1 ? id : result[row] + multiplier_ * id;
+        });
     rows.updateBounds();
     return;
   }
