@@ -22,6 +22,8 @@
 #include "velox/common/serialization/NativeSerdeIO.h"
 #include "velox/type/FloatingPointUtil.h"
 
+#include <array>
+
 #include <gflags/gflags.h>
 
 DEFINE_int32(
@@ -1034,6 +1036,56 @@ void VectorHasher::lookupValueIdsTyped(
     }
     if (Kind == TypeKind::INTEGER && isRange_) {
       lookupIdsRangeSimd<int32_t>(decoded, rows, result);
+      rows.updateBounds();
+      return;
+    }
+  }
+
+  if constexpr (
+      std::is_integral_v<T> && !std::is_same_v<T, bool> &&
+      sizeof(T) <= sizeof(int64_t)) {
+    if (!isRange_ && valueIdPrefetchDistance() > 0 &&
+        (decoded.isIdentityMapping() ||
+         rows.countSelected() <= decoded.base()->size())) {
+      // Hash each key once: its F14 token both prefetches the chunk and
+      // drives the lookup, and a block of tokens keeps that many misses in
+      // flight.
+      constexpr int32_t kBlock = 64;
+      std::array<vector_size_t, kBlock> blockRows;
+      std::array<int64_t, kBlock> blockValues;
+      std::array<folly::F14HashToken, kBlock> tokens;
+      int32_t numInBlock = 0;
+      auto lookupBlock = [&]() {
+        for (int32_t i = 0; i < numInBlock; ++i) {
+          const auto row = blockRows[i];
+          const auto iter =
+              uniqueValues_.find(tokens[i], UniqueValue(blockValues[i]));
+          if (iter == uniqueValues_.end()) {
+            rows.setValid(row, false);
+            continue;
+          }
+          const uint64_t id = iter->id();
+          result[row] = multiplier_ == 1 ? id : result[row] + multiplier_ * id;
+        }
+        numInBlock = 0;
+      };
+      rows.applyToSelected([&](vector_size_t row) INLINE_LAMBDA {
+        if (decoded.isNullAt(row)) {
+          if (multiplier_ == 1) {
+            result[row] = 0;
+          }
+          return;
+        }
+        blockValues[numInBlock] = decoded.valueAt<T>(row);
+        tokens[numInBlock] =
+            uniqueValues_.prehash(UniqueValue(blockValues[numInBlock]));
+        uniqueValues_.prefetch(tokens[numInBlock]);
+        blockRows[numInBlock] = row;
+        if (++numInBlock == kBlock) {
+          lookupBlock();
+        }
+      });
+      lookupBlock();
       rows.updateBounds();
       return;
     }
