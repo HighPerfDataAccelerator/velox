@@ -17,6 +17,7 @@
 
 #include <cstdint>
 
+#include "velox/common/base/BitUtil.h"
 #include "velox/type/StringView.h"
 #include "velox/type/Timestamp.h"
 #include "velox/type/Type.h"
@@ -30,10 +31,20 @@ class XxHash64 final {
   using ReturnType = int64_t;
 
   /// Hashes a 32-bit integer value.
-  static uint64_t hashInt32(const int32_t input, uint64_t seed);
+  static uint64_t hashInt32(const int32_t input, uint64_t seed) {
+    int64_t hash = seed + kPrime64_5 + 4L;
+    hash ^= static_cast<int64_t>((input & 0xFFFFFFFFL) * kPrime64_1);
+    hash = bits::rotateLeft64(hash, 23) * kPrime64_2 + kPrime64_3;
+    return fmix(hash);
+  }
 
   /// Hashes a 64-bit integer value.
-  static uint64_t hashInt64(int64_t input, uint64_t seed);
+  static uint64_t hashInt64(int64_t input, uint64_t seed) {
+    int64_t hash = seed + kPrime64_5 + 8L;
+    hash ^= bits::rotateLeft64(input * kPrime64_2, 31) * kPrime64_1;
+    hash = bits::rotateLeft64(hash, 27) * kPrime64_1 + kPrime64_4;
+    return fmix(hash);
+  }
 
   /// Hashes a float value, treating -0.0f as +0.0f.
   static uint64_t hashFloat(float input, uint64_t seed) {
@@ -65,7 +76,14 @@ class XxHash64 final {
   static constexpr uint64_t kPrime64_4 = 0x85EBCA77C2B2AE63L;
   static constexpr uint64_t kPrime64_5 = 0x27D4EB2F165667C5L;
 
-  static uint64_t fmix(uint64_t hash);
+  static uint64_t fmix(uint64_t hash) {
+    hash ^= hash >> 33;
+    hash *= kPrime64_2;
+    hash ^= hash >> 29;
+    hash *= kPrime64_3;
+    hash ^= hash >> 32;
+    return hash;
+  }
 
   static uint64_t hashBytesByWords(const StringView& input, uint64_t seed);
 };
