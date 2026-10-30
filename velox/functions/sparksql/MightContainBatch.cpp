@@ -17,9 +17,13 @@
 #include "velox/functions/sparksql/MightContainBatch.h"
 
 #include <array>
+#include <mutex>
 #include <optional>
+#include <string>
+#include <string_view>
 #include <vector>
 
+#include <folly/container/F14Map.h>
 #include <gflags/gflags.h>
 
 #include "velox/common/base/BloomFilter.h"
@@ -32,6 +36,12 @@ DEFINE_bool(
     false,
     "Remember recent results of a batched might_contain by input value, so "
     "that low-cardinality inputs skip the Bloom filter lookups");
+
+DEFINE_bool(
+    velox_might_contain_share_filters,
+    false,
+    "Let batched might_contain functions of all tasks in the process probe "
+    "one shared copy of an identical serialized Bloom filter");
 
 namespace facebook::velox::functions::sparksql {
 namespace bloom_probe {
@@ -143,8 +153,14 @@ namespace {
 
 class MightContainBatchFunction : public exec::VectorFunction {
  public:
-  MightContainBatchFunction(std::optional<BloomFilterView> view, bool sve)
-      : view_(view), sve_(sve), memoEnabled_(FLAGS_velox_might_contain_memo) {}
+  MightContainBatchFunction(
+      std::optional<BloomFilterView> view,
+      std::shared_ptr<const std::string> sharedFilter,
+      bool sve)
+      : view_(view),
+        sharedFilter_(std::move(sharedFilter)),
+        sve_(sve),
+        memoEnabled_(FLAGS_velox_might_contain_memo) {}
 
   void apply(
       const SelectivityVector& rows,
@@ -275,6 +291,9 @@ class MightContainBatchFunction : public exec::VectorFunction {
   // function, which then returns false for every non-NULL row.
   const std::optional<BloomFilterView> view_;
 
+  // The shared copy 'view_' reads when filters are shared, else null.
+  const std::shared_ptr<const std::string> sharedFilter_;
+
   const bool sve_;
 
   // Memo state. A function instance belongs to one expression set, which a
@@ -286,6 +305,33 @@ class MightContainBatchFunction : public exec::VectorFunction {
   mutable int64_t memoNumProbed_{0};
   mutable int64_t memoNumHits_{0};
 };
+
+// Returns the process-wide copy of 'serialized' that every function probing an
+// identical filter shares. Each task otherwise holds its own copy, and the
+// copies of tasks on the two hardware threads of a core compete for its L2.
+std::shared_ptr<const std::string> sharedFilter(StringView serialized) {
+  static std::mutex mutex;
+  static folly::F14FastMap<size_t, std::vector<std::weak_ptr<const std::string>>>
+      filters;
+  const std::string_view bytes(serialized.data(), serialized.size());
+  const auto hash = std::hash<std::string_view>{}(bytes);
+  std::lock_guard<std::mutex> lock(mutex);
+  auto& candidates = filters[hash];
+  for (auto it = candidates.begin(); it != candidates.end();) {
+    auto candidate = it->lock();
+    if (candidate == nullptr) {
+      it = candidates.erase(it);
+      continue;
+    }
+    if (*candidate == bytes) {
+      return candidate;
+    }
+    ++it;
+  }
+  auto copy = std::make_shared<const std::string>(bytes);
+  candidates.push_back(copy);
+  return copy;
+}
 
 } // namespace
 
@@ -303,6 +349,7 @@ std::shared_ptr<exec::VectorFunction> makeMightContainBatch(
   VELOX_CHECK_EQ(inputArgs.size(), 2);
   const auto& constant = inputArgs[0].constantValue;
   std::optional<BloomFilterView> view;
+  std::shared_ptr<const std::string> shared;
   // A NULL constant filter makes every row NULL through default NULL handling.
   if (constant != nullptr && !constant->isNullAt(0)) {
     const auto serialized =
@@ -312,9 +359,15 @@ std::shared_ptr<exec::VectorFunction> makeMightContainBatch(
         BloomFilterView::kSerializedHeaderSize,
         "Serialized BloomFilter is too small: {}",
         serialized.size());
-    view.emplace(serialized.data());
+    if (FLAGS_velox_might_contain_share_filters) {
+      shared = sharedFilter(serialized);
+      view.emplace(shared->data());
+    } else {
+      view.emplace(serialized.data());
+    }
   }
-  return std::make_shared<MightContainBatchFunction>(view, sve);
+  return std::make_shared<MightContainBatchFunction>(
+      view, std::move(shared), sve);
 }
 
 } // namespace facebook::velox::functions::sparksql
