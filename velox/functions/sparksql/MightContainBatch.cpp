@@ -18,11 +18,20 @@
 
 #include <array>
 #include <optional>
+#include <vector>
+
+#include <gflags/gflags.h>
 
 #include "velox/common/base/BloomFilter.h"
 #include "velox/expression/DecodedArgs.h"
 #include "velox/expression/FunctionSignature.h"
 #include "velox/vector/FlatVector.h"
+
+DEFINE_bool(
+    velox_might_contain_memo,
+    false,
+    "Remember recent results of a batched might_contain by input value, so "
+    "that low-cardinality inputs skip the Bloom filter lookups");
 
 namespace facebook::velox::functions::sparksql {
 namespace bloom_probe {
@@ -135,7 +144,7 @@ namespace {
 class MightContainBatchFunction : public exec::VectorFunction {
  public:
   MightContainBatchFunction(std::optional<BloomFilterView> view, bool sve)
-      : view_(view), sve_(sve) {}
+      : view_(view), sve_(sve), memoEnabled_(FLAGS_velox_might_contain_memo) {}
 
   void apply(
       const SelectivityVector& rows,
@@ -155,14 +164,21 @@ class MightContainBatchFunction : public exec::VectorFunction {
     const auto* values = decodedValues.get();
     const uint64_t* bloom = view_->bitsData();
     const auto bloomSize = static_cast<uint32_t>(view_->size());
-    auto probe = [&](const int64_t* input, int32_t size, uint8_t* out) {
+    auto probeBloom = [&](const int64_t* input, int32_t size, uint8_t* out) {
       if (sve_) {
         bloom_probe::probeSve(bloom, bloomSize, input, size, out);
       } else {
         bloom_probe::probeGeneric(bloom, bloomSize, input, size, out);
       }
     };
-    constexpr int32_t kBatch = 1'024;
+    auto probe = [&](const int64_t* input, int32_t size, uint8_t* out) {
+      if (memoEnabled_) {
+        probeWithMemo(input, size, out, probeBloom);
+      } else {
+        probeBloom(input, size, out);
+      }
+    };
+    constexpr int32_t kBatch = kMaxProbeSize;
     std::array<uint8_t, kBatch> hits;
     if (values->isIdentityMapping() && rows.isAllSelected()) {
       const auto* raw = values->data<int64_t>();
@@ -199,11 +215,76 @@ class MightContainBatchFunction : public exec::VectorFunction {
   }
 
  private:
+  // Answers repeated input values from a small direct-mapped table of earlier
+  // results and probes the Bloom filter only for the rest. Runtime filters on
+  // low-cardinality keys (dates, regions) then stay in L1/L2 instead of
+  // missing on a large, sparsely populated filter. Results are unchanged. The
+  // table is dropped once the first kMemoDecisionRows rows show a low hit rate.
+  template <typename ProbeBloom>
+  void probeWithMemo(
+      const int64_t* input,
+      int32_t size,
+      uint8_t* out,
+      ProbeBloom& probeBloom) const {
+    if (memoKeys_.empty()) {
+      memoKeys_.resize(kMemoSize);
+      memoStates_.assign(kMemoSize, kMemoEmpty);
+    }
+    std::array<int64_t, kMaxProbeSize> missValues;
+    std::array<int32_t, kMaxProbeSize> missPositions;
+    std::array<uint8_t, kMaxProbeSize> missHits;
+    int32_t numMisses = 0;
+    for (int32_t i = 0; i < size; ++i) {
+      // Inputs are xxhash64 values, so their low bits index the table well.
+      const auto slot = static_cast<uint64_t>(input[i]) & (kMemoSize - 1);
+      if (memoStates_[slot] != kMemoEmpty && memoKeys_[slot] == input[i]) {
+        out[i] = memoStates_[slot];
+      } else {
+        missValues[numMisses] = input[i];
+        missPositions[numMisses++] = i;
+      }
+    }
+    if (numMisses > 0) {
+      probeBloom(missValues.data(), numMisses, missHits.data());
+      for (int32_t i = 0; i < numMisses; ++i) {
+        out[missPositions[i]] = missHits[i];
+        const auto slot =
+            static_cast<uint64_t>(missValues[i]) & (kMemoSize - 1);
+        memoKeys_[slot] = missValues[i];
+        memoStates_[slot] = missHits[i];
+      }
+    }
+    memoNumProbed_ += size;
+    memoNumHits_ += size - numMisses;
+    if (memoNumProbed_ >= kMemoDecisionRows &&
+        memoNumHits_ * 2 < memoNumProbed_) {
+      memoEnabled_ = false;
+      memoKeys_.clear();
+      memoKeys_.shrink_to_fit();
+      memoStates_.clear();
+      memoStates_.shrink_to_fit();
+    }
+  }
+
+  static constexpr int32_t kMaxProbeSize = 1'024;
+  static constexpr uint64_t kMemoSize = 4'096;
+  static constexpr uint8_t kMemoEmpty = 2;
+  static constexpr int64_t kMemoDecisionRows = 1 << 16;
+
   // Empty when the filter argument is not constant, matching the simple
   // function, which then returns false for every non-NULL row.
   const std::optional<BloomFilterView> view_;
 
   const bool sve_;
+
+  // Memo state. A function instance belongs to one expression set, which a
+  // single driver thread evaluates.
+  mutable bool memoEnabled_;
+  mutable std::vector<int64_t> memoKeys_;
+  // Per slot: the remembered result (0 or 1), or kMemoEmpty.
+  mutable std::vector<uint8_t> memoStates_;
+  mutable int64_t memoNumProbed_{0};
+  mutable int64_t memoNumHits_{0};
 };
 
 } // namespace
