@@ -20,7 +20,89 @@
 
 #include <sys/mman.h>
 
+#include <deque>
+#include <mutex>
+
+#include <gflags/gflags.h>
+
+DECLARE_int64(velox_memory_contiguous_reuse_cache_bytes);
+
 namespace facebook::velox::memory {
+namespace {
+
+// Process-wide cache of mmap'ed contiguous regions freed by any
+// MallocAllocator. Hash tables and RowContainer runs are allocated and freed
+// per task with the same power-of-two reservation sizes; returning the region
+// to the kernel with munmap() and mapping a fresh one makes every reuse pay a
+// 4KB page fault plus kernel zeroing per touched page. Keeping a bounded
+// number of freed regions mapped and handing them back for an identical
+// reservation size avoids those faults. Regions handed out from the cache are
+// not zeroed, which matches the mallocContiguousEnabled (aligned_alloc) path.
+// The bound is on bytes that were in use when the region was freed, which is
+// what stays resident.
+class ContiguousReuseCache {
+ public:
+  static ContiguousReuseCache& instance() {
+    static auto* cache = new ContiguousReuseCache();
+    return *cache;
+  }
+
+  // Returns a cached region of exactly 'maxBytes' or nullptr.
+  void* take(size_t maxBytes) {
+    if (FLAGS_velox_memory_contiguous_reuse_cache_bytes <= 0) {
+      return nullptr;
+    }
+    std::lock_guard<std::mutex> l(mutex_);
+    // Newest first: most recently used pages are most likely still in cache.
+    for (auto it = entries_.rbegin(); it != entries_.rend(); ++it) {
+      if (it->maxBytes == maxBytes) {
+        void* data = it->data;
+        residentBytes_ -= it->residentBytes;
+        entries_.erase(std::next(it).base());
+        return data;
+      }
+    }
+    return nullptr;
+  }
+
+  // Takes ownership of the mapping if it fits; returns false if the caller
+  // must unmap it.
+  bool put(void* data, size_t maxBytes, size_t residentBytes) {
+    const int64_t limit = FLAGS_velox_memory_contiguous_reuse_cache_bytes;
+    if (limit <= 0 || residentBytes > static_cast<size_t>(limit) / 2) {
+      return false;
+    }
+    std::vector<Entry> evicted;
+    {
+      std::lock_guard<std::mutex> l(mutex_);
+      entries_.push_back({data, maxBytes, residentBytes});
+      residentBytes_ += residentBytes;
+      while (residentBytes_ > static_cast<size_t>(limit)) {
+        evicted.push_back(entries_.front());
+        residentBytes_ -= entries_.front().residentBytes;
+        entries_.pop_front();
+      }
+    }
+    for (const auto& e : evicted) {
+      ::munmap(e.data, e.maxBytes);
+    }
+    return true;
+  }
+
+ private:
+  struct Entry {
+    void* data;
+    size_t maxBytes;
+    size_t residentBytes;
+  };
+
+  std::mutex mutex_;
+  std::deque<Entry> entries_;
+  size_t residentBytes_{0};
+};
+
+} // namespace
+
 MallocAllocator::MallocAllocator(const Options& options)
     : kind_(MemoryAllocator::Kind::kMalloc),
       mallocContiguousEnabled_(options.mallocContiguousEnabled),
@@ -240,6 +322,9 @@ void* MallocAllocator::dispatchAllocateContiguous(size_t maxBytes) {
   if (mallocContiguousEnabled_) {
     return ::aligned_alloc(AllocationTraits::kPageSize, maxBytes);
   }
+  if (void* cached = ContiguousReuseCache::instance().take(maxBytes)) {
+    return cached;
+  }
   // TODO: add handling of MAP_FAILED.
   return ::mmap(
       nullptr,
@@ -255,6 +340,10 @@ void MallocAllocator::dispatchFreeContiguous(ContiguousAllocation& allocation) {
     ::free(allocation.data());
   } else {
     useHugePages(allocation, false);
+    if (ContiguousReuseCache::instance().put(
+            allocation.data(), allocation.maxSize(), allocation.size())) {
+      return;
+    }
     if (::munmap(allocation.data(), allocation.maxSize()) < 0) {
       VELOX_MEM_LOG(ERROR) << "Error for munmap(" << allocation.data() << ", "
                            << succinctBytes(allocation.size()) << "): '"

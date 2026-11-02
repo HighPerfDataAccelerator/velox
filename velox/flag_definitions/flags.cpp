@@ -135,6 +135,14 @@ DEFINE_bool(
 
 DEFINE_bool(velox_memory_use_hugepages, true, "Use explicit huge pages");
 
+// Used in common/memory/MallocAllocator.cpp.
+DEFINE_int64(
+    velox_memory_contiguous_reuse_cache_bytes,
+    1LL << 30,
+    "Bytes of freed mmap'ed contiguous allocations (hash tables, RowContainer "
+    "runs) that MallocAllocator keeps mapped per process for reuse by a later "
+    "allocation of the same size, avoiding page faults. 0 disables.");
+
 DEFINE_int32(
     cache_prefetch_min_pct,
     80,
