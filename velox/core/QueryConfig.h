@@ -450,7 +450,7 @@ class QueryConfig {
       abandonHashBuildDedupMinPct,
       "abandon_dedup_hashmap_min_pct",
       int32_t,
-      0,
+      50,
       "Abandon dedup hash map if distinct key percentage exceeds this. 0 disables.")
 
   VELOX_QUERY_CONFIG(
