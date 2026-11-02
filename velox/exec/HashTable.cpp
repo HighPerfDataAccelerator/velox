@@ -32,6 +32,8 @@
 #include <algorithm>
 
 DECLARE_bool(velox_hash_join_fixed_width_output_enabled);
+DECLARE_bool(velox_hash_join_flatten_duplicate_chains);
+DECLARE_int64(velox_hash_join_flat_chains_max_bytes);
 
 #if defined(__aarch64__)
 DEFINE_int32(
@@ -746,6 +748,7 @@ void HashTable<ignoreNullKeys>::clear(bool freeTable) {
   }
   numDistinct_ = 0;
   numTombstones_ = 0;
+  flatChains_.reset();
 }
 
 template <bool ignoreNullKeys>
@@ -1978,6 +1981,7 @@ void HashTable<ignoreNullKeys>::prepareJoinTable(
     bool dropDuplicates,
     folly::Executor* executor) {
   buildExecutor_ = executor;
+  flatChains_.reset();
   if (dropDuplicates) {
     if (table_ != nullptr) {
       // Reset table_ and capacity_ to trigger rehash.
@@ -2051,6 +2055,80 @@ void HashTable<ignoreNullKeys>::prepareJoinTable(
   } else {
     decideHashMode(0, spillInputStartPartitionBit);
   }
+  flattenDuplicateChains();
+}
+
+template <bool ignoreNullKeys>
+void HashTable<ignoreNullKeys>::flattenDuplicateChains() {
+  // Chains shorter than this on average are cheap to walk; flattening them
+  // would mostly add a lookup per probe row.
+  constexpr uint64_t kMinAverageChainLength = 4;
+
+  flatChains_.reset();
+  if (!FLAGS_velox_hash_join_flatten_duplicate_chains || nextOffset_ == 0 ||
+      !hasDuplicates_.check() || table_ == nullptr || pool_ == nullptr) {
+    return;
+  }
+  uint64_t numRows = rows_->numRows();
+  for (const auto& other : otherTables_) {
+    numRows += other->rows()->numRows();
+  }
+  if (numRows * sizeof(char*) >
+          static_cast<uint64_t>(FLAGS_velox_hash_join_flat_chains_max_bytes) ||
+      numRows > std::numeric_limits<uint32_t>::max()) {
+    return;
+  }
+
+  try {
+    auto flatChains = std::make_unique<FlatChains>(pool_);
+    auto& chainRows = flatChains->rows;
+    chainRows.reserve(numRows);
+    auto addChain = [&](char* head) {
+      char* next = nextRow(head);
+      if (next == nullptr) {
+        return;
+      }
+      const uint64_t begin = chainRows.size();
+      chainRows.push_back(head);
+      for (; next != nullptr; next = nextRow(next)) {
+        chainRows.push_back(next);
+      }
+      flatChains->ranges.emplace(
+          reinterpret_cast<uintptr_t>(head),
+          (begin << 32) | (chainRows.size() - begin));
+    };
+
+    if (hashMode_ == HashMode::kArray) {
+      const auto numSlots = std::min<int64_t>(
+          tableAllocation_.size() / sizeof(char*), capacity_);
+      for (int64_t i = 0; i < numSlots; ++i) {
+        if (table_[i] != nullptr) {
+          addChain(table_[i]);
+        }
+      }
+    } else {
+      for (int64_t offset = 0; offset < sizeMask_; offset += kBucketSize) {
+        auto* bucket = bucketAt(offset);
+        for (int32_t slot = 0; slot < sizeof(TagVector); ++slot) {
+          const auto tag = bucket->tagAt(slot);
+          if (tag != ProbeState::kEmptyTag &&
+              tag != ProbeState::kTombstoneTag) {
+            addChain(bucket->pointerAt(slot));
+          }
+        }
+      }
+    }
+
+    const auto numChains = flatChains->ranges.size();
+    if (numChains == 0 ||
+        chainRows.size() < kMinAverageChainLength * numChains) {
+      return;
+    }
+    flatChains_ = std::move(flatChains);
+  } catch (const VeloxRuntimeError&) {
+    // Flattening only speeds up probing; run without it if memory is short.
+    flatChains_.reset();
+  }
 }
 
 template <bool ignoreNullKeys>
@@ -2098,6 +2176,23 @@ struct JoinResultEmitter {
   }
 };
 
+// Returns true when every hit has the same fixed width and misses add no
+// bytes, so 'numOutputRows' rows cannot exceed 'maxBytes' and per-hit byte
+// accounting can be skipped. Division avoids overflow in the
+// capacity * row-width bound.
+bool isRowLimitedJoinOutput(
+    const BaseHashTable::JoinResultIterator& iter,
+    size_t numOutputRows,
+    uint64_t maxBytes) {
+  if (!FLAGS_velox_hash_join_fixed_width_output_enabled ||
+      !iter.varSizeListColumns.empty() || maxBytes == 0) {
+    return false;
+  }
+  const uint64_t rowSize =
+      iter.estimatedRowSize.value_or(iter.fixedSizeListColumnsSizeSum);
+  return rowSize == 0 || numOutputRows <= maxBytes / rowSize;
+}
+
 template <bool kCountBytes = true, typename SizeFunction>
 JoinResultEmitter<kCountBytes, SizeFunction> makeJoinResultEmitter(
     folly::Range<vector_size_t*> inputRows,
@@ -2132,6 +2227,14 @@ int32_t HashTable<ignoreNullKeys>::listJoinResults(
     // When there is no duplicates, and row size is estimable, we are able to
     // go through fast path.
     return listJoinResultsFastPath(
+        iter, includeMisses, inputRows, hits, maxBytes);
+  }
+  if (flatChains_ != nullptr) {
+    if (isRowLimitedJoinOutput(iter, inputRows.size(), maxBytes)) {
+      return listJoinResultsFlatChains<false>(
+          iter, includeMisses, inputRows, hits, maxBytes);
+    }
+    return listJoinResultsFlatChains<true>(
         iter, includeMisses, inputRows, hits, maxBytes);
   }
   if (nextOffset_ == 0 || !hasDuplicates_) {
@@ -2182,16 +2285,7 @@ int32_t HashTable<ignoreNullKeys>::listJoinResultsInterleaved(
     folly::Range<vector_size_t*> inputRows,
     folly::Range<char**> hits,
     uint64_t maxBytes) {
-  // In this case every hit has the same fixed width, and misses add no
-  // bytes. Division avoids overflow in the capacity * row-width bound.
-  const bool rowLimited = FLAGS_velox_hash_join_fixed_width_output_enabled &&
-      iter.varSizeListColumns.empty() && maxBytes > 0 &&
-      (!iter.estimatedRowSize.has_value() || *iter.estimatedRowSize >= 0) &&
-      (iter.estimatedRowSize.value_or(iter.fixedSizeListColumnsSizeSum) == 0 ||
-       inputRows.size() <= maxBytes /
-               iter.estimatedRowSize.value_or(
-                   iter.fixedSizeListColumnsSizeSum));
-  if (rowLimited) {
+  if (isRowLimitedJoinOutput(iter, inputRows.size(), maxBytes)) {
     return listJoinResultsInterleavedImpl<false>(
         iter, includeMisses, inputRows, hits, maxBytes);
   }
@@ -2302,6 +2396,80 @@ int32_t HashTable<ignoreNullKeys>::listJoinResultsInterleavedImpl(
       return numOut;
     }
   }
+}
+
+template <bool ignoreNullKeys>
+template <bool kCountBytes>
+int32_t HashTable<ignoreNullKeys>::listJoinResultsFlatChains(
+    JoinResultIterator& iter,
+    bool includeMisses,
+    folly::Range<vector_size_t*> inputRows,
+    folly::Range<char**> hits,
+    uint64_t maxBytes) {
+  if (iter.rows == nullptr || inputRows.empty()) {
+    return 0;
+  }
+  size_t numOut = 0;
+  uint64_t totalBytes{0};
+  const size_t maxOut = inputRows.size();
+  auto emit = makeJoinResultEmitter<kCountBytes>(
+      inputRows, hits, numOut, totalBytes, maxBytes, [&](char* hit) {
+        return projectedRowSize(iter, hit);
+      });
+  const auto& ranges = flatChains_->ranges;
+  char* const* chainRows = flatChains_->rows.data();
+  const auto numProbeRows = iter.rows->size();
+
+  while (iter.lastRowIndex < numProbeRows) {
+    const auto row = (*iter.rows)[iter.lastRowIndex]; // NOLINT
+    char* hit = (*iter.hits)[row]; // NOLINT
+    if (hit == nullptr) {
+      ++iter.lastRowIndex;
+      if (includeMisses && !emit(row, nullptr)) {
+        return numOut;
+      }
+      continue;
+    }
+    const auto it = ranges.find(reinterpret_cast<uintptr_t>(hit));
+    if (it == ranges.end()) {
+      ++iter.lastRowIndex;
+      if (!emit(row, hit)) {
+        return numOut;
+      }
+      continue;
+    }
+    char* const* chain = chainRows + (it->second >> 32);
+    const uint32_t chainLength = static_cast<uint32_t>(it->second);
+    auto& position = iter.flatChainPosition;
+    if constexpr (kCountBytes) {
+      while (position < chainLength) {
+        if (!emit(row, chain[position++])) {
+          if (position == chainLength) {
+            position = 0;
+            ++iter.lastRowIndex;
+          }
+          return numOut;
+        }
+      }
+    } else {
+      // Row-limited output: copy as many matches as fit in one go.
+      const auto numToCopy =
+          std::min<size_t>(chainLength - position, maxOut - numOut);
+      std::fill_n(inputRows.data() + numOut, numToCopy, row);
+      std::copy_n(chain + position, numToCopy, hits.data() + numOut);
+      numOut += numToCopy;
+      position += numToCopy;
+      if (position < chainLength) {
+        return numOut;
+      }
+    }
+    position = 0;
+    ++iter.lastRowIndex;
+    if (numOut == maxOut) {
+      return numOut;
+    }
+  }
+  return numOut;
 }
 
 template <bool ignoreNullKeys>
@@ -2518,6 +2686,7 @@ int32_t HashTable<true>::listNullKeyRows(
 
 template <bool ignoreNullKeys>
 void HashTable<ignoreNullKeys>::erase(folly::Range<char**> rows) {
+  flatChains_.reset();
   auto numRows = rows.size();
   raw_vector<uint64_t> hashes(pool_);
   hashes.resize(numRows);

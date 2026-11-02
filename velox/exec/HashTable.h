@@ -16,7 +16,10 @@
 #pragma once
 
 #include <array>
+#include <memory>
 #include <vector>
+
+#include <folly/container/F14Map.h>
 
 #include "velox/common/base/Portability.h"
 #include "velox/common/base/RuntimeMetrics.h"
@@ -256,6 +259,7 @@ class BaseHashTable {
       rows = &lookup.rows;
       hits = &lookup.hits;
       lastRowIndex = 0;
+      flatChainPosition = 0;
       walker.reset();
     }
 
@@ -289,6 +293,11 @@ class BaseHashTable {
 
     /// Cross-call state for the interleaved walker.
     InterleavedWalkerState walker;
+
+    /// Number of matches of the probe row at 'lastRowIndex' already listed
+    /// when the table has flattened duplicate chains. The probe row is
+    /// consumed only after its whole chain is listed.
+    uint32_t flatChainPosition{0};
   };
 
   struct RowsIterator {
@@ -1048,6 +1057,24 @@ class HashTable : public BaseHashTable {
       folly::Range<char**> hits,
       uint64_t maxBytes);
 
+  // Lists join results from 'flatChains_': each probe row's matches are copied
+  // from a contiguous array instead of following next-row links.
+  // kCountBytes = false skips per-hit byte accounting when the output batch is
+  // row-limited.
+  template <bool kCountBytes>
+  int32_t listJoinResultsFlatChains(
+      JoinResultIterator& iter,
+      bool includeMisses,
+      folly::Range<vector_size_t*> inputRows,
+      folly::Range<char**> hits,
+      uint64_t maxBytes);
+
+  // Copies every duplicate-key chain of a finished join table into
+  // 'flatChains_' so that listing matches does not chase next-row pointers.
+  // Leaves 'flatChains_' empty when the table has no long chains or the copy
+  // would exceed FLAGS_velox_hash_join_flat_chains_max_bytes.
+  void flattenDuplicateChains();
+
   // Tries to use as many range hashers as can in a normalized key situation.
   void enableRangeWhereCan(
       const std::vector<uint64_t>& rangeSizes,
@@ -1340,6 +1367,33 @@ class HashTable : public BaseHashTable {
 
   // Offset of next row link for join build side set from 'rows_'.
   int32_t nextOffset_{0};
+
+  // Duplicate-key chains of a finished join table laid out contiguously.
+  struct FlatChains {
+    explicit FlatChains(memory::MemoryPool* pool)
+        : rows(pool), ranges(memory::StlAllocator<RangeEntry>(*pool)) {}
+
+    using RangeEntry = std::pair<const uintptr_t, uint64_t>;
+
+    // Rows of all chains, one chain after another, each starting at its head
+    // and following next-row order.
+    raw_vector<char*> rows;
+
+    // Chain head address -> (offset of the chain in 'rows' << 32) | chain
+    // length. Keyed by integer address: folly hashes and compares 'const
+    // char*' keys as C strings.
+    folly::F14FastMap<
+        uintptr_t,
+        uint64_t,
+        folly::f14::DefaultHasher<uintptr_t>,
+        folly::f14::DefaultKeyEqual<uintptr_t>,
+        memory::StlAllocator<RangeEntry>>
+        ranges;
+  };
+
+  // Set by flattenDuplicateChains() when the join table has long duplicate
+  // chains. Read-only while probing.
+  std::unique_ptr<FlatChains> flatChains_;
   char** table_ = nullptr;
   memory::ContiguousAllocation tableAllocation_;
 

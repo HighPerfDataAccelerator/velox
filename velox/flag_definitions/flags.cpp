@@ -166,3 +166,17 @@ DEFINE_bool(
     velox_hash_join_fixed_width_output_enabled,
     true,
     "Skip per-hit byte accounting when a fixed-width output batch is row-limited.");
+
+// Used in exec/HashTable.cpp.
+DEFINE_bool(
+    velox_hash_join_flatten_duplicate_chains,
+    true,
+    "Copy long duplicate-key chains of a finished join table into contiguous "
+    "arrays so probes list matches without chasing next-row pointers.");
+
+// Used in exec/HashTable.cpp.
+DEFINE_int64(
+    velox_hash_join_flat_chains_max_bytes,
+    64LL << 20,
+    "Largest join table, in bytes of row pointers (8 per build row), whose "
+    "duplicate-key chains are flattened.");
