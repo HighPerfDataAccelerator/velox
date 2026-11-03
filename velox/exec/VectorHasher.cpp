@@ -15,12 +15,19 @@
  */
 
 #include "velox/exec/VectorHasher.h"
+
+#include <gflags/gflags.h>
 #include "velox/common/base/BitUtil.h"
 #include "velox/common/base/Portability.h"
 #include "velox/common/base/SimdUtil.h"
 #include "velox/common/memory/HashStringAllocator.h"
 #include "velox/common/serialization/NativeSerdeIO.h"
 #include "velox/type/FloatingPointUtil.h"
+
+DECLARE_bool(velox_vector_hasher_dense_value_ids);
+DECLARE_int64(velox_vector_hasher_dense_value_ids_max_range);
+DECLARE_bool(velox_vector_hasher_batched_value_id_lookup);
+DECLARE_int64(velox_vector_hasher_oa_value_ids_max_slots);
 
 namespace facebook::velox::exec {
 
@@ -241,6 +248,21 @@ bool VectorHasher::makeValueIdsFlatNoNulls(
   }
 
   bool success = true;
+  if constexpr (
+      std::is_integral_v<T> && !std::is_same_v<T, bool> &&
+      sizeof(T) <= sizeof(int64_t)) {
+    if (!isRange_ && oaIdsValid()) {
+      const auto end = rows.end();
+      rows.applyToSelected([&](vector_size_t row) INLINE_LAMBDA {
+        if (row + kOaPrefetchDistance < end) {
+          prefetchOaSlot(values[row + kOaPrefetchDistance]);
+        }
+        makeValueIdForOneRow<T, false>(
+            nullptr, row, values, row, result, success);
+      });
+      return success;
+    }
+  }
   rows.applyToSelected([&](vector_size_t row) INLINE_LAMBDA {
     makeValueIdForOneRow<T, false>(nullptr, row, values, row, result, success);
   });
@@ -273,6 +295,21 @@ bool VectorHasher::makeValueIdsDecoded(
   if (rows.countSelected() <= decoded_.base()->size()) {
     // Cache is not beneficial in this case and we don't use them.
     auto* nulls = decoded_.nulls(&rows);
+    if constexpr (
+        std::is_integral_v<T> && !std::is_same_v<T, bool> &&
+        sizeof(T) <= sizeof(int64_t)) {
+      if (!isRange_ && oaIdsValid()) {
+        const auto end = rows.end();
+        rows.applyToSelected([&](vector_size_t row) INLINE_LAMBDA {
+          if (row + kOaPrefetchDistance < end) {
+            prefetchOaSlot(values[indices[row + kOaPrefetchDistance]]);
+          }
+          makeValueIdForOneRow<T, mayHaveNulls>(
+              nulls, row, values, indices[row], result, success);
+        });
+        return success;
+      }
+    }
     rows.applyToSelected([&](vector_size_t row) INLINE_LAMBDA {
       makeValueIdForOneRow<T, mayHaveNulls>(
           nulls, row, values, indices[row], result, success);
@@ -455,6 +492,15 @@ void VectorHasher::lookupValueIdsTyped(
 
   if (decoded.isIdentityMapping() ||
       rows.countSelected() <= decoded.base()->size()) {
+    if constexpr (
+        std::is_integral_v<T> && !std::is_same_v<T, bool> &&
+        sizeof(T) <= sizeof(int64_t)) {
+      if (!isRange_ && !(denseIdsValid() && denseOutside_ == 0) &&
+          FLAGS_velox_vector_hasher_batched_value_id_lookup) {
+        lookupDistinctIdsBatched<T>(decoded, rows, result);
+        return;
+      }
+    }
     rows.applyToSelected([&](vector_size_t row) INLINE_LAMBDA {
       if (decoded.isNullAt(row)) {
         if (multiplier_ == 1) {
@@ -496,6 +542,69 @@ void VectorHasher::lookupValueIdsTyped(
     }
     result[row] = multiplier_ == 1 ? id : result[row] + multiplier_ * id;
   });
+  rows.updateBounds();
+}
+
+template <typename T>
+void VectorHasher::lookupDistinctIdsBatched(
+    const DecodedVector& decoded,
+    SelectivityVector& rows,
+    uint64_t* result) const {
+  // A hash set probe per row is bound by memory latency once the set is out
+  // of L1/L2. Hash and prefetch a batch of keys first, then probe.
+  constexpr int32_t kBatch = 32;
+  vector_size_t batchRows[kBatch];
+  int64_t batchKeys[kBatch];
+  folly::F14HashToken tokens[kBatch];
+  int32_t numBatch = 0;
+  const bool useOa = oaIdsValid();
+  auto probeBatch = [&]() {
+    if (useOa) {
+      for (int32_t i = 0; i < numBatch; ++i) {
+        __builtin_prefetch(&oaSlots_[oaHash(batchKeys[i])]);
+      }
+      for (int32_t i = 0; i < numBatch; ++i) {
+        const auto row = batchRows[i];
+        const uint64_t id = lookupOaId(batchKeys[i]);
+        if (id == kUnmappable) {
+          rows.setValid(row, false);
+          continue;
+        }
+        result[row] = multiplier_ == 1 ? id : result[row] + multiplier_ * id;
+      }
+      numBatch = 0;
+      return;
+    }
+    for (int32_t i = 0; i < numBatch; ++i) {
+      tokens[i] = uniqueValues_.prehash(UniqueValue(batchKeys[i]));
+      uniqueValues_.prefetch(tokens[i]);
+    }
+    for (int32_t i = 0; i < numBatch; ++i) {
+      const auto row = batchRows[i];
+      auto iter = uniqueValues_.find(tokens[i], UniqueValue(batchKeys[i]));
+      if (iter == uniqueValues_.end()) {
+        rows.setValid(row, false);
+        continue;
+      }
+      const uint64_t id = iter->id();
+      result[row] = multiplier_ == 1 ? id : result[row] + multiplier_ * id;
+    }
+    numBatch = 0;
+  };
+  rows.applyToSelected([&](vector_size_t row) INLINE_LAMBDA {
+    if (decoded.isNullAt(row)) {
+      if (multiplier_ == 1) {
+        result[row] = 0;
+      }
+      return;
+    }
+    batchRows[numBatch] = row;
+    batchKeys[numBatch] = toInt64(decoded.valueAt<T>(row));
+    if (++numBatch == kBatch) {
+      probeBatch();
+    }
+  });
+  probeBatch();
   rows.updateBounds();
 }
 
@@ -647,6 +756,74 @@ uint64_t VectorHasher::valueId(int128_t value) {
     return kUnmappable;
   }
   return iterator->second;
+}
+
+void VectorHasher::prepareDenseValueIds(bool allowOpenAddressing) {
+  denseIdsCount_ = 0;
+  denseOutside_ = 0;
+  oaCount_ = 0;
+  if (!FLAGS_velox_vector_hasher_dense_value_ids || isRange_ ||
+      distinctOverflow_ || uniqueValues_.empty() || hasHugeintValue_) {
+    return;
+  }
+  switch (typeKind_) {
+    case TypeKind::TINYINT:
+    case TypeKind::SMALLINT:
+    case TypeKind::INTEGER:
+    case TypeKind::BIGINT:
+      break;
+    default:
+      return;
+  }
+  if (hasRange_ && max_ >= min_) {
+    const uint64_t range =
+        static_cast<uint64_t>(max_) - static_cast<uint64_t>(min_) + 1;
+    if (range != 0 &&
+        range <= FLAGS_velox_vector_hasher_dense_value_ids_max_range &&
+        range <= uniqueValues_.size() * 16) {
+      denseIds_.assign(range, 0);
+      denseMin_ = min_;
+      size_t inRange = 0;
+      for (const auto& unique : uniqueValues_) {
+        const uint64_t index = static_cast<uint64_t>(unique.data()) -
+            static_cast<uint64_t>(denseMin_);
+        if (index < range) {
+          denseIds_[index] = unique.id();
+          ++inRange;
+        }
+      }
+      denseOutside_ = uniqueValues_.size() - inRange;
+      denseIdsCount_ = inRange;
+      if (denseIdsCount_ != 0) {
+        return;
+      }
+    }
+  }
+  if (allowOpenAddressing) {
+    buildOaIds(std::max<uint64_t>(
+        1024, bits::nextPowerOfTwo(uniqueValues_.size() * 4)));
+  }
+}
+
+void VectorHasher::buildOaIds(uint64_t numSlots) {
+  oaCount_ = 0;
+  if (numSlots > FLAGS_velox_vector_hasher_oa_value_ids_max_slots) {
+    oaSlots_.clear();
+    oaSlots_.shrink_to_fit();
+    return;
+  }
+  oaSlots_.assign(numSlots, OaSlot{0, 0});
+  oaShift_ = 64 - __builtin_ctzll(numSlots);
+  const uint64_t mask = numSlots - 1;
+  for (const auto& unique : uniqueValues_) {
+    const int64_t value = unique.data();
+    uint64_t slot = oaHash(value);
+    while (oaSlots_[slot].id != 0) {
+      slot = (slot + 1) & mask;
+    }
+    oaSlots_[slot] = {value, unique.id()};
+  }
+  oaCount_ = uniqueValues_.size();
 }
 
 uint64_t VectorHasher::lookupValueId(int128_t value) const {
@@ -921,6 +1098,7 @@ uint64_t VectorHasher::enableValueIds(uint64_t multiplier, int32_t reservePct) {
   multiplier_ = multiplier;
   rangeSize_ = addIdReserve(numDistinct(), reservePct) + 1;
   isRange_ = false;
+  prepareDenseValueIds();
   uint64_t result;
   if (__builtin_mul_overflow(multiplier_, rangeSize_, &result)) {
     return kRangeTooLarge;
@@ -959,6 +1137,8 @@ void VectorHasher::copyStatsFrom(const VectorHasher& other) {
 
   min_ = other.min_;
   max_ = other.max_;
+  denseIdsCount_ = 0;
+  oaCount_ = 0;
   uniqueValues_ = other.uniqueValues_;
   uniqueHugeintValues_ = other.uniqueHugeintValues_;
 }
@@ -1221,6 +1401,8 @@ void VectorHasher::deserializeState(std::string_view data) {
         bloomFilterData);
   }
 
+  denseIdsCount_ = 0;
+  oaCount_ = 0;
   uniqueValues_.clear();
   uniqueValuesStorage_.clear();
   distinctStringsBytes_ = 0;

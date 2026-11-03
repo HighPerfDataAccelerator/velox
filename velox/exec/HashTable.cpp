@@ -2055,6 +2055,12 @@ void HashTable<ignoreNullKeys>::prepareJoinTable(
   } else {
     decideHashMode(0, spillInputStartPartitionBit);
   }
+  if (hashMode_ != HashMode::kHash) {
+    for (auto& hasher : hashers_) {
+      // The finished table is read-only, so probes can share these.
+      hasher->prepareDenseValueIds();
+    }
+  }
   flattenDuplicateChains();
 }
 

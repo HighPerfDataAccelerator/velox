@@ -152,6 +152,8 @@ class VectorHasher {
   static constexpr uint64_t kRangeTooLarge = ~0UL;
   // Stop counting distinct values after this many and revert to regular hash.
   static constexpr int32_t kMaxDistinct = 100'000;
+  // Rows of lookahead when prefetching open-addressing value id slots.
+  static constexpr int32_t kOaPrefetchDistance = 16;
 
   // Indicates reserving kMaxDistinct possible values when supplied as
   // reservePct to enableValueIds().
@@ -418,6 +420,8 @@ class VectorHasher {
   }
 
   void clearDistinctValues() {
+    denseIdsCount_ = 0;
+    oaCount_ = 0;
     uniqueValues_.clear();
     uniqueHugeintValues_.clear();
     uniqueValuesStorage_.clear();
@@ -494,6 +498,14 @@ class VectorHasher {
       const DecodedVector& decoded,
       SelectivityVector& rows,
       raw_vector<uint64_t>& hashes,
+      uint64_t* result) const;
+
+  // Looks up distinct-value ids of integer keys for 'rows' in batches with
+  // prefetching. Deselects rows whose key is not found.
+  template <typename T>
+  void lookupDistinctIdsBatched(
+      const DecodedVector& decoded,
+      SelectivityVector& rows,
       uint64_t* result) const;
 
   // Fast path for range mapping of int64/int32 keys.
@@ -592,11 +604,46 @@ class VectorHasher {
       return int64Value - min_ + 1;
     }
 
+    uint64_t denseIndex = ~0ULL;
+    int64_t oaSlot = -1;
+    const bool dense = denseIdsValid();
+    if (dense) {
+      denseIndex =
+          static_cast<uint64_t>(int64Value) - static_cast<uint64_t>(denseMin_);
+      if (denseIndex < denseIds_.size() && denseIds_[denseIndex] != 0) {
+        return denseIds_[denseIndex];
+      }
+    } else if (oaIdsValid()) {
+      const uint64_t mask = oaSlots_.size() - 1;
+      uint64_t slot = oaHash(int64Value);
+      while (oaSlots_[slot].id != 0) {
+        if (oaSlots_[slot].key == int64Value) {
+          return oaSlots_[slot].id;
+        }
+        slot = (slot + 1) & mask;
+      }
+      oaSlot = static_cast<int64_t>(slot);
+    }
+
     UniqueValue unique(value);
     unique.setId(uniqueValues_.size() + 1);
     auto pair = uniqueValues_.insert(unique);
     if (!pair.second) {
       return pair.first->id();
+    }
+    if (dense) {
+      // Keep every distinct value either in 'denseIds_' or counted outside.
+      if (denseIndex < denseIds_.size()) {
+        denseIds_[denseIndex] = unique.id();
+        ++denseIdsCount_;
+      } else {
+        ++denseOutside_;
+      }
+    } else if (oaSlot >= 0) {
+      oaSlots_[oaSlot] = {int64Value, unique.id()};
+      if (++oaCount_ * 2 > oaSlots_.size()) {
+        growOaIds();
+      }
     }
     updateRange(int64Value);
     if (uniqueValues_.size() >= rangeSize_) {
@@ -616,6 +663,18 @@ class VectorHasher {
       }
       return int64Value - min_ + 1;
     }
+    if (denseIdsValid() && denseOutside_ == 0) {
+      const uint64_t index =
+          static_cast<uint64_t>(int64Value) - static_cast<uint64_t>(denseMin_);
+      if (index >= denseIds_.size()) {
+        return kUnmappable;
+      }
+      const uint32_t id = denseIds_[index];
+      return id == 0 ? kUnmappable : id;
+    }
+    if (oaIdsValid()) {
+      return lookupOaId(int64Value);
+    }
     UniqueValue unique(value);
     auto iter = uniqueValues_.find(unique);
     if (iter != uniqueValues_.end()) {
@@ -624,7 +683,33 @@ class VectorHasher {
     return kUnmappable;
   }
 
+  // Returns the id of 'value' in the open-addressing table or kUnmappable.
+  uint64_t lookupOaId(int64_t value) const {
+    const uint64_t mask = oaSlots_.size() - 1;
+    uint64_t slot = oaHash(value);
+    while (oaSlots_[slot].id != 0) {
+      if (oaSlots_[slot].key == value) {
+        return oaSlots_[slot].id;
+      }
+      slot = (slot + 1) & mask;
+    }
+    return kUnmappable;
+  }
+
   uint64_t lookupValueId(int128_t value) const;
+
+ public:
+  /// For an integer key mapped by distinct values whose [min, max] range is
+  /// small enough, builds a direct-indexed array from value - min to value id
+  /// so that valueId() and lookupValueIds() mostly avoid a hash set probe per
+  /// row. For a wider range, builds a small open-addressing table from value
+  /// to id used by valueId() instead. The hash set stays authoritative:
+  /// valueId() records new values in these, and they are ignored once the set
+  /// is changed by any other path. Called when distinct-value ids are enabled
+  /// and when a join table is finished.
+  void prepareDenseValueIds(bool allowOpenAddressing = true);
+
+ private:
 
   void updateRange(int64_t value) {
     if (hasRange_) {
@@ -706,6 +791,58 @@ class VectorHasher {
   // Table for mapping distinct values to small ints.
   folly::F14FastSet<UniqueValue, UniqueValueHasher, UniqueValueComparer>
       uniqueValues_;
+
+  bool oaIdsValid() const {
+    return oaCount_ != 0 && oaCount_ == uniqueValues_.size();
+  }
+
+  uint64_t oaHash(int64_t value) const {
+    return (static_cast<uint64_t>(value) * 0x9E3779B97F4A7C15ULL) >> oaShift_;
+  }
+
+  // Prefetches the open-addressing slot of 'value' ahead of valueId().
+  template <typename T>
+  void prefetchOaSlot(T value) const {
+    if constexpr (
+        std::is_integral_v<T> && !std::is_same_v<T, bool> &&
+        sizeof(T) <= sizeof(int64_t)) {
+      __builtin_prefetch(&oaSlots_[oaHash(static_cast<int64_t>(value))]);
+    }
+  }
+
+  // Rebuilds the open-addressing ids from 'uniqueValues_' with
+  // 'numSlots' slots. Disables them if 'numSlots' is over the limit.
+  void buildOaIds(uint64_t numSlots);
+
+  void growOaIds() {
+    buildOaIds(oaSlots_.size() * 2);
+  }
+
+  bool denseIdsValid() const {
+    return denseIdsCount_ != 0 &&
+        denseIdsCount_ + denseOutside_ == uniqueValues_.size();
+  }
+
+  // Direct-indexed value ids for [denseMin_, denseMin_ + denseIds_.size()), 0
+  // meaning no such value. 'denseIdsCount_' values are in the array and
+  // 'denseOutside_' values of 'uniqueValues_' are outside its range. Valid
+  // while these add up to uniqueValues_.size().
+  std::vector<uint32_t> denseIds_;
+  int64_t denseMin_{0};
+  size_t denseIdsCount_{0};
+  size_t denseOutside_{0};
+
+  // Open-addressing (linear probing) map from value to id for integer keys
+  // whose range is too wide for 'denseIds_'. A slot is empty if its id is 0.
+  // Holds all of 'uniqueValues_' while 'oaCount_' equals its size.
+  struct OaSlot {
+    int64_t key;
+    uint64_t id; // 0 means empty.
+  };
+  // Key and id share a cache line so a probe costs one miss.
+  std::vector<OaSlot> oaSlots_;
+  int32_t oaShift_{64};
+  size_t oaCount_{0};
 
   // Table for mapping distinct hugeint values to small ints.
   folly::F14FastMap<int128_t, uint32_t> uniqueHugeintValues_;

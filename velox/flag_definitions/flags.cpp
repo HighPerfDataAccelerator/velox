@@ -180,3 +180,25 @@ DEFINE_int64(
     64LL << 20,
     "Largest join table, in bytes of row pointers (8 per build row), whose "
     "duplicate-key chains are flattened.");
+
+// Used in velox/exec/VectorHasher.cpp.
+DEFINE_bool(
+    velox_vector_hasher_dense_value_ids,
+    true,
+    "Map integer keys that use distinct-value ids (hash join and group by) to "
+    "ids with a direct-indexed array in front of the hash set.");
+DEFINE_int64(
+    velox_vector_hasher_dense_value_ids_max_range,
+    4LL << 20,
+    "Largest max - min + 1 of distinct key values for "
+    "velox_vector_hasher_dense_value_ids.");
+DEFINE_bool(
+    velox_vector_hasher_batched_value_id_lookup,
+    true,
+    "Probe the distinct-value set of integer join keys in prefetched batches.");
+DEFINE_int64(
+    velox_vector_hasher_oa_value_ids_max_slots,
+    1LL << 19,
+    "Largest open-addressing table that maps wide-range integer keys (group "
+    "by and finished join tables) to distinct-value ids in front of the hash "
+    "set.");
