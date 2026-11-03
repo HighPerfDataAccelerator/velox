@@ -515,12 +515,17 @@ class QueryConfig {
 
   /// Abandons building a HashTable without duplicates in HashBuild for left
   /// semi/anti join if the percentage of distinct keys exceeds this threshold.
+  /// Dedup is on by default because semi/anti join build sides are often fed by
+  /// joins that repeat each key many times; dropping duplicates while building
+  /// keeps the table small and avoids spilling. When keys turn out to be mostly
+  /// distinct the build abandons dedup after 'abandon_dedup_hashmap_min_rows',
+  /// so the extra cost is bounded to the first rows.
   VELOX_QUERY_CONFIG(
       kAbandonDedupHashMapMinPct,
       abandonHashBuildDedupMinPct,
       "abandon_dedup_hashmap_min_pct",
       int32_t,
-      0,
+      80,
       "Abandon dedup hash map if distinct key percentage exceeds this. 0 disables.")
 
   VELOX_QUERY_CONFIG(
