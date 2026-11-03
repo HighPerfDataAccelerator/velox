@@ -167,6 +167,12 @@ HashTable<ignoreNullKeys>::HashTable(
       /*useListRowIndex=*/false,
       pool);
   nextOffset_ = rows_->nextOffset();
+  for (auto i = 0; i < hashers_.size(); ++i) {
+    const auto kind = hashers_[i]->typeKind();
+    if (kind == TypeKind::VARCHAR || kind == TypeKind::VARBINARY) {
+      stringKeyOffsets_.push_back(rows_->columnAt(i).offset());
+    }
+  }
 }
 
 class ProbeState {
@@ -187,6 +193,11 @@ class ProbeState {
 
   int32_t row() const {
     return row_;
+  }
+
+  // First row whose tag matched, or nullptr. Valid after firstProbe().
+  char* group() const {
+    return group_;
   }
 
   // Use one instruction to make 16 copies of the tag being searched for
@@ -720,9 +731,41 @@ void HashTable<ignoreNullKeys>::groupProbeWithPrefetch(HashLookup& lookup) {
     // Tags loaded by firstProbe() go stale once an earlier state in this
     // window inserts a new group, possibly with the same key.
     const auto numDistinctBefore = numDistinct_;
+    if (!isNormalizedKey && !stringKeyOffsets_.empty()) {
+      // firstProbe() prefetched each candidate row. Comparing string keys
+      // also reads their out-of-line bytes, so prefetch those a few states
+      // ahead, when the candidate row has had time to arrive.
+      constexpr int32_t kStringPrefetchDistance = 8;
+      for (int32_t i = 0; i < std::min(kStringPrefetchDistance, numStates);
+           ++i) {
+        prefetchStringKeys(states[i].group());
+      }
+      for (int32_t i = 0; i < numStates; ++i) {
+        if (i + kStringPrefetchDistance < numStates) {
+          prefetchStringKeys(states[i + kStringPrefetchDistance].group());
+        }
+        fullProbe<false, isNormalizedKey>(
+            lookup, states[i], numDistinct_ != numDistinctBefore);
+      }
+      continue;
+    }
     for (int32_t i = 0; i < numStates; ++i) {
       fullProbe<false, isNormalizedKey>(
           lookup, states[i], numDistinct_ != numDistinctBefore);
+    }
+  }
+}
+
+template <bool ignoreNullKeys>
+FOLLY_ALWAYS_INLINE void HashTable<ignoreNullKeys>::prefetchStringKeys(
+    const char* group) const {
+  if (group == nullptr) {
+    return;
+  }
+  for (const auto offset : stringKeyOffsets_) {
+    const auto* view = reinterpret_cast<const StringView*>(group + offset);
+    if (!view->isInline()) {
+      __builtin_prefetch(view->data());
     }
   }
 }

@@ -1216,6 +1216,9 @@ class HashTable : public BaseHashTable {
   template <bool isNormalizedKey>
   void groupProbeWithPrefetch(HashLookup& lookup);
 
+  // Prefetches the out-of-line bytes of the string keys of 'group', if any.
+  void prefetchStringKeys(const char* group) const;
+
   // Array probe with SIMD.
   void arrayJoinProbe(HashLookup& lookup);
 
@@ -1359,6 +1362,9 @@ class HashTable : public BaseHashTable {
   // the join can be cardinality increasing. Atomic for tsan because
   // many threads can set this.
   OneWayStatusFlag hasDuplicates_;
+
+  // Row offsets of the VARCHAR and VARBINARY keys.
+  std::vector<int32_t> stringKeyOffsets_;
 
   // Offset of next row link for join build side set from 'rows_'.
   int32_t nextOffset_{0};
