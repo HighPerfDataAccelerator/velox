@@ -623,23 +623,98 @@ struct SubstrFunction {
   // Results refer to strings in the first argument.
   static constexpr int32_t reuse_strings_from_arg = 0;
 
-  // ASCII input always produces ASCII result.
-  static constexpr bool is_default_ascii_behavior = true;
-
+  // Asciiness is checked per row instead of for the whole input vector
+  // (is_default_ascii_behavior): with a non-negative start only the leading
+  // bytes covered by the substring need to be checked, which avoids scanning
+  // long strings such as descriptions when only a short prefix is taken.
   FOLLY_ALWAYS_INLINE void call(
       out_type<Varchar>& result,
       const arg_type<Varchar>& input,
       int32_t start,
       int32_t length = std::numeric_limits<int32_t>::max()) {
-    doCall<false>(result, input, start, length);
+    if (length <= 0) {
+      result.setEmpty();
+      return;
+    }
+    if (start >= 0) {
+      prefixCall(result, input, start == 0 ? 1 : start, length);
+      return;
+    }
+    if (stringCore::isAscii(input.data(), input.size())) {
+      doCall<true>(result, input, start, length);
+    } else {
+      doCall<false>(result, input, start, length);
+    }
   }
 
-  FOLLY_ALWAYS_INLINE void callAscii(
+  // stringCore::isAscii() checks strings shorter than a SIMD register one byte
+  // at a time. Short prefixes are checked with 8-byte words instead.
+  static FOLLY_ALWAYS_INLINE bool prefixIsAscii(const char* data, size_t size) {
+    if (size >= 32) {
+      return stringCore::isAscii(data, size);
+    }
+    uint64_t bits = 0;
+    uint64_t word;
+    size_t i = 0;
+    for (; i + sizeof(uint64_t) <= size; i += sizeof(uint64_t)) {
+      std::memcpy(&word, data + i, sizeof(uint64_t));
+      bits |= word;
+    }
+    if (i < size) {
+      if (size >= sizeof(uint64_t)) {
+        std::memcpy(&word, data + size - sizeof(uint64_t), sizeof(uint64_t));
+        bits |= word;
+      } else {
+        for (; i < size; ++i) {
+          bits |= static_cast<uint8_t>(data[i]);
+        }
+      }
+    }
+    return (bits & 0x8080808080808080ULL) == 0;
+  }
+
+  // Substring for 'start' >= 1 and 'length' >= 1. Same result as doCall(),
+  // but reads only the bytes up to the end of the substring.
+  FOLLY_ALWAYS_INLINE void prefixCall(
       out_type<Varchar>& result,
       const arg_type<Varchar>& input,
       int32_t start,
-      int32_t length = std::numeric_limits<int32_t>::max()) {
-    doCall<true>(result, input, start, length);
+      int32_t length) {
+    const char* data = input.data();
+    const size_t size = input.size();
+    const uint64_t end = static_cast<uint64_t>(start) - 1 + length;
+    const size_t checked = end < size ? end : size;
+    if (prefixIsAscii(data, checked)) {
+      const size_t begin = std::min<size_t>(start - 1, checked);
+      // Like getByteRange(), keep continuation bytes following the last
+      // character.
+      size_t endByte = checked;
+      while (endByte < size && utf_cont(data[endByte])) {
+        ++endByte;
+      }
+      result.setNoCopy(StringView(data + begin, endByte - begin));
+      return;
+    }
+    // Same character walk as stringCore::getByteRange(): a character starts
+    // at each non-continuation byte and leading continuation bytes are
+    // skipped.
+    size_t offset = 0;
+    auto skipContBytes = [&]() {
+      while (offset < size && utf_cont(data[offset])) {
+        ++offset;
+      }
+    };
+    skipContBytes();
+    for (int32_t i = 1; offset < size && i < start; ++i) {
+      ++offset;
+      skipContBytes();
+    }
+    const size_t begin = offset;
+    for (int32_t i = 0; offset < size && i < length; ++i) {
+      ++offset;
+      skipContBytes();
+    }
+    result.setNoCopy(StringView(data + begin, offset - begin));
   }
 
   template <bool isAscii>
