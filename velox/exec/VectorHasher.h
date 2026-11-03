@@ -626,6 +626,22 @@ class VectorHasher {
 
   uint64_t lookupValueId(int128_t value) const;
 
+  // Rows ahead of the current row whose 'uniqueValues_' chunk is prefetched.
+  static constexpr int32_t kUniqueValuePrefetchDistance = 16;
+
+  // Smallest 'uniqueValues_' that is prefetched. Smaller sets stay in the
+  // core-local caches.
+  static constexpr size_t kMinUniqueValuesToPrefetch = 4'096;
+
+  // Returns true if lookups of T values go to 'uniqueValues_' and that set is
+  // large enough to miss the core-local caches.
+  template <typename T>
+  bool shouldPrefetchUniqueValues() const;
+
+  // Prefetches the 'uniqueValues_' chunk where 'value' would be found.
+  template <typename T>
+  void prefetchUniqueValue(T value) const;
+
   void updateRange(int64_t value) {
     if (hasRange_) {
       if (value < min_) {

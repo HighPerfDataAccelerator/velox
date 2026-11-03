@@ -201,6 +201,21 @@ bool VectorHasher::makeValueIdsFlatWithNulls<bool>(
   return true;
 }
 
+template <typename T>
+bool VectorHasher::shouldPrefetchUniqueValues() const {
+  if constexpr (std::is_same_v<T, int32_t> || std::is_same_v<T, int64_t>) {
+    return !isRange_ && uniqueValues_.size() >= kMinUniqueValuesToPrefetch;
+  }
+  return false;
+}
+
+template <typename T>
+void VectorHasher::prefetchUniqueValue(T value) const {
+  if constexpr (std::is_same_v<T, int32_t> || std::is_same_v<T, int64_t>) {
+    uniqueValues_.prefetch(uniqueValues_.prehash(UniqueValue(value)));
+  }
+}
+
 template <typename T, bool mayHaveNulls>
 void VectorHasher::makeValueIdForOneRow(
     const uint64_t* nulls,
@@ -241,6 +256,17 @@ bool VectorHasher::makeValueIdsFlatNoNulls(
   }
 
   bool success = true;
+  if (shouldPrefetchUniqueValues<T>()) {
+    const auto prefetchEnd = rows.end() - kUniqueValuePrefetchDistance;
+    rows.applyToSelected([&](vector_size_t row) INLINE_LAMBDA {
+      if (row < prefetchEnd) {
+        prefetchUniqueValue(values[row + kUniqueValuePrefetchDistance]);
+      }
+      makeValueIdForOneRow<T, false>(
+          nullptr, row, values, row, result, success);
+    });
+    return success;
+  }
   rows.applyToSelected([&](vector_size_t row) INLINE_LAMBDA {
     makeValueIdForOneRow<T, false>(nullptr, row, values, row, result, success);
   });
@@ -256,7 +282,12 @@ bool VectorHasher::makeValueIdsFlatWithNulls(
   const auto* nulls = decoded_.nulls(&rows);
 
   bool success = true;
+  const bool prefetch = shouldPrefetchUniqueValues<T>();
+  const auto prefetchEnd = rows.end() - kUniqueValuePrefetchDistance;
   rows.applyToSelected([&](vector_size_t row) INLINE_LAMBDA {
+    if (prefetch && row < prefetchEnd) {
+      prefetchUniqueValue(values[row + kUniqueValuePrefetchDistance]);
+    }
     makeValueIdForOneRow<T, true>(nulls, row, values, row, result, success);
   });
   return success;
@@ -273,7 +304,13 @@ bool VectorHasher::makeValueIdsDecoded(
   if (rows.countSelected() <= decoded_.base()->size()) {
     // Cache is not beneficial in this case and we don't use them.
     auto* nulls = decoded_.nulls(&rows);
+    const bool prefetch = shouldPrefetchUniqueValues<T>();
+    const auto prefetchEnd = rows.end() - kUniqueValuePrefetchDistance;
     rows.applyToSelected([&](vector_size_t row) INLINE_LAMBDA {
+      if (prefetch && row < prefetchEnd) {
+        prefetchUniqueValue(
+            values[indices[row + kUniqueValuePrefetchDistance]]);
+      }
       makeValueIdForOneRow<T, mayHaveNulls>(
           nulls, row, values, indices[row], result, success);
     });
@@ -453,9 +490,15 @@ void VectorHasher::lookupValueIdsTyped(
     }
   }
 
+  const bool prefetch = shouldPrefetchUniqueValues<T>();
+  const auto prefetchEnd = rows.end() - kUniqueValuePrefetchDistance;
   if (decoded.isIdentityMapping() ||
       rows.countSelected() <= decoded.base()->size()) {
     rows.applyToSelected([&](vector_size_t row) INLINE_LAMBDA {
+      if (prefetch && row < prefetchEnd) {
+        prefetchUniqueValue(
+            decoded.valueAt<T>(row + kUniqueValuePrefetchDistance));
+      }
       if (decoded.isNullAt(row)) {
         if (multiplier_ == 1) {
           result[row] = 0;
