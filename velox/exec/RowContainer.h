@@ -1618,7 +1618,37 @@ class RowContainer {
         return stringsEqualSlow<true>(left, right);
       }
     }
+    // Sizes and prefixes are equal. Short payloads are compared inline to
+    // avoid an out-of-line memcmp call per key.
+    const uint32_t size = left.size();
+    if (size <= kInlineStringCompareMaxBytes) {
+      return shortBytesEqual(left.data(), right.data(), size);
+    }
     return left == right;
+  }
+
+  static constexpr uint32_t kInlineStringCompareMaxBytes = 64;
+
+  // Compares 'size' bytes, 'size' >= 8. Reads never go past 'size'.
+  static FOLLY_ALWAYS_INLINE bool
+  shortBytesEqual(const char* left, const char* right, uint32_t size) {
+    uint64_t leftWord;
+    uint64_t rightWord;
+    uint32_t i = 0;
+    for (; i + sizeof(uint64_t) <= size; i += sizeof(uint64_t)) {
+      std::memcpy(&leftWord, left + i, sizeof(uint64_t));
+      std::memcpy(&rightWord, right + i, sizeof(uint64_t));
+      if (leftWord != rightWord) {
+        return false;
+      }
+    }
+    if (i < size) {
+      const uint32_t tail = size - sizeof(uint64_t);
+      std::memcpy(&leftWord, left + tail, sizeof(uint64_t));
+      std::memcpy(&rightWord, right + tail, sizeof(uint64_t));
+      return leftWord == rightWord;
+    }
+    return true;
   }
 
   template <bool rightStored>
