@@ -731,6 +731,7 @@ void HashTable<ignoreNullKeys>::allocateTables(
 
 template <bool ignoreNullKeys>
 void HashTable<ignoreNullKeys>::clear(bool freeTable) {
+  clearChainIndex();
   for (auto* rowContainer : allRows()) {
     rowContainer->clear();
   }
@@ -1978,6 +1979,7 @@ void HashTable<ignoreNullKeys>::prepareJoinTable(
     bool dropDuplicates,
     folly::Executor* executor) {
   buildExecutor_ = executor;
+  clearChainIndex();
   if (dropDuplicates) {
     if (table_ != nullptr) {
       // Reset table_ and capacity_ to trigger rehash.
@@ -2051,6 +2053,7 @@ void HashTable<ignoreNullKeys>::prepareJoinTable(
   } else {
     decideHashMode(0, spillInputStartPartitionBit);
   }
+  buildChainIndex();
 }
 
 template <bool ignoreNullKeys>
@@ -2138,8 +2141,181 @@ int32_t HashTable<ignoreNullKeys>::listJoinResults(
     return listJoinResultsSingleHit(
         iter, includeMisses, inputRows, hits, maxBytes);
   }
+  if (!chainIndex_.empty()) {
+    if (isRowLimitedJoinOutput(iter, inputRows, maxBytes)) {
+      return listJoinResultsFromChainIndex<false>(
+          iter, includeMisses, inputRows, hits, maxBytes);
+    }
+    return listJoinResultsFromChainIndex<true>(
+        iter, includeMisses, inputRows, hits, maxBytes);
+  }
   return listJoinResultsInterleaved(
       iter, includeMisses, inputRows, hits, maxBytes);
+}
+
+template <bool ignoreNullKeys>
+bool HashTable<ignoreNullKeys>::isRowLimitedJoinOutput(
+    const JoinResultIterator& iter,
+    folly::Range<vector_size_t*> inputRows,
+    uint64_t maxBytes) const {
+  // In this case every hit has the same fixed width, and misses add no
+  // bytes. Division avoids overflow in the capacity * row-width bound.
+  return FLAGS_velox_hash_join_fixed_width_output_enabled &&
+      iter.varSizeListColumns.empty() && maxBytes > 0 &&
+      (!iter.estimatedRowSize.has_value() || *iter.estimatedRowSize >= 0) &&
+      (iter.estimatedRowSize.value_or(iter.fixedSizeListColumnsSizeSum) == 0 ||
+       inputRows.size() <= maxBytes /
+               iter.estimatedRowSize.value_or(
+                   iter.fixedSizeListColumnsSizeSum));
+}
+
+template <bool ignoreNullKeys>
+template <bool kCountBytes>
+int32_t HashTable<ignoreNullKeys>::listJoinResultsFromChainIndex(
+    JoinResultIterator& iter,
+    bool includeMisses,
+    folly::Range<vector_size_t*> inputRows,
+    folly::Range<char**> hits,
+    uint64_t maxBytes) {
+  if (iter.rows == nullptr) {
+    return 0;
+  }
+  // Distance, in chain entries, at which build rows are prefetched ahead of
+  // being emitted. The emitted rows are read right after by filter evaluation
+  // and column extraction.
+  constexpr int64_t kRowPrefetchDistance = 16;
+  // Distance, in probe rows, at which head rows are prefetched. The head's
+  // next pointer decides between the single-hit and indexed-chain cases.
+  constexpr int32_t kHeadPrefetchDistance = 8;
+
+  size_t numOut = 0;
+  uint64_t totalBytes{0};
+  auto emit = makeJoinResultEmitter<kCountBytes>(
+      inputRows, hits, numOut, totalBytes, maxBytes, [&](char* hit) {
+        return projectedRowSize(iter, hit);
+      });
+
+  auto& state = iter.chainIndexState;
+  char* const* chainRows = chainIndexRows_->as<char*>();
+  const auto& probeRows = *iter.rows;
+  const auto& probeHits = *iter.hits;
+  const auto numProbeRows = probeRows.size();
+
+  while (true) {
+    while (state.position < state.end) {
+      const auto position = state.position++;
+      if (position + kRowPrefetchDistance < state.end) {
+        __builtin_prefetch(chainRows[position + kRowPrefetchDistance]);
+      }
+      if (!emit(state.probeRow, chainRows[position])) {
+        return numOut;
+      }
+    }
+    if (iter.lastRowIndex >= numProbeRows) {
+      return numOut;
+    }
+    if (iter.lastRowIndex + kHeadPrefetchDistance < numProbeRows) {
+      __builtin_prefetch(
+          probeHits[probeRows[iter.lastRowIndex + kHeadPrefetchDistance]]);
+    }
+    const auto row = probeRows[iter.lastRowIndex];
+    ++iter.lastRowIndex;
+    char* hit = probeHits[row];
+    if (hit == nullptr) {
+      if (includeMisses && !emit(row, nullptr)) {
+        return numOut;
+      }
+      continue;
+    }
+    if (nextRow(hit) == nullptr) {
+      if (!emit(row, hit)) {
+        return numOut;
+      }
+      continue;
+    }
+    const auto it = chainIndex_.find(reinterpret_cast<uintptr_t>(hit));
+    VELOX_CHECK(it != chainIndex_.end());
+    state.probeRow = row;
+    state.position = it->second.first;
+    state.end = it->second.second;
+
+  }
+}
+
+template <bool ignoreNullKeys>
+void HashTable<ignoreNullKeys>::clearChainIndex() {
+  chainIndex_.clear();
+  chainIndexRows_.reset();
+}
+
+template <bool ignoreNullKeys>
+void HashTable<ignoreNullKeys>::buildChainIndex() {
+  // Below this average number of rows per duplicate chain, walking the chain
+  // costs about as much as the extra index lookup per probe row.
+  constexpr int64_t kMinAverageChainLength = 8;
+  // Small tables stay in cache, so chain walks are cheap anyway.
+  constexpr int64_t kMinIndexedRows = 1'024;
+
+  clearChainIndex();
+  if (nextOffset_ == 0 || !hasDuplicates_ || table_ == nullptr) {
+    return;
+  }
+
+  std::vector<char*> heads;
+  auto addHead = [&](char* row) {
+    if (row != nullptr && nextRow(row) != nullptr) {
+      heads.push_back(row);
+    }
+  };
+  if (hashMode_ == HashMode::kArray) {
+    for (int64_t i = 0; i < capacity_; ++i) {
+      addHead(table_[i]);
+    }
+  } else {
+    for (int64_t offset = 0; offset < sizeMask_; offset += kBucketSize) {
+      auto* bucket = bucketAt(offset);
+      for (int32_t slot = 0; slot < sizeof(TagVector); ++slot) {
+        const auto tag = bucket->tagAt(slot);
+        if (tag == ProbeState::kEmptyTag || tag == ProbeState::kTombstoneTag) {
+          continue;
+        }
+        addHead(bucket->pointerAt(slot));
+      }
+    }
+  }
+  if (heads.empty()) {
+    return;
+  }
+
+  std::vector<int64_t> chainLengths(heads.size());
+  int64_t numChainRows{0};
+  for (size_t i = 0; i < heads.size(); ++i) {
+    int64_t length{0};
+    for (char* row = heads[i]; row != nullptr; row = nextRow(row)) {
+      ++length;
+    }
+    chainLengths[i] = length;
+    numChainRows += length;
+  }
+  if (numChainRows < kMinIndexedRows ||
+      numChainRows < kMinAverageChainLength *
+              static_cast<int64_t>(heads.size())) {
+    return;
+  }
+
+  chainIndexRows_ = AlignedBuffer::allocate<char*>(numChainRows, rows_->pool());
+  auto* chainRows = chainIndexRows_->asMutable<char*>();
+  chainIndex_.reserve(heads.size());
+  int64_t position{0};
+  for (size_t i = 0; i < heads.size(); ++i) {
+    const int64_t start = position;
+    for (char* row = heads[i]; row != nullptr; row = nextRow(row)) {
+      chainRows[position++] = row;
+    }
+    VELOX_DCHECK_EQ(position - start, chainLengths[i]);
+    chainIndex_.emplace(
+        reinterpret_cast<uintptr_t>(heads[i]), std::make_pair(start, position));
+  }
 }
 
 template <bool ignoreNullKeys>
@@ -2182,16 +2358,7 @@ int32_t HashTable<ignoreNullKeys>::listJoinResultsInterleaved(
     folly::Range<vector_size_t*> inputRows,
     folly::Range<char**> hits,
     uint64_t maxBytes) {
-  // In this case every hit has the same fixed width, and misses add no
-  // bytes. Division avoids overflow in the capacity * row-width bound.
-  const bool rowLimited = FLAGS_velox_hash_join_fixed_width_output_enabled &&
-      iter.varSizeListColumns.empty() && maxBytes > 0 &&
-      (!iter.estimatedRowSize.has_value() || *iter.estimatedRowSize >= 0) &&
-      (iter.estimatedRowSize.value_or(iter.fixedSizeListColumnsSizeSum) == 0 ||
-       inputRows.size() <= maxBytes /
-               iter.estimatedRowSize.value_or(
-                   iter.fixedSizeListColumnsSizeSum));
-  if (rowLimited) {
+  if (isRowLimitedJoinOutput(iter, inputRows, maxBytes)) {
     return listJoinResultsInterleavedImpl<false>(
         iter, includeMisses, inputRows, hits, maxBytes);
   }

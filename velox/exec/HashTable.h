@@ -18,6 +18,8 @@
 #include <array>
 #include <vector>
 
+#include <folly/container/F14Map.h>
+
 #include "velox/common/base/Portability.h"
 #include "velox/common/base/RuntimeMetrics.h"
 #include "velox/exec/OneWayStatusFlag.h"
@@ -244,6 +246,15 @@ class BaseHashTable {
       }
     };
 
+    /// Resume state for listing results from the duplicate-chain index: the
+    /// probe row being expanded and the remaining range of its chain in the
+    /// index.
+    struct ChainIndexState {
+      vector_size_t probeRow{0};
+      int64_t position{0};
+      int64_t end{0};
+    };
+
     JoinResultIterator(
         std::vector<vector_size_t>&& _varSizeListColumns,
         uint64_t _fixedSizeListColumnsSizeSum,
@@ -257,13 +268,15 @@ class BaseHashTable {
       hits = &lookup.hits;
       lastRowIndex = 0;
       walker.reset();
+      chainIndexState = {};
     }
 
     bool atEnd() const {
       if (!rows) {
         return true;
       }
-      if (lastRowIndex < rows->size()) {
+      if (lastRowIndex < rows->size() ||
+          chainIndexState.position < chainIndexState.end) {
         return false;
       }
       for (int32_t i = walker.slotHead; i < walker.numActive; ++i) {
@@ -289,6 +302,9 @@ class BaseHashTable {
 
     /// Cross-call state for the interleaved walker.
     InterleavedWalkerState walker;
+
+    /// Cross-call state when listing from the duplicate-chain index.
+    ChainIndexState chainIndexState;
   };
 
   struct RowsIterator {
@@ -1048,6 +1064,34 @@ class HashTable : public BaseHashTable {
       folly::Range<char**> hits,
       uint64_t maxBytes);
 
+  // Returns true when every hit has the same fixed projected width so the
+  // output batch is bounded by row count and per-hit byte accounting can be
+  // skipped.
+  bool isRowLimitedJoinOutput(
+      const JoinResultIterator& iter,
+      folly::Range<vector_size_t*> inputRows,
+      uint64_t maxBytes) const;
+
+  // Lists join results using 'chainIndex_'. Emits the same rows in the same
+  // order as walking the next-row chains, but reads each chain from a
+  // contiguous array so the loads of consecutive duplicates are independent
+  // and can be prefetched.
+  template <bool kCountBytes>
+  int32_t listJoinResultsFromChainIndex(
+      JoinResultIterator& iter,
+      bool includeMisses,
+      folly::Range<vector_size_t*> inputRows,
+      folly::Range<char**> hits,
+      uint64_t maxBytes);
+
+  // Builds 'chainIndex_' and 'chainIndexRows_' after the join table is final
+  // if duplicate chains are long enough on average for walking them pointer by
+  // pointer to dominate result listing. Leaves the index empty otherwise.
+  void buildChainIndex();
+
+  // Drops the duplicate-chain index.
+  void clearChainIndex();
+
   // Tries to use as many range hashers as can in a normalized key situation.
   void enableRangeWhereCan(
       const std::vector<uint64_t>& rangeSizes,
@@ -1337,6 +1381,16 @@ class HashTable : public BaseHashTable {
   // the join can be cardinality increasing. Atomic for tsan because
   // many threads can set this.
   OneWayStatusFlag hasDuplicates_;
+
+  // Maps the address of a chain's head row to the range [first, second) in
+  // 'chainIndexRows_' holding all rows of the chain, in chain order. Only
+  // chains with more than one row are present. Empty unless buildChainIndex()
+  // decided that indexing pays off. Keyed by integer address because folly's
+  // default hasher treats 'const char*' keys as C strings.
+  folly::F14FastMap<uintptr_t, std::pair<int64_t, int64_t>> chainIndex_;
+
+  // Row pointers of all indexed chains, laid out chain after chain.
+  BufferPtr chainIndexRows_;
 
   // Offset of next row link for join build side set from 'rows_'.
   int32_t nextOffset_{0};

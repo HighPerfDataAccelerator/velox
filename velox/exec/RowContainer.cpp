@@ -433,6 +433,10 @@ char* RowContainer::initializeRow(char* row, bool reuse) {
     // zero out string views so that clear() will not hit uninited data. The
     // fastest way is to set the whole row to 0.
     ::memset(row, 0, fixedRowSize_);
+  } else if (nextOffset_ != 0) {
+    // A row that never gets a duplicate keeps a null next-row pointer, which
+    // ends its chain in the join hash table.
+    *reinterpret_cast<char**>(row + nextOffset_) = nullptr;
   }
   if (!nullOffsets_.empty()) {
     // Sets all null and initialized bits to 0 (for each accumulator,
