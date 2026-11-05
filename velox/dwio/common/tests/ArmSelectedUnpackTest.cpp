@@ -171,6 +171,46 @@ TEST(ArmSelectedUnpack, ExactInputSelectionAndOutputGuardPages) {
   checkGuardPages<int64_t>();
 }
 
+TEST(ArmSelectedUnpack, LargeBitPositionsUse64BitAddresses) {
+  if (!kHasSve) {
+    GTEST_SKIP() << "Requires SVE";
+  }
+  // Sparse virtual allocation: only the pages containing selected fields are
+  // touched. The last row's bit position exceeds UINT32_MAX.
+  constexpr int32_t kLargeRow = 200000000;
+  constexpr uint8_t kWidth = 24;
+  constexpr int32_t kOffset = 7;
+  constexpr size_t kBytes = (int64_t{kLargeRow} * kWidth + kOffset) / 8 + 8;
+  auto* data = static_cast<char*>(mmap(
+      nullptr,
+      kBytes,
+      PROT_READ | PROT_WRITE,
+      MAP_PRIVATE | MAP_ANONYMOUS,
+      -1,
+      0));
+  ASSERT_NE(data, MAP_FAILED);
+  std::vector<int32_t> rows(33);
+  for (int i = 0; i < 33; ++i) {
+    rows[i] = i < 16 ? i : kLargeRow;
+    const auto byte = (int64_t{rows[i]} * kWidth + kOffset) / 8;
+    std::memset(data + byte, 0xb7, 8);
+  }
+  std::vector<int64_t> output(33, -1);
+  const auto done = unpackSafePrefix(
+      reinterpret_cast<const uint64_t*>(data),
+      kOffset,
+      rows.data(),
+      rows.size(),
+      kWidth,
+      (uint64_t{1} << kWidth) - 1,
+      output.data());
+  EXPECT_EQ(done, rows.size());
+  for (size_t i = 0; i < rows.size(); ++i) {
+    EXPECT_EQ(output[i], reference<int64_t>(data, kOffset, rows[i], kWidth));
+  }
+  EXPECT_EQ(munmap(data, kBytes), 0);
+}
+
 TEST(ArmSelectedUnpack, FallbackDoesNotAccessMemory) {
   GuardedBuffer inaccessible;
   const auto* input = reinterpret_cast<const uint64_t*>(inaccessible.end());

@@ -22,6 +22,7 @@
 
 #include <gflags/gflags.h>
 #include <cstring>
+#include <limits>
 
 DEFINE_bool(
     velox_arm_sve_bit_unpack_enabled,
@@ -204,7 +205,7 @@ int32_t decode1To24(
 template <typename T>
 void unpack(
     const uint64_t* bits,
-    int32_t bitOffset,
+    int32_t inputBitOffset,
     RowSet rows,
     int32_t rowBias,
     uint8_t bitWidth,
@@ -220,7 +221,7 @@ void unpack(
   VELOX_DCHECK_NOT_NULL(bits);
 
   // We subtract rowBias * bitWidth bits from the starting position.
-  bitOffset -= rowBias * bitWidth;
+  int64_t bitOffset = int64_t{inputBitOffset} - int64_t{rowBias} * bitWidth;
   if (bitOffset < 0) {
     // Decrement the pointer by enough bytes to have a non-negative bitOffset.
     auto bytes = bits::divRoundUp(-bitOffset, 8);
@@ -231,7 +232,7 @@ void unpack(
   auto numRows = rows.size();
   if (bitWidth > 56) {
     for (auto i = 0; i < numRows; ++i) {
-      auto bit = bitOffset + (rows[i]) * bitWidth;
+      auto bit = bitOffset + int64_t{rows[i]} * bitWidth;
       result[i] = bits::detail::loadBits<T>(bits, bit, bitWidth) & mask;
     }
     return;
@@ -240,7 +241,7 @@ void unpack(
   bool anyUnsafe = false;
   if (bufferEnd) {
     const char* endByte = reinterpret_cast<const char*>(bits) +
-        bits::divRoundUp(bitOffset + (rows.back() + 1) * bitWidth, 8);
+        bits::divRoundUp(bitOffset + (int64_t{rows.back()} + 1) * bitWidth, 8);
     // redzone is the number of bytes at the end of the accessed range that
     // could overflow the buffer if accessed 64 its wide.
     int64_t redZone =
@@ -287,13 +288,15 @@ void unpack(
   // 32-bit gather. numSafeRows already excludes the buffer-end red zone.
   // Keep wider fields and the tail on the existing bounded scalar path.
   if constexpr (std::is_same_v<T, int32_t> || std::is_same_v<T, int64_t>) {
-    if (bitWidth <= 24) {
+    if (bitWidth <= 24 && numSafeRows > 0 &&
+        bitOffset + int64_t{rows[numSafeRows - 1]} * bitWidth <=
+            std::numeric_limits<int32_t>::max()) {
       using I = xsimd::batch<int32_t>;
       using U = xsimd::batch<uint32_t>;
       for (; i + I::size <= numSafeRows; i += I::size) {
         const auto positions = I::load_unaligned(rows.data() + i) *
                 static_cast<int32_t>(bitWidth) +
-            bitOffset;
+            static_cast<int32_t>(bitOffset);
         const auto words = simd::gather<uint32_t, int32_t, 1>(
             reinterpret_cast<const uint32_t*>(bits), positions >> 3);
         const auto shifts = xsimd::bitwise_cast<U>(positions & 7);
@@ -312,39 +315,44 @@ void unpack(
 #endif
 
 #if XSIMD_WITH_AVX2
-  // Use AVX2 for specific widths.
-  switch (bitWidth) {
-    WIDTH_CASE(1);
-    WIDTH_CASE(2);
-    WIDTH_CASE(3);
-    WIDTH_CASE(4);
-    WIDTH_CASE(5);
-    WIDTH_CASE(6);
-    WIDTH_CASE(7);
-    WIDTH_CASE(8);
-    WIDTH_CASE(9);
-    WIDTH_CASE(10);
-    WIDTH_CASE(11);
-    WIDTH_CASE(12);
-    WIDTH_CASE(13);
-    WIDTH_CASE(14);
-    WIDTH_CASE(15);
-    WIDTH_CASE(16);
-    WIDTH_CASE(17);
-    WIDTH_CASE(18);
-    WIDTH_CASE(19);
-    WIDTH_CASE(20);
-    WIDTH_CASE(21);
-    WIDTH_CASE(22);
-    WIDTH_CASE(23);
-    WIDTH_CASE(24);
-    default:
-      break;
+  // These kernels calculate bit positions in int32 lanes. Larger positions
+  // must use the scalar path below, which retains 64-bit address arithmetic.
+  if (numSafeRows > 0 &&
+      bitOffset + int64_t{rows[numSafeRows - 1]} * bitWidth <=
+          std::numeric_limits<int32_t>::max()) {
+    switch (bitWidth) {
+      WIDTH_CASE(1);
+      WIDTH_CASE(2);
+      WIDTH_CASE(3);
+      WIDTH_CASE(4);
+      WIDTH_CASE(5);
+      WIDTH_CASE(6);
+      WIDTH_CASE(7);
+      WIDTH_CASE(8);
+      WIDTH_CASE(9);
+      WIDTH_CASE(10);
+      WIDTH_CASE(11);
+      WIDTH_CASE(12);
+      WIDTH_CASE(13);
+      WIDTH_CASE(14);
+      WIDTH_CASE(15);
+      WIDTH_CASE(16);
+      WIDTH_CASE(17);
+      WIDTH_CASE(18);
+      WIDTH_CASE(19);
+      WIDTH_CASE(20);
+      WIDTH_CASE(21);
+      WIDTH_CASE(22);
+      WIDTH_CASE(23);
+      WIDTH_CASE(24);
+      default:
+        break;
+    }
   }
 #endif
 
   for (; i < numSafeRows; ++i) {
-    auto bit = bitOffset + (rows[i]) * bitWidth;
+    auto bit = bitOffset + int64_t{rows[i]} * bitWidth;
     auto byte = bit / 8;
     auto shift = bit & 7;
     uint64_t word;
@@ -356,7 +364,7 @@ void unpack(
     auto lastSafeWord = bufferEnd - sizeof(uint64_t);
     VELOX_DCHECK(lastSafeWord);
     for (auto i_2 = numSafeRows; i_2 < numRows; ++i_2) {
-      auto bit = bitOffset + (rows[i_2]) * bitWidth;
+      auto bit = bitOffset + int64_t{rows[i_2]} * bitWidth;
       auto byte = bit / 8;
       auto shift = bit & 7;
       result[i_2] = safeLoadBits(

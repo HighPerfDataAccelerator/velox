@@ -27,6 +27,7 @@
 #include <vector>
 
 DECLARE_bool(velox_arm_sve_bit_unpack_enabled);
+DECLARE_bool(velox_arm_sve_bit_deposit_enabled);
 
 namespace {
 namespace common = facebook::velox::dwio::common;
@@ -184,4 +185,74 @@ TEST(ArmSelectedUnpackApi, WidthsRowBiasSafeTailsAndGuardPages) {
   gflags::FlagSaver savedFlags;
   EXPECT_EQ(correctness(), 60512);
 }
+TEST(ArmSelectedUnpackApi, LargeRowPositionsAndBias) {
+  gflags::FlagSaver savedFlags;
+  constexpr int32_t kLargeRow = 200000000;
+  constexpr uint8_t kWidth = 24;
+  constexpr int kCount = 33;
+  constexpr int kOffset = 7;
+  const size_t bytes = (int64_t{kLargeRow + kCount} * kWidth + kOffset + 7) / 8;
+  auto* data = static_cast<uint8_t*>(mmap(
+      nullptr,
+      bytes,
+      PROT_READ | PROT_WRITE,
+      MAP_PRIVATE | MAP_ANONYMOUS,
+      -1,
+      0));
+  ASSERT_NE(data, MAP_FAILED);
+  std::vector<int32_t> rows(kCount);
+  for (int i = 0; i < kCount; ++i) {
+    rows[i] = kLargeRow + i;
+  }
+  const auto firstByte = (int64_t{kLargeRow} * kWidth + kOffset) / 8;
+  std::fill(data + firstByte, data + bytes, uint8_t{0xb7});
+  std::vector<int64_t> output(kCount);
+  for (int mode : {0, 1, 2, 3}) {
+    FLAGS_velox_arm_sve_bit_deposit_enabled = mode >= 2;
+    for (bool bounded : {false, true}) {
+      // Leave the unbounded load enough readable padding by excluding the
+      // final rows. Both branches still exercise overflowing bit positions.
+      auto selected = rows;
+      if (!bounded) {
+        selected.resize(kCount - 3);
+      }
+      call(
+          mode % 2,
+          data,
+          kOffset,
+          selected,
+          0,
+          kWidth,
+          bounded ? reinterpret_cast<const char*>(data + bytes) : nullptr,
+          output.data());
+      for (size_t i = 0; i < selected.size(); ++i) {
+        EXPECT_EQ(
+            output[i],
+            reference<int64_t>(
+                data, int64_t{selected[i]} * kWidth + kOffset, kWidth));
+      }
+    }
+    // A large rowBias must cancel before multiplication narrows to int32.
+    std::vector<uint64_t> small(32, 0xb7b7b7b7b7b7b7b7ULL);
+    call(
+        mode % 2,
+        reinterpret_cast<const uint8_t*>(small.data()),
+        kOffset,
+        rows,
+        kLargeRow,
+        kWidth,
+        nullptr,
+        output.data());
+    for (int i = 0; i < kCount; ++i) {
+      EXPECT_EQ(
+          output[i],
+          reference<int64_t>(
+              reinterpret_cast<const uint8_t*>(small.data()),
+              int64_t{i} * kWidth + kOffset,
+              kWidth));
+    }
+  }
+  EXPECT_EQ(munmap(data, bytes), 0);
+}
+
 } // namespace

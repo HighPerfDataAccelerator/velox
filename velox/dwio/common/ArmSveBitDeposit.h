@@ -179,7 +179,7 @@ unpack32(uint8_t width, const uint8_t* input, unsigned startShift, T* output) {
 template <typename T>
 inline int32_t unpackSelectedPrefix(
     const uint64_t* input,
-    int32_t bitOffset,
+    int64_t bitOffset,
     const int32_t* rows,
     int32_t count,
     uint8_t width,

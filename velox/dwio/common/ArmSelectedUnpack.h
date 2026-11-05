@@ -31,7 +31,7 @@ namespace facebook::velox::dwio::common::arm_sve {
 template <typename T>
 inline int32_t unpackSafePrefix(
     const uint64_t* input,
-    int32_t normalizedBitOffset,
+    int64_t normalizedBitOffset,
     const int32_t* rows,
     int32_t count,
     uint8_t width,
