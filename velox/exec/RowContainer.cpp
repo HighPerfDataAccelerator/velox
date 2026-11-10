@@ -61,6 +61,23 @@ void extractFixedBatchValues(
   }
   for (int32_t i = 0; i < count; i += 64) {
     const auto n = std::min(64, count - i);
+    // Rows are scattered over the container, so start fetching the fields of
+    // the next block while this block is copied.
+    if (i + 64 < count) {
+      const auto next = std::min(64, count - i - 64);
+      for (int32_t j = 0; j < next; ++j) {
+        const char* row;
+        if constexpr (selected) {
+          const auto number = numbers[i + 64 + j];
+          row = number < 0 ? nullptr : rows[number];
+        } else {
+          row = rows[i + 64 + j];
+        }
+        if (row != nullptr) {
+          __builtin_prefetch(row + column.offset());
+        }
+      }
+    }
     const auto* const* blockRows = selected ? rows : rows + i;
     const auto* blockNumbers = selected ? numbers + i : nullptr;
     const uint64_t valid = useSve
