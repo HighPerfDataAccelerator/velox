@@ -1203,6 +1203,27 @@ void HashProbe::processRightSemiNoFilter(bool emptyBuildSide) {
   input_ = nullptr;
 }
 
+namespace {
+// Compacts join result pairs in place, keeping the pairs whose build row is
+// not yet marked as probed. Returns the number of pairs kept.
+int32_t dropProbedBuildRows(
+    int32_t probedFlagOffset,
+    int32_t numRows,
+    char** buildRows,
+    vector_size_t* probeRows) {
+  int32_t numKept{0};
+  for (int32_t i = 0; i < numRows; ++i) {
+    char* row = buildRows[i];
+    if (row == nullptr || !bits::isBitSet(row, probedFlagOffset)) {
+      buildRows[numKept] = row;
+      probeRows[numKept] = probeRows[i];
+      ++numKept;
+    }
+  }
+  return numKept;
+}
+} // namespace
+
 RowVectorPtr HashProbe::getOutputInternal(bool toSpillOutput) {
   if (isFinished()) {
     return nullptr;
@@ -1416,7 +1437,22 @@ RowVectorPtr HashProbe::getOutputInternal(bool toSpillOutput) {
       VELOX_CHECK_NOT_NULL(table_);
     }
 
-    numOut = evalFilter(numOut);
+    // Right semi and right anti joins only need to know whether a build row
+    // matched at least once. Pairs whose build row is already marked cannot
+    // change the result, so drop them before evaluating the filter.
+    if (filter_ && !nullAware_ &&
+        (isRightSemiFilterJoin(joinType_) ||
+         isRightSemiProjectJoin(joinType_) || isRightAntiJoin(joinType_))) {
+      numOut = dropProbedBuildRows(
+          table_->rows()->probedFlagOffset(),
+          numOut,
+          outputTableRows_->asMutable<char*>(),
+          outputRowMapping_->asMutable<vector_size_t>());
+    }
+
+    if (numOut > 0) {
+      numOut = evalFilter(numOut);
+    }
 
     if (numOut == 0) {
       // The hash probe might get stuck in the output loop if the filter is
