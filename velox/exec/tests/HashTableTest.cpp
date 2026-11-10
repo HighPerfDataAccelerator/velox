@@ -31,6 +31,7 @@
 
 #if defined(__aarch64__)
 DECLARE_int32(velox_arm_hash_table_prefetch_distance);
+DECLARE_bool(velox_group_by_hash_mode_for_distinct_keys);
 #endif
 
 using namespace facebook::velox;
@@ -647,6 +648,24 @@ TEST_P(HashTableTest, structKey) {
   testCycle(BaseHashTable::HashMode::kHash, 100000, 2, type, 1);
 }
 
+TEST_P(HashTableTest, distinctKeysUseHashModeForGroupBy) {
+  auto rowType = ROW({"a", "b"}, {BIGINT(), BIGINT()});
+  auto table = createHashTableForAggregation(rowType, 2);
+  auto lookup = std::make_unique<HashLookup>(table->hashers(), pool());
+  // Sparse keys whose combined range overflows 64 bits, so each key would
+  // map through distinct values.
+  auto data = makeRowVector({
+      makeFlatVector<int64_t>(
+          20'000, [](auto row) { return row * 50'000'000'000; }),
+      makeFlatVector<int64_t>(
+          20'000, [](auto row) { return 1 + (row / 2) * 50'000'000'000; }),
+  });
+  lookup->reset(data->size());
+  insertGroups(*data, *lookup, *table);
+  ASSERT_EQ(table->hashMode(), BaseHashTable::HashMode::kHash);
+  ASSERT_EQ(table->numDistinct(), data->size());
+}
+
 TEST_P(HashTableTest, mixed6Sparse) {
   auto type =
       ROW({"k1", "k2", "k3", "k4", "k5", "k6"},
@@ -715,6 +734,10 @@ TEST_P(HashTableTest, clearAfterInsert) {
 // rangesWithReserve overflows, distinctsWithReserve fits and bestWithReserve =
 // rangesWithReserve.
 TEST_P(HashTableTest, bestWithReserveOverflow) {
+  // Covers normalized keys built from distinct values, which group-by tables
+  // otherwise replace with hash mode.
+  gflags::FlagSaver flagSaver;
+  FLAGS_velox_group_by_hash_mode_for_distinct_keys = false;
   auto rowType =
       ROW({"a", "b", "c", "d"}, {BIGINT(), BIGINT(), BIGINT(), BIGINT()});
   const auto numKeys = 4;

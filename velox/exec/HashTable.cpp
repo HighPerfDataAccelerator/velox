@@ -44,6 +44,12 @@ DEFINE_int32(
     "ARM group-by rehash prefetch look-ahead in rows; zero disables prefetch");
 #endif
 
+DEFINE_bool(
+    velox_group_by_hash_mode_for_distinct_keys,
+    true,
+    "Use hash mode for group-by tables whose normalized key would need "
+    "distinct-value lookups");
+
 using facebook::velox::common::testutil::TestValue;
 
 namespace facebook::velox::exec {
@@ -2055,6 +2061,15 @@ void HashTable<ignoreNullKeys>::decideHashMode(
     enableRangeWhereCan(rangeSizes, distinctSizes, useRange);
   } else {
     clearUseRange(useRange);
+  }
+  // A group-by key in distinct mode costs a lookup in its distinct-value table
+  // for every input row on top of the table probe. When the key concatenation
+  // does not fit a range or an array, hashing and comparing the keys is
+  // cheaper.
+  if (!isJoinBuild_ && FLAGS_velox_group_by_hash_mode_for_distinct_keys &&
+      std::find(useRange.begin(), useRange.end(), false) != useRange.end()) {
+    setHashMode(HashMode::kHash, numNew, spillInputStartPartitionBit);
+    return;
   }
   setHasherMode(hashers_, useRange, rangeSizes, distinctSizes);
   setHashMode(HashMode::kNormalizedKey, numNew, spillInputStartPartitionBit);
