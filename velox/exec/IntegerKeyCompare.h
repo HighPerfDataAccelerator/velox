@@ -20,11 +20,6 @@
 #include <cstring>
 #include <vector>
 
-// Set to 0 to retain generic key comparisons for controlled A/B builds.
-#ifndef VELOX_ENABLE_FIXED_INTEGER_KEY_COMPARE
-#define VELOX_ENABLE_FIXED_INTEGER_KEY_COMPARE 1
-#endif
-
 namespace facebook::velox::exec::detail::integer_key_compare {
 
 // Keep decoded vectors and row-column metadata local to one probe batch.

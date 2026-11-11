@@ -491,7 +491,6 @@ void HashTable<ignoreNullKeys>::groupProbe(
 template <bool ignoreNullKeys>
 bool HashTable<ignoreNullKeys>::tryGroupProbeWithFixedIntegerKeys(
     HashLookup& lookup) {
-#if VELOX_ENABLE_FIXED_INTEGER_KEY_COMPARE
   if (lookup.hashers.empty()) {
     return false;
   }
@@ -549,21 +548,16 @@ bool HashTable<ignoreNullKeys>::tryGroupProbeWithFixedIntegerKeys(
     }
   }
   return true;
-#else
-  return false;
-#endif
 }
 
 template <bool ignoreNullKeys>
 template <bool isNormalizedKey>
 void HashTable<ignoreNullKeys>::groupProbeWithPrefetch(HashLookup& lookup) {
-#if VELOX_ENABLE_FIXED_INTEGER_KEY_COMPARE
   if constexpr (!isNormalizedKey) {
     if (tryGroupProbeWithFixedIntegerKeys(lookup)) {
       return;
     }
   }
-#endif
 
   constexpr int32_t kKeyOffset =
       isNormalizedKey ? -static_cast<int32_t>(sizeof(normalized_key_t)) : 0;
