@@ -256,6 +256,61 @@ class SumAggregationTest : public SumTestBase {
   }
 };
 
+TEST_F(SumAggregationTest, decimalAccumulatorStateTransitions) {
+  using Aggregate = DecimalSumAggregate<int128_t, int128_t, 38>;
+  using Accumulator = Aggregate::AccumulatorType;
+  // Keep the compact state size from growing unnoticed.
+  EXPECT_EQ(sizeof(Accumulator), 32);
+
+  auto raw = makeFlatVector<int128_t>({17, -17, 42, 9}, DECIMAL(38, 0));
+  DecodedVector decodedRaw(*raw);
+  exec::VectorReader<int128_t> rawReader(&decodedRaw);
+  auto partial = makeRowVector({
+      makeNullableFlatVector<int128_t>({0, std::nullopt, 5}, DECIMAL(38, 0)),
+      makeFlatVector<bool>({true, false, false}),
+  });
+  DecodedVector decodedPartial(*partial);
+  exec::VectorReader<Row<int128_t, bool>> partialReader(&decodedPartial);
+  Accumulator accumulator(nullptr, nullptr);
+  const auto add = [&](vector_size_t row) {
+    return accumulator.addInput(
+        nullptr, exec::OptionalAccessor<int128_t>(&rawReader, row));
+  };
+  const auto merge = [&](vector_size_t row) {
+    return accumulator.combine(
+        nullptr,
+        exec::OptionalAccessor<Row<int128_t, bool>>(&partialReader, row));
+  };
+  EXPECT_TRUE(accumulator.isEmpty);
+  EXPECT_EQ(accumulator.computeFinalResult(), int128_t{0});
+  EXPECT_FALSE(merge(0));
+
+  // Ordinary values can cancel to zero without making the group empty.
+  EXPECT_TRUE(add(0));
+  EXPECT_TRUE(add(1));
+  EXPECT_FALSE(accumulator.isEmpty);
+  EXPECT_EQ(accumulator.computeFinalResult(), int128_t{0});
+  EXPECT_TRUE(merge(0));
+  EXPECT_FALSE(accumulator.isEmpty);
+  EXPECT_EQ(accumulator.computeFinalResult(), int128_t{0});
+
+  // An overflowed intermediate result is sticky across raw and merged input.
+  EXPECT_TRUE(merge(1));
+  EXPECT_FALSE(accumulator.computeFinalResult().has_value());
+  EXPECT_TRUE(add(2));
+  EXPECT_TRUE(merge(2));
+  EXPECT_TRUE(merge(0));
+  EXPECT_FALSE(accumulator.isEmpty);
+  EXPECT_FALSE(accumulator.computeFinalResult().has_value());
+
+  // Reusing accumulator storage must restore both the sum and its validity.
+  accumulator = Accumulator(nullptr, nullptr);
+  EXPECT_TRUE(accumulator.isEmpty);
+  EXPECT_EQ(accumulator.computeFinalResult(), int128_t{0});
+  EXPECT_TRUE(add(3));
+  EXPECT_EQ(accumulator.computeFinalResult(), int128_t{9});
+}
+
 TEST_F(SumAggregationTest, overflow) {
   SumTestBase::testAggregateOverflow<int64_t, int64_t, int64_t>("spark_sum");
 }

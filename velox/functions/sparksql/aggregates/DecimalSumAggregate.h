@@ -60,11 +60,14 @@ class DecimalSumAggregate {
   /// initial value of sum is 0. We need to keep sum unchanged if the input is
   /// null, as sum function ignores null input. If the isEmpty is true, then it
   /// means there were no values to begin with or all the values were null, so
-  /// the result will be null. If the isEmpty is false, then if sum is nullopt
-  /// that means an overflow has happened, it returns null.
+  /// the result will be null. A missing sum with isEmpty false represents
+  /// overflow propagated from an intermediate result.
   struct AccumulatorType {
-    std::optional<int128_t> sum{0};
+    // Store validity next to the other flags to avoid optional padding.
+    // The intermediate row representation is unchanged.
+    int128_t sum{0};
     int64_t overflow{0};
+    bool hasSum{true};
     bool isEmpty{true};
 
     static constexpr bool is_aligned_ = true;
@@ -76,11 +79,10 @@ class DecimalSumAggregate {
         DecimalSumAggregate<TInputType, TSumType, ResultPrecision>* /*fn*/) {}
 
     std::optional<int128_t> computeFinalResult() const {
-      if (!sum.has_value()) {
+      if (!hasSum) {
         return std::nullopt;
       }
-      auto const adjustedSum =
-          DecimalUtil::adjustSumForOverflow(sum.value(), overflow);
+      auto const adjustedSum = DecimalUtil::adjustSumForOverflow(sum, overflow);
       if (adjustedSum.has_value() &&
           DecimalUtil::valueInPrecisionRange(adjustedSum, ResultPrecision)) {
         return adjustedSum;
@@ -96,15 +98,13 @@ class DecimalSumAggregate {
       if (!data.has_value()) {
         return false;
       }
-      if (!sum.has_value()) {
-        // sum is initialized to 0. When it is nullopt, it implies that the
-        // input data must not be empty.
+      if (!hasSum) {
+        // A missing sum represents overflow from a non-empty input.
         VELOX_CHECK(!isEmpty);
         return true;
       }
       int128_t result;
-      overflow +=
-          DecimalUtil::addWithOverflow(result, data.value(), sum.value());
+      overflow += DecimalUtil::addWithOverflow(result, data.value(), sum);
       sum = result;
       isEmpty = false;
       return true;
@@ -126,15 +126,14 @@ class DecimalSumAggregate {
         return false;
       }
 
-      bool currentOverflow = !isEmpty && !sum.has_value();
+      bool currentOverflow = !isEmpty && !hasSum;
       bool otherOverflow = !otherIsEmpty.value() && !otherSum.has_value();
       if (currentOverflow || otherOverflow) {
-        sum = std::nullopt;
+        hasSum = false;
         isEmpty = false;
       } else {
         int128_t result;
-        overflow +=
-            DecimalUtil::addWithOverflow(result, otherSum.value(), sum.value());
+        overflow += DecimalUtil::addWithOverflow(result, otherSum.value(), sum);
         sum = result;
         isEmpty &= otherIsEmpty.value();
       }
