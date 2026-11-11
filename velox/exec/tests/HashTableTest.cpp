@@ -25,9 +25,12 @@
 #include "velox/vector/tests/utils/VectorTestBase.h"
 
 #include <folly/executors/CPUThreadPoolExecutor.h>
+#include <folly/lang/Bits.h>
 #include <gmock/gmock-matchers.h>
 #include <gtest/gtest.h>
 #include <memory>
+#include <unordered_map>
+#include <unordered_set>
 
 #if defined(__aarch64__)
 DECLARE_int32(velox_arm_hash_table_prefetch_distance);
@@ -945,6 +948,97 @@ TEST_P(HashTableTest, groupRehashPrefetchDistances) {
   }
 }
 #endif
+
+TEST_P(HashTableTest, joinBuildDuplicateChainsAtBatchBoundaries) {
+  if (GetParam()) {
+    GTEST_SKIP() << "This test builds a single table";
+  }
+  constexpr int32_t kNumKeys = 4096;
+  for (const auto extraRows : {0, 1, 63, 64, 65, 127, 128, 129, 8193}) {
+    for (const bool generic : {false, true}) {
+      for (const bool allowDuplicates : {false, true}) {
+        SCOPED_TRACE(
+            fmt::format(
+                "extraRows={}, generic={}, allowDuplicates={}",
+                extraRows,
+                generic,
+                allowDuplicates));
+        const auto numRows = kNumKeys + extraRows;
+        std::vector<std::unique_ptr<VectorHasher>> hashers;
+        for (int32_t key = 0; key < 2; ++key) {
+          hashers.push_back(std::make_unique<VectorHasher>(BIGINT(), key));
+        }
+        auto table = HashTable<true>::createForJoin(
+            std::move(hashers),
+            {},
+            allowDuplicates,
+            false,
+            false,
+            1'000,
+            pool());
+        auto input = makeRowVector({
+            makeFlatVector<int64_t>(
+                numRows,
+                [](auto row) { return int64_t(row % kNumKeys) * 1000; }),
+            makeFlatVector<int64_t>(
+                numRows,
+                [](auto row) {
+                  return int64_t((row % kNumKeys) * 7 % kNumKeys) * 1000;
+                }),
+        });
+        // The fixture scatters row allocation order independently of key order.
+        copyVectorsToTable({input}, 0, table.get());
+        std::unordered_map<char*, int32_t> rowIds;
+        for (int32_t row = 0; row < numRows; ++row) {
+          rowIds.emplace(rowOfKey_[row], row);
+        }
+        table->prepareJoinTable(
+            {}, BaseHashTable::kNoSpillInputStartPartitionBit, 1'000'000);
+        if (generic) {
+          // Rebuild from unlinked rows when switching representations.
+          if (allowDuplicates) {
+            for (int32_t row = 0; row < numRows; ++row) {
+              folly::storeUnaligned<char*>(
+                  rowOfKey_[row] + table->rows()->nextOffset(),
+                  static_cast<char*>(nullptr));
+            }
+          }
+          table->forceGenericHashMode(
+              BaseHashTable::kNoSpillInputStartPartitionBit);
+        }
+        ASSERT_EQ(
+            table->hashMode(),
+            generic ? BaseHashTable::HashMode::kHash
+                    : BaseHashTable::HashMode::kNormalizedKey);
+        HashLookup lookup(table->hashers(), pool());
+        lookup.reset(numRows);
+        SelectivityVector selected(numRows);
+        table->prepareForJoinProbe(lookup, input, selected, true);
+        table->joinProbe(lookup);
+        for (int32_t key = 0; key < kNumKeys; ++key) {
+          std::unordered_set<char*> visited;
+          auto* row = lookup.hits[key];
+          ASSERT_NE(row, nullptr);
+          while (row != nullptr) {
+            const auto entry = rowIds.find(row);
+            ASSERT_NE(entry, rowIds.end());
+            EXPECT_EQ(entry->second % kNumKeys, key);
+            ASSERT_TRUE(visited.insert(row).second)
+                << "Cycle in duplicate chain";
+            if (!allowDuplicates) {
+              break;
+            }
+            row =
+                folly::loadUnaligned<char*>(row + table->rows()->nextOffset());
+          }
+          EXPECT_EQ(
+              visited.size(),
+              allowDuplicates ? 1 + (numRows - 1 - key) / kNumKeys : 1);
+        }
+      }
+    }
+  }
+}
 
 TEST_P(HashTableTest, regularHashingTableSize) {
   keySpacing_ = 1000;

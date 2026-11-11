@@ -31,6 +31,10 @@
 #include <gflags/gflags.h>
 #include <algorithm>
 
+#ifndef VELOX_ENABLE_JOIN_CHAIN_PREFETCH
+#define VELOX_ENABLE_JOIN_CHAIN_PREFETCH 1
+#endif
+
 DECLARE_bool(velox_hash_join_fixed_width_output_enabled);
 DECLARE_bool(velox_hash_join_head_chain_drain_enabled);
 DECLARE_bool(velox_hash_join_compact_chains_enabled);
@@ -1725,6 +1729,13 @@ FOLLY_ALWAYS_INLINE void HashTable<ignoreNullKeys>::insertForJoinWithPrefetch(
     }
     for (int32_t j = 0; j < kPrefetchSize; ++j) {
       states[j].firstProbe(*this, keyOffset);
+#if VELOX_ENABLE_JOIN_CHAIN_PREFETCH
+      // Key prefetching may not cover the duplicate-chain link updated by
+      // pushNext(). Prefetch the link while other candidates are probed.
+      if (auto* candidate = states[j].group(); candidate && nextOffset_ > 0) {
+        __builtin_prefetch(candidate + nextOffset_, 0, 3);
+      }
+#endif
     }
     for (int32_t j = 0; j < kPrefetchSize; ++j) {
       auto index = i + j;
