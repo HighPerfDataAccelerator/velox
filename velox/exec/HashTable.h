@@ -1156,6 +1156,10 @@ class HashTable : public BaseHashTable {
 
   // Probes and inserts group-by rows in windows of kPrefetchSize rows so the
   // bucket and row cache misses of a window overlap.
+  // Probes eligible fixed-width integer grouping keys. Returns false without
+  // changing the lookup or table when the fast path is unavailable.
+  bool tryGroupProbeWithFixedIntegerKeys(HashLookup& lookup);
+
   template <bool isNormalizedKey>
   void groupProbeWithPrefetch(HashLookup& lookup);
 

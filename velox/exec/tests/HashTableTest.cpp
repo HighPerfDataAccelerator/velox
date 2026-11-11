@@ -22,12 +22,16 @@
 #include "velox/exec/Aggregate.h"
 #include "velox/exec/VectorHasher.h"
 #include "velox/functions/prestosql/aggregates/RegisterAggregateFunctions.h"
+#include "velox/type/tests/utils/CustomTypesForTesting.h"
 #include "velox/vector/tests/utils/VectorTestBase.h"
 
 #include <folly/executors/CPUThreadPoolExecutor.h>
 #include <gmock/gmock-matchers.h>
 #include <gtest/gtest.h>
+#include <limits>
+#include <map>
 #include <memory>
+#include <optional>
 
 using namespace facebook::velox;
 using namespace facebook::velox::exec;
@@ -876,6 +880,157 @@ TEST_P(HashTableTest, groupProbeDuplicateNewKeys) {
     }
     EXPECT_EQ(table->numDistinct(), kNumBatches * kNumNewKeysPerBatch);
     EXPECT_EQ(table->hashMode(), mode);
+  }
+}
+
+TEST_P(HashTableTest, groupProbeFixedIntegerKeys) {
+  // Mixed widths exercise packed row fields; repeated batches replace the
+  // decoded input buffers while the stored groups remain in the table.
+  for (const vector_size_t batchSize : {1, 63, 64, 65, 129, 1024}) {
+    for (const bool nullable : {false, true}) {
+      for (const bool sparse : {false, true}) {
+        for (const bool collide : {false, true}) {
+          SCOPED_TRACE(
+              fmt::format(
+                  "batchSize={} nullable={} sparse={} collide={}",
+                  batchSize,
+                  nullable,
+                  sparse,
+                  collide));
+          auto table = createHashTableForAggregation(
+              ROW({"small", "large", "constant"},
+                  {INTEGER(), BIGINT(), INTEGER()}),
+              3);
+          table->forceGenericHashMode(
+              BaseHashTable::kNoSpillInputStartPartitionBit);
+          if (collide) {
+            // Rehashing recomputes real hashes, so reserve enough space to
+            // keep the deliberately colliding hashes stable across batches.
+            HashTableTestHelper<false>::create(table.get())
+                .allocateTables(4096);
+          }
+          HashLookup lookup(table->hashers(), pool());
+          std::map<std::vector<std::optional<int64_t>>, char*> groups;
+          for (int32_t batch = 0; batch < 3; ++batch) {
+            std::vector<std::optional<int32_t>> smallKeys;
+            std::vector<std::optional<int64_t>> largeKeys;
+            for (vector_size_t row = 0; row < batchSize; ++row) {
+              const auto key = (row + batch * 3) % 23;
+              smallKeys.push_back(
+                  nullable && key % 5 == 0
+                      ? std::nullopt
+                      : std::optional<int32_t>(
+                            key % 2 == 0
+                                ? std::numeric_limits<int32_t>::min() + key
+                                : std::numeric_limits<int32_t>::max() - key));
+              largeKeys.push_back(
+                  nullable && key % 7 == 0
+                      ? std::nullopt
+                      : std::optional<int64_t>(
+                            key % 2 == 0
+                                ? std::numeric_limits<int64_t>::max() - key
+                                : std::numeric_limits<int64_t>::min() + key));
+            }
+            const auto input = makeRowVector(
+                {makeNullableFlatVector<int32_t>(smallKeys),
+                 makeNullableFlatVector<int64_t>(largeKeys),
+                 makeConstant<int32_t>(-17, batchSize)});
+            auto indices = makeIndicesInReverse(batchSize);
+            for (const auto encoding :
+                 {VectorEncoding::Simple::FLAT,
+                  VectorEncoding::Simple::DICTIONARY,
+                  VectorEncoding::Simple::CONSTANT}) {
+              SCOPED_TRACE(static_cast<int>(encoding));
+              std::vector<VectorPtr> columns;
+              for (const auto& column : input->children()) {
+                if (encoding == VectorEncoding::Simple::DICTIONARY) {
+                  columns.push_back(
+                      wrapInDictionary(indices, batchSize, column));
+                } else if (encoding == VectorEncoding::Simple::CONSTANT) {
+                  columns.push_back(
+                      BaseVector::wrapInConstant(batchSize, 0, column));
+                } else {
+                  columns.push_back(column);
+                }
+              }
+              const auto data = makeRowVector(columns);
+              SelectivityVector rows(batchSize);
+              if (sparse) {
+                for (vector_size_t row = 1; row < batchSize; row += 2) {
+                  rows.setValid(row, false);
+                }
+                rows.updateBounds();
+              }
+              if (collide) {
+                lookup.reset(rows.end());
+                lookup.rows.clear();
+                rows.applyToSelected([&](auto row) {
+                  lookup.rows.push_back(row);
+                  lookup.hashes[row] = 0;
+                });
+                for (column_index_t column = 0; column < 3; ++column) {
+                  table->hashers()[column]->decode(
+                      *data->childAt(column), rows);
+                }
+                table->groupProbe(
+                    lookup, BaseHashTable::kNoSpillInputStartPartitionBit);
+              } else {
+                insertGroups(*data, rows, lookup, *table);
+              }
+              const auto before = groups.size();
+              rows.applyToSelected([&](auto row) {
+                // Derive expected keys from the original logical inputs,
+                // independently of the decoded vectors used by the probe.
+                const auto sourceRow =
+                    encoding == VectorEncoding::Simple::CONSTANT ? 0
+                    : encoding == VectorEncoding::Simple::DICTIONARY
+                    ? batchSize - row - 1
+                    : row;
+                const std::vector<std::optional<int64_t>> key{
+                    smallKeys[sourceRow], largeKeys[sourceRow], -17};
+                ASSERT_NE(lookup.hits[row], nullptr);
+                const auto position =
+                    groups.emplace(key, lookup.hits[row]).first;
+                EXPECT_EQ(lookup.hits[row], position->second);
+              });
+              EXPECT_EQ(table->numDistinct(), groups.size());
+              EXPECT_EQ(lookup.newGroups.size(), groups.size() - before);
+              EXPECT_EQ(table->hashMode(), BaseHashTable::HashMode::kHash);
+              table->checkConsistency();
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+TEST_P(HashTableTest, groupProbeFixedIntegerFallback) {
+  // Raw values that differ by 256 are equal for this custom BIGINT type.
+  // A raw integer comparison must not replace the type's comparison.
+  const auto customKeys = makeFlatVector<int64_t>(
+      {0, 256, 1, 257, 512, 513}, BIGINT_TYPE_WITH_CUSTOM_COMPARISON());
+  const auto stringKeys = makeFlatVector<std::string>(
+      {"first", "first", "second", "second", "first", "second"});
+  for (const VectorPtr& keys : std::vector<VectorPtr>{customKeys, stringKeys}) {
+    SCOPED_TRACE(keys->type()->toString());
+    auto data = makeRowVector({makeConstant<int32_t>(7, 6), keys});
+    auto table = createHashTableForAggregation(asRowType(data->type()), 2);
+    if (table->hashMode() != BaseHashTable::HashMode::kHash) {
+      table->forceGenericHashMode(
+          BaseHashTable::kNoSpillInputStartPartitionBit);
+    }
+    HashLookup lookup(table->hashers(), pool());
+    for (int32_t repeat = 0; repeat < 2; ++repeat) {
+      insertGroups(*data, lookup, *table);
+      ASSERT_EQ(table->numDistinct(), 2);
+      EXPECT_EQ(lookup.hits[0], lookup.hits[1]);
+      EXPECT_EQ(lookup.hits[0], lookup.hits[4]);
+      EXPECT_EQ(lookup.hits[2], lookup.hits[3]);
+      EXPECT_EQ(lookup.hits[2], lookup.hits[5]);
+      EXPECT_NE(lookup.hits[0], lookup.hits[2]);
+      EXPECT_EQ(lookup.newGroups.size(), repeat == 0 ? 2 : 0);
+    }
   }
 }
 
