@@ -12,6 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+add_executable(velox_integer_group_probe_benchmark IntegerGroupProbeBenchmark.cpp)
+
+target_link_libraries(
+  velox_integer_group_probe_benchmark
+  velox_exec
+  velox_vector_test_lib
+  Folly::follybenchmark
+)
+
 add_executable(velox_exec_vector_hasher_benchmark VectorHasherBenchmark.cpp)
 
 target_link_libraries(

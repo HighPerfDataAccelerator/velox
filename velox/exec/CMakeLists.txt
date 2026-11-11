@@ -144,6 +144,7 @@ velox_add_library(
   Exchange.h
   ExchangeClient.h
   InMemoryExchangeClient.h
+  IntegerKeyCompare.h
   ExchangeFactory.h
   ExchangeQueue.h
   ExchangeSink.h
