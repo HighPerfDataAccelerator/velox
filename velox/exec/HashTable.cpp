@@ -23,6 +23,7 @@
 #include "velox/common/process/TraceContext.h"
 #include "velox/common/testutil/TestValue.h"
 #include "velox/exec/AdaptivePrefetch.h"
+#include "velox/exec/IntegerKeyCompare.h"
 #include "velox/exec/OperatorUtils.h"
 
 using facebook::velox::common::testutil::TestValue;
@@ -488,8 +489,76 @@ void HashTable<ignoreNullKeys>::groupProbe(
 }
 
 template <bool ignoreNullKeys>
+bool HashTable<ignoreNullKeys>::tryGroupProbeWithFixedIntegerKeys(
+    HashLookup& lookup) {
+  if (lookup.hashers.empty()) {
+    return false;
+  }
+  for (const auto& hasher : lookup.hashers) {
+    const auto* vector = hasher->decodedVector().base();
+    const auto kind = vector->typeKind();
+    if (vector->typeUsesCustomComparison() ||
+        (kind != TypeKind::INTEGER && kind != TypeKind::BIGINT)) {
+      return false;
+    }
+  }
+
+  using KeyColumn =
+      detail::integer_key_compare::IntegerKeyColumn<DecodedVector, RowColumn>;
+  std::vector<KeyColumn> int32Keys;
+  std::vector<KeyColumn> int64Keys;
+  int32Keys.reserve(lookup.hashers.size());
+  int64Keys.reserve(lookup.hashers.size());
+  for (int32_t key = 0; key < lookup.hashers.size(); ++key) {
+    const auto& decoded = lookup.hashers[key]->decodedVector();
+    auto& columns =
+        decoded.base()->typeKind() == TypeKind::INTEGER ? int32Keys : int64Keys;
+    columns.push_back({&decoded, rows_->columnAt(key)});
+  }
+  ProbeState states[kPrefetchSize];
+  const auto numProbes = lookup.rows.size();
+  const auto* rows = lookup.rows.data();
+  const auto* hashes = lookup.hashes.data();
+  for (int32_t begin = 0; begin < numProbes; begin += kPrefetchSize) {
+    const auto numStates = std::min<int32_t>(kPrefetchSize, numProbes - begin);
+    for (int32_t i = 0; i < numStates; ++i) {
+      const auto row = rows[begin + i];
+      states[i].preProbe(*this, hashes[row], row);
+    }
+    for (int32_t i = 0; i < numStates; ++i) {
+      states[i].template firstProbe<ProbeState::Operation::kInsert>(*this, 0);
+    }
+    const auto numDistinctBefore = numDistinct_;
+    for (int32_t i = 0; i < numStates; ++i) {
+      // Preserve stale-tag rechecking after earlier insertions in this
+      // window.
+      lookup.hits[states[i].row()] =
+          states[i].template fullProbe<ProbeState::Operation::kInsert>(
+              *this,
+              0,
+              [&](char* group, int32_t row) {
+                return detail::integer_key_compare::equalFixedIntegerKeys<
+                    !ignoreNullKeys>(group, row, int32Keys, int64Keys);
+              },
+              [&](int32_t row, uint64_t index) {
+                return insertEntry(lookup, index, row);
+              },
+              numTombstones_,
+              numDistinct_ != numDistinctBefore);
+    }
+  }
+  return true;
+}
+
+template <bool ignoreNullKeys>
 template <bool isNormalizedKey>
 void HashTable<ignoreNullKeys>::groupProbeWithPrefetch(HashLookup& lookup) {
+  if constexpr (!isNormalizedKey) {
+    if (tryGroupProbeWithFixedIntegerKeys(lookup)) {
+      return;
+    }
+  }
+
   constexpr int32_t kKeyOffset =
       isNormalizedKey ? -static_cast<int32_t>(sizeof(normalized_key_t)) : 0;
   ProbeState states[kPrefetchSize];
