@@ -1711,22 +1711,28 @@ FOLLY_ALWAYS_INLINE void HashTable<ignoreNullKeys>::insertForJoinWithPrefetch(
     int32_t numGroups,
     TableInsertPartitionInfo* partitionInfo) {
   auto i = 0;
-  ProbeState states[kPrefetchSize];
+#if defined(__aarch64__)
+  constexpr int32_t kJoinBuildPrefetchSize =
+      isNormailizedKeyMode ? 128 : kPrefetchSize;
+#else
+  constexpr int32_t kJoinBuildPrefetchSize = kPrefetchSize;
+#endif
+  ProbeState states[kJoinBuildPrefetchSize];
   constexpr int32_t kKeyOffset =
       -static_cast<int32_t>(sizeof(normalized_key_t));
   int32_t keyOffset = 0;
   if constexpr (isNormailizedKeyMode) {
     keyOffset = kKeyOffset;
   }
-  for (; i + kPrefetchSize <= numGroups; i += kPrefetchSize) {
-    for (int32_t j = 0; j < kPrefetchSize; ++j) {
+  for (; i + kJoinBuildPrefetchSize <= numGroups; i += kJoinBuildPrefetchSize) {
+    for (int32_t j = 0; j < kJoinBuildPrefetchSize; ++j) {
       auto index = i + j;
       states[j].preProbe(*this, hashes[index], index);
     }
-    for (int32_t j = 0; j < kPrefetchSize; ++j) {
+    for (int32_t j = 0; j < kJoinBuildPrefetchSize; ++j) {
       states[j].firstProbe(*this, keyOffset);
     }
-    for (int32_t j = 0; j < kPrefetchSize; ++j) {
+    for (int32_t j = 0; j < kJoinBuildPrefetchSize; ++j) {
       auto index = i + j;
       buildFullProbe<isNormailizedKeyMode>(
           states[j], hashes[index], groups[index], j != 0, partitionInfo);
