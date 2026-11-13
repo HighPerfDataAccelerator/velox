@@ -20,6 +20,7 @@
 #include "velox/common/base/tests/GTestUtils.h"
 #include "velox/common/testutil/TestValue.h"
 #include "velox/exec/Aggregate.h"
+#include "velox/exec/ColumnarBroadcastOutput.h"
 #include "velox/exec/VectorHasher.h"
 #include "velox/functions/prestosql/aggregates/RegisterAggregateFunctions.h"
 #include "velox/vector/tests/utils/VectorTestBase.h"
@@ -877,6 +878,123 @@ TEST_P(HashTableTest, groupProbeDuplicateNewKeys) {
     EXPECT_EQ(table->numDistinct(), kNumBatches * kNumNewKeysPerBatch);
     EXPECT_EQ(table->hashMode(), mode);
   }
+}
+
+TEST_P(HashTableTest, columnarBroadcastOutput) {
+  if (GetParam()) {
+    GTEST_SKIP() << "This test builds a single table";
+  }
+  constexpr vector_size_t kNumRows = 4096;
+  for (const bool widePayload : {false, true}) {
+    SCOPED_TRACE(widePayload);
+    std::vector<std::unique_ptr<VectorHasher>> hashers;
+    hashers.push_back(std::make_unique<VectorHasher>(BIGINT(), 0));
+    auto table = HashTable<true>::createForJoin(
+        std::move(hashers),
+        {BIGINT(), BIGINT()},
+        true,
+        false,
+        false,
+        1'000,
+        pool());
+    auto input = makeRowVector({
+        makeFlatVector<int64_t>(kNumRows, [](auto row) { return row; }),
+        makeFlatVector<int64_t>(
+            kNumRows,
+            [](auto row) { return -row; },
+            [](auto row) { return row % 7 == 0; }),
+        makeFlatVector<int64_t>(
+            kNumRows,
+            [widePayload](auto row) {
+              return int64_t(row) + (widePayload ? (int64_t{1} << 40) : 0);
+            }),
+    });
+    copyVectorsToTable({input}, 0, table.get());
+    table->prepareJoinTable(
+        {}, BaseHashTable::kNoSpillInputStartPartitionBit, 1'000'000);
+    ASSERT_EQ(table->hashMode(), BaseHashTable::HashMode::kArray);
+    EXPECT_EQ(table->columnarBroadcastCache(), nullptr);
+    const auto bytesBefore = table->allocatedBytes();
+    ASSERT_TRUE(table->initializeColumnarBroadcast());
+    EXPECT_GT(table->allocatedBytes(), bytesBefore);
+    const auto cachedBytes = table->allocatedBytes();
+    EXPECT_TRUE(table->initializeColumnarBroadcast());
+    EXPECT_EQ(table->allocatedBytes(), cachedBytes);
+
+    auto probe = makeRowVector({makeFlatVector<int64_t>(
+        {0, 1, kNumRows - 1, kNumRows, kNumRows + 1, 17})});
+    HashLookup lookup(table->hashers(), pool());
+    lookup.reset(probe->size());
+    std::fill(lookup.hits.begin(), lookup.hits.end(), nullptr);
+    SelectivityVector selected(probe->size());
+    table->prepareForJoinProbe(lookup, probe, selected, true);
+    table->joinProbe(lookup);
+    const std::vector<IdentityProjection> projections{{2, 0}, {0, 1}, {1, 2}};
+    const std::vector<TypePtr> outputTypes{BIGINT(), BIGINT(), BIGINT()};
+    std::vector<VectorPtr> outputs(3);
+    for (const vector_size_t count : {1, 63, 64, 65, 257}) {
+      std::vector<vector_size_t> mapping(count);
+      std::vector<char*> matches(count);
+      for (vector_size_t row = 0; row < count; ++row) {
+        mapping[row] = (row * 5) % probe->size();
+        matches[row] = lookup.hits[mapping[row]];
+      }
+      const auto originalMapping = mapping;
+      const auto matchRange =
+          folly::Range<char* const*>(matches.data(), matches.size());
+      ASSERT_TRUE(
+          detail::tryColumnarBroadcastOutput(
+              table.get(),
+              lookup,
+              mapping.data(),
+              matchRange,
+              folly::Range<const IdentityProjection*>(
+                  projections.data(), projections.size()),
+              pool(),
+              outputTypes,
+              outputs));
+      EXPECT_EQ(mapping, originalMapping);
+      for (const auto& projection : projections) {
+        auto expected = BaseVector::create(BIGINT(), count, pool());
+        table->extractColumn(matchRange, projection.inputChannel, expected);
+        for (vector_size_t row = 0; row < count; ++row) {
+          EXPECT_TRUE(
+              outputs[projection.outputChannel]->equalValueAt(
+                  expected.get(), row, row));
+        }
+      }
+    }
+    table->clear(true);
+    EXPECT_EQ(table->columnarBroadcastCache(), nullptr);
+  }
+}
+
+TEST_P(HashTableTest, columnarBroadcastRejectsDuplicates) {
+  if (GetParam()) {
+    GTEST_SKIP() << "This test builds a single table";
+  }
+  constexpr vector_size_t kNumRows = 4096;
+  std::vector<std::unique_ptr<VectorHasher>> hashers;
+  hashers.push_back(std::make_unique<VectorHasher>(BIGINT(), 0));
+  auto table = HashTable<true>::createForJoin(
+      std::move(hashers),
+      {BIGINT(), BIGINT()},
+      true,
+      false,
+      false,
+      1'000,
+      pool());
+  auto input = makeRowVector({
+      makeFlatVector<int64_t>(kNumRows, [](auto row) { return row / 2; }),
+      makeFlatVector<int64_t>(kNumRows, [](auto row) { return row; }),
+      makeFlatVector<int64_t>(kNumRows, [](auto row) { return -row; }),
+  });
+  copyVectorsToTable({input}, 0, table.get());
+  table->prepareJoinTable(
+      {}, BaseHashTable::kNoSpillInputStartPartitionBit, 1'000'000);
+  ASSERT_TRUE(table->hasDuplicateKeys());
+  EXPECT_FALSE(table->initializeColumnarBroadcast());
+  EXPECT_EQ(table->columnarBroadcastCache(), nullptr);
 }
 
 TEST_P(HashTableTest, regularHashingTableSize) {

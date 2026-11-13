@@ -19,6 +19,7 @@
 #include "velox/common/base/Counters.h"
 #include "velox/common/base/StatsReporter.h"
 #include "velox/common/testutil/TestValue.h"
+#include "velox/exec/ColumnarBroadcastOutput.h"
 #include "velox/exec/OperatorType.h"
 #include "velox/exec/OperatorUtils.h"
 #include "velox/exec/Task.h"
@@ -994,6 +995,18 @@ void HashProbe::fillOutput(vector_size_t size) {
   if (isLeftSemiProjectJoin(joinType_)) {
     fillLeftSemiProjectMatchColumn(size);
   } else {
+    if (detail::tryColumnarBroadcastOutput(
+            table_.get(),
+            *lookup_,
+            outputRowMapping_ ? outputRowMapping_->as<vector_size_t>()
+                              : nullptr,
+            folly::Range<char* const*>(outputTableRows_->as<char*>(), size),
+            tableOutputProjections_,
+            pool(),
+            outputType_->children(),
+            output_->children())) {
+      return;
+    }
     extractColumns(
         table_.get(),
         folly::Range<char* const*>(outputTableRows_->as<char*>(), size),

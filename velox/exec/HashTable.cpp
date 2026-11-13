@@ -24,6 +24,8 @@
 #include "velox/common/testutil/TestValue.h"
 #include "velox/exec/AdaptivePrefetch.h"
 #include "velox/exec/OperatorUtils.h"
+#include "velox/exec/SharedBroadcastValues.h"
+#include "velox/vector/FlatVector.h"
 
 using facebook::velox::common::testutil::TestValue;
 
@@ -711,6 +713,7 @@ void HashTable<ignoreNullKeys>::allocateTables(
 
 template <bool ignoreNullKeys>
 void HashTable<ignoreNullKeys>::clear(bool freeTable) {
+  broadcastCache_.reset();
   for (auto* rowContainer : allRows()) {
     rowContainer->clear();
   }
@@ -1560,6 +1563,7 @@ void HashTable<ignoreNullKeys>::setHashMode(
     HashMode mode,
     int32_t numNew,
     int8_t spillInputStartPartitionBit) {
+  broadcastCache_.reset();
   VELOX_CHECK_NE(hashMode_, HashMode::kHash);
   TestValue::adjust("facebook::velox::exec::HashTable::setHashMode", &mode);
   if (mode == HashMode::kArray) {
@@ -1945,6 +1949,200 @@ bool mayUseValueIds(const BaseHashTable& table) {
 }
 } // namespace
 
+bool BaseHashTable::initializeColumnarBroadcast() {
+  if (auto* table = dynamic_cast<HashTable<true>*>(this)) {
+    return table->initializeColumnarBroadcastImpl();
+  }
+  return false;
+}
+
+const ColumnarBroadcastCache* BaseHashTable::columnarBroadcastCache() const {
+  if (auto* table = dynamic_cast<const HashTable<true>*>(this)) {
+    return table->columnarBroadcastCacheImpl();
+  }
+  return nullptr;
+}
+
+template <bool ignoreNullKeys>
+bool HashTable<ignoreNullKeys>::initializeColumnarBroadcastImpl() {
+  if constexpr (!ignoreNullKeys) {
+    return false;
+  }
+  if (broadcastCache_) {
+    return true;
+  }
+  const auto count = rows_->numRows();
+  if (!isJoinBuild_ || hashMode_ != HashMode::kArray || !table_ ||
+      hashers_.size() != 1 || !hashers_[0]->isRange() ||
+      !otherTables_.empty() || hasDuplicateKeys() ||
+      rows_->probedFlagOffset() || rows_->countOffset() || count < 4096 ||
+      capacity_ > uint64_t(count) * 2) {
+    return false;
+  }
+  const auto& types = rows_->columnTypes();
+  if (types.size() < 3 || types.size() > 8) {
+    return false;
+  }
+  uint64_t width = 0;
+  for (const auto& type : types) {
+    if (type->kind() != TypeKind::INTEGER && type->kind() != TypeKind::BIGINT) {
+      return false;
+    }
+    width += type->cppSizeInBytes();
+  }
+  if (capacity_ * width > (32ULL << 20)) {
+    return false;
+  }
+  auto cache = std::make_unique<ColumnarBroadcastCache>();
+  auto& columns = cache->columns;
+  for (size_t col = 0; col < types.size(); ++col) {
+    auto values = BaseVector::create(types[col], capacity_, pool_);
+    if (types[col]->kind() == TypeKind::INTEGER) {
+      std::fill_n(
+          values->template as<FlatVector<int32_t>>()->mutableRawValues(),
+          capacity_,
+          0);
+    } else {
+      std::fill_n(
+          values->template as<FlatVector<int64_t>>()->mutableRawValues(),
+          capacity_,
+          0);
+    }
+    extractColumn(folly::Range<char* const*>(table_, capacity_), col, values);
+    if (values->nulls()) {
+      for (uint64_t slot = 0; slot < capacity_; ++slot) {
+        if (!table_[slot]) {
+          values->setNull(slot, false);
+        }
+      }
+      if (BaseVector::countNulls(values->nulls(), capacity_) == 0) {
+        values->setNulls(nullptr);
+      }
+    }
+
+    if (types[col]->kind() == TypeKind::BIGINT) {
+      const auto* source =
+          values->template as<FlatVector<int64_t>>()->rawValues();
+      bool fits = true;
+      for (uint64_t i = 0; i < capacity_; ++i) {
+        if (!values->isNullAt(i) &&
+            (source[i] < std::numeric_limits<int32_t>::min() ||
+             source[i] > std::numeric_limits<int32_t>::max())) {
+          fits = false;
+          break;
+        }
+      }
+      if (fits) {
+        auto narrow = BaseVector::create(INTEGER(), capacity_, pool_);
+        auto* dest =
+            narrow->template as<FlatVector<int32_t>>()->mutableRawValues();
+        for (uint64_t i = 0; i < capacity_; ++i) {
+          dest[i] = values->isNullAt(i) ? 0 : static_cast<int32_t>(source[i]);
+        }
+        narrow->setNulls(values->nulls());
+        values = std::move(narrow);
+      }
+    }
+    columns.push_back(std::move(values));
+  }
+  // Interleave fixed-width payloads when all values fit in int32.
+  const auto stride = columns.size() - 1;
+  bool pack = true;
+  for (size_t col = 1; col < columns.size(); ++col) {
+    pack &= columns[col]->typeKind() == TypeKind::INTEGER;
+  }
+  if (pack) {
+    const auto size = capacity_ * stride;
+    auto packed = BaseVector::create(INTEGER(), size, pool_);
+    auto* dest = packed->template as<FlatVector<int32_t>>()->mutableRawValues();
+    bool anyNull = false;
+    for (size_t col = 1; col < columns.size(); ++col) {
+      const auto* source =
+          columns[col]->template as<FlatVector<int32_t>>()->rawValues();
+      for (uint64_t slot = 0; slot < capacity_; ++slot) {
+        const auto i = slot * stride + col - 1;
+        dest[i] = source[slot];
+        if (columns[col]->isNullAt(slot)) {
+          packed->setNull(i, true);
+          anyNull = true;
+        }
+      }
+    }
+    if (!anyNull) {
+      packed->setNulls(nullptr);
+    }
+    for (size_t col = 1; col < columns.size(); ++col) {
+      columns[col].reset();
+    }
+    cache->packedPayload = std::move(packed);
+  }
+  auto key = columns[0];
+  // Validate the inverse range mapping using every occupied slot. Keep the
+  // key array if even a hole's reconstructed value could overflow its type.
+  bool affine = true, seen = false;
+  int64_t bias = 0;
+  const int64_t lo = types[0]->kind() == TypeKind::INTEGER
+      ? std::numeric_limits<int32_t>::min()
+      : std::numeric_limits<int64_t>::min();
+  const int64_t hi = types[0]->kind() == TypeKind::INTEGER
+      ? std::numeric_limits<int32_t>::max()
+      : std::numeric_limits<int64_t>::max();
+  for (uint64_t slot = 0; slot < capacity_; ++slot) {
+    if (!table_[slot]) {
+      continue;
+    }
+    const int64_t value = key->typeKind() == TypeKind::INTEGER
+        ? int64_t(key->template as<FlatVector<int32_t>>()->valueAt(slot))
+        : key->template as<FlatVector<int64_t>>()->valueAt(slot);
+    if (!seen) {
+      const __int128 candidate = __int128(value) - slot;
+      if (candidate < lo || candidate + capacity_ - 1 > hi) {
+        affine = false;
+        break;
+      }
+      bias = static_cast<int64_t>(candidate);
+      seen = true;
+    }
+    if (__int128(bias) + slot != value) {
+      affine = false;
+      break;
+    }
+  }
+  if (affine && seen) {
+    cache->keyBias = bias;
+    columns[0].reset();
+  }
+
+  for (auto& column : columns) {
+    column = detail::shareBroadcastValues(column);
+  }
+  cache->packedPayload = detail::shareBroadcastValues(cache->packedPayload);
+  broadcastCache_ = std::move(cache);
+  return true;
+}
+
+template <bool ignoreNullKeys>
+const ColumnarBroadcastCache*
+HashTable<ignoreNullKeys>::columnarBroadcastCacheImpl() const {
+  return broadcastCache_.get();
+}
+
+template <bool ignoreNullKeys>
+int64_t HashTable<ignoreNullKeys>::columnarBroadcastAllocatedBytes() const {
+  if (!broadcastCache_) {
+    return 0;
+  }
+  int64_t bytes = broadcastCache_->packedPayload
+      ? broadcastCache_->packedPayload->retainedSize()
+      : 0;
+  for (const auto& column : broadcastCache_->columns) {
+    if (column) {
+      bytes += column->retainedSize();
+    }
+  }
+  return bytes;
+}
+
 template <bool ignoreNullKeys>
 void HashTable<ignoreNullKeys>::prepareJoinTable(
     std::vector<std::unique_ptr<BaseHashTable>> tables,
@@ -1952,6 +2150,7 @@ void HashTable<ignoreNullKeys>::prepareJoinTable(
     size_t vectorHasherMaxNumDistinct,
     bool dropDuplicates,
     folly::Executor* executor) {
+  broadcastCache_.reset();
   buildExecutor_ = executor;
   if (dropDuplicates) {
     if (table_ != nullptr) {
@@ -2463,6 +2662,7 @@ int32_t HashTable<true>::listNullKeyRows(
 
 template <bool ignoreNullKeys>
 void HashTable<ignoreNullKeys>::erase(folly::Range<char**> rows) {
+  broadcastCache_.reset();
   auto numRows = rows.size();
   raw_vector<uint64_t> hashes(pool_);
   hashes.resize(numRows);

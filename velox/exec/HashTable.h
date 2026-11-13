@@ -16,6 +16,7 @@
 #pragma once
 
 #include <array>
+#include <optional>
 #include <vector>
 
 #include "velox/common/base/Portability.h"
@@ -25,6 +26,14 @@
 #include "velox/exec/VectorHasher.h"
 
 namespace facebook::velox::exec {
+
+/// Immutable values indexed by array-hash slot. Null column entries are backed
+/// by packedPayload, or by keyBias for the range key at channel zero.
+struct ColumnarBroadcastCache {
+  std::vector<VectorPtr> columns;
+  VectorPtr packedPayload;
+  std::optional<int64_t> keyBias;
+};
 
 using PartitionBoundIndexType = int64_t;
 /// Provides the partition info for parallel join table build use.
@@ -528,6 +537,13 @@ class BaseHashTable {
   /// join use.
   virtual std::vector<RowContainer*> allRows() const = 0;
 
+  /// Builds an optional read cache for a completed broadcast join table.
+  /// Call before publishing the table to concurrent readers. The caller must
+  /// keep its rows immutable until the table is cleared or rebuilt.
+  /// Returns false when the table is not eligible; row extraction stays valid.
+  bool initializeColumnarBroadcast();
+  const ColumnarBroadcastCache* columnarBroadcastCache() const;
+
   /// Static functions for processing internals. Public because used in
   /// structs that define probe and insert algorithms.
 
@@ -733,7 +749,8 @@ class HashTable : public BaseHashTable {
   int64_t allocatedBytes() const override {
     // For each row: sizeof(char*) per table entry + memory
     // allocated with MemoryAllocator for fixed-width rows and strings.
-    return sizeof(char*) * capacity_ + rows_->allocatedBytes();
+    return sizeof(char*) * capacity_ + rows_->allocatedBytes() +
+        columnarBroadcastAllocatedBytes();
   }
 
   HashStringAllocator* stringAllocator() override {
@@ -756,6 +773,9 @@ class HashTable : public BaseHashTable {
     return HashTableStats{
         capacity_, numRehashes_, numDistinct_, numTombstones_};
   }
+
+  bool initializeColumnarBroadcastImpl();
+  const ColumnarBroadcastCache* columnarBroadcastCacheImpl() const;
 
   bool hasDuplicateKeys() const override {
     return hasDuplicates_.check();
@@ -1362,6 +1382,10 @@ class HashTable : public BaseHashTable {
 
   // If true, avoids using VectorHasher value ranges with kArray hash mode.
   bool disableRangeArrayHash_{false};
+
+  int64_t columnarBroadcastAllocatedBytes() const;
+
+  std::unique_ptr<ColumnarBroadcastCache> broadcastCache_;
 
   friend class ProbeState;
   friend test::HashTableTestHelper<ignoreNullKeys>;

@@ -63,6 +63,8 @@ velox_add_library(
   HashJoinBridge.cpp
   HashPartitionFunction.cpp
   HashProbe.cpp
+  ColumnarBroadcastOutput.cpp
+  SharedBroadcastValues.cpp
   HashTable.cpp
   HashTableCache.cpp
   IndexLookupJoin.cpp
@@ -174,6 +176,8 @@ velox_add_library(
   HashJoinBridge.h
   HashPartitionFunction.h
   HashProbe.h
+  ColumnarBroadcastOutput.h
+  SharedBroadcastValues.h
   HashTable.h
   HashTableCache.h
   HilbertIndex.h
