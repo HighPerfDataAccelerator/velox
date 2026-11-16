@@ -28,6 +28,7 @@
 #include <gmock/gmock-matchers.h>
 #include <gtest/gtest.h>
 #include <memory>
+#include <random>
 
 using namespace facebook::velox;
 using namespace facebook::velox::exec;
@@ -38,6 +39,8 @@ namespace facebook::velox::exec::test {
 template <bool ignoreNullKeys>
 class HashTableTestHelper {
  public:
+  using Bucket = typename HashTable<ignoreNullKeys>::Bucket;
+
   static HashTableTestHelper create(HashTable<ignoreNullKeys>* table) {
     return HashTableTestHelper(table);
   }
@@ -1507,6 +1510,76 @@ TEST_P(HashTableTest, toStringMultipleKeys) {
       {}, BaseHashTable::kNoSpillInputStartPartitionBit, 1'000'000);
 
   ASSERT_NO_THROW(table->toString());
+}
+
+namespace {
+template <bool ignoreNullKeys>
+void checkBucketPointerWrites() {
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+  using Bucket = typename HashTableTestHelper<ignoreNullKeys>::Bucket;
+  constexpr uint64_t kPointerMask = (uint64_t{1} << 48) - 1;
+  // The serialized slot layout is 16 tag bytes followed by 16 six-byte
+  // pointers. Check the complete buckets, including their trailing padding.
+  alignas(128) std::array<Bucket, 2> buckets;
+  ASSERT_EQ(sizeof(Bucket), 128);
+  const std::array<uint64_t, 8> boundaries{
+      0,
+      1,
+      0xffff,
+      0x1'0000,
+      0xffff'ffff,
+      0x1'0000'0000,
+      0x1234'5678'9abc,
+      kPointerMask};
+  std::mt19937_64 random(1'971);
+  auto* bytes = reinterpret_cast<uint8_t*>(buckets.data());
+  for (int32_t trial = 0; trial < 1'000; ++trial) {
+    for (size_t i = 0; i < sizeof(buckets); ++i) {
+      bytes[i] = static_cast<uint8_t>(random());
+    }
+    for (int32_t bucket = 0; bucket < buckets.size(); ++bucket) {
+      for (int32_t slot = 0; slot < 16; ++slot) {
+        const auto value = trial < boundaries.size() ? boundaries[trial]
+                                                     : random() & kPointerMask;
+        std::array<uint8_t, sizeof(buckets)> expected;
+        std::memcpy(expected.data(), bytes, sizeof(buckets));
+        const auto offset = bucket * sizeof(Bucket) + 16 + slot * 6;
+        for (int32_t byte = 0; byte < 6; ++byte) {
+          expected[offset + byte] = static_cast<uint8_t>(value >> (8 * byte));
+        }
+        buckets[bucket].setPointer(
+            slot, reinterpret_cast<void*>(static_cast<uintptr_t>(value)));
+        ASSERT_EQ(std::memcmp(expected.data(), bytes, sizeof(buckets)), 0)
+            << "trial=" << trial << ", bucket=" << bucket << ", slot=" << slot;
+        ASSERT_EQ(
+            reinterpret_cast<uintptr_t>(buckets[bucket].pointerAt(slot)),
+            value);
+      }
+    }
+  }
+#else
+  GTEST_SKIP() << "The byte oracle checks the little-endian bucket layout";
+#endif
+}
+} // namespace
+
+TEST(HashTableTest, pointerStoresPreserveAdjacentBytes) {
+  checkBucketPointerWrites<false>();
+  checkBucketPointerWrites<true>();
+}
+
+DEBUG_ONLY_TEST(HashTableTest, bucketPointerRejectsHighBits) {
+  using KeepNullsBucket = HashTableTestHelper<false>::Bucket;
+  using IgnoreNullsBucket = HashTableTestHelper<true>::Bucket;
+  KeepNullsBucket keepNulls{};
+  IgnoreNullsBucket ignoreNulls{};
+  auto* pointer = reinterpret_cast<void*>(uintptr_t{1} << 48);
+  VELOX_ASSERT_THROW(
+      keepNulls.setPointer(0, pointer),
+      "A pointer must have its 16 high bits 0");
+  VELOX_ASSERT_THROW(
+      ignoreNulls.setPointer(0, pointer),
+      "A pointer must have its 16 high bits 0");
 }
 
 TEST(HashTableTest, tableInsertPartitionInfo) {

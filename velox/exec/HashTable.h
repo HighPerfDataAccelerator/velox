@@ -16,6 +16,7 @@
 #pragma once
 
 #include <array>
+#include <cstring>
 #include <vector>
 
 #include "velox/common/base/Portability.h"
@@ -911,9 +912,23 @@ class HashTable : public BaseHashTable {
     }
 
     void setPointer(int32_t slotIndex, void* pointer) {
+      const auto value = reinterpret_cast<uintptr_t>(pointer);
+      VELOX_DCHECK_EQ(
+          value & ~kPointerMask, 0, "A pointer must have its 16 high bits 0");
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+      // Write only this slot's six bytes without reading adjacent pointer
+      // bytes. Use memcpy because slots need not be aligned for the integer
+      // stores.
+      const auto low = static_cast<uint32_t>(value);
+      const auto high = static_cast<uint16_t>(value >> 32);
+      auto* const slot = &pointers_[slotIndex * kPointerSize];
+      std::memcpy(slot, &low, sizeof(low));
+      std::memcpy(slot + sizeof(low), &high, sizeof(high));
+#else
       auto* const slot =
           reinterpret_cast<uintptr_t*>(&pointers_[slotIndex * kPointerSize]);
-      *slot = (*slot & ~kPointerMask) | reinterpret_cast<uintptr_t>(pointer);
+      *slot = (*slot & ~kPointerMask) | value;
+#endif
     }
 
    private:
