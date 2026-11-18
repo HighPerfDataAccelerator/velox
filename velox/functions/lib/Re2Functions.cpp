@@ -14,6 +14,11 @@
  * limitations under the License.
  */
 #include "velox/functions/lib/Re2Functions.h"
+
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+#include <cstring>
 #include "velox/functions/lib/string/StringImpl.h"
 #include "velox/vector/FunctionVector.h"
 
@@ -671,22 +676,62 @@ bool matchSuffixPattern(
           length) == 0;
 }
 
+// Position of the first occurrence of 'needle' in [s, s + n), or npos.
+FOLLY_ALWAYS_INLINE size_t
+findSubstring(const char* s, size_t n, const char* needle, size_t k) {
+#if defined(__aarch64__)
+  if (k >= 2 && n >= k + 15) {
+    // Compare the first and the last needle byte at 16 start positions at a
+    // time; memcmp the middle only where both match. The last block starts
+    // at n - k - 15 (overlapping the previous one), so every start position
+    // in [0, n - k] is covered and no load reaches past s + n.
+    const uint8x16_t first = vdupq_n_u8(static_cast<uint8_t>(needle[0]));
+    const uint8x16_t last = vdupq_n_u8(static_cast<uint8_t>(needle[k - 1]));
+    const auto* p = reinterpret_cast<const uint8_t*>(s);
+    const size_t lastStart = n - k - 15;
+    size_t i = 0;
+    for (;;) {
+      const uint8x16_t eq = vandq_u8(
+          vceqq_u8(vld1q_u8(p + i), first),
+          vceqq_u8(vld1q_u8(p + i + k - 1), last));
+      // 4 bits per byte position.
+      uint64_t mask = vget_lane_u64(
+          vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_u8(eq), 4)), 0);
+      while (mask != 0) {
+        const size_t pos = __builtin_ctzll(mask) >> 2;
+        if (k == 2 || ::memcmp(s + i + pos + 1, needle + 1, k - 2) == 0) {
+          return i + pos;
+        }
+        mask &= ~(0xFULL << (pos * 4));
+      }
+      if (i == lastStart) {
+        return std::string::npos;
+      }
+      i = std::min(i + 16, lastStart);
+    }
+  }
+#endif
+  return std::string_view(s, n).find(std::string_view(needle, k));
+}
+
 bool matchSubstringPattern(
     const StringView& input,
     const std::string& fixedPattern) {
-  return (
-      std::string_view(input).find(std::string_view(fixedPattern)) !=
-      std::string::npos);
+  return findSubstring(
+             input.data(),
+             input.size(),
+             fixedPattern.data(),
+             fixedPattern.size()) != std::string::npos;
 }
 
 bool matchSubstringsPattern(
     const StringView& input,
     const std::vector<std::string>& patterns) {
   const char* data = input.data();
+  const char* end = input.end();
   for (int i = 0; i < patterns.size(); i++) {
-    auto curPos =
-        std::string_view(data, input.end() - data)
-            .find(std::string_view(patterns[i].c_str(), patterns[i].size()));
+    const auto curPos = findSubstring(
+        data, end - data, patterns[i].data(), patterns[i].size());
     if (curPos == std::string::npos) {
       return false;
     }
