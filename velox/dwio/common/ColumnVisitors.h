@@ -20,6 +20,7 @@
 #include "velox/common/base/SimdUtil.h"
 #include "velox/dwio/common/DecoderUtil.h"
 #include "velox/dwio/common/SelectiveColumnReader.h"
+#include "velox/dwio/common/SveDictionaryFilter.h"
 #include "velox/dwio/common/TypeUtil.h"
 namespace facebook::velox::dwio::common {
 
@@ -1134,6 +1135,31 @@ class DictionaryColumnVisitor
     // permute the passing values to the left of a vector register and
     // write  the whole register to the end of 'values'
     constexpr bool kFilterOnly = super::kFilterOnly;
+#if defined(__ARM_FEATURE_SVE)
+    // Runs without an in-dictionary bitmap (the Parquet reader never sets one)
+    // go to the SVE kernel in SveDictionaryFilter.h unless
+    // --velox_sve_dictionary_filter=false.
+    if constexpr (sve::kSupportsDictionaryFilter<T>) {
+      if (inDict() == nullptr && sve::dictionaryFilterEnabled()) {
+        const int32_t numPassed = sve::filterDictionaryRun<T>(
+            input,
+            numInput,
+            (scatter ? scatterRows : super::rows_) + super::rowIndex_,
+            filterCache(),
+            [&](int32_t index) {
+              filterCache()[index] = applyFilter(super::filter_, dict()[index])
+                  ? FilterResult::kSuccess
+                  : FilterResult::kFailure;
+            },
+            dict(),
+            filterHits + numValues,
+            kFilterOnly ? nullptr : values + numValues);
+        numValues += numPassed;
+        super::rowIndex_ += numInput;
+        return;
+      }
+    }
+#endif
     constexpr int32_t kWidth = xsimd::batch<int32_t>::size;
     int32_t last = numInput & ~(kWidth - 1);
     for (auto i = 0; i < numInput; i += kWidth) {
@@ -1544,6 +1570,31 @@ class StringDictionaryColumnVisitor
     }
     constexpr bool filterOnly =
         std::is_same_v<typename super::Extract, DropValues>;
+#if defined(__ARM_FEATURE_SVE)
+    // Same SVE kernel as DictionaryColumnVisitor::processRun(), used without
+    // an in-dictionary bitmap (the Parquet reader never sets one) unless
+    // --velox_sve_dictionary_filter=false. The values are the indices, so no
+    // dictionary is passed.
+    if (DictSuper::inDict() == nullptr && sve::dictionaryFilterEnabled()) {
+      const int32_t numPassed = sve::filterDictionaryRun<int32_t>(
+          input,
+          numInput,
+          (scatter ? scatterRows : super::rows_) + super::rowIndex_,
+          DictSuper::filterCache(),
+          [&](int32_t index) {
+            DictSuper::filterCache()[index] =
+                applyFilter(super::filter_, valueInDictionary(index))
+                ? FilterResult::kSuccess
+                : FilterResult::kFailure;
+          },
+          nullptr,
+          filterHits + numValues,
+          filterOnly ? nullptr : values + numValues);
+      numValues += numPassed;
+      super::rowIndex_ += numInput;
+      return;
+    }
+#endif
     constexpr int32_t kWidth = xsimd::batch<int32_t>::size;
     for (auto i = 0; i < numInput; i += kWidth) {
       auto indices = xsimd::load_unaligned(input + i);

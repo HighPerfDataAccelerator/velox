@@ -62,6 +62,7 @@ velox_add_library(
   SortingWriter.cpp
   Statistics.cpp
   StatisticsBuilder.cpp
+  SveDictionaryFilter.cpp
   Throttler.cpp
   TypeUtils.cpp
   TypeWithId.cpp
@@ -132,6 +133,7 @@ velox_add_library(
   StatisticsBuilder.h
   StreamIdentifier.h
   StreamUtil.h
+  SveDictionaryFilter.h
   Throttler.h
   TypeUtil.h
   TypeUtils.h
