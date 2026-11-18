@@ -84,34 +84,49 @@ void probeSve(
   // flight.
   constexpr int32_t kBlock = 32;
   const uint64_t sizeMask = bloomSize - 1;
-  const svuint64_t one = svdup_n_u64(1);
+  const int64_t lanes = svcntd();
   std::array<uint64_t, 2 * kBlock> hashes;
-  auto hashBlock = [&](int64_t start, uint64_t* target) {
+  const auto indices = [&](svbool_t active, svuint64_t key) {
+    return svand_n_u64_x(active, svlsr_n_u64_x(active, key, 24), sizeMask);
+  };
+  const auto hashBlock = [&](int64_t start, uint64_t* target) {
     const int64_t end = std::min<int64_t>(size, start + kBlock);
-    for (int64_t i = start; i < end; i += svcntd()) {
+    for (int64_t i = start; i < end; i += lanes) {
       const svbool_t active = svwhilelt_b64(i, end);
       svuint64_t key = svreinterpret_u64_s64(svld1_s64(active, values + i));
       // folly::hash::twang_mix64, lane by lane.
       key = svadd_u64_x(
           active, svnot_u64_x(active, key), svlsl_n_u64_x(active, key, 21));
       key = sveor_u64_x(active, key, svlsr_n_u64_x(active, key, 24));
-      key = svadd_u64_x(
-          active,
-          svadd_u64_x(active, key, svlsl_n_u64_x(active, key, 3)),
-          svlsl_n_u64_x(active, key, 8));
+      key = svmul_n_u64_x(active, key, 265);
       key = sveor_u64_x(active, key, svlsr_n_u64_x(active, key, 14));
-      key = svadd_u64_x(
-          active,
-          svadd_u64_x(active, key, svlsl_n_u64_x(active, key, 2)),
-          svlsl_n_u64_x(active, key, 4));
+      key = svmul_n_u64_x(active, key, 21);
       key = sveor_u64_x(active, key, svlsr_n_u64_x(active, key, 28));
       key = svadd_u64_x(active, key, svlsl_n_u64_x(active, key, 31));
       svst1_u64(active, target + (i - start), key);
-      const svuint64_t index =
-          svand_n_u64_x(active, svlsr_n_u64_x(active, key, 24), sizeMask);
-      svprfd_gather_u64index(active, bloom, index, SV_PLDL1KEEP);
+      svprfd_gather_u64index(active, bloom, indices(active, key), SV_PLDL1KEEP);
     }
   };
+  const auto gather = [&](svbool_t active, svuint64_t key) {
+    return svld1_gather_u64index_u64(active, bloom, indices(active, key));
+  };
+  const auto storeHits = [](svbool_t active,
+                            svuint64_t key,
+                            svuint64_t words,
+                            uint8_t* output) {
+    // Align each selected bit with bit zero and test them together.
+    const auto bit = [&](uint64_t shift) {
+      const auto position =
+          svand_n_u64_x(active, svlsr_n_u64_x(active, key, shift), 63);
+      return svlsr_u64_x(active, words, position);
+    };
+    const auto hits = svand_u64_x(
+        active,
+        svand_u64_x(active, bit(0), bit(6)),
+        svand_u64_x(active, bit(12), bit(18)));
+    svst1b_u64(active, output, svand_n_u64_x(active, hits, 1));
+  };
+
   if (size > 0) {
     hashBlock(0, hashes.data());
   }
@@ -120,26 +135,12 @@ void probeSve(
       hashBlock(start + kBlock, hashes.data() + (slot ^ 1) * kBlock);
     }
     const uint64_t* current = hashes.data() + slot * kBlock;
-    const int64_t end = std::min<int64_t>(size, start + kBlock);
-    for (int64_t i = start; i < end; i += svcntd()) {
-      const svbool_t active = svwhilelt_b64(i, end);
-      const svuint64_t key = svld1_u64(active, current + (i - start));
-      const svuint64_t index =
-          svand_n_u64_x(active, svlsr_n_u64_x(active, key, 24), sizeMask);
-      auto bit = [&](uint64_t shift) {
-        return svlsl_u64_x(
-            active,
-            one,
-            svand_n_u64_x(active, svlsr_n_u64_x(active, key, shift), 63));
-      };
-      const svuint64_t bits = svorr_u64_x(
-          active,
-          svorr_u64_x(active, bit(0), bit(6)),
-          svorr_u64_x(active, bit(12), bit(18)));
-      const svuint64_t words = svld1_gather_u64index_u64(active, bloom, index);
-      const svbool_t hit =
-          svcmpeq_u64(active, svand_u64_x(active, words, bits), bits);
-      svst1b_u64(active, out + i, svdup_n_u64_z(hit, 1));
+    const int64_t length = std::min<int64_t>(size - start, kBlock);
+    auto* output = out + start;
+    for (int64_t i = 0; i < length; i += lanes) {
+      const auto active = svwhilelt_b64(i, length);
+      const auto key = svld1_u64(active, current + i);
+      storeHits(active, key, gather(active, key), output + i);
     }
   }
 #else
@@ -154,10 +155,12 @@ namespace {
 class MightContainBatchFunction : public exec::VectorFunction {
  public:
   MightContainBatchFunction(
+      VectorPtr filter,
       std::optional<BloomFilterView> view,
       std::shared_ptr<const std::string> sharedFilter,
       bool sve)
-      : view_(view),
+      : filter_(std::move(filter)),
+        view_(view),
         sharedFilter_(std::move(sharedFilter)),
         sve_(sve),
         memoEnabled_(FLAGS_velox_might_contain_memo) {}
@@ -287,6 +290,9 @@ class MightContainBatchFunction : public exec::VectorFunction {
   static constexpr uint8_t kMemoEmpty = 2;
   static constexpr int64_t kMemoDecisionRows = 1 << 16;
 
+  // Own the constant vector when the view reads its serialized words.
+  const VectorPtr filter_;
+
   // Empty when the filter argument is not constant, matching the simple
   // function, which then returns false for every non-NULL row.
   const std::optional<BloomFilterView> view_;
@@ -365,9 +371,17 @@ std::shared_ptr<exec::VectorFunction> makeMightContainBatch(
     } else {
       view.emplace(serialized.data());
     }
+    const auto availableWords =
+        (serialized.size() - BloomFilterView::kSerializedHeaderSize) /
+        sizeof(uint64_t);
+    VELOX_USER_CHECK_LE(
+        static_cast<size_t>(view->size()),
+        availableWords,
+        "Truncated serialized BloomFilter");
   }
+  VectorPtr filter = shared ? nullptr : constant;
   return std::make_shared<MightContainBatchFunction>(
-      view, std::move(shared), sve);
+      std::move(filter), view, std::move(shared), sve);
 }
 
 } // namespace facebook::velox::functions::sparksql
