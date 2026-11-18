@@ -54,6 +54,28 @@ uint64_t blockScalar(
   return valid;
 }
 
+// Copy a block of non-null row pointers without the per-vector gather and
+// validity-mask reduction used by the 128-bit SVE path.
+template <int width>
+void blockScalarFour(
+    const char* const* rows,
+    int count,
+    int offset,
+    uint8_t* output) {
+  int i = 0;
+  for (; i + 4 <= count; i += 4) {
+    uint8_t values[4 * width];
+    std::memcpy(values, rows[i] + offset, width);
+    std::memcpy(values + width, rows[i + 1] + offset, width);
+    std::memcpy(values + 2 * width, rows[i + 2] + offset, width);
+    std::memcpy(values + 3 * width, rows[i + 3] + offset, width);
+    std::memcpy(output + i * width, values, sizeof(values));
+  }
+  for (; i < count; ++i) {
+    std::memcpy(output + i * width, rows[i] + offset, width);
+  }
+}
+
 template <int width, bool selected, bool nullable>
 uint64_t blockSve(
     const char* const* rows,

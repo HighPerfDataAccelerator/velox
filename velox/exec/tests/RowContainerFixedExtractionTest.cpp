@@ -158,10 +158,13 @@ TEST_F(RowContainerFixedExtractionTest, exactWidthGuardPageAndNullSuppression) {
   ASSERT_NE(area, MAP_FAILED);
   ASSERT_EQ(mprotect(area + page, page, PROT_NONE), 0);
   for (int width : {4, 8})
-    for (int n : {31, 32, 33, 63, 64, 65, 127}) {
+    for (int n : {31, 32, 33, 63, 64, 65, 127, 511, 512, 513, 577}) {
       std::vector<const char*> rows(n, area + page - width - 13);
-      for (int i = 0; i < n; i += 3)
-        rows[i] = nullptr;
+      for (int i = 0; i < n; i += 3) {
+        if ((i / 64) % 2 == 0) {
+          rows[i] = nullptr;
+        }
+      }
       TypePtr type;
       if (width == 4)
         type = INTEGER();
@@ -175,7 +178,7 @@ TEST_F(RowContainerFixedExtractionTest, exactWidthGuardPageAndNullSuppression) {
           false,
           actual);
       for (int i = 0; i < n; ++i)
-        EXPECT_EQ(actual->isNullAt(i), i % 3 == 0);
+        EXPECT_EQ(actual->isNullAt(i), rows[i] == nullptr);
       // The value address lies in PROT_NONE, but the valid row's null bit
       // requires the scalar nullable path to suppress that value load.
       std::fill(rows.begin(), rows.end(), area + page - 1);
