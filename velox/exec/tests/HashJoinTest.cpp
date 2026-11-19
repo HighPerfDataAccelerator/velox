@@ -29,6 +29,7 @@
 #include "velox/exec/OperatorType.h"
 #include "velox/exec/OperatorUtils.h"
 #include "velox/exec/PlanNodeStats.h"
+#include "velox/exec/RowContainer.h"
 #include "velox/exec/tests/utils/ArbitratorTestUtil.h"
 #include "velox/exec/tests/utils/AssertQueryBuilder.h"
 #include "velox/exec/tests/utils/HashJoinTestBase.h"
@@ -71,6 +72,86 @@ class MultiThreadedHashJoinTest : public HashJoinTest {
          TestParam{3, true}});
   }
 };
+
+TEST_P(HashJoinTest, contiguousAndGappedIntegerJoinOutput) {
+  gflags::FlagSaver flagSaver;
+  FLAGS_velox_arm_sve_row_extraction_enabled = true;
+  constexpr vector_size_t count = 257;
+  const auto base = int64_t{1} << 40;
+  auto input = makeRowVector(
+      {"id", "t_key"},
+      {makeFlatVector<int32_t>(count, [](auto i) { return i; }),
+       makeFlatVector<int64_t>(count, [base](auto i) { return base + i; })});
+  for (bool gapped : {false, true}) {
+    auto build = makeRowVector(
+        {"u_key"}, {makeFlatVector<int64_t>(count, [base, gapped](auto i) {
+          return base + (gapped && i == 80 ? 20 : i);
+        })});
+    // Replacing build key 80 with a second 20 leaves the first and last
+    // mapped row unchanged while changing the mapping between them.
+    for (int batchSize : {79, 512}) {
+      HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
+          .numDrivers(1)
+          .probeKeys({"t_key"})
+          .buildKeys({"u_key"})
+          .probeVectors({input})
+          .buildVectors({build})
+          .joinOutputLayout({"u_key", "id", "t_key"})
+          .config(
+              core::QueryConfig::kPreferredOutputBatchRows,
+              std::to_string(batchSize))
+          .config(
+              core::QueryConfig::kMaxOutputBatchRows, std::to_string(batchSize))
+          .injectSpill(false)
+          .referenceQuery(
+              "SELECT u_key, id, t_key FROM t JOIN u ON t_key = u_key")
+          .run();
+    }
+  }
+}
+
+TEST_P(HashJoinTest, projectedIntegerBuildKey) {
+  gflags::FlagSaver flagSaver;
+  FLAGS_velox_arm_sve_row_extraction_enabled = true;
+  auto checkKeys = [&](auto keyBase) {
+    using T = decltype(keyBase);
+    auto probeKeys = makeFlatVector<T>(
+        257,
+        [&](auto row) { return keyBase + row % 17 - 8; },
+        [](auto row) { return row % 23 == 0; });
+    auto reverse = makeIndices(257, [](auto row) { return 256 - row; });
+    auto build = makeRowVector(
+        {"payload", "u_key"},
+        {makeFlatVector<int64_t>(68, [](auto row) { return 2 * row; }),
+         makeFlatVector<T>(
+             68,
+             [&](auto row) { return keyBase + row % 13 - 6; },
+             [](auto row) { return row % 19 == 0; })});
+    auto probe = [&](const VectorPtr& keys) {
+      return makeRowVector(
+          {"id", "t_key"},
+          {makeFlatVector<int64_t>(257, [](auto row) { return row; }), keys});
+    };
+    HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
+        .numDrivers(1)
+        .parallelizeJoinBuildRows(parallelBuildSideRowsEnabled_)
+        .probeKeys({"t_key"})
+        .buildKeys({"u_key"})
+        .probeVectors(
+            {probe(probeKeys),
+             probe(wrapInDictionary(reverse, 257, probeKeys))})
+        .buildVectors({build})
+        .joinOutputLayout({"payload", "u_key", "id", "t_key"})
+        .config(core::QueryConfig::kPreferredOutputBatchRows, "79")
+        .config(core::QueryConfig::kMaxOutputBatchRows, "79")
+        .injectSpill(false)
+        .referenceQuery(
+            "SELECT payload, u_key, id, t_key FROM t JOIN u ON t_key = u_key")
+        .run();
+  };
+  checkKeys(int32_t{0});
+  checkKeys(int64_t{1} << 40);
+}
 
 TEST_P(MultiThreadedHashJoinTest, bigintArray) {
   HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
