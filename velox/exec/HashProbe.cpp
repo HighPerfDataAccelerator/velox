@@ -132,6 +132,48 @@ void gatherProbeKeys(
     }
   }
 }
+
+// A join can retain an entire probe vector, or a consecutive slice of it.
+// Check every mapping entry before the output can alias the input.
+vector_size_t contiguousProbeOffset(
+    const BufferPtr& mapping,
+    vector_size_t size) {
+  if (!mapping || size < 64) {
+    return -1;
+  }
+  const auto* rows = mapping->as<uint32_t>();
+  const uint32_t first = rows[0];
+  if (rows[size - 1] - first != static_cast<uint32_t>(size - 1)) {
+    return -1;
+  }
+  for (uint64_t i = 0; i < static_cast<uint64_t>(size); i += svcntw()) {
+    const auto active = svwhilelt_b32(i, static_cast<uint64_t>(size));
+    const auto expected = svindex_u32(first + static_cast<uint32_t>(i), 1);
+    const auto observed = svld1_u32(active, rows + i);
+    if (svptest_any(active, svcmpne_u32(active, observed, expected))) {
+      return -1;
+    }
+  }
+  return static_cast<vector_size_t>(first);
+}
+
+VectorPtr contiguousProbeOutput(
+    const VectorPtr& probe,
+    vector_size_t offset,
+    vector_size_t size) {
+  if (offset < 0 || isLazyNotLoaded(*probe)) {
+    return nullptr;
+  }
+  if (offset == 0 && size == probe->size()) {
+    return probe;
+  }
+  if (probe->isFlatEncoding() ||
+      probe->encoding() == VectorEncoding::Simple::DICTIONARY ||
+      probe->isConstantEncoding()) {
+    return probe->slice(offset, size);
+  }
+  return nullptr;
+}
 #endif
 
 // Copy values from 'rows' of 'table' according to 'projections' in
@@ -271,6 +313,7 @@ void HashProbe::initialize() {
 #if defined(__aarch64__) && defined(__ARM_FEATURE_SVE) && defined(__linux__)
   if (isInnerJoin(joinType_) && !nullAsValue_ &&
       FLAGS_velox_arm_sve_row_extraction_enabled && isVera()) {
+    veraSveOutput_ = true;
     for (size_t i = 0; i < tableOutputProjections_.size(); ++i) {
       const auto& projection = tableOutputProjections_[i];
       const auto key = projection.inputChannel;
@@ -1060,11 +1103,25 @@ void HashProbe::fillOutput(vector_size_t size) {
   TestValue::adjust("facebook::velox::exec::HashProbe::fillOutput", this);
   prepareOutput(size);
 
+#if defined(__aarch64__) && defined(__ARM_FEATURE_SVE) && defined(__linux__)
+  const auto contiguous = veraSveOutput_ &&
+          (!projectedInputColumns_.empty() || !veraKeyProjections_.empty())
+      ? contiguousProbeOffset(outputRowMapping_, size)
+      : -1;
+#endif
   for (auto [in, out] : projectedInputColumns_) {
     // Load input vector if it is being split into multiple batches. It is not
     // safe to wrap unloaded LazyVector into two different dictionaries.
     ensureLoadedIfNotAtEnd(in);
     auto inputChild = input_->childAt(in);
+#if defined(__aarch64__) && defined(__ARM_FEATURE_SVE) && defined(__linux__)
+    if (contiguous >= 0) {
+      if (auto direct = contiguousProbeOutput(inputChild, contiguous, size)) {
+        output_->childAt(out) = std::move(direct);
+        continue;
+      }
+    }
+#endif
     output_->childAt(out) = wrapChild(size, outputRowMapping_, inputChild);
   }
 
@@ -1095,6 +1152,13 @@ void HashProbe::fillOutput(vector_size_t size) {
         auto* projection = &tableOutputProjections_[index];
         extractThrough(projection);
         auto& output = output_->childAt(projection->outputChannel);
+        if (contiguous >= 0) {
+          if (auto direct = contiguousProbeOutput(probe, contiguous, size)) {
+            output = std::move(direct);
+            first = projection + 1;
+            continue;
+          }
+        }
         const auto* loaded = probe->loadedVector();
         if (outputRowMapping_ && loaded->isFlatEncoding()) {
           const auto* mapping = outputRowMapping_->as<vector_size_t>();

@@ -796,6 +796,7 @@ class HashProbe : public Operator {
   // The index of the row container in the current hash table that this hash
   // probe oprator is processing to output build-side rows.
   int buildSideOutputRowContainerId_{-1};
+  bool veraSveOutput_{false};
 
   // Build-output projection index and matching probe channel for each integer
   // key eligible for the Vera SVE gather.

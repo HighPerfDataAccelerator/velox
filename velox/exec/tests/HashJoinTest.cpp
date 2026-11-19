@@ -73,6 +73,43 @@ class MultiThreadedHashJoinTest : public HashJoinTest {
   }
 };
 
+TEST_P(HashJoinTest, contiguousAndGappedIntegerJoinOutput) {
+  gflags::FlagSaver flagSaver;
+  FLAGS_velox_arm_sve_row_extraction_enabled = true;
+  constexpr vector_size_t count = 257;
+  const auto base = int64_t{1} << 40;
+  auto input = makeRowVector(
+      {"id", "t_key"},
+      {makeFlatVector<int32_t>(count, [](auto i) { return i; }),
+       makeFlatVector<int64_t>(count, [base](auto i) { return base + i; })});
+  for (bool gapped : {false, true}) {
+    auto build = makeRowVector(
+        {"u_key"}, {makeFlatVector<int64_t>(count, [base, gapped](auto i) {
+          return base + (gapped && i == 80 ? 20 : i);
+        })});
+    // Replacing build key 80 with a second 20 leaves the first and last
+    // mapped row unchanged while changing the mapping between them.
+    for (int batchSize : {79, 512}) {
+      HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
+          .numDrivers(1)
+          .probeKeys({"t_key"})
+          .buildKeys({"u_key"})
+          .probeVectors({input})
+          .buildVectors({build})
+          .joinOutputLayout({"u_key", "id", "t_key"})
+          .config(
+              core::QueryConfig::kPreferredOutputBatchRows,
+              std::to_string(batchSize))
+          .config(
+              core::QueryConfig::kMaxOutputBatchRows, std::to_string(batchSize))
+          .injectSpill(false)
+          .referenceQuery(
+              "SELECT u_key, id, t_key FROM t JOIN u ON t_key = u_key")
+          .run();
+    }
+  }
+}
+
 TEST_P(HashJoinTest, projectedIntegerBuildKey) {
   gflags::FlagSaver flagSaver;
   FLAGS_velox_arm_sve_row_extraction_enabled = true;
