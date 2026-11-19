@@ -16,6 +16,12 @@
 
 #include "velox/exec/HashProbe.h"
 #include <folly/ScopeGuard.h>
+#if defined(__aarch64__) && defined(__ARM_FEATURE_SVE) && defined(__linux__)
+#include <arm_sve.h>
+#include <asm/hwcap.h>
+#include <sys/auxv.h>
+#include <type_traits>
+#endif
 #include "velox/common/base/Counters.h"
 #include "velox/common/base/StatsReporter.h"
 #include "velox/common/testutil/TestValue.h"
@@ -77,6 +83,57 @@ RowTypePtr HashProbe::makeTableType(
 }
 
 namespace {
+#if defined(__aarch64__) && defined(__ARM_FEATURE_SVE) && defined(__linux__)
+bool isVera() {
+  static const bool enabled = [] {
+    constexpr auto required = HWCAP_CPUID | HWCAP_SVE;
+    if ((getauxval(AT_HWCAP) & required) != required) {
+      return false;
+    }
+    uint64_t midr;
+    asm("mrs %0, midr_el1" : "=r"(midr));
+    // Match NVIDIA implementer and Olympus part across variants and revisions.
+    return (midr & 0xff00fff0) == 0x4e000100;
+  }();
+  return enabled;
+}
+
+// The probe key of a matched inner join is identical to the build key. For
+// flat INTEGER and BIGINT keys, gather from the contiguous probe vector
+// using the same row mapping as the probe-side output columns.
+template <typename T>
+void gatherProbeKeys(
+    const FlatVector<T>& input,
+    const vector_size_t* mapping,
+    vector_size_t size,
+    memory::MemoryPool* pool,
+    VectorPtr& output) {
+  if (!output || !BaseVector::isVectorWritable(output) ||
+      !output->isFlatEncoding()) {
+    output = BaseVector::create(input.type(), size, pool);
+  }
+  output->resize(size);
+  output->clearAllNulls();
+  auto* target = output->asFlatVector<T>()->mutableRawValues();
+  const auto* values = input.rawValues();
+  if constexpr (std::is_same_v<T, int32_t>) {
+    for (uint64_t i = 0; i < static_cast<uint64_t>(size); i += svcntw()) {
+      const auto active = svwhilelt_b32(i, static_cast<uint64_t>(size));
+      const auto index = svld1_s32(active, mapping + i);
+      svst1_s32(
+          active, target + i, svld1_gather_s32index_s32(active, values, index));
+    }
+  } else {
+    for (uint64_t i = 0; i < static_cast<uint64_t>(size); i += svcntd()) {
+      const auto active = svwhilelt_b64(i, static_cast<uint64_t>(size));
+      const auto index = svld1sw_s64(active, mapping + i);
+      svst1_s64(
+          active, target + i, svld1_gather_s64index_s64(active, values, index));
+    }
+  }
+}
+#endif
+
 // Copy values from 'rows' of 'table' according to 'projections' in
 // 'result'. Reuses 'result' children where possible.
 void extractColumns(
@@ -210,6 +267,23 @@ void HashProbe::initialize() {
       tableOutputProjections_.emplace_back(tableChannel.value(), i);
     }
   }
+
+#if defined(__aarch64__) && defined(__ARM_FEATURE_SVE) && defined(__linux__)
+  if (isInnerJoin(joinType_) && !nullAsValue_ &&
+      FLAGS_velox_arm_sve_row_extraction_enabled && isVera()) {
+    for (size_t i = 0; i < tableOutputProjections_.size(); ++i) {
+      const auto& projection = tableOutputProjections_[i];
+      const auto key = projection.inputChannel;
+      if (key < keyChannels_.size() &&
+          (outputType_->childAt(projection.outputChannel) == INTEGER() ||
+           outputType_->childAt(projection.outputChannel) == BIGINT()) &&
+          probeType_->childAt(keyChannels_[key]) ==
+              outputType_->childAt(projection.outputChannel)) {
+        veraKeyProjections_.emplace_back(i, keyChannels_[key]);
+      }
+    }
+  }
+#endif
 
   if (numIdentityProjections == probeType_->size() &&
       tableOutputProjections_.empty()) {
@@ -997,6 +1071,58 @@ void HashProbe::fillOutput(vector_size_t size) {
   if (isLeftSemiProjectJoin(joinType_)) {
     fillLeftSemiProjectMatchColumn(size);
   } else {
+#if defined(__aarch64__) && defined(__ARM_FEATURE_SVE) && defined(__linux__)
+    if (size >= 64 && !veraKeyProjections_.empty()) {
+      const auto buildRows =
+          folly::Range<char* const*>(outputTableRows_->as<char*>(), size);
+      auto* first = tableOutputProjections_.data();
+      auto extractThrough = [&](const IdentityProjection* end) {
+        if (first != end) {
+          extractColumns(
+              table_.get(),
+              buildRows,
+              {first, end},
+              pool(),
+              outputType_->children(),
+              output_->children());
+        }
+      };
+      for (const auto& [index, probeChannel] : veraKeyProjections_) {
+        const auto& probe = input_->childAt(probeChannel);
+        if (isLazyNotLoaded(*probe)) {
+          continue;
+        }
+        auto* projection = &tableOutputProjections_[index];
+        extractThrough(projection);
+        auto& output = output_->childAt(projection->outputChannel);
+        const auto* loaded = probe->loadedVector();
+        if (outputRowMapping_ && loaded->isFlatEncoding()) {
+          const auto* mapping = outputRowMapping_->as<vector_size_t>();
+          if (probe->typeKind() == TypeKind::INTEGER) {
+            gatherProbeKeys(
+                *loaded->asFlatVector<int32_t>(),
+                mapping,
+                size,
+                pool(),
+                output);
+          } else {
+            gatherProbeKeys(
+                *loaded->asFlatVector<int64_t>(),
+                mapping,
+                size,
+                pool(),
+                output);
+          }
+        } else {
+          output = wrapChild(size, outputRowMapping_, probe);
+        }
+        first = projection + 1;
+      }
+      extractThrough(
+          tableOutputProjections_.data() + tableOutputProjections_.size());
+      return;
+    }
+#endif
     extractColumns(
         table_.get(),
         folly::Range<char* const*>(outputTableRows_->as<char*>(), size),
