@@ -1242,6 +1242,11 @@ class HashTable : public BaseHashTable {
   void arrayJoinProbe(HashLookup& lookup);
 
   // Shortcut for probe with normalized keys.
+#if defined(__linux__) && defined(__aarch64__) && \
+    defined(__ARM_FEATURE_SVE) && defined(__AARCH64EL__)
+  void probeRepeatedNormalizedKeys(HashLookup& lookup);
+#endif
+
   void joinNormalizedKeyProbe(HashLookup& lookup);
 
   // Returns the total size of the variable size 'columns' in 'row'.
