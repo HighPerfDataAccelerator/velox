@@ -17,6 +17,10 @@
 #include "velox/exec/RowContainer.h"
 #include "velox/exec/ArmRowExtraction.h"
 
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
+
 #include <array>
 #include <cstring>
 #include <type_traits>
@@ -943,6 +947,34 @@ void RowContainer::storeSerializedRow(std::string_view serialized, char* row) {
       "Serialized row size mismatch while storing RowContainer row");
 }
 
+namespace {
+
+inline void copyStringPayload(char* dest, const char* src, size_t size) {
+#if defined(__aarch64__) && defined(__ARM_NEON)
+  // The first and last vectors cover the payload without reading or
+  // writing past its ends. They may overlap for intermediate lengths.
+  auto* out = reinterpret_cast<uint8_t*>(dest);
+  const auto* in = reinterpret_cast<const uint8_t*>(src);
+  if (size >= 16 && size <= 32) {
+    const auto first = vld1q_u8(in);
+    const auto last = vld1q_u8(in + size - 16);
+    vst1q_u8(out, first);
+    vst1q_u8(out + size - 16, last);
+    return;
+  }
+  if (size >= 8 && size < 16) {
+    const auto first = vld1_u8(in);
+    const auto last = vld1_u8(in + size - 8);
+    vst1_u8(out, first);
+    vst1_u8(out + size - 8, last);
+    return;
+  }
+#endif
+  std::memcpy(dest, src, size);
+}
+
+} // namespace
+
 void RowContainer::extractStringsBatch(
     const char* const* rows,
     folly::Range<const vector_size_t*> rowNumbers,
@@ -1025,7 +1057,7 @@ void RowContainer::extractStringsBatch(
         const auto value = strings[i];
         auto* header = HashStringAllocator::headerOf(value.data());
         if (header->size() >= value.size()) {
-          std::memcpy(cursor, value.data(), value.size());
+          copyStringPayload(cursor, value.data(), value.size());
         } else {
           HashStringAllocator::InputStream stream(header);
           stream.ByteInputStream::readBytes(cursor, value.size());

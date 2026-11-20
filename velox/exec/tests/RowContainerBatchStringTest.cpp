@@ -214,9 +214,12 @@ TEST_F(RowContainerBatchStringTest, offsetsSelectionsNullsAndOwnership) {
         auto data = container(type, nullable);
         auto input = BaseVector::create<FlatVector<StringView>>(
             type, count, pool_.get());
-        const int lengths[] = {0, 3, 12, 13, 32, 127, 1024};
+        const int lengths[] = {0, 3, 12, 13, 15, 16, 17, 31, 32, 33, 127, 1024};
         for (vector_size_t i = 0; i < count; ++i) {
-          std::string bytes(lengths[i % 7], static_cast<char>('a' + i % 20));
+          std::string bytes(lengths[i % std::size(lengths)], '\0');
+          for (size_t j = 0; j < bytes.size(); ++j) {
+            bytes[j] = static_cast<char>('a' + (i + j) % 26);
+          }
           if (bytes.size() > 1) {
             bytes[1] = '\0';
           }
