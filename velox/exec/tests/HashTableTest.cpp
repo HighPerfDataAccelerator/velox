@@ -39,6 +39,9 @@ DECLARE_int32(velox_arm_hash_table_prefetch_distance);
 DECLARE_bool(velox_group_by_hash_mode_for_distinct_keys);
 #endif
 
+DECLARE_bool(velox_hash_join_fixed_width_output_enabled);
+DECLARE_bool(velox_hash_join_compact_chains_enabled);
+
 using namespace facebook::velox;
 using namespace facebook::velox::exec;
 using namespace facebook::velox::test;
@@ -1240,6 +1243,85 @@ TEST_P(HashTableTest, listJoinResultsSize) {
     auto numRows = table->listJoinResults(
         iter, true, inputRows, outputRows, testParam.maxBytes);
     ASSERT_EQ(numRows, testParam.expectedRows);
+  }
+}
+
+TEST_P(HashTableTest, listJoinResultsShortChains) {
+  if (GetParam()) {
+    GTEST_SKIP();
+  }
+  gflags::FlagSaver saveFlags;
+  FLAGS_velox_hash_join_fixed_width_output_enabled = true;
+  FLAGS_velox_hash_join_compact_chains_enabled = false;
+  std::vector<std::unique_ptr<VectorHasher>> hashers;
+  hashers.push_back(std::make_unique<VectorHasher>(BIGINT(), 0));
+  auto table = HashTable<true>::createForJoin(
+      std::move(hashers), {BIGINT()}, true, false, false, 1000, pool());
+  const std::vector<int64_t> buildKeys{1, 2, 2, 2, 3, 4};
+  std::vector<RowVectorPtr> batches{makeRowVector(
+      {makeFlatVector<int64_t>(buildKeys),
+       makeFlatVector<int64_t>(buildKeys.size(), [](auto i) { return i; })})};
+  copyVectorsToTable(batches, 0, table.get());
+  table->prepareJoinTable(
+      {},
+      BaseHashTable::kNoSpillInputStartPartitionBit,
+      1000,
+      false,
+      executor_.get());
+  ASSERT_TRUE(table->hasDuplicateKeys());
+
+  constexpr int32_t kProbeRows = 127;
+  const auto keys = makeFlatVector<int64_t>(kProbeRows, [](auto i) {
+    return i % 31 == 0 ? 2 : (i % 7 == 0 ? 1 : -1);
+  });
+  const auto probe = makeRowVector({keys});
+  HashLookup lookup(table->hashers(), pool());
+  SelectivityVector all(kProbeRows);
+  table->prepareForJoinProbe(lookup, probe, all, false);
+  lookup.hits.resize(kProbeRows);
+  std::fill(lookup.hits.begin(), lookup.hits.end(), nullptr);
+  table->joinProbe(lookup);
+
+  for (bool dense : {false, true}) {
+    lookup.rows.clear();
+    for (int i = 0; i < kProbeRows; ++i) {
+      if (dense || i % 5 != 0) {
+        lookup.rows.push_back(i);
+      }
+    }
+    for (bool includeMisses : {false, true}) {
+      std::vector<std::pair<vector_size_t, char*>> expected;
+      for (auto row : lookup.rows) {
+        auto* head = lookup.hits[row];
+        if (includeMisses && !head) {
+          expected.emplace_back(row, nullptr);
+        }
+        while (head) {
+          expected.emplace_back(row, head);
+          std::memcpy(&head, head + table->rows()->nextOffset(), sizeof(head));
+        }
+      }
+      for (const int capacity : {1, 7, 8, 17, kProbeRows}) {
+        BaseHashTable::JoinResultIterator iter({}, 8, std::nullopt, 8, 8, true);
+        iter.reset(lookup);
+        std::vector<vector_size_t> ids(capacity);
+        std::vector<char*> hits(capacity);
+        std::vector<std::pair<vector_size_t, char*>> actual;
+        while (!iter.atEnd()) {
+          const auto n = table->listJoinResults(
+              iter,
+              includeMisses,
+              folly::Range(ids.data(), capacity),
+              folly::Range(hits.data(), capacity),
+              std::numeric_limits<uint64_t>::max());
+          ASSERT_TRUE(n > 0 || iter.atEnd());
+          for (int i = 0; i < n; ++i) {
+            actual.emplace_back(ids[i], hits[i]);
+          }
+        }
+        EXPECT_EQ(actual, expected);
+      }
+    }
   }
 }
 
