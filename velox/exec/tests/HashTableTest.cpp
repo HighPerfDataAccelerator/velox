@@ -614,6 +614,85 @@ class HashTableTest : public testing::TestWithParam<bool>,
   std::unique_ptr<folly::CPUThreadPoolExecutor> executor_;
 };
 
+TEST_P(HashTableTest, repeatedNormalizedProbeRows) {
+  auto type = ROW({"a", "b"}, {BIGINT(), BIGINT()});
+  keySpacing_ = 1000;
+  std::vector<std::unique_ptr<VectorHasher>> hashers;
+  for (int i = 0; i < 2; ++i)
+    hashers.emplace_back(std::make_unique<VectorHasher>(BIGINT(), i));
+  topTable_ = HashTable<true>::createForJoin(
+      std::move(hashers), {}, true, false, false, 1000, pool());
+  makeRows(10000, 2, 0, type, batches_);
+  copyVectorsToTable(batches_, 0, topTable_.get());
+  topTable_->prepareJoinTable(
+      {},
+      BaseHashTable::kNoSpillInputStartPartitionBit,
+      1'000'000,
+      false,
+      executor_.get());
+  ASSERT_EQ(topTable_->hashMode(), BaseHashTable::HashMode::kNormalizedKey);
+  testEraseEveryN(3);
+  std::vector<uint64_t> keys;
+  for (char* row : rowOfKey_) {
+    if (row != nullptr) {
+      keys.push_back(RowContainer::normalizedKey(row));
+      if (keys.size() == 64)
+        break;
+    }
+  }
+  ASSERT_EQ(keys.size(), 64);
+  for (int i = 0; i < 64; ++i)
+    keys.push_back(keys[i] ^ (uint64_t{1} << 63));
+
+  HashLookup scalar(topTable_->hashers(), pool());
+  std::vector<char*> expectedHit;
+  std::vector<uint64_t> expectedHash;
+  for (auto key : keys) {
+    scalar.reset(1);
+    scalar.rows[0] = 0;
+    scalar.hashes[0] = key;
+    topTable_->joinProbe(scalar);
+    expectedHit.push_back(scalar.hits[0]);
+    expectedHash.push_back(scalar.hashes[0]);
+  }
+  ASSERT_NE(expectedHit[0], nullptr);
+  ASSERT_TRUE(
+      std::any_of(expectedHit.begin(), expectedHit.end(), [](char* hit) {
+        return hit == nullptr;
+      }));
+
+  HashLookup lookup(topTable_->hashers(), pool());
+  for (int n : {255, 256, 257, 1024}) {
+    for (bool sparse : {false, true}) {
+      lookup.reset(n);
+      std::vector<size_t> keyIndex(n);
+      const std::array<int, 8> lengths{1, 2, 7, 13, 9, 19, 4, 24};
+      for (int first = 0, run = 0; first < n; ++run) {
+        const int end = std::min(n, first + lengths[run % lengths.size()]);
+        const size_t index = (run * 41) % keys.size();
+        for (int i = first; i < end; ++i) {
+          keyIndex[i] = index;
+          lookup.hashes[i] = keys[index];
+        }
+        first = end;
+      }
+      int selected = 0;
+      for (int row = 0; row < n; ++row) {
+        if (!sparse || (row >= 5 && row % 11 != 0))
+          lookup.rows[selected++] = row;
+      }
+      lookup.rows.resize(selected);
+      topTable_->joinProbe(lookup);
+      for (int row : lookup.rows) {
+        auto index = keyIndex[row];
+        EXPECT_EQ(expectedHit[index], lookup.hits[row]);
+        EXPECT_EQ(expectedHash[index], lookup.hashes[row]);
+        EXPECT_EQ(keys[index], lookup.normalizedKeys[row]);
+      }
+    }
+  }
+}
+
 TEST_P(HashTableTest, int2DenseArray) {
   auto type = ROW({"k1", "k2"}, {BIGINT(), BIGINT()});
   testCycle(BaseHashTable::HashMode::kArray, 500, 2, type, 2);
