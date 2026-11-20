@@ -54,6 +54,11 @@ class HashTableTestHelper {
     return HashTableTestHelper(table);
   }
 
+  void reserveGroups(int32_t size) {
+    table_->checkSize(
+        size, false, BaseHashTable::kNoSpillInputStartPartitionBit);
+  }
+
   int64_t nextBucketOffset(int64_t offset) const {
     return table_->nextBucketOffset(offset);
   }
@@ -613,6 +618,127 @@ class HashTableTest : public testing::TestWithParam<bool>,
   std::string baseString_;
   std::unique_ptr<folly::CPUThreadPoolExecutor> executor_;
 };
+
+TEST_P(HashTableTest, veraFixedIntegerGroupShapes) {
+  // A single scalar key ID makes every projected tuple within a shape unique.
+  // The collision case uses the same ID and hash for distinct trailing values.
+  const auto noSpill = BaseHashTable::kNoSpillInputStartPartitionBit;
+  const int domains = 1024;
+  const int batchSize = 259;
+  for (int shape = 0; shape < 8; ++shape) {
+    const bool three = shape == 0 || shape == 5;
+    const bool collision = shape == 6;
+    const bool sparse = shape == 5;
+    std::vector<TypePtr> types = three
+        ? std::vector<TypePtr>{INTEGER(), INTEGER(), INTEGER()}
+        : std::vector<TypePtr>{
+              INTEGER(),
+              INTEGER(),
+              INTEGER(),
+              INTEGER(),
+              BIGINT(),
+              BIGINT(),
+              BIGINT(),
+              INTEGER(),
+              BIGINT()};
+    const int distinct = collision ? 997 : domains;
+    std::vector<int32_t> ids(distinct);
+    std::iota(ids.begin(), ids.end(), 0);
+    std::mt19937 rng(103 + shape);
+    auto table = createHashTableForAggregation(
+        ROW(std::vector<TypePtr>(types)), types.size());
+    table->forceGenericHashMode(noSpill);
+    HashTableTestHelper<false>::create(table.get())
+        .reserveGroups(distinct * (collision ? 32 : 3));
+    HashLookup lookup(table->hashers(), pool());
+    std::vector<char*> known(distinct * (collision ? 2 : 1));
+    const auto flatCount = shape == 1 ? 1
+        : shape == 2                  ? 3
+        : shape == 3                  ? 4
+                                      : int(types.size());
+    for (int round = 0; round < 4; ++round) {
+      std::shuffle(ids.begin(), ids.end(), rng);
+      for (int j = 0; j < distinct; j += batchSize) {
+        const int n = std::min(distinct - j, batchSize);
+        std::vector<VectorPtr> cols;
+        std::vector<DecodedVector> decoded(types.size());
+        const int variant = collision && (round % 2);
+        for (int c = 0; c < types.size(); ++c) {
+          const auto kind = types[c]->kind();
+          if (c == 8 && shape != 7) {
+            cols.push_back(makeConstant<int64_t>(variant ? -89 : 315, n));
+          } else if (c >= flatCount) {
+            cols.push_back(makeNullConstant(kind, n));
+          } else {
+            auto numeric = [&](int i) {
+              auto id = ids[j + i];
+              return c == 0 ? uint64_t(id)
+                            : folly::hash::twang_mix64(uint64_t(id) + 371 * c);
+            };
+            auto nullable = [&](int i) {
+              return shape == 7 && c == 4 && ids[j + i] % 3 == 0;
+            };
+            if (kind == TypeKind::INTEGER) {
+              cols.push_back(makeFlatVector<int32_t>(
+                  n, [&](auto i) { return int32_t(numeric(i)); }, nullable));
+            } else {
+              cols.push_back(makeFlatVector<int64_t>(
+                  n, [&](auto i) { return int64_t(numeric(i)); }, nullable));
+            }
+          }
+        }
+        auto batch = makeRowVector(cols);
+        SelectivityVector rows(n);
+        if (sparse) {
+          for (int i = 0; i < n; ++i)
+            if (ids[j + i] % 3 == 1)
+              rows.setValid(i, false);
+          rows.updateBounds();
+        }
+        table->prepareForGroupProbe(lookup, batch, rows, noSpill);
+        if (collision) {
+          rows.applyToSelected([&](int i) {
+            lookup.hashes[i] = folly::hasher<uint64_t>()(ids[j + i] / 16);
+          });
+        }
+        table->groupProbe(lookup, noSpill);
+        for (int c = 0; c < types.size(); ++c)
+          decoded[c].decode(*cols[c], rows);
+        rows.applyToSelected([&](int i) {
+          auto* group = lookup.hits[i];
+          ASSERT_TRUE(group);
+          auto& head = known[ids[j + i] + variant * distinct];
+          if (head) {
+            ASSERT_EQ(head, group);
+          } else {
+            head = group;
+          }
+          // Inspect the actual stored payload and null bits independently.
+          for (int c = 0; c < types.size(); ++c) {
+            const auto col = table->rows()->columnAt(c);
+            const bool null =
+                static_cast<uint8_t>(group[col.nullByte()]) & col.nullMask();
+            ASSERT_EQ(null, decoded[c].isNullAt(i));
+            if (null)
+              continue;
+            if (types[c]->kind() == TypeKind::INTEGER) {
+              int32_t got;
+              std::memcpy(&got, group + col.offset(), 4);
+              ASSERT_EQ(got, decoded[c].valueAt<int32_t>(i));
+            } else {
+              int64_t got;
+              std::memcpy(&got, group + col.offset(), 8);
+              ASSERT_EQ(got, decoded[c].valueAt<int64_t>(i));
+            }
+          }
+        });
+      }
+      const size_t expected = std::count_if(
+          known.begin(), known.end(), [](char* p) { return p != nullptr; });
+      ASSERT_EQ(table->numDistinct(), expected);
+    }
+  }
+}
 
 TEST_P(HashTableTest, int2DenseArray) {
   auto type = ROW({"k1", "k2"}, {BIGINT(), BIGINT()});

@@ -29,6 +29,12 @@
 #include "velox/functions/prestosql/types/parser/TypeParser.h"
 #include "velox/vector/FlatVector.h"
 
+#if defined(__linux__) && defined(__aarch64__) && \
+    defined(__ARM_FEATURE_SVE) && defined(__AARCH64EL__)
+#include <asm/hwcap.h>
+#include <sys/auxv.h>
+#endif
+
 #include <gflags/gflags.h>
 #include <algorithm>
 
@@ -707,6 +713,143 @@ void HashTable<ignoreNullKeys>::groupProbe(
   groupProbeWithPrefetch<false>(lookup);
 }
 
+#if defined(__linux__) && defined(__aarch64__) && \
+    defined(__ARM_FEATURE_SVE) && defined(__AARCH64EL__)
+namespace {
+bool supportsVeraGroupPrefetch() {
+  static const bool enabled = [] {
+    const auto required = HWCAP_CPUID | HWCAP_SVE;
+    if ((getauxval(AT_HWCAP) & required) != required) {
+      return false;
+    }
+    uint64_t midr;
+    asm("mrs %0, midr_el1" : "=r"(midr));
+    return (midr & 0xff00fff0) == 0x4e000100;
+  }();
+  return enabled;
+}
+
+// Describe the constant and flat inputs once. A mixed null bitmap or a
+// non-contiguous selection keeps the existing decoded comparison.
+struct VeraIntegerGroupKeys {
+  struct Field {
+    const void* data;
+    int32_t offset;
+  };
+  struct Constant {
+    uint64_t value;
+    int32_t offset;
+    int32_t size;
+  };
+  std::array<Field, 16> flat32, flat64;
+  std::array<Constant, 16> constants;
+  int32_t count32{0}, count64{0}, countConst{0};
+  int32_t nullByte{-1};
+  int32_t lastByte{0};
+  uint16_t nullMask{0}, nullValue{0};
+
+  bool prepare(HashLookup& lookup, const RowContainer& rows) {
+    const auto n = lookup.rows.size();
+    if (lookup.hashers.size() < 4 || lookup.hashers.size() > 16 || n < 128 ||
+        !simd::isDense(lookup.rows.data(), n)) {
+      return false;
+    }
+    const auto begin = lookup.rows[0];
+    for (int k = 0; k < lookup.hashers.size(); ++k) {
+      auto& decoded = lookup.hashers[k]->decodedVector();
+      const auto col = rows.columnAt(k);
+      lastByte = std::max<int32_t>(
+          lastByte, col.nullMask() ? col.nullByte() : col.offset());
+      const bool constant = decoded.isConstantMapping();
+      if ((!constant && !decoded.isIdentityMapping()) ||
+          decoded.hasExtraNulls()) {
+        return false;
+      }
+      const bool isNull = constant && decoded.isNullAt(begin);
+      if (!constant && decoded.mayHaveNulls()) {
+        const auto* bits = decoded.nulls();
+        if (bits && !facebook::velox::bits::isAllSet(bits, begin, begin + n)) {
+          return false;
+        }
+      }
+      if (col.nullMask()) {
+        if (nullByte < 0) {
+          nullByte = col.nullByte();
+        }
+        const auto byte = static_cast<int32_t>(col.nullByte()) - nullByte;
+        if (byte < 0 || byte > 1) {
+          return false;
+        }
+        const auto mask = static_cast<uint16_t>(col.nullMask()) << (byte * 8);
+        nullMask |= mask;
+        if (isNull) {
+          nullValue |= mask;
+        }
+      } else if (isNull) {
+        return false;
+      }
+      if (isNull) {
+        continue;
+      }
+      const bool wide = decoded.base()->typeKind() == TypeKind::BIGINT;
+      if (constant) {
+        constants[countConst++] = {
+            wide ? static_cast<uint64_t>(decoded.valueAt<int64_t>(begin))
+                 : static_cast<uint32_t>(decoded.valueAt<int32_t>(begin)),
+            col.offset(),
+            wide ? 8 : 4};
+      } else if (wide) {
+        flat64[count64++] = {decoded.data<int64_t>(), col.offset()};
+      } else {
+        flat32[count32++] = {decoded.data<int32_t>(), col.offset()};
+      }
+    }
+    return count32 != 0;
+  }
+
+  template <typename T>
+  static T load(const char* p) {
+    T v;
+    std::memcpy(&v, p, sizeof(v));
+    return v;
+  }
+
+  bool equal(const char* group, int row) const {
+    if (nullMask) {
+      const uint16_t flags = nullMask > 0xff ? load<uint16_t>(group + nullByte)
+                                             : load<uint8_t>(group + nullByte);
+      if ((flags & nullMask) != nullValue) {
+        return false;
+      }
+    }
+    for (int i = 0; i < count32; ++i) {
+      const auto& f = flat32[i];
+      if (load<uint32_t>(group + f.offset) !=
+          static_cast<const uint32_t*>(f.data)[row]) {
+        return false;
+      }
+    }
+    for (int i = 0; i < count64; ++i) {
+      const auto& f = flat64[i];
+      if (load<uint64_t>(group + f.offset) !=
+          static_cast<const uint64_t*>(f.data)[row]) {
+        return false;
+      }
+    }
+    for (int i = 0; i < countConst; ++i) {
+      const auto& c = constants[i];
+      const uint64_t v = c.size == 4 ? load<uint32_t>(group + c.offset)
+                                     : load<uint64_t>(group + c.offset);
+      if (v != c.value) {
+        return false;
+      }
+    }
+    return true;
+  }
+};
+} // namespace
+#endif
+
 template <bool ignoreNullKeys>
 bool HashTable<ignoreNullKeys>::tryGroupProbeWithFixedIntegerKeys(
     HashLookup& lookup) {
@@ -722,6 +865,54 @@ bool HashTable<ignoreNullKeys>::tryGroupProbeWithFixedIntegerKeys(
     }
   }
 
+  auto probe = [&](auto&& equal, auto&& prefetch) {
+    ProbeState states[kPrefetchSize];
+    const auto numProbes = lookup.rows.size();
+    const auto* rows = lookup.rows.data();
+    const auto* hashes = lookup.hashes.data();
+    for (int32_t begin = 0; begin < numProbes; begin += kPrefetchSize) {
+      const auto numStates =
+          std::min<int32_t>(kPrefetchSize, numProbes - begin);
+      for (int32_t i = 0; i < numStates; ++i) {
+        const auto row = rows[begin + i];
+        states[i].preProbe(*this, hashes[row], row);
+      }
+      for (int32_t i = 0; i < numStates; ++i) {
+        states[i].template firstProbe<ProbeState::Operation::kInsert>(*this, 0);
+        prefetch(states[i]);
+      }
+      const auto numDistinctBefore = numDistinct_;
+      for (int32_t i = 0; i < numStates; ++i) {
+        // Preserve stale-tag rechecking after earlier insertions in this
+        // window.
+        lookup.hits[states[i].row()] =
+            states[i].template fullProbe<ProbeState::Operation::kInsert>(
+                *this,
+                0,
+                equal,
+                [&](int32_t row, uint64_t index) {
+                  return insertEntry(lookup, index, row);
+                },
+                numTombstones_,
+                numDistinct_ != numDistinctBefore);
+      }
+    }
+  };
+#if defined(__linux__) && defined(__aarch64__) && \
+    defined(__ARM_FEATURE_SVE) && defined(__AARCH64EL__)
+  VeraIntegerGroupKeys keys;
+  if (!ignoreNullKeys && supportsVeraGroupPrefetch() &&
+      keys.prepare(lookup, *rows_)) {
+    probe(
+        [&](char* group, int32_t row) { return keys.equal(group, row); },
+        [&](const ProbeState& state) {
+          if (auto* group = state.group()) {
+            __builtin_prefetch(group + keys.lastByte, 0, 3);
+          }
+        });
+    return true;
+  }
+#endif
   using KeyColumn =
       detail::integer_key_compare::IntegerKeyColumn<DecodedVector, RowColumn>;
   std::vector<KeyColumn> int32Keys;
@@ -734,38 +925,12 @@ bool HashTable<ignoreNullKeys>::tryGroupProbeWithFixedIntegerKeys(
         decoded.base()->typeKind() == TypeKind::INTEGER ? int32Keys : int64Keys;
     columns.push_back({&decoded, rows_->columnAt(key)});
   }
-  ProbeState states[kPrefetchSize];
-  const auto numProbes = lookup.rows.size();
-  const auto* rows = lookup.rows.data();
-  const auto* hashes = lookup.hashes.data();
-  for (int32_t begin = 0; begin < numProbes; begin += kPrefetchSize) {
-    const auto numStates = std::min<int32_t>(kPrefetchSize, numProbes - begin);
-    for (int32_t i = 0; i < numStates; ++i) {
-      const auto row = rows[begin + i];
-      states[i].preProbe(*this, hashes[row], row);
-    }
-    for (int32_t i = 0; i < numStates; ++i) {
-      states[i].template firstProbe<ProbeState::Operation::kInsert>(*this, 0);
-    }
-    const auto numDistinctBefore = numDistinct_;
-    for (int32_t i = 0; i < numStates; ++i) {
-      // Preserve stale-tag rechecking after earlier insertions in this
-      // window.
-      lookup.hits[states[i].row()] =
-          states[i].template fullProbe<ProbeState::Operation::kInsert>(
-              *this,
-              0,
-              [&](char* group, int32_t row) {
-                return detail::integer_key_compare::equalFixedIntegerKeys<
-                    !ignoreNullKeys>(group, row, int32Keys, int64Keys);
-              },
-              [&](int32_t row, uint64_t index) {
-                return insertEntry(lookup, index, row);
-              },
-              numTombstones_,
-              numDistinct_ != numDistinctBefore);
-    }
-  }
+  probe(
+      [&](char* group, int32_t row) {
+        return detail::integer_key_compare::equalFixedIntegerKeys<
+            !ignoreNullKeys>(group, row, int32Keys, int64Keys);
+      },
+      [](const ProbeState&) {});
   return true;
 }
 
