@@ -42,8 +42,48 @@ inline int32_t unpackSafePrefix(
     if (count < 16 || width == 0 || width > 56) {
       return 0;
     }
+    uint64_t i = 0;
+#if defined(__AARCH64EL__)
+    // Even at bit offset seven, a field of up to 25 bits fits in one word.
+    // Use all 32-bit lanes when bit positions fit. Selections may be unordered.
+    if (width <= 25 && mask <= 0x1ffffff &&
+        static_cast<uint64_t>(normalizedBitOffset) <= UINT32_MAX) {
+      const auto offset = static_cast<uint32_t>(normalizedBitOffset);
+      // Bound row * width without division, using width <= 32.
+      const uint32_t maxRow = (UINT32_MAX - offset) >> 5;
+      const uint64_t lanes32 = svcntw();
+      const auto all = svptrue_b32();
+      for (; i + lanes32 <= static_cast<uint64_t>(count); i += lanes32) {
+        const auto selected = svreinterpret_u32_s32(svld1_s32(all, rows + i));
+        if (svptest_any(all, svcmpgt_n_u32(all, selected, maxRow))) {
+          break;
+        }
+        const auto bit =
+            svmla_n_u32_x(all, svdup_n_u32(offset), selected, width);
+        const auto byte = svlsr_n_u32_x(all, bit, 3);
+        const auto words = svld1_gather_u32offset_u32(
+            all, reinterpret_cast<const uint32_t*>(input), byte);
+        const auto values = svand_n_u32_x(
+            all,
+            svlsr_u32_x(all, words, svand_n_u32_x(all, bit, 7)),
+            static_cast<uint32_t>(mask));
+        if constexpr (std::is_same_v<T, int32_t>) {
+          svst1_s32(all, output + i, svreinterpret_s32_u32(values));
+        } else {
+          svst1_s64(
+              svptrue_b64(),
+              output + i,
+              svreinterpret_s64_u64(svunpklo_u64(values)));
+          svst1_s64(
+              svptrue_b64(),
+              output + i + svcntd(),
+              svreinterpret_s64_u64(svunpkhi_u64(values)));
+        }
+      }
+    }
+#endif
     const uint64_t lanes = svcntd();
-    for (uint64_t i = 0; i < static_cast<uint64_t>(count); i += lanes) {
+    for (; i < static_cast<uint64_t>(count); i += lanes) {
       const auto active = svwhilelt_b64(i, static_cast<uint64_t>(count));
       const auto selected = svld1sw_s64(active, rows + i);
       const auto bit = svadd_n_s64_x(
