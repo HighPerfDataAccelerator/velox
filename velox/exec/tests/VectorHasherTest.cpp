@@ -1468,6 +1468,36 @@ TEST_F(VectorHasherTest, endOfRange) {
   EXPECT_EQ(tinyData->size(), uniques.size());
 }
 
+TEST_F(VectorHasherTest, shortKeyWordsAndCrcTails) {
+  alignas(uint64_t) std::array<char, 48> bytes;
+  for (size_t i = 0; i < bytes.size(); ++i) {
+    bytes[i] = static_cast<char>(i * 13);
+  }
+
+  for (size_t offset = 0; offset < 8; ++offset) {
+    for (uint32_t size = 0; size <= sizeof(uint64_t); ++size) {
+      uint64_t expected = 0;
+      std::memcpy(&expected, bytes.data() + offset, size);
+      UniqueValue value(bytes.data() + offset, size);
+      EXPECT_EQ(static_cast<uint64_t>(value.data()), expected);
+      EXPECT_EQ(UniqueValueHasher{}(value), simd::crc32U64(0, expected));
+    }
+  }
+
+  for (uint32_t size = 9; size <= 32; ++size) {
+    uint32_t crc = 0;
+    for (uint32_t offset = 0; offset < size; offset += sizeof(uint64_t)) {
+      uint64_t word = 0;
+      std::memcpy(
+          &word,
+          bytes.data() + offset,
+          std::min<size_t>(sizeof(word), size - offset));
+      crc = simd::crc32U64(crc, word);
+    }
+    EXPECT_EQ(UniqueValueHasher{}(UniqueValue(bytes.data(), size)), crc);
+  }
+}
+
 TEST_F(VectorHasherTest, hashCollision) {
   constexpr int kValue = 42;
   UniqueValue x(kValue);
