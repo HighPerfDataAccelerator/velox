@@ -176,7 +176,7 @@ TEST(ArmSelectedUnpack, LargeBitPositionsUse64BitAddresses) {
     GTEST_SKIP() << "Requires SVE";
   }
   // Sparse virtual allocation: only the pages containing selected fields are
-  // touched. The last row's bit position exceeds UINT32_MAX.
+  // touched. One interior row exceeds UINT32_MAX bits while its neighbors fit.
   constexpr int32_t kLargeRow = 200000000;
   constexpr uint8_t kWidth = 24;
   constexpr int32_t kOffset = 7;
@@ -191,9 +191,9 @@ TEST(ArmSelectedUnpack, LargeBitPositionsUse64BitAddresses) {
   ASSERT_NE(data, MAP_FAILED);
   std::vector<int32_t> rows(33);
   for (int i = 0; i < 33; ++i) {
-    rows[i] = i < 16 ? i : kLargeRow;
+    rows[i] = i == 17 ? kLargeRow : i;
     const auto byte = (int64_t{rows[i]} * kWidth + kOffset) / 8;
-    std::memset(data + byte, 0xb7, 8);
+    std::memset(data + byte, i + 1, 8);
   }
   std::vector<int64_t> output(33, -1);
   const auto done = unpackSafePrefix(
@@ -209,6 +209,25 @@ TEST(ArmSelectedUnpack, LargeBitPositionsUse64BitAddresses) {
     EXPECT_EQ(output[i], reference<int64_t>(data, kOffset, rows[i], kWidth));
   }
   EXPECT_EQ(munmap(data, kBytes), 0);
+}
+
+TEST(ArmSelectedUnpack, NarrowWidthWithWideMask) {
+  if (!kHasSve) {
+    GTEST_SKIP() << "Requires SVE";
+  }
+  // The caller can provide a mask spanning more bits than the field width.
+  const std::vector<uint64_t> input(32, UINT64_MAX);
+  std::vector<int32_t> rows(33);
+  std::iota(rows.begin(), rows.end(), 0);
+  constexpr uint64_t kMask = (uint64_t{1} << 40) - 1;
+  std::vector<int64_t> output(rows.size());
+  ASSERT_EQ(
+      unpackSafePrefix(
+          input.data(), 7, rows.data(), rows.size(), 25, kMask, output.data()),
+      rows.size());
+  for (auto value : output) {
+    EXPECT_EQ(value, kMask);
+  }
 }
 
 TEST(ArmSelectedUnpack, FallbackDoesNotAccessMemory) {
