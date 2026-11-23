@@ -30,6 +30,9 @@
 #include "velox/vector/FlatVector.h"
 
 #if defined(__linux__) && defined(__aarch64__) && defined(__ARM_FEATURE_SVE)
+#if defined(__AARCH64EL__)
+#include <arm_neon.h>
+#endif
 #include <arm_sve.h>
 #include <asm/hwcap.h>
 #include <sys/auxv.h>
@@ -987,6 +990,91 @@ void HashTable<ignoreNullKeys>::arrayGroupProbe(HashLookup& lookup) {
   }
 }
 
+#if defined(__linux__) && defined(__aarch64__) && \
+    defined(__ARM_FEATURE_SVE) && defined(__AARCH64EL__)
+template <bool ignoreNullKeys>
+FOLLY_NOINLINE void HashTable<ignoreNullKeys>::probeRepeatedNormalizedKeys(
+    HashLookup& lookup) {
+  const int32_t numRows = lookup.rows.size();
+  auto* __restrict hashes = lookup.hashes.data();
+  lookup.normalizedKeys.resize(numRows);
+  auto* __restrict keys = lookup.normalizedKeys.data();
+  auto* __restrict hits = lookup.hits.data();
+  // The caller stores normalized inputs in hashes. Preserve them before mixing.
+  std::copy_n(hashes, numRows, keys);
+
+  constexpr int32_t kWindow = 256;
+  constexpr int32_t kKeyOffset =
+      -static_cast<int32_t>(sizeof(normalized_key_t));
+  int32_t runStarts[kWindow + 1];
+  ProbeState states[kPrefetchSize];
+  for (int32_t begin = 0; begin < numRows;) {
+    const auto end = begin + std::min(kWindow, numRows - begin);
+    int32_t numRuns = 1;
+    runStarts[0] = begin;
+    int32_t row = begin + 1;
+    for (; end - row >= 8; row += 8) {
+      // Narrow eight adjacent 64-bit equality comparisons to one byte per row.
+      const auto eq01 =
+          vceqq_u64(vld1q_u64(keys + row), vld1q_u64(keys + row - 1));
+      const auto eq23 =
+          vceqq_u64(vld1q_u64(keys + row + 2), vld1q_u64(keys + row + 1));
+      const auto eq45 =
+          vceqq_u64(vld1q_u64(keys + row + 4), vld1q_u64(keys + row + 3));
+      const auto eq67 =
+          vceqq_u64(vld1q_u64(keys + row + 6), vld1q_u64(keys + row + 5));
+      const auto low =
+          vuzp1q_u32(vreinterpretq_u32_u64(eq01), vreinterpretq_u32_u64(eq23));
+      const auto high =
+          vuzp1q_u32(vreinterpretq_u32_u64(eq45), vreinterpretq_u32_u64(eq67));
+      const auto equal = vmovn_u16(
+          vuzp1q_u16(vreinterpretq_u16_u32(low), vreinterpretq_u16_u32(high)));
+      uint64_t changes =
+          ~vget_lane_u64(vreinterpret_u64_u8(equal), 0) & 0x0101010101010101ULL;
+      while (changes) {
+        runStarts[numRuns++] = row + __builtin_ctzll(changes) / 8;
+        changes &= changes - 1;
+      }
+    }
+    for (; row < end; ++row) {
+      if (keys[row] != keys[row - 1]) {
+        runStarts[numRuns++] = row;
+      }
+    }
+    runStarts[numRuns] = end;
+
+    for (int32_t first = 0; first < numRuns; first += kPrefetchSize) {
+      const auto count = std::min(kPrefetchSize, numRuns - first);
+      for (int32_t i = 0; i < count; ++i) {
+        const auto head = runStarts[first + i];
+        const auto hash = mixNormalizedKey(keys[head], sizeBits_);
+        hashes[head] = hash;
+        states[i].preProbe(*this, hash, head);
+      }
+      for (int32_t i = 0; i < count; ++i) {
+        states[i].firstProbe(*this, kKeyOffset);
+      }
+      for (int32_t i = 0; i < count; ++i) {
+        const auto head = runStarts[first + i];
+        const auto limit = runStarts[first + i + 1];
+        char* hit = states[i].joinNormalizedKeyFullProbe(*this, keys);
+        const auto hash = hashes[head];
+        for (int32_t pos = head; pos < limit; ++pos) {
+          hashes[pos] = hash;
+          hits[pos] = hit;
+        }
+        if constexpr (kTrackLoads) {
+          if (hit) {
+            numHits_ += limit - head - 1;
+          }
+        }
+      }
+    }
+    begin = end;
+  }
+}
+#endif
+
 template <bool ignoreNullKeys>
 void HashTable<ignoreNullKeys>::joinProbe(HashLookup& lookup) {
   incrementProbes(lookup.rows.size());
@@ -995,6 +1083,24 @@ void HashTable<ignoreNullKeys>::joinProbe(HashLookup& lookup) {
     return;
   }
   if (hashMode_ == HashMode::kNormalizedKey) {
+#if defined(__linux__) && defined(__aarch64__) && \
+    defined(__ARM_FEATURE_SVE) && defined(__AARCH64EL__)
+    const int32_t numRows = lookup.rows.size();
+    if (numRows >= 256 && lookup.rows[0] == 0 &&
+        simd::isDense(lookup.rows.data(), numRows) && isVeraJoinCpu()) {
+      const auto* keys = lookup.hashes.data();
+      constexpr int32_t kSamples = 8;
+      int32_t repeats = 0;
+      for (int32_t i = 0; i < kSamples; ++i) {
+        const auto row = i * (numRows / kSamples);
+        repeats += keys[row] == keys[row + 1];
+      }
+      if (repeats >= 6) {
+        probeRepeatedNormalizedKeys(lookup);
+        return;
+      }
+    }
+#endif
     populateNormalizedKeys(lookup, sizeBits_);
     joinNormalizedKeyProbe(lookup);
     return;
