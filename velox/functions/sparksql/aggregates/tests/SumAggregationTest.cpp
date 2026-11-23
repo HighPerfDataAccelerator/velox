@@ -357,6 +357,63 @@ TEST_F(SumAggregationTest, decimalSumCompanionMerge) {
   AssertQueryBuilder(plan).assertResults(expected);
 }
 
+TEST_F(SumAggregationTest, repeatedGroupsNullWindowsAndWideOperands) {
+  const auto type = DECIMAL(38, 0);
+  std::vector<int32_t> ids;
+  std::vector<std::optional<int128_t>> values;
+  constexpr int kGroups = 37;
+  std::vector<std::optional<int128_t>> sums(kGroups);
+  std::vector<int32_t> expectedGroups;
+  for (int i = 0; i < kGroups; ++i)
+    expectedGroups.push_back(i);
+  for (int i = 0; i < 4099; ++i) {
+    const int32_t group = (i / 13) % kGroups;
+    ids.push_back(group);
+    if (group == 0 || (i % 64 >= 60 && i % 64 <= 62) || i % 97 == 0) {
+      values.push_back(std::nullopt);
+      continue;
+    }
+    int128_t v = (i % 2 == 0 ? 1 : -1) * int128_t(i + 1);
+    if (i % 37 == 0)
+      v = (int128_t{1} << 85) * (i % 3 == 0 ? -1 : 1);
+    values.push_back(v);
+    sums[group] = sums[group].value_or(0) + v;
+  }
+  auto in = makeRowVector(
+      {makeFlatVector<int32_t>(ids),
+       makeNullableFlatVector<int128_t>(values, type)});
+  auto expected = makeRowVector(
+      {makeFlatVector<int32_t>(expectedGroups),
+       makeNullableFlatVector<int128_t>(sums, type)});
+  testAggregations({in}, {"c0"}, {"spark_sum(c1)"}, {expected});
+}
+
+TEST_F(SumAggregationTest, longDecimalChangesCarryRangeWithinGroup) {
+  const auto type = DECIMAL(38, 0);
+  const int128_t limit = int128_t{1} << 64;
+  auto groups = makeFlatVector<int32_t>({1, 2, 3, 1, 2, 3, 1, 2, 1, 2});
+  auto amounts = makeNullableFlatVector<int128_t>(
+      {limit - 1,
+       -limit,
+       std::nullopt,
+       9,
+       -9,
+       std::nullopt,
+       -2,
+       2,
+       -limit,
+       limit},
+      type);
+  auto expected = makeRowVector(
+      {makeFlatVector<int32_t>({1, 2, 3}),
+       makeNullableFlatVector<int128_t>({6, -7, std::nullopt}, type)});
+  testAggregations(
+      {makeRowVector({groups, amounts})},
+      {"c0"},
+      {"spark_sum(c1)"},
+      {expected});
+}
+
 TEST_F(SumAggregationTest, decimalSum) {
   std::vector<std::optional<int64_t>> shortDecimalRawVector;
   std::vector<std::optional<int128_t>> longDecimalRawVector;
