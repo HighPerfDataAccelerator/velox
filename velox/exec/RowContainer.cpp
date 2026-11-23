@@ -28,7 +28,7 @@ DEFINE_bool(
 DEFINE_bool(
     velox_arm_sve_row_extraction_enabled,
     false,
-    "Use predicated ARM SVE gathers for direct non-nullable integer columns");
+    "Use ARM-optimized extraction for direct non-nullable integer columns");
 
 DECLARE_bool(velox_row_container_string_extraction_prefetch_enabled);
 
@@ -59,8 +59,17 @@ void extractFixedBatchValues(
     nulls =
         flat->mutableNulls(flat->size(), true)->template asMutable<uint64_t>();
   }
+#if VELOX_ARM_ROW_EXTRACTION_AVAILABLE
+  const bool useScalarFour =
+      !selected && !nullable && useSve && count >= 512 && svcntd() == 2;
+#else
+  constexpr bool useScalarFour = false;
+#endif
+  bool allRowsPresent = useScalarFour &&
+      std::all_of(rows, rows + 64, [](const char* row) { return row != nullptr; });
   for (int32_t i = 0; i < count; i += 64) {
     const auto n = std::min(64, count - i);
+    bool nextRowsPresent = useScalarFour;
     // Rows are scattered over the container, so start fetching the fields of
     // the next block while this block is copied.
     if (i + 64 < count) {
@@ -75,29 +84,39 @@ void extractFixedBatchValues(
         }
         if (row != nullptr) {
           __builtin_prefetch(row + column.offset());
+        } else {
+          nextRowsPresent = false;
         }
       }
     }
     const auto* const* blockRows = selected ? rows : rows + i;
     const auto* blockNumbers = selected ? numbers + i : nullptr;
-    const uint64_t valid = useSve
-        ? detail::row_extraction::blockSve<sizeof(T), selected, nullable>(
-              blockRows,
-              blockNumbers,
-              n,
-              column.offset(),
-              column.nullByte(),
-              column.nullMask(),
-              output + i * sizeof(T))
-        : detail::row_extraction::blockScalar<sizeof(T), selected, nullable>(
-              blockRows,
-              blockNumbers,
-              n,
-              column.offset(),
-              column.nullByte(),
-              column.nullMask(),
-              output + i * sizeof(T));
     const auto all = n == 64 ? ~uint64_t{0} : (uint64_t{1} << n) - 1;
+    uint64_t valid;
+    if (allRowsPresent) {
+      detail::row_extraction::blockScalarFour<sizeof(T)>(
+          blockRows, n, column.offset(), output + i * sizeof(T));
+      valid = all;
+    } else if (useSve) {
+      valid = detail::row_extraction::blockSve<sizeof(T), selected, nullable>(
+          blockRows,
+          blockNumbers,
+          n,
+          column.offset(),
+          column.nullByte(),
+          column.nullMask(),
+          output + i * sizeof(T));
+    } else {
+      valid = detail::row_extraction::blockScalar<sizeof(T), selected, nullable>(
+          blockRows,
+          blockNumbers,
+          n,
+          column.offset(),
+          column.nullByte(),
+          column.nullMask(),
+          output + i * sizeof(T));
+    }
+    allRowsPresent = nextRowsPresent;
     if (!nulls && valid != all) {
       nulls = flat->mutableNulls(flat->size(), true)
                   ->template asMutable<uint64_t>();
