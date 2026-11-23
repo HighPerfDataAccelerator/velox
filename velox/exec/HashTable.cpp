@@ -29,6 +29,14 @@
 #include "velox/functions/prestosql/types/parser/TypeParser.h"
 #include "velox/vector/FlatVector.h"
 
+#if defined(__linux__) && defined(__aarch64__) && \
+    defined(__ARM_FEATURE_SVE) && defined(__AARCH64EL__)
+#include <arm_neon.h>
+#include <arm_sve.h>
+#include <asm/hwcap.h>
+#include <sys/auxv.h>
+#endif
+
 #include <gflags/gflags.h>
 #include <algorithm>
 
@@ -2448,6 +2456,75 @@ JoinResultEmitter<kCountBytes, SizeFunction> makeJoinResultEmitter(
   };
 }
 
+#if defined(__linux__) && defined(__aarch64__) && \
+    defined(__ARM_FEATURE_SVE) && defined(__AARCH64EL__)
+bool useVeraShortJoinChains() {
+  static const bool enabled = [] {
+    const auto required = HWCAP_CPUID | HWCAP_SVE;
+    if ((getauxval(AT_HWCAP) & required) != required) {
+      return false;
+    }
+    uint64_t midr;
+    asm("mrs %0, midr_el1" : "=r"(midr));
+    return (midr & 0xff00fff0) == 0x4e000100;
+  }();
+  return enabled;
+}
+
+size_t emitVeraShortJoinChains(
+    BaseHashTable::JoinResultIterator& iter,
+    int32_t nextOffset,
+    folly::Range<vector_size_t*> inputRows,
+    folly::Range<char**> hits,
+    size_t numOut) {
+  const auto numProbeRows = iter.rows->size();
+  const int32x4_t offsets = {0, 1, 2, 3};
+  const uint8x8_t weights = {1, 2, 4, 8, 16, 32, 64, 128};
+  while (numProbeRows - iter.lastRowIndex >= 8 &&
+         inputRows.size() - numOut >= 8) {
+    const auto* selected = iter.rows->data() + iter.lastRowIndex;
+    const auto start = selected[0];
+    const auto expected = vaddq_s32(vdupq_n_s32(start), offsets);
+    const auto first = vceqq_s32(vld1q_s32(selected), expected);
+    const auto last =
+        vceqq_s32(vld1q_s32(selected + 4), vaddq_s32(expected, vdupq_n_s32(4)));
+    if (!vminvq_u32(vandq_u32(first, last))) {
+      break;
+    }
+    char* const* batch = iter.hits->data() + start;
+    uint64x2x4_t heads;
+    std::memcpy(&heads, batch, sizeof(heads));
+    const auto pair = [](uint64x2_t a, uint64x2_t b) {
+      return vmovn_u32(
+          vcombine_u32(vmovn_u64(vtstq_u64(a, a)), vmovn_u64(vtstq_u64(b, b))));
+    };
+    const auto live = vmovn_u16(vcombine_u16(
+        pair(heads.val[0], heads.val[1]), pair(heads.val[2], heads.val[3])));
+    auto mask = static_cast<unsigned>(vaddv_u8(vand_u8(live, weights)));
+    // Leave the first multi-hit row for the regular chain walker.
+    int consumed = 8;
+    while (mask) {
+      const int slot = __builtin_ctz(mask);
+      auto* head = batch[slot];
+      char* next;
+      std::memcpy(&next, head + nextOffset, sizeof(next));
+      if (next) {
+        consumed = slot;
+        break;
+      }
+      inputRows[numOut] = start + slot;
+      hits[numOut++] = head;
+      mask &= mask - 1;
+    }
+    iter.lastRowIndex += consumed;
+    if (consumed < 8) {
+      break;
+    }
+  }
+  return numOut;
+}
+#endif
+
 } // namespace
 
 template <bool ignoreNullKeys>
@@ -2596,6 +2673,12 @@ int32_t HashTable<ignoreNullKeys>::listJoinResultsInterleavedImpl(
   const bool headChainDrainEnabled =
       FLAGS_velox_hash_join_head_chain_drain_enabled;
   const auto numProbeRows = iter.rows->size();
+#if defined(__linux__) && defined(__aarch64__) && \
+    defined(__ARM_FEATURE_SVE) && defined(__AARCH64EL__)
+  const bool useShortChains = kDefaultPolicy && !kCountBytes &&
+      !kCompactChains && !includeMisses && numProbeRows >= 32 &&
+      svcntd() == 2 && useVeraShortJoinChains();
+#endif
   auto& walker = iter.walker;
   auto bufferedHitAt = [&](int32_t slot, int32_t position) -> char*& {
     return walker.bufferData[slot * aheadWindow + position];
@@ -2621,6 +2704,18 @@ int32_t HashTable<ignoreNullKeys>::listJoinResultsInterleavedImpl(
     if (walker.slotHead >= walker.numActive) {
       walker.slotHead = 0;
       walker.numActive = 0;
+#if defined(__linux__) && defined(__aarch64__) && \
+    defined(__ARM_FEATURE_SVE) && defined(__AARCH64EL__)
+      if constexpr (kDefaultPolicy && !kCountBytes && !kCompactChains) {
+        if (useShortChains) {
+          numOut = emitVeraShortJoinChains(
+              iter, nextOffset_, inputRows, hits, numOut);
+          if (numOut == inputRows.size()) {
+            return finish();
+          }
+        }
+      }
+#endif
       while (walker.numActive < numParallelChains &&
              iter.lastRowIndex < numProbeRows) {
         const auto row = (*iter.rows)[iter.lastRowIndex]; // NOLINT
