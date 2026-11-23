@@ -215,6 +215,11 @@ TEST_F(MightContainBatchTest, tooSmallFilterIsUserError) {
     VELOX_ASSERT_USER_THROW(
         evaluateWith(name, std::string("ab"), data, SelectivityVector(1)),
         "Serialized BloomFilter is too small");
+    auto truncated = serializedFilter(64, {1});
+    truncated.pop_back();
+    VELOX_ASSERT_USER_THROW(
+        evaluateWith(name, truncated, data, SelectivityVector(1)),
+        "Truncated serialized BloomFilter");
   }
 }
 

@@ -553,6 +553,8 @@ class BaseHashTable {
   /// Static functions for processing internals. Public because used in
   /// structs that define probe and insert algorithms.
 
+  static constexpr uint8_t kHashTagShift = 38;
+
   /// Extracts a 7 bit tag from a hash number. The high bit is always set.
   static uint8_t hashTag(uint64_t hash) {
     // This is likely all 0 for small key types (<= 32 bits).  Not an issue
@@ -560,7 +562,7 @@ class BaseHashTable {
     // If there are multiple small type keys, they are mixed which makes them a
     // 64 bit hash.  Normalized keys are mixed before being used as hash
     // numbers.
-    return static_cast<uint8_t>(hash >> 38) | 0x80;
+    return static_cast<uint8_t>(hash >> kHashTagShift) | 0x80;
   }
 
   /// Loads a vector of tags for bulk comparison. Disables tsan errors
@@ -757,8 +759,17 @@ class HashTable : public BaseHashTable {
   int64_t allocatedBytes() const override {
     // For each row: sizeof(char*) per table entry + memory
     // allocated with MemoryAllocator for fixed-width rows and strings.
-    return sizeof(char*) * capacity_ + rows_->allocatedBytes() +
-        compactJoinAllocatedBytes();
+    const auto mainBytes = sizeof(char*) * capacity_;
+    auto tableBytes = mainBytes;
+#if defined(__linux__) && defined(__aarch64__) && defined(__ARM_FEATURE_SVE)
+    if (hashMode_ == HashMode::kNormalizedKey) {
+      const auto extra = estimatedJoinTagFilterBytes(capacity_);
+      if (extra && tableAllocation_.size() >= mainBytes + extra) {
+        tableBytes = tableAllocation_.size();
+      }
+    }
+#endif
+    return tableBytes + rows_->allocatedBytes() + compactJoinAllocatedBytes();
   }
 
   HashStringAllocator* stringAllocator() override {
@@ -848,7 +859,8 @@ class HashTable : public BaseHashTable {
       // If rehashed, the table adds size_ entries (i.e. doubles),
       // adding one pointer worth for each new position.  (16 tags, 16 6 byte
       // pointers, 16 bytes padding).
-      return capacity_ * tableSlotSize();
+      return capacity_ * tableSlotSize() +
+          estimatedJoinTagFilterBytes(2 * capacity_);
     }
     return 0;
   }
@@ -857,10 +869,11 @@ class HashTable : public BaseHashTable {
     // Take the max of max size in array mode and estimated size in non-array
     // mode.
     const uint64_t maxByteSizeInArrayMode = kArrayHashMaxSize * tableSlotSize();
+    const auto slots = newHashTableEntries(numDistinct, 0);
     return bits::roundUp(
         std::max(
             maxByteSizeInArrayMode,
-            newHashTableEntries(numDistinct, 0) * tableSlotSize()),
+            slots * tableSlotSize() + estimatedJoinTagFilterBytes(slots)),
         memory::AllocationTraits::kPageSize);
   }
 
@@ -1305,6 +1318,8 @@ class HashTable : public BaseHashTable {
   bool joinBuildNoDuplicates() const {
     return isJoinBuild_ && !allowDuplicates_;
   }
+
+  uint64_t estimatedJoinTagFilterBytes(uint64_t capacity) const;
 
   // Returns the byte offset of the bucket for 'hash' starting from 'table_'.
   int64_t bucketOffset(uint64_t hash) const {

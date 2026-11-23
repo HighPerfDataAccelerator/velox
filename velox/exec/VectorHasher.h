@@ -15,6 +15,10 @@
  */
 #pragma once
 
+#if defined(__ARM_FEATURE_SVE) && defined(__AARCH64EL__)
+#include <arm_sve.h>
+#endif
+
 #include <folly/container/F14Map.h>
 #include <folly/container/F14Set.h>
 
@@ -36,6 +40,17 @@ class NativeBufferedWriter;
 
 namespace facebook::velox::exec {
 
+// Load at most eight bytes, preserving zero padding and the original CRC input.
+inline uint64_t loadValueIdWord(const char* data, uint32_t size) {
+#if defined(__ARM_FEATURE_SVE) && defined(__AARCH64EL__)
+  const auto live = svwhilelt_b8_u32(0, size);
+  const auto bytes = svld1_u8(live, reinterpret_cast<const uint8_t*>(data));
+  return svlastb_u64(svptrue_pat_b64(SV_VL1), svreinterpret_u64_u8(bytes));
+#else
+  return bits::loadPartialWord(reinterpret_cast<const uint8_t*>(data), size);
+#endif
+}
+
 // Represents a unique scalar or string value and its mapping to a
 // small integer range for use as part of a normalized key or array
 // index.
@@ -48,9 +63,8 @@ class UniqueValue {
 
   explicit UniqueValue(const char* value, uint32_t size) {
     size_ = size;
-    data_ = 0;
     if (size <= sizeof(data_)) {
-      memcpy(&data_, value, size);
+      data_ = loadValueIdWord(value, size);
     } else {
       data_ = reinterpret_cast<int64_t>(value);
     }
@@ -118,9 +132,8 @@ struct UniqueValueHasher {
 
     auto numBytesRemaining = size - wordIndex * 8;
     if (numBytesRemaining > 0) {
-      auto lastWord = bits::loadPartialWord(
-          reinterpret_cast<const uint8_t*>(data + wordIndex),
-          numBytesRemaining);
+      auto lastWord = loadValueIdWord(
+          reinterpret_cast<const char*>(data + wordIndex), numBytesRemaining);
       hash = simd::crc32U64(hash, lastWord);
     }
 

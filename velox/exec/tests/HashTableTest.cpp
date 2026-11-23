@@ -926,6 +926,58 @@ TEST_P(HashTableTest, enableRangeWhereCan) {
   insertGroups(*data, *lookup, *table);
 }
 
+TEST_P(HashTableTest, normalizedJoinTagFilter) {
+  // Both component values occur on the build side. Most probe pairs do not.
+  constexpr int32_t kBuildRows = 180'000;
+  auto component = [](int32_t id) {
+    return (id / 4096) * 64 + (id % 4096) / 64;
+  };
+  auto build = makeRowVector(
+      {makeFlatVector<int64_t>(kBuildRows, [](auto i) { return i % 4096; }),
+       makeFlatVector<int64_t>(kBuildRows, component)});
+  std::vector<std::unique_ptr<VectorHasher>> hashers;
+  for (column_index_t i = 0; i < 2; ++i) {
+    hashers.push_back(std::make_unique<VectorHasher>(BIGINT(), i));
+  }
+  auto table = HashTable<true>::createForJoin(
+      std::move(hashers), {}, true, false, false, 1'000, pool());
+  copyVectorsToTable({build}, 0, table.get());
+  table->prepareJoinTable(
+      {},
+      BaseHashTable::kNoSpillInputStartPartitionBit,
+      1'000'000,
+      false,
+      executor_.get());
+  ASSERT_EQ(table->hashMode(), BaseHashTable::HashMode::kNormalizedKey);
+  ASSERT_GE(table->capacity(), 1 << 18);
+  for (int pass = 0; pass < 2; ++pass) {
+    for (const int32_t size : {255, 256, 257, 511, 4097}) {
+      auto id = [](auto row) { return (row * 3877) % kBuildRows; };
+      auto probe = makeRowVector(
+          {makeFlatVector<int64_t>(
+               size, [&](auto row) { return id(row) % 4096; }),
+           makeFlatVector<int64_t>(size, [&](auto row) {
+             return component(id(row)) ^ (row % 10 != 0);
+           })});
+      HashLookup lookup(table->hashers(), pool());
+      SelectivityVector selected(size);
+      table->prepareForJoinProbe(lookup, probe, selected, false);
+      ASSERT_EQ(lookup.rows.size(), size);
+      table->joinProbe(lookup);
+      for (auto row : lookup.rows) {
+        EXPECT_EQ(
+            lookup.hits[row],
+            row % 10 == 0 && (pass == 0 || id(row) != 0) ? rowOfKey_[id(row)]
+                                                         : nullptr);
+      }
+    }
+    if (pass == 0) {
+      char* erased[] = {rowOfKey_[0]};
+      table->erase(folly::Range<char**>(erased, 1));
+    }
+  }
+}
+
 TEST_P(HashTableTest, arrayProbeNormalizedKey) {
   auto table = createHashTableForAggregation(ROW({"a"}, {BIGINT()}), 1);
   auto lookup = std::make_unique<HashLookup>(table->hashers(), pool());

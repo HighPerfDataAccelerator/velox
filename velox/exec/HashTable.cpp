@@ -29,9 +29,11 @@
 #include "velox/functions/prestosql/types/parser/TypeParser.h"
 #include "velox/vector/FlatVector.h"
 
-#if defined(__linux__) && defined(__aarch64__) && \
-    defined(__ARM_FEATURE_SVE) && defined(__AARCH64EL__)
+#if defined(__linux__) && defined(__aarch64__) && defined(__ARM_FEATURE_SVE)
+#if defined(__AARCH64EL__)
 #include <arm_neon.h>
+#endif
+#include <arm_sve.h>
 #include <asm/hwcap.h>
 #include <sys/auxv.h>
 #endif
@@ -658,9 +660,8 @@ FOLLY_ALWAYS_INLINE void HashTable<ignoreNullKeys>::fullProbe(
 
 namespace {
 
-#if defined(__linux__) && defined(__aarch64__) && \
-    defined(__ARM_FEATURE_SVE) && defined(__AARCH64EL__)
-bool isVeraRepeatedKeyCpu() {
+#if defined(__linux__) && defined(__aarch64__) && defined(__ARM_FEATURE_SVE)
+bool isVeraJoinCpu() {
   static const bool enabled = [] {
     const auto required = HWCAP_CPUID | HWCAP_SVE;
     if ((getauxval(AT_HWCAP) & required) != required) {
@@ -672,6 +673,61 @@ bool isVeraRepeatedKeyCpu() {
   }();
   return enabled;
 }
+// Each group of 16 slots owns one 32-bit tag mask after the main table.
+constexpr int32_t kTagsPerBucket = BaseHashTable::TagVector::size;
+constexpr int32_t kJoinBucketBytes = kTagsPerBucket * sizeof(char*);
+static_assert(kTagsPerBucket == 16 && kJoinBucketBytes == 128);
+
+size_t joinTagFilterSize(int64_t capacity) {
+  // Bound the auxiliary allocation to 1 MiB of masks per table.
+  return capacity >= (1 << 18) && capacity <= (1 << 22) && isVeraJoinCpu()
+      ? static_cast<size_t>(capacity / kTagsPerBucket) * sizeof(uint32_t) +
+          sizeof(uint64_t)
+      : 0;
+}
+uint64_t* joinTagFilterHeader(
+    const memory::ContiguousAllocation& allocation,
+    int64_t capacity) {
+  const auto extra = joinTagFilterSize(capacity);
+  if (!extra || allocation.size() < sizeof(char*) * capacity + extra) {
+    return nullptr;
+  }
+  return reinterpret_cast<uint64_t*>(
+      allocation.data<uint8_t>() + sizeof(char*) * capacity);
+}
+void invalidateJoinTagFilter(
+    const memory::ContiguousAllocation& allocation,
+    int64_t capacity) {
+  if (auto* header = joinTagFilterHeader(allocation, capacity)) {
+    if (__atomic_load_n(header, __ATOMIC_RELAXED)) {
+      __atomic_store_n(header, 0, __ATOMIC_RELEASE);
+    }
+  }
+}
+void buildJoinTagFilter(
+    const memory::ContiguousAllocation& allocation,
+    int64_t capacity) {
+  if (auto* header = joinTagFilterHeader(allocation, capacity)) {
+    auto* masks = reinterpret_cast<uint32_t*>(header + 1);
+    const auto* buckets = allocation.data<uint8_t>();
+    for (int64_t i = 0; i < capacity / kTagsPerBucket; ++i) {
+      const auto* tags = buckets + kJoinBucketBytes * i;
+      uint32_t mask = 0;
+      bool hasEmpty = false;
+      for (int pos = 0; pos < kTagsPerBucket; ++pos) {
+        const auto tag = tags[pos];
+        hasEmpty |= tag == 0;
+        if (tag & 0x80) {
+          mask |= uint32_t{1} << (tag & 31);
+        }
+      }
+      // A full bucket can overflow into another bucket. Keep all such probes.
+      masks[i] = hasEmpty ? mask : UINT32_MAX;
+    }
+    __atomic_store_n(header, 1, __ATOMIC_RELEASE);
+  }
+}
+
 #endif
 
 // Group prefetch size for join build & probe.
@@ -710,9 +766,25 @@ void populateNormalizedKeys(HashLookup& lookup, int8_t sizeBits) {
 } // namespace
 
 template <bool ignoreNullKeys>
+uint64_t HashTable<ignoreNullKeys>::estimatedJoinTagFilterBytes(
+    uint64_t capacity) const {
+#if defined(__linux__) && defined(__aarch64__) && defined(__ARM_FEATURE_SVE)
+  return isJoinBuild_ ? joinTagFilterSize(capacity) : 0;
+#else
+  return 0;
+#endif
+}
+
+template <bool ignoreNullKeys>
 void HashTable<ignoreNullKeys>::groupProbe(
     HashLookup& lookup,
     int8_t spillInputStartPartitionBit) {
+#if defined(__linux__) && defined(__aarch64__) && defined(__ARM_FEATURE_SVE)
+  if (isJoinBuild_ && hashMode_ == HashMode::kNormalizedKey) {
+    invalidateJoinTagFilter(tableAllocation_, capacity_);
+  }
+#endif
+
   incrementProbes(lookup.rows.size());
 
   if (hashMode_ == HashMode::kArray) {
@@ -1015,7 +1087,7 @@ void HashTable<ignoreNullKeys>::joinProbe(HashLookup& lookup) {
     defined(__ARM_FEATURE_SVE) && defined(__AARCH64EL__)
     const int32_t numRows = lookup.rows.size();
     if (numRows >= 256 && lookup.rows[0] == 0 &&
-        simd::isDense(lookup.rows.data(), numRows) && isVeraRepeatedKeyCpu()) {
+        simd::isDense(lookup.rows.data(), numRows) && isVeraJoinCpu()) {
       const auto* keys = lookup.hashes.data();
       constexpr int32_t kSamples = 8;
       int32_t repeats = 0;
@@ -1119,6 +1191,77 @@ void HashTable<ignoreNullKeys>::joinNormalizedKeyProbe(HashLookup& lookup) {
   char** hits = lookup.hits.data();
   constexpr int32_t kKeyOffset =
       -static_cast<int32_t>(sizeof(normalized_key_t));
+#if defined(__linux__) && defined(__aarch64__) && \
+    defined(__ARM_FEATURE_SVE) && defined(__AARCH64EL__)
+  if (numProbes >= 256 && simd::isDense(rows, numProbes)) {
+    auto* header = joinTagFilterHeader(tableAllocation_, capacity_);
+    if (header && __atomic_load_n(header, __ATOMIC_ACQUIRE)) {
+      const auto* masks = reinterpret_cast<const uint32_t*>(header + 1);
+      const auto first = static_cast<uint32_t>(rows[0]);
+      // The tag masks are most effective when most input keys are absent.
+      int rejected = 0;
+      for (int i = 0; i < 32; ++i) {
+        const auto hash = hashes[first + i * (numProbes / 32)];
+        const auto mask = masks[bucketOffset(hash) >> 7];
+        rejected += ((mask >> (hashTag(hash) & 31)) & 1) == 0;
+      }
+      if (rejected >= 16) {
+        constexpr uint32_t kChunk = 256;
+        // Compact row numbers that may match. Validate each one against
+        // the original table, including exact keys and overflow buckets.
+        uint32_t survivors[kChunk];
+        const uint32_t lanes = svcntw();
+        const auto bucketMask = static_cast<uint32_t>(bucketOffsetMask_ >> 7);
+        std::fill_n(hits + first, numProbes, nullptr);
+        for (uint32_t begin = first; begin < first + numProbes;
+             begin += kChunk) {
+          int count = 0;
+          const uint32_t end = std::min(first + numProbes, begin + kChunk);
+          for (uint32_t i = begin; i < end; i += lanes) {
+            const auto active = svwhilelt_b32(i, end);
+            const auto halves = svld2_u32(
+                active, reinterpret_cast<const uint32_t*>(hashes + i));
+            const auto idx = svand_n_u32_x(
+                active,
+                svlsr_n_u32_x(active, svget2_u32(halves, 0), 7),
+                bucketMask);
+            const auto bit = svand_n_u32_x(
+                active,
+                svlsr_n_u32_x(
+                    active, svget2_u32(halves, 1), kHashTagShift - 32),
+                31);
+            const auto words = svld1_gather_u32index_u32(active, masks, idx);
+            const auto match = svcmpne_n_u32(
+                active,
+                svand_n_u32_x(active, svlsr_u32_x(active, words, bit), 1),
+                0);
+            const auto n = svcntp_b32(active, match);
+            svst1_u32(
+                svwhilelt_b32(uint64_t{0}, n),
+                survivors + count,
+                svcompact_u32(match, svindex_u32(i, 1)));
+            count += n;
+          }
+          for (int base = 0; base < count; base += kPrefetchSize) {
+            const int n = std::min(kPrefetchSize, count - base);
+            for (int i = 0; i < n; ++i) {
+              const auto row = survivors[base + i];
+              states[i].preProbe(*this, hashes[row], row);
+            }
+            for (int i = 0; i < n; ++i) {
+              states[i].firstProbe(*this, kKeyOffset);
+            }
+            for (int i = 0; i < n; ++i) {
+              hits[states[i].row()] =
+                  states[i].joinNormalizedKeyFullProbe(*this, keys);
+            }
+          }
+        }
+        return;
+      }
+    }
+  }
+#endif
   for (; probeIndex + kPrefetchSize <= numProbes; probeIndex += kPrefetchSize) {
     for (int32_t i = 0; i < kPrefetchSize; ++i) {
       int32_t row = rows[probeIndex + i];
@@ -1157,15 +1300,33 @@ void HashTable<ignoreNullKeys>::allocateTables(
   // The total size is 8 bytes per slot, in groups of 16 slots with 16 bytes of
   // tags and 16 * 6 bytes of pointers and a padding of 16 bytes to round up the
   // cache line.
+  size_t extra = 0;
+#if defined(__linux__) && defined(__aarch64__) && defined(__ARM_FEATURE_SVE)
+  if (isJoinBuild_ && hashMode_ == HashMode::kNormalizedKey) {
+    extra = joinTagFilterSize(size);
+  }
+#endif
   const auto numPages =
-      memory::AllocationTraits::numPages(size * tableSlotSize());
+      memory::AllocationTraits::numPages(size * tableSlotSize() + extra);
   rows_->pool()->allocateContiguous(numPages, tableAllocation_);
   table_ = tableAllocation_.data<char*>();
   ::memset(table_, 0, capacity_ * sizeof(char*));
+#if defined(__linux__) && defined(__aarch64__) && defined(__ARM_FEATURE_SVE)
+  if (extra) {
+    __atomic_store_n(
+        joinTagFilterHeader(tableAllocation_, size), 0, __ATOMIC_RELAXED);
+  }
+#endif
 }
 
 template <bool ignoreNullKeys>
 void HashTable<ignoreNullKeys>::clear(bool freeTable) {
+#if defined(__linux__) && defined(__aarch64__) && defined(__ARM_FEATURE_SVE)
+  if (isJoinBuild_ && hashMode_ == HashMode::kNormalizedKey) {
+    invalidateJoinTagFilter(tableAllocation_, capacity_);
+  }
+#endif
+
   compactJoinChains_.reset();
   for (auto* rowContainer : allRows()) {
     rowContainer->clear();
@@ -1947,6 +2108,12 @@ void HashTable<ignoreNullKeys>::insertForJoin(
     const uint64_t* hashes,
     int32_t numGroups,
     TableInsertPartitionInfo* partitionInfo) {
+#if defined(__linux__) && defined(__aarch64__) && defined(__ARM_FEATURE_SVE)
+  if (isJoinBuild_ && hashMode_ == HashMode::kNormalizedKey) {
+    invalidateJoinTagFilter(tableAllocation_, capacity_);
+  }
+#endif
+
   // The insertable rows are in the table, all get put in the hash table or
   // array.
   if (hashMode_ == HashMode::kArray) {
@@ -1968,6 +2135,12 @@ template <bool ignoreNullKeys>
 void HashTable<ignoreNullKeys>::rehash(
     bool initNormalizedKeys,
     int8_t spillInputStartPartitionBit) {
+#if defined(__linux__) && defined(__aarch64__) && defined(__ARM_FEATURE_SVE)
+  if (isJoinBuild_ && hashMode_ == HashMode::kNormalizedKey) {
+    invalidateJoinTagFilter(tableAllocation_, capacity_);
+  }
+#endif
+
   compactJoinChains_.reset();
   ++numRehashes_;
   if (canApplyParallelJoinBuild()) {
@@ -2430,6 +2603,12 @@ void HashTable<ignoreNullKeys>::prepareJoinTable(
     size_t vectorHasherMaxNumDistinct,
     bool dropDuplicates,
     folly::Executor* executor) {
+#if defined(__linux__) && defined(__aarch64__) && defined(__ARM_FEATURE_SVE)
+  if (isJoinBuild_ && hashMode_ == HashMode::kNormalizedKey) {
+    invalidateJoinTagFilter(tableAllocation_, capacity_);
+  }
+#endif
+
   compactJoinChains_.reset();
   buildExecutor_ = executor;
   if (dropDuplicates) {
@@ -2508,6 +2687,11 @@ void HashTable<ignoreNullKeys>::prepareJoinTable(
     decideHashMode(0, spillInputStartPartitionBit);
   }
   buildCompactJoinChains();
+#if defined(__linux__) && defined(__aarch64__) && defined(__ARM_FEATURE_SVE)
+  if (isJoinBuild_ && hashMode_ == HashMode::kNormalizedKey) {
+    buildJoinTagFilter(tableAllocation_, capacity_);
+  }
+#endif
 }
 
 template <bool ignoreNullKeys>
@@ -3097,6 +3281,12 @@ int32_t HashTable<true>::listNullKeyRows(
 
 template <bool ignoreNullKeys>
 void HashTable<ignoreNullKeys>::erase(folly::Range<char**> rows) {
+#if defined(__linux__) && defined(__aarch64__) && defined(__ARM_FEATURE_SVE)
+  if (isJoinBuild_ && hashMode_ == HashMode::kNormalizedKey) {
+    invalidateJoinTagFilter(tableAllocation_, capacity_);
+  }
+#endif
+
   compactJoinChains_.reset();
   auto numRows = rows.size();
   raw_vector<uint64_t> hashes(pool_);
@@ -3818,6 +4008,11 @@ std::unique_ptr<HashTable<ignoreNullKeys>> HashTable<
   }
 
   table->numDistinct_ = numDistinct;
+#if defined(__linux__) && defined(__aarch64__) && defined(__ARM_FEATURE_SVE)
+  if (table->isJoinBuild_ && table->hashMode_ == HashMode::kNormalizedKey) {
+    buildJoinTagFilter(table->tableAllocation_, table->capacity_);
+  }
+#endif
   const auto serializedCapacity = readValue.template operator()<uint64_t>();
   const auto serializedHasherCount = readValue.template operator()<uint32_t>();
   VELOX_CHECK_EQ(
@@ -3893,6 +4088,11 @@ std::unique_ptr<HashTable<ignoreNullKeys>> HashTable<
     }
   }
   table->numDistinct_ = numDistinct;
+#if defined(__linux__) && defined(__aarch64__) && defined(__ARM_FEATURE_SVE)
+  if (table->isJoinBuild_ && table->hashMode_ == HashMode::kNormalizedKey) {
+    buildJoinTagFilter(table->tableAllocation_, table->capacity_);
+  }
+#endif
   LOG(INFO) << "Deserialized HashTable: " << table->toString();
 
   return table;
