@@ -98,6 +98,38 @@ bool isVera() {
   return enabled;
 }
 
+// Check all output row pointers before projecting a single build row.
+inline bool sameVeraBuildRow(char* const* rows, int32_t size) {
+  if (size < 128 || rows[0] == nullptr || rows[1] != rows[0] ||
+      rows[size / 2] != rows[0] || rows[size - 1] != rows[0]) {
+    return false;
+  }
+  using Address = uint64_t __attribute__((may_alias));
+  static_assert(sizeof(Address) == sizeof(*rows));
+  const auto* addresses = reinterpret_cast<const Address*>(rows);
+  const auto first = reinterpret_cast<uintptr_t>(rows[0]);
+  const auto all = svptrue_b64();
+  const int64_t lanes = svcntd();
+  int64_t i = 0;
+  for (; i + 2 * lanes <= size; i += 2 * lanes) {
+    const auto a = svld1_u64(all, addresses + i);
+    const auto b = svld1_u64(all, addresses + i + lanes);
+    const auto differences = svorr_u64_x(
+        all, sveor_n_u64_x(all, a, first), sveor_n_u64_x(all, b, first));
+    if (svptest_any(all, svcmpne_n_u64(all, differences, 0))) {
+      return false;
+    }
+  }
+  for (; i < size; i += lanes) {
+    const auto active = svwhilelt_b64(i, static_cast<int64_t>(size));
+    if (svptest_any(
+            active, svcmpne_n_u64(active, svld1_u64(active, addresses + i), first))) {
+      return false;
+    }
+  }
+  return true;
+}
+
 // The probe key of a matched inner join is identical to the build key. For
 // flat INTEGER and BIGINT keys, gather from the contiguous probe vector
 // using the same row mapping as the probe-side output columns.
@@ -1129,6 +1161,25 @@ void HashProbe::fillOutput(vector_size_t size) {
     fillLeftSemiProjectMatchColumn(size);
   } else {
 #if defined(__aarch64__) && defined(__ARM_FEATURE_SVE) && defined(__linux__)
+    if (veraSveOutput_ && !tableOutputProjections_.empty() &&
+        sameVeraBuildRow(outputTableRows_->as<char*>(), size)) {
+      // All build projections reference this exact stored row. Extract its
+      // values and null flags once and let downstream operators reuse them.
+      const auto first =
+          folly::Range<char* const*>(outputTableRows_->as<char*>(), 1);
+      extractColumns(
+          table_.get(),
+          first,
+          tableOutputProjections_,
+          pool(),
+          outputType_->children(),
+          output_->children());
+      for (const auto& projection : tableOutputProjections_) {
+        auto& child = output_->childAt(projection.outputChannel);
+        child = BaseVector::wrapInConstant(size, 0, child);
+      }
+      return;
+    }
     if (size >= 64 && !veraKeyProjections_.empty()) {
       const auto buildRows =
           folly::Range<char* const*>(outputTableRows_->as<char*>(), size);
