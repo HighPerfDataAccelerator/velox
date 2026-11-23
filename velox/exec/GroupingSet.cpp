@@ -14,6 +14,20 @@
  * limitations under the License.
  */
 #include "velox/exec/GroupingSet.h"
+#include <array>
+#include <optional>
+
+#if defined(__linux__) && defined(__aarch64__) && \
+    defined(__ARM_FEATURE_SVE) && defined(__AARCH64EL__)
+#define VELOX_HAS_VERA_GROUP_KEY_RUNS 1
+#include <arm_neon.h>
+#include <arm_sve.h>
+#include <asm/hwcap.h>
+#include <sys/auxv.h>
+#else
+#define VELOX_HAS_VERA_GROUP_KEY_RUNS 0
+#endif
+
 #include "velox/common/base/BitUtil.h"
 #include "velox/common/testutil/TestValue.h"
 #include "velox/exec/OperatorUtils.h"
@@ -24,6 +38,193 @@ using facebook::velox::common::testutil::TestValue;
 namespace facebook::velox::exec {
 
 namespace {
+#if VELOX_HAS_VERA_GROUP_KEY_RUNS
+bool supportsVeraGroupSourceRuns() {
+  static const bool enabled = [] {
+    constexpr auto required = HWCAP_SVE | HWCAP_CPUID;
+    if ((getauxval(AT_HWCAP) & required) != required) {
+      return false;
+    }
+    uint64_t midr;
+    asm("mrs %0, midr_el1" : "=r"(midr));
+    // NVIDIA implementer 0x4e, Vera part 0x010, any variant or revision.
+    return (midr & 0xff00fff0) == 0x4e000100;
+  }();
+  return enabled;
+}
+
+struct GroupSourceField {
+  enum class Kind { kIndex, kInt32, kInt64, kString };
+  Kind kind;
+  const void* values;
+  const uint64_t* nulls;
+
+  bool sameAsPrevious(vector_size_t row) const {
+    if (nulls) {
+      const bool left = bits::isBitNull(nulls, row - 1);
+      const bool right = bits::isBitNull(nulls, row);
+      if (left || right) {
+        return left == right;
+      }
+    }
+    if (kind == Kind::kIndex || kind == Kind::kInt32) {
+      auto* v = static_cast<const int32_t*>(values);
+      return v[row - 1] == v[row];
+    }
+    if (kind == Kind::kInt64) {
+      auto* v = static_cast<const int64_t*>(values);
+      return v[row - 1] == v[row];
+    }
+    // Matching representations prove equal bytes, including for two long
+    // views referring to the same immutable payload.
+    static_assert(sizeof(StringView) == 16);
+    auto* v = reinterpret_cast<const uint8_t*>(
+        static_cast<const StringView*>(values) + row);
+    const auto difference = veorq_u8(vld1q_u8(v - 16), vld1q_u8(v));
+    if (vmaxvq_u8(difference) == 0) {
+      return true;
+    }
+    const auto* views = static_cast<const StringView*>(values);
+    const auto& left = views[row - 1];
+    const auto& right = views[row];
+    // A matching low word proves equal length and a matching four-byte
+    // prefix. Long strings can occupy distinct addresses in flat inputs.
+    if (vmaxv_u8(vget_low_u8(difference)) != 0 || left.isInline() ||
+        left.size() > 64) {
+      return false;
+    }
+    const auto* a = reinterpret_cast<const uint8_t*>(left.data());
+    const auto* b = reinterpret_cast<const uint8_t*>(right.data());
+    const auto length = static_cast<uint64_t>(left.size());
+    for (uint64_t pos = StringView::kPrefixSize; pos < length;
+         pos += svcntb()) {
+      const auto active = svwhilelt_b8(pos, length);
+      if (svptest_any(
+              active,
+              svcmpne_u8(
+                  active,
+                  svld1_u8(active, a + pos),
+                  svld1_u8(active, b + pos)))) {
+        return false;
+      }
+    }
+    return true;
+  }
+};
+
+void selectGroupSourceRuns(
+    const BaseHashTable& table,
+    const RowVector& input,
+    std::optional<SelectivityVector>& heads) {
+  const auto n = input.size();
+  const auto& hashers = table.hashers();
+  if (n < 256 || hashers.size() < 4 || hashers.size() > 16 ||
+      table.hashMode() != BaseHashTable::HashMode::kHash ||
+      !supportsVeraGroupSourceRuns()) {
+    return;
+  }
+  std::array<GroupSourceField, 16> fields;
+  int count = 0;
+  bool hasStrings = false;
+  for (const auto& hasher : hashers) {
+    const auto& vector = input.childAt(hasher->channel());
+    const auto kind = vector->typeKind();
+    if (vector->typeUsesCustomComparison() ||
+        (kind != TypeKind::VARCHAR && kind != TypeKind::BIGINT &&
+         kind != TypeKind::INTEGER)) {
+      return;
+    }
+    hasStrings |= kind == TypeKind::VARCHAR;
+    const auto encoding = vector->encoding();
+    if (encoding == VectorEncoding::Simple::CONSTANT) {
+      continue;
+    }
+    const auto* nulls = vector->rawNulls();
+    if (encoding == VectorEncoding::Simple::DICTIONARY) {
+      // Equal indices select the same element in this input vector. Values
+      // null in the wrapper are tested before reading the index.
+      const auto* indices = vector->wrapInfo()->as<vector_size_t>();
+      bool known = false;
+      for (int k = 0; k < count; ++k) {
+        known |= fields[k].kind == GroupSourceField::Kind::kIndex &&
+            fields[k].values == indices && fields[k].nulls == nulls;
+      }
+      if (!known) {
+        fields[count++] = {GroupSourceField::Kind::kIndex, indices, nulls};
+      }
+    } else if (encoding == VectorEncoding::Simple::FLAT) {
+      if (kind == TypeKind::VARCHAR) {
+        fields[count++] = {
+            GroupSourceField::Kind::kString,
+            vector->asFlatVector<StringView>()->rawValues(),
+            nulls};
+      } else if (kind == TypeKind::INTEGER) {
+        fields[count++] = {
+            GroupSourceField::Kind::kInt32,
+            vector->asFlatVector<int32_t>()->rawValues(),
+            nulls};
+      } else {
+        fields[count++] = {
+            GroupSourceField::Kind::kInt64,
+            vector->asFlatVector<int64_t>()->rawValues(),
+            nulls};
+      }
+    } else {
+      return;
+    }
+  }
+  if (!hasStrings) {
+    return;
+  }
+  auto equal = [&](vector_size_t row) {
+    for (int k = 0; k < count; ++k) {
+      if (!fields[k].sameAsPrevious(row)) {
+        return false;
+      }
+    }
+    return true;
+  };
+  // Sample before allocating or scanning every key in a low-reuse batch.
+  int repeated = 0;
+  for (int i = 0; i < 12; ++i) {
+    repeated += equal(1 + i * (n / 12));
+  }
+  if (repeated < 8) {
+    return;
+  }
+  heads.emplace(n, false);
+  heads->setValid(0, true);
+  for (vector_size_t row = 1; row + 1 < n; ++row) {
+    if (!equal(row)) {
+      heads->setValid(row, true);
+    }
+  }
+  // Retain the final position so the lookup allocates its full output span.
+  heads->setValid(n - 1, true);
+  heads->updateBounds();
+  if (heads->countSelected() > n / 2) {
+    heads.reset();
+  }
+}
+
+void expandGroupSourceHits(HashLookup& lookup) {
+  // The hash table returned one hit per selected run head, in input order.
+  const auto lanes = svcntd();
+  for (size_t i = 1; i < lookup.rows.size(); ++i) {
+    const auto first = lookup.rows[i - 1];
+    const auto end = static_cast<uint64_t>(lookup.rows[i]);
+    const auto group =
+        svdup_u64(reinterpret_cast<uintptr_t>(lookup.hits[first]));
+    for (uint64_t next = first + 1; next < end; next += lanes) {
+      svst1_u64(
+          svwhilelt_b64(next, end),
+          reinterpret_cast<uint64_t*>(lookup.hits.data() + next),
+          group);
+    }
+  }
+}
+#endif
+
 constexpr CompareFlags kEqualFlags =
     CompareFlags::equality(CompareFlags::NullHandlingMode::kNullAsValue);
 
@@ -310,10 +511,20 @@ void GroupingSet::addInputForActiveRows(
     }
   }
 
+#if VELOX_HAS_VERA_GROUP_KEY_RUNS
+  std::optional<SelectivityVector> runHeads;
+  if (!ignoreNullKeys_ && !reuseHashes && activeRows_.isAllSelected() &&
+      activeRows_.size() == input->size()) {
+    selectGroupSourceRuns(*table_, *input, runHeads);
+  }
+  auto& probeRows = runHeads ? *runHeads : activeRows_;
+#else
+  auto& probeRows = activeRows_;
+#endif
   table_->prepareForGroupProbe(
       *lookup_,
       input,
-      activeRows_,
+      probeRows,
       BaseHashTable::kNoSpillInputStartPartitionBit);
   if (reuseHashes) {
     for (auto& hasher : table_->hashers()) {
@@ -327,6 +538,11 @@ void GroupingSet::addInputForActiveRows(
   }
 
   table_->groupProbe(*lookup_, BaseHashTable::kNoSpillInputStartPartitionBit);
+#if VELOX_HAS_VERA_GROUP_KEY_RUNS
+  if (runHeads) {
+    expandGroupSourceHits(*lookup_);
+  }
+#endif
   masks_.addInput(input, activeRows_);
 
   auto* groups = lookup_->hits.data();

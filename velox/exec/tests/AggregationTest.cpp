@@ -445,6 +445,100 @@ void AggregationTest::setTestKey(
   vector->set(row, StringView(chars));
 }
 
+TEST_F(AggregationTest, repeatedInputsPreserveEveryAggregateRow) {
+  constexpr vector_size_t n = 513;
+  enum class Input {
+    kDictionary,
+    kWrapperNulls,
+    kFlat,
+    kRandom,
+    kStringBoundaries,
+    kAllEqual
+  };
+  for (auto shape :
+       {Input::kDictionary,
+        Input::kWrapperNulls,
+        Input::kFlat,
+        Input::kRandom,
+        Input::kStringBoundaries,
+        Input::kAllEqual}) {
+    std::vector<RowVectorPtr> batches;
+    for (int batch = 0; batch < 3; ++batch) {
+      const auto group = [=](int row) {
+        return shape == Input::kRandom ? ((row * 997 + batch) % 131)
+                                       : ((row / 11 + batch * 29) % 131);
+      };
+      const auto index = makeIndices(n, group);
+      auto keys = makeFlatVector<std::string>(
+          131,
+          [](int i) {
+            return fmt::format(
+                "same-prefix-but-different-long-customer-key-{}", i);
+          },
+          [](int i) { return i % 47 == 6; });
+      auto extra = makeNulls(n, [](int i) { return i % 37 == 5; });
+      auto dictionary = [&](BufferPtr nulls, const VectorPtr& base) {
+        return BaseVector::wrapInDictionary(nulls, index, n, base);
+      };
+      VectorPtr string0 =
+          dictionary(shape == Input::kWrapperNulls ? extra : nullptr, keys);
+      VectorPtr string1 = dictionary(nullptr, keys);
+      if (shape == Input::kFlat) {
+        string0 = makeFlatVector<std::string>(
+            n,
+            [&](int i) { return fmt::format("k{}", group(i)); },
+            [](int i) { return i % 47 == 17; });
+        string1 = makeFlatVector<std::string>(n, [&](int i) {
+          return fmt::format("same-prefix-but-different-long-{}", group(i));
+        });
+      }
+      auto year =
+          makeFlatVector<int64_t>(n, [&](int i) { return group(i) % 3; });
+      auto id = makeFlatVector<int32_t>(
+          n,
+          [&](int i) { return group(i) % 7; },
+          [](int i) { return i % 101 == 5; });
+      if (shape == Input::kStringBoundaries) {
+        string0 = makeFlatVector<std::string>(n, [&](int i) {
+          constexpr int lengths[] = {12, 13, 16, 17, 63, 64, 65};
+          const auto run = i / 17;
+          std::string value(lengths[(run / 2) % 7], 'a');
+          value.back() = char('A' + (run % 2));
+          return value;
+        });
+        string1 = makeConstant<StringView>("boundary", n);
+        year = makeFlatVector<int64_t>(n, [](int) { return 2000; });
+        id = makeFlatVector<int32_t>(n, [](int) { return 4; });
+      } else if (shape == Input::kAllEqual) {
+        string0 =
+            makeConstant<StringView>("constant-text-larger-than-inline", n);
+        string1 = makeNullConstant(TypeKind::VARCHAR, n);
+        year = makeFlatVector<int64_t>(n, [](int) { return 2000; });
+        id = makeFlatVector<int32_t>(n, [](int) { return 4; });
+      }
+      auto measure = makeFlatVector<int64_t>(
+          n, [=](int i) { return (i * 7 + batch * 3) % 71 - 35; });
+      auto mask =
+          makeFlatVector<bool>(n, [=](int i) { return (i + batch) % 3 == 0; });
+      batches.push_back(
+          makeRowVector({string0, string1, year, id, measure, mask}));
+    }
+    auto plan = PlanBuilder()
+                    .values(batches)
+                    .singleAggregation(
+                        {"c0", "c1", "c2", "c3"},
+                        {"count(1)", "sum(c4)", "min(c4)", "sum(c4)"},
+                        {"", "", "", "c5"})
+                    .planNode();
+    createDuckDbTable(batches);
+    AssertQueryBuilder(plan, duckDbQueryRunner_)
+        .config("hash_adaptivity_enabled", "false")
+        .maxDrivers(1)
+        .assertResults(
+            "SELECT c0,c1,c2,c3,count(*),sum(c4),min(c4),sum(c4) filter (where c5) FROM tmp GROUP BY 1,2,3,4");
+  }
+}
+
 TEST_F(AggregationTest, missingFunctionOrSignature) {
   auto data = makeRowVector({
       makeFlatVector<int64_t>({1, 2, 3}),
