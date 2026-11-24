@@ -65,7 +65,9 @@ void extractFixedBatchValues(
   }
 #if VELOX_ARM_ROW_EXTRACTION_AVAILABLE
   const bool useScalarFour =
-      !selected && !nullable && useSve && count >= 512 && svcntd() == 2;
+      !selected && count >= 512 &&
+      (useSve || (nullable && FLAGS_velox_arm_sve_row_extraction_enabled)) &&
+      svcntd() == 2;
 #else
   constexpr bool useScalarFour = false;
 #endif
@@ -98,9 +100,19 @@ void extractFixedBatchValues(
     const auto all = n == 64 ? ~uint64_t{0} : (uint64_t{1} << n) - 1;
     uint64_t valid;
     if (allRowsPresent) {
-      detail::row_extraction::blockScalarFour<sizeof(T)>(
-          blockRows, n, column.offset(), output + i * sizeof(T));
-      valid = all;
+      if constexpr (nullable) {
+        valid = detail::row_extraction::blockNullableFour<sizeof(T)>(
+            blockRows,
+            n,
+            column.offset(),
+            column.nullByte(),
+            column.nullMask(),
+            output + i * sizeof(T));
+      } else {
+        detail::row_extraction::blockScalarFour<sizeof(T)>(
+            blockRows, n, column.offset(), output + i * sizeof(T));
+        valid = all;
+      }
     } else if (useSve) {
       valid = detail::row_extraction::blockSve<sizeof(T), selected, nullable>(
           blockRows,
