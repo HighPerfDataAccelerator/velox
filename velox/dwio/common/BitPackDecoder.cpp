@@ -16,6 +16,7 @@
 
 #include "velox/dwio/common/BitPackDecoder.h"
 #include "velox/common/base/SimdUtil.h"
+#include "velox/dwio/common/SveBitUnpack.h"
 
 #include "velox/dwio/common/ArmSelectedUnpack.h"
 #include "velox/dwio/common/ArmSveBitDeposit.h"
@@ -260,8 +261,29 @@ void unpack(
   }
   int32_t i = 0;
 
+#if defined(__ARM_FEATURE_SVE)
+  // Decodes the safe rows for widths up to sve::kMaxBitWidth unless
+  // --velox_sve_bit_unpack=false. Wider fields and int128_t results fall
+  // through to the paths below. The kernels compute bit positions in 32-bit
+  // lanes, so larger positions are left to the paths below as well.
+  if constexpr (sizeof(T) <= sizeof(int64_t)) {
+    if (sve::bitUnpackEnabled() && numSafeRows > 0 &&
+        bitOffset + int64_t{rows[numSafeRows - 1]} * bitWidth <=
+            std::numeric_limits<int32_t>::max()) {
+      i = sve::unpackRows(
+          bits,
+          static_cast<int32_t>(bitOffset),
+          rows.data(),
+          numSafeRows,
+          bitWidth,
+          result);
+    }
+  }
+#endif
+
 #if VELOX_ARM_SVE_BDEP_AVAILABLE
-  if (FLAGS_velox_arm_sve_bit_deposit_enabled) {
+  // Starts at row 0, so it only runs if the kernel above decoded nothing.
+  if (FLAGS_velox_arm_sve_bit_deposit_enabled && i == 0) {
     i = arm_sve_bdep::unpackSelectedPrefix(
         bits, bitOffset, rows.data(), numSafeRows, bitWidth, result);
   }

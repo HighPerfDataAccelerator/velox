@@ -280,6 +280,37 @@ void SelectiveColumnReader::compactScalarValues(
   vector_size_t rowIndex = 0;
   auto nextRow = rows[rowIndex];
   const auto* moveNullsFrom = shouldMoveNulls(rows);
+  if (numValues_ > 0 &&
+      sourceRows[numValues_ - 1] - sourceRows[0] == numValues_ - 1) {
+    // The values cover a contiguous run of rows, so the value of row r is at
+    // index r - base: gather the surviving rows instead of merging the two
+    // row lists with a data-dependent branch per source value. In place is
+    // safe: the source index is never below the destination index.
+    const auto base = sourceRows[0];
+    const auto numRows = rows.size();
+    if (moveNullsFrom == nullptr) {
+      for (size_t k = 0; k < numRows; ++k) {
+        typedDestValues[k] = typedSourceValues[rows[k] - base];
+      }
+    } else {
+      for (size_t k = 0; k < numRows; ++k) {
+        const size_t i = rows[k] - base;
+        typedDestValues[k] = typedSourceValues[i];
+        if (k != i) {
+          bits::setBit(rawResultNulls_, k, bits::isBitSet(moveNullsFrom, i));
+        }
+      }
+    }
+    if (!isFinal) {
+      for (size_t k = 0; k < numRows; ++k) {
+        valueRows_[k] = rows[k];
+      }
+    }
+    numValues_ = numRows;
+    valueRows_.resize(numValues_);
+    values_->setSize(numValues_ * sizeof(TVector));
+    return;
+  }
   for (size_t i = 0; i < numValues_; ++i) {
     if (sourceRows[i] < nextRow) {
       continue;
