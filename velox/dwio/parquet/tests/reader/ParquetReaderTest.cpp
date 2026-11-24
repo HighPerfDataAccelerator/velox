@@ -15,6 +15,7 @@
  */
 
 #include <gmock/gmock.h>
+#include <bit>
 #include <numeric>
 
 #include "velox/common/Casts.h"
@@ -103,6 +104,51 @@ class ParquetReaderTest : public ParquetTestBase {
     return readerOptions;
   }
 };
+
+TEST_F(ParquetReaderTest, retainedPlainInt64Page) {
+  // The fixture contains 4096 required INT64 values, (row % 257) - 128,
+  // in Zstd-compressed 4096-byte PLAIN pages with dictionary encoding off.
+  const auto schema = ROW({"k"}, {BIGINT()});
+  std::vector<VectorPtr> batches;
+  {
+    auto reader = createReader("required_plain_int64.parquet");
+    auto spec = makeScanSpec(schema);
+    spec->childByName("k")->setFilter(std::make_shared<common::IsNotNull>());
+    auto options = makeRowReaderOpts(schema);
+    options.setScanSpec(spec);
+    auto rowReader = reader->createRowReader(options);
+    auto result = BaseVector::create(schema, 0, leafPool_.get());
+    // Some batches straddle a page boundary.
+    while (rowReader->next(127, result)) {
+      batches.push_back(
+          BaseVector::loadedVectorShared(result->as<RowVector>()->childAt(0)));
+    }
+  }
+
+  int64_t row = 0;
+  size_t views = 0;
+  for (const auto& batch : batches) {
+    auto* flat = batch->asFlatVector<int64_t>();
+    ASSERT_NE(flat, nullptr);
+    for (vector_size_t i = 0; i < flat->size(); ++i, ++row) {
+      ASSERT_FALSE(flat->isNullAt(i));
+      ASSERT_EQ(flat->valueAt(i), row % 257 - 128);
+    }
+    if (flat->values()->isView()) {
+      ++views;
+      auto original = flat->values();
+      const auto value = flat->valueAt(0);
+      flat->mutableRawValues()[0] = ~value;
+      EXPECT_FALSE(flat->values()->isView());
+      EXPECT_EQ(original->as<int64_t>()[0], value);
+    }
+  }
+  EXPECT_EQ(row, 4096);
+  if constexpr (std::endian::native == std::endian::little) {
+    EXPECT_GT(views, 0);
+  }
+  EXPECT_LT(views, batches.size());
+}
 
 TEST_F(ParquetReaderTest, createFormatOptions) {
   config::ConfigBase connectorConfig({

@@ -128,6 +128,9 @@ class PageReader {
   template <typename Visitor>
   void readWithVisitor(Visitor& visitor);
 
+  template <bool mayBorrow, typename Visitor>
+  void readWithVisitorImpl(Visitor& visitor, BufferPtr* borrowed);
+
   // skips 'numValues' top level rows, touching null flags only. Non-null values
   // are not prepared for reading.
   void skipNullsOnly(int64_t numValues);
@@ -595,6 +598,11 @@ getParquetDecompressionOptions(common::CompressionKind kind) {
 
 template <typename Visitor>
 void PageReader::readWithVisitor(Visitor& visitor) {
+  readWithVisitorImpl<false>(visitor, nullptr);
+}
+
+template <bool mayBorrow, typename Visitor>
+void PageReader::readWithVisitorImpl(Visitor& visitor, BufferPtr* borrowed) {
   constexpr bool hasFilter =
       !std::is_same_v<typename Visitor::FilterType, common::AlwaysTrue>;
   constexpr bool filterOnly =
@@ -619,6 +627,40 @@ void PageReader::readWithVisitor(Visitor& visitor) {
         numValuesRead<hasFilter, hasHook>(reader, numPageRowsRead);
     visitor.setNumValuesBias(numValuesBeforePage);
     visitor.setRows(pageRows);
+    if constexpr (mayBorrow) {
+      // rowsForPage has already decoded the levels and positioned the value
+      // decoder. Keep the existing path for multi-page reads, nulls, and sparse
+      // selections.
+      if (!isMultiPage && currentVisitorRow_ == numVisitorRows_ && !nulls &&
+          pageRows.front() == 0 && pageRows.back() == pageRows.size() - 1 &&
+          isTopLevel_ && encoding_ == thrift::Encoding::PLAIN &&
+          type_->parquetType_ == thrift::Type::INT64 && decompressedData_) {
+        const auto bytes = pageRows.size() * sizeof(int64_t);
+        auto input = directDecoder_->fixedWidthInput();
+        const auto ptr = reinterpret_cast<uintptr_t>(input.data());
+        const auto base =
+            reinterpret_cast<uintptr_t>(decompressedData_->as<char>());
+        const auto offset = ptr - base;
+        if (input.size() >= bytes && ptr >= base &&
+            ptr % alignof(int64_t) == 0 &&
+            offset <= decompressedData_->size() &&
+            bytes <= decompressedData_->size() - offset &&
+            decompressedData_->capacity() - offset - bytes >= simd::kPadding) {
+          *borrowed =
+              Buffer::slice<uint8_t>(decompressedData_, offset, bytes, &pool_);
+          directDecoder_->skip(pageRows.size());
+          std::copy(
+              pageRows.begin(),
+              pageRows.end(),
+              visitor.outputRows(pageRows.size()));
+          visitor.setNumValues(pageRows.size());
+          if (rowNumberBias_) {
+            reader.offsetOutputRows(0, rowNumberBias_);
+          }
+          return;
+        }
+      }
+    }
     callDecoder(nulls, nullsFromFastPath, visitor);
     if (encoding_ == thrift::Encoding::DELTA_BINARY_PACKED &&
         deltaBpDecoder_->validValuesCount() == 0) {

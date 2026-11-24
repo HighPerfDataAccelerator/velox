@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include <bit>
+
 #include "velox/dwio/common/SelectiveIntegerColumnReader.h"
 #include "velox/dwio/parquet/reader/ParquetColumnReader.h"
 #include "velox/dwio/parquet/reader/ParquetData.h"
@@ -71,6 +73,24 @@ class IntegerColumnReader : public dwio::common::SelectiveIntegerColumnReader {
   }
 
   void getValues(const RowSet& rows, VectorPtr* result) override {
+    if (borrowedValues_) {
+      VELOX_CHECK(mayGetValues_);
+      if (rows.size() == numValues_) {
+        *result = std::make_shared<FlatVector<int64_t>>(
+            pool_,
+            requestedType_,
+            nullptr,
+            numValues_,
+            borrowedValues_,
+            std::vector<BufferPtr>{});
+        return;
+      }
+      // A later filter requested a subset. Retain the usual compaction state
+      // for this and subsequent getValues calls.
+      std::memcpy(
+          rawValues_, borrowedValues_->as<char>(), borrowedValues_->size());
+      borrowedValues_.reset();
+    }
     auto& fileType = static_cast<const ParquetTypeWithId&>(*fileType_);
     const auto& logicalType = fileType.logicalType_;
     if (logicalType &&
@@ -89,6 +109,7 @@ class IntegerColumnReader : public dwio::common::SelectiveIntegerColumnReader {
       int64_t offset,
       const RowSet& rows,
       const uint64_t* /*incomingNulls*/) override {
+    borrowedValues_.reset();
     VELOX_WIDTH_DISPATCH(
         parquetSizeOfIntKind(fileType_->type()->kind()),
         prepareRead,
@@ -101,10 +122,28 @@ class IntegerColumnReader : public dwio::common::SelectiveIntegerColumnReader {
 
   template <typename ColumnVisitor>
   void readWithVisitor(const RowSet& rows, ColumnVisitor visitor) {
+    if constexpr (
+        std::endian::native == std::endian::little && ColumnVisitor::dense &&
+        std::is_same_v<typename ColumnVisitor::DataType, int64_t> &&
+        std::is_same_v<typename ColumnVisitor::FilterType, common::IsNotNull> &&
+        std::is_same_v<
+            typename ColumnVisitor::Extract,
+            dwio::common::ExtractToReader>) {
+      const auto& fileType = static_cast<const ParquetTypeWithId&>(*fileType_);
+      if (!isFlatMapValue_ && requestedType_ == BIGINT() &&
+          fileType.type() == BIGINT() && !fileType.logicalType_) {
+        formatData_->as<ParquetData>()
+            .reader()
+            ->template readWithVisitorImpl<true>(visitor, &borrowedValues_);
+        return;
+      }
+    }
     formatData_->as<ParquetData>().readWithVisitor(visitor);
   }
 
  private:
+  BufferPtr borrowedValues_;
+
   // Rescales integer or decimal values to match the requested decimal type.
   // For INT->Decimal, fileScale is 0; for Decimal->Decimal, fileScale comes
   // from the file's decimal type.
