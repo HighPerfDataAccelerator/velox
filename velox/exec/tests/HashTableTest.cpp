@@ -691,6 +691,34 @@ TEST_P(HashTableTest, repeatedNormalizedProbeRows) {
       }
     }
   }
+  // Put run boundaries on the initial sample and vary the midpoint sample
+  // on both sides of the six-repeat threshold. Include missing build keys.
+  constexpr int kStride = 32;
+  constexpr int kRows = 8 * kStride + 1;
+  for (int primary : {4, 5}) {
+    for (int secondary : {5, 6}) {
+      SCOPED_TRACE(::testing::Message() << primary << ", " << secondary);
+      const auto indexAt = [&](int row) {
+        const int block = row / kStride;
+        const int offset = row % kStride;
+        const bool boundary = (offset == 1 && block >= primary) ||
+            (offset == kStride / 2 + 1 && block >= secondary);
+        return block + ((block % 2 == 0) == boundary ? 64 : 0);
+      };
+      lookup.reset(kRows);
+      for (int row = 0; row < kRows; ++row) {
+        lookup.rows[row] = row;
+        lookup.hashes[row] = keys[indexAt(row)];
+      }
+      topTable_->joinProbe(lookup);
+      for (int row = 0; row < kRows; ++row) {
+        const auto index = indexAt(row);
+        EXPECT_EQ(lookup.hits[row], expectedHit[index]);
+        EXPECT_EQ(lookup.hashes[row], expectedHash[index]);
+        EXPECT_EQ(lookup.normalizedKeys[row], keys[index]);
+      }
+    }
+  }
 }
 
 TEST_P(HashTableTest, int2DenseArray) {
