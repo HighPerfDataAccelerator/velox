@@ -17,6 +17,7 @@
 #include "velox/functions/sparksql/MightContainBatch.h"
 
 #include <array>
+#include <cstring>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -71,13 +72,14 @@ void probeGeneric(
   }
 }
 
-void probeSve(
+#if VELOX_ARM_SVE_BLOOM_PROBE_AVAILABLE
+template <bool packed>
+static void probeSveImpl(
     const uint64_t* bloom,
     uint32_t bloomSize,
     const int64_t* values,
     int32_t size,
     uint8_t* out) {
-#if VELOX_ARM_SVE_BLOOM_PROBE_AVAILABLE
   // Software pipeline over blocks: vector-hash block k + 1 and prefetch its
   // words before gathering and testing block k, so that two blocks of
   // independent misses overlap. 128-bit vectors alone keep too few loads in
@@ -110,10 +112,7 @@ void probeSve(
   const auto gather = [&](svbool_t active, svuint64_t key) {
     return svld1_gather_u64index_u64(active, bloom, indices(active, key));
   };
-  const auto storeHits = [](svbool_t active,
-                            svuint64_t key,
-                            svuint64_t words,
-                            uint8_t* output) {
+  const auto hitBits = [](svbool_t active, svuint64_t key, svuint64_t words) {
     // Align each selected bit with bit zero and test them together.
     const auto bit = [&](uint64_t shift) {
       const auto position =
@@ -124,7 +123,7 @@ void probeSve(
         active,
         svand_u64_x(active, bit(0), bit(6)),
         svand_u64_x(active, bit(12), bit(18)));
-    svst1b_u64(active, output, svand_n_u64_x(active, hits, 1));
+    return svand_n_u64_x(active, hits, 1);
   };
 
   if (size > 0) {
@@ -136,13 +135,64 @@ void probeSve(
     }
     const uint64_t* current = hashes.data() + slot * kBlock;
     const int64_t length = std::min<int64_t>(size - start, kBlock);
-    auto* output = out + start;
-    for (int64_t i = 0; i < length; i += lanes) {
-      const auto active = svwhilelt_b64(i, length);
-      const auto key = svld1_u64(active, current + i);
-      storeHits(active, key, gather(active, key), output + i);
+    if constexpr (packed) {
+      const auto two = [&](const uint64_t* h) {
+        const auto active = svptrue_b64();
+        const auto key = svld1_u64(active, h);
+        return svcmpne_n_u64(
+            active, hitBits(active, key, gather(active, key)), 0);
+      };
+      // Compact eight two-lane predicates into 16 consecutive result bits.
+      const auto four = [&](const uint64_t* h) {
+        return svuzp1_b32(two(h), two(h + 2));
+      };
+      const auto eight = [&](const uint64_t* h) {
+        return svuzp1_b16(four(h), four(h + 4));
+      };
+      int32_t i = 0;
+      for (; i + 16 <= length; i += 16) {
+        const auto mask = svuzp1_b8(eight(current + i), eight(current + i + 8));
+        auto* dst =
+            reinterpret_cast<unsigned char (*)[2]>(out + (start + i) / 8);
+        asm("str %1, %0" : "=Q"(*dst) : "Upa"(mask));
+      }
+      for (; i < length; ++i) {
+        const auto key = current[i];
+        const auto required = mask(key);
+        uint64_t word;
+        std::memcpy(
+            &word,
+            reinterpret_cast<const uint8_t*>(bloom) +
+                8 * ((key >> 24) & sizeMask),
+            8);
+        bits::setBit(out, start + i, (word & required) == required);
+      }
+    } else {
+      auto* output = out + start;
+      const auto storeHits = [&](svbool_t active,
+                                 svuint64_t key,
+                                 svuint64_t words,
+                                 uint8_t* output) {
+        svst1b_u64(active, output, hitBits(active, key, words));
+      };
+      for (int64_t i = 0; i < length; i += lanes) {
+        const auto active = svwhilelt_b64(i, length);
+        const auto key = svld1_u64(active, current + i);
+        storeHits(active, key, gather(active, key), output + i);
+      }
     }
   }
+}
+#endif
+
+void probeSve(
+    const uint64_t* bloom,
+    uint32_t bloomSize,
+    const int64_t* values,
+    int32_t size,
+    uint8_t* out) {
+#if VELOX_ARM_SVE_BLOOM_PROBE_AVAILABLE
+  probeSveImpl<false>(bloom, bloomSize, values, size, out);
 #else
   probeGeneric(bloom, bloomSize, values, size, out);
 #endif
@@ -151,6 +201,34 @@ void probeSve(
 } // namespace bloom_probe
 
 namespace {
+
+void writeDenseHits(
+    uint64_t* result,
+    int32_t start,
+    const uint8_t* hits,
+    int32_t size,
+    [[maybe_unused]] bool useSve) {
+  int32_t i = 0;
+#if VELOX_ARM_SVE_BLOOM_PROBE_AVAILABLE
+  if (useSve && size >= 16 && svcntb() == 16) {
+    for (; i < size && ((start + i) & 7) != 0; ++i) {
+      bits::setBit(result, start + i, hits[i] != 0);
+    }
+    auto* bytes = reinterpret_cast<uint8_t*>(result);
+    for (; size - i >= 16; i += 16) {
+      const auto lanes = svptrue_b8();
+      const auto mask = svcmpne_n_u8(lanes, svld1_u8(lanes, hits + i), 0);
+      // At VL=128 the predicate stores one bit per input byte in two bytes.
+      auto* dst =
+          reinterpret_cast<unsigned char (*)[2]>(bytes + ((start + i) >> 3));
+      asm("str %1, %0" : "=Q"(*dst) : "Upa"(mask));
+    }
+  }
+#endif
+  for (; i < size; ++i) {
+    bits::setBit(result, start + i, hits[i] != 0);
+  }
+}
 
 class MightContainBatchFunction : public exec::VectorFunction {
  public:
@@ -204,10 +282,20 @@ class MightContainBatchFunction : public exec::VectorFunction {
       for (vector_size_t start = rows.begin(); start < rows.end();
            start += kBatch) {
         const int32_t size = std::min<int32_t>(kBatch, rows.end() - start);
-        probe(raw + start, size, hits.data());
-        for (int32_t i = 0; i < size; ++i) {
-          bits::setBit(rawResult, start + i, hits[i] != 0);
+#if VELOX_ARM_SVE_BLOOM_PROBE_AVAILABLE
+        if (sve_ && !memoEnabled_ && size >= 16 && (start & 7) == 0 &&
+            svcntb() == 16) {
+          bloom_probe::probeSveImpl<true>(
+              bloom,
+              bloomSize,
+              raw + start,
+              size,
+              reinterpret_cast<uint8_t*>(rawResult) + start / 8);
+          continue;
         }
+#endif
+        probe(raw + start, size, hits.data());
+        writeDenseHits(rawResult, start, hits.data(), size, sve_);
       }
       return;
     }
