@@ -76,6 +76,43 @@ void blockScalarFour(
   }
 }
 
+// All row pointers in the block are present. Check four null flags together
+// so groups of valid values can use the same copy as non-nullable columns.
+template <int width>
+uint64_t blockNullableFour(
+    const char* const* rows,
+    int count,
+    int offset,
+    int nullByte,
+    uint8_t nullMask,
+    uint8_t* output) {
+  uint64_t missing = 0;
+  const auto copyOne = [&](int i) {
+    if (static_cast<uint8_t>(rows[i][nullByte]) & nullMask) {
+      missing |= uint64_t{1} << i;
+    } else {
+      std::memcpy(output + i * width, rows[i] + offset, width);
+    }
+  };
+  int i = 0;
+  for (; i + 4 <= count; i += 4) {
+    const auto flags = rows[i][nullByte] | rows[i + 1][nullByte] |
+        rows[i + 2][nullByte] | rows[i + 3][nullByte];
+    if ((flags & nullMask) == 0) [[likely]] {
+      blockScalarFour<width>(rows + i, 4, offset, output + i * width);
+    } else {
+      for (int j = 0; j < 4; ++j) {
+        copyOne(i + j);
+      }
+    }
+  }
+  for (; i < count; ++i) {
+    copyOne(i);
+  }
+  const auto all = count == 64 ? ~uint64_t{0} : (uint64_t{1} << count) - 1;
+  return all & ~missing;
+}
+
 template <int width, bool selected, bool nullable>
 uint64_t blockSve(
     const char* const* rows,

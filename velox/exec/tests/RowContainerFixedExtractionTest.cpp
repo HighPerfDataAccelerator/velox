@@ -50,9 +50,13 @@ class RowContainerFixedExtractionTest : public testing::Test,
       const T value = static_cast<T>(random());
       memcpy(data[i].data() + 13, &value, sizeof(value));
       data[i][2] =
-          nullable && (pattern == 3 || (pattern == 1 && i % 5 == 0)) ? 4 : 0;
-      rows[i] = pattern == 4 || (pattern == 1 && i % 11 == 0) ? nullptr
-                                                              : data[i].data();
+          nullable && (pattern == 3 || (pattern == 1 && i % 5 == 0) ||
+                       (pattern == 5 && i % 17 == 0))
+          ? 4
+          : 0;
+      const bool missing = pattern == 4 || (pattern == 1 && i % 11 == 0) ||
+          (pattern == 5 && i % 128 == 64);
+      rows[i] = missing ? nullptr : data[i].data();
       indices[i] = pattern == 2 ? (i * 17) % total : total - i - 1;
       if (pattern == 1 && i % 19 == 0)
         indices[i] = -1;
@@ -131,6 +135,14 @@ TEST_F(RowContainerFixedExtractionTest, nullableColumnsAndMissingRowPointers) {
           check<int32_t>(n, 7, false, nullable, pattern, existing);
           check<int64_t>(n, 65, false, nullable, pattern, existing);
         }
+}
+TEST_F(RowContainerFixedExtractionTest, alternatingNullableBlocks) {
+  for (int n : {511, 512, 513, 575, 579}) {
+    for (bool existing : {false, true}) {
+      check<int32_t>(n, 7, false, true, 5, existing);
+      check<int64_t>(n, 65, false, true, 5, existing);
+    }
+  }
 }
 TEST_F(
     RowContainerFixedExtractionTest,
