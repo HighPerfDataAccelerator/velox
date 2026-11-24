@@ -22,6 +22,12 @@
 #include "velox/common/serialization/NativeSerdeIO.h"
 #include "velox/type/FloatingPointUtil.h"
 
+#if defined(__linux__) && defined(__aarch64__) && defined(__ARM_FEATURE_SVE) && defined(__AARCH64EL__)
+#include <arm_sve.h>
+#include <asm/hwcap.h>
+#include <sys/auxv.h>
+#endif
+
 #include <array>
 
 #include <gflags/gflags.h>
@@ -35,6 +41,74 @@ DEFINE_int32(
 namespace facebook::velox::exec {
 
 namespace {
+
+#if defined(__linux__) && defined(__aarch64__) && defined(__ARM_FEATURE_SVE) && defined(__AARCH64EL__)
+bool isVeraIdCpu() {
+  static const bool enabled = [] {
+    const auto required = HWCAP_CPUID | HWCAP_SVE;
+    if ((getauxval(AT_HWCAP) & required) != required) {
+      return false;
+    }
+    uint64_t midr;
+    asm("mrs %0, midr_el1" : "=r"(midr));
+    return (midr & 0xff00fff0) == 0x4e000100;
+  }();
+  return enabled;
+}
+
+template <bool kCombine>
+FOLLY_NOINLINE void lookupDenseBigintRangeVera(
+    const int64_t* values,
+    vector_size_t size,
+    uint64_t lower,
+    uint64_t width,
+    uint64_t multiplier,
+    uint64_t* selected,
+    uint64_t* result) {
+  const auto active = svptrue_b64();
+  const auto scale = svdup_n_u64(multiplier);
+  vector_size_t row = 0;
+  for (; size - row >= 2; row += 2) {
+    // Unsigned subtraction maps the signed interval to [0, width]. It
+    // also excludes values below lower without a separate comparison.
+    const auto offsets = svsub_n_u64_x(
+        active, svreinterpret_u64_s64(svld1_s64(active, values + row)), lower);
+    const auto rejected = svcmpgt_n_u64(active, offsets, width);
+    if (svptest_any(active, rejected)) {
+      const bool first = svptest_first(active, rejected);
+      const bool second = svptest_last(active, rejected);
+      if (first) {
+        bits::clearBit(selected, row);
+      }
+      if (second) {
+        bits::clearBit(selected, row + 1);
+      }
+      if (first && second) {
+        continue;
+      }
+    }
+    const auto ids = svadd_n_u64_x(active, offsets, 1);
+    if constexpr (kCombine) {
+      svst1_u64(
+          active,
+          result + row,
+          svmla_u64_x(active, svld1_u64(active, result + row), ids, scale));
+    } else {
+      svst1_u64(active, result + row, ids);
+    }
+  }
+  if (row < size) {
+    const auto offset = static_cast<uint64_t>(values[row]) - lower;
+    if (offset > width) {
+      bits::clearBit(selected, row);
+    } else if constexpr (kCombine) {
+      result[row] += (offset + 1) * multiplier;
+    } else {
+      result[row] = offset + 1;
+    }
+  }
+}
+#endif
 
 constexpr uint32_t kVectorHasherStateMagic = 0x56485331; // VHS1
 constexpr uint32_t kVectorHasherStateVersion = 3;
@@ -1156,6 +1230,36 @@ void VectorHasher::lookupIdsRangeSimd(
     SelectivityVector& rows,
     uint64_t* result) const {
   static_assert(sizeof(T) == 8 || sizeof(T) == 4);
+#if defined(__linux__) && defined(__aarch64__) && defined(__ARM_FEATURE_SVE) && defined(__AARCH64EL__)
+  if constexpr (std::is_same_v<T, int64_t>) {
+    if (rows.size() >= 128 && rows.isAllSelected() && min_ <= max_ &&
+        isVeraIdCpu() && svcntd() == 2) {
+      const auto lower = static_cast<uint64_t>(min_);
+      const auto width = static_cast<uint64_t>(max_) - lower;
+      auto* selected = rows.asMutableRange().bits();
+      if (multiplier_ == 1) {
+        lookupDenseBigintRangeVera<false>(
+            decoded.data<T>(),
+            rows.size(),
+            lower,
+            width,
+            multiplier_,
+            selected,
+            result);
+      } else {
+        lookupDenseBigintRangeVera<true>(
+            decoded.data<T>(),
+            rows.size(),
+            lower,
+            width,
+            multiplier_,
+            selected,
+            result);
+      }
+      return;
+    }
+  }
+#endif
   auto lower = xsimd::batch<T>::broadcast(min_);
   auto upper = xsimd::batch<T>::broadcast(max_);
   auto data = decoded.data<T>();

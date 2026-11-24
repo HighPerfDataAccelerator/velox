@@ -1074,6 +1074,54 @@ TEST_F(VectorHasherTest, computeValueIdsHugeint) {
   ASSERT_FALSE(hasher->computeValueIds(outOfRangeRows, result));
 }
 
+TEST_F(VectorHasherTest, denseBigintRangeLookup) {
+  constexpr int64_t kWidth = 511;
+  constexpr uint64_t kInitialId = 271;
+  for (int64_t lower : {INT64_MIN + 5, int64_t{-257}, INT64_MAX - 1024}) {
+    const auto upper = lower + kWidth;
+    const auto build = makeFlatVector<int64_t>({lower, upper});
+    for (uint64_t multiplier : {1, 37}) {
+      auto hasher = VectorHasher::create(BIGINT(), 0);
+      SelectivityVector buildRows(build->size());
+      raw_vector<uint64_t> buildIds(build->size());
+      hasher->decode(*build, buildRows);
+      ASSERT_FALSE(hasher->computeValueIds(buildRows, buildIds));
+      ASSERT_EQ(
+          (kWidth + 2) * multiplier, hasher->enableValueRange(multiplier, 0));
+      for (int32_t size : {127, 128, 129, 255, 4095}) {
+        const auto probe = makeFlatVector<int64_t>(size, [&](int32_t row) {
+          // Include pairs with two, one or zero rejected lanes and odd tails.
+          if (row % 13 < 2) {
+            return lower - 1;
+          }
+          if (row % 17 == 3) {
+            return upper + 1;
+          }
+          return lower + (53 * row) % (kWidth + 1);
+        });
+        SelectivityVector probeRows(size);
+        raw_vector<uint64_t> ids(size);
+        std::fill(ids.begin(), ids.end(), kInitialId);
+        VectorHasher::ScratchMemory scratch;
+        hasher->lookupValueIds(*probe, probeRows, scratch, ids);
+        int32_t accepted = 0;
+        for (int32_t row = 0; row < size; ++row) {
+          const auto value = probe->valueAt(row);
+          const bool inRange = value >= lower && value <= upper;
+          EXPECT_EQ(probeRows.isValid(row), inRange);
+          if (inRange) {
+            const auto id = static_cast<uint64_t>(value - lower + 1);
+            EXPECT_EQ(
+                ids[row], multiplier == 1 ? id : kInitialId + id * multiplier);
+            ++accepted;
+          }
+        }
+        EXPECT_EQ(probeRows.countSelected(), accepted);
+      }
+    }
+  }
+}
+
 TEST_F(VectorHasherTest, lookupValueIdsHugeint) {
   const auto first = HugeInt::build(1, 42);
   const auto second = HugeInt::build(2, 42);
