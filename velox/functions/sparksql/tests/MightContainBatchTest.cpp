@@ -176,6 +176,17 @@ TEST_F(MightContainBatchTest, flatNullableAndSelectedRows) {
   }
 }
 
+TEST_F(MightContainBatchTest, denseResultBitmapTails) {
+  const auto filter = serializedFilter(128, {-7, 0, 4, 9, 63, 88});
+  for (vector_size_t size : {15, 16, 17, 31, 32, 33, 1023, 1024, 1025, 2049}) {
+    SCOPED_TRACE(size);
+    auto values = makeFlatVector<int64_t>(
+        size, [](vector_size_t row) { return row % 3 == 0 ? -7 : row % 127; });
+    assertSameAsScalar(
+        filter, makeRowVector({values}), SelectivityVector(size));
+  }
+}
+
 TEST_F(MightContainBatchTest, dictionaryAndConstantInputs) {
   const auto serialized = serializedFilter(64, {1, 2, 3, 40, 50});
   auto base = makeNullableFlatVector<int64_t>({1, 2, std::nullopt, 40, 7, 50});
