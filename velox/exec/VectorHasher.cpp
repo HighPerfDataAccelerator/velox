@@ -22,6 +22,12 @@
 #include "velox/common/serialization/NativeSerdeIO.h"
 #include "velox/type/FloatingPointUtil.h"
 
+#if defined(__linux__) && defined(__aarch64__) && defined(__ARM_FEATURE_SVE)
+#include <arm_sve.h>
+#include <asm/hwcap.h>
+#include <sys/auxv.h>
+#endif
+
 #include <array>
 
 #include <gflags/gflags.h>
@@ -35,6 +41,55 @@ DEFINE_int32(
 namespace facebook::velox::exec {
 
 namespace {
+
+#if defined(__linux__) && defined(__aarch64__) && defined(__ARM_FEATURE_SVE)
+bool isVeraIdCpu() {
+  static const bool enabled = [] {
+    const auto required = HWCAP_CPUID | HWCAP_SVE;
+    if ((getauxval(AT_HWCAP) & required) != required) {
+      return false;
+    }
+    uint64_t midr;
+    asm("mrs %0, midr_el1" : "=r"(midr));
+    return (midr & 0xff00fff0) == 0x4e000100;
+  }();
+  return enabled;
+}
+
+// Sample 32 neighbouring pairs before scanning for full runs.
+bool hasRepeatedIntKeys(const int32_t* values) {
+  const auto all = svptrue_b32();
+  uint32_t matches = 0;
+  for (uint32_t i = 0; i < 32; i += svcntw()) {
+    const auto pg = svwhilelt_b32(i, uint32_t{32});
+    matches += svcntp_b32(
+        all,
+        svcmpeq_s32(
+            pg, svld1_s32(pg, values + i), svld1_s32(pg, values + i + 1)));
+  }
+  return matches >= 16;
+}
+
+vector_size_t intRunEnd(
+    const int32_t* values,
+    vector_size_t row,
+    vector_size_t end,
+    int32_t value) {
+  if (++row == end || values[row] != value) {
+    return row;
+  }
+  ++row;
+  while (row < end) {
+    const auto pg = svwhilelt_b32(row, end);
+    const auto mismatch = svcmpne_n_s32(pg, svld1_s32(pg, values + row), value);
+    if (svptest_any(pg, mismatch)) {
+      return row + svcntp_b32(pg, svbrkb_b_z(pg, mismatch));
+    }
+    row += svcntp_b32(pg, pg);
+  }
+  return row;
+}
+#endif
 
 constexpr uint32_t kVectorHasherStateMagic = 0x56485331; // VHS1
 constexpr uint32_t kVectorHasherStateVersion = 3;
@@ -231,6 +286,43 @@ bool VectorHasher::makeValueIds(
     });
     return true;
   }
+
+#if defined(__linux__) && defined(__aarch64__) && defined(__ARM_FEATURE_SVE)
+  if constexpr (Kind == TypeKind::INTEGER) {
+    if (!isRange_ && decoded_.isIdentityMapping() && rows.isAllSelected() &&
+        rows.end() - rows.begin() >= 128 && isVeraIdCpu()) {
+      const auto* values = decoded_.data<int32_t>();
+      const auto begin = rows.begin();
+      const auto end = rows.end();
+      const auto* nulls =
+          decoded_.mayHaveNulls() ? decoded_.nulls(&rows) : nullptr;
+      if ((!nulls || bits::isAllSet(nulls, begin, end)) &&
+          hasRepeatedIntKeys(values + begin)) {
+        for (auto row = begin; row < end;) {
+          const auto value = values[row];
+          const auto id = valueId(value);
+          if (id == kUnmappable) {
+            for (; row < end; ++row) {
+              analyzeValue(values[row]);
+            }
+            return false;
+          }
+          const auto next = intRunEnd(values, row, end, value);
+          if (multiplier_ == 1) {
+            std::fill(result + row, result + next, id);
+          } else {
+            const auto contribution = multiplier_ * id;
+            for (auto i = row; i < next; ++i) {
+              result[i] += contribution;
+            }
+          }
+          row = next;
+        }
+        return true;
+      }
+    }
+  }
+#endif
 
   if (decoded_.isIdentityMapping()) {
     if (decoded_.mayHaveNulls()) {
