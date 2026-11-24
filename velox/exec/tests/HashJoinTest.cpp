@@ -110,6 +110,43 @@ TEST_P(HashJoinTest, contiguousAndGappedIntegerJoinOutput) {
   }
 }
 
+TEST_P(HashJoinTest, repeatedBuildRowOutput) {
+  gflags::FlagSaver flagSaver;
+  FLAGS_velox_arm_sve_row_extraction_enabled = true;
+  auto build = makeRowVector(
+      {"u_key", "payload", "label"},
+      {makeFlatVector<int32_t>({1, 2}),
+       makeNullableFlatVector<int64_t>({91, std::nullopt}),
+       makeFlatVector<StringView>(
+           {"first long build value", "second long build value"})});
+  const auto probe = [&](vector_size_t count, int32_t key, bool mixed) {
+    return makeRowVector(
+        {"id", "t_key"},
+        {makeFlatVector<int32_t>(count, [](auto row) { return row; }),
+         makeFlatVector<int32_t>(count, [=](auto row) {
+           return mixed && row == 37 ? 2 : key;
+         })});
+  };
+  HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
+      .numDrivers(1)
+      .parallelizeJoinBuildRows(parallelBuildSideRowsEnabled_)
+      .probeKeys({"t_key"})
+      .buildKeys({"u_key"})
+      .probeVectors(
+          {probe(257, 1, false),
+           probe(257, 1, true),
+           probe(257, 2, false),
+           probe(127, 1, false)})
+      .buildVectors({build})
+      .joinOutputLayout({"label", "id", "payload", "u_key"})
+      .config(core::QueryConfig::kPreferredOutputBatchRows, "257")
+      .config(core::QueryConfig::kMaxOutputBatchRows, "257")
+      .injectSpill(false)
+      .referenceQuery(
+          "SELECT label, id, payload, u_key FROM t JOIN u ON t_key = u_key")
+      .run();
+}
+
 TEST_P(HashJoinTest, projectedIntegerBuildKey) {
   gflags::FlagSaver flagSaver;
   FLAGS_velox_arm_sve_row_extraction_enabled = true;
