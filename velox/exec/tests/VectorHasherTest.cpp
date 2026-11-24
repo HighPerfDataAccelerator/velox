@@ -2033,3 +2033,81 @@ DEBUG_ONLY_TEST_F(VectorHasherTest, computeValueIdsForRowsCustomComparison) {
           result),
       "Value IDs cannot be used");
 }
+
+TEST_F(VectorHasherTest, runIdsMatchScalarPerRow) {
+  for (auto size : {127, 128, 129, 255, 513, 1027}) {
+    for (auto multiplier : {1, 13}) {
+      for (int scenario = 0; scenario < 4; ++scenario) {
+        SCOPED_TRACE(
+            ::testing::Message()
+            << size << " " << multiplier << " " << scenario);
+        auto vector = makeFlatVector<int32_t>(size, [](auto i) {
+          if (i < 34) {
+            return INT32_MIN;
+          }
+          if (i < 107) {
+            return (i - 34) / 7;
+          }
+          return (i % 11) ? INT32_MAX : i;
+        });
+        if (scenario == 1) {
+          vector->setNull(76, true);
+        }
+        VectorPtr input = scenario == 2 ? makeDictionary(size, vector) : vector;
+        SelectivityVector rows(size);
+        if (scenario == 3) {
+          rows.setValid(46, false);
+          rows.updateBounds();
+        }
+        auto hasher = VectorHasher::create(INTEGER(), 0);
+        raw_vector<uint64_t> result(size);
+        std::fill(result.begin(), result.end(), 7);
+        hasher->decode(*input, rows);
+        EXPECT_FALSE(hasher->computeValueIds(rows, result));
+        hasher->enableValueIds(multiplier, 0);
+        std::fill(result.begin(), result.end(), 7);
+        hasher->decode(*input, rows);
+        ASSERT_TRUE(hasher->computeValueIds(rows, result));
+        DecodedVector expectedValues(*input, rows);
+        std::unordered_map<int32_t, uint64_t> expected;
+        for (int i = 0; i < size; ++i) {
+          if (!rows.isValid(i)) {
+            EXPECT_EQ(result[i], 7);
+            continue;
+          }
+          uint64_t id = 0;
+          if (!input->isNullAt(i)) {
+            auto pos = expected.emplace(
+                expectedValues.valueAt<int32_t>(i), expected.size() + 1);
+            id = pos.first->second;
+          }
+          EXPECT_EQ(result[i], (multiplier == 1 ? 0 : 7) + multiplier * id)
+              << i;
+        }
+      }
+    }
+  }
+}
+
+TEST_F(VectorHasherTest, integerRunsUpdateCardinalityAfterUnmappableKey) {
+  auto hasher = VectorHasher::create(INTEGER(), 0);
+  auto seed = makeFlatVector<int32_t>(128, [](auto row) { return row % 2; });
+  SelectivityVector selected(seed->size());
+  raw_vector<uint64_t> ids(seed->size());
+  hasher->decode(*seed, selected);
+  EXPECT_FALSE(hasher->computeValueIds(selected, ids));
+  hasher->enableValueIds(1, 0);
+
+  auto value = [](int row) { return row < 71 ? 1 : row < 99 ? -1 : 100; };
+  auto input = makeFlatVector<int32_t>(128, value);
+  hasher->decode(*input, selected);
+  EXPECT_FALSE(hasher->computeValueIds(selected, ids));
+  uint64_t asRange, asDistinct;
+  hasher->cardinality(0, asRange, asDistinct);
+  EXPECT_EQ(asDistinct, 5);
+  hasher->enableValueIds(1, 0);
+  ASSERT_TRUE(hasher->computeValueIds(selected, ids));
+  for (int row = 0; row < 128; ++row) {
+    EXPECT_EQ(ids[row], row < 71 ? 2 : row < 99 ? 3 : 4) << row;
+  }
+}
