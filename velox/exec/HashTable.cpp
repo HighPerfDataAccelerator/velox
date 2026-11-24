@@ -673,6 +673,64 @@ bool isVeraJoinCpu() {
   }();
   return enabled;
 }
+#if defined(__AARCH64EL__)
+// Consume a dense window of probe rows. A zero return selects the scalar
+// fallback. Keep the first unconsumed hit available for the next refill.
+inline int packVeraDenseJoinHits(
+    const int32_t* ids,
+    char* const* hits,
+    char** cursors,
+    int32_t* probeRows,
+    int32_t* lengths,
+    int32_t& used,
+    int32_t nextOffset) {
+  constexpr int32_t kWidth = 16;
+  const uint32_t first = static_cast<uint32_t>(ids[0]);
+  if (first > static_cast<uint32_t>(INT32_MAX - kWidth + 1)) {
+    return 0;
+  }
+  const uint32x4_t lane{0, 1, 2, 3};
+  auto expected = vaddq_u32(vdupq_n_u32(first), lane);
+  auto mismatch = vdupq_n_u32(0);
+  for (int i = 0; i < kWidth; i += 4) {
+    const auto rows = vreinterpretq_u32_s32(vld1q_s32(ids + i));
+    mismatch = vorrq_u32(mismatch, veorq_u32(rows, expected));
+    expected = vaddq_u32(expected, vdupq_n_u32(4));
+  }
+  if (vmaxvq_u32(mismatch)) {
+    return 0;
+  }
+
+  const auto* heads = hits + first;
+  const uint8x8_t weights{1, 2, 4, 8, 16, 32, 64, 128};
+  auto mask8 = [&](char* const* src) {
+    uint64x2x4_t words;
+    std::memcpy(&words, src, sizeof(words));
+    auto flags4 = [](uint64x2_t a, uint64x2_t b) {
+      return vmovn_u32(vcombine_u32(vmovn_u64(vtstq_u64(a, a)),
+                                    vmovn_u64(vtstq_u64(b, b))));
+    };
+    const auto flags = vmovn_u16(vcombine_u16(
+        flags4(words.val[0], words.val[1]), flags4(words.val[2], words.val[3])));
+    return static_cast<unsigned>(vaddv_u8(vand_u8(flags, weights)));
+  };
+  unsigned mask = mask8(heads) | (mask8(heads + 8) << 8);
+  while (mask) {
+    const int i = __builtin_ctz(mask);
+    auto* head = heads[i];
+    __builtin_prefetch(head + nextOffset);
+    cursors[used] = head;
+    probeRows[used] = first + i;
+    lengths[used++] = 0;
+    mask &= mask - 1;
+    if (used == 8 && mask) {
+      return i + 1;
+    }
+  }
+  return kWidth;
+}
+#endif
+
 // Each group of 16 slots owns one 32-bit tag mask after the main table.
 constexpr int32_t kTagsPerBucket = BaseHashTable::TagVector::size;
 constexpr int32_t kJoinBucketBytes = kTagsPerBucket * sizeof(char*);
@@ -2905,6 +2963,11 @@ int32_t HashTable<ignoreNullKeys>::listJoinResultsInterleavedImpl(
   const bool prefetchEnabled = kDefaultPolicy || iter.prefetchEnabled;
   const bool headChainDrainEnabled =
       FLAGS_velox_hash_join_head_chain_drain_enabled;
+#if defined(__linux__) && defined(__aarch64__) && defined(__ARM_FEATURE_SVE) && defined(__AARCH64EL__)
+  static_assert(JoinResultIterator::kNumParallelChains == 8);
+  const bool useDenseRefill = kDefaultPolicy && !kCountBytes && !kCompactChains &&
+      isVeraJoinCpu() && svcntd() == 2;
+#endif
   const auto numProbeRows = iter.rows->size();
   auto& walker = iter.walker;
   auto bufferedHitAt = [&](int32_t slot, int32_t position) -> char*& {
@@ -2931,6 +2994,21 @@ int32_t HashTable<ignoreNullKeys>::listJoinResultsInterleavedImpl(
     if (walker.slotHead >= walker.numActive) {
       walker.slotHead = 0;
       walker.numActive = 0;
+#if defined(__linux__) && defined(__aarch64__) && defined(__ARM_FEATURE_SVE) && defined(__AARCH64EL__)
+      if (useDenseRefill && !includeMisses) {
+        while (walker.numActive < 8 &&
+               numProbeRows - iter.lastRowIndex >= 16) {
+          const auto consumed = packVeraDenseJoinHits(
+              iter.rows->data() + iter.lastRowIndex, iter.hits->data(),
+              walker.slotCursors.data(), walker.slotProbeRows.data(),
+              walker.bufferLength.data(), walker.numActive, nextOffset_);
+          if (consumed == 0) {
+            break;
+          }
+          iter.lastRowIndex += consumed;
+        }
+      }
+#endif
       while (walker.numActive < numParallelChains &&
              iter.lastRowIndex < numProbeRows) {
         const auto row = (*iter.rows)[iter.lastRowIndex]; // NOLINT
