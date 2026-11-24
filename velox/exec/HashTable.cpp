@@ -715,19 +715,23 @@ inline int packVeraDenseJoinHits(
     return static_cast<unsigned>(vaddv_u8(vand_u8(flags, weights)));
   };
   unsigned mask = mask8(heads) | (mask8(heads + 8) << 8);
+  auto slot = used;
+  int consumed = kWidth;
   while (mask) {
     const int i = __builtin_ctz(mask);
     auto* head = heads[i];
     __builtin_prefetch(head + nextOffset);
-    cursors[used] = head;
-    probeRows[used] = first + i;
-    lengths[used++] = 0;
+    cursors[slot] = head;
+    probeRows[slot] = first + i;
+    lengths[slot++] = 0;
     mask &= mask - 1;
-    if (used == 8 && mask) {
-      return i + 1;
+    if (slot == 8 && mask) {
+      consumed = i + 1;
+      break;
     }
   }
-  return kWidth;
+  used = slot;
+  return consumed;
 }
 #endif
 
