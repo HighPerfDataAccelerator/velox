@@ -43,6 +43,25 @@ class DirectDecoder : public IntDecoder<isSigned> {
     this->skipLongs(toSkip);
   }
 
+  // Exposes the unread portion of the current fixed-width block. A caller that
+  // borrows bytes must advance the decoder with skip() after accepting them.
+  std::string_view fixedWidthInput() {
+    VELOX_DCHECK(!this->useVInts_);
+    skipPending();
+    if (this->bufferStart_ == this->bufferEnd_) {
+      const void* data;
+      int32_t length;
+      if (!this->inputStream_->Next(&data, &length) || length == 0) {
+        return {};
+      }
+      this->bufferStart_ = static_cast<const char*>(data);
+      this->bufferEnd_ = this->bufferStart_ + length;
+    }
+    return {
+        this->bufferStart_,
+        static_cast<size_t>(this->bufferEnd_ - this->bufferStart_)};
+  }
+
   template <typename T>
   void nextValues(T* data, uint64_t numValues, const uint64_t* nulls);
 
