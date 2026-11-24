@@ -1153,6 +1153,17 @@ void HashTable<ignoreNullKeys>::joinProbe(HashLookup& lookup) {
         const auto row = i * (numRows / kSamples);
         repeats += keys[row] == keys[row + 1];
       }
+      // Close calls get a second set of independent adjacent pairs halfway
+      // between the first set. Keep the common low-repetition path unchanged.
+      if (repeats == 4 || repeats == 5) {
+        int secondRepeats = 0;
+        const auto stride = numRows / kSamples;
+        for (int32_t i = 0; i < kSamples; ++i) {
+          const auto row = i * stride + stride / 2;
+          secondRepeats += keys[row] == keys[row + 1];
+        }
+        repeats = secondRepeats;
+      }
       if (repeats >= 6) {
         probeRepeatedNormalizedKeys(lookup);
         return;
