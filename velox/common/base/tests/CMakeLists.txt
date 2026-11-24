@@ -32,6 +32,7 @@ add_executable(
   RuntimeMetricsTest.cpp
   ScopedLockTest.cpp
   SemaphoreTest.cpp
+  SimdGatherBitsBoundsTest.cpp
   SimdUtilTest.cpp
   SimdUtilSveTest.cpp
   SkewedPartitionBalancerTest.cpp

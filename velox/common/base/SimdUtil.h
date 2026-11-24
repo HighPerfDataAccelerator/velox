@@ -320,8 +320,8 @@ xsimd::batch<int16_t, A> gather(
     int numIndices,
     const A& = {});
 
-// Loads up to 8 disjoint bits at bit offsets 'indices' and returns
-// these as a bit mask.
+// Loads up to 8 disjoint bits from a uint64_t-backed bitmap at 'indices'.
+// Each addressed uint64_t word must be readable. Returns the gathered bit mask.
 template <typename A = xsimd::default_arch>
 uint8_t gather8Bits(
     const void* bits,
